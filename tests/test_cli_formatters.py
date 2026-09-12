@@ -940,7 +940,7 @@ def test_the_disclosure_reaches_an_early_return_path():
     assert "malformed function field" in values
 
 
-def _coercion_sites():
+def _coercion_sites(source: str | None = None):
     """Every named-field container coercion in the formatter module, and every
     coercion that BYPASSES the recording helpers, read out of the module's AST.
 
@@ -948,23 +948,43 @@ def _coercion_sites():
     the renderers' own `@_discloses(lists=..., dicts=...)` declarations, which is
     a restatement of the implementation: a declaration list and a table of that
     same list agreeing with each other proves nothing, and it read as 89 rows of
-    coverage while checking nothing the code does.
+    coverage while re-stating the declarations it was meant to check.
+
+    `source` parses a module given as TEXT instead, so the set of shapes this
+    recognises can itself be enumerated and asserted rather than merely claimed.
 
     The bypass half recognises a payload lookup (`.get(k)` with a literal OR a
     variable key, and `[k]` subscript) that reaches a container coercion either
-    directly or through ONE local alias -- the shapes review actually used to
-    evade the first version of this check, plus the subscript shape that hid a
-    live blocker. It is not a proof over arbitrary indirection; two hops through
-    two variables, or a lookup crossing a function boundary, would still pass,
-    which is why the realistic-payload tests below exist alongside it."""
+    directly or through ONE local alias, in every one of these spellings:
+
+      * `<lookup> or []` / `or {}` / `or ()`          -- the pre-#619 idiom
+      * `_as_dict(<lookup>)`                          -- the raw coercer
+      * `<any>.get(k, [])` / `.get(k, {})`            -- a defaulted lookup
+      * `<lookup> if isinstance(...) else []` / `{}`  -- the ternary
+      * `<x> if isinstance(<x>, list|dict|tuple) else None` -- the ternary whose
+        default is `None`, which the recording helpers read as ABSENT, so it
+        buries a malformed value exactly as completely as `[]` does
+      * `if isinstance(<lookup>, list|dict|tuple): ... else: <name> = []`, its
+        `= None` variant, and its negated `if not isinstance(...)` rebind -- the
+        STATEMENT spelling of that same ternary
+
+    What it still does NOT see -- stated in full, because an UNDER-stated limit
+    is what let the `else None` ternary sit live at two named-field sites while
+    the docstring admitted only two holes: two alias hops through two variables;
+    a lookup crossing a function boundary; a walrus binding; a `try/except
+    TypeError` coercion; a default taken from a module-level constant; a
+    `functools.partial` or other deferred call; and any coercion written at
+    module level rather than inside a function. Those are why the ENUMERATED
+    differential below RUNS the renderers instead of reading them."""
     import ast
     import inspect
 
     from bn import formatters
 
-    tree = ast.parse(inspect.getsource(formatters))
+    tree = ast.parse(source if source is not None else inspect.getsource(formatters))
     RECORDERS = ("_field_list", "_field_dict")
     COERCERS = ("_as_list", "_as_dict")
+    CONTAINERS = ("list", "dict", "tuple", "set")
 
     def is_lookup(node):
         """A read of a NAMED field off some mapping, by `.get(k)` or `[k]`.
@@ -986,9 +1006,35 @@ def _coercion_sites():
                 or (isinstance(node, ast.Dict) and not node.keys)
                 or (isinstance(node, ast.Tuple) and not node.elts))
 
+    def coerced_default(node):
+        """A default that renders as "no container". `None` counts: the recording
+        helpers read an explicit null as ABSENT, so defaulting a malformed value
+        to `None` hides it exactly as thoroughly as defaulting it to `[]`."""
+        return empty_container(node) or (
+            isinstance(node, ast.Constant) and node.value is None)
+
+    def container_isinstance(node):
+        """The expression whose CONTAINER shape `node` tests, else None. Accepts
+        the negated form, so `if not isinstance(x, list)` is seen as well."""
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            node = node.operand
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance" and len(node.args) == 2):
+            return None
+        wanted = node.args[1]
+        names = wanted.elts if isinstance(wanted, ast.Tuple) else [wanted]
+        if not any(isinstance(n, ast.Name) and n.id in CONTAINERS for n in names):
+            return None
+        return node.args[0]
+
     sites, raw = [], []
     for fn in tree.body:
         if not isinstance(fn, ast.FunctionDef):
+            continue
+        # The recording helpers ARE the choke point: they necessarily test the
+        # shape of a lookup and fall back, which is the very shape being hunted
+        # everywhere else. Scanning them would report the fix as the defect.
+        if fn.name in RECORDERS + COERCERS:
             continue
         # Locals bound straight from a payload lookup: one alias hop is the
         # evasion review demonstrated, so resolve it rather than trust the shape.
@@ -1018,10 +1064,35 @@ def _coercion_sites():
                     for c in node.values[:-1]:
                         if suspect(c):
                             raw.append((fn.name, ast.unparse(node)))
-            # `x if isinstance(x, list) else []` over a payload lookup/alias.
-            if isinstance(node, ast.IfExp) and empty_container(node.orelse):
-                if suspect(node.body):
+            # `x if isinstance(x, list) else []`, and the `else None` spelling.
+            # An empty-container default is a container tell on its own; `None`
+            # is one only when the test decides the SHAPE of the very value being
+            # bound, which is what separates a container coercion from a guard on
+            # the SOURCE (`fn.get("name") if isinstance(fn, dict) else None`).
+            if isinstance(node, ast.IfExp) and suspect(node.body):
+                tested = container_isinstance(node.test)
+                shape_tested = (tested is not None
+                                and ast.dump(tested) == ast.dump(node.body))
+                if empty_container(node.orelse) or (
+                        shape_tested and coerced_default(node.orelse)):
                     raw.append((fn.name, ast.unparse(node)))
+            # The STATEMENT form of that ternary: a container-shape test on a
+            # payload lookup, with a branch binding an empty container/None to a
+            # name that is ALSO bound straight from a lookup. That last clause is
+            # what keeps it a coercion check rather than an "isinstance plus an
+            # accumulator" check -- `lines = []` inside a shape branch is not a
+            # coerced field, and reporting it would train the guard to be ignored.
+            if isinstance(node, ast.If):
+                tested = container_isinstance(node.test)
+                if tested is not None and suspect(tested):
+                    for stmt in list(node.body) + list(node.orelse):
+                        for sub in ast.walk(stmt):
+                            if not (isinstance(sub, ast.Assign) and coerced_default(sub.value)):
+                                continue
+                            if any(isinstance(t, ast.Name) and t.id in aliases
+                                   for t in sub.targets):
+                                raw.append((fn.name, f"if {ast.unparse(node.test)}: ... "
+                                                     f"{ast.unparse(sub)}"))
             # `.get(k, [])` / `.get(k, {})` -- a defaulted lookup coerces too.
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "get" and len(node.args) == 2
@@ -1045,6 +1116,128 @@ def test_no_payload_container_is_coerced_outside_the_recording_helpers():
         f"malformed value there renders as empty with no disclosure: {raw[:6]}")
 
 
+# Every spelling the guard claims to see, one probe module each. Enumerated as
+# DATA so the claim is ASSERTED rather than described: round 5 evaded the guard
+# with two of these (the `else None` ternary, live at two real sites, and the
+# statement form) while its docstring still called the class closed.
+_GUARD_CATCHES = {
+    "or-empty-list": 'rows = value.get("k") or []\n    return str(rows)',
+    "or-empty-dict": 'rows = value.get("k") or {}\n    return str(rows)',
+    "or-empty-tuple": 'rows = value.get("k") or ()\n    return str(rows)',
+    "or-empty-subscript": 'rows = value["k"] or []\n    return str(rows)',
+    "raw-coercer-on-get": 'return str(_as_dict(value.get("k")))',
+    "raw-coercer-on-subscript": 'return str(_as_dict(value["k"]))',
+    "raw-coercer-variable-key": 'return str(_as_dict(value.get(key)))',
+    "raw-coercer-one-alias-hop": 'raw = value.get("k")\n    return str(_as_dict(raw))',
+    "defaulted-get-list": 'return str(value.get("k", []))',
+    "defaulted-get-dict": 'return str(value.get("k", {}))',
+    "ternary-else-empty": ('rows = value.get("k") if isinstance(value, dict) else []\n'
+                           '    return str(rows)'),
+    "ternary-else-none": ('rows = value.get("k") if isinstance(value.get("k"), list)'
+                          ' else None\n    return str(rows)'),
+    "ternary-else-none-alias": ('raw = value.get("k")\n'
+                                '    rows = raw if isinstance(raw, dict) else None\n'
+                                '    return str(rows)'),
+    "statement-if-else-empty": ('if isinstance(value.get("k"), list):\n'
+                                '        rows = value.get("k")\n'
+                                '    else:\n        rows = []\n    return str(rows)'),
+    "statement-if-else-none": ('if isinstance(value.get("k"), dict):\n'
+                               '        rows = value.get("k")\n'
+                               '    else:\n        rows = None\n    return str(rows)'),
+    "statement-negated-rebind": ('rows = value.get("k")\n'
+                                 '    if not isinstance(rows, list):\n        rows = []\n'
+                                 '    return str(rows)'),
+}
+
+# The mirror: shapes that must NOT be reported, or the guard degenerates into
+# "this module contains an isinstance" and stops discriminating at all.
+_GUARD_IGNORES = {
+    "recorded-lookup": 'return str(_field_list(value, "k"))',
+    "recorded-dict-lookup": 'return str(_field_dict(value, "k"))',
+    "source-shape-guard": ('name = value.get("k") if isinstance(value, dict) else None\n'
+                           '    return str(name)'),
+    "element-shape-check": ('out = []\n    for s in _field_list(value, "k"):\n'
+                            '        if not isinstance(s, dict):\n            continue\n'
+                            '        out.append(s)\n    return str(out)'),
+    "presence-test": ('rows = _field_list(value, "k")\n'
+                      '    if rows or "k" in value:\n        return str(len(rows))\n'
+                      '    return ""'),
+    "index-into-a-list": 'rows = _field_list(value, "k")\n    return str(rows[-1:])',
+    "accumulator-inside-a-shape-branch": ('if isinstance(value.get("k"), list):\n'
+                                          '        lines = []\n'
+                                          '        lines.append("x")\n'
+                                          '        return str(lines)\n'
+                                          '    return ""'),
+}
+
+
+@pytest.mark.parametrize("name,body", sorted(_GUARD_CATCHES.items()))
+def test_the_coercion_guard_sees_every_form_it_claims_to_see(name, body):
+    _, raw = _coercion_sites(f"def _render_probe(value, key='k'):\n    {body}\n")
+    assert raw, f"the guard is blind to the {name} spelling of a container coercion"
+
+
+@pytest.mark.parametrize("name,body", sorted(_GUARD_IGNORES.items()))
+def test_the_coercion_guard_does_not_fire_on_a_recorded_read(name, body):
+    _, raw = _coercion_sites(f"def _render_probe(value, key='k'):\n    {body}\n")
+    assert not raw, f"the guard mis-reports {name} as a bypass: {raw}"
+
+
+# Malformed payloads for a field whose well-formed shape is a list / a dict.
+# Includes the FALSY wrong shapes: `0`, `""`, `False` and the opposite empty
+# container are PRESENT values of the wrong type, not absent ones, and reading
+# them as absent is the same confident-empty answer this change exists to stop.
+_MALFORMED = {
+    "list": ("bad", {"a": 1}, 0, "", False, {}),
+    "dict": ("bad", ["bad"], 0, "", False, []),
+}
+
+
+def test_a_malformed_container_either_discloses_or_renders_exactly_as_absent():
+    """The ENUMERATED positive differential, over every top-level recorded field
+    the AST can find rather than a hand-picked table of examples (the 89-row
+    table this replaced ran real renders, but only at the positions its author
+    typed out).
+
+    Under the choke point the property needs no expected-output table at all: if
+    the renderer READ the field, the recorder fired and the disclosure is in the
+    output; so a rendering byte-identical to the ABSENT one proves the value was
+    never consumed, and a rendering that is the raw-payload fallback echoes the
+    bogus value verbatim. Anything else is a malformed container being reported
+    as a result -- the confident empty, which is the one reading with no honest
+    interpretation."""
+    from bn import formatters
+
+    sites, _ = _coercion_sites()
+    assert sites, "AST walk found no coercion sites at all -- the guard is blind"
+    checked, silent = 0, []
+    for fn_name, keys, kind, top in sites:
+        render = getattr(formatters, fn_name, None)
+        if not top or render is None or not fn_name.startswith("_render"):
+            continue
+        try:
+            absent = render({})
+        except Exception:                          # unrelated shape requirement
+            continue
+        for key in keys:
+            for bogus in _MALFORMED[kind]:
+                try:
+                    out = render({key: bogus})
+                except Exception:
+                    continue
+                checked += 1
+                # Three honest outcomes: disclosed; provably never consumed
+                # (byte-identical to absent); or the payload echoed verbatim by
+                # the raw fallback, which hides nothing at all.
+                if ("malformed" in out or out == absent
+                        or out == formatters._render_fallback_text({key: bogus})):
+                    continue
+                silent.append(f"{fn_name}({key}={bogus!r}) renders as a result with "
+                              f"no disclosure and differs from the absent rendering")
+    assert checked >= 200, f"differential ran on only {checked} cases -- not enumerated"
+    assert not silent, silent[:8]
+
+
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     """The mirror property, and the more dangerous direction: crying "malformed"
     at a genuinely empty result would teach a caller to ignore the signal, which
@@ -1053,7 +1246,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     from bn import formatters
 
     sites, _ = _coercion_sites()
-    noisy = []
+    assert sites, "AST walk found no coercion sites at all -- the mirror is blind"
+    noisy, checked = [], 0
     for fn_name, keys, kind, top in sites:
         render = getattr(formatters, fn_name, None)
         if not top or render is None or not fn_name.startswith("_render"):
@@ -1063,10 +1257,17 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             for payload in ({}, {key: empty}, {key: None}):
                 try:
                     out = render(payload)
-                except Exception:                  # unrelated shape requirement
+                except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+                    # The renderer's own shape requirement, not a disclosure bug.
+                    # Narrowed from a bare `except Exception` so anything else --
+                    # including a raise the recorder itself introduces -- fails
+                    # here instead of being swallowed, and `checked` bounds how
+                    # vacuous the remainder is allowed to become.
                     continue
+                checked += 1
                 if "malformed" in out:
                     noisy.append(f"{fn_name}({key}) on {payload!r}")
+    assert checked >= 100, f"mirror ran on only {checked} payloads -- not enumerated"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -1241,19 +1442,98 @@ def test_render_instance_find_non_dict_item_degrades():
     assert "'bad'" in out
 
 
-def test_render_taint_models_malformed_class_entries_are_not_counted_as_sinks():
-    # Wrapping a malformed entry list as a one-element list made it count as one
-    # modeled sink -- a fabricated row in an inventory an auditor reads as ground
-    # truth. An explicit null is an ABSENT list, so it is not a skew to disclose;
-    # a truthy wrong-shaped one is.
+def test_render_taint_models_class_rows_are_counted_by_what_was_examined():
+    # Two directions, both of them a mis-count of an inventory an auditor reads
+    # as ground truth. Wrapping a malformed entry list as a one-element list
+    # counted it as one modeled sink (a fabricated row); filtering the class out
+    # when its entry list was falsy then DROPPED a class that was examined from
+    # "in N class(es)" (a claim that fewer classes were looked at than were).
+    # The class row is what "examined" means, the entries are what "found"
+    # means, and the two counts are independent.
     from bn.formatters import _render_taint_models_text
+
+    # PRESENT AND EMPTY: a real result -- we looked at this class and found no
+    # modeled sink. Still listed, still counted, and not called malformed.
+    empty = _render_taint_models_text(
+        {"sinks_by_class": {"exec": [{"symbol": "system"}], "empty_cls": []}})
+    assert "sinks (1 in 2 class(es))" in empty
+    assert "[empty_cls]" in empty
+    assert "malformed" not in empty
+
+    # ABSENT (explicit null): nothing was claimed for the class, so there is no
+    # skew to disclose -- but the class key is still there and still counted.
     nulled = _render_taint_models_text({"sinks_by_class": {"unbounded_input": None}})
-    assert "sinks (0 in 0 class(es))" in nulled
+    assert "sinks (0 in 1 class(es))" in nulled
+    assert "[unbounded_input]" in nulled
     assert "malformed" not in nulled
 
+    # PRESENT BUT WRONG SHAPE: zero sink rows (never one per character), the
+    # class still listed and counted, and the skew disclosed by name.
     skewed = _render_taint_models_text({"sinks_by_class": {"unbounded_input": "gets"}})
-    assert "sinks (0 in 0 class(es))" in skewed
+    assert "sinks (0 in 1 class(es))" in skewed
+    assert "[unbounded_input]" in skewed
     assert "malformed unbounded_input field" in skewed
+
+    # And the FALSY wrong shape, which read as absent until presence replaced
+    # truthiness inside the recording helpers.
+    falsy = _render_taint_models_text({"sinks_by_class": {"unbounded_input": {}}})
+    assert "sinks (0 in 1 class(es))" in falsy
+    assert "malformed unbounded_input field" in falsy
+
+
+def test_a_falsy_wrong_shaped_container_is_disclosed_not_read_as_absent():
+    # `0`, `""`, `False` and a `{}` where a list belongs are PRESENT values of
+    # the wrong type. Testing the raw value for truth instead of presence read
+    # every one of them as absent and rendered a confident empty listing from a
+    # payload the renderer could not use (#619).
+    from bn.formatters import (_render_class_list_text, _render_callsites_text,
+                               _render_orient_text)
+    for bogus in ({}, 0, "", False):
+        out = _render_class_list_text({"items": bogus, "total": 1})
+        assert "malformed items field" in out, bogus
+        out = _render_callsites_text({"items": bogus, "total": 1})
+        assert "malformed items field" in out, bogus
+    # Nested one level down, and for a dict-shaped field.
+    assert "malformed imports_summary field" in _render_orient_text({"imports_summary": []})
+
+
+def test_class_show_discloses_a_skewed_vtable_container():
+    # The vtable container itself, not its slots: a malformed one rendered a
+    # class card byte-identical to a class that genuinely has no vtable, inside
+    # the very cluster #619 names.
+    from bn.formatters import _render_class_show_text
+    rec = {"name": "Widget", "confidence": "rtti"}
+    absent = _render_class_show_text(rec)
+    skewed = _render_class_show_text({**rec, "vtable": "bad"})
+    assert "malformed vtable field" in skewed
+    assert skewed.startswith(absent)                 # strict superset of absent
+    # An explicit null still means "no vtable", and must stay quiet.
+    assert "malformed" not in _render_class_show_text({**rec, "vtable": None})
+
+
+def test_xref_grouping_discloses_a_skewed_caller_function():
+    # Coerced through a ternary the choke-point guard could not see, so a
+    # malformed caller_function silently grouped the ref as if it had no
+    # containing function at all.
+    from bn.formatters import _render_xrefs_text
+    out = _render_xrefs_text({"symbol": "gets", "code_refs": [
+        {"address": "0x1", "caller_function": "main"}]})
+    assert "malformed caller_function field" in out
+
+
+def test_orient_skewed_section_listing_is_a_superset_of_the_empty_one():
+    # The same superset invariant the vtable case established, applied to the
+    # nested section listing: a malformed listing must say everything the empty
+    # one says and then disclose, never render strictly LESS than empty.
+    from bn.formatters import _render_orient_text
+    empty = _render_orient_text({"sections": {"items": []}})
+    skewed = _render_orient_text({"sections": {"items": "bad"}})
+    absent = _render_orient_text({})
+    assert "sections: 0" in empty
+    assert "sections: 0" in skewed
+    assert "malformed items field" in skewed
+    assert skewed.startswith(empty)
+    assert "sections" not in absent                  # absent claims nothing
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():

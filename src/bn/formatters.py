@@ -60,21 +60,11 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _as_list(value: Any) -> list[Any]:
-    """Coerce a nested field to a list for safe iteration.
-
-    Mirrors ``_as_dict``: a renderer that does ``_field_list(value, "items")`` still
-    iterates a truthy NON-list (a string from a malformed or future bridge result)
-    element by element -- for a string that is one bogus row per CHARACTER. This
-    returns ``[]`` for anything that isn't a list (#619)."""
-    return value if isinstance(value, list) else []
-
-
 def _skew_note(*fields: str) -> str:
-    """Disclose a container field that arrived as a truthy value of the WRONG
+    """Disclose a container field that was PRESENT but held a value of the WRONG
     shape, instead of rendering it as if it were empty.
 
-    ``_as_dict``/``_as_list`` stop the AttributeError, but coercing a malformed
+    ``_as_dict`` stops the AttributeError, but coercing a malformed
     field to ``{}``/``[]`` makes the row render byte-identically to a genuinely
     empty result: the caller reads a confident "nothing here" and cannot tell
     the payload was unusable. Base raised loudly, so degrading must stay loud --
@@ -106,8 +96,16 @@ def _record_skew(field: str) -> None:
 
 
 def _field_list(source: Any, *keys: str) -> list[Any]:
-    """``source[key]`` as a list, recording the skew when it is present but is
-    not one, at ANY depth.
+    """``source[key]`` as a list, recording the skew when the key is PRESENT but
+    holds something that is neither ``None`` nor a list, at ANY depth.
+
+    Three states, kept distinct here so no caller has to re-derive them: ABSENT
+    (key missing, or an explicit null -- nothing was claimed), PRESENT-AND-EMPTY
+    (a real result: we looked and found none), and PRESENT-BUT-WRONG-SHAPE (a
+    skew to disclose). Testing the raw value for TRUTH instead of presence
+    collapsed the third into the first for every FALSY wrong shape -- ``0``,
+    ``""``, ``False``, a ``{}`` where a list belongs -- which rendered a payload
+    the renderer could not use as a confident empty result (#619).
 
     Extra ``keys`` are retained aliases (#651): the first that actually holds a
     non-empty list wins. ``source.get("items") or source.get("locals")`` instead
@@ -117,22 +115,28 @@ def _field_list(source: Any, *keys: str) -> list[Any]:
     src = _as_dict(source)
     rows: list[Any] = []
     for key in keys:
-        raw = src.get(key)
+        if key not in src:
+            continue
+        raw = src[key]
         if isinstance(raw, list):
             if raw and not rows:
                 rows = raw
-        elif raw:
+        elif raw is not None:
             _record_skew(key)
     return rows
 
 
 def _field_dict(source: Any, key: str) -> dict[str, Any]:
-    """``source[key]`` as a dict, recording the skew when it is present but is
-    not one, at ANY depth. The dict mirror of ``_field_list`` (#619)."""
-    raw = _as_dict(source).get(key)
+    """``source[key]`` as a dict, recording the skew when the key is PRESENT but
+    holds something that is neither ``None`` nor a dict, at ANY depth. The dict
+    mirror of ``_field_list``, including its three-state distinction (#619)."""
+    src = _as_dict(source)
+    if key not in src:
+        return {}
+    raw = src[key]
     if isinstance(raw, dict):
         return raw
-    if raw:
+    if raw is not None:
         _record_skew(key)
     return {}
 
@@ -1415,9 +1419,13 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
     for ref in refs:
         if not isinstance(ref, dict):
             continue
-        caller = ref.get("caller_function") if isinstance(ref.get("caller_function"), dict) else None
+        # Through the choke point, so a malformed `caller_function` discloses
+        # itself rather than silently grouping the ref as if it had no
+        # containing function. A PRESENT but empty dict still takes the function
+        # branch, exactly as it did before the coercion moved here (#619).
+        caller = _field_dict(ref, "caller_function")
         key: tuple
-        if caller is not None:
+        if caller or isinstance(ref.get("caller_function"), dict):
             key = ("fn", caller.get("address"), caller.get("name"))
             caller_address = caller.get("address")
             caller_name = caller.get("name")
@@ -2265,7 +2273,10 @@ def _render_orient_text(value: Any) -> str:
     lines.append(f"  imports: {total if total is not None else '?'}" + (f" ({kinds})" if kinds else ""))
     secs = _field_dict(value, "sections")
     sec_items = _field_list(secs, "items")
-    if sec_items or isinstance(secs.get("items"), list):
+    # Present-and-empty and present-but-malformed both render the count row, so
+    # the malformed rendering is a strict SUPERSET of the empty one (the note is
+    # appended by the decorator); only a genuinely ABSENT listing omits it.
+    if sec_items or "items" in secs:
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
     ea = value.get("existing_annotations")
@@ -3000,8 +3011,13 @@ def _render_taint_models_text(value: Any) -> str:
         # inventory is read as ground truth, so counting a row that may not
         # exist is worse than disclosing the class as unusable. The per-class
         # skew is recorded by key, so the render's own note names it.
+        #
+        # The class itself is still LISTED and still counted, whether its entry
+        # list is empty, absent or unusable. "We looked at this class and found
+        # no modeled sink" is a real result, and dropping it from "in N class(es)"
+        # understates the inventory in exactly the direction -- fewer classes
+        # examined than were -- that this whole change exists to refuse (#619).
         classes = {cls: _field_list(sbc, cls) for cls in sbc}
-        classes = {cls: rows for cls, rows in classes.items() if rows}
         total = sum(len(entries) for entries in classes.values())
         lines.append(f"sinks ({total} in {len(classes)} class(es)); NOT findings:")
         for cls, entries in classes.items():
@@ -4326,8 +4342,12 @@ def _render_one_class(rec: Any) -> str:
         return _render_fallback_text(rec)
     size = rec.get("size")
     size_s = size.get("value") if isinstance(size, dict) else None
-    vt = rec.get("vtable") if isinstance(rec.get("vtable"), dict) else None
-    vt_addr = vt.get("address") if vt else None
+    # Through the choke point, so a malformed `vtable` container discloses
+    # itself instead of rendering byte-identically to a class that simply has
+    # none -- the cluster #619 names. `{}` is what absent and malformed both
+    # degrade to, and every read below already treats it as "no vtable".
+    vt = _field_dict(rec, "vtable")
+    vt_addr = vt.get("address")
     bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else str(b)
                       for b in _field_list(rec, "bases") if b)
     head = f"class {rec.get('name', '<unknown>')}"
@@ -4351,7 +4371,7 @@ def _render_one_class(rec: Any) -> str:
     # A malformed slot container must fall through to the explanation below, not
     # to a class card that shows a vtable address and then nothing at all -- that
     # rendered strictly LESS than the genuinely-empty case (#619).
-    vt_slots = _field_list(vt, "slots") if vt else []
+    vt_slots = _field_list(vt, "slots")
     if vt_slots:
         for s in vt_slots:
             if not isinstance(s, dict):
@@ -4366,7 +4386,7 @@ def _render_one_class(rec: Any) -> str:
         # decodable local body; say so rather than render fake or empty virtuals.
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
-    if vt and vt.get("truncated"):
+    if vt.get("truncated"):
         lines.append(
             f"  vtable: showing {len(vt_slots)} slots; scan capped at {vt.get('max_slots')} -- "
             "more may exist (raise the cap or inspect the table directly)"
