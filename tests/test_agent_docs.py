@@ -310,10 +310,28 @@ def test_lock_model_paragraph_describes_none_ops_as_self_managing():
         "the lock-model paragraph must say `none` ops self-manage locking; "
         f"it reads: {sentence}"
     )
-    named = [op for op in stateful if f"`{op}`" in sentence]
+    # The refutation is the load-bearing half. Requiring only "self-manage" plus
+    # SOME op name anywhere in the paragraph was satisfiable by an incidental
+    # parenthetical after the refuting clause had been deleted, which left the
+    # paragraph silent on the false reading it exists to correct.
+    claim = "touches no BN state"
+    at = sentence.find(claim)
+    assert at != -1, (
+        f'the paragraph must explicitly refute the "{claim}" reading of '
+        f'`lock="none"`, which is the claim this guard exists to keep true: {sentence}'
+    )
+    lead = sentence[:at]
+    assert "not" in lead.rsplit('`lock="none"`', 1)[-1], (
+        f'the paragraph mentions "{claim}" without refuting it, which is worse '
+        f"than not mentioning it at all: {sentence}"
+    )
+    # The counterexample must sit in the refutation itself. Accepting any op name
+    # anywhere in the paragraph let an incidental later parenthetical stand in
+    # after the refuting clause and its three op names had been deleted.
+    named = [op for op in stateful if f"`{op}`" in sentence[at:at + 200]]
     assert named, (
-        'the paragraph must name at least one stateful lock="none" op, so the '
-        f"self-management claim is concrete rather than a phrase: {stateful}"
+        'the refutation must name a stateful lock="none" op as its counterexample, '
+        f"so it is concrete rather than a phrase; stateful ops are {stateful}"
     )
 
 

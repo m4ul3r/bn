@@ -749,8 +749,12 @@ def _render_result(
 # numeric literal: `1e999` round-trips through `json` as `float("inf")`, and
 # `int(inf)` raises `OverflowError`. `BridgeError` is deliberately absent --
 # code that raises one already says exactly what it means.
+# `RecursionError` is here for the same reason `ArithmeticError` is: a deeply
+# nested payload blows the stack in a recursive walk (json.dumps, a renderer),
+# which is a property of the RESPONSE, not a bug in this process.
 _MALFORMED_RESULT_ERRORS = (
     AttributeError, TypeError, KeyError, IndexError, ValueError, ArithmeticError,
+    RecursionError,
 )
 
 
@@ -1091,7 +1095,16 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
         # that a result the CLI cannot classify must not read as a confirmed
         # success -- so it goes out as the documented BridgeError (exit 2).
         compact = _apply_result_transform(summary, result, "classify the mutation result")
-        if isinstance(compact, dict) and compact.get("measured") is False:
+        if not isinstance(compact, dict):
+            # A registered transform that returns something else has not
+            # classified anything, and "no classification" must not read as a
+            # confirmed success -- the same rule as a transform that raised.
+            raise BridgeError(
+                f"could not classify the mutation result -- the compact summary came "
+                f"back as {type(compact).__name__}, not an object. Compare the bridge "
+                f"and CLI builds with `bn doctor`."
+            )
+        if compact.get("measured") is False:
             return 4
     return 0
 

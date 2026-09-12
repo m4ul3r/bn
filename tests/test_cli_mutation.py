@@ -1221,6 +1221,20 @@ def test_malformed_results_field_is_a_clean_bridge_error(monkeypatch, capsys, ro
 # The parameters that carry a bridge-result transform into `_call` and
 # `_mutation_exit_code`. Calling one of these directly is what four consecutive
 # rounds of review each found one more of.
+def _CLI_SOURCES() -> list[Path]:
+    """EVERY CLI module, not just `cli.py`.
+
+    The first cut of this property parsed `cli.py` alone -- but the mutation
+    handlers live in `commands/`, and one of them already imports the exit-code
+    helper and a summary transform by name. A property scoped to one file is a
+    list again: it says nothing about the files where the call sites actually
+    live.
+    """
+    sources = sorted((REPO / "src" / "bn").rglob("*.py"))
+    assert len(sources) > 10, f"the CLI package shrank to {len(sources)} modules"
+    return sources
+
+
 _RESULT_TRANSFORM_PARAMS = frozenset({
     "result_transform", "spill_status", "summary", "summary_transform",
 })
@@ -1239,10 +1253,10 @@ def test_no_result_transform_is_invoked_outside_the_malformed_result_guard():
     call site added next year inherits the guard or fails here, rather than
     becoming the fifth blocker.
     """
-    tree = ast.parse((REPO / "src" / "bn" / "cli.py").read_text(encoding="utf-8"))
     unguarded = sorted(
-        f"{node.func.id}() at cli.py:{node.lineno}"
-        for node in ast.walk(tree)
+        f"{node.func.id}() at {path.relative_to(REPO)}:{node.lineno}"
+        for path in _CLI_SOURCES()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
         if isinstance(node, ast.Call)
         if isinstance(node.func, ast.Name)
         if node.func.id in _RESULT_TRANSFORM_PARAMS
@@ -1256,10 +1270,10 @@ def test_no_result_transform_is_invoked_outside_the_malformed_result_guard():
 def test_the_malformed_result_guard_is_reached_from_every_transform_parameter():
     """...and the guarded entry point must actually be wired to each of them, so
     the property above cannot be satisfied by simply never using them."""
-    tree = ast.parse((REPO / "src" / "bn" / "cli.py").read_text(encoding="utf-8"))
     passed_through = {
         arg.id
-        for node in ast.walk(tree)
+        for path in _CLI_SOURCES()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
         if isinstance(node, ast.Call)
         if isinstance(node.func, ast.Name) and node.func.id == "_apply_result_transform"
         for arg in node.args

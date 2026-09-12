@@ -160,7 +160,12 @@ def test_skill_command_index_names_every_required_group(command_groups):
 def _index_section() -> str:
     """The Command index body, WITHOUT the remainder of its heading line."""
     text = SKILL.read_text(encoding="utf-8")
-    assert COMMAND_INDEX_HEADING in text, f"{COMMAND_INDEX_HEADING!r} is gone from SKILL.md"
+    sections = text.count(COMMAND_INDEX_HEADING)
+    assert sections == 1, (
+        f"expected exactly one {COMMAND_INDEX_HEADING!r} section, found {sections}: "
+        "this guard reads the FIRST one, so a second would sit outside the sweep "
+        "entirely and every command it advertises would stop being checked"
+    )
     after = text.split(COMMAND_INDEX_HEADING, 1)[1]
     body = after.split("\n", 1)[1] if "\n" in after else ""
     return body.split("\n## ", 1)[0]
@@ -188,8 +193,21 @@ _BASH_BLOCK = re.compile(r"```(?:bash|sh|shell|console)\n(.*?)```", re.S)
 # A runnable invocation: a line whose first word is `bn`.
 _RUNNABLE = re.compile(r"^[ \t]*bn +(?P<rest>[a-z].*)$", re.M)
 
-# The index line's own pointer: `- **<Group>** … → **`reference/<file>.md`**`.
+# The index line's TERMINAL pointer -- what follows the arrow. Searching the
+# whole line instead returns the first `reference/*.md` it happens to mention,
+# so a reference named inside an entry's parenthetical gloss silently stood in
+# for the file the line actually points an agent at.
 _INDEX_REFERENCE = re.compile(r"`(reference/[a-z_]+\.md)`")
+
+
+def _index_pointer(line: str) -> str:
+    assert "\u2192" in line, f"index line has no `->` pointer: {line}"
+    tail = line.split("\u2192", 1)[1]
+    pointers = _INDEX_REFERENCE.findall(tail)
+    assert len(pointers) == 1, (
+        f"an index line must point at exactly one reference file, found {pointers}: {line}"
+    )
+    return pointers[0]
 
 
 def _expand(entry: re.Match[str]) -> list[str]:
@@ -282,8 +300,7 @@ def test_skill_index_entries_are_documented_where_the_index_points(line, command
         "every line in the Command index must be a readable `- **Group** ...` "
         f"entry, or this guard silently stops checking it: {line!r}"
     )
-    reference = _INDEX_REFERENCE.search(line)
-    assert reference, f"index line names no reference file: {line}"
+    reference = _index_pointer(line)
     entries = _index_entries(line)
     assert entries, f"index line advertises nothing: {line}"
     unreadable = [entry for entry in entries if not _INDEX_ENTRY.fullmatch(entry)]
@@ -298,11 +315,11 @@ def test_skill_index_entries_are_documented_where_the_index_points(line, command
         f"the SKILL.md index advertises commands the CLI registry does not have: "
         f"{unregistered}"
     )
-    text = (REFERENCE.parent / reference.group(1)).read_text(encoding="utf-8")
+    text = (REFERENCE.parent / reference).read_text(encoding="utf-8")
     documented = _documented_commands(text, command_paths)
     missing = [cmd for cmd in commands if cmd not in documented]
     assert not missing, (
-        f"the SKILL.md index points at {reference.group(1)} for commands that "
+        f"the SKILL.md index points at {reference} for commands that "
         f"file never shows as a runnable command: {missing}"
     )
 
