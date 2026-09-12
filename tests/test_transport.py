@@ -3328,3 +3328,143 @@ def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
         server.server_close()
 
     assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def _plant_registry(inst_dir, name, **fields):
+    """Write a raw registry document, bypassing the well-formed helper."""
+    (inst_dir / f"{name}.json").write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _healthy_sibling(inst_dir):
+    """A genuinely live instance, so a dropped record is distinguishable from
+    a discovery sweep that died before it got to the rest of the directory."""
+    sock = inst_dir / "good.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="good")
+        ),
+        encoding="utf-8",
+    )
+    return server
+
+
+@pytest.mark.parametrize("raw_socket_path", [
+    pytest.param("", id="empty-string"),
+    pytest.param(".", id="dot"),
+    pytest.param("plain.sock", id="bare-relative-name"),
+    pytest.param("./nested/plain.sock", id="explicitly-relative"),
+])
+def test_load_instance_requires_an_absolute_socket_path_even_from_inside_the_cache(
+    tmp_path, monkeypatch, raw_socket_path
+):
+    """A relative socket_path resolves against the CWD, not against anything.
+
+    Confinement asks whether the path is under the cache, and ``Path("")`` is
+    ``Path(".")`` -- so a relative value inherits whatever directory the CLI
+    happens to be run from. Run from inside the cache it passes confinement and
+    the record is ADOPTED as a live bridge pointing at a directory. The only
+    legitimate writer emits ``str(bridge_socket_path(...))``, which is always
+    absolute, so a non-absolute value is corruption and the answer must not
+    depend on the caller's CWD.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "nested").mkdir()
+    # Every row must fail for the RIGHT reason, so each relative value names
+    # something that actually exists once resolved against the CWD; otherwise
+    # the record would drop on the missing-socket arm and prove nothing.
+    (inst_dir / "plain.sock").write_text("", encoding="utf-8")
+    (inst_dir / "nested" / "plain.sock").write_text("", encoding="utf-8")
+    monkeypatch.chdir(inst_dir)
+
+    _plant_registry(inst_dir, "relpath", pid=os.getpid(),
+                    socket_path=raw_socket_path, instance_id="relpath",
+                    plugin_name="bn_agent_bridge")
+    server = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+@pytest.mark.parametrize("raw_pid", [
+    pytest.param("1", id="numeric-string"),
+    pytest.param(" 1 ", id="padded-numeric-string"),
+    pytest.param("1_0", id="underscored-numeric-string"),
+    pytest.param("\u0661", id="unicode-digit-string"),
+    pytest.param(1.9, id="float-truncating-to-a-live-pid"),
+])
+def test_load_instance_does_not_coerce_a_registry_pid(tmp_path, monkeypatch, raw_pid):
+    """The pid is read, never converted.
+
+    ``int()`` is lossy in exactly the direction that hurts: every one of these
+    becomes a small pid that exists, so the record is ADOPTED as a live bridge.
+    Guarding the known-bad VALUES is a list; requiring the declared TYPE is the
+    property. The bridge writes ``os.getpid()``, so an int is the only shape a
+    real registry ever carries.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    hostile_socket = inst_dir / "coerced.sock"
+    hostile_socket.write_text("", encoding="utf-8")
+
+    _plant_registry(inst_dir, "coerced", pid=raw_pid,
+                    socket_path=str(hostile_socket), instance_id="coerced",
+                    plugin_name="bn_agent_bridge")
+    server = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+@pytest.mark.parametrize("hostile_id", [
+    pytest.param("../evil", id="traversal"),
+    pytest.param("/abs/evil", id="absolute"),
+    pytest.param(17, id="not-a-string"),
+])
+def test_legacy_fixed_registry_validates_its_instance_id(
+    tmp_path, monkeypatch, hostile_id
+):
+    """The legacy fixed registry is the one path with no filename to check against.
+
+    ``instance_id != path.stem`` only runs for registries under the instances
+    directory, so the fixed pair in the cache root let any value through into
+    ``BridgeInstance.instance_id`` and out of ``instance_selector`` -- a
+    selector the caller then passes back to path helpers.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    instances_dir().mkdir(parents=True, exist_ok=True)
+    fixed_socket = tmp_path / "bn_agent_bridge.sock"
+    server = _Server(str(fixed_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path().write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": str(fixed_socket),
+            "instance_id": hostile_id,
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+    sibling = _healthy_sibling(instances_dir())
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]

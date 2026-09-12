@@ -378,6 +378,53 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
         return False
 
 
+def _registry_fields_are_well_formed(
+    raw_socket_path: object, raw_pid: object, raw_instance_id: object
+) -> bool:
+    """Every payload field the adopt-vs-drop decision reads, checked in one place.
+
+    A registry is DATA. Successive reviews found the same defect shape over and
+    over -- a check that passed for the WRONG reason, so a record naming no
+    live bridge was adopted as one -- because each field was guarded by a list
+    of known-bad values instead of by its declared type and domain. This is the
+    single admission point for those fields, and it is deliberately
+    type-STRICT, mirroring ``proc_identity.recorded_start_ticks``: the only
+    writer emits ``os.getpid()``, ``str(bridge_socket_path(...))`` and a
+    grammar-validated id, so anything else is corruption and is DROPPED rather
+    than coerced into something plausible.
+
+    - ``socket_path`` must be an absolute path string. Coercion is what made a
+      relative or empty value resolve against the process CWD, so whether a
+      bogus record was believed depended on where the CLI was run from.
+    - ``pid`` must be a real ``int`` in the range ``os.kill`` accepts. ``int()``
+      is lossy in exactly the direction that hurts: ``True``, ``"1"``, ``" 1 "``
+      and ``1.9`` all become 1, and pid 1 always exists and answers EPERM. Zero
+      and negatives address a process GROUP, so ``os.kill(0, 0)`` succeeds
+      against our own group; anything wider than a C int makes ``os.kill``
+      raise ``OverflowError``, which is not an ``OSError``.
+    - ``instance_id`` must be absent or a valid id. The filename check below
+      only covers registries under ``instances_dir()``; the legacy fixed pair
+      lives in the cache root and had nothing to check its id against, so any
+      value reached ``instance_selector`` and came back out as a selector.
+
+    The identity fields (``boot_id``, ``pid_start_ticks``) are validated by
+    ``proc_identity``, which already refuses a wrong type there.
+    """
+    if not isinstance(raw_socket_path, str) or not Path(raw_socket_path).is_absolute():
+        return False
+    if isinstance(raw_pid, bool) or not isinstance(raw_pid, int):
+        return False
+    if not 0 < raw_pid <= _PID_MAX:
+        return False
+    if raw_instance_id is None:
+        return True
+    try:
+        _paths_validate_instance_id(raw_instance_id)
+    except ValueError:
+        return False
+    return True
+
+
 def _load_instance(
     path: Path,
     *,
@@ -386,29 +433,21 @@ def _load_instance(
 ) -> BridgeInstance | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        socket_path = Path(payload["socket_path"])
+        raw_socket_path = payload["socket_path"]
         raw_pid = payload["pid"]
-        pid = int(raw_pid)
-    except (OSError, TypeError, ValueError, OverflowError, KeyError, json.JSONDecodeError):
-        # TypeError and OverflowError belong here with the rest: `Path(12)`,
-        # `int(["x"])` and `int(Infinity)` on a hand-edited or truncated
-        # registry are the same class of corruption as unparseable JSON or a
-        # missing key, and discovery skips a corrupt record rather than taking
-        # every discovery-backed command down with a raw traceback (#618).
-        return None
-    if isinstance(raw_pid, bool) or not 0 < pid <= _PID_MAX:
-        # A registry is data, so its pid is validated BEFORE it reaches a
-        # syscall. Wider than a C int and `os.kill` raises OverflowError --
-        # not an OSError, so `_process_alive` would not catch it.
-        #
-        # The values that do NOT crash are the dangerous ones, because they
-        # make a record that should have been discarded look ALIVE: zero and
-        # negatives address a process GROUP, so `os.kill(0, 0)` succeeds
-        # against OUR OWN group; and a JSON `true` is an `int` in Python, so it
-        # would become pid 1, which always exists and answers EPERM (#618).
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        # TypeError belongs here with the rest: subscripting a JSON document
+        # that is not an object is the same class of corruption as unparseable
+        # JSON or a missing key, and discovery skips a corrupt record rather
+        # than taking every discovery-backed command down with a raw traceback.
         return None
 
     instance_id = payload.get("instance_id")
+    if not _registry_fields_are_well_formed(raw_socket_path, raw_pid, instance_id):
+        return None
+    socket_path = Path(raw_socket_path)
+    pid = raw_pid
+
     if path.parent == instances_dir() and instance_id != path.stem:
         # The registry filename is the caller's explicit selector. Never trust a
         # payload that claims a different identity, and never unlink the socket
