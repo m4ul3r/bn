@@ -2080,7 +2080,17 @@ def main(argv: list[str] | None = None) -> int:
         # to every OperationFailure, including read/resolver ops that raise
         # "unsupported"/"invalid_request" -- those keep exit 2 so a read-op
         # failure's exit code does not silently widen alongside mutations.
-        if getattr(args, "_mutation_call", False) and status in FAILED_MUTATION_STATUSES:
+        # The status is COERCED before the lookup: a set membership test hashes
+        # its left operand, and this handler is the last code that runs before a
+        # failure becomes an exit code -- so a bridge answering with a structured
+        # status (an object, an array) raised `TypeError: unhashable type` out of
+        # `main()` itself, as a traceback and an exit 1 the documented 0/1/2/3/4
+        # contract does not list. `str()` here and nowhere else: the mutation
+        # ROW statuses are read inside the malformed-result rule, where an
+        # unreadable status is deliberately the documented BridgeError rather
+        # than a row silently classed "not a failure" (#715).
+        if (getattr(args, "_mutation_call", False)
+                and str(status) in FAILED_MUTATION_STATUSES):
             return 3
         return 2
 

@@ -1370,14 +1370,18 @@ def test_a_deeply_nested_result_is_a_clean_bridge_error(monkeypatch, capsys, tmp
 _CLI = REPO / "src" / "bn" / "cli.py"
 _GUARD = "_apply_result_transform"      # the rule
 _BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
-# The rule's own implementation is the one place a transform is invoked
-# directly, so it is the ONLY function the dispatch sweeps skip. The boundary
-# was skipped too, and that exemption was true of nothing: `_guarded_transform`
-# invokes no transform -- it closes over one and delegates to the rule -- so it
-# needed no exemption, and having one meant a raw `transform(probe)` injected
-# into the boundary itself was unreported, in the one function whose stated
-# purpose is that this cannot happen (round 13).
-_RULE_FUNCTIONS = (_GUARD,)
+# The rule's own implementation invokes a transform directly at exactly ONE
+# place -- the call inside the `try` that catches `_MALFORMED_RESULT_ERRORS` --
+# so the exemption is that CALL, and not the function containing it. Exempting
+# the whole body was the same mistake one scope out: a second raw
+# `transform(result)` placed anywhere else in `_apply_result_transform` (before
+# the `try`, in the handler, in a `finally`) was unreported while every guard
+# stayed green and a malformed result left `main()` as a raw traceback
+# (round 14). The boundary used to be skipped too, and that exemption was true
+# of nothing: `_guarded_transform` invokes no transform -- it closes over one
+# and delegates to the rule -- so it needed no exemption, and having one meant
+# a raw `transform(probe)` injected into the boundary itself was unreported, in
+# the one function whose stated purpose is that this cannot happen (round 13).
 # The ONE name cli.py may bind the string `"result"` to outside the unwrap
 # helper: the key it writes into a fan-out row. Round 8 made that name the
 # exemption, and the name itself then became the dodge -- `response.get(
@@ -1760,6 +1764,61 @@ def _stores_holder(value: ast.expr, holders: set[str]) -> bool:
     return False
 
 
+# --- What the SLOT rules below do and do not answer, stated in full ---
+#
+# The three rules that follow -- `_slot_names` (what a holder is stored under),
+# `_slot_dispatch_sites` (what is invoked through such a name) and
+# `_slot_traffic` (which statements handle an exempt slot) -- recognise LITERAL
+# stores, LITERAL dispatch sites and LITERAL traffic. A slot name has to appear
+# in the source as a string constant, an attribute or a keyword; a dispatch has
+# to be an attribute access or a constant-string subscript; and a statement is
+# traffic in an exempt slot if it spells that slot out.
+#
+# These forms are NOT recognised, and each was reached by an injection in
+# review rather than found in `cli.py`:
+#
+#   1. a store whose slot name is COMPUTED -- `setattr(obj, name, t)`,
+#      `setattr(obj, "han" + "dler", t)`, `setattr(obj, f"hand{x}ler", t)`;
+#   2. a dispatch whose subscript key is computed -- `ns.inner[key](r)`,
+#      `ns.inner[f"par{y}ked"](r)`;
+#   3. a dispatch assembled by a library -- `operator.attrgetter("parked")(ns)(r)`;
+#   4. a COMPREHENSION, in either role: as a callee display
+#      (`[t for _ in (0,)][0](r)`, `next(t for _ in (0,))(r)`) or as a store
+#      (`ns.inner.update({k: t for k in ("parked",)})`);
+#   5. an immediately-applied lambda -- `(lambda: t)()(r)`;
+#   6. a store in a NESTED class body -- `class _Reg: handler = t`;
+#   7. a subscript store under a non-constant key -- `ns.inner[key] = t`.
+#
+# There is no sound static answer here, and the reason is not that this sweep is
+# young. `cli.py` is PARSED and never run by these properties, so a name has no
+# runtime object behind it; deciding whether an arbitrary Python expression
+# evaluates to a particular function is the halting problem wearing a hat. Each
+# round of review that closed one of these forms was answered by the next form
+# out -- rounds 12, 13 and 14 are three consecutive instances -- because an
+# adversary writing the escape always has one more syntactic form than the
+# recogniser has cases. Nine rounds bought nine forms and left the tenth open.
+# So the escapes are WRITTEN DOWN, exactly as the doc number sweep's two escapes
+# are written down in tests/test_agent_docs.py, instead of being implied away.
+#
+# What is actually load-bearing does not depend on any of this:
+#
+#   * `src/bn/cli.py` has ONE guarded boundary. Every transform the CLI receives
+#     is bound to the malformed-result rule there, once, before anything can
+#     invoke it -- so the shape of the later call site is irrelevant to whether
+#     it is guarded. The static properties police that boundary staying the only
+#     door; they are not the guarantee.
+#   * `test_every_transform_parameter_of_call_survives_a_malformed_result` RUNS
+#     `main()` once per transform parameter with a transform that raises on a
+#     malformed result, and asserts the documented BridgeError and exit code
+#     rather than a traceback. That cell is behavioural: it cannot be satisfied
+#     by a syntactic form, and it is what proved one of the nine boundary
+#     bindings inert (an unmeasured `formatters.py` guard, routed to #722).
+#
+# An injection that defeats a BEHAVIOURAL cell, or that bypasses the one
+# boundary at RUNTIME, is a real finding. An injection that merely finds form
+# eight of the static sweep is this paragraph.
+
+
 def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -> set[str]:
     """The attribute/key names a caller-supplied transform is STORED under in *fn*.
 
@@ -1877,6 +1936,23 @@ def _guarded_slots(transforms: "_Transforms") -> frozenset[str]:
                                 for binding in bound_at.get(name, ()))
                             for name in stored):
                         unguarded.add(keyword.arg)
+            # ...and the POSITIONAL string, which `_slot_names` already reads as
+            # naming a slot: `setattr(obj, "render", t)`. The two halves of one
+            # rule have to read the same store forms -- the slot was created and
+            # then classed GUARDED because no store of it was ever seen, which
+            # silenced every dispatch through that name (round 14).
+            constants = {argument.value for argument in node.args
+                         if isinstance(argument, ast.Constant)
+                         and isinstance(argument.value, str)}
+            for carried in (*node.args, *(keyword.value for keyword in node.keywords)):
+                if not constants or not _stores_holder(carried, holders):
+                    continue
+                stored = _carried(carried, holders)
+                if not stored or not all(
+                        any(_dominates(binding, use)
+                            for binding in bound_at.get(name, ()))
+                        for name in stored):
+                    unguarded |= constants
         for node in ast.walk(fn):
             if isinstance(node, ast.Dict):
                 for key, value in zip(node.keys, node.values):
@@ -2185,20 +2261,47 @@ _NOT_A_RESULT_TRANSFORM = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _rule_exempt_calls() -> frozenset[int]:
+    """The node ids of the calls the malformed-result rule performs UNDER it.
+
+    Exactly the calls inside a `try` of `_apply_result_transform` whose handler
+    catches `_MALFORMED_RESULT_ERRORS` -- the one place a transform is invoked
+    raw because that invocation IS the rule. Every other call in the rule
+    function is swept like any other.
+
+    Fail-closed by construction: if the rule loses its guarded `try` (or the
+    rule is renamed out of existence) this set is empty and the rule's own
+    `transform(result)` becomes a reported unguarded site, rather than the
+    exemption silently widening to the whole module.
+    """
+    rule = _named(_GUARD)
+    if rule is None:
+        return frozenset()
+    return frozenset(
+        id(inner)
+        for node in ast.walk(rule) if isinstance(node, ast.Try)
+        if any(isinstance(handler.type, ast.Name)
+               and handler.type.id == "_MALFORMED_RESULT_ERRORS"
+               for handler in node.handlers)
+        for statement in node.body
+        for inner in ast.walk(statement) if isinstance(inner, ast.Call)
+    )
+
+
 def _dispatch_sites() -> list[str]:
     """Every `cli.py` call that dispatches a holder the boundary does not
     dominate, as `<callee>() in <function>()` plus its line."""
     transforms = _transform_holders()
     guarded_slots = _guarded_slots(transforms)
     sites = []
+    exempt = _rule_exempt_calls()
     for fn in _cli_functions():
-        if fn.name in _RULE_FUNCTIONS:
-            continue
         where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
         sites += [
             f"{_callee(node)}() in {fn.name}()|cli.py:{node.lineno}"
             for node in ast.walk(fn)
-            if isinstance(node, ast.Call)
+            if isinstance(node, ast.Call) and id(node) not in exempt
             for use in [where.get(id(node), ())]
             for dispatched in [_callee_roots(node, transforms.slots)
                                & transforms.holders[id(fn)]]
@@ -2209,7 +2312,8 @@ def _dispatch_sites() -> list[str]:
         # which is what relates two expressions naming one namespace.
         sites += [f"{_callee(node)}() in {fn.name}()|cli.py:{node.lineno}"
                   for node, _slot in _slot_dispatch_sites(
-                      fn, transforms.slots, guarded_slots)]
+                      fn, transforms.slots, guarded_slots)
+                  if id(node) not in exempt]
     return sorted(set(sites))
 
 
@@ -2505,12 +2609,13 @@ def test_no_bridge_result_transform_leaves_cli_py_unguarded():
                                       for fn in defs))
                   for name, defs in repo.items()}
     leaked = []
+    exempt = _rule_exempt_calls()
     for fn in _cli_functions():
-        if fn.name in _RULE_FUNCTIONS:
-            continue
         where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call) or _callee_names(node) & in_module:
+                continue
+            if id(node) in exempt:
                 continue
             use = where.get(id(node), ())
             for callee in _callee_roots(node, transforms.slots) - in_module:
@@ -2752,6 +2857,60 @@ def test_non_mutation_status_still_exits_2(monkeypatch):
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x"])
     assert rc == 2
+
+
+def test_an_unhashable_escaped_status_exits_2_instead_of_tracebacking(monkeypatch):
+    """The last member of the family this PR is about: a bridge value tested
+    RAW, in the one handler whose whole job is to turn a failure into a
+    documented exit code.
+
+    `main()`'s `except BridgeError` asks whether the escaped `status` is a
+    `FAILED_MUTATION_STATUSES` member. A set membership test hashes its left
+    operand, so a bridge answering with a structured status (an object or an
+    array rather than a string) raised `TypeError: unhashable type` OUT of that
+    handler -- a traceback and a process exit of 1, which the documented
+    0/1/2/3/4 contract does not list, on the error path, for a read op as much as
+    for a mutation.
+
+    Such a status is not one of the five failure statuses, so the documented
+    answer is the same 2 a future/unexpected status string already gets.
+    """
+    from bn.transport import BridgeError
+
+    for status in ({"code": "invalid_request"}, ["invalid_request"]):
+        def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                              instance_id=None, _status=status, **kwargs):
+            raise BridgeError("structured bridge status", status=_status)
+
+        monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        assert bn.cli.main(
+            ["symbol", "rename", "--target", "active", "sub_401000", "x"]) == 2
+        monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        assert bn.cli.main(["function", "list"]) == 2
+
+
+def test_an_unhashable_result_row_status_is_a_clean_bridge_error(monkeypatch, capsys):
+    """The SAME shape one boundary in, where the answer is deliberately
+    different and must stay that way.
+
+    `_mutation_reports_failure` looks each `results[]` row's status up in the
+    same set, but it runs INSIDE the malformed-result rule, and `TypeError` is
+    in `_MALFORMED_RESULT_ERRORS` -- so an unreadable status is the documented
+    BridgeError and exit 2, never a traceback. Pinned because the obvious
+    "repair" is to coerce the status to `str` at both sites, and here that would
+    silently reclassify a row this CLI could not read as NOT a failure, letting
+    an unreadable mutation response continue toward exit 0 or 4. That is exactly
+    what the function's docstring refuses to do.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, **kwargs):
+        return {"ok": True, "result": {"success": True, "committed": True,
+                                       "results": [{"status": {"kind": "verified"}}]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x"])
+    assert rc == 2
+    assert "classify the mutation result" in capsys.readouterr().err
 
 
 def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):

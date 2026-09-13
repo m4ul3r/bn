@@ -381,34 +381,201 @@ def _registered_handlers() -> dict[str, object]:
     return {" ".join(spec["path"]): spec["handler"] for spec in cli._COMMANDS}
 
 
-# The one call that writes the shared per-project pin. Named here so the sticky
-# exemption's reason is a fact about the CODE rather than about the index.
-_STICKY_WRITE = "session_state.update"
+# The sticky pin has exactly ONE writer, and the exemption's reason is a fact
+# about the CODE: "this command writes the shared per-project pin". So the check
+# has to be about THAT FUNCTION. Two earlier cuts answered a different question:
+#
+#   * `"session_state.update" in ast.unparse(call.func)` is a substring over
+#     rendered source. It accepts any attribute chain that merely ENDS in those
+#     two names (`namespace.session_state.update(...)` on a parameter), and it
+#     misses the same function reached under another name
+#     (`from bn.session_state import update as pin; pin(...)`).
+#   * matching a registered handler to that source by `handler.__name__` is not
+#     unique across modules: a dead same-named function in any module under
+#     `src/bn` reclassified an unrelated registered command (round 14).
+#
+# So a call's callee is RESOLVED through the importing module's own bindings to
+# a module-qualified name, a handler is matched by `__module__` + `__qualname__`
+# rather than by bare name, and a handler that reaches the writer through a
+# chain of resolvable calls counts too -- a wrapper is not an escape.
+#
+# LIMIT, stated rather than implied: this resolves REFERENCES, so a call made
+# through a value instead of a name -- a variable holding the function,
+# `getattr(module, "update")`, a dispatch table looked up at run time -- is not
+# resolvable from source and is not detected. The exemption set is asserted to
+# be EXACTLY the detected writers, so the failure mode of that limit is a new
+# pin writer going unnoticed, never an unrelated command being parked here.
+_PIN_WRITER = "bn.session_state.update"
+
+
+def _module_name(path: Path, root: Path) -> str:
+    parts = path.relative_to(root).with_suffix("").parts
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(("bn", *parts))
+
+
+def _module_bindings(tree: ast.Module, module: str) -> dict[str, str]:
+    """Local name -> the dotted object it names, for one module.
+
+    Function-local imports are read too: `from bn.session_state import update as
+    pin` inside a handler body binds `pin` just as a module-level import does.
+    """
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                head = alias.name.split(".")[0]
+                bindings[alias.asname or head] = alias.name if alias.asname else head
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                owner = module.split(".")[:-1]
+                if node.level > 1:
+                    owner = owner[:max(0, len(owner) - (node.level - 1))]
+                base = ".".join([*owner, *([base] if base else [])])
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = (
+                    f"{base}.{alias.name}" if base else alias.name)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] = f"{module}.{node.name}"
+    return bindings
+
+
+def _dotted_callee(expr: ast.expr) -> str | None:
+    """`a.b.c` as a dotted string; None for anything that is not a name path."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        head = _dotted_callee(expr.value)
+        return f"{head}.{expr.attr}" if head else None
+    return None
+
+
+def _canonical(dotted: str, module: str, bindings: dict[str, dict[str, str]]) -> str:
+    """*dotted*, as written inside *module*, rewritten to its defining module.
+
+    Each step replaces the longest prefix that names a module in the corpus plus
+    a name that module binds. `cli.session_state.update` written in
+    `bn.commands.admin` becomes `bn.cli.session_state.update`, then
+    `bn.session_state.update`. A name the corpus does not bind is left alone, so
+    an attribute chain on a local value never collides with a real function.
+    """
+    parts = [*module.split("."), *dotted.split(".")]
+    for _ in range(8):
+        for cut in range(len(parts) - 1, 0, -1):
+            target = bindings.get(".".join(parts[:cut]), {}).get(parts[cut])
+            if target:
+                following = [*target.split("."), *parts[cut + 1:]]
+                break
+        else:
+            break
+        if following == parts:
+            break
+        parts = following
+    return ".".join(parts)
+
+
+def _corpus_functions(tree: ast.Module):
+    """(qualname, node) for every function a registered handler can BE: module
+    level, and one class level down."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node.name, node
+        elif isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield f"{node.name}.{member.name}", member
+
+
+def _pin_writing_functions(sources: dict[str, str]) -> frozenset[str]:
+    """Module-qualified names of every function in *sources* that reaches the
+    pin writer -- directly, or through a chain of calls the corpus resolves.
+
+    Takes the corpus as an argument so the resolution itself is testable against
+    a corpus that contains the collisions the real tree does not currently have.
+    """
+    trees = {module: ast.parse(text) for module, text in sources.items()}
+    bindings = {module: _module_bindings(tree, module)
+                for module, tree in trees.items()}
+    calls: dict[str, set[str]] = {}
+    for module, tree in trees.items():
+        for qualname, fn in _corpus_functions(tree):
+            calls[f"{module}.{qualname}"] = {
+                _canonical(dotted, module, bindings)
+                for node in ast.walk(fn) if isinstance(node, ast.Call)
+                for dotted in [_dotted_callee(node.func)] if dotted
+            }
+    writers = {name for name, targets in calls.items() if _PIN_WRITER in targets}
+    while True:
+        reaching = {name for name, targets in calls.items()
+                    if name not in writers and targets & writers}
+        if not reaching:
+            return frozenset(writers)
+        writers |= reaching
 
 
 def _sticky_state_writers() -> frozenset[str]:
     """Every registered command whose handler writes the sticky pin.
 
-    Derived from the handler's own source, so the group cannot be used to park a
+    Derived from the handler's own identity -- the function the registry holds,
+    located by module and qualified name -- so the group cannot be used to park a
     command that does not touch the pin, and a new pin-writing command is a
     documentation decision that fails here until it is made.
     """
-    sources = {}
-    for path in sorted((SKILL.parents[2] / "src" / "bn").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for fn in ast.walk(tree):
-            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if any(isinstance(node, ast.Call)
-                   and _STICKY_WRITE in ast.unparse(node.func)
-                   for node in ast.walk(fn)):
-                sources[fn.name] = path
-    assert sources, (
-        f"no function under src/bn calls {_STICKY_WRITE}; the sticky exemption's "
+    root = SKILL.parents[2] / "src" / "bn"
+    writers = _pin_writing_functions({
+        _module_name(path, root): path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("*.py"))
+    })
+    assert writers, (
+        f"no function under src/bn reaches {_PIN_WRITER}; the sticky exemption's "
         "reason is unchecked, so the pin writer has been renamed"
     )
-    return frozenset(command for command, handler in _registered_handlers().items()
-                     if handler.__name__ in sources)
+    return frozenset(
+        command for command, handler in _registered_handlers().items()
+        if f"{handler.__module__}.{handler.__qualname__}" in writers
+    )
+
+
+def test_the_sticky_pin_writer_is_matched_by_identity_not_by_name():
+    """The exemption's reason is "THIS handler writes the shared pin", and the
+    two cuts before this one answered a different question -- a substring over
+    rendered source, then a bare function name shared across modules. Asserted
+    against a corpus carrying the collisions the real tree happens not to have,
+    because the real tree not having them today is why both cuts looked right.
+    """
+    writers = _pin_writing_functions({
+        "bn.session_state": "def update(**fields):\n    return fields\n",
+        "bn.commands.admin": (
+            "from bn import session_state\n"
+            "def pin(selector):\n"
+            "    session_state.update(target=selector)\n"
+            "def wrapper(selector):\n"
+            "    pin(selector)\n"
+            "def unrelated(namespace):\n"
+            "    return namespace.session_state.update(namespace)\n"
+        ),
+        "bn.commands.decoy": (
+            "def pin(selector):\n"
+            "    return selector\n"
+            "def aliased(selector):\n"
+            "    from bn.session_state import update as _set\n"
+            "    _set(target=selector)\n"
+        ),
+    })
+    assert writers == {
+        # the direct write...
+        "bn.commands.admin.pin",
+        # ...the wrapper that reaches it...
+        "bn.commands.admin.wrapper",
+        # ...and the same function under an import alias in another module.
+        "bn.commands.decoy.aliased",
+        # NOT bn.commands.decoy.pin (same bare name, writes nothing) and NOT
+        # bn.commands.admin.unrelated (an attribute chain on a parameter that
+        # merely ends in the writer's two names).
+    }, sorted(writers)
 
 
 def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
