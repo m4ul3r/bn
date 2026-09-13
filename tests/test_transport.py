@@ -4778,9 +4778,15 @@ def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp
 
     summary = gc_instances()               # explicit, lock-holding, operator-invoked
 
-    assert summary["sockets_removed"] == 1
     assert summary["logs_removed"] == 1
-    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+    # The SOCKET stays, and that is the disclosed residual rather than an
+    # oversight: every unlink in this module needs positive proof, and where
+    # the kernel cannot be asked there is none. Reaping it here would unlink
+    # the endpoint of any bridge that has bound this name and not yet
+    # registered -- a live file, for a leftover inode.
+    assert summary["sockets_removed"] == 0
+    assert sock_path.exists()
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock", "crashed.sock"]
 
 
 def test_a_record_naming_a_dead_foreign_socket_is_reclaimed_without_touching_it(tmp_path, monkeypatch):
@@ -4892,7 +4898,11 @@ def test_the_reclaim_needs_a_dead_endpoint_not_an_unbound_one(tmp_path, monkeypa
 
     assert summary["registries_purged"] == 1
     assert summary["logs_removed"] == 1
-    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+    # The socket file outlives them where the kernel cannot be asked: the
+    # record's reclaim no longer waits on the socket's fact, and the socket's
+    # unlink still demands it.
+    assert summary["sockets_removed"] == 0
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock", "mismatch.sock"]
 
 
 def test_a_misread_confinement_keeps_a_serving_bridges_record(tmp_path, monkeypatch):
@@ -4948,3 +4958,83 @@ def test_a_misread_confinement_keeps_a_serving_bridges_record(tmp_path, monkeypa
         with contextlib.suppress(OSError):
             server.close()
         sock_path.unlink(missing_ok=True)
+
+
+def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path, monkeypatch):
+    """A wrong ``False`` here unlinks a serving bridge's own endpoint.
+
+    ``/proc/net/unix`` is the sole corroboration behind every socket unlink in
+    this module, and it is a LINE-oriented text file holding raw path bytes. A
+    cache path containing a newline cannot appear in it at all, and one holding
+    a non-UTF-8 byte survived decoding only as U+FFFD, so the comparison failed
+    and the answer came back as the positive fact "nothing is bound" -- about a
+    socket that was bound AND listening. The answer for a path the listing
+    cannot represent is ``None``, and for a path it can represent only as bytes
+    the comparison is done on bytes (#618).
+    """
+    from bn.transport import _path_has_bound_socket
+
+    for label, raw in ((b"newline", b"root\nwith-newline"), (b"non-utf8", b"root-\xff-byte")):
+        root = tmp_path / os.fsdecode(raw)
+        root.mkdir()
+        monkeypatch.setenv("BN_CACHE_DIR", str(root))
+        inst_dir = instances_dir()
+        inst_dir.mkdir(parents=True, exist_ok=True)
+        sock_path = inst_dir / "serving.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)                   # bound AND listening: a serving bridge
+        try:
+            # Never the positive "nothing is bound" about a socket that is bound:
+            # a newline is unrepresentable (None), a raw byte is answered exactly.
+            answer = _path_has_bound_socket(sock_path)
+            assert answer is not False, label
+
+            summary = gc_instances()       # the registry-less sweep, with no record
+
+            assert summary["sockets_removed"] == 0, label
+            assert sock_path.exists(), label
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(0.5)
+            try:
+                client.connect(str(sock_path))     # still reachable by name
+            finally:
+                client.close()
+        finally:
+            with contextlib.suppress(OSError):
+                server.close()
+            sock_path.unlink(missing_ok=True)
+
+
+def test_the_reclaim_keeps_a_record_whose_fields_fail_validation(tmp_path, monkeypatch):
+    """The exemption's SAFE direction, pinned -- not just its presence.
+
+    ``_reclaim_unusable_registry`` runs every candidate through the same
+    type-strict validator the loader uses, and until this test nothing pinned
+    what happens when it FIRES: removing the call left the suite green while
+    ``gc_instances`` both raised on a non-``str`` ``socket_path`` and deleted
+    records the loader deliberately keeps. A property that proves a guard
+    EXISTS says nothing about what it does when it fires the other way (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    records = {
+        "wrongtype": {"pid": 4321, "socket_path": {"not": "a string"}, "instance_id": "wrongtype"},
+        "badpid": {"pid": "nope", "socket_path": str(inst_dir / "badpid.sock"),
+                   "instance_id": "badpid"},
+        "badid": {"pid": 4321, "socket_path": str(inst_dir / "badid.sock"),
+                  "instance_id": "../escape"},
+    }
+    for sid, payload in records.items():
+        (inst_dir / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+
+    summary = gc_instances()               # must not raise, and must not delete
+
+    assert summary["registries_purged"] == 0
+    assert summary["logs_removed"] == 0
+    assert sorted(p.name for p in inst_dir.iterdir() if p.name != ".spawn.lock") == [
+        "badid.json", "badid.log", "badpid.json", "badpid.log",
+        "wrongtype.json", "wrongtype.log",
+    ]

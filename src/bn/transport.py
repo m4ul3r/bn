@@ -415,14 +415,34 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
     Linux that file does not exist, and the answer is then UNKNOWABLE rather
     than "nothing is bound": ``None`` keeps the caller from destroying on an
     absence, which is the rule the rest of this module follows.
+
+    Unknowable also covers what the listing cannot REPRESENT, and that
+    distinction is the whole safety of this function -- a wrong ``False`` is
+    the sole corroboration behind every socket unlink in this module, so it
+    destroys a bridge's own bound-and-listening endpoint. Two shapes:
+
+    * The file is line-oriented, so a path containing a newline cannot appear
+      in it at all. That is not evidence of nothing being bound, so it answers
+      ``None``.
+    * A path is bytes, not text. Decoding the listing as UTF-8 with
+      ``errors="replace"`` turned any non-UTF-8 byte in a cache path into
+      U+FFFD and made every comparison fail, which read as "nothing is bound"
+      about a serving socket. The comparison is therefore done on BYTES, the
+      form the kernel wrote and the form ``bind`` was given, so such a path is
+      answered exactly rather than approximately.
     """
+    wanted = os.fsencode(str(socket_path))
+    if b"\n" in wanted:
+        return None
+    resolved = os.path.realpath(wanted)
+    if b"\n" in resolved:
+        return None
     try:
-        listing = Path("/proc/net/unix").read_text(encoding="utf-8", errors="replace")
+        listing = Path("/proc/net/unix").read_bytes()
     except OSError:
         return None
-    name = socket_path.name
-    target = os.path.realpath(socket_path)
-    for line in listing.splitlines():
+    name = os.fsencode(socket_path.name)
+    for line in listing.split(b"\n"):
         # `Num RefCount Protocol Flags Type St Inode Path`, whitespace-separated,
         # and the trailing path is present only for a BOUND socket. Splitting on
         # the first seven runs keeps a path containing spaces intact.
@@ -434,8 +454,9 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
         # passed to `bind` (a relative cache root, a symlinked `instances/`), so
         # compare what the two names resolve to -- filtered by basename first,
         # because a busy host lists thousands of sockets.
-        if bound_path == str(socket_path) or (
-            os.path.basename(bound_path) == name and os.path.realpath(bound_path) == target
+        if bound_path == wanted or (
+            os.path.basename(bound_path) == name
+            and os.path.realpath(bound_path) == resolved
         ):
             return True
     return False
@@ -1032,10 +1053,14 @@ def gc_instances() -> dict[str, Any]:
             # looks like from here: a bridge binds before it writes its registry
             # and one the GUI plugin starts takes no spawn lock, so the lock
             # above cannot order it. Unlinking that name leaves the bridge
-            # serving on an unlinked inode, reachable by nobody. Only a
-            # POSITIVE answer refuses the unlink, so an unknowable one (no
-            # ``/proc/net/unix``) keeps this sweep exactly as it was (#618).
-            if suffix == ".sock" and _path_has_bound_socket(entry) is True:
+            # serving on an unlinked inode, reachable by nobody. So this unlink
+            # takes the same evidence as every other one in this module --
+            # positive proof that nothing is bound -- and an unknowable answer
+            # keeps the file. The earlier form refused only on a positive
+            # ``True``, which meant that wherever the kernel cannot be asked it
+            # reaped a bridge's own socket, and it also let a WRONG ``False``
+            # (a path the listing cannot represent) do the same (#618).
+            if suffix == ".sock" and _path_has_bound_socket(entry) is not False:
                 continue
             with contextlib.suppress(OSError):
                 entry.unlink()
