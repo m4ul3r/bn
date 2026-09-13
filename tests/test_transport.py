@@ -5566,3 +5566,42 @@ def test_a_name_no_file_can_carry_is_conclusively_absent(tmp_path):
     raw = tmp_path / os.fsdecode(b"ra\xffw.sock")
     raw.touch()
     assert _path_is_absent(raw) is False
+
+
+def test_a_live_owner_whose_state_cannot_be_read_is_not_litter(tmp_path, monkeypatch):
+    """An unreadable process STATE is not a dead owner -- pinned destructively.
+
+    ``owner_alive`` is ``_process_alive(pid) and process_state not in
+    {"Z","X","x"}``, and the second half is a BLACKLIST on purpose:
+    ``_process_state`` answers ``None`` wherever ``/proc`` is absent, which is
+    every record on a platform this PR names repeatedly. Two plausible wrong
+    forms -- requiring the state to be readable, or whitelisting the states
+    that count as running -- turn ``None`` into "the owner is gone", and the
+    shared predicate then makes every record on that host litter. Nothing
+    pinned that direction: both mutations left all three fenced test files
+    green while a live bridge lost its registry AND its log, with the socket
+    spared only by the unrelated kernel-proof gate in the sweep (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    # The platform with no /proc: the state is unknowable, not dead.
+    monkeypatch.setattr("bn.transport._process_state", lambda pid: None)
+    record = inst_dir / "socketless.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "socketless.sock", pid=os.getpid(),
+                                     instance_id="socketless")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "socketless.log"
+    log.write_text("bridge output\n", encoding="utf-8")
+
+    assert list_instances() == []                 # hidden, as it is at base
+    assert record.exists() and log.exists()       # and not destroyed
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 0
+    assert summary["logs_removed"] == 0
+    assert record.exists()
+    assert log.read_text(encoding="utf-8") == "bridge output\n"
