@@ -666,8 +666,12 @@ def _render_comment_text(value: Any) -> str:
     # and, alongside them, the whole-function documentation (`fn.comment`) as
     # `function_doc` -- surfaced above the address comments so the two stores read
     # as one coherent view instead of the doc silently going missing from `get`.
-    comments = value.get("comments")
-    if isinstance(comments, list):
+    # The aggregate view is what a CLAIMED `comments` selects, asked as PRESENT
+    # through the choke point: a present-but-wrong-shaped one used to fall
+    # through to the single-comment form and render "(no comment)" -- byte
+    # identical to a payload that never mentioned comments at all (#619).
+    comments = _field_list(value, "comments")
+    if _field_present(value, "comments"):
         lines = []
         doc = value.get("function_doc")
         if doc:
@@ -715,8 +719,8 @@ def _render_comment_list_text(value: Any) -> str:
 def _render_tag_types_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    types = value.get("tag_types")
-    if not isinstance(types, list) or not types:
+    types = _field_list(value, "tag_types")
+    if not types:
         return "none"
     lines = []
     for t in types:
@@ -732,8 +736,8 @@ def _render_tag_types_text(value: Any) -> str:
 def _render_tag_get_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    tags = value.get("tags")
-    if not isinstance(tags, list) or not tags:
+    tags = _field_list(value, "tags")
+    if not tags:
         return "(no tags)"
     return "\n".join(_render_tag_row(t) for t in tags if isinstance(t, dict))
 
@@ -1058,13 +1062,12 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     # ExtendedAnalyze) legitimately report 0/0 -- and hidden only when idle/not
     # started, so the line doesn't flicker away mid-analysis. Counts appended when
     # a meaningful total is known.
-    prog = value.get("analysis_progress")
-    if isinstance(prog, dict):
-        state = prog.get("state")
-        if state and state not in ("IdleState", "InitialState"):
-            total = prog.get("total") or 0
-            counts = f" {prog.get('count')}/{total}" if total else ""
-            lines.append(f"\tanalysis progress: {state}{counts}")
+    prog = _field_dict(value, "analysis_progress")
+    state = prog.get("state")
+    if state and state not in ("IdleState", "InitialState"):
+        total = prog.get("total") or 0
+        counts = f" {prog.get('count')}/{total}" if total else ""
+        lines.append(f"\tanalysis progress: {state}{counts}")
     # Function-count + named-vs-auto-named summary that every agent reaches for
     # first (#122). Counts reflect the current analysis state (a --quick view
     # reports what it has so far; analysis_state already flags that).
@@ -1093,8 +1096,8 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         )
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
-    segments = value.get("segments")
-    if isinstance(segments, list) and segments:
+    segments = _field_list(value, "segments")
+    if segments:
         lines.append("\tsegments:")
         for seg in (s for s in segments if isinstance(s, dict)):
             perms = "".join(
@@ -1735,8 +1738,8 @@ def _render_target_line(target: Any) -> str:
         return "0x0 [null]"
     raw = target.get("raw")
     normalized = target.get("normalized")
-    fn = target.get("function")
-    if isinstance(fn, dict) and fn.get("name"):
+    fn = _field_dict(target, "function")
+    if fn.get("name"):
         fn_address = fn.get("address", normalized or raw or "<unknown>")
         base = f"{fn.get('name')} @ {fn_address}"
         if fn.get("exact_start") is False:
@@ -2167,7 +2170,9 @@ def _render_pointer_table_text(value: Any) -> str:
         f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"
         f"  read-width: {value.get('read_width', value.get('pointer_size', '<unknown>'))}",
     ]
-    suffix = _context_suffix(value.get("context"))
+    # Through the choke point, so a malformed `context` envelope discloses
+    # instead of rendering the table byte-identically to one with no context.
+    suffix = _context_suffix(_field_dict(value, "context"))
     if suffix:
         lines.append(f"context{suffix}")
     for warning in _field_list(value, "warnings"):
@@ -2336,8 +2341,12 @@ def _render_orient_text(value: Any) -> str:
     if sec_items or _field_present(secs, "items"):
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
-    ea = value.get("existing_annotations")
-    if isinstance(ea, dict):
+    # PRESENT, not DECLARED and not raw truth: an `existing_annotations` the
+    # payload CLAIMED renders its counts even when every count is zero (base
+    # rendered a `{}` that way), and a malformed one discloses instead of
+    # dropping the whole block as if the target had never been annotated (#619).
+    ea = _field_dict(value, "existing_annotations")
+    if _field_present(value, "existing_annotations"):
         # #561: disclose annotations already present so an agent doesn't over-credit
         # itself or trust inherited names/comments as current-run analysis.
         if ea.get("unavailable"):
@@ -2568,11 +2577,16 @@ def _render_defuse_text(value: Any) -> str:
         f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
         f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
     ]
-    definition = value.get("definition")
-    if isinstance(definition, dict) and definition:
+    definition = _field_dict(value, "definition")
+    if definition:
         lines.append(f"def: {definition.get('address')}  {definition.get('op')}  {definition.get('text', '')}".rstrip())
-    elif definition:
-        lines.append(f"def: {definition!r}")
+    elif _field_present(value, "definition"):
+        # PRESENT but not a usable definition object. `<none (parameter/entry/
+        # aliased)>` is a confident claim about WHY there is no definition, so a
+        # falsy wrong shape (`0`, `""`, `False`, `[]`) rendering it read as that
+        # diagnosis instead of as an unusable field -- render what arrived and
+        # let the choke point's note disclose the skew (#619).
+        lines.append(f"def: {_as_dict(value).get('definition')!r}")
     else:
         lines.append("def: <none (parameter/entry/aliased)>")
     if value.get("is_phi"):
@@ -4015,8 +4029,12 @@ def _render_mutation_text(value: Any) -> str:
                 lines.append("rollback failed: the view may be left modified")
             else:
                 lines.append("rolled back: live verification failed")
-        if value.get("message"):
-            lines.append(value["message"])
+        # A non-string `message` (a dict/list from a malformed or future bridge
+        # result) reached `"\n".join` and raised, so one wrong-typed field cost
+        # every line of the failure report above it. Dump it instead (#619).
+        msg = value.get("message")
+        if msg:
+            lines.append(msg if isinstance(msg, str) else _render_fallback_text(msg))
         for item in failed:
             lines.append("failed: " + _format_op_summary(item))
             if item.get("requested"):
@@ -4034,7 +4052,7 @@ def _render_mutation_text(value: Any) -> str:
         # exit-0 preview. Surface it so text mode never drops the caveat.
         msg = value.get("message")
         if msg and msg != "Preview verified and reverted.":
-            lines.append(msg)
+            lines.append(msg if isinstance(msg, str) else _render_fallback_text(msg))
         lines.append("")
 
     has_type_op = any(_is_type_result(r) for r in results)
@@ -4109,8 +4127,8 @@ def _render_py_exec_text(value: Any) -> str:
     if warnings:
         parts.append("warnings:\n" + "\n".join(f"- {warning}" for warning in warnings))
 
-    artifact = value.get("artifact")
-    if isinstance(artifact, dict) and artifact.get("artifact_path"):
+    artifact = _field_dict(value, "artifact")
+    if artifact.get("artifact_path"):
         parts.append(f"artifact: {artifact['artifact_path']}")
 
     if not parts:
@@ -4123,17 +4141,17 @@ def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    installed = value.get("installed_destinations")
-    skipped = value.get("skipped_destinations")
+    installed = _field_list(value, "installed_destinations")
+    skipped = _field_list(value, "skipped_destinations")
     lines = []
 
-    if isinstance(installed, list) and installed:
+    if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
         lines.extend(f"- {dest}" for dest in installed)
     else:
         lines.append("Skills already installed.")
 
-    if isinstance(skipped, list) and skipped:
+    if skipped:
         lines.append("Skipped existing destinations:")
         lines.extend(f"- {dest}" for dest in skipped)
 
@@ -4253,7 +4271,11 @@ def _render_trace_text(value: Any) -> str:
             else:
                 lines.append(f"  {il_text}")
 
-    lines.extend(_render_trace_frontiers(value.get("frontiers")))
+    # Through the choke point: a malformed `frontiers` container rendered a
+    # backward trace byte-identically to one whose frontier was genuinely empty,
+    # so the terminal steps a reader uses to judge the slice went missing with
+    # no note (#619).
+    lines.extend(_render_trace_frontiers(_field_list(value, "frontiers")))
     assumptions = [a for a in _field_list(value, "assumptions") if a]
     if assumptions:
         lines.append("")
@@ -4299,9 +4321,13 @@ def _class_inputs_note(value: Any) -> str:
     """#653.6: on a ZERO-class result, print the empty inputs so the absence is
     ATTRIBUTABLE -- "this target is C" reads identically to "the lens failed to
     cluster" otherwise, and an agent had to prove RTTI absence by hand."""
-    inputs = value.get("inputs") if isinstance(value, dict) else None
-    if not isinstance(inputs, dict):
+    # PRESENT through the choke point, not a raw shape test: a malformed
+    # `inputs` dropped the whole attribution note, so a zero-class result read
+    # byte-identically to one the lens had never been given evidence for --
+    # the exact confusion #653.6 added this note to end (#619).
+    if not _field_present(value, "inputs"):
         return ""
+    inputs = _field_dict(value, "inputs")
     return (
         f"\n  inputs: demangled C++ symbols: {inputs.get('demangled_cxx_methods', 0)}, "
         f"RTTI typeinfo: {inputs.get('rtti_typeinfo_symbols', 0)}, "
@@ -4410,8 +4436,13 @@ def _render_class_show_text(value: Any) -> str:
 def _render_one_class(rec: Any) -> str:
     if not isinstance(rec, dict):
         return _render_fallback_text(rec)
+    # `size` arrives as a `{value: N}` envelope OR as a bare scalar -- the list
+    # view already renders both, and this card dropped the bare form, so a class
+    # that DID state its size rendered byte-identically to one that never said
+    # (#619). Not a choke-point read: a scalar is a legitimate shape here, not a
+    # skew, so every PRESENT value renders rather than disclosing.
     size = rec.get("size")
-    size_s = size.get("value") if isinstance(size, dict) else None
+    size_s = size.get("value") if isinstance(size, dict) else size
     # Through the choke point, so a malformed `vtable` container discloses
     # itself instead of rendering byte-identically to a class that simply has
     # none -- the cluster #619 names. `{}` is what absent and malformed both
@@ -4425,7 +4456,7 @@ def _render_one_class(rec: Any) -> str:
                       for b in _field_list(rec, "bases"))
     head = f"class {rec.get('name', '<unknown>')}"
     bits = []
-    if size_s:
+    if size_s is not None:
         bits.append(f"size {size_s}")
     if vt_addr:
         bits.append(f"vtable @ {vt_addr}")

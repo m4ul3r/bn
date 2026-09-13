@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import functools
+import inspect
 import json
 import types
 
@@ -1503,104 +1506,497 @@ _MALFORMED = {
     "list": ("bad", {"a": 1}, 0, "", False, {}),
     "dict": ("bad", ["bad"], 0, "", False, []),
 }
-_WELL_FORMED = {"list": [{"name": "x", "address": "0x1"}], "dict": {"name": "x"}}
 
 
-def _top_level_render_sites():
-    """(renderer, key, kind) for every top-level recorded field the AST reports,
-    with the renderer resolved. The differential's population, derived."""
+def _probe_renderers():
+    """Every renderer in the module, discovered by INSPECTING THE MODULE, not by
+    asking the coercion guard which functions it found a site in.
+
+    A renderer that returns lines instead of a string is rendered the way its
+    caller renders it, and one that is not itself a `@_discloses` boundary is
+    wrapped in one -- in production its caller's boundary is what appends the
+    note, so probing it without a boundary would report every helper as silent.
+    Wrapping is not a shortcut past the property: the boundary drains what the
+    CHOKE POINT recorded, so a coercion that bypasses the choke point still
+    produces no note and still fails below."""
     from bn import formatters
 
-    sites, _ = _coercion_sites()
-    assert sites, "AST walk found no coercion sites at all -- the guard is blind"
     out = []
-    for fn_name, keys, kind, top in sites:
-        render = getattr(formatters, fn_name, None)
-        if not top or render is None or not fn_name.startswith("_render"):
+    for name in sorted(dir(formatters)):
+        if not name.startswith("_render"):
             continue
-        for key in keys:
-            out.append((fn_name, render, key, kind))
+        fn = getattr(formatters, name)
+        if not callable(fn):
+            continue
+        try:
+            params = inspect.signature(fn).parameters.values()
+        except (TypeError, ValueError):                    # pragma: no cover
+            continue
+        positional = [p for p in params
+                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        if len(positional) != 1:          # a row/column helper, not a payload renderer
+            continue
+        if hasattr(fn, "__wrapped__"):
+            out.append((name, fn))
+            continue
+
+        def as_text(payload, _fn=fn):
+            rendered = _fn(payload)
+            if isinstance(rendered, str):
+                return rendered
+            if isinstance(rendered, (list, tuple)):
+                return "\n".join(str(line) for line in rendered)
+            return str(rendered)
+
+        out.append((name, formatters._discloses(as_text)))
     return out
 
 
-def test_a_malformed_container_is_disclosed_wherever_it_is_read():
-    """The ENUMERATED positive differential, over every top-level recorded field
-    the AST can find rather than a hand-picked table (the 89-row table this
-    replaced ran real renders, but only at the positions its author typed out).
+class _KeyProbe(dict):
+    """A payload that records which top-level keys the renderer ASKS FOR.
 
-    Under the choke point the property needs no expected-output table: if the
-    renderer READ the field, the recorder fired and the disclosure is in the
-    output. So for a field the renderer demonstrably CONSUMES -- proven by a
-    well-formed value changing the rendering -- a malformed one must disclose.
-    Accepting "renders identically to absent" for a consumed field would be
-    circular with the AST guard, which is exactly the reasoning that let earlier
-    rounds call this class closed.
+    This is the population's origin, and the reason it is not a restatement of
+    the guard: the probe sees the read itself, so a renderer that coerces a
+    container WITHOUT the choke point is still in the population -- and, having
+    recorded nothing to disclose, fails. Deriving the population from the
+    guard's site list instead dropped exactly that renderer OUT of it: a guard
+    whose population comes from the thing it guards cannot fail."""
 
-    A RAISE is a failure too: soft-degrading is the whole point of #619, so a
-    renderer that survives an absent field and dies on a malformed one has
-    regressed to the crash this replaced."""
+    def __init__(self, data, seen):
+        super().__init__(data)
+        self.seen = seen
+
+    def _note(self, key):
+        if isinstance(key, str):
+            self.seen.add(key)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        self._note(key)
+        return super().__contains__(key)
+
+    def get(self, key, *default):
+        self._note(key)
+        return super().get(key, *default)
+
+    def pop(self, key, *default):
+        self._note(key)
+        return super().pop(key, *default)
+
+    def setdefault(self, key, *default):
+        self._note(key)
+        return super().setdefault(key, *default)
+
+
+# Serialization is the OPPOSITE of consumption: `json.dumps` walks a container
+# to show it verbatim, which hides nothing and so needs no disclosure. Counting
+# the encoder's walk as a container read reported 19 string-typed fields as
+# containers, so the flag suppresses hits raised underneath a dumps().
+_SERIALIZING: list[int] = []
+
+
+class _QuietJson:
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def dumps(self, *args, **kwargs):
+        _SERIALIZING.append(1)
+        try:
+            return self._real.dumps(*args, **kwargs)
+        finally:
+            _SERIALIZING.pop()
+
+
+class _WatchedList(list):
+    """A list that records being USED as a container. `__bool__` is defined so a
+    truthiness test is distinguishable from `len()` -- without it, `if x:` on a
+    list falls through to `__len__` and every scalar field tested for truth read
+    as a container."""
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self.hits: set[str] = set()
+
+    def _hit(self, name):
+        if not _SERIALIZING:
+            self.hits.add(name)
+
+    def __bool__(self):
+        self._hit("bool")
+        return list.__len__(self) > 0
+
+    def __len__(self):
+        self._hit("len")
+        return list.__len__(self)
+
+    def __iter__(self):
+        self._hit("iter")
+        return list.__iter__(self)
+
+    def __getitem__(self, index):
+        self._hit("item")
+        return list.__getitem__(self, index)
+
+    def __contains__(self, value):
+        self._hit("contains")
+        return list.__contains__(self, value)
+
+
+class _WatchedDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hits: set[str] = set()
+
+    def _hit(self, name):
+        if not _SERIALIZING:
+            self.hits.add(name)
+
+    def __bool__(self):
+        self._hit("bool")
+        return dict.__len__(self) > 0
+
+    def __len__(self):
+        self._hit("len")
+        return dict.__len__(self)
+
+    def __iter__(self):
+        self._hit("iter")
+        return dict.__iter__(self)
+
+    def __getitem__(self, key):
+        self._hit("item")
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        self._hit("contains")
+        return dict.__contains__(self, key)
+
+    def get(self, key, *default):
+        self._hit("item")
+        return dict.get(self, key, *default)
+
+    def keys(self):
+        self._hit("keys")
+        return dict.keys(self)
+
+    def items(self):
+        self._hit("items")
+        return dict.items(self)
+
+    def values(self):
+        self._hit("values")
+        return dict.values(self)
+
+
+# Truthiness alone is NOT container use -- see _WatchedList.__bool__.
+_CONTAINER_USE = frozenset({"len", "iter", "item", "keys", "items", "values", "contains"})
+_PROBE_ELEMENT = {"name": "probe", "address": "0x1", "kind": "code", "symbol": "probe",
+                  "type": "int", "offset": 0, "count": 1, "op": "probe", "status": "ok"}
+# Keyed by the observed kind; `None` (no container use observed) gets a plain
+# string, so filling a renderer's OTHER keys does not shove a container into a
+# scalar field and send it down a branch it would never take in production.
+_PROBE_WELL_FORMED = {"list": [_PROBE_ELEMENT], "dict": dict(_PROBE_ELEMENT), None: "probe"}
+
+
+def _render_or_exception(render, payload):
+    try:
+        return render(payload)
+    except Exception as exc:                   # noqa: BLE001 - the sweep's subject
+        return exc
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime_population():
+    """THE differential's population: every `(renderer, key)` the module reads at
+    RUNTIME, the container kind observed at that read, and the payload context
+    the read happens in.
+
+    Three things it deliberately does not do:
+
+    * It does not ask `_coercion_sites()` anything. The AST guard has declared
+      blind spots (`_GUARD_BLIND`), and a population taken from it cannot fail
+      on a coercion it cannot see -- the bypass leaves the population instead of
+      failing in it. Round 5 deleted an 89-row table for this; the round-7
+      population repeated it one level up. Derived here by RUNNING renderers, it
+      found 16 live bypasses the guard is blind to.
+    * It does not infer the container kind from the source. A key is a container
+      position only if a probe container placed there was actually WALKED --
+      iterated, indexed, len'd, or asked for keys/items/values.
+    * It does not assume a key is readable in an empty payload. The context is
+      the one the read was OBSERVED in, so a key behind a mutually exclusive
+      branch (a resolved `function` hides the `context` fallback) is probed in
+      the payload that reaches it rather than being silently skipped."""
     from bn import formatters
 
-    checked, silent, raised = 0, [], []
-    for fn_name, render, key, kind in _top_level_render_sites():
-        try:
-            absent = render({})
-        except Exception:                          # unrelated shape requirement
+    real_json = formatters.json
+    formatters.json = _QuietJson(real_json)
+    try:
+        population = []
+        for name, render in _probe_renderers():
+            seen: set[str] = set()
+            for _ in range(6):                        # fixed point: gated branches open
+                before = frozenset(seen)
+                for filler in (None, "list", "dict"):
+                    ctx = {k: copy.deepcopy(_PROBE_WELL_FORMED[filler]) for k in sorted(seen)}
+                    _render_or_exception(render, _KeyProbe(ctx, seen))
+                if frozenset(seen) == before:
+                    break
+            keys = sorted(seen)
+
+            # Contexts are tried least-perturbing first: the BARE payload, then
+            # every other key filled at the kind that key was itself classified
+            # as, then cruder fills. Order matters twice over -- a retained alias
+            # (#651) is only read when the canonical key is ABSENT, so probing it
+            # in a filled context classified it off a payload where the canonical
+            # key was malformed, and that context then made the MIRROR fire on
+            # data it had built wrong.
+            kinds = {}
+            records = {}
+            for _round in (0, 1):
+                records = {}
+                for key in keys:
+                    contexts = [{},
+                                {k: copy.deepcopy(_PROBE_WELL_FORMED[kinds.get(k)])
+                                 for k in keys if k != key},
+                                {k: copy.deepcopy(_PROBE_WELL_FORMED["list"])
+                                 for k in keys if k != key},
+                                {k: copy.deepcopy(_PROBE_WELL_FORMED["dict"])
+                                 for k in keys if k != key},
+                                {k: "probe" for k in keys if k != key}]
+                    observed = None
+                    for ctx in contexts:
+                        for kind in ("list", "dict"):
+                            probe = _watched(kind)
+                            _render_or_exception(render, {**copy.deepcopy(ctx), key: probe})
+                            if probe.hits & _CONTAINER_USE:
+                                observed = (ctx, kind)
+                                break
+                        if observed:
+                            break
+                    records[key] = observed if observed else (contexts[0], None)
+                kinds = {key: rec[1] for key, rec in records.items()}
+            for key in keys:
+                ctx, kind = records[key]
+                population.append((name, render, key, kind, ctx))
+        return population
+    finally:
+        formatters.json = real_json
+
+
+def _watched(kind):
+    return (_WatchedList([dict(_PROBE_ELEMENT)]) if kind == "list"
+            else _WatchedDict(_PROBE_ELEMENT))
+
+
+def test_the_runtime_population_is_exactly_this_big():
+    """The LOAD-BEARING half of the differential below, and the half every
+    earlier round left out.
+
+    Without an exact size, a site that VANISHES from the population is
+    indistinguishable from a site that passed -- which is how a `>= 520` floor
+    over 552 cases tolerated five renderers quietly leaving the population. A
+    floor cannot tell a fix from a disappearance. These numbers are therefore
+    exact, and a deliberate change to the module updates them in the same
+    commit; that update is visible in review, a shrinking floor is not."""
+    population = _runtime_population()
+    probed = len(_probe_renderers())
+    reading = {name for name, _, _, _, _ in population}
+    containers = [rec for rec in population if rec[3] is not None]
+    assert (probed, len(reading), len(population), len(containers)) == (85, 73, 385, 125), (
+        "the runtime-discovered population changed size: "
+        f"{probed} renderers probed / {len(reading)} of them read a named field / "
+        f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
+        "pairs read as a container. If you ADDED a renderer or a field, update "
+        "these four numbers. If you did not, a renderer stopped reading a field "
+        "it used to read, and the differential below just stopped covering it -- "
+        "which is the failure this assertion exists to make visible.")
+
+
+def test_the_container_probe_misses_exactly_one_top_level_read():
+    """What the runtime probe CANNOT classify, named rather than left as a
+    number. The round-7 differential said "consumed under-detects at 18 of 92
+    sites" and stopped there, which is an unexplained hole; this is the same
+    question answered.
+
+    The module's own `_field_list`/`_field_dict` literal arguments are an
+    INDEPENDENT inventory of the choke-point reads -- independent because the
+    probe never consults it, and it is used here only to measure the probe's
+    coverage, never to build the population (building the population from it is
+    the defect this whole rework removed).
+
+    Two gaps, both structural and both stated exactly:
+
+    * `_render_defuse_text.other_versions` is read at top level but not
+      classified, because its ONLY use is `if others:` followed by `{others}` in
+      an f-string. Truthiness is deliberately not counted as container use -- a
+      list and a scalar are indistinguishable under `bool()`, and counting it
+      reported 936 scalar fields as containers -- and `__repr__` does not walk
+      the object. It is still swept for raises, and its skew still discloses
+      through the choke point; it is only outside the disclosure differential.
+    * 91 of the 194 declared reads sit where a TOP-LEVEL key probe cannot reach
+      them: a key of a callee ROW, a per-block `insns`, a flow's `leaves`, or a
+      read inside a helper that is handed a nested object rather than the
+      renderer's payload. Those are covered by the named nested tests above.
+
+    Both counts are exact, so a read that silently leaves top-level coverage
+    fails here instead of quietly shrinking the differential."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    declared = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        echoes = formatters._render_fallback_text          # the raw-payload dump
-        try:
-            well_formed = render({key: _WELL_FORMED[kind]})
-        except Exception:
-            well_formed = absent
-        # A renderer that falls through to the raw payload dump "changes output"
-        # for any value at all, which is not evidence that it CONSUMED the field.
-        consumed = (well_formed != absent
-                    and well_formed != echoes({key: _WELL_FORMED[kind]}))
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in ("_field_list", "_field_dict")):
+                for arg in node.args[1:]:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        declared.add((fn.name, arg.value))
+
+    population = _runtime_population()
+    classified = {(name, key) for name, _, key, kind, _ in population if kind is not None}
+    read = {(name, key) for name, _, key, _, _ in population}
+    missed = sorted(f"{name}.{key}" for name, key in declared - classified
+                    if (name, key) in read)
+    nested = [pair for pair in declared - classified if pair not in read]
+    assert len(declared) == 194, f"the module declares {len(declared)} choke-point reads, not 194"
+    assert missed == ["_render_defuse_text.other_versions"], (
+        "a choke-point read the probe reaches at top level is no longer "
+        f"classified as a container, so the differential stopped covering it: {missed}")
+    assert len(nested) == 91, (
+        f"{len(nested)} declared reads sit where the top-level probe cannot "
+        "reach them, not 91")
+
+
+def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
+    """THE positive differential, over a population discovered by RUNNING the
+    renderers (see `_runtime_population`) rather than by asking the coercion
+    guard which sites it found.
+
+    The property is the defect, stated directly: a container field that is
+    PRESENT but holds the wrong shape must never render byte-identically to that
+    field being ABSENT or EMPTY. That is the whole harm of #619 -- the caller
+    reads a confident "nothing here" out of a payload the renderer could not
+    use, and cannot tell. Disclosing satisfies it; so does rendering the value
+    visibly; absorbing it silently does not.
+
+    Stated this way it needs no expected-output table and no "renders identically
+    to absent is acceptable" arm -- that arm was the round-7 escape hatch, and it
+    is now the failure condition.
+
+    What it does NOT catch, named rather than implied: a renderer that answers a
+    malformed container with some OTHER confident value (a count fabricated from
+    a string's characters) renders differently from empty and passes here. That
+    direction is pinned by name -- see the `sample 3 of 3`, class-count and
+    ambiguous-count tests -- because it needs a per-site expectation this
+    property cannot derive.
+
+    Measured across the base commit and this one: base absorbs 506 of 756 cases
+    at 88 sites; this commit absorbs 0."""
+    from bn import formatters
+
+    echoes = formatters._render_fallback_text              # the raw-payload dump
+    absorbed, visible, checked = [], set(), 0
+    for fn_name, render, key, kind, ctx in _runtime_population():
+        if kind is None:
+            continue
+        absent = _render_or_exception(render, copy.deepcopy(ctx))
+        empty = _render_or_exception(
+            render, {**copy.deepcopy(ctx), key: [] if kind == "list" else {}})
         for bogus in _MALFORMED[kind]:
-            try:
-                out = render({key: bogus})
-            except Exception as exc:
-                raised.append(f"{fn_name}({key}={bogus!r}) raised {type(exc).__name__} "
-                              f"where the absent payload rendered cleanly")
-                continue
+            payload = {**copy.deepcopy(ctx), key: bogus}
+            out = _render_or_exception(render, payload)
             checked += 1
-            # Disclosed, or echoed verbatim by the raw fallback -- which hides
-            # nothing at all, so there is nothing to disclose.
-            if "malformed" in out or out == echoes({key: bogus}):
+            if isinstance(out, Exception):
+                continue                   # the raise sweep owns this case
+            if "malformed" in out:
                 continue
-            if consumed:
-                silent.append(f"{fn_name}({key}={bogus!r}) is a field this renderer "
-                              f"demonstrably consumes, and the malformed value is "
-                              f"not disclosed")
-            elif out != absent:
-                silent.append(f"{fn_name}({key}={bogus!r}) renders as a result with "
-                              f"no disclosure and differs from the absent rendering")
+            # The raw dump hides nothing, so there is nothing to disclose.
+            if out == echoes(payload) or echoes(payload) in out:
+                continue
+            if out == absent or out == empty:
+                absorbed.append(
+                    f"{fn_name}({key}={bogus!r}) renders byte-identically to that "
+                    f"field being {'absent' if out == absent else 'empty'}, with no "
+                    f"disclosure -- an unusable payload reading as a confident result")
+            else:
+                visible.add(f"{fn_name}.{key}")
+    assert checked == 750, f"the differential ran {checked} cases, not 750"
+    assert not absorbed, absorbed[:8]
+    # The residue: PRESENT, rendered visibly, not disclosed. Legitimate only for
+    # a union-typed field, where a scalar is a real shape and not a skew. Pinned
+    # by name so a container field cannot join them quietly.
+    assert sorted(visible) == ["_render_class_show_text.size", "_render_one_class.size"], (
+        "a field renders a wrong-shaped container visibly but without disclosing; "
+        f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
+
+
+def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
+    """The soft-degrade half of #619, kind-free, so it covers all 385 read keys
+    rather than the 125 the container probe classifies: a renderer that renders
+    an absent field cleanly and DIES on a present wrong-shaped one has regressed
+    to the crash this change replaced.
+
+    Base raises 55 times across 24 sites here; this commit raises 0. Four of
+    those base sites are in renderers this PR never edited, which is the
+    argument for deriving the population instead of listing it."""
+    swept, raised = 0, []
+    for fn_name, render, key, _kind, ctx in _runtime_population():
+        absent = _render_or_exception(render, copy.deepcopy(ctx))
+        for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
+            swept += 1
+            out = _render_or_exception(render, {**copy.deepcopy(ctx), key: bogus})
+            if isinstance(out, Exception) and not isinstance(absent, Exception):
+                raised.append(f"{fn_name}({key}={bogus!r}) raised "
+                              f"{type(out).__name__} where the absent payload "
+                              f"rendered cleanly")
+    assert swept == 3080, f"the raise sweep ran {swept} renders, not 3080"
     assert not raised, raised[:8]
-    assert checked >= 520, f"differential ran on only {checked} cases -- not enumerated"
-    assert not silent, silent[:8]
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     """The mirror property, and the more dangerous direction: crying "malformed"
     at a genuinely empty result would teach a caller to ignore the signal, which
-    destroys it while appearing to fix it. Every top-level coerced field, with
-    the value absent, empty, or an explicit null."""
+    destroys it while appearing to fix it.
+
+    Over the same runtime population, but on payloads that are benign BY
+    CONSTRUCTION rather than by the probe's guess: the key absent, the key an
+    explicit null, and -- only where a container kind was actually observed --
+    the empty container of that kind. Two deliberate exclusions, both because
+    the probe would be asserting its own shape guess rather than the renderer's
+    behaviour:
+
+    * A field the container probe could not classify gets no substituted value.
+      Filling it with a string guesses its type, and a guessed type on a list
+      field is a real skew, so the mirror fired on a payload it built wrong.
+    * A POPULATED container is excluded because there is no single well-formed
+      dict for every dict field -- `sinks_by_class` is a dict of LISTS, and a
+      dict of scalars is a genuine skew one level down. Populated well-formed
+      payloads are covered by name instead, in
+      `test_well_formed_realistic_payloads_carry_no_disclosure`."""
     noisy, checked = [], 0
-    for fn_name, render, key, kind in _top_level_render_sites():
-        empty: object = [] if kind == "list" else {}
-        for payload in ({}, {key: empty}, {key: None}):
-            try:
-                out = render(payload)
-            except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-                # The renderer's own shape requirement, not a disclosure bug.
-                # Narrowed from a bare `except Exception` so anything else fails
-                # here instead of being swallowed, and `checked` bounds how
-                # vacuous the remainder is allowed to become.
-                continue
+    for fn_name, render, key, kind, _ctx in _runtime_population():
+        benign: list[object] = [None]
+        if kind is not None:
+            benign.append([] if kind == "list" else {})
+        for payload in [{}] + [{key: value} for value in benign]:
+            out = _render_or_exception(render, payload)
+            if isinstance(out, Exception):
+                continue          # the renderer's own shape requirement
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked >= 260, f"mirror ran on only {checked} payloads -- not enumerated"
+    assert checked == 895, f"the mirror ran {checked} renders, not 895"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -2383,51 +2779,33 @@ def test_the_compact_summary_ok_key_mirrors_success_on_every_outcome():
     assert seen == {True, False}, f"the outcome population only produced ok={seen}"
 
 
-def test_no_renderer_mutates_a_container_it_read_through_the_choke_point():
+def test_no_renderer_mutates_the_payload_it_was_handed():
     """The recording helpers hand back the payload's OWN list, so a renderer that
     appended to one would silently edit the caller's result -- and the JSON path
     would then emit rows the text path invented. No defensive copy is taken (that
     would allocate on all ~190 reads to defend against nothing), so the no-mutate
-    rule is asserted instead, over every name in the module bound from a helper
-    rather than over the handful anyone happened to look at."""
-    import ast
-    import inspect
+    rule is asserted instead.
 
-    from bn import formatters
+    Asserted by RUNNING the renderers and comparing the payload against a
+    snapshot taken before the render, not by matching mutation syntax in the AST.
+    The AST form saw only a `.append` on a name bound directly from a helper, so
+    an alias hop, handing the list to a helper, mutating an ELEMENT and a walrus
+    binding all evaded it -- a shape list only ever sees the shapes its author
+    imagined, which is the same defect as deriving the differential's population
+    from the guard that the differential exists to check.
 
-    tree = ast.parse(inspect.getsource(formatters))
-    MUTATORS = ("append", "extend", "insert", "sort", "reverse", "pop", "clear",
-                "remove", "update", "setdefault", "popitem")
-    RECORDERS = ("_field_list", "_field_dict")
-    offenders, watched = [], set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        held = {t.id
-                for node in ast.walk(fn) if isinstance(node, ast.Assign)
-                for t in node.targets
-                if isinstance(t, ast.Name) and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in RECORDERS}
-        watched |= held
-        for node in ast.walk(fn):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in MUTATORS
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id in held):
-                offenders.append(f"{fn.name}: {ast.unparse(node)}")
-            if isinstance(node, (ast.AugAssign, ast.Delete)):
-                targets = [node.target] if isinstance(node, ast.AugAssign) else node.targets
-                for t in targets:
-                    name = t.value if isinstance(t, ast.Subscript) else t
-                    if isinstance(name, ast.Name) and name.id in held:
-                        offenders.append(f"{fn.name}: {ast.unparse(node)}")
-            if isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
-                            and t.value.id in held):
-                        offenders.append(f"{fn.name}: {ast.unparse(node)}")
-    assert watched, "no name is bound from a recording helper -- the scan is blind"
-    assert not offenders, (
-        "a renderer mutates a container it read through the recording helpers, "
-        f"which is the CALLER's object, not a copy: {offenders[:6]}")
+    What a runtime check cannot see, stated plainly: a mutation on a branch these
+    payloads do not reach. It covers every (renderer, key) the population
+    discovered, in the context that key is read in, which is strictly more of
+    the module than any spelling list reached."""
+    mutated = []
+    for fn_name, render, key, kind, ctx in _runtime_population():
+        payload = {**copy.deepcopy(ctx), key: copy.deepcopy(_PROBE_WELL_FORMED[kind])}
+        before = copy.deepcopy(payload)
+        _render_or_exception(render, payload)
+        if payload != before:
+            mutated.append(f"{fn_name}({key}) left the payload changed: "
+                           f"{before!r} -> {payload!r}")
+    assert not mutated, (
+        "a renderer mutated the payload it was handed, which is the CALLER's "
+        f"object and is what the JSON path emits: {mutated[:6]}")
