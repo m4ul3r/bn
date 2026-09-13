@@ -405,14 +405,19 @@ EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
 # a number in it and nothing accounts for it yet.
 #
 # A decimal is one number, not two (`3.11` must not read as a `3` and an `11`),
-# and an issue reference is not a code (`#625`). A TRAILING period is sentence
-# punctuation though -- excluding it outright let "a refused op returns three."
-# straight through, which is the same escape one character further along.
+# and an issue reference is not a code (`#625`). Everything else counts: a
+# trailing period is sentence punctuation, not a decimal point (excluding it
+# outright let "a refused op returns three." straight through), a hyphen
+# neighbour is still a number ("twenty-five", `utf-8`), and the words run past
+# nine so that spelling one out is not a way around the digits. A multi-digit
+# numeral yields one token, because its later digits follow a word character.
+_NUMBER_WORDS = (
+    "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    "thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred"
+)
 _NUMBER_TOKEN = re.compile(
-    r"(?<![\w#$/-])(?<!\d\.)"
-    r"(?:\d|zero|one|two|three|four|five|six|seven|eight|nine)"
-    r"(?![\w/-])(?!\.\d)",
-    re.I)
+    rf"(?<![\w#$/])(?<!\d\.)(?:\d|{_NUMBER_WORDS})(?![\w/])(?!\.\d)", re.I)
 # Generated, not authored: the fingerprint of every prose line in a fenced doc
 # that carries a number and is not pinned by a cell above. Regenerate with
 # `_fingerprint(" ".join(line.split()))` over the docs. An entry is a claim
@@ -422,37 +427,39 @@ _NUMBER_TOKEN = re.compile(
 NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
     "CLAUDE.md": frozenset({
         "2813ca55", "4177be03", "78629073", "7d6b2776", "80180431", "8597bc7e", "8e4a9610",
-        "dadf1f99", "db981a08", "ee61fade", "fa70ea09",
+        "bb36a4be", "dadf1f99", "db981a08", "ee61fade", "fa70ea09",
     }),
     "README.md": frozenset({
-        "0a768f64", "18aefee8", "1946ee65", "39297f76", "4a59a3b8", "589b6b1c", "70fe4ca5",
-        "767b9f9b", "ae3959b5", "b3987998", "b70bd14f",
+        "0a768f64", "18aefee8", "1946ee65", "39297f76", "4a59a3b8", "4f15b254", "589b6b1c",
+        "62c7882b", "70fe4ca5", "767b9f9b", "ae3959b5", "b3987998", "b70bd14f", "d765c702",
     }),
     "skills/bn/SKILL.md": frozenset({
-        "3435274a", "3d99e01e", "476c699a", "649eaeac", "718cbccf", "7f2b6f7d", "8919c69b",
-        "c094744f",
+        "3435274a", "351cea9b", "3d99e01e", "476c699a", "61785515", "649eaeac", "66190c94",
+        "718cbccf", "7f2b6f7d", "8909cfbd", "8919c69b", "c094744f", "cc207c7d",
     }),
     "skills/bn/reference/mutating.md": frozenset({
         "004be911", "023ef17d", "073c32cb", "21ab0f26", "357b33d7", "3a31edd0", "3ab0e800",
         "3b705aa6", "4d2bfe51", "4ea5a88f", "73915809", "757a2ce7", "7a963eb3", "7b90ea1f",
-        "7d08894a", "7d87431b", "99a32d48", "abcbb98d", "b01a5a75", "b29746c8", "c11a3930",
-        "ca2ff185", "dfafc784", "e0108fe1", "e26fd985", "f73aab60", "fe025816",
+        "7d08894a", "7d87431b", "99a32d48", "abcbb98d", "b01a5a75", "b29746c8", "b570f08e",
+        "c11a3930", "ca2ff185", "dfafc784", "e0108fe1", "e26fd985", "e7bc29dc", "f73aab60",
+        "fe025816",
     }),
     "skills/bn/reference/reading.md": frozenset({
-        "0c9d943c", "1949d287", "1a70e75d", "1c15c2d2", "1dd5bce8", "25419b43", "2ea1ed0f",
-        "33fd9640", "3716a90b", "43ca5e2b", "4f5394e5", "4fe41c72", "505bed3f", "5221e5b6",
-        "6a4f918d", "6a58a9dc", "6ab53c02", "6ed98be4", "7bc2e390", "86526afb", "965d7b1e",
-        "9971ee4b", "9a98f5ff", "9dbbd6d8", "a916839d", "b71d1544", "b92a2be1", "be1545e3",
-        "be4ef095", "c0610400", "c4b1b451", "d418748d", "dad2603f", "df48aed6", "e9b95184",
-        "eca3534e",
+        "075c33cd", "0c9d943c", "1428ab30", "1949d287", "1a70e75d", "1c15c2d2", "1dd5bce8",
+        "25419b43", "2ea1ed0f", "33fd9640", "3716a90b", "43ca5e2b", "4f5394e5", "4fe41c72",
+        "505bed3f", "5221e5b6", "6a4f918d", "6a58a9dc", "6ab53c02", "6ed98be4", "7bc2e390",
+        "86526afb", "91995abd", "965d7b1e", "9971ee4b", "9a98f5ff", "9dbbd6d8", "a916839d",
+        "b71d1544", "b92a2be1", "be1545e3", "be4ef095", "c0610400", "c4b1b451", "d418748d",
+        "dad2603f", "df48aed6", "e9b95184", "eca3534e",
     }),
     "skills/bn/reference/runtime.md": frozenset({
-        "06aad85c", "079c846e", "0a8cddd1", "1fbd64eb", "347a4a13", "34c79efb", "44497fad",
-        "53f0229b", "55a24561", "589fc7e3", "596d0a92", "65df27e3", "6a70bcd2", "6f94b989",
-        "7272fe33", "767bdfe8", "8c218bae", "8f382f50", "926f4920", "947fffc7", "98cfec52",
-        "9a1ac7d1", "9cb452f2", "a8fb6baa", "b4306499", "b5febfe7", "bec2b018", "c22c0ad1",
-        "c2335aac", "ca2c1267", "cb4d6e9e", "d20853ec", "d6c30113", "d7f57f32", "e1e09dec",
-        "e45a920a", "e6c69801", "e8bc9423", "eddb9cfa",
+        "06aad85c", "079c846e", "0a8cddd1", "0ddc02d0", "1fbd64eb", "347a4a13", "34c79efb",
+        "44497fad", "53f0229b", "55a24561", "589fc7e3", "596d0a92", "61785515", "65df27e3",
+        "66190c94", "6a70bcd2", "6f94b989", "7272fe33", "767bdfe8", "8c218bae", "8f382f50",
+        "926f4920", "947fffc7", "98cfec52", "9a1ac7d1", "9cb452f2", "a8fb6baa", "af1d6d85",
+        "b4306499", "b5febfe7", "be5e5584", "bec2b018", "c22c0ad1", "c2335aac", "ca2c1267",
+        "cb4d6e9e", "d20853ec", "d6c30113", "d7f57f32", "e1e09dec", "e45a920a", "e6c69801",
+        "e8bc9423", "eddb9cfa",
     }),
 }
 
