@@ -5038,3 +5038,197 @@ def test_the_reclaim_keeps_a_record_whose_fields_fail_validation(tmp_path, monke
         "badid.json", "badid.log", "badpid.json", "badpid.log",
         "wrongtype.json", "wrongtype.log",
     ]
+
+
+def test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage(tmp_path, monkeypatch):
+    """One unrelated process must not take every discovery-backed command down.
+
+    ``/proc/<pid>/stat`` embeds the process's ``comm`` verbatim, and ``comm``
+    is BYTES -- a neighbour whose executable basename holds a byte that is not
+    UTF-8 puts that byte in the file. ``_process_state`` read it with
+    ``read_text(encoding="utf-8")`` and caught only ``OSError``, so a
+    ``UnicodeDecodeError`` escaped and ``list_instances()`` AND
+    ``gc_instances()`` both died with a raw traceback because of a process
+    that has nothing to do with this cache. Its sibling reader,
+    ``proc_identity.process_start_ticks``, already catches ``ValueError``.
+
+    Same root cause as the socket blocker of the previous round: a failing or
+    lossy DECODE of bytes the kernel wrote. The state character lives AFTER
+    the comm field, so the parse is done on bytes and the comm is never
+    decoded at all; anything unparseable answers ``None`` -- unknowable, which
+    no arm treats as evidence (#618).
+    """
+    if not Path("/proc/self/stat").exists():
+        pytest.skip("Linux /proc only")
+    from bn.transport import _process_state
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    # comm is the basename of the file that was exec'd, copied in raw.
+    odd_name = tmp_path / os.fsdecode(b"py\xffx")
+    os.symlink(sys.executable, odd_name)
+    proc = subprocess.Popen([str(odd_name), "-c", "import time; time.sleep(30)"])
+    sock_path = inst_dir / "oddcomm.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # a live, serving neighbour
+    record = inst_dir / "oddcomm.json"
+    record.write_text(
+        json.dumps({"pid": proc.pid, "socket_path": str(sock_path),
+                    "instance_id": "oddcomm"}),
+        encoding="utf-8",
+    )
+    log = inst_dir / "oddcomm.log"
+    log.write_text("crash breadcrumb\n", encoding="utf-8")
+    try:
+        stat_path = Path(f"/proc/{proc.pid}/stat")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and b"\xff" not in stat_path.read_bytes():
+            time.sleep(0.05)
+        assert b"\xff" in stat_path.read_bytes(), "kernel did not keep the raw comm byte"
+
+        assert _process_state(proc.pid) in {"R", "S", "D", "t", "T"}   # answered, not raised
+
+        assert [inst.instance_id for inst in list_instances()] == ["oddcomm"]
+
+        summary = gc_instances()
+
+        assert summary["registries_purged"] == 0
+        assert summary["logs_removed"] == 0
+        assert summary["sockets_removed"] == 0
+        assert record.exists() and log.exists() and sock_path.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+        proc.kill()
+        proc.wait()
+
+
+def test_a_bound_socket_whose_path_contains_a_space_is_still_found(tmp_path):
+    """The space-preserving split, pinned in BOTH directions.
+
+    ``/proc/net/unix`` is whitespace-separated and the bound path is its LAST
+    field, so it is split on the first seven runs. A plain ``split()`` would
+    truncate a cache path at its first space, no line would match, and the
+    answer would come back as the positive fact "nothing is bound" about a
+    socket that is bound and listening -- the sole corroboration behind every
+    socket unlink in this module (#618). Nothing pinned that, and a guard
+    proven only to EXIST says nothing about what it does when it fires.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache dir"          # a space, exactly where the listing puts it
+    root.mkdir()
+    sock_path = root / "serving.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is True
+        # The other direction: a space is not licence to match by prefix either.
+        assert _path_has_bound_socket(root / "never bound.sock") is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
+    """The basename+realpath fallback, pinned in BOTH directions.
+
+    The kernel lists the string ``bind`` was given. A record may spell the same
+    endpoint differently -- a symlinked ``instances/``, a relative cache root --
+    and a literal byte comparison then fails on a socket that is bound and
+    listening, which reads as the positive "nothing is bound" and unlinks a
+    serving bridge's own endpoint. The fallback resolves both names; the
+    basename filter is only a cheap pre-filter, so a DIFFERENT socket that
+    happens to share a basename must still answer ``False`` (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    real = tmp_path / "real"
+    real.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    sock_path = real / "serving.sock"      # the kernel records THIS spelling
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(link / "serving.sock") is True
+        assert _path_has_bound_socket(other / "serving.sock") is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_symlink_target_holding_a_newline_is_unknowable_not_unbound(tmp_path):
+    """The SECOND newline guard, which only a symlink target can reach.
+
+    The first guard rejects a newline in the name the caller asked about. A
+    name with no newline can still RESOLVE through one -- a symlinked cache
+    root whose target holds a newline -- and the resolved form is what the
+    fallback compares, so the line-oriented listing can never represent it.
+    Without this guard the answer is ``False``, the fabricated positive that
+    unlinks a bound and LISTENING socket. A source that cannot REPRESENT the
+    question must answer ``None`` (#618).
+
+    Both directions: a target WITHOUT a newline is resolved and answered
+    truthfully, so the guard is not blanket over-refusal.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    for label, target_name in (("newline", "target\nnewline"), ("plain", "target-plain")):
+        target = tmp_path / target_name
+        target.mkdir()
+        link = tmp_path / f"link-{label}"      # the LINK's own name is newline-free
+        os.symlink(target, link)
+        sock_path = target / "serving.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)                       # bound AND listening
+        try:
+            answer = _path_has_bound_socket(link / "serving.sock")
+            assert answer is (None if label == "newline" else True), label
+        finally:
+            with contextlib.suppress(OSError):
+                server.close()
+            sock_path.unlink(missing_ok=True)
+
+
+def test_unlink_if_unchanged_destroys_nothing_for_a_caller_with_no_document(tmp_path):
+    """"No document to compare" means no file was judged -- pinned both ways.
+
+    Every destructive decision in this module is taken on evidence read before
+    the unlink, and this is the re-check that makes the unlink act on the
+    document that was judged rather than on the NAME. A caller that judged no
+    document has nothing to re-check, so the answer is "keep": treating
+    ``None`` as "matches whatever is there" would make the re-check a no-op
+    and hand the name back to the unconditional unlink this exists to replace
+    (#618). The live direction is pinned beside it so the guard cannot be
+    widened into blanket retention.
+    """
+    from bn.transport import _unlink_if_unchanged
+
+    path = tmp_path / "record.json"
+    document = b'{"pid": 4321}'
+    path.write_bytes(document)
+
+    assert _unlink_if_unchanged(path, None) is False
+    assert path.exists()
+    assert _unlink_if_unchanged(path, b'{"pid": 1}') is False    # a different document
+    assert path.exists()
+    assert _unlink_if_unchanged(path, document) is True          # the one that was judged
+    assert not path.exists()

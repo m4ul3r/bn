@@ -168,16 +168,32 @@ def _process_alive(pid: int) -> bool:
 
 
 def _process_state(pid: int) -> str | None:
-    """Return Linux /proc state, or None when unavailable."""
+    """Return Linux /proc state, or None when unavailable.
+
+    Parsed on BYTES. ``comm`` is embedded in this file exactly as the kernel
+    holds it, so a neighbouring process whose executable basename carries a
+    non-UTF-8 byte made ``read_text(encoding="utf-8")`` raise -- and with only
+    ``OSError`` caught, a ``UnicodeDecodeError`` escaped into
+    ``list_instances()`` and ``gc_instances()``. One unrelated process on the
+    host then took down every discovery-backed command. The state character
+    sits after the closing parenthesis of ``comm``, so that field is skipped
+    without ever being decoded, and anything this parser cannot read answers
+    ``None`` -- unknowable, which no arm treats as evidence (#618).
+    """
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
     except OSError:
         return None
-    close = stat.rfind(")")
+    close = stat.rfind(b")")
     if close < 0:
         return None
     fields = stat[close + 1 :].strip().split()
-    return fields[0] if fields else None
+    if not fields:
+        return None
+    try:
+        return fields[0].decode("ascii")
+    except UnicodeDecodeError:
+        return None
 
 
 def bridge_process_alive(instance: BridgeInstance) -> bool:
