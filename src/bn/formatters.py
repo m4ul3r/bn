@@ -170,6 +170,25 @@ def _field_declared(source: Any, key: str) -> bool:
     return key in _as_dict(source)
 
 
+def _field_skewed(key: str) -> bool:
+    """Was ``source[key]`` PRESENT but the WRONG SHAPE? The THIRD question, and
+    the choke point is the only thing that can answer it.
+
+    ``_field_list``/``_field_dict`` return the same empty container for a field
+    that was genuinely empty and for one they could not use, and
+    ``_field_present`` is True for both -- so a renderer that wanted "unusable"
+    and spelled it ``_field_present`` was a SECOND decider over a question this
+    module had already decided, and it answered wrong on the WELL-FORMED input:
+    an empty ``definition`` object rendered as a raw Python repr where the
+    diagnostic belonged, with nothing disclosed because nothing was wrong. This
+    reads the record the choke point just wrote, so there is one answer (#619).
+
+    Only meaningful inside a ``@_discloses`` boundary and after the read: a
+    renderer asks it about a key it has already taken through the choke point.
+    """
+    return key in (_SKEWED_FIELDS.get() or ())
+
+
 def _count_field(source: Any, key: str) -> int:
     """``source[key]`` as a count, recording the skew when the key is PRESENT but
     holds something no count can be read out of.
@@ -1475,10 +1494,24 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     #122). Returns None when the page IS the whole set (no paging happened) or
     the envelope lacks an integer total to report against."""
     total = value.get("total")
-    returned = value.get("returned", len(items) if isinstance(items, list) else 0)
-    offset = value.get("offset", 0) or 0
-    if not isinstance(total, int):
+    if not isinstance(total, int) or isinstance(total, bool):
+        # Dropping the footer for an unusable total is right -- there is nothing
+        # honest to report against -- but dropping it SILENTLY made a skewed
+        # envelope render byte-identically to an unpaged one. A bool is not a
+        # total either, however much `isinstance(x, int)` likes it (#619).
+        if _field_present(value, "total"):
+            _record_skew("total")
         return None
+    # `returned` and `offset` reach ARITHMETIC, so they go through the count
+    # choke point like every other count: a string offset made
+    # `total - (offset + returned)` raise TypeError and cost all six paged
+    # listings entirely, where the same envelope with `offset` absent rendered
+    # cleanly. `returned` keeps its item-count default, which is a measurement
+    # rather than a fabricated zero, so it is asked for only when the envelope
+    # actually claimed one.
+    returned = (_count_field(value, "returned") if _field_present(value, "returned")
+                else (len(items) if isinstance(items, list) else 0))
+    offset = _count_field(value, "offset")
     if value.get("has_more"):
         remaining = total - (offset + returned)
         next_offset = offset + returned
@@ -2698,12 +2731,17 @@ def _render_defuse_text(value: Any) -> str:
     definition = _field_dict(value, "definition")
     if definition:
         lines.append(f"def: {definition.get('address')}  {definition.get('op')}  {definition.get('text', '')}".rstrip())
-    elif _field_present(value, "definition"):
+    elif _field_skewed("definition"):
         # PRESENT but not a usable definition object. `<none (parameter/entry/
         # aliased)>` is a confident claim about WHY there is no definition, so a
         # falsy wrong shape (`0`, `""`, `False`, `[]`) rendering it read as that
         # diagnosis instead of as an unusable field -- render what arrived and
         # let the choke point's note disclose the skew (#619).
+        #
+        # Asked of the choke point, not re-derived: `_field_present` is True for
+        # a WELL-FORMED empty dict too, so spelling the test that way printed
+        # `def: {}` -- a raw Python literal, undisclosed -- for a payload that
+        # had simply found no definition. One question, one answer.
         lines.append(f"def: {_as_dict(value).get('definition')!r}")
     else:
         lines.append("def: <none (parameter/entry/aliased)>")
@@ -3535,8 +3573,16 @@ def _render_sections_text(value: Any) -> str:
     if isinstance(value, dict) and value.get("wx_verdict"):
         verdict = value["wx_verdict"]
         if verdict == "wx_sections_present":
+            # Per ELEMENT, not just per field: an older bridge sent this as a
+            # list of section ROWS rather than a list of names, and `", ".join`
+            # raised TypeError -- which cost the whole sections listing AND
+            # this W+X security verdict, the one line the view exists to
+            # answer. A name that is not a name renders as itself instead
+            # (#619).
             names = _field_list(value, "writable_executable_items")
-            line = f"w+x: {len(names)} section(s): {', '.join(names)}"
+            shown = ", ".join(n if isinstance(n, str) else f"<unknown: {n!r}>"
+                              for n in names)
+            line = f"w+x: {len(names)} section(s): {shown}"
         elif verdict == "no_wx_sections_observed":
             line = "w+x: none observed"
         else:  # unknown_insufficient_metadata (#461)
@@ -3870,6 +3916,7 @@ def _build_mutation_summary(
     message: Any,
     proto_residue: bool = False,
     default_error: str = "mutation failed",
+    unmeasured_cause: str = "this op reported no results[] rows",
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -3923,7 +3970,7 @@ def _build_mutation_summary(
         # the same explanation, layered on top of whatever failure message was
         # already found above.
         unmeasured_explanation = (
-            "unmeasured: this op reported no results[] rows, so "
+            f"unmeasured: {unmeasured_cause}, so "
             "changed/verified/noop/failed counts could not be derived (None, "
             "not a confirmed 0) and dirty_after defaults to True as a "
             "fail-safe -- do not assume nothing changed"
@@ -4030,6 +4077,20 @@ def _mutation_summary(value: Any) -> Any:
     )
 
 
+# `go rename`'s own counters -- the ONE list, and the read loop below iterates
+# it, so a seventh counter cannot be read outside the capture that decides
+# whether this summary was measured at all. A tuple maintained BESIDE the reads
+# would be a second declaration to drift; this one IS the reads.
+_GO_RENAME_COUNTERS = (
+    "go_renamed_candidates",
+    "go_committed_count",
+    "go_verified_count",
+    "go_failed_count",
+    "skipped_user_named",
+    "skipped_changed_during_apply",
+)
+
+
 @_discloses_in_summary
 def _go_rename_summary(value: Any) -> Any:
     """Compact status for `go rename`, which reports through its OWN counters.
@@ -4050,11 +4111,29 @@ def _go_rename_summary(value: Any) -> Any:
         return _mutation_summary(value)
     committed = bool(value.get("committed", False))
     preview = bool(value.get("preview", False))
-    candidates = _count_field(value, "go_renamed_candidates")
-    committed_count = _count_field(value, "go_committed_count")
-    verified = _count_field(value, "go_verified_count")
-    failed = _count_field(value, "go_failed_count")
-    skipped = _count_field(value, "skipped_user_named")
+    # EVERY counter this summary derives a decision key from, read in ONE place
+    # so "which counters feed the decision" and "which counters were readable"
+    # cannot become two answers that drift apart. `measured` is DERIVED from
+    # those reads; asserting it True was a live defect, because `_count_field`
+    # answers 0 for a counter it could not read and 0 is this op's
+    # "nothing happened, do not save" verdict (#619/#683).
+    #
+    # Read inside a NESTED capture and re-recorded afterwards: the enclosing
+    # `@_discloses_in_summary` still discloses each unreadable counter by name,
+    # and the answer here does not depend on a boundary being installed.
+    token = _SKEWED_FIELDS.set([])
+    try:
+        counters = {key: _count_field(value, key) for key in _GO_RENAME_COUNTERS}
+        unreadable = list(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    candidates = counters["go_renamed_candidates"]
+    committed_count = counters["go_committed_count"]
+    verified = counters["go_verified_count"]
+    failed = counters["go_failed_count"]
+    skipped = counters["skipped_user_named"]
     rolled_back = value.get("rolled_back")
 
     # `changed` is what is LIVE in the view when the call returns, never the plan:
@@ -4079,9 +4158,17 @@ def _go_rename_summary(value: Any) -> Any:
     # every rename verified -- zero failure rows, message only -- from reporting
     # failed=0 with no error while the view sits partially renamed.
     return _build_mutation_summary(
-        # go_rename measures through its own counters by design (this whole
-        # function is that escape hatch) -- always measured, never #684-flagged.
-        measured=True,
+        # This op measures through its own counters rather than through
+        # `results[]` -- but "measures through" is not "measured": a counter
+        # that arrived in a shape no count reads out of leaves the derived
+        # counts exactly as unknown as an empty `results[]` does, and the
+        # builder's fail-safe (counts None, dirty_after True) is what stops a
+        # fabricated 0 from rendering the decision keys of a genuine all-noop
+        # commit. Hardcoding True here made that fail-safe unreachable from the
+        # one op whose whole reason for existing is #683.
+        measured=not unreadable,
+        unmeasured_cause=("this op's own counters could not be read, so the "
+                          "work it reported cannot be counted"),
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
@@ -4089,7 +4176,7 @@ def _go_rename_summary(value: Any) -> Any:
         # candidates + scan-time-only skips -- keeping verified+noop+failed <=
         # op_count, the invariant every other mutation summary holds.
         op_count=candidates + skipped
-                 - _count_field(value, "skipped_changed_during_apply"),
+                 - counters["skipped_changed_during_apply"],
         reported_success=bool(value.get("success", True)),
         # `results[]` holds only the FAILURE rows for this op.
         failure_rows=_field_list(value, "results"),
@@ -4133,7 +4220,12 @@ def _render_mutation_summary_text(value: Any) -> str:
         # attempted to), so running it again is a different execution that
         # cannot recover what the first one did, and duplicates state for a
         # non-idempotent op.
-        line += ("\nwarning: unmeasured -- this op reported no results[] rows; "
+        # It does not state WHY: there is more than one way to be unmeasured
+        # (no `results[]` rows, or an op's own counters arriving in a shape no
+        # count reads out of), and the cause travels in `first_error` below
+        # from the one place that knows it. A renderer asserting the cause
+        # printed the wrong one the moment a second cause existed.
+        line += ("\nwarning: unmeasured -- "
                  "the changed/verified/noop/failed counts above are UNKNOWN. "
                  "dirty_after is reported True as a fail-safe, not confirmed. "
                  "Do not assume nothing changed: read the view back (e.g. "

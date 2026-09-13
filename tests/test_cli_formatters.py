@@ -211,8 +211,10 @@ def test_text_format_error_stays_on_stderr(monkeypatch, capsys):
 
 
 def test_text_renderer_failure_becomes_clean_error(fake_transport, capsys):
-    # #101: a malformed bridge result that trips a text renderer must surface a
-    # clean BridgeError (exit 2) pointing at --format json, not a raw traceback.
+    # #101: a malformed bridge result that trips a text renderer must SOFT-DEGRADE
+    # to placeholders at exit 0; the BridgeError wrapper (exit 2, pointing at
+    # --format json) remains the last resort for truly unhandleable shapes, and
+    # `test_text_format_error_stays_on_stderr` above is what covers it.
     # 'function' present but a STRING, not a dict -> .get() would crash.
     fake_transport({"function_info": {"ok": True, "result": {"function": "not-a-dict"}}})
     # function info should now render with placeholders (defensive _as_dict), not crash.
@@ -945,6 +947,73 @@ def test_the_disclosure_reaches_an_early_return_path():
     assert "malformed function field" in values
 
 
+# The tests this PR adds that PASS against the base commit, declared rather than
+# discovered by whoever next runs the vacuity check. Six of them, and each is
+# green on base BY DESIGN -- a test whose subject is this file's own machinery,
+# or an invariant that already held and must keep holding. The declaration is
+# the point: "green on base" is the first thing a reviewer checks for vacuity,
+# and an undeclared green test costs a round of argument every time.
+#
+# Each is proven non-vacuous by breaking the exact thing it defends:
+_GREEN_ON_BASE_BY_DESIGN = {
+    "test_an_explicit_null_listing_claims_nothing_and_renders_no_count_row":
+        "an explicit null claimed nothing at base too; it goes red if the "
+        "presence test is re-spelled as `key in payload`",
+    "test_the_coercion_guard_does_not_fire_on_a_recorded_read":
+        "tests the AST guard in this file, not the module; red if RECORDERS "
+        "stops being consulted",
+    "test_the_coercion_guard_sees_every_form_it_claims_to_see":
+        "same -- the guard's own coverage over synthetic sources; red if any "
+        "declared form stops being matched",
+    "test_the_coercion_guards_blind_spots_are_the_ones_it_declares":
+        "same -- red if a declared blind spot is silently closed or widened",
+    "test_the_compact_summary_ok_key_mirrors_success_on_every_outcome":
+        "#447's mirror already held; red if `ok` is hardcoded or stops "
+        "tracking `success`",
+    "test_well_formed_realistic_payloads_carry_no_disclosure":
+        "the no-false-positive half of the disclosure -- red if a legitimately "
+        "empty container starts recording a skew",
+}
+
+
+def test_the_green_on_base_declaration_is_not_stale():
+    """A declaration nobody re-checks is prose, including this one."""
+    missing = [name for name in _GREEN_ON_BASE_BY_DESIGN
+               if name not in globals()]
+    assert not missing, (
+        f"_GREEN_ON_BASE_BY_DESIGN names {missing}, which no longer exist. "
+        "Drop them, or the list certifies tests that are not here.")
+    assert all(_GREEN_ON_BASE_BY_DESIGN.values()), (
+        "every entry needs the reason it is green on base by design")
+
+
+
+
+# The choke-point helpers, and the bare coercion helpers that BYPASS them.
+# Hoisted out of `_coercion_sites` so `test_the_coercion_guard_names_no_deleted
+# _helper` can check them against the live module: the list carried `_as_list`
+# for four rounds after this PR deleted it, and a guard row naming a helper that
+# does not exist tests a spelling nobody can write. Harmless is not the same as
+# checked.
+_RECORDERS = ("_field_list", "_field_dict")
+_COERCERS = ("_as_dict",)
+
+
+def test_the_coercion_guard_names_no_deleted_helper():
+    """Every helper name the AST guard matches on must still exist.
+
+    A stale name is a silently dead guard row, and this file's whole subject is
+    that a justification nobody re-checks does not expire when it stops being
+    true."""
+    from bn import formatters
+
+    missing = [name for name in _RECORDERS + _COERCERS
+               if not hasattr(formatters, name)]
+    assert not missing, (
+        f"the coercion guard matches on {missing}, which the module no longer "
+        "defines -- those rows can never fire again")
+
+
 def _coercion_sites(source: str | None = None):
     """Every named-field container coercion in the formatter module, and every
     coercion that BYPASSES the recording helpers, read out of the module's AST.
@@ -993,8 +1062,8 @@ def _coercion_sites(source: str | None = None):
     from bn import formatters
 
     tree = ast.parse(source if source is not None else inspect.getsource(formatters))
-    RECORDERS = ("_field_list", "_field_dict")
-    COERCERS = ("_as_list", "_as_dict")
+    RECORDERS = _RECORDERS
+    COERCERS = _COERCERS
     CONTAINERS = ("list", "dict", "tuple", "set", "frozenset")
 
     def is_lookup(node):
@@ -1412,7 +1481,6 @@ _GUARD_CATCHES = {
     "R1-coercer-on-subscript": 'return str(_as_dict(value["k"]))',
     "R1-coercer-variable-key": 'return str(_as_dict(value.get(key)))',
     "R1-coercer-one-alias-hop": 'raw = value.get("k")\n    return str(_as_dict(raw))',
-    "R1-coercer-list-name-still-guarded": 'return str(_as_list(value.get("k")))',
     "R2-or-empty-list": 'rows = value.get("k") or []\n    return str(rows)',
     "R2-or-empty-dict": 'rows = value.get("k") or {}\n    return str(rows)',
     "R2-or-empty-tuple": 'rows = value.get("k") or ()\n    return str(rows)',
@@ -1634,7 +1702,55 @@ def _exclusion_category_holds(name, category):
         return callable(_render_or_exception(obj, "probe"))
     if category == "returns-data-not-text":
         out = _render_or_exception(obj, dict(_PROBE_ELEMENT))
-        return not isinstance(out, (str, Exception))
+        # BOTH halves of the stated reason, because the second was the
+        # load-bearing one and was still prose: returning data is what makes
+        # there be no rendering to absorb, and the CLI handing the SAME RAW
+        # payload to a probed renderer is what makes the skew this helper
+        # records reach a boundary at all. Drop the second and the exclusion
+        # becomes the very thing round 11 blocked on -- a reader excused
+        # because "something else renders its output" when nothing does.
+        return (not isinstance(out, (str, Exception))
+                and _raw_payload_also_rendered(name))
+    return False
+
+
+def _raw_payload_also_rendered(name):
+    """Does the CLI hand the payload this data helper reads to a PROBED text
+    renderer in the same call?
+
+    Re-derived from the CLI's own AST: find the functions that reference the
+    helper, then the call that installs one of them as a keyword, and require
+    that call to install a `*renderer=` whose formatters symbols are all probed.
+    So if the pipe-note path ever stopped sharing its payload with the body
+    renderer, this exclusion fails instead of continuing to assert it."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    module = pathlib.Path(formatters.__file__).resolve()
+    probed = {label.split("(")[0] for label, _ in _probe_renderers()}
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue
+        tree = ast.parse(path.read_text())
+        symbols, modules = _formatters_bindings(tree)
+        users = {fn.name for fn in ast.walk(tree)
+                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and name in _formatters_refs(fn, symbols, modules)}
+        if not users:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(isinstance(inner, ast.Name) and inner.id in users
+                       for kw in node.keywords for inner in ast.walk(kw.value)):
+                continue
+            rendered = {r for kw in node.keywords
+                        if kw.arg and kw.arg.endswith("renderer")
+                        for r in _formatters_refs(kw.value, symbols, modules)}
+            if rendered and rendered <= probed:
+                return True
     return False
 
 
@@ -1664,6 +1780,59 @@ _COMPOSED_ENTRY_POINTS = {
 }
 
 
+def _formatters_bindings(tree):
+    """Every name in one module's AST that is bound to a formatters SYMBOL, and
+    every name bound to the formatters MODULE.
+
+    Two bindings, because there are two ways to reach a symbol and an inventory
+    that knows only one of them is a spelling rule -- the class of defect rounds
+    8, 9, 10 and 11 each broke on. `from ...formatters import _render_x` binds a
+    symbol and is read as an `ast.Name`; `from .. import formatters as _fmt` and
+    `import bn.formatters` bind the MODULE, and `_fmt._render_x` is an
+    `ast.Attribute` that no Name walk will ever see. A renderer installed that
+    way was in no inventory, no population and no named exclusion."""
+    import ast
+
+    symbols: set[str] = set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "formatters":          # from . import formatters
+                    modules.add(alias.asname or alias.name)
+                elif (node.module or "").endswith("formatters"):
+                    symbols.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith("formatters"):   # import bn.formatters as F
+                    modules.add(alias.asname or alias.name.split(".")[0])
+    return symbols, modules
+
+
+def _formatters_refs(node, symbols, modules):
+    """Every formatters symbol REFERENCED anywhere under `node`, by either
+    spelling: a bare name bound from the module, or an attribute taken off the
+    module itself (`_fmt._x`, `bn.formatters._x`). An attribute is only counted
+    when the live module really has it, so `_fmt.json` is not mistaken for an
+    entry point."""
+    import ast
+
+    from bn import formatters
+
+    found: set[str] = set()
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Name) and inner.id in symbols:
+            found.add(inner.id)
+        elif isinstance(inner, ast.Attribute):
+            base = inner.value
+            if ((isinstance(base, ast.Name) and base.id in modules)
+                    or (isinstance(base, ast.Attribute)
+                        and base.attr == "formatters")):
+                if hasattr(formatters, inner.attr):
+                    found.add(inner.attr)
+    return found
+
+
 @functools.lru_cache(maxsize=1)
 def _cli_installed_transforms():
     """Every `bn.formatters` symbol the CLI installs as a RESULT TRANSFORM, read
@@ -1685,10 +1854,7 @@ def _cli_installed_transforms():
         if path.resolve() == module:
             continue
         tree = ast.parse(path.read_text())
-        imported = {alias.asname or alias.name
-                    for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-                    if (node.module or "").endswith("formatters")
-                    for alias in node.names}
+        symbols, modules = _formatters_bindings(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1699,8 +1865,7 @@ def _cli_installed_transforms():
                 if not kw.arg or ("transform" not in kw.arg
                                   and kw.arg != "spill_status"):
                     continue
-                names |= {inner.id for inner in ast.walk(kw.value)
-                          if isinstance(inner, ast.Name) and inner.id in imported}
+                names |= _formatters_refs(kw.value, symbols, modules)
     return frozenset(names)
 
 
@@ -1741,12 +1906,8 @@ def _cli_referenced_formatters():
         if path.resolve() == module:
             continue                   # the module under guard is not its own caller
         tree = ast.parse(path.read_text())
-        imported = {alias.asname or alias.name
-                    for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-                    if (node.module or "").endswith("formatters")
-                    for alias in node.names}
-        referenced |= {node.id for node in ast.walk(tree)
-                       if isinstance(node, ast.Name) and node.id in imported}
+        symbols, modules = _formatters_bindings(tree)
+        referenced |= _formatters_refs(tree, symbols, modules)
     return frozenset(referenced)
 
 
@@ -2268,6 +2429,7 @@ def _runtime_population():
                                 *({k: literal for k in keys if k != key}
                                   for literal in literals)]
                     observed = None
+                    read_in = None
                     for ctx in contexts:
                         for kind in ("list", "dict"):
                             probe = _watched(kind)
@@ -2277,7 +2439,31 @@ def _runtime_population():
                                 break
                         if observed:
                             break
-                    records[key] = observed if observed else (contexts[0], None)
+                        if read_in is None:
+                            # Not a container position in this context -- but was
+                            # the key READ here at all? Falling straight back to
+                            # the BARE payload for every unclassified key was a
+                            # live bypass and not a detail: a read behind a
+                            # value-gated branch (`kind == "go_rename"`, and all
+                            # six of that op's counters behind it) happens in
+                            # exactly one of these contexts and in none of the
+                            # others, so the sweeps below swept a branch they
+                            # never entered and the only tripwire left for a read
+                            # added there was a re-baselineable size counter.
+                            # The context has to be one the read actually
+                            # happens in, which is what the docstring above
+                            # claims and what this makes true.
+                            asked: set[str] = set()
+                            _render_or_exception(
+                                render,
+                                _KeyProbe({**copy.deepcopy(ctx), key: "probe"}, asked))
+                            if key in asked:
+                                read_in = ctx
+                    if observed:
+                        records[key] = observed
+                    else:
+                        records[key] = (contexts[0] if read_in is None else read_in,
+                                        None)
                 kinds = {key: rec[1] for key, rec in records.items()}
             for key in keys:
                 ctx, kind = records[key]
@@ -2423,6 +2609,188 @@ def test_the_runtime_population_is_exactly_this_big():
         "the commit. If you changed no read, a renderer stopped reading a field "
         "it used to read and the differential below just stopped covering it -- "
         "which is the failure this assertion exists to make visible.")
+    # Main's ask after round 12, and the cheap half of the test below: the
+    # COUNT of pairs whose recorded context is not the bare payload. A silent
+    # regression to `{}` for every unclassified read -- which is what round 12
+    # blocked on -- moves this number, so it cannot happen quietly again.
+    situated = [rec for rec in population if rec[4]]
+    assert len(situated) == 141, (
+        f"{len(situated)} of {len(population)} population pairs are read in a "
+        "NON-EMPTY context, not 141. A pair whose context collapses back to the "
+        "bare payload is a pair whose read the sweeps below may never reach: "
+        "recording `{}` for every key no container was walked at put 367 of 564 "
+        "pairs -- including all six `go rename` counters, behind "
+        "`kind == \"go_rename\"` -- outside every behavioural guard.")
+
+
+def test_every_population_context_actually_reaches_the_read_it_was_recorded_for():
+    """The population's third promise, made executable.
+
+    `_runtime_population` states that "the context is the one the read was
+    OBSERVED in". That was FALSE for 367 of 564 pairs: any key no watched
+    container was walked at fell back to the BARE payload, so a read behind a
+    value-gated branch was swept in a payload that never entered the branch.
+    The guard could not fail there -- proven by adding a seventh `go rename`
+    counter, which left every behavioural assertion green and moved only three
+    size counters.
+
+    A promise in a docstring is prose, and prose does not expire. This re-runs
+    every recorded (renderer, key, context) triple and asserts the renderer
+    ACTUALLY ASKS for that key in that context, which is the property the
+    sweeps depend on and the one nobody could see was broken."""
+    unreached = []
+    for label, render, key, kind, ctx in _runtime_population():
+        asked: set[str] = set()
+        _render_or_exception(
+            render, _KeyProbe({**copy.deepcopy(ctx), key: "probe"}, asked))
+        if key in asked:
+            continue
+        # A container position may only be read when a container is what sits
+        # there (`if isinstance(x, list)` gates the read itself), so give it the
+        # kind it was classified as before calling the context unreachable.
+        payload = _KeyProbe(copy.deepcopy(ctx), asked)
+        payload[key] = _watched(kind or "list")
+        _render_or_exception(render, payload)
+        if key not in asked:
+            unreached.append(f"{label}.{key}")
+    assert not unreached, (
+        "these population entries record a context the renderer never reads the "
+        "key in, so every sweep below runs a branch it does not enter and "
+        f"cannot fail there: {unreached[:8]}")
+
+
+# The keys `_go_rename_summary` reads that are NOT counts: a kind discriminator,
+# three flags, a message and the failure listing, plus the seven keys the paired
+# renderer reads back off the summary it produced. Declared here so the runtime
+# read set below can be split, and so a NEW key has to arrive in one bucket or
+# the other deliberately.
+_GO_RENAME_NON_COUNT_READS = {
+    "kind", "committed", "preview", "success", "rolled_back", "message",
+    "results", "prototype_user_type_residue",
+    "changed_count", "verified_count", "noop_count", "failed_count",
+    "measured", "dirty_after", "first_error",
+}
+
+
+def test_every_count_the_go_rename_summary_decides_on_is_covered_by_measured():
+    """`measured` is derived from the counter reads, so a counter read OUTSIDE
+    that loop is a counter `measured` does not cover -- and a fabricated 0 from
+    such a read is this op's "nothing changed, do not save" verdict (#683).
+
+    A SET, not a number, and discovered by RUNNING the transform rather than by
+    matching its source: `_KeyProbe` reports the keys the composed entry point
+    actually asked for, so a seventh counter read appears here however it is
+    spelled -- `int(value.get(...))`, an isinstance-guarded coercion, an alias
+    hop -- and lands in neither bucket. Both injection forms round 12 used moved
+    only re-baselineable size counters before this existed.
+
+    Deliberately NOT derived from `_count_field` call sites: a population taken
+    from the choke point cannot fail on a read that skipped the choke point,
+    which is the whole defect class this file keeps re-finding."""
+    from bn import formatters
+
+    read = {key for label, _, key, _, _ in _runtime_population()
+            if label.split("(")[0] == "_go_rename_summary"}
+    counters = set(formatters._GO_RENAME_COUNTERS)
+    assert counters <= read, (
+        f"{sorted(counters - read)} is declared a `go rename` counter and the "
+        "composed transform never reads it -- the loop that decides `measured` "
+        "has stopped covering it")
+    stray = sorted(read - counters - _GO_RENAME_NON_COUNT_READS)
+    assert not stray, (
+        f"the go-rename summary reads {stray}, which is in neither "
+        "_GO_RENAME_COUNTERS nor the declared non-count reads. If it is a "
+        "counter it must be read through the loop that decides `measured`, or "
+        "an unreadable one fabricates a 0 into a DECISION key; if it is not, "
+        "add it to _GO_RENAME_NON_COUNT_READS and say why in the commit.")
+
+
+# The declared choke-point reads neither differential reaches, each with a
+# payload that DOES reach it. These are helpers behind a branch gated on a value
+# no probe filler supplies at the position that needs it: a specific op name
+# paired with a requested shape, a truncation cause, a frontier-leaf kind on the
+# nested ELEMENT rather than on the payload, a callee row's resolved target.
+#
+# The point of the table is that the exemption stops being prose. Each builder
+# places the value under test at the read's own position, and
+# `test_every_uncovered_read_is_covered_directly` asserts the choke point
+# actually RECORDED the skew there -- which is only possible if the payload
+# reached the read. A builder that stops reaching it fails, instead of the list
+# quietly certifying a read nothing runs.
+_RESIDUE_DIRECT_COVER = {
+    "_blast_radius_line.affected_summary":
+        ("dict", lambda v: {"affected_summary": v}),
+    "_format_operation_result.defined_types":
+        ("dict", lambda v: {"op": "types_declare", "defined_types": v}),
+    "_format_operation_result.requested":
+        ("dict", lambda v: {"op": "set_comment", "requested": v}),
+    "_leaf_group_key.callee":
+        ("dict", lambda v: {"kind": "unmodeled_callee", "callee": v}),
+    "_render_callgraph_text.target":
+        ("dict", lambda v: {"callees": [{"kind": "direct", "target": v}]}),
+    "_taint_truncation_note.truncation_cause":
+        ("list", lambda v: {"truncated": True, "truncation_cause": v}),
+    "_types_affected_lines.affected_types":
+        ("list", lambda v: {"affected_types": v}),
+}
+
+
+def test_every_uncovered_read_is_covered_directly():
+    """The residue's exemption, executed.
+
+    Five of the seven entries occurred exactly ONCE in this file -- inside the
+    assertion list that exempted them -- under a comment claiming "each with its
+    own named test above". There was no such test, so a guard-blind coercion at
+    an exempted read restored the base crash with the whole file green. This is
+    the third time in this PR that a stated reason turned out to be false, and
+    the answer is the same one that worked for `_PROBE_EXCLUSIONS`: make the
+    reason run.
+
+    The property is the choke point's own record, not the rendered text: these
+    are helpers whose output is a tuple, a list, a fragment or a line, and
+    disclosing a skew is the enclosing renderer's job. What must hold is that
+    the read went THROUGH the choke point, which is observable exactly here --
+    and it also proves the payload reached the read, since an unreached read
+    records nothing.
+
+    Both directions: a well-formed container at the same position records
+    nothing, so an unconditional `_record_skew` could not satisfy this."""
+    from bn import formatters
+
+    for label, (kind, build) in sorted(_RESIDUE_DIRECT_COVER.items()):
+        fn_name, key = label.rsplit(".", 1)
+        entry = getattr(formatters, fn_name)
+        # Unwrap a `@_discloses` boundary: it installs its OWN recorder on
+        # entry, which would swallow the record this test measures. The property
+        # here is that the read goes through the CHOKE POINT at all; what the
+        # enclosing boundary then does with it is the differentials' business.
+        fn = getattr(entry, "__wrapped__", entry)
+        for bogus in _MALFORMED[kind]:
+            token = formatters._SKEWED_FIELDS.set([])
+            try:
+                out = _render_or_exception(fn, build(copy.deepcopy(bogus)))
+                recorded = list(formatters._SKEWED_FIELDS.get() or ())
+            finally:
+                formatters._SKEWED_FIELDS.reset(token)
+            assert not isinstance(out, BaseException), (
+                f"{label} raised {type(out).__name__} on {bogus!r}: {out}")
+            assert key in recorded, (
+                f"{label} did not record a skew for {bogus!r}. Either the read "
+                "no longer goes through the choke point, or this entry's "
+                f"payload stopped reaching it -- recorded {recorded}")
+        # Populated, genuinely EMPTY, and an explicit null -- the three states
+        # the choke point distinguishes, none of them a skew.
+        for clean in (_PROBE_WELL_FORMED[kind],
+                      [] if kind == "list" else {},
+                      None):
+            token = formatters._SKEWED_FIELDS.set([])
+            try:
+                _render_or_exception(fn, build(copy.deepcopy(clean)))
+                recorded = list(formatters._SKEWED_FIELDS.get() or ())
+            finally:
+                formatters._SKEWED_FIELDS.reset(token)
+            assert key not in recorded, (
+                f"{label} cried skew for the well-formed {clean!r}")
 
 
 def test_the_container_probe_misses_exactly_three_top_level_reads():
@@ -2531,14 +2899,19 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
         return any(k == key and (r == fn or fn in reach.get(r, ()))
                    for r, k in exercised)
     uncovered = sorted(f"{fn}.{key}" for fn, key in nested if not covered(fn, key))
-    # The residue, named rather than counted. Two families, neither of them a
-    # container rendering that could absorb silently: helpers behind a branch
-    # gated on a value no literal in the module supplies at the position that
-    # needs it (a specific op name paired with a specific requested shape, a
-    # truncation cause, a frontier-leaf KIND on the nested ELEMENT rather than
-    # on the payload), each with its own named test above -- the truncated-taint
-    # stats, the affected-types listing, the blast-radius summary, the mutation
-    # operation rows.
+    # The residue, and its exemption is EXECUTABLE rather than prose. It said
+    # "each with its own named test above", which was false for five of the
+    # seven: those names occurred exactly once in this whole file, inside this
+    # assertion list, so a guard-blind coercion at one of them restored the base
+    # crash with the file green. That is the same defect as round 11's
+    # false exclusion reason -- a justification nobody can re-check does not
+    # expire when it stops being true.
+    #
+    # So the list is not an exemption any more: every entry must appear in
+    # `_RESIDUE_DIRECT_COVER`, and the test below RUNS each one through the
+    # choke-point differential by calling the helper with a payload built to
+    # reach the read. If a reaching payload cannot be built, the entry fails
+    # there instead of being excused here.
     #
     # The three #685 summary transforms USED to sit here, excused as "reads that
     # produce a dict rather than text". That excuse was round 11's blocker: the
@@ -2548,15 +2921,12 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     # points now (`_COMPOSED_ENTRY_POINTS`) and are exercised by the top-level
     # differential like any other renderer, which is why they are gone from
     # this list rather than re-excused in it.
-    assert uncovered == ["_blast_radius_line.affected_summary",
-                         "_format_operation_result.defined_types",
-                         "_format_operation_result.requested",
-                         "_leaf_group_key.callee",
-                         "_render_callgraph_text.target",
-                         "_taint_truncation_note.truncation_cause",
-                         "_types_affected_lines.affected_types"], (
-        "a declared choke-point read is exercised by neither differential: "
-        f"{uncovered}")
+    assert uncovered == sorted(_RESIDUE_DIRECT_COVER), (
+        "a declared choke-point read is exercised by neither differential and "
+        "is not in _RESIDUE_DIRECT_COVER either, so nothing runs it: "
+        f"{sorted(set(uncovered) - set(_RESIDUE_DIRECT_COVER))}. Get it into a "
+        "population, or give it a reaching payload in _RESIDUE_DIRECT_COVER -- "
+        "an entry here with no executed case behind it is prose.")
 
 
 def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
@@ -3643,12 +4013,14 @@ def test_the_go_rename_counters_degrade_instead_of_costing_the_whole_summary():
     rename batch -- so `_count_field` records the skew and the summary discloses
     it by name.
 
-    Named rather than left to the aggregate raise sweep, and this is a STATED
-    LIMIT of the probe rather than a preference: these six reads only happen
-    when `kind == "go_rename"`, and the probe records an UNCLASSIFIED key's
-    context as the bare payload, which delegates to the generic summary and
-    never opens this branch. A key behind a branch no filler value satisfies is
-    outside the sweep, so it is covered here instead."""
+    Named as well as swept, and the STATED LIMIT it used to carry is gone: the
+    probe recorded an unclassified key's context as the bare payload, which
+    delegates to the generic summary and never opens `kind == "go_rename"`, so
+    these six reads were outside every sweep. The population records the
+    context the read was OBSERVED in now, and
+    `test_every_population_context_actually_reaches_the_read_it_was_recorded_for`
+    asserts that of every entry -- so the aggregate sweep covers these too, and
+    this test's job is the per-counter disclosure the aggregate cannot state."""
     from bn import formatters
 
     base = {"kind": "go_rename", "success": True, "committed": True}
@@ -3675,6 +4047,154 @@ def test_the_go_rename_counters_degrade_instead_of_costing_the_whole_summary():
             assert "malformed" not in out, (
                 f"{counter}={genuine!r} is a readable count and must not disclose: "
                 f"{out!r}")
+
+
+def test_an_unreadable_go_rename_counter_can_never_read_as_a_finished_run():
+    """`measured` must be DERIVED from the reads, never asserted.
+
+    `go rename` is the op whose entire reason for existing is that a fabricated
+    `changed=0` discarded a completed rename batch (#683) -- and `measured=True`
+    was hardcoded here, on the grounds that this function measures through its
+    own counters "by design". That made the shared builder's unmeasured
+    fail-safe unreachable from the one path that needs it most: an unreadable
+    commit counter fabricated `changed_count: 0` and flipped `dirty_after` to
+    `False`, so every DECISION key matched a genuine all-noop run byte for byte
+    on the default text path.
+
+    Disclosure is not enough here and that is the whole point. Every other
+    finding on this file is "an unusable payload renders as clean"; this one is
+    "an unusable payload renders as an actionable instruction to throw work
+    away". A note in `first_error` does not reach a control loop that branches
+    on `dirty_after` -- `if not summary["dirty_after"]: close()`, the idiom the
+    builder's own #684 comment enumerates -- so the DECISION KEYS themselves
+    must differ from a real nothing-changed run.
+    """
+    from bn import formatters
+
+    decision = lambda s: tuple(s[k] for k in ("dirty_after", "changed_count",
+                                              "verified_count", "noop_count",
+                                              "failed_count", "measured"))
+    base = {"kind": "go_rename", "success": True, "committed": True}
+    # A REAL all-noop commit: every counter readable and zero. This is the
+    # verdict a skewed run must never be able to impersonate.
+    noop = formatters._go_rename_summary({**base, "go_renamed_candidates": 0,
+                                          "go_committed_count": 0,
+                                          "go_verified_count": 0,
+                                          "go_failed_count": 0,
+                                          "skipped_user_named": 0})
+    assert decision(noop) == (False, 0, 0, 0, 0, True), noop
+    for counter in ("go_renamed_candidates", "go_committed_count",
+                    "go_verified_count", "go_failed_count", "skipped_user_named",
+                    "skipped_changed_during_apply"):
+        for bogus in ("bad", "1783 renamed", {"a": 1}, ["x"], "", False, {}, []):
+            skewed = formatters._go_rename_summary(
+                {**base, "go_renamed_candidates": 1783, "go_verified_count": 1783,
+                 counter: bogus})
+            assert skewed["measured"] is False, (
+                f"{counter}={bogus!r} could not be read, and the summary still "
+                f"claims measured=True: {skewed!r}")
+            assert skewed["dirty_after"] is True, (
+                f"{counter}={bogus!r} left dirty_after={skewed['dirty_after']!r} "
+                "-- a control loop branching on it discards the batch")
+            for count in ("changed_count", "verified_count", "noop_count",
+                          "failed_count"):
+                assert skewed[count] is None, (
+                    f"{counter}={bogus!r} fabricated {count}="
+                    f"{skewed[count]!r} out of a payload it could not read")
+            assert decision(skewed) != decision(noop), (
+                f"{counter}={bogus!r} produces the decision keys of a genuine "
+                f"all-noop run: {decision(skewed)}")
+        # Anti-vacuity, both directions: `measured` has to be able to be True,
+        # or a hardcoded False would satisfy every assertion above. A real
+        # count and the numeric string the bridge has always been allowed to
+        # send both stay measured, with the count read as itself.
+        for genuine, expected in ((3, 3), ("3", 3)):
+            read = formatters._go_rename_summary({**base, counter: genuine})
+            assert read["measured"] is True, (
+                f"{counter}={genuine!r} is a readable count and the summary "
+                f"reports it unmeasured: {read!r}")
+            if counter == "go_committed_count":
+                assert read["changed_count"] == expected, read
+
+
+def test_a_well_formed_empty_container_is_never_reported_as_unusable():
+    """"PRESENT but the wrong shape" is a THIRD question, and only the choke
+    point can answer it.
+
+    `_field_dict` hands back `{}` for a genuinely empty dict AND for one it
+    could not use, and `_field_present` is True for both -- so a renderer that
+    spelled "unusable" as `_field_present` was a SECOND decider over a question
+    already decided, and it answered wrong on the well-formed input: an empty
+    `definition` object printed a raw Python repr `def: {}`, with nothing
+    disclosed because there was nothing wrong, where the diagnostic
+    `<none (parameter/entry/aliased)>` belonged. Ask `_field_skewed`, which is
+    the choke point's own record of what it could not read.
+
+    Both directions, because either alone is satisfiable by a constant: a
+    well-formed empty container renders the diagnostic and discloses nothing,
+    and every FALSY wrong shape still renders what arrived and discloses."""
+    from bn import formatters
+
+    absent = formatters._render_defuse_text({})
+    assert "def: <none (parameter/entry/aliased)>" in absent, absent
+    empty = formatters._render_defuse_text({"definition": {}})
+    assert "def: <none (parameter/entry/aliased)>" in empty, (
+        "a well-formed EMPTY definition object is a real result -- we looked "
+        f"and found none -- and must not render as an unusable payload: {empty!r}")
+    assert "malformed" not in empty, (
+        f"a well-formed empty container cried malformed: {empty!r}")
+    # Non-dict shapes only: a dict with unexpected KEYS is a usable object the
+    # choke point has no complaint about, and it renders through the normal
+    # branch with placeholders. The skew is about the container's SHAPE.
+    for bogus in (0, "", False, [], "x", 3, ["a"]):
+        out = formatters._render_defuse_text({"definition": bogus})
+        assert "<none (parameter/entry/aliased)>" not in out, (
+            f"definition={bogus!r} is not a usable definition object and must "
+            f"not render the confident 'why there is none' diagnosis: {out!r}")
+        assert _disclosed(out, "definition"), (
+            f"definition={bogus!r} left no note naming the field: {out!r}")
+
+
+def test_no_list_ELEMENT_costs_the_whole_render():
+    """The granularity at which #619 names half its defects, and the one no
+    other population here varies.
+
+    Every differential and every sweep in this file varies the FIELD: it puts a
+    wrong-shaped value AT a key. A list that arrives as a list of the WRONG
+    ELEMENTS is the other half -- `', '.join(names)` on a list of rows, a
+    `row["symbol"]` on a list of strings -- and it is what an older bridge
+    version actually sends. Those positions were outside every population by
+    construction, which left a live raise family the guards could not see: one
+    malformed element in a section listing raised TypeError and cost the whole
+    listing PLUS the W+X security verdict the renderer prefixes to it.
+
+    The property is the sweep's, not the differential's: an element the
+    renderer cannot use may legitimately render as a placeholder or be skipped,
+    but it may never RAISE where the same payload with that list absent
+    renders cleanly. Sizes are exact, for the reason every size here is."""
+    junk = [None, 0, 1, True, "s", [], {}, [{"a": 1}], {"a": 1}]
+    raised = []
+    swept = 0
+    for label, render, key, kind, ctx in _runtime_population():
+        if kind != "list":
+            continue
+        absent = _render_or_exception(render, copy.deepcopy(ctx))
+        for element in junk:
+            payload = {**copy.deepcopy(ctx), key: [copy.deepcopy(element)]}
+            swept += 1
+            out = _render_or_exception(render, payload)
+            if isinstance(out, BaseException) and not isinstance(absent, BaseException):
+                raised.append(f"{label}({key}=[{element!r}]) raised "
+                              f"{type(out).__name__}: {out}")
+    assert not raised, (
+        "a wrong-shaped list ELEMENT cost the whole render where the same "
+        f"payload with the list absent rendered cleanly: {raised[:6]}")
+    assert swept == 1134, (
+        f"the element sweep ran {swept} renders, not 1134 -- the size of the "
+        "covered set (every list position the population discovered x every "
+        "junk element kind), so move it only with a list position you "
+        "deliberately added or removed")
+
 
 
 def test_no_renderer_mutates_the_payload_it_was_handed():
