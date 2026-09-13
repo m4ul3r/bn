@@ -174,29 +174,82 @@ def test_exit_code_bullet_documents_every_code_the_cli_can_return():
 
 
 # The CLI package, which IS the population below: the bridge lives outside it,
-# so an integer a function here returns is either a process exit code or a bare
-# magic number that ought to be a named constant.
+# so an integer this package hands the shell is either a process exit code or a
+# bare magic number that ought to be a named constant.
 _CLI_PACKAGE = REPO / "src" / "bn"
+# The two ways this package ends a process with a status of its own.
+_EXIT_CALLS = frozenset({"exit", "_exit", "SystemExit"})
+
+
+def _result_positions(expr: ast.expr) -> list[ast.expr]:
+    """The expressions *expr* can itself evaluate to.
+
+    A conditional and a boolean operator both return one of their operands, so
+    `return 7 if cond else 0` returns the literal 7 -- a widening the round-17
+    lens smuggled past a sweep that only looked at `return <constant>`. Nothing
+    else is descended into: an int inside a call argument or a subscript is not
+    a value the function returns, and treating it as one flagged a page limit
+    and a rounding precision.
+    """
+    if isinstance(expr, ast.IfExp):
+        return [*_result_positions(expr.body), *_result_positions(expr.orelse)]
+    if isinstance(expr, ast.BoolOp):
+        return [pos for value in expr.values for pos in _result_positions(value)]
+    return [expr]
+
+
+def _int_literal(expr: ast.expr | None) -> int | None:
+    # `type(...) is int` and not isinstance: `True` is an int subclass, and
+    # `return True` is not a claim about an exit code.
+    if isinstance(expr, ast.Constant) and type(expr.value) is int:
+        return expr.value
+    return None
 
 
 def _codes_the_cli_can_return() -> dict[int, list[str]]:
-    """Every integer returned as a LITERAL by any function in the CLI package.
+    """Every status this package can hand the shell as a LITERAL.
 
-    A total population -- every `return <int>` in every module under
-    `src/bn`, no entry-point list, no exemption -- because the sweep that
-    checked only the functions someone remembered is how a widened contract got
-    past this file in the first place.
+    A total population -- every module under `src/bn`, no entry-point list and
+    no exemption -- because a sweep that reads only the functions someone
+    remembered is how a widened contract got past this file in the first place.
+
+    Two mechanisms, because the package uses both: a `return`, whose value
+    reaches the shell through `main()`; and a status handed to `sys.exit` /
+    `os._exit` / `SystemExit`, which is how argparse's refusal and
+    `__main__.py` deliver theirs. A return counts only when EVERY position it
+    can evaluate to is an int literal, so `return None if spilling else 100` --
+    a page limit, not a code -- is not one, and `return 7 if cond else 0` is.
+
+    What a literal sweep cannot see, stated rather than implied: a status
+    computed at run time (`sys.exit(main())`, `parser.exit(status)`) is not a
+    literal anywhere, and the code it carries is the one its callee returns,
+    which this population already holds. A code-less `exit()` is 0 by
+    definition, and 0 is documented.
     """
     codes: dict[int, list[str]] = {}
+
+    def record(code: int, path: Path, node: ast.AST) -> None:
+        codes.setdefault(code, []).append(f"{path.name}:{node.lineno}")
+
     for path in sorted(_CLI_PACKAGE.rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Return):
+            if isinstance(node, ast.Return) and node.value is not None:
+                literals = [_int_literal(pos) for pos in _result_positions(node.value)]
+                if literals and all(code is not None for code in literals):
+                    for code in literals:
+                        record(code, path, node)
                 continue
-            value = node.value
-            # `type(...) is int` and not isinstance: `True` is an int subclass,
-            # and `return True` is not a claim about an exit code.
-            if isinstance(value, ast.Constant) and type(value.value) is int:
-                codes.setdefault(value.value, []).append(f"{path.name}:{node.lineno}")
+            call = node.exc if isinstance(node, ast.Raise) else node
+            if not isinstance(call, ast.Call):
+                continue
+            name = (call.func.attr if isinstance(call.func, ast.Attribute)
+                    else getattr(call.func, "id", None))
+            if name not in _EXIT_CALLS:
+                continue
+            for argument in call.args[:1]:
+                code = _int_literal(argument)
+                if code is not None:
+                    record(code, path, node)
     return codes
 
 
@@ -207,10 +260,12 @@ def test_no_code_the_cli_can_return_is_undocumented():
     the DOCUMENT narrows -- a deleted clause -- and stayed green when the CODE
     widened: round 16's falsification lens injected `return 7` into a registered
     handler and left this module, `tests/test_cli_mutation.py` and
-    `tests/test_skill_reference_drift.py` all green. A contract that documents
-    the codes someone wrote down rather than the codes the CLI can produce is
-    exactly the #721 defect this file exists to catch, so the two sets are
-    asserted EQUAL and the population is the whole package.
+    `tests/test_skill_reference_drift.py` all green; round 17's got past the
+    repair twice more, with `return 7 if False else 0` and with `sys.exit(7)`.
+    A contract that documents the codes someone wrote down rather than the codes
+    the CLI can produce is exactly the #721 defect this file exists to catch, so
+    the two sets are asserted EQUAL over both exit mechanisms. The population's
+    own limit is stated on the helper rather than implied away.
     """
     documented = {int(code) for code
                   in re.findall(r"(?:^|[ ,—-]) ?(\d+) = ", _bullet("- Exit codes:"))}
@@ -219,11 +274,10 @@ def test_no_code_the_cli_can_return_is_undocumented():
     undocumented = {code: returned[code] for code in sorted(set(returned) - documented)}
     assert set(returned) == documented, (
         "the exit-code bullet and the CLI package disagree about which codes "
-        f"exist. Documented but returned nowhere: {sorted(documented - set(returned))}. "
-        f"Returned but undocumented: {undocumented}. An undocumented integer "
-        "return here is either an exit code the contract has not caught up with, "
-        "or a magic number that should be a named constant rather than a bare "
-        "`return`"
+        f"exist. Documented but produced nowhere: {sorted(documented - set(returned))}. "
+        f"Produced but undocumented: {undocumented}. An undocumented status here "
+        "is either an exit code the contract has not caught up with, or a magic "
+        "number that should be a named constant rather than a bare literal"
     )
 
 
@@ -348,7 +402,6 @@ def test_the_exit_code_bullet_clauses_are_what_the_cli_actually_does():
                         "results": [{"status": "invalid_request"}]}
     failed_at_apply = {"success": False, "committed": False,
                        "results": [{"status": "verification_failed"}]}
-
     assert _mutation_exit_code(verified, _mutation_summary) == 0
     # "a measured all-`noop` is 0"
     assert _mutation_exit_code(all_noop, _mutation_summary) == 0
@@ -408,6 +461,14 @@ _EXIT_CODE_ECHOES = (
      r"reports the documented `(?P<code>\d)` instead", "undeliverable-output"),
     ("skills/bn/reference/mutating.md", "the-status-line-never-walks-it",
      r"verified reply exits `(?P<code>\d)` there", "unserializable-reply-as-text"),
+    # Round 17: the two clauses that replaced a refuted sentence, measured rather
+    # than pinned as present. The refusal one deliberately reuses the `failing`
+    # scenario, so the doc's "a refusal is exit 3" is compared against what the
+    # classifier really returns for a refused mutation.
+    ("skills/bn/reference/mutating.md", "an-unreachable-bridge-is-2",
+     r"path a (?P<code>\d) is also the code for", "unreachable-bridge"),
+    ("skills/bn/reference/mutating.md", "a-refusal-is-not-one-of-those",
+     r"on a mutation a refusal is exit (?P<code>\d)", "failing"),
 )
 
 
@@ -451,15 +512,17 @@ _EXIT_CODE_PINS = (
      "unmeasured mutation into a clean zero."),
     # Round 16's falsification lens refuted the sentence that stood here ("a 2 on
     # a mutation says the requested output did not arrive, not that the write did
-    # not land"): an invalid flag VALUE exits 2 at parse time with no request
-    # sent. The replacement says what 2 does NOT tell a consumer, and
-    # tests/test_cli_mutation.py::test_a_rejected_flag_value_is_a_2_with_nothing_sent
-    # measures the counterexample it now names.
+    # not land": an invalid flag VALUE exits 2 at parse time with no request
+    # sent), and round 17's refuted the replacement's first clause ("2 is also
+    # this path's code for a refused request": on a mutation a refusal is 3,
+    # which this same file states 43 lines earlier). The two clauses that state a
+    # code are now ECHOES, measured below, because a clause parked in a pin is
+    # only asserted to be PRESENT; this pin holds the part with nothing to
+    # measure, and tests/test_cli_mutation.py::
+    # test_the_cases_the_reference_lists_for_exit_2_really_are_2 measures each
+    # case it names.
     ("skills/bn/reference/mutating.md", "a-2-alone-does-not-say-the-write-landed",
-     "2 is\n"
-     "also this path's code for a refused request, an unreachable bridge, an\n"
-     "unparseable reply and a flag value rejected before anything was sent, so a 2\n"
-     "alone does not tell you whether the write landed."),
+     "So a 2 alone does not tell you whether the write landed"),
     ("skills/bn/reference/reading.md", "bounded-slice-is-a-success",
      "a provably-bounded constant length (a success, exit 0)"),
     # Found by widening the sweep to the whole agent-facing set: this doc states
@@ -1222,19 +1285,28 @@ def _unserializable_reply() -> dict[str, object]:
             "results": [{"status": "verified"}], "detail": nested}
 
 
-def _exit_code_of_a_run(argv: list[str], result: dict[str, object]) -> int:
+def _exit_code_of_a_run(argv: list[str], result: dict[str, object] | None) -> int:
     """What `bn` really EXITS with for *argv* against a fixed bridge reply.
 
-    The two output-divergence echoes state a code no classifier call can
-    produce: that divergence lives strictly after the classification, in the
-    step that delivers the output. Asking `_mutation_exit_code` for it would
-    quote the document back at itself, so the command is run.
+    Three echoes state a code no classifier call can produce: the output
+    divergences live strictly after the classification, in the step that
+    delivers the output, and an unreachable bridge never reaches it. Asking
+    `_mutation_exit_code` for any of them would quote the document back at
+    itself, so the command is run.
+
+    *result* of None means the bridge could not be reached at all.
     """
     import bn.cli
+    from bn.transport import BridgeError
+
+    def unreachable(op, **kwargs):
+        raise BridgeError(
+            "Failed to contact Binary Ninja bridge; no instance is listening")
 
     reply = {"ok": True, "result": result}
     original = bn.cli.send_request
-    bn.cli.send_request = lambda op, **kwargs: reply
+    bn.cli.send_request = (unreachable if result is None
+                           else (lambda op, **kwargs: reply))
     try:
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -1263,6 +1335,8 @@ def _exit_code_for(scenario: str) -> int:
                  "results": [{"status": "verified"}]})
     if scenario == "unserializable-reply-as-text":
         return _exit_code_of_a_run(_RENAME_ARGV, _unserializable_reply())
+    if scenario == "unreachable-bridge":
+        return _exit_code_of_a_run(_RENAME_ARGV, None)
 
     shapes = {
         "verified": ({"success": True, "committed": True,

@@ -76,12 +76,13 @@ a reply too deeply nested for `--format json`/`ndjson` to serialize. The
 default status line prints named fields and never walks such a reply, so a
 verified reply exits `0` there. The divergence moves in a single direction: an
 undeliverable output replaces the code with 2 and can never turn a failed or an
-unmeasured mutation into a clean zero. But do NOT read that backwards: 2 is
-also this path's code for a refused request, an unreachable bridge, an
-unparseable reply and a flag value rejected before anything was sent, so a 2
-alone does not tell you whether the write landed. The stderr line names which
-of them it was; when it names the delivery step, re-read the view rather than
-re-issuing the mutation.
+unmeasured mutation into a clean zero. But do NOT read that backwards: on this
+path a 2 is also the code for a bridge this CLI could not reach, a reply it
+could not parse, and a flag value rejected before anything was sent. A refusal
+is NOT in that list: on a mutation a refusal is exit 3, as the status table
+above says. So a 2 alone does not tell you whether the write landed; the stderr
+line names which of them it was, and when it names the delivery step, re-read
+the view rather than re-issuing the mutation.
 
 ### Compact status keys
 

@@ -1199,6 +1199,59 @@ def test_a_rejected_flag_value_is_a_2_with_nothing_sent(monkeypatch):
     assert len(sent) == 1, sent
 
 
+def test_the_cases_the_reference_lists_for_exit_2_really_are_2(monkeypatch, capsys):
+    """Every case the mutation reference names for a 2 on this path, measured --
+    and the one it deliberately excludes.
+
+    Round 17's falsification lens refuted the sentence this replaces: it said
+    "2 is also this path's code for a refused request", and a refused mutation
+    is exit 3, which the same file's status table states 43 lines earlier. The
+    lens's second point was procedural and is the reason this cell exists: the
+    clause was parked in `_EXIT_CODE_PINS`, which asserts only that the literal
+    string is PRESENT, so a false clause could sit there indefinitely. Each case
+    the corrected sentence lists is executed here, and so is the exclusion.
+    """
+    from bn.transport import BridgeError
+
+    argv = ["symbol", "rename", "--target", "active", "sub_401000", "x"]
+
+    def reply(result):
+        def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                              instance_id=None, **kwargs):
+            return {"ok": True, "result": result}
+        return fake_send_request
+
+    def raises(exc):
+        def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                              instance_id=None, **kwargs):
+            raise exc
+        return fake_send_request
+
+    # "a bridge this CLI could not reach"
+    monkeypatch.setattr(bn.cli, "send_request",
+                        raises(BridgeError("Failed to contact Binary Ninja bridge")))
+    assert bn.cli.main(argv) == 2
+
+    # "a reply it could not parse" -- a mutation result that is not an object
+    monkeypatch.setattr(bn.cli, "send_request", reply(["verified"]))
+    assert bn.cli.main(argv) == 2
+
+    # "a flag value rejected before anything was sent" is measured on its own in
+    # test_a_rejected_flag_value_is_a_2_with_nothing_sent, which also proves the
+    # wire log stays empty.
+
+    # ...and the exclusion, which is what the refuted clause got wrong: on a
+    # mutation a refusal is 3, whether it arrives as a row or as a status.
+    monkeypatch.setattr(bn.cli, "send_request", reply(
+        {"success": False, "committed": False,
+         "results": [{"status": "invalid_request"}]}))
+    assert bn.cli.main(argv) == 3
+    monkeypatch.setattr(bn.cli, "send_request",
+                        raises(BridgeError("refused", status="invalid_request")))
+    assert bn.cli.main(argv) == 3
+    capsys.readouterr()
+
+
 def test_a_locally_built_result_survives_a_renderer_that_cannot_read_it(
         monkeypatch, capsys):
     """The receiving function the behavioural half was not covering.

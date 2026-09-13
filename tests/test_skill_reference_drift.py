@@ -430,7 +430,9 @@ def _registered_handlers() -> dict[str, object]:
 # ARGUMENT is attributed to the function whose signature carries it, though it
 # runs once at definition time and never when that function is invoked. Both
 # over-detect, which is the direction that costs a real command its index
-# requirement -- so a third one found later is a finding, not a footnote.
+# requirement -- so a further one found later is a finding, not a footnote, and
+# round 17 found one (a nested CLASS method sharing the flat nested-name space),
+# which is closed above rather than added to this list.
 _PIN_WRITER = "bn.session_state._atomic_write"
 
 
@@ -552,7 +554,11 @@ def _invoked_callees(fn: ast.AST, module: str,
     function classified a handler that cannot write the pin, and over-detection
     is not the benign direction here -- see the LIMIT above. An immediately
     applied lambda IS invoked, so it is folded in; a lambda stored and called
-    through the value is a call through a value, the stated limit.
+    through the value is a call through a value, the stated limit. A nested
+    CLASS body is skipped for the same reason: its methods are reached through
+    an INSTANCE, which is a value, and registering them under their bare names
+    in this flat space made a bare call to an unrelated module-level function of
+    the same name fold a method's callees into the caller (round 17).
     """
     nested: dict[str, ast.AST] = {}
     raw: dict[str, set[str]] = {}
@@ -565,6 +571,8 @@ def _invoked_callees(fn: ast.AST, module: str,
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 nested[node.name] = node
                 collect(node, node.name)
+                continue
+            if isinstance(node, ast.ClassDef):
                 continue
             if isinstance(node, ast.Call):
                 dotted = _dotted_callee(node.func)
@@ -728,6 +736,18 @@ _PIN_MODULE = ("def update(**fields):\n"
                  id="a-nested-scope-nothing-invokes"),
     pytest.param(False, "def h(session_state):\n    return session_state.update(1)\n",
                  id="a-parameter-shadowing-the-module"),
+    # Round 17: a nested CLASS method used to share the flat nested-name space,
+    # so a bare call to an unrelated module-level function of the same name
+    # folded the method's callees into the caller. `h` here calls the
+    # module-level `write`, which writes nothing.
+    pytest.param(False, ("def write(a):\n"
+                         "    return a\n"
+                         "def h(a):\n"
+                         "    class _Holder:\n"
+                         "        def write(self):\n"
+                         "            session_state.update(target=a)\n"
+                         "    return write(a)\n"),
+                 id="a-nested-class-method-nothing-instantiates"),
     # ...and the limit that remains stated: resolution is by REFERENCE, so a
     # call made through a value is not visible in the source.
     pytest.param(False, ("def h(a):\n"
@@ -736,6 +756,12 @@ _PIN_MODULE = ("def update(**fields):\n"
                  id="a-call-through-a-value"),
     pytest.param(False, "def h(a):\n    getattr(session_state, 'update')(target=a)\n",
                  id="a-call-through-getattr"),
+    pytest.param(False, ("def h(a):\n"
+                         "    class _Holder:\n"
+                         "        def write(self):\n"
+                         "            session_state.update(target=a)\n"
+                         "    return _Holder().write()\n"),
+                 id="a-method-call-through-an-instance"),
 ])
 def test_the_pin_writer_resolution_states_its_limit_in_both_directions(
         detected: bool, body: str):
