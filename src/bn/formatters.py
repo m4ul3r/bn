@@ -170,7 +170,8 @@ def _field_declared(source: Any, key: str) -> bool:
     return key in _as_dict(source)
 
 
-def _discloses(fn: Callable[..., str]) -> Callable[..., str]:
+def _discloses(fn: Callable[..., str] | None = None, *,
+               prefix: bool = False) -> Callable[..., str]:
     """Append the skew disclosure for every container this text renderer coerced
     away, however deep it was read.
 
@@ -183,19 +184,34 @@ def _discloses(fn: Callable[..., str]) -> Callable[..., str]:
     payload. Wrapping the whole render covers EVERY return path, including the
     early ones ("none", "no sessions", the no-possible-values return) that a
     per-branch line misses, and draining a recorded set rather than re-reading
-    declared keys means there is no key list to drift from the code (#619)."""
-    @functools.wraps(fn)
-    def rendered(*args: Any, **kwargs: Any) -> str:
-        token = _SKEWED_FIELDS.set([])
-        try:
-            out = fn(*args, **kwargs)
-            skewed = sorted(_SKEWED_FIELDS.get() or ())
-        finally:
-            _SKEWED_FIELDS.reset(token)
-        if not skewed or not isinstance(out, str):
-            return out
-        return out + ("\n" if out else "") + _skew_note(*skewed)
-    return rendered
+    declared keys means there is no key list to drift from the code (#619).
+
+    ``prefix=True`` marks a renderer whose output is concatenated AHEAD of
+    another render -- the CLI builds `disasm` as note + steer + body -- so its
+    note must END with a newline or it glues onto the next renderer's first
+    line. Such a renderer being no boundary at all is the worse failure, and it
+    was live: ``_resolution_note`` and ``_disasm_linear_steer_note`` read
+    through the choke point, but every CLI caller invokes them BARE, so the skew
+    they recorded landed in the default (absent) recorder and was dropped -- the
+    containing-function note this module calls load-bearing vanished in silence
+    on six text subcommands (#619)."""
+    def decorate(inner: Callable[..., str]) -> Callable[..., str]:
+        @functools.wraps(inner)
+        def rendered(*args: Any, **kwargs: Any) -> str:
+            token = _SKEWED_FIELDS.set([])
+            try:
+                out = inner(*args, **kwargs)
+                skewed = sorted(_SKEWED_FIELDS.get() or ())
+            finally:
+                _SKEWED_FIELDS.reset(token)
+            if not skewed or not isinstance(out, str):
+                return out
+            note = _skew_note(*skewed)
+            if prefix:
+                return out + note + "\n"
+            return out + ("\n" if out else "") + note
+        return rendered
+    return decorate if fn is None else decorate(fn)
 
 
 def _fmt_count(value: Any) -> str:
@@ -310,6 +326,10 @@ def _slice_text_lines(
     return header + "\n" + "\n".join(sliced)
 
 
+# A BOUNDARY, not just a reader: every CLI caller concatenates this note ahead of
+# another render and none of them wraps it, so without one of its own the skew it
+# records below reaches no recorder and the note disappears in silence (#619).
+@_discloses(prefix=True)
 def _resolution_note(value: Any) -> str:
     """A leading note when a function-scoped read annotated how it resolved the
     requested address (#193 Part 4).
@@ -371,6 +391,9 @@ def _is_exact_start(resolved_from: dict[str, Any]) -> bool:
         return False
 
 
+# A BOUNDARY for the same reason as `_resolution_note`: `disasm` builds its text
+# as note + steer + body, and nothing wraps the steer (#619).
+@_discloses(prefix=True)
 def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
     """A disasm-only note when a mid-function address was sliced (#371.3).
 
@@ -437,8 +460,9 @@ def _render_capabilities_text(value: Any) -> str:
         lines.append(f"  {command}  --  {help_text}" if help_text else f"  {command}")
         if item.get("prefer_when"):
             lines.append(f"      prefer when: {item['prefer_when']}")
-        if item.get("see_also"):
-            lines.append(f"      see also: {', '.join(item['see_also'])}")
+        see_also = _field_list(item, "see_also")
+        if see_also:
+            lines.append(f"      see also: {', '.join(str(x) for x in see_also)}")
     return "\n".join(lines)
 
 
@@ -516,7 +540,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
             # BN's own block index -- label it, or the out-of-order numbers read
             # as a sort bug rather than as CFG order.
             lines.append(
-                f"  blk{b.get('index', '?'):<4} {b.get('start', '?')}..{b.get('end', '?')}  "
+                f"  blk{_fmt_count(b.get('index', '?')):<4} {b.get('start', '?')}..{b.get('end', '?')}  "
                 f"{b.get('length', '?')} bytes  -> {out}")
 
     return _resolution_note(value) + "\n".join(lines)
@@ -617,13 +641,13 @@ def _render_field_xrefs_text(value: Any) -> str:
     malformed_refs = [it for it in items if not isinstance(it, dict)]
     if code_refs:
         for ref in code_refs:
-            details = [ref.get("address", "<unknown>")]
+            details = [str(ref.get("address", "<unknown>"))]
             if ref.get("function"):
-                details.append(ref["function"])
+                details.append(str(ref["function"]))
             if ref.get("incoming_type"):
                 details.append(f"type={ref['incoming_type']}")
             if ref.get("disasm"):
-                details.append(ref["disasm"])
+                details.append(str(ref["disasm"]))
             lines.append("- " + " | ".join(details))
     else:
         lines.append("- none")
@@ -790,7 +814,7 @@ def _render_load_text(value: Any) -> str:
         lines.append("targets:")
         for t in targets:
             if isinstance(t, dict):
-                lines.append("- " + (t.get("selector") or t.get("basename") or "<unknown>"))
+                lines.append("- " + str(t.get("selector") or t.get("basename") or "<unknown>"))
             else:
                 lines.append("- " + _render_fallback_text(t))
     return "\n".join(lines)
@@ -926,8 +950,8 @@ def _render_session_status_text(value: Any) -> str:
         )
         if item.get("error"):
             lines.append(f"  error: {item['error']}")
-        result = item.get("result")
-        if isinstance(result, dict):
+        result = _field_dict(item, "result")
+        if result:
             for target in _field_list(result, "targets"):
                 if isinstance(target, dict) and target.get("selector"):
                     lines.append(f"  target: {target['selector']}")
@@ -976,10 +1000,10 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
-        binaries = item.get("binaries")
+        binaries = _field_list(item, "binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
-        project_roots = item.get("project_roots")
+        project_roots = _field_list(item, "project_roots")
         if project_roots:
             lines.append(
                 f"  projects: {', '.join(str(root) for root in project_roots)}"
@@ -1481,7 +1505,7 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
         caller = _field_dict(ref, "caller_function")
         key: tuple
         if caller or isinstance(ref.get("caller_function"), dict):
-            key = ("fn", caller.get("address"), caller.get("name"))
+            key = ("fn", str(caller.get("address")), str(caller.get("name")))
             caller_address = caller.get("address")
             caller_name = caller.get("name")
         else:
@@ -1491,7 +1515,9 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
             # ref's label (which mislabeled the others). A label-less ref is
             # never coalesced -- it keys on its own address so each renders as a
             # distinct "<unknown>" line with its own context.
-            label = _unknown_ref_label(ref.get("context")) or ref.get("function")
+            fn_label = ref.get("function")
+            label = (_unknown_ref_label(_field_dict(ref, "context"))
+                     or ("" if fn_label is None else str(fn_label)))
             if label:
                 key = ("label", label)
             else:
@@ -1503,7 +1529,7 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
                 "caller_address": caller_address,
                 "caller_name": caller_name,
                 "sites": [],
-                "context": ref.get("context"),
+                "context": _field_dict(ref, "context") or None,
             }
             order.append(key)
         groups[key]["sites"].append(str(ref.get("address", "<unknown>")))
@@ -1512,17 +1538,19 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
 
 def _unknown_ref_label(context: Any) -> str:
     """A concise fallback label (symbol name, else section name) for a ref that
-    has no containing function, so it isn't rendered as a bare "<unknown>"."""
+    has no containing function, so it isn't rendered as a bare "<unknown>".
+
+    Reads through the choke point: a skewed `symbol` here silently downgraded the
+    ref to "<unknown>", which reads as "this ref belongs to nothing" rather than
+    "the label could not be read" (#619)."""
     if not isinstance(context, dict):
         return ""
-    symbol = context.get("symbol")
-    if isinstance(symbol, dict) and symbol.get("name"):
+    symbol = _field_dict(context, "symbol")
+    if symbol.get("name"):
         return str(symbol["name"])
-    sections = context.get("sections")
-    if isinstance(sections, list):
-        for item in sections:
-            if isinstance(item, dict) and item.get("name"):
-                return str(item["name"])
+    for item in _field_list(context, "sections"):
+        if isinstance(item, dict) and item.get("name"):
+            return str(item["name"])
     return ""
 
 
@@ -1608,7 +1636,7 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
             caller_addr = group["caller_address"] or "<unknown>"
             caller_name = (
                 group["caller_name"]
-                or _unknown_ref_label(group.get("context"))
+                or _unknown_ref_label(_field_dict(group, "context"))
                 or "<unknown>"
             )
             sites = group["sites"]
@@ -1646,31 +1674,40 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
 
 
 def _context_suffix(context: Any) -> str:
+    """The `| section=… | seg=rwx | symbol=…` tail on a ref row.
+
+    Every sub-field goes through the choke point. They used to be `.get()` plus
+    an `isinstance` filter, which is the #619 defect one container down: a ref
+    whose `symbol` or `sections` arrived skewed rendered a row with NO context at
+    all -- byte-identical to a ref that genuinely has none -- and the caller
+    reads the absence as fact. The filters stay (a wrong shape still renders
+    nothing rather than garbage); what changes is that the skew is now RECORDED,
+    so the render says so."""
     if not isinstance(context, dict):
         return ""
     parts = []
-    sections = context.get("sections")
-    if isinstance(sections, list) and sections:
+    sections = _field_list(context, "sections")
+    if sections:
         names = [str(item.get("name", "")) for item in sections if isinstance(item, dict) and item.get("name")]
         if names:
             parts.append("section=" + ",".join(names))
-    segment = context.get("segment")
-    if isinstance(segment, dict):
+    segment = _field_dict(context, "segment")
+    if segment:
         perms = (
             ("r" if segment.get("readable") else "-")
             + ("w" if segment.get("writable") else "-")
             + ("x" if segment.get("executable") else "-")
         )
         parts.append(f"seg={perms}")
-    symbol = context.get("symbol")
-    if isinstance(symbol, dict) and symbol.get("name"):
+    symbol = _field_dict(context, "symbol")
+    if symbol.get("name"):
         sym_type = symbol.get("type")
         if sym_type:
             parts.append(f"symbol={symbol['name']}[{sym_type}]")
         else:
             parts.append(f"symbol={symbol['name']}")
-    string = context.get("string")
-    if isinstance(string, dict) and string.get("value"):
+    string = _field_dict(context, "string")
+    if string.get("value"):
         enc = string.get("encoding")
         label = "string" if enc in (None, "ascii") else f"string({enc})"
         parts.append(
@@ -1721,7 +1758,7 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
             # the context suffix).
             fp = " [function pointer]" if ref.get("function_pointer") else ""
             lines.append(
-                f"- {address}  {ref_kind}  {function}{_context_suffix(ref.get('context'))}{fp}"
+                f"- {address}  {ref_kind}  {function}{_context_suffix(_field_dict(ref, 'context'))}{fp}"
             )
     if value.get("fn_pointer_scan_truncated"):
         lines.append(
@@ -1757,22 +1794,25 @@ def _render_target_line(target: Any) -> str:
     else:
         addr = normalized or raw or "<unknown>"
         context = _field_dict(target, "context")
-        symbol = context.get("symbol")
-        string = context.get("string")
-        sections = context.get("sections")
+        # Through the choke point: a skewed `symbol`/`string`/`sections` here
+        # silently downgraded a resolved target to a bare address, which reads
+        # as "this pointer names nothing" (#619).
+        symbol = _field_dict(context, "symbol")
+        string = _field_dict(context, "string")
+        sections = _field_list(context, "sections")
         section_name = None
-        if isinstance(sections, list) and sections and isinstance(sections[0], dict):
+        if sections and isinstance(sections[0], dict):
             section_name = sections[0].get("name")
-        if isinstance(symbol, dict) and symbol.get("name"):
+        if symbol.get("name"):
             base = f"{symbol['name']} @ {addr}"
-            annot = [a for a in (section_name, symbol.get("type")) if a]
+            annot = [str(a) for a in (section_name, symbol.get("type")) if a]
             if annot:
                 base += f" [{', '.join(annot)}]"
-        elif isinstance(string, dict) and string.get("value"):
+        elif string.get("value"):
             enc = string.get("encoding")
             base = json.dumps(string["value"], ensure_ascii=True)
             annot = [
-                a
+                str(a)
                 for a in (
                     section_name,
                     (enc if enc and enc != "ascii" else None),
@@ -1869,7 +1909,8 @@ def _render_function_evidence_text(value: Any) -> str:
             tag = " ".join(x for x in (source, confidence) if x)
             lines.append("  arguments:" + (f" ({tag})" if tag else ""))
             for arg in args:
-                lines.append(f"    {arg.get('text', '')}{_render_resolved_arg(arg.get('resolved'))}")
+                lines.append(f"    {arg.get('text', '')}"
+                             f"{_render_resolved_arg(_field_dict(arg, 'resolved'))}")
             if call.get("arity_unknown"):
                 # #648: the callee has no recovered prototype, so BN assumed every
                 # argument register was live and HLIL rendered whatever sat in them.
@@ -1904,8 +1945,8 @@ def _render_function_evidence_text(value: Any) -> str:
                 "  arity: UNKNOWN — call target could not be resolved to a callee "
                 "function, so no signature exists to check arguments against."
             )
-        variadic = call.get("variadic")
-        if isinstance(variadic, dict) and variadic.get("is_variadic"):
+        variadic = _field_dict(call, "variadic")
+        if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
             if variadic.get("under_recovered") and variadic.get("warning"):
                 lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
@@ -2185,12 +2226,13 @@ def _render_pointer_table_text(value: Any) -> str:
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
-        prefix = f"[{item.get('index', '?'):>2}] {item.get('entry_address', '<unknown>')}"
+        prefix = f"[{_fmt_count(item.get('index', '?')):>2}] {item.get('entry_address', '<unknown>')}"
         if not item.get("readable", True):
             lines.append(f"{prefix}  <unreadable>")
             continue
         plausibility = "" if item.get("plausible", True) else "  [implausible]"
-        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> {_render_target_line(item.get('target'))}{plausibility}")
+        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> "
+                     f"{_render_target_line(_field_dict(item, 'target'))}{plausibility}")
     return "\n".join(lines)
 
 
@@ -2212,7 +2254,7 @@ def _render_message_lens_text(value: Any) -> str:
         type_string = _field_dict(match, "type_string")
         lines.append("")
         lines.append(f"{type_string.get('address', '<unknown>')}  {json.dumps(type_string.get('value', ''), ensure_ascii=True)}")
-        suffix = _context_suffix(type_string.get("context"))
+        suffix = _context_suffix(_field_dict(type_string, "context"))
         if suffix:
             lines.append(f"  context{suffix}")
         xrefs = _field_dict(match, "xrefs")
@@ -2221,10 +2263,10 @@ def _render_message_lens_text(value: Any) -> str:
         lines.append(f"  xrefs: {code_count} code, {data_count} data")
         for ref in _field_list(xrefs, "code_refs")[:3]:
             if isinstance(ref, dict):
-                lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(ref.get('context'))}")
+                lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(_field_dict(ref, 'context'))}")
         for ref in _field_list(xrefs, "data_refs")[:3]:
             if isinstance(ref, dict):
-                lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(ref.get('context'))}")
+                lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(_field_dict(ref, 'context'))}")
         table_windows = _field_list(match, "metadata_table_windows")
         if table_windows:
             lines.append(f"  metadata table windows: {len(table_windows)}")
@@ -2243,8 +2285,8 @@ def _render_message_lens_text(value: Any) -> str:
         lines.append("")
         lines.append(f"rtti {sym.get('kind', '?')}: {sym.get('symbol', '')} @ {sym.get('address', '?')}"
                      f"  xrefs: {cc} code, {dc} data")
-        tw = sym.get("table_window")
-        if isinstance(tw, dict):
+        tw = _field_dict(sym, "table_window")
+        if tw:
             # #303: the table window is the #275 envelope keyed on `items`; the
             # pre-#275 `entries` key always read 0, so a resolved RTTI vtable
             # window falsely rendered "(0 slots)" in text while the JSON carried
@@ -2381,7 +2423,9 @@ def _render_orient_text(value: Any) -> str:
         for s in items[:15]:
             if isinstance(s, dict):
                 # `or ''` (not just the .get default) guards an explicit value:None.
-                lines.append(f"    {s.get('address', '?')}  {(s.get('value') or '')[:80]!r}")
+                raw = s.get("value")
+                shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
+                lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
     return "\n".join(lines)
 
 
@@ -2418,7 +2462,8 @@ def _render_init_arrays_text(value: Any) -> str:
             if not item.get("readable", True):
                 lines.append(f"{prefix}  <unreadable>")
                 continue
-            lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> {_render_target_line(item.get('target'))}")
+            lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> "
+                         f"{_render_target_line(_field_dict(item, 'target'))}")
     return "\n".join(lines)
 
 
@@ -2495,8 +2540,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             lines.append(f"hlil: null ({row['hlil_statement_reason']})")
         if row.get("pre_branch_condition"):
             lines.append(f"pre-branch: {row['pre_branch_condition']}")
-        variadic = row.get("callee_variadic")
-        if isinstance(variadic, dict) and variadic.get("is_variadic"):
+        variadic = _field_dict(row, "callee_variadic")
+        if variadic.get("is_variadic"):
             # #558: steer to the argument-recovery views for an imported variadic callee.
             lines.append(
                 f"variadic-callee: {variadic.get('name', '?')} — HLIL may show only fixed "
@@ -2561,8 +2606,10 @@ def _render_structured_il_text(value: Any) -> str:
         if not isinstance(ins, dict):
             lines.append(f"  {ins}")
             continue
-        reads = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in _field_list(ins, "vars_read"))
-        writes = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in _field_list(ins, "vars_written"))
+        reads = ",".join(str(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")))
+                         for v in _field_list(ins, "vars_read"))
+        writes = ",".join(str(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")))
+                          for v in _field_list(ins, "vars_written"))
         head = f"  [{ins.get('il_index')}] {ins.get('address')}  {ins.get('op')}  {ins.get('text', '')}".rstrip()
         lines.append(head)
         if reads or writes:
@@ -2594,7 +2641,7 @@ def _render_defuse_text(value: Any) -> str:
         lines.append("def: <none (parameter/entry/aliased)>")
     if value.get("is_phi"):
         srcs = ", ".join(
-            (s.get("ssa", s.get("name", "?")) if isinstance(s, dict) else repr(s))
+            (str(s.get("ssa", s.get("name", "?"))) if isinstance(s, dict) else repr(s))
             for s in _field_list(value, "phi_sources"))
         lines.append(f"phi sources: {srcs}")
     uses = _field_list(value, "uses")
@@ -2736,12 +2783,13 @@ def _leaf_group_key(leaf: Any) -> tuple:
         # of rows that only look alike because both are broken.
         return (type(leaf), repr(leaf))
     kind = leaf.get("kind")
+    kind = kind if isinstance(kind, str) else str(kind)
     if kind == "unmodeled_callee":
-        return (kind, _field_dict(leaf, "callee").get("name", "?"))
+        return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
     if kind == "field_load_unresolved":
-        return (kind, leaf.get("base"), leaf.get("offset"))
+        return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
-        return (kind, _field_dict(leaf, "callee").get("name", "?"))
+        return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
     return (kind,)
 
 
@@ -2835,7 +2883,7 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     trunc = _taint_truncation_note(stats)
     if findings:
         sinks = [_field_dict(f, "sink") for f in findings]
-        classes = ", ".join(sorted({s.get("class") or "?" for s in sinks}))
+        classes = ", ".join(sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
@@ -2974,7 +3022,8 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             m = _field_dict(sl, "metrics")
             sig = _field_dict(sl, "signature").get("rendered", "")
             n = sl.get("reached_via_call_sites", 1)
-            xn = f"  (x{n} callsites)" if n and n > 1 else ""
+            xn = (f"  (x{n} callsites)"
+                  if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
             unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
             # Compact one line per slice by default; (xN) surfaces the engine's existing
@@ -3118,7 +3167,8 @@ def _render_taint_models_text(value: Any) -> str:
     ov = _field_list(value, "overlays")
     if ov:
         lines.append("")
-        lines.append("overlays: " + ", ".join(_as_dict(o).get("path", _as_dict(o).get("kind", "?")) for o in ov))
+        lines.append("overlays: " + ", ".join(
+            str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
     return "\n".join(lines) if lines else "no models match the filter"
 
 
@@ -3273,8 +3323,8 @@ def _render_strings_rows(value: Any) -> str:
         # --probable-format-strings enrichment: surface the recovered printf
         # directives and code-xref count so the survey is scannable without
         # re-reading the JSON. Absent on a plain strings dump.
-        directives = item.get("format_directives")
-        if isinstance(directives, list) and directives:
+        directives = _field_list(item, "format_directives")
+        if directives:
             refs = item.get("code_refs")
             suffix = f"  [fmt: {' '.join(str(d) for d in directives)}"
             if isinstance(refs, int):
@@ -3312,7 +3362,7 @@ def _render_sections_rows(value: Any) -> str:
         perms = ""
         if "readable" in item:
             perms = ("r" if item["readable"] else "-") + ("w" if item.get("writable") else "-") + ("x" if item.get("executable") else "-")
-        line = f"{start}-{end}  {length:>8}  {perms:>3}  {semantics:<20}  {name}"
+        line = f"{start}-{end}  {_fmt_count(length):>8}  {perms:>3}  {str(semantics):<20}  {name}"
         lines.append(line.rstrip())
     return "\n".join(lines)
 
@@ -3530,6 +3580,8 @@ def _render_doctor_text(value: Any) -> str:
 
 def _format_operation_result(item: dict[str, Any]) -> str:
     op = item.get("op", "<unknown>")
+    if not isinstance(op, str):                    # an unhashable op crashed the `in` test
+        op = str(op)
     requested = _field_dict(item, "requested")
 
     def _get(key: str, default: str = "<unknown>") -> str:
@@ -3718,7 +3770,7 @@ def _add_mutation_ok(value: Any) -> Any:
     if not isinstance(value, dict) or "ok" in value:
         return value
     results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
-    failed = any(r.get("status") in FAILED_MUTATION_STATUSES for r in results)
+    failed = any(str(r.get("status")) in FAILED_MUTATION_STATUSES for r in results)
     return {"ok": bool(value.get("success", True)) and not failed, **value}
 
 
@@ -3866,7 +3918,7 @@ def _mutation_summary(value: Any) -> Any:
     if value.get("kind") == "mutation_summary":
         return value
     results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
-    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
+    failed = [r for r in results if str(r.get("status")) in FAILED_MUTATION_STATUSES]
     verified = sum(1 for r in results if r.get("status") == "verified")
     noop = sum(1 for r in results if r.get("status") == "noop")
     # #684: every genuine `mutation_engine` op populates at least one `results[]`
@@ -4019,7 +4071,7 @@ def _render_mutation_text(value: Any) -> str:
     success = bool(value.get("success", True))
     committed = bool(value.get("committed", False))
     results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
-    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
+    failed = [r for r in results if str(r.get("status")) in FAILED_MUTATION_STATUSES]
 
     lines: list[str] = []
 
@@ -4298,12 +4350,15 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
     stopping conditions, not a verdict."""
     if not isinstance(frontiers, list) or not frontiers:
         return []
-    total = sum(g.get("count", 0) for g in frontiers if isinstance(g, dict))
+    total = sum(c for c in (g.get("count", 0) for g in frontiers if isinstance(g, dict))
+                if isinstance(c, int) and not isinstance(c, bool))
     out = ["", f"  frontiers ({total} terminal step(s) in {len(frontiers)} group(s)):"]
     for g in frontiers:
         if not isinstance(g, dict):
             continue
         reason = g.get("reason") or "unspecified"
+        if not isinstance(reason, str):            # an unhashable reason crashed the lookup
+            reason = str(reason)
         label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
         # Name the resolved callee(s) at a boundary so the roll-up reads
         # `call boundary x3 (strlen, memcpy)` rather than a bare count.
@@ -4388,7 +4443,7 @@ def _render_class_list_text(value: Any) -> str:
         size_s = size.get("value") if isinstance(size, dict) else size
         # `bases` arrives as name-dicts (what class show renders) or bare strings;
         # joining a dict crashed the whole listing (#619).
-        bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else str(b)
+        bases = ", ".join(str((b.get("name") or "?") if isinstance(b, dict) else b)
                           for b in _field_list(rec, "bases") if b)
         base_s = f"  : {bases}" if bases else ""
         # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
@@ -4464,7 +4519,7 @@ def _render_one_class(rec: Any) -> str:
     # No element filter: a declared but EMPTY base entry is a base the payload
     # claimed, so it renders as `?` the way base rendered it. Dropping it turned
     # "has an unnamed base" into "has no such base" in a hierarchy view (#619).
-    bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else (str(b) if b else "?")
+    bases = ", ".join(str((b.get("name") or "?") if isinstance(b, dict) else (b if b else "?"))
                       for b in _field_list(rec, "bases"))
     head = f"class {rec.get('name', '<unknown>')}"
     bits = []

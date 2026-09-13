@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import copy
 import functools
 import inspect
@@ -1558,6 +1559,101 @@ _MALFORMED = {
 }
 
 
+# Excluded from the probe BY NAME, each with the reason it is not a payload
+# renderer. An exclusion that is not named here does not exist: a silent one is
+# how five live renderers left the population at round 8 and two more at round 9.
+_PROBE_EXCLUSIONS = {
+    "_render_paged_list_text": ("takes its page key and its item renderer as REQUIRED "
+                                "parameters, so the field it reads is an argument rather "
+                                "than a property of the module, and every caller reaches "
+                                "it through a renderer that is itself probed"),
+    "_slice_text_lines": ("its first argument is ALREADY-RENDERED TEXT plus a required "
+                          "line range, not a payload; it reads no payload key at all"),
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_installed_renderers():
+    """Every `bn.formatters` symbol the CLI installs as a text renderer, read out
+    of the command modules' own AST.
+
+    An inventory of this module's LIVE ENTRY POINTS that is independent of how
+    the module spells its function names and of which functions carry the
+    `@_discloses` decorator. Both of those are properties of the thing under
+    guard, and both have already dropped live renderers out of the population:
+    round 8's arity rule dropped six, and the `_render*` NAME prefix beside it
+    dropped `_resolution_note` and `_disasm_linear_steer_note` -- two renderers
+    the CLI concatenates ahead of six subcommands' output -- whose top-level
+    reads were then certified as part of the unreachable-nested bucket.
+
+    A renderer named through a `*_renderer=` keyword is followed one hop into a
+    locally defined wrapper, because that is how `decompile` installs its own."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    commands = pathlib.Path(formatters.__file__).resolve().parent / "commands"
+    installed: set[str] = set()
+    for path in sorted(commands.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        imported = {alias.asname or alias.name
+                    for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                    if (node.module or "").endswith("formatters")
+                    for alias in node.names}
+        local_defs = {node.name: node for node in ast.walk(tree)
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        def names_in(node, seen=None):
+            seen = set() if seen is None else seen
+            found = set()
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Name):
+                    continue
+                if sub.id in imported:
+                    found.add(sub.id)
+                elif sub.id in local_defs and sub.id not in seen:
+                    seen.add(sub.id)
+                    found |= names_in(local_defs[sub.id], seen)
+            return found
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg and kw.arg.endswith("_renderer"):
+                    installed |= names_in(kw.value)
+    return frozenset(installed)
+
+
+def test_every_renderer_the_cli_installs_is_in_the_population():
+    """The population's entry points come from the CLI, not from this module's
+    naming convention.
+
+    `_probe_renderers` scans `dir(formatters)` for a `_render` prefix, which is a
+    property of the thing being guarded: a live renderer spelled `_resolution_note`
+    was invisible to it, so the differential, the raise sweep and the no-mutation
+    invariant could not fail on it, and its top-level reads were mis-filed as
+    unreachable-nested. This asserts the two inventories agree, so a renderer the
+    CLI installs cannot leave the population by being named differently."""
+    from bn import formatters
+
+    installed = _cli_installed_renderers()
+    # Anti-vacuity: a broken AST walk returning nothing would satisfy the
+    # subset check below without examining anything.
+    assert {"_resolution_note", "_disasm_linear_steer_note", "_slice_text_lines",
+            "_render_defuse_text"} <= installed, sorted(installed)
+    probed = {label.split("(")[0] for label, _ in _probe_renderers()}
+    missing = sorted(installed - probed - set(_PROBE_EXCLUSIONS))
+    assert not missing, (
+        f"the CLI installs {missing} as text renderer(s) that the probe never "
+        "runs, so no guard below can fail on them. Probe them, or name each one "
+        "in _PROBE_EXCLUSIONS with the reason it is not a payload renderer.")
+    for name, reason in _PROBE_EXCLUSIONS.items():
+        assert callable(getattr(formatters, name, None)), f"{name} no longer exists"
+        assert name not in probed and reason, f"{name} is probed; drop its exclusion"
+
+
 def _probe_renderers():
     """Every renderer in the module, crossed with every combination of its
     boolean flags. Discovered by INSPECTING THE MODULE, not by asking the
@@ -1577,26 +1673,41 @@ def _probe_renderers():
     because a flag gates whole blocks of reads (`--verbose` locals, `--full`
     SSA paths) that the default call never reaches.
 
-    Exactly one function is excluded, by name and with its reason:
-    `_render_paged_list_text` takes its page key and its item renderer as
-    REQUIRED parameters, so the field it reads is an argument rather than a
-    property of the module, and every caller reaches it through a renderer that
-    is itself probed.
+    Two candidate sets, unioned: every `_render*` name in the module, and every
+    symbol the CLI installs as a text renderer (`_cli_installed_renderers`,
+    read out of the command modules rather than out of this one). The name
+    prefix alone is a property of the thing under guard, and it dropped
+    `_resolution_note` and `_disasm_linear_steer_note` -- both concatenated
+    ahead of six live subcommands -- out of the population entirely.
+
+    Exclusions are named with their reason in `_PROBE_EXCLUSIONS` and asserted
+    by `test_every_renderer_the_cli_installs_is_in_the_population`; a silent
+    exclusion is the defect, not the exclusion itself.
 
     A renderer that returns lines instead of a string is rendered the way its
-    caller renders it, and one that is not itself a `@_discloses` boundary is
-    wrapped in one -- in production its caller's boundary is what appends the
-    note, so probing it without a boundary would report every helper as silent.
-    Wrapping is not a shortcut past the property: the boundary drains what the
-    CHOKE POINT recorded, so a coercion that bypasses the choke point still
-    produces no note and still fails below."""
+    caller renders it, and a NESTED helper that is not itself a `@_discloses`
+    boundary is wrapped in one -- in production its caller's boundary is what
+    appends the note, so probing it without a boundary would report every helper
+    as silent. Wrapping is not a shortcut past the property: the boundary drains
+    what the CHOKE POINT recorded, so a coercion that bypasses the choke point
+    still produces no note and still fails below.
+
+    A renderer the CLI installs DIRECTLY is never wrapped, because production
+    does not wrap it: the command modules call `_resolution_note(value) +
+    _render_defuse_text(value)`, so an undecorated one has no boundary at all and
+    the skew it records is dropped. Wrapping it here would have manufactured the
+    disclosure the user never sees -- the probe must call a live entry point
+    exactly as its caller does, or it measures the harness instead of the code."""
+
     import itertools
 
     from bn import formatters
 
     out = []
-    for name in sorted(dir(formatters)):
-        if not name.startswith("_render"):
+    candidates = ({name for name in dir(formatters) if name.startswith("_render")}
+                  | set(_cli_installed_renderers()))
+    for name in sorted(candidates):
+        if not hasattr(formatters, name):
             continue
         fn = getattr(formatters, name)
         if not callable(fn):
@@ -1609,8 +1720,13 @@ def _probe_renderers():
                       if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
         if len([p for p in positional if p.default is p.empty]) != 1:
             continue                       # not a payload renderer; see docstring
+        # A REQUIRED keyword-only bool is a flag too: `_disasm_linear_steer_note`
+        # gates its whole body on `sliced`, and calling it without one is a
+        # TypeError, so a rule that only saw defaulted flags could not run it.
         flags = [p.name for p in params
-                 if p.default is not p.empty and isinstance(p.default, bool)]
+                 if (p.default is not p.empty and isinstance(p.default, bool))
+                 or (p.kind is p.KEYWORD_ONLY and p.default is p.empty
+                     and p.annotation in (bool, "bool"))]
         for values in itertools.product((False, True), repeat=len(flags)):
             kwargs = dict(zip(flags, values))
             label = name + ("" if not kwargs else
@@ -1625,9 +1741,11 @@ def _probe_renderers():
                 return str(rendered)
 
             # An already-decorated renderer appends its own note from inside
-            # `call`; an undecorated helper needs the boundary its caller
-            # supplies in production.
+            # `call`; a nested helper needs the boundary its caller supplies in
+            # production. A renderer the CLI installs directly has NO such
+            # caller, so it is probed exactly as bare as production leaves it.
             out.append((label, call if hasattr(fn, "__wrapped__")
+                        or name in _cli_installed_renderers()
                         else formatters._discloses(call)))
     return out
 
@@ -1940,6 +2058,95 @@ def _watched(kind):
             else _WatchedDict(_PROBE_ELEMENT))
 
 
+def _payload_for(ctx, path, leaf):
+    """The renderer's payload with `leaf` placed at the end of `path`.
+
+    A path step is `(key, kind)`: a list-kind step wraps the node as the single
+    ELEMENT of the list at that key, a dict-kind step puts the node AT the key,
+    because that is what the renderer walks in each case."""
+    node = leaf
+    for key, kind in reversed(path):
+        node = {key: [node] if kind == "list" else node}
+    return {**copy.deepcopy(ctx), **node}
+
+
+# How far below the payload the nested probe descends. Two levels reaches a key
+# of a callee ROW, a per-block `insns`, a flow's `leaves`, and a ref bucket
+# inside a match row -- the shapes the module actually nests. The bound is
+# stated because it is a real limit: a read three containers down is outside
+# this differential and is covered only by a named test.
+_NEST_DEPTH = 2
+
+
+@functools.lru_cache(maxsize=1)
+def _nested_population():
+    """The same discovery, one and two containers BELOW the payload.
+
+    The top-level probe records what a renderer asks of its own payload, so a
+    container read out of a callee row or a per-match ref bucket is invisible to
+    it: those reads were counted (the `nested` bucket) and then never
+    differentially tested, so a silent-empty coercion at a nested position
+    passed every guard in this file -- proven by injecting a one-hop helper at a
+    nested ref bucket with all 176 tests green.
+
+    Counting is not covering. This descends instead: for every container
+    position already observed, it hands that container a RECORDING element,
+    collects the keys the renderer asks of it, classifies each by whether a
+    watched container placed there is actually walked, and pushes the ones that
+    are onto the next level's frontier. The population is still only what a
+    renderer was OBSERVED reading -- never what the module declares."""
+    from bn import formatters
+
+    real_json = formatters.json
+    formatters.json = _QuietJson(real_json)
+    try:
+        nested = []
+        frontier = [(name, render, (key, kind), ctx)
+                    for name, render, key, kind, ctx in _runtime_population()
+                    if kind is not None]
+        for _depth in range(_NEST_DEPTH):
+            next_frontier = []
+            for name, render, step, ctx in frontier:
+                path = step if isinstance(step[0], tuple) else (step,)
+                literals = _comparison_literals(name.split("(")[0])
+                seen: set[str] = set()
+                for _ in range(4):                    # fixed point, as at top level
+                    before = frozenset(seen)
+                    for filler in (None, "list", "dict"):
+                        leaf = _KeyProbe(
+                            {**_PROBE_ELEMENT,
+                             **{k: copy.deepcopy(_PROBE_WELL_FORMED[filler]) for k in sorted(seen)}},
+                            seen)
+                        _render_or_exception(render, _payload_for(ctx, path, leaf))
+                    for literal in literals:
+                        leaf = _KeyProbe({**_PROBE_ELEMENT, **{k: literal for k in sorted(seen)}}, seen)
+                        _render_or_exception(render, _payload_for(ctx, path, leaf))
+                    if frozenset(seen) == before:
+                        break
+                for nkey in sorted(seen):
+                    observed = None
+                    for kind in ("list", "dict"):
+                        probe = _watched(kind)
+                        leaf = {**_PROBE_ELEMENT, nkey: probe}
+                        _render_or_exception(render, _payload_for(ctx, path, leaf))
+                        if probe.hits & _CONTAINER_USE:
+                            observed = kind
+                            break
+                    # Kind-free, exactly like the top level: an UNCLASSIFIED
+                    # nested key still gets swept for raises, because a scalar
+                    # read that dies on a wrong shape is the same #619 defect --
+                    # a sampled string sliced as `(s.get("value") or "")[:80]`
+                    # raised on a dict and cost the whole card. Only a classified
+                    # container is descended into and differentiated.
+                    nested.append((name, render, path, nkey, observed, ctx))
+                    if observed is not None:
+                        next_frontier.append((name, render, path + ((nkey, observed),), ctx))
+            frontier = next_frontier
+        return nested
+    finally:
+        formatters.json = real_json
+
+
 def test_the_runtime_population_is_exactly_this_big():
     """The LOAD-BEARING half of the differential below, and the half every
     earlier round left out.
@@ -1954,7 +2161,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (98, 84, 507, 190), (
+    assert (probed, len(reading), len(population), len(containers)) == (102, 86, 510, 193), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -1991,10 +2198,15 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     * The remaining declared reads sit where a TOP-LEVEL key probe cannot reach
       them: a key of a callee ROW, a per-block `insns`, a flow's `leaves`, or a
       read inside a helper that is handed a nested object rather than the
-      renderer's payload. Those are covered by the named nested tests above.
+      renderer's payload. Those are the population of the NESTED differential
+      above, plus the named nested tests.
 
-    Both counts are exact, so a read that silently leaves top-level coverage
-    fails here instead of quietly shrinking the differential."""
+    Counted twice on purpose, and this is a round-9 repair. `declared` is a SET
+    of `(function, key)` pairs, so a key read at several call sites in one
+    function survives losing one of them: 25 pairs have 2-4 sites each, and
+    converting one of those sites to a raw coercion moved neither count. The
+    CALL SITES are therefore counted too, so a read that leaves coverage fails
+    here instead of quietly shrinking the differential."""
     import ast
     import inspect
 
@@ -2002,6 +2214,7 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
 
     tree = ast.parse(inspect.getsource(formatters))
     declared = set()
+    sites = set()
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -2011,6 +2224,7 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
                 for arg in node.args[1:]:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         declared.add((fn.name, arg.value))
+                        sites.add((fn.name, arg.value, node.lineno, arg.col_offset))
 
     population = _runtime_population()
     # A population label carries the flag combination it was probed under
@@ -2024,15 +2238,41 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     missed = sorted(f"{name}.{key}" for name, key in declared - classified
                     if (name, key) in read)
     nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 202, f"the module declares {len(declared)} choke-point reads, not 202"
+    assert len(declared) == 227, f"the module declares {len(declared)} choke-point reads, not 227"
+    assert len(sites) == 249, (
+        f"the module has {len(sites)} choke-point CALL SITES, not 249. A pair "
+        "read at several sites keeps its (function, key) entry when one site is "
+        "converted to a raw coercion, which is why the sites are counted too.")
     assert missed == ["_render_defuse_text.other_versions",
                       "_render_leaf_line.dropped_args",
                       "_render_leaf_line.tainted_args"], (
         "a choke-point read the probe reaches at top level is no longer "
         f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 72, (
+    assert len(nested) == 94, (
         f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 72")
+        "reach them, not 94")
+    # Counting is not covering, and that was round 9's blocker: the nested reads
+    # were counted here and then differentially tested nowhere, so a one-hop
+    # helper coercing a nested ref bucket passed every guard in this file. Every
+    # nested declared read must now be EXERCISED -- by the nested differential,
+    # or by the top-level one where a helper reads a key off the renderer's own
+    # payload and the AST attributes it to the helper's name.
+    exercised = ({key for _, _, key, kind, _ in population if kind is not None}
+                 | {key for _, _, _, key, kind, _ in _nested_population()
+                    if kind is not None})
+    uncovered = sorted(f"{fn}.{key}" for fn, key in nested if key not in exercised)
+    # The residue, named rather than counted: each is read by a HELPER behind a
+    # branch gated on a constant the helper owns (an op name, a truncation
+    # cause), so neither probe's per-renderer filler opens it. Each has its own
+    # named test above -- the truncated-taint stats, the affected-types listing,
+    # the blast-radius summary, the mutation operation rows.
+    assert uncovered == ["_blast_radius_line.affected_summary",
+                         "_format_operation_result.defined_types",
+                         "_format_operation_result.requested",
+                         "_taint_truncation_note.truncation_cause",
+                         "_types_affected_lines.affected_types"], (
+        "a declared choke-point read is exercised by neither differential: "
+        f"{uncovered}")
 
 
 def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
@@ -2060,8 +2300,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
     Measured by replaying THIS population against the base module (same keys,
     same contexts, same `_MALFORMED` values; base's renderers are called bare
-    because base has no disclosure boundary to wrap them in): base absorbs 876
-    of these 1140 cases at 187 of the 190 container positions, and raises in
+    because base has no disclosure boundary to wrap them in): base absorbs 894
+    of these 1158 cases at 190 of the 193 container positions, and raises in
     100 more; this commit absorbs 0 and raises 0."""
     from bn import formatters
 
@@ -2100,16 +2340,16 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1140, f"the differential ran {checked} cases, not 1140"
+    assert checked == 1158, f"the differential ran {checked} cases, not 1158"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 507 read keys
-    rather than the 190 the container probe classifies as containers: a renderer
+    """The soft-degrade half of #619, kind-free, so it covers all 510 read keys
+    rather than the 193 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
-    Over these same 4056 renders base raises 153 times across 58 (renderer, key)
+    Over these same 4080 renders base raises 153 times across 58 (renderer, key)
     positions; this commit raises 0. Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -2125,7 +2365,98 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
                 raised.append(f"{fn_name}({key}={bogus!r}) raised "
                               f"{type(out).__name__} where the absent payload "
                               f"rendered cleanly")
-    assert swept == 4056, f"the raise sweep ran {swept} renders, not 4056"
+    assert swept == 4080, f"the raise sweep ran {swept} renders, not 4080"
+    assert not raised, raised[:8]
+
+
+def test_the_nested_population_is_exactly_this_big():
+    """The same exact-size discipline as the top-level population, one and two
+    containers down. A nested position that VANISHES is otherwise
+    indistinguishable from one that passed."""
+    nested = _nested_population()
+    depths = collections.Counter(len(path) for _, _, path, _, _, _ in nested)
+    containers = [rec for rec in nested if rec[4] is not None]
+    assert (len(nested), len(containers), depths[1], depths[2]) == (1075, 173, 734, 341), (
+        f"the nested population changed size: {len(nested)} nested keys read "
+        f"({depths[1]} one container below the payload, {depths[2]} two), "
+        f"{len(containers)} of them read as containers. If you added a nested "
+        "read, update these numbers; if you did not, a renderer stopped reading "
+        "a nested field and the differential below stopped covering it.")
+
+
+def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
+    """THE differential, at the positions the top-level probe cannot reach: a key
+    of a callee ROW, a per-block `insns`, a ref bucket inside a match row.
+
+    Same property as at top level -- a container that is PRESENT but holds the
+    wrong shape must never render byte-identically to that field being ABSENT or
+    EMPTY -- and the same reason: the caller reads a confident "nothing here" out
+    of a payload the renderer could not use.
+
+    This is the half round 9 found missing. The nested reads were COUNTED (the
+    `nested` bucket below) and never tested, so a one-hop helper coercing a
+    nested ref bucket kept every guard in this file green while a falsy wrong
+    shape rendered byte-identically to the key being absent. Counting is not
+    covering.
+
+    Replayed against the base module the way the top-level differential is: base
+    absorbs 820 of these 1038 nested cases at 162 of the 173 nested container
+    positions and raises in 141 more; this commit absorbs 0."""
+    from bn import formatters
+
+    echoes = formatters._render_fallback_text
+    absorbed, checked = [], 0
+    for fn_name, render, path, key, kind, ctx in _nested_population():
+        if kind is None:
+            continue
+        # The baseline drops the key from the ELEMENT, so "absent" really is
+        # absent even for a key the probe element carries by default.
+        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+        absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
+        empty = _render_or_exception(
+            render, _payload_for(ctx, path, {**base, key: [] if kind == "list" else {}}))
+        for bogus in _MALFORMED[kind]:
+            payload = _payload_for(ctx, path, {**base, key: bogus})
+            out = _render_or_exception(render, payload)
+            checked += 1
+            if isinstance(out, Exception):
+                continue                   # the nested raise sweep owns this case
+            if "malformed" in out:
+                continue
+            if out == echoes(payload) or echoes(payload) in out:
+                continue
+            if out == absent or out == empty:
+                where = ".".join(k for k, _ in path)
+                absorbed.append(
+                    f"{fn_name}({where}[].{key}={bogus!r}) renders byte-identically "
+                    f"to that nested field being "
+                    f"{'absent' if out == absent else 'empty'}, with no disclosure")
+    assert not absorbed, absorbed[:8]
+    assert checked == 1038, f"the nested differential ran {checked} cases, not 1038"
+
+
+def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
+    """The soft-degrade half of #619 at nested positions, kind-free: a renderer
+    that renders a nested field's absence cleanly and DIES on a present
+    wrong-shaped one has regressed to the crash this change replaced.
+
+    Kind-free because the crash does not need a container: a sampled string
+    sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
+    spec, an unhashable `kind` used as a grouping key. Over these 8600 renders
+    base raises 269 times at 88 nested positions; this commit raises 0."""
+    swept, raised = 0, []
+    for fn_name, render, path, key, _kind, ctx in _nested_population():
+        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+        absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
+        for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
+            swept += 1
+            out = _render_or_exception(render, _payload_for(ctx, path, {**base, key: bogus}))
+            if isinstance(out, Exception) and not isinstance(absent, Exception):
+                where = ".".join(k for k, _ in path)
+                raised.append(f"{fn_name}({where}[].{key}={bogus!r}) raised "
+                              f"{type(out).__name__} where the absent payload "
+                              "rendered cleanly")
+    assert swept == 8600, f"the nested raise sweep ran {swept} renders, not 8600"
     assert not raised, raised[:8]
 
 
@@ -2161,7 +2492,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1204, f"the mirror ran {checked} renders, not 1204"
+    assert checked == 1213, f"the mirror ran {checked} renders, not 1213"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
