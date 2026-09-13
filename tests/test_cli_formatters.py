@@ -5588,25 +5588,46 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
 #                       bound from one, or through another routed parameter
 #                       (a fixed point, so `_layout_size(before_layout)` inside
 #                       `_size_delta` counts);
-#   reaches_the_output  the value still reaches the render on the FAILING path --
-#                       re-rendered (`repr`/`str`/`json.dumps`/
+#   reaches_the_output  the value still reaches the render ON THE PATH THAT
+#                       REFUSED IT -- re-rendered (`repr`/`str`/`json.dumps`/
 #                       `_render_fallback_text`), interpolated into an f-string,
 #                       returned as-is, or covered because the whole payload it
-#                       was read off is dumped. Nothing is absorbed, so nothing
-#                       needs disclosing.
+#                       was read off is dumped there. Nothing is absorbed, so
+#                       nothing needs disclosing.
 #
 # Anything else DROPS a value the payload carried and says nothing, which is
 # #619 exactly.
 #
+# "On the path that refused it" is the whole of the rule, and getting it wrong
+# is how the FIRST cut of this classifier was itself empty by construction:
+# scanning the whole function for any render of the name grants
+# `x = value.get(k); if isinstance(x, str) and x: <render x>` -- the module's
+# dominant #619 shape -- a clean bill, because the only render of `x` sits in
+# the branch where `x` WAS a string. Three of the eight live drops this round
+# repaired were invisible under that reading. The drop region is now the other
+# branch plus what follows the conditional, and
+# `test_every_string_shape_guard_either_shows_the_value_or_routes_it` puts both
+# shapes to the rule on a synthetic module so the rule itself can fail.
+#
 # STATED LIMITATION, because this is a syntactic property over the module's own
 # source and an exhaustive answer for arbitrary payload shapes is not attainable
-# statically: it sees a shape test spelled `isinstance(x, str)` with a literal
-# class. A test spelled `type(x) is str`, through a class held in a variable, or
-# as a duck-typed `try: x.strip()` is outside it. The first two are asserted
-# absent from the module below; the third is not detectable and is disclosed
-# rather than claimed. What DOES hold unconditionally is the runtime half: the
-# container differential and the raise sweeps cover every CONTAINER position the
-# probes discover, whatever spelling guards it.
+# statically. Three things it does not do, named rather than implied:
+#
+#   * it sees a shape test spelled `isinstance(x, str)` with a literal class. A
+#     test spelled `type(x) is str`, through a class held in a variable, or as a
+#     duck-typed `try: x.strip()` is outside it. The first two are asserted
+#     absent from the module below; the third is not detectable;
+#   * the drop region is an APPROXIMATION of control flow, not a CFG: a render
+#     that follows the conditional counts as reachable from the refusing path
+#     even when some unrelated earlier branch would have returned first. That
+#     errs toward granting `reaches_the_output`, so it can over-forgive -- never
+#     over-accuse;
+#   * it decides whether the value REACHES the output, not whether what reaches
+#     it is intelligible.
+#
+# What DOES hold unconditionally is the runtime half: the container differential
+# and the raise sweeps cover every CONTAINER position the probes discover,
+# whatever spelling guards it.
 _STRING_SHAPE_GUARD_CATEGORIES = (
     "chokepoint", "routed", "routed_in", "reaches_the_output")
 
@@ -5635,23 +5656,57 @@ _STRING_SHAPE_GUARDS = {
 }
 
 
+def _negations_to(root, target, seen=0):
+    """How many `not`s wrap `target` on its path down from `root`, or None when
+    `target` is not in this subtree.
+
+    The polarity of a shape test decides WHICH branch is the one that refused
+    the value: `if isinstance(x, str):` hands the usable value to the body,
+    `if not isinstance(x, str):` hands it to everything after. Getting that
+    backwards inverts the whole question."""
+    import ast
+
+    if root is target:
+        return seen
+    for child in ast.iter_child_nodes(root):
+        deeper = seen + 1 if (isinstance(root, ast.UnaryOp)
+                              and isinstance(root.op, ast.Not)) else seen
+        found = _negations_to(child, target, deeper)
+        if found is not None:
+            return found
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def _string_shape_guards():
-    """Every inline `isinstance(<x>, str)` test in the module, classified.
+    """Every inline `isinstance(<x>, str)` test in the MODULE, classified."""
+    import inspect
+
+    from bn import formatters
+
+    return _classify_string_shape_guards(inspect.getsource(formatters))
+
+
+@functools.lru_cache(maxsize=4)
+def _classify_string_shape_guards(source):
+    """Every inline `isinstance(<x>, str)` test in `source`, classified.
 
     See `_STRING_SHAPE_GUARDS` for what the four categories mean and why the
     population is harvested here rather than taken from the choke point's own
     call sites. Returns `{(function, tested expression): category}`, with
     `"DROPS"` for a guard that discards a value the payload carried without
     routing it through `_text_value` -- the #619 defect, and the only outcome
-    the test below refuses."""
-    import ast
-    import inspect
+    the test below refuses.
 
-    from bn import formatters
+    Takes the SOURCE rather than reading the module itself, so the rule can be
+    put to a synthetic module carrying both shapes on purpose. A classifier that
+    cannot tell a dropping filter from a showing one reports any module clean,
+    which is how the first cut of this passed while three of the eight live
+    drops it was written for sat in front of it."""
+    import ast
 
     shows = {"repr", "str", "json.dumps", "_render_fallback_text"}
-    tree = ast.parse(inspect.getsource(formatters))
+    tree = ast.parse(source)
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     calls: dict[str, list] = {}
@@ -5721,7 +5776,61 @@ def _string_shape_guards():
         if routed_params == before:
             break
 
-    def classify(fn, expr):
+    def drop_region(fn, guard):
+        """The code reached on the path where the value was NOT a usable string.
+
+        THE question the first cut of this classifier did not ask, and the reason
+        it could not fail for the module's dominant #619 shape. Scanning the
+        WHOLE function for any render of the name files
+        `if isinstance(x, str) and x: lines.append(f"...{x}")` as safe -- the
+        only render of `x` is in the branch where it IS a string, and the path
+        that dropped it renders nothing at all. Under that rule, three of the
+        eight live drops this round repaired classified `reaches_the_output`,
+        and a fresh one added beside them classified safe too.
+
+        The region is the OTHER branch plus everything that follows the
+        conditional, climbing out of each enclosing block up to the function
+        body -- falling through is how a refusing path reaches a later
+        `return _render_fallback_text(value)`. For a ternary or a comprehension
+        filter there is no fall-through to add: the other arm is the whole
+        region, and a filtered-out element reaches nothing at all.
+        """
+        parents = {id(child): node
+                   for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
+
+        def following(node):
+            out, current = [], node
+            while True:
+                parent = parents.get(id(current))
+                if parent is None:
+                    return out
+                for _field, value in ast.iter_fields(parent):
+                    if isinstance(value, list) and any(v is current for v in value):
+                        index = next(i for i, v in enumerate(value) if v is current)
+                        out.extend(value[index + 1:])
+                if parent is fn:
+                    return out
+                current = parent
+
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If):
+                arms = [(node.test, node.body, node.orelse, True)]
+            elif isinstance(node, ast.IfExp):
+                arms = [(node.test, [node.body], [node.orelse], False)]
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                arms = [(cond, [node.elt], [], False)
+                        for gen in node.generators for cond in gen.ifs]
+            else:
+                continue
+            for test, body, orelse, falls_through in arms:
+                negations = _negations_to(test, guard)
+                if negations is None:
+                    continue
+                refused = orelse if negations % 2 == 0 else body
+                return list(refused) + (following(node) if falls_through else [])
+        return None
+
+    def classify(fn, guard, expr):
         if fn.name == "_text_value":
             return "chokepoint"
         bound = binds[id(fn)].get(expr)
@@ -5730,8 +5839,13 @@ def _string_shape_guards():
         names = params[id(fn)]
         if expr in names and (fn.name, names.index(expr)) in routed_params:
             return "routed_in"
-        # The value still reaches the render: itself, or the payload it was
-        # read off being dumped whole.
+        refused = drop_region(fn, guard)
+        if refused is None:
+            # No conditional consumes this shape test, so which path drops the
+            # value cannot be decided. Fail CLOSED rather than grant it.
+            return "unstructured"
+        # The value still reaches the render ON THE PATH THAT REFUSED IT: itself,
+        # or the payload it was read off being dumped whole.
         carriers = {expr}
         for value in bound or ():
             if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
@@ -5739,16 +5853,17 @@ def _string_shape_guards():
                 carriers.add(ast.unparse(value.func.value))
             elif isinstance(value, ast.Subscript):
                 carriers.add(ast.unparse(value.value))
-        for node in ast.walk(fn):
-            if (isinstance(node, ast.Call) and ast.unparse(node.func) in shows
-                    and any(ast.unparse(a) in carriers for a in node.args)):
-                return "reaches_the_output"
-            if (isinstance(node, ast.FormattedValue)
-                    and ast.unparse(node.value).split("!")[0] == expr):
-                return "reaches_the_output"
-            if (isinstance(node, ast.Return) and node.value is not None
-                    and ast.unparse(node.value) == expr):
-                return "reaches_the_output"
+        for root in refused:
+            for node in ast.walk(root):
+                if (isinstance(node, ast.Call) and ast.unparse(node.func) in shows
+                        and any(ast.unparse(a) in carriers for a in node.args)):
+                    return "reaches_the_output"
+                if (isinstance(node, ast.FormattedValue)
+                        and ast.unparse(node.value).split("!")[0] in carriers):
+                    return "reaches_the_output"
+                if (isinstance(node, ast.Return) and node.value is not None
+                        and ast.unparse(node.value) == expr):
+                    return "reaches_the_output"
         return "DROPS"
 
     found: dict[tuple[str, str], str] = {}
@@ -5762,7 +5877,7 @@ def _string_shape_guards():
             continue
         fn = owner_of[id(node)]
         expr = ast.unparse(node.args[0])
-        found.setdefault((fn.name, expr), classify(fn, expr))
+        found.setdefault((fn.name, expr), classify(fn, node, expr))
     return found
 
 
@@ -5798,12 +5913,51 @@ def test_every_string_shape_guard_either_shows_the_value_or_routes_it():
         "classified by re-derivation, so a guard that changed category changed "
         "behaviour -- say which it is now.")
     assert set(guards.values()) <= set(_STRING_SHAPE_GUARD_CATEGORIES)
-    # Anti-vacuity on the population itself, not on the verdict: these are the
-    # categories a rule collapse would empty. `routed_in` is the whole layout
-    # family (the AttributeError that cost a mutation card) and it only holds
-    # through the transitive fixed point; `reaches_the_output` is the majority
-    # and a walk that returned nothing would satisfy the emptiness claim above
-    # for free.
+    # ANTI-VACUITY ON THE RULE, not on the module. An emptiness claim over a
+    # classifier that grants `reaches_the_output` to everything is free, and
+    # that is precisely how the first cut of this shipped: it scanned the WHOLE
+    # function for any render of the name, so the module's dominant shape --
+    # `x = value.get(k); if isinstance(x, str) and x: <render x>` -- came out
+    # SAFE even though the path that refused `x` renders nothing at all. Three
+    # of the eight live drops this round repaired were invisible to it.
+    #
+    # Both shapes, in one synthetic module, so the rule is asked the question
+    # directly rather than inferred from the module happening to be clean.
+    probe = "\n".join((
+        "def shows(value):",
+        "    if not isinstance(value, dict):",
+        "        return _render_fallback_text(value)",
+        "    text = value.get('k')",
+        "    if isinstance(text, str) and text:",
+        "        return 'k=' + text",
+        "    return _render_fallback_text(value)",
+        "",
+        "def drops(value):",
+        "    if not isinstance(value, dict):",
+        "        return _render_fallback_text(value)",
+        "    lines = []",
+        "    note = value.get('note')",
+        "    if isinstance(note, str) and note:",
+        "        lines.append(f'note: {note}')",
+        "    return chr(10).join(lines)",
+        "",
+        "def routes(value):",
+        "    note = _text_value(value, 'note')",
+        "    if isinstance(note, str):",
+        "        return note",
+        "    return ''",
+        ""))
+    verdicts = _classify_string_shape_guards(probe)
+    assert verdicts[("drops", "note")] == "DROPS", (
+        "the classifier cannot see the module's dominant #619 shape -- a value "
+        "rendered ONLY in the branch where it was usable, and dropped in "
+        f"silence otherwise: {verdicts}")
+    assert verdicts[("shows", "text")] == "reaches_the_output", (
+        f"a value the refusing path still dumps is not a drop: {verdicts}")
+    assert verdicts[("routes", "note")] == "routed", (
+        f"a value taken from the choke point is already disclosed: {verdicts}")
+    # And the population itself, since the categories a rule collapse would
+    # empty are the ones doing the work here.
     counts = collections.Counter(guards.values())
     assert counts["routed_in"] >= 5 and counts["reaches_the_output"] >= 10, counts
     # The stated limitation, made checkable for the two spellings that ARE
@@ -6064,6 +6218,20 @@ def test_an_unreadable_op_status_is_neither_a_crash_nor_a_pass():
     for failing in sorted(formatters.FAILED_MUTATION_STATUSES):
         assert formatters._add_mutation_ok(card(failing))["ok"] is False
         assert "malformed" not in formatters._render_mutation_text(card(failing))
+    # #447 parity, on EVERY shape and not only the unreadable ones: a uniform
+    # `jq '.ok'` must give the same answer whether or not `--summary` was
+    # passed. Half a parity is how the first cut of this shipped -- `ok` was
+    # withheld on the full result and claimed on the compact one built from the
+    # identical payload, because only one of the two derivations read the row
+    # status inside its recorder capture.
+    for status in (_ABSENT, None, "verified", "noop", "verification_failed",
+                   {"code": 7}, ["verification_failed"], 7, True, 1.5, ()):
+        payload = card(status)
+        assert (formatters._mutation_summary(payload)["ok"]
+                is formatters._add_mutation_ok(payload)["ok"]), (
+            f"`jq '.ok'` flips with --summary on status={status!r}: "
+            f"{formatters._mutation_summary(payload)['ok']} vs "
+            f"{formatters._add_mutation_ok(payload)['ok']}")
     for unreadable in ({"code": 7}, ["verification_failed"], 7, True, 1.5, ()):
         out = formatters._render_mutation_text(card(unreadable))
         assert _disclosed(out, "status"), (
@@ -6073,9 +6241,50 @@ def test_an_unreadable_op_status_is_neither_a_crash_nor_a_pass():
             f"status={unreadable!r} cannot be read, so 'no op row failed' is not "
             "established and ok must not be claimed")
         summary = formatters._mutation_summary(card(unreadable))
+        assert summary["ok"] is False and summary["success"] is False, (
+            f"status={unreadable!r} is a row nobody could classify, so the "
+            f"compact status must withhold ok too, not claim it: {summary!r}")
         assert "malformed" in str(summary.get("first_error")), (
             f"status={unreadable!r} must reach the compact summary a control "
             f"loop reads, not just the text card: {summary!r}")
+
+
+def test_a_type_row_never_states_a_field_count_it_could_not_measure():
+    """#683's harm, one row over from where the op-row property guards it.
+
+    `struct widget_t, 0 fields` reads as "this type is empty" -- the same
+    "nothing landed" a control loop acts on -- and the unchanged-type row
+    derived that zero from `after_layout` WITHOUT asking whether it could read
+    it. A skew note went out beside the number, and the note is not what the
+    loop reads: that is exactly the reasoning
+    `test_an_op_row_never_states_a_count_the_payload_did_not` applies to the op
+    row, so the module held two different count contracts. It holds one now.
+
+    ABSENT and EMPTY are still MEASURED zeroes and still state one -- refusing
+    those would be a silent cap on every honest row."""
+    from bn import formatters
+
+    def card(after_layout):
+        entry = {"type_name": "widget_t", "changed": False}
+        if after_layout is not _ABSENT:
+            entry["after_layout"] = after_layout
+        return formatters._render_mutation_text(
+            {"success": True, "committed": True, "affected_types": [entry],
+             "results": [{"op": "types_declare", "status": "verified", "count": 1}]})
+
+    assert ", 2 fields" in card("struct widget_t size=0x8\n    0x0 int a\n"
+                                "    0x4 int b"), "a readable layout must be counted"
+    for measured in (_ABSENT, None, ""):
+        assert ", 0 fields" in card(measured), (
+            f"after_layout={measured!r} claims nothing and 'we looked and found "
+            "none' is a real measurement -- it must keep stating its zero")
+    for unreadable in ({"fields": [1, 2, 3]}, ["0x0 int a"], 7, True, 1.5, ()):
+        out = card(unreadable)
+        assert "0 fields" not in out, (
+            f"after_layout={unreadable!r} could not be read, so a field count "
+            f"derived from it is fabricated -- and 0 is the dangerous one: {out!r}")
+        assert _disclosed(out, "after_layout"), (
+            f"after_layout={unreadable!r} was refused with no note naming it: {out!r}")
 
 
 def test_an_op_row_never_states_a_count_the_payload_did_not():
@@ -6138,11 +6347,23 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                and node.func.id == "_operation_row" for node in ast.walk(fn)))
     assert builders == ["_format_op_summary", "_format_operation_result"], builders
 
-    # Every key those four functions read off the op item, by any spelling.
+    # Every key those four functions read off the op item, by any spelling --
+    # and every key the functions THEY REACH read too. Scoped to the four
+    # syntactically, a fabricated count read inside a helper they call was
+    # outside the sweep: the key never entered the swept set, so the case was
+    # never built. The reach set costs nothing here (it adds three helpers and
+    # no new key today) and it means a count hidden one call down arrives
+    # covered rather than uncovered.
     readers = {"_field_list", "_field_dict", "_field_present", "_field_declared",
                "_count_field", "_text_value"}
+    roots = ("_operation_row", "_operation_row_text", *builders)
+    reached = set(roots)
+    for root in roots:
+        reached |= set(_module_reach().get(root, ()))
     keys: set[str] = set()
-    for name in ("_operation_row", "_operation_row_text", *builders):
+    for name in sorted(reached):
+        if name not in funcs:
+            continue
         for node in ast.walk(funcs[name]):
             if isinstance(node, ast.Call):
                 func = node.func

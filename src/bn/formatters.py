@@ -4012,12 +4012,24 @@ def _types_affected_lines(value: dict[str, Any]) -> list[str]:
         # `after.strip()` was `AttributeError: 'dict' object has no attribute
         # 'strip'`, which cost the WHOLE mutation card where the same entry
         # without `after_layout` rendered cleanly (#619).
-        before_layout = _text_value(entry, "before_layout")
-        after_layout = _text_value(entry, "after_layout")
+        # Read inside a per-ENTRY capture so the third state stays attributable
+        # to THIS entry: `_field_skewed` answers for the whole render, and a
+        # batch's earlier entry would otherwise decide this one's count. Then
+        # re-record, so the card still discloses by name.
+        token = _SKEWED_FIELDS.set([])
+        try:
+            before_layout = _text_value(entry, "before_layout")
+            after_layout = _text_value(entry, "after_layout")
+            layout_diff = _text_value(entry, "layout_diff")
+            unreadable = list(_SKEWED_FIELDS.get() or ())
+        finally:
+            _SKEWED_FIELDS.reset(token)
+        for key in unreadable:
+            _record_skew(key)
         if entry.get("changed"):
             before_sz = _layout_size(before_layout)
             after_sz = _layout_size(after_layout)
-            deltas = _layout_field_deltas(_text_value(entry, "layout_diff"))
+            deltas = _layout_field_deltas(layout_diff)
             if before_sz is not None and after_sz is not None and before_sz != after_sz:
                 out.append(f"  {prefix}{_size_delta(before_layout, after_layout)}")
             elif not deltas:
@@ -4030,8 +4042,18 @@ def _types_affected_lines(value: dict[str, Any]) -> list[str]:
         else:
             after = after_layout or ""
             head = after.splitlines()[0].strip() if after.strip() else f"struct {name}"
-            count = _layout_field_count(after)
-            out.append(f"  {head}, {count} field{'s' if count != 1 else ''}")
+            if "after_layout" in unreadable:
+                # ONE count contract in this module, not two. A field count
+                # derived from a layout nobody could read is #683's fabrication
+                # -- "0 fields" is "this type is empty" to a reader -- and the
+                # note beside it is not what a control loop reads. The op row
+                # prints `<count not stated>` for exactly this class; so does
+                # this row. An ABSENT or EMPTY layout is still a measured zero
+                # and still says "0 fields".
+                out.append(f"  {head}, field count not stated (unreadable layout)")
+            else:
+                count = _layout_field_count(after)
+                out.append(f"  {head}, {count} field{'s' if count != 1 else ''}")
     return out
 
 
@@ -4304,12 +4326,20 @@ def _mutation_summary(value: Any) -> Any:
     token = _SKEWED_FIELDS.set([])
     try:
         results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        # The ROW STATUSES are classified inside the capture too, for exactly the
+        # reason the listing is. Read outside it, an unreadable `status` still
+        # DISCLOSED -- the enclosing summary drain caught it -- but it never
+        # reached `unusable`, so this transform answered `ok: true` on the same
+        # payload `_add_mutation_ok` refuses, and a uniform `jq '.ok'` FLIPPED
+        # depending on whether `--summary` was passed. Half a parity is not a
+        # parity: a row nobody could classify is not a row that passed, on both
+        # derivations or on neither (#447/#619).
+        failed = [r for r in results if _is_failed_status(r)]
         unreadable = list(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
     for key in unreadable:
         _record_skew(key)
-    failed = [r for r in results if _is_failed_status(r)]
     verified = sum(1 for r in results if r.get("status") == "verified")
     noop = sum(1 for r in results if r.get("status") == "noop")
     # #684: every genuine `mutation_engine` op populates at least one `results[]`
