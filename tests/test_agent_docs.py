@@ -376,18 +376,30 @@ _EXIT_CODE_PINS = (
      "unmeasured success"),
     ("skills/bn/reference/reading.md", "bounded-slice-is-a-success",
      "a provably-bounded constant length (a success, exit 0)"),
+    # Found by widening the sweep to the whole agent-facing set: this doc states
+    # a `bn` exit code and was outside the six docs the sweep used to read, so
+    # the claim could have drifted from the code with every guard green.
+    ("skills/bn-kernel/SKILL.md", "limit-zero-is-refused-at-parse-time",
+     "rejected at parse time (exit 2), because the bridge would reject a zero "
+     "limit and"),
     ("skills/bn/reference/runtime.md", "restart-of-an-unreachable-bridge-is-1",
      "this way exits **1** rather than 0 whenever the teardown and respawn succeed"),
     ("skills/bn/reference/runtime.md", "restart-that-cannot-signal-is-2",
      "the restart refuses to signal and exits **2** instead"),
 )
 
-# Every doc an agent reads for the contract. `skills/bn/SKILL.md` states no exit
-# code today and is in the sweep so that adding one there fails until pinned.
-EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
-                  "skills/bn/reference/mutating.md",
-                  "skills/bn/reference/reading.md",
-                  "skills/bn/reference/runtime.md")
+# The DOCUMENT SET was the last enumerated population left in this accounting,
+# and it failed the same way every enumerated population in this PR failed: six
+# docs were swept because six were the ones a reviewer had found stating an exit
+# code, and the reason was PROSE -- "every doc an agent reads for the contract".
+# It was not even a theoretical gap: `skills/bn-kernel/SKILL.md` states a real
+# `bn` exit code (a `--limit 0` refusal) and sat outside the sweep, and a false
+# contract appended to `skills/bn-vr/SKILL.md` and `skills/bn/agents/bn-re.md`
+# left all 101 tests in this module and the drift module green. So the sweep is
+# the whole agent-facing set, DERIVED from the same glob the ghost-tree and
+# lock-reading properties quantify over: a doc joins the population by EXISTING,
+# not by being listed.
+EXIT_CODE_DOCS = tuple(str(doc.relative_to(REPO)) for doc in AGENT_FACING_DOCS)
 
 # Round 8 replaced a hand-listed echo table with a sweep, and the sweep was a
 # RECOGNISER: a bare 0-4 within 120 characters after the word `exit`. Both
@@ -397,12 +409,25 @@ EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
 # or the digit was outside the range, or the number was spelled out.
 #
 # A recogniser for natural language is escapable by construction, so there is
-# no vocabulary here at all. The population is EVERY line of every fenced doc
-# that carries a number, and each is accounted for exactly one of two ways: a
-# cell above pins it to what the CLI really returns, or it is in the ledger
-# below of lines that carry a number for some other reason. A new sentence
-# about an exit code fails here in ANY phrasing, because it is a new line with
-# a number in it and nothing accounts for it yet.
+# almost no vocabulary here: the population is every line of every agent-facing
+# doc that carries a NUMBER or names an EXIT, and each is accounted for exactly
+# one of two ways -- a cell above pins it to what the CLI really returns, or the
+# ledger below records that it is not a claim.
+#
+# What this does NOT catch, stated in full because the previous wording claimed
+# otherwise ("in ANY phrasing"):
+#
+#   * a contract with no numeral, no number word and no form of the word "exit"
+#     -- "a mutation the bridge refuses before apply exits with the bridge-error
+#     code" was caught only once `exit\w*` joined the alphabet, and "the shell
+#     status of a refused mutation is the bridge-error status" still is not;
+#   * a code written in hex (`exit 0x4`) or as a number word past `hundred`.
+#
+# Both are implausible phrasings for a doc, which is the only reason they are
+# accepted rather than paid for: admitting `0x<hex>` would put every example
+# address in the population. The population is therefore large and STATED,
+# rather than total and claimed -- every widening of it so far came from someone
+# writing the escape down, which is why the escapes are written down here.
 #
 # A decimal is one number, not two (`3.11` must not read as a `3` and an `11`),
 # and an issue reference is not a code (`#625`). Everything else counts: a
@@ -419,8 +444,14 @@ _NUMBER_WORDS = (
     "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
     "thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred"
 )
+# `exit`/`exits`/`exited`/`exit-code`, `$?`, and the two spellings of the same
+# idea a shell script uses. A line naming an exit is in the population whether
+# or not it carries a digit: the falsification lens stated a whole false
+# contract with neither a numeral nor a number word.
+_EXIT_WORDS = r"exit\w*|status code|return code|returncode|\$\?"
 _NUMBER_TOKEN = re.compile(
-    rf"(?<![\w#$])(?<!\d\.)(?:\d+|{_NUMBER_WORDS})(?![\w])(?!\.\d)", re.I)
+    rf"(?<![\w#$])(?<!\d\.)(?:\d+|{_NUMBER_WORDS}|{_EXIT_WORDS})(?![\w])(?!\.\d)",
+    re.I)
 # Generated, not authored: the fingerprint of every prose line in a fenced doc
 # that carries a number and is not pinned by a cell above. Regenerate with
 # `_fingerprint(" ".join(line.split()))` over the docs. An entry is a claim
@@ -429,207 +460,385 @@ _NUMBER_TOKEN = re.compile(
 # statement silently, by not matching a pattern.
 NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
     "CLAUDE.md": frozenset({
-        "019b39ab",  # BN_REQUIRE_REAL_TESTS=1 uv run pytest tests/test_integrati
-        "0535459a",  # 2. On the bridge, register the op with `@op("name", lock="
-        "06935f28",  # `bn` is an agent-friendly CLI for Binary Ninja. It has two
-        "08df77ee",  # `op_registry.py` is the single source of truth: `@op(name,
-        "0b9e7173",  # When only one target is open, target-required commands can
-        "3f1d7f43",  # 1. Add a handler in the appropriate `src/bn/commands/*.py`
-        "49146e24",  # This file provides guidance to Claude Code (claude.ai/code
-        "5369b91c",  # 3. Add tests in `tests/` (mirror the source layout).
-        "5c14e27a",  # `observed` are `{}` when the failure supplied no detail. A
+        "019b39ab",  # ... uv run pytest ... ... # strict: fail (not skip) if BN is mis
+        "0535459a",  # ... On the bridge, register the op with `@op("name", lock="read"
+        "06935f28",  # `bn` is an agent-friendly CLI for Binary ... It has two parts: a
+        "08df77ee",  # ... is the single source of truth: `@op(name, lock="read"|"write
+        "0b9e7173",  # When only one target is open, target-required commands can omit 
+        "3f1d7f43",  # ... Add a handler in the appropriate ... module, decorated with 
+        "49146e24",  # This file provides guidance to Claude Code ... when working with
+        "5369b91c",  # ... Add tests in ... (mirror the source ...
+        "5c14e27a",  # `observed` are `{}` when the failure supplied no ... All three k
         "9a7f2e2c",  # ### Two-Process Model
-        "9bcf19ed",  # - Test files mirror source, split by concern rather than o
-        "ad00bd37",  # uv run pytest tests/test_cli_core.py # one module
-        "b65d6dff",  # **Line count is not a split criterion (#629).** Split a mo
-        "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed
+        "9bcf19ed",  # - Test files mirror source, split by concern rather than one mod
+        "ad00bd37",  # uv run pytest ... # one module
+        "b65d6dff",  # **Line count is not a split criterion ... Split a module only on
+        "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed excep
+        "d95c6e1f",  # All mutations support `--preview` (apply → capture diffs → rever
     }),
     "README.md": frozenset({
-        "1e0f43b6",  # bn local retype sub_401000 0x401000:local:StackVariableSou
-        "35d15f75",  # bn local rename sub_401000 0x401000:local:StackVariableSou
-        "3d833038",  # `bn function list` and `bn function search` return the ful
-        "66b37d2e",  # Omitting `--target` only works when exactly one target is 
-        "76157733",  # - The CLI discovers a bridge, connects to it, and forwards
-        "7d089991",  # When you need counts from BN iterators such as `f.hlil.ins
-        "8b8c9c6a",  # You can run several sessions in parallel. When exactly one
-        "9a80299a",  # Use `--stdin` or `--script` for multiline Python snippets.
-        "9cd96091",  # bytes: 1234
-        "b135db65",  # `bn session start` spawns a `bn-agent` process, registers 
-        "b35752e8",  # `bn callsites` is the direct-call lane for exact return-ad
-        "b78dcc70",  # summary: kind=object count=3
+        "1e0f43b6",  # bn local retype ... ... float --preview
+        "35d15f75",  # bn local rename ... ... speed --preview
+        "3d833038",  # `bn function list` and `bn function search` return the full matc
+        "66b37d2e",  # Omitting `--target` only works when exactly one target is ... If
+        "6be09cc8",  # Any status above other than ... puts a mutation at exit code ...
+        "76157733",  # - The CLI discovers a bridge, connects to it, and forwards ... W
+        "7d089991",  # When you need counts from BN iterators such as ... materialize t
+        "8b8c9c6a",  # You can run several sessions in ... When exactly one live sessio
+        "9a80299a",  # Use `--stdin` or `--script` for multiline Python ... Use `--code
+        "9cd96091",  # bytes: ...
+        "b135db65",  # `bn session start` spawns a `bn-agent` process, registers it und
+        "b35752e8",  # `bn callsites` is the direct-call lane for exact return-address 
+        "b4a59231",  # Non-preview writes only report success after reading the live BN
+        "b78dcc70",  # summary: kind=object ...
         "c5fcc64c",  # - `bn` has two parts:
-        "ca1fc685",  # - `call_index`: zero-based ordinal for matching callsites 
-        "d4db75c0",  # - **Peer-credential enforcement (Linux).** Every connectio
-        "d55c4454",  # If exactly one BinaryView is open, target-specific command
-        "e15482b8",  # Run Python inside the Binary Ninja process for one-off ins
-        "ee507a32",  # Single-function escape hatch — analyze just one function w
-        "f1ee3218",  # Any status above other than `verified`/`noop` puts a mutat
-        "f50ed8c8",  # tokens: 456
-        "f6f3e5cb",  # "target_id": "firmware.bin@0",
+        "ca1fc685",  # - ... zero-based ordinal for matching callsites in the containin
+        "d4db75c0",  # - **Peer-credential enforcement ... Every connection to the brid
+        "d55c4454",  # If exactly one BinaryView is open, target-specific commands can 
+        "e15482b8",  # Run Python inside the Binary Ninja process for one-off inspectio
+        "ee507a32",  # Single-function escape hatch — analyze just one function without
+        "f50ed8c8",  # tokens: ...
+        "f6f3e5cb",  # ... ...
     }),
     "skills/bn/SKILL.md": frozenset({
-        "0580e23a",  # > bn -i dogfood-1 -t <sel> xrefs main
-        "12038a20",  # > **Parallel / fan-out agents — HARD rule.** Sticky pins (
-        "2b531c12",  # - **accumulator / shift structure** — a size-parse loop th
-        "34ea1441",  # - **loop-invariant bound pointers** — a hoisted fixed limi
-        "5e15be9b",  # - **HLIL can mislead beyond access width — trust `bn disas
-        "600daf80",  # > bn -i dogfood-1 -t <sel> decompile main
+        "0580e23a",  # > bn -i ... -t <sel> xrefs main
+        "12038a20",  # > **Parallel ... fan-out agents — HARD ... Sticky pins (`instanc
+        "2b531c12",  # - **accumulator ... shift structure** — a size-parse loop that s
+        "34ea1441",  # - **loop-invariant bound pointers** — a hoisted fixed limit (`ad
+        "5e15be9b",  # - **HLIL can mislead beyond access width — trust `bn ... Pseudo-
+        "600daf80",  # > bn -i ... -t <sel> decompile main
         "6efe0859",  # ## Two gotchas that cause wrong answers
-        "8bccdffa",  # - **conditional-compare / `csel` / `ccmn` guards** — AArch
-        "94ae359d",  # The full command catalog lives in three files **in this sk
-        "98945b00",  # One open target: omit `-t`. Multiple open: pass `-t <selec
-        "b5f3f247",  # - **access width** — a byte compare can render full-width,
-        "c9765e33",  # > OMP sibling task agents also share one retained eval nam
-        "e8374ea0",  # > bn session start /path/to/bin --instance-id dogfood-1 # 
+        "8bccdffa",  # - **conditional-compare ... `csel` ... `ccmn` guards** — ... fla
+        "94ae359d",  # The full command catalog lives in three files **in this skill's 
+        "98945b00",  # One open target: omit ... Multiple open: pass `-t <selector>` (f
+        "b5f3f247",  # - **access width** — a byte compare can render full-width, and a
+        "c9765e33",  # > OMP sibling task agents also share one retained eval ... They 
+        "e8374ea0",  # > bn session start ... --instance-id ... # spawn name (not globa
+    }),
+    "skills/bn/agents/bn-re.md": frozenset({
+        "05ac791d",  # ... **Cheap signature check first ... ... `bn class list --no-st
+        "16912b15",  # - **Map:** functions you ... (old → new, one line each, with the
+        "3fd2c53a",  # ... table, OR ... non-stub ... constructors
+        "6f2dfbee",  # ... **Hidden-code-surface sweep — CONDITIONAL, triggered by evid
+        "7247d687",  # one-phrase purpose), structs recovered (name + key fields), and 
+        "899545ee",  # ... **Confirm the target is live before anything ... Run `bn tar
+        "b9626673",  # ... **Persist, don't ... Apply every rename ... retype ... struc
+        "e7d6caa7",  # ... ... You may be dispatched alongside sibling RE agents over
+    }),
+    "skills/bn/agents/bn-vr.md": frozenset({
+        "3b240f3b",  # ... **Parallel-safety ... ... Reads fan out safely; writes seria
+        "510c255d",  # ... **MANDATORY sink enumeration + source→sink tracing — this is
+        "519384bb",  # ... **Confirm the target is live and pick the ... Run `bn target
+        "79cda4e3",  # ... **Adversarially verify every finding before you report ... H
+        "800a7391",  # on a stripped ...
+        "87c67dbd",  # static dispatch table, or ... non-stub constructors), since stri
+        "c251ca40",  # Confirm each bug against `bn disasm` ... `ldrb` vs `ldr` for off
+        "db90b2f2",  # ... **Persist context, don't ... Leave your reasoning in the BND
+        "eb154184",  # - **Bug class** — buffer overflow ... format string ... integer 
     }),
     "skills/bn/reference/mutating.md": frozenset({
-        "0501df9a",  # distinct from `3` (a failure — a status in `FAILED_MUTATIO
-        "107f9fec",  # | `first_error` | the first failure's explanation, or the 
-        "10f5e35f",  # against op 1's value. Such a manifest is rejected up front
-        "139a9f88",  # in a write-heavy session (a `proto set` cost ~7 KB; a 115-
-        "18b47674",  # or — like `go rename`, the one op that reports through its
-        "207a375e",  # That is ~225 bytes. The full audit payload — every per-op 
-        "23f868f0",  # ## 7. Bundles
-        "2bb6b7aa",  # ### Step 4 — save before close
-        "2dbbc6bc",  # mutation: committed changed=71 verified=71 noop=0 failed=0
-        "3c817542",  # bn data retype 0x460000 'cmd_help_entry[257]' [--preview]
-        "3dda57c0",  # Every shipped mutation is measurable one of two ways: it p
-        "3f5376fa",  # which fails safe on its own) before trusting a `0`-looking
-        "441109f0",  # typo in op 13 no longer rolls back 12 good ops.
-        "46d085e3",  # `comment set/get/delete` take the address either positiona
-        "474d7d87",  # | `op_count`, `changed_count`, `verified_count`, `noop_cou
-        "48b3a493",  # each call takes exactly one location: an address (position
-        "531bd535",  # ### Step 2 — live writes are verified
+        "0501df9a",  # distinct from ... (a failure — a status in ... which
+        "107f9fec",  # | ... | the first failure's explanation, or the unmeasured expla
+        "10f5e35f",  # against op ... ... Such a manifest is rejected up front, naming 
+        "139a9f88",  # in a write-heavy session (a `proto set` cost ... KB; a ... previ
+        "18b47674",  # or — like `go rename`, the one op that reports through its own c
+        "207a375e",  # That is ... ... The full audit payload — every per-op diff, `req
+        "23f868f0",  # ## ... Bundles
+        "2bb6b7aa",  # ### Step ... — save before close
+        "2dbbc6bc",  # mutation: committed ... ... ... ... ...
+        "3c817542",  # bn data retype ... ... [--preview]
+        "3dda57c0",  # Every shipped mutation is measurable one of two ways: it populat
+        "3f5376fa",  # which fails safe on its own) before trusting a ... status line a
+        "441109f0",  # typo in op ... no longer rolls back ... good ...
+        "45187bc1",  # line and exit codes are therefore the same as every other mutati
+        "46d085e3",  # `comment ... take the address either positionally (`bn comment s
+        "474d7d87",  # | ... ... ... ... ... | derived from `results[]`; ... are `null`
+        "48b3a493",  # each call takes exactly one location: an address (positional or 
+        "531bd535",  # ### Step ... — live writes are verified
+        "560d20bb",  # ("applied but unverifiable"), so a script that only checks `$?` 
         "5a40c289",  # Mutations print a **one-line status summary** by default:
-        "5b35cedf",  # `set_comment` plus a `delete_comment`) can never verify: o
-        "82ffca8f",  # pairing, since the two are almost always applied together.
-        "87b64a1d",  # It is the one mutation whose bridge result reports the wor
-        "8d2b1a2d",  # Annotations live in the `.bndb`. Always save before closin
-        "9cc9bb4f",  # ### Step 1 — preview first
-        "9e742d4b",  # | `op` | required fields | one of | interactive equivalent
-        "a29b6d0b",  # Split them across two batches — last-write-wins is not exp
-        "bd21de45",  # The mutation surface is built around a four-step safety lo
-        "bfb392d4",  # 261 KB / 87k tokens), so it is **opt-in**:
-        "cca7f348",  # - **One write per key.** Every op is verified against the 
-        "cdf328d4",  # ## 6. Mutation flow
-        "d4b55e60",  # kind of call, so an unmeasured `--preview` is `4` as well 
-        "dbcf469b",  # ### Step 3 — read back
-        "e1e1f0e1",  # write could not be confirmed instead of reading it as a cl
-        "f83e45cf",  # manifest that writes the same key twice (two `set_comment`
-        "fefcdd8b",  # still wins if both apply) and from `0` (a verified or meas
+        "5b35cedf",  # ... plus a ... can never verify: op ... would be judged
+        "6a54edaa",  # combination changes the exit code (each computes it from the sam
+        "6f8e7c3f",  # - ... — the request was refused: a bad field *value*, a missing 
+        "82ffca8f",  # pairing, since the two are almost always applied ...
+        "87b64a1d",  # It is the one mutation whose bridge result reports the work thro
+        "8d2b1a2d",  # Annotations live in the ... Always save before closing — `bn clo
+        "9cc9bb4f",  # ### Step ... — preview first
+        "9e742d4b",  # | `op` | required fields | one of | interactive equivalent |
+        "a29b6d0b",  # Split them across two batches — last-write-wins is not expressib
+        "bd21de45",  # The mutation surface is built around a four-step safety loop: **
+        "bfb392d4",  # ... KB ... ... tokens), so it is **opt-in**:
+        "cca7f348",  # - **One write per ... Every op is verified against the batch's E
+        "cdf328d4",  # ## ... Mutation flow
+        "d4b55e60",  # kind of call, so an unmeasured `--preview` is ... as well — ther
+        "dbcf469b",  # ### Step ... — read back
+        "e1e1f0e1",  # write could not be confirmed instead of reading it as a clean ..
+        "f83e45cf",  # manifest that writes the same key twice (two ... on one address,
+        "fefcdd8b",  # still wins if both apply) and from ... (a verified or measured a
     }),
     "skills/bn/reference/reading.md": frozenset({
-        "0644faaa",  # bn trace main 0x27e1a --arg 1 --interprocedural # IP: foll
-        "06b091d5",  # All three dispatch under the **shared read lock**, so they
-        "06f979cb",  # - **"Pointers-to-code" means the target's SECTION is code,
-        "0c2b8572",  # ## 5. Caller-static mapping
-        "0c699f6f",  # If you call `bn callsites <callee>` without `--within` / `
-        "163c410d",  # - `bn xrefs` accepts a function name *or* a hex/decimal ad
-        "1d2d1df3",  # - **`row_fields`: in-band row-key discovery.** Row schemas
-        "1e4db595",  # - `bn data vars --start <addr> --end <addr>` lists the **t
-        "1e4fc043",  # - **JSON list-command field map (the `.items[]` idiom and 
-        "2004d8ed",  # - `bn evidence ...` is a read-locked family that surfaces 
-        "20900821",  # bn function list [--sort {address|size|name}] [--reverse] 
-        "224aa0bc",  # bn evidence table <addr> --record-size N --field cmd:u32@0
-        "23940cf6",  # bn disasm <fn> [--lines 40:80 | --count 20]
-        "29c52aa0",  # bn strings [--query <q>] [--regex] [--min-length 5] [--sec
-        "2d2e5021",  # struct CmdDesc desc = {0};
-        "3a2dd5dc",  # `--within-file` accepts one identifier (name or hex addres
-        "3e7166e2",  # - `bn class` is the **C++ object-model lens** (#205): a co
-        "3f16152c",  # bn evidence calls <reg-fn> --arg-struct N --field type:u8@
-        "48853422",  # bn class show <Name> # one class: methods, vtable, size, b
-        "491d1280",  # - **`bn evidence surface`** enumerates the **hidden code s
-        "4a9d61dc",  # bn evidence function <fn> [--context 2] # per-call ABI arg
-        "4acd3a8b",  # `{"kind": <discriminator>, "items": [...], "total": N, "of
-        "4c17ee45",  # - **aarch64 decompiles carry dead `int128_t vN_M` declarat
-        "4cd6e220",  # --field command:u16@0 --field type:u8@2 --field subtype:u8
-        "52c4dfff",  # - **JSON envelope contract (#275).** Every collection-retu
-        "67ce174e",  # bn tag get 0x401000 | --function <fn> # tags at one addres
-        "69200094",  # bn trace handle_l2cap_con_req 0x1c2bc --arg 2 --format jso
-        "6f2cba1d",  # bn evidence calls init_cmd --arg-struct 1 /
-        "71ad85de",  # - **Unconditional (always-unsafe) sinks — no `tainted_args
-        "74a30711",  # - `hlil_statement` resolves for a call whose **return valu
-        "78b987cf",  # **High-fan-in `total` is monotone, not missing.** A callsi
-        "829c1ed6",  # bn decompile <fn> [--addresses] [--lines 40:80] [--force-a
-        "84b0522c",  # bn taint backward -f <fn> --sink arg:memcpy:2 # slice a si
-        "8ee528f5",  # - **Bounded-WRITE sinks — wrapped `recv(len)`/`read(len)` 
-        "926c7cae",  # - **`evidence calls <reg-fn> --arg-struct N --field …`** r
-        "93d922fb",  # - `xrefs` → `.items[]`, each row carrying `.kind` (`code` 
-        "9625a12f",  # ## 4. Read flow
-        "a7f1eea5",  # bn dataflow defuse <fn> --var <name|local_id|name#version>
-        "a9412200",  # - `bn disasm <function> --lines N:M` is a 1-indexed slice 
-        "ab8129a3",  # - `bn trace <fn> <addr> [--arg N] [--interprocedural]` wal
-        "abd1941b",  # bn xrefs <fn-or-addr> [--limit 20]
-        "b06ea8ac",  # bn disasm <addr> --linear [N] # linear disasm of N (defaul
-        "b15c995b",  # - **Nested tables are canonical too:** a pointer table emb
-        "b3400709",  # - **Project-internal wrappers — model them so taint follow
-        "c5e2eebe",  # - `bn function create <address> [--preview]` forces Binary
-        "ceb51492",  # --field flags:u8@4 --field expected_len:u16@6 --field call
-        "d3e7db45",  # - Two more signals from the same demotion logic: `arity_mi
-        "dd81c5c0",  # - **Width-sensitive reads — trust `bn disasm`, not the dec
-        "dfa3a380",  # - **Nothing-found vs incomplete (don't confuse them):** `i
-        "e2f2e169",  # bn trace main 0x27e1a --arg 1 # intra: stops at call bound
-        "ec1c6720",  # bn taint forward -f <fn> --source param:0 [--sink-class re
-        "f0e63d8f",  # - **Addresses in JSON are hex STRINGS**, not integers: `{"
-        "f760dc5e",  # - **Unpaged / fixed-window / presence reads** carry `{kind
-        "fb0af0ab",  # - **Spilled output is NOT the data (#311).** A heavy `--fo
+        "0644faaa",  # bn trace main ... --arg ... --interprocedural # IP: follows into
+        "06b091d5",  # All three dispatch under the **shared read lock**, so they stay 
+        "06f979cb",  # - **"Pointers-to-code" means the target's SECTION is code, not m
+        "0c2b8572",  # ## ... Caller-static mapping
+        "0c699f6f",  # If you call `bn callsites <callee>` without `--within` ... `--wi
+        "163c410d",  # - `bn xrefs` accepts a function name *or* a ... ... Text groups 
+        "1d2d1df3",  # - ... in-band row-key ... Row schemas differ **on purpose** — `f
+        "1e4db595",  # - `bn data vars --start <addr> --end <addr>` lists the **typed d
+        "1e4fc043",  # - **JSON list-command field map (the ... idiom and its ... Most 
+        "2004d8ed",  # - `bn evidence ... is a read-locked family that surfaces the **r
+        "20900821",  # bn function list [--sort {address|size|name}] [--reverse] [--min
+        "224aa0bc",  # bn evidence table <addr> --record-size N --field ... --field ...
+        "23940cf6",  # bn disasm <fn> [--lines ... | --count ...
+        "29c52aa0",  # bn strings [--query <q>] [--regex] [--min-length ... [--section 
+        "2d2e5021",  # struct CmdDesc desc = ...
+        "3a2dd5dc",  # `--within-file` accepts one identifier (name or hex address) per
+        "3e7166e2",  # - `bn class` is the **C++ object-model lens** ... a correlation 
+        "3f16152c",  # bn evidence calls <reg-fn> --arg-struct N --field ... --field ..
+        "48853422",  # bn class show <Name> # one class: methods, vtable, size, bases, 
+        "491d1280",  # - **`bn evidence surface`** enumerates the **hidden code surface
+        "4a9d61dc",  # bn evidence function <fn> [--context ... # per-call ABI args ...
+        "4acd3a8b",  # `{"kind": <discriminator>, "items": ... "total": N, "offset": ..
+        "4c17ee45",  # - ... decompiles carry dead ... ... ... Each call site is preced
+        "4cd6e220",  # --field ... --field ... --field ... ...
+        "52c4dfff",  # - **JSON envelope contract ... Every collection-returning read e
+        "67ce174e",  # bn tag get ... | --function <fn> # tags at one address, or the w
+        "69200094",  # bn trace ... ... --arg ... --format json # structured JSON outpu
+        "6f2cba1d",  # bn evidence calls ... --arg-struct ... ...
+        "71ad85de",  # - **Unconditional (always-unsafe) sinks — no ... no ... A sink w
+        "74a30711",  # - ... resolves for a call whose **return value is discarded** — 
+        "78b987cf",  # **High-fan-in `total` is monotone, not ... A callsites read stop
+        "829c1ed6",  # bn decompile <fn> [--addresses] [--lines ... [--force-analysis] 
+        "84b0522c",  # bn taint backward -f <fn> --sink ... # slice a sink's args back 
+        "8ee528f5",  # - **Bounded-WRITE sinks — wrapped ... overflows ... A length-pre
+        "926c7cae",  # - **`evidence calls <reg-fn> --arg-struct N --field …`** recover
+        "93d922fb",  # - `xrefs` → ... each row carrying ... (`code` | `data`), ... (co
+        "9625a12f",  # ## ... Read flow
+        "a7f1eea5",  # bn dataflow defuse <fn> --var ... # SSA def site + use sites of 
+        "a9412200",  # - `bn disasm <function> --lines N:M` is a ... slice of the bridg
+        "ab8129a3",  # - `bn trace <fn> <addr> [--arg N] [--interprocedural]` walks **M
+        "abd1941b",  # bn xrefs <fn-or-addr> [--limit ...
+        "b06ea8ac",  # bn disasm <addr> --linear [N] # linear disasm of N (default ... 
+        "b15c995b",  # - **Nested tables are canonical too:** a pointer table embedded 
+        "b3400709",  # - **Project-internal wrappers — model them so taint follows them
+        "c5e2eebe",  # - `bn function create <address> [--preview]` forces Binary Ninja
+        "ceb51492",  # --field ... --field ... --field ...
+        "d3e7db45",  # - Two more signals from the same demotion logic: ... true` when 
+        "dd81c5c0",  # - **Width-sensitive reads — trust `bn disasm`, not the ... Pseud
+        "dfa3a380",  # - **Nothing-found vs incomplete (don't confuse them):** `items: 
+        "e2f2e169",  # bn trace main ... --arg ... # intra: stops at call boundary
+        "ec1c6720",  # bn taint forward -f <fn> --source ... [--sink-class ... # untrus
+        "f0e63d8f",  # - **Addresses in JSON are hex STRINGS**, not integers: `{"addres
+        "f760dc5e",  # - **Unpaged ... fixed-window ... presence reads** carry `{kind, 
+        "fb0af0ab",  # - **Spilled output is NOT the data ... A heavy `--format json` r
     }),
     "skills/bn/reference/runtime.md": frozenset({
-        "0580e23a",  # > bn -i dogfood-1 -t <sel> xrefs main
-        "0d658e61",  # **Predicting spill (#409).** Two signals let you avoid a w
-        "10113c3e",  # **Spill envelopes.** When output exceeds **10 000 estimate
-        "178a8928",  # - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > 
-        "17deb2e4",  # - **No targets ⇒ no `py exec`.** `bn py exec` requires at 
-        "201b6c48",  # ## 3. Output & context
-        "20e2e605",  # s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False
-        "2449caa9",  # > **Global BNDB cache (read-only mounts).** Auto-prefer is
-        "27da9925",  # ## 11. Skill install
-        "2e17cf8a",  # bn decompile main -i myid -t pam_qnx.so.2 # after the leaf
-        "30c54757",  # ## 1. Workflow & target selection
-        "393df258",  # > bn session start /path/to/binary --instance-id dogfood-1
-        "3ecb3444",  # bn session list [-i <id>] # all running instances, or filt
-        "416de700",  # **Fan-out (`--all-instances` / `--all-targets`).** Whole-t
-        "42663a3b",  # bn xrefs <fn-or-addr> --limit 20 # cap text output
-        "42c9764f",  # Requests time out after 600s by default; override with `BN
-        "472980ae",  # bn decompile <fn> --lines 40:80 # 1-indexed inclusive; pri
-        "4c0dc63e",  # 2. Pick a target:
-        "4c3276d9",  # bn bundle -i myid -t pam_qnx.so.2 function main # between 
-        "5083bc40",  # **Stopping is identity-checked and atomically signalled (#
-        "56550fe3",  # ## 10. Known quirks
-        "5ad3c6c3",  # - `--script <file>` for code on disk; `--code` for true on
-        "5d6983de",  # `bn load <raw>` and `bn session start <raw> [...]` auto-pr
-        "5dea8f09",  # shape, so a polling agent never has to index `items[0]` or
-        "600daf80",  # > bn -i dogfood-1 -t <sel> decompile main
-        "63414412",  # The `[N]` prefix is the view id; you can pass `-t N`. If n
-        "64bf870d",  # ## 8. Python escape hatch
-        "6785f03a",  # State lives at `~/.cache/bn/sessions/<sha256(project_root)
-        "680f5025",  # It checks CLI version, plugin staleness (`stale_plugin_ver
-        "6a2f4c3b",  # s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
-        "6b121aa2",  # **Private project associations.** `bn session start` assoc
-        "6bcea80f",  # "count": 1
-        "7ae58359",  # Identity is `(boot id, pid, process start time)`. Start ti
-        "7f52ba89",  # verdict, because one verdict over many jobs would be a lie
-        "8c11c1cb",  # 3. (Optional) Pin sticky defaults — useful for a **single*
-        "959dac82",  # - `-t/--target` and `-i/--instance` work **before or after
-        "9954584e",  # > **HARD rule for parallel / fan-out agents.** Sticky pins
-        "a6ed9d82",  # `--lines START:END` works on `decompile`, `il`, `disasm`, 
-        "a7fc01f4",  # ## 2. Sessions & headless
-        "aa616d1b",  # 1. Discover targets:
-        "ac6214d0",  # Blast radius: a bare, path, or `--all` close resolves agai
-        "b35e947b",  # ## 9. Troubleshooting
-        "b54e57c1",  # - **Threshold override** — set `BN_SPILL_TOKENS` (e.g. `BN
-        "bddeeded",  # **Quick-mode capability matrix.** Per-command behavior on 
-        "c114407a",  # | `evidence function` | **partial** — reads one function's
-        "c1803b96",  # - **Near-spill note** — when a read *fits* but lands withi
-        "ca93b1b0",  # > **`xrefs` text is display-capped (not just spilled).** F
-        "cb024404",  # - **`types declare` verification failures.** The source-pa
-        "cfcd9558",  # | `decompile`, `il` | **partial** — render only already-an
-        "d1ce60b3",  # bn close [<path>] [-t <sel>] [--all] # close one or explic
-        "d6cfb85b",  # - `target`, `instance` — **provenance**: which target and 
-        "dd5822d0",  # s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1,
-        "e0237277",  # When multiple bridge instances exist, flagless `bn load <p
-        "e3475983",  # s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
-        "f2a53a19",  # bn -i myid -t pam_qnx.so.2 decompile main # at root (prefe
+        "0580e23a",  # > bn -i ... -t <sel> xrefs main
+        "0d658e61",  # **Predicting spill ... Two signals let you avoid a wasted full r
+        "10113c3e",  # **Spill ... When output exceeds ... ... estimated tokens** ... .
+        "178a8928",  # - **Instance:** CLI ... > env ... > sticky > sole live instance 
+        "17deb2e4",  # - **No targets ⇒ no `py ... `bn py exec` requires at least one o
+        "201b6c48",  # ## ... Output & context
+        "20e2e605",  # ... sign=False), ... ...
+        "2449caa9",  # > **Global BNDB cache (read-only ... Auto-prefer isn't limited t
+        "27da9925",  # ## ... Skill install
+        "2b10a25d",  # **Stopping is identity-checked and atomically signalled ... `ses
+        "2e17cf8a",  # bn decompile main -i myid -t ... # after the leaf
+        "30c54757",  # ## ... Workflow & target selection
+        "393df258",  # > bn session start ... --instance-id ... # spawn naming
+        "3ecb3444",  # bn session list [-i <id>] # all running instances, or filter one
+        "42663a3b",  # bn xrefs <fn-or-addr> --limit ... # cap text output
+        "42c9764f",  # Requests time out after ... by default; override with ... ... ..
+        "472980ae",  # bn decompile <fn> --lines ... # ... inclusive; prints ... lines 
+        "4c0dc63e",  # ... Pick a target:
+        "4c3276d9",  # bn bundle -i myid -t ... function main # between group and leaf 
+        "56550fe3",  # ## ... Known quirks
+        "5ad3c6c3",  # - `--script <file>` for code on disk; `--code` for true ...
+        "5d6983de",  # `bn load <raw>` and `bn session start <raw> ... auto-prefer a si
+        "5dea8f09",  # shape, so a polling agent never has to index ... or re-derive te
+        "600daf80",  # > bn -i ... -t <sel> decompile main
+        "63414412",  # The `[N]` prefix is the view id; you can pass `-t ... If no brid
+        "64bf870d",  # ## ... Python escape hatch
+        "6785f03a",  # State lives at ... Project root walks up to the nearest ... (cwd
+        "6a2f4c3b",  # ... sign=False), ...
+        "6aaa0c2e",  # It checks CLI version, plugin staleness ... ... the Binary Ninja
+        "6b121aa2",  # **Private project ... `bn session start` associates the new brid
+        "6bcea80f",  # "count": ...
+        "78a7e943",  # **Fan-out (`--all-instances` ... ... Whole-target **read survey*
+        "7ae58359",  # Identity is `(boot id, pid, process start ... Start times count 
+        "7f52ba89",  # verdict, because one verdict over many jobs would be a lie, and 
+        "8c11c1cb",  # ... (Optional) Pin sticky defaults — useful for a **single** ...
+        "9308d393",  # **Unreachable bridges are hidden, not ... The bridge binds its s
+        "959dac82",  # - ... and ... work **before or after** the subcommand, and for t
+        "9954584e",  # > **HARD rule for parallel ... fan-out ... Sticky pins are **one
+        "a7fc01f4",  # ## ... Sessions & headless
+        "aa616d1b",  # ... Discover targets:
+        "ac6214d0",  # Blast radius: a bare, path, or `--all` close resolves against **
+        "b2734c06",  # `--lines START:END` works on `decompile`, `il`, `disasm`, and `f
+        "b35e947b",  # ## ... Troubleshooting
+        "b54e57c1",  # - **Threshold override** — set ... ... ... to ... the spill poin
+        "bddeeded",  # **Quick-mode capability ... Per-command behavior on a `--quick` 
+        "c114407a",  # | `evidence function` | **partial** — reads one function's call 
+        "c1803b96",  # - **Near-spill note** — when a read *fits* but lands within ... 
+        "ca93b1b0",  # > **`xrefs` text is display-capped (not just ... For a hot symbo
+        "cb024404",  # - **`types declare` verification ... The source-parser path hand
+        "cfcd9558",  # | `decompile`, `il` | **partial** — render only already-analyzed
+        "d1ce60b3",  # bn close [<path>] [-t <sel>] [--all] # close one or explicitly -
+        "d6cfb85b",  # - `target`, `instance` — **provenance**: which target and bridge
+        "dd5822d0",  # ... ... sign=False)), ...
+        "e0237277",  # When multiple bridge instances exist, flagless `bn load <path>` 
+        "e3475983",  # ... sign=False), ...
+        "f2a53a19",  # bn -i myid -t ... decompile main # at root (preferred for agents
+    }),
+    "skills/bn-kernel/SKILL.md": frozenset({
+        "031591a9",  # reports ... and ... keeps the bridge-owned `kind`, `total` and
+        "0ab592f9",  # wire this is an internal one-row **probe** at your requested `of
+        "1016956a",  # On every reachable exit, close only the exact selector returned 
+        "13d5a877",  # ... bn session start ... --instance-id worker --detach
+        "19e6cec0",  # ... asks for the schema, not the ... Passing ... to a curated
+        "1a60fe9a",  # run, every start and load succeeded with that budget, but two st
+        "1b9cffb0",  # band, including on a **zero-hit** page for any pre-declared kind
+        "26b229c0",  # Python process safe for sibling task ... A sibling exit ... can 
+        "27e9ecca",  # returns only after attempting that exact teardown on every reach
+        "292ab6e0",  # ... on the same agent-owned spawn, never a substitute for ...
+        "3804218c",  # ... bn session start ... --instance-id worker
+        "3a2677e0",  # ... ...
+        "3bd6c497",  # spawn budget (for example ... and give the surrounding tool a
+        "3ff3109a",  # HLIL and decompilation can distort access width, conditional gua
+        "4333a9bd",  # Full loads can take many minutes and each bridge can consume hun
+        "501a0d7d",  # This is a programmatic-only ... Wire-level `bn <paged command> -
+        "5217ba8e",  # ONE real request and returns no ... The bridge enforces `limit >
+        "5b90ca26",  # ... may legitimately be **absent** from a ... envelope: the brid
+        "615d3c92",  # polling the exact job ... In a ... dogfood
+        "62271b7e",  # applied exactly once as one end-to-end deadline: every page of a
+        "69aebef4",  # ... Use `int(row["address"], ... for arithmetic; do not call `he
+        "6bb82d86",  # return len(rows), ... "name", "address", "size", ...
+        "6dd5e055",  # - `await ... ... `await ... ... ... always return row lists; eve
+        "71820845",  # Use this skill for high-volume reads that benefit from OMP's ret
+        "742c5bd1",  # more than ... seconds (maximum ... ...
+        "74a85e20",  # ... is always normalized to ... A non-zero `offset` means the
+        "7e6433f3",  # bn -i worker session status "$JOB" --format json # one job: mach
+        "7ed9f73a",  # - `await ... reports offending comment locations; ... is the exp
+        "90230d5e",  # Paged reads also require each page to publish an integer `offset
+        "92bdec53",  # - `await ... exposes ... ... (the exact `imports` row count), an
+        "9e322829",  # The bootstrap is idempotent: rerun it after an eval-kernel ... E
+        "9f6fa0eb",  # s = ... target="<target-selector>")
+        "a32d2524",  # "you never acquired ownership, on every reachable exit close its
+        "a36439c7",  # with ... bn session start <target> --instance-id ...
+        "a46e3990",  # - `await ... count=N)` ... `lines=(START, END)` returns an addre
+        "b5ecda74",  # - `await ... ... defaults to ... rows to avoid latency cliffs; p
+        "b817911f",  # rows = await ...
+        "be1fbfeb",  # diagnostic channel for a failure: read the raised `BnError` for 
+        "c197cd77",  # A deliberate alternative timeout must be positive; never use ...
+        "c515afa2",  # - `await ... ... ... defaults to ... ... A bounded high-fan-in p
+        "ccd87225",  # When two or more concurrent children will use bn-kernel, launch 
+        "cd848d36",  # await ... ...
+        "ce70200b",  # ... — one verdict over many jobs would be a lie — and its items
+        "d7159bc2",  # The skill can detect and contain foreign bindings, but it cannot
+        "d7d5f3f9",  # ...
+        "dadd509e",  # ... ... ...
+        "db9deb20",  # zero-row position, that row alone proves more exists at this ...
+        "e22c411b",  # bridge, or treat the command as unavailable — do not synthesize 
+        "e5563d00",  # "Start your unique headless bridge with the exact ... "
+        "e6fb072e",  # large = [row for row in rows if ... ... >= ...
+        "e9265826",  # **Bare-decimal addresses, one disclosure ... Every containment-e
+        "f23ef97b",  # > **Concurrent sibling task agents:** OMP currently shares one r
+        "f9d5322a",  # ... # ...
+        "fd3e3a3d",  # the collection already ... The documented ... spelling disables
+        "fede3564",  # inherit one eval session and can overwrite ... or kill sibling
+        "ffc45d17",  # Native reads are bounded to ... seconds by ... Every curated exp
+    }),
+    "skills/bn-re/SKILL.md": frozenset({
+        "02a15c24",  # ... **Map the C++ type lattice (RTTI ... symbolicated C++ target
+        "0a6d25f3",  # bn class show <ClassName> # one class: methods, vtable slots, ba
+        "131433a5",  # > **One-shot sweep: `bn evidence ... It composes this whole sect
+        "133b9367",  # ### Phase ... Struct reconstruction
+        "13d6d847",  # ### Phase ... Retype locals and parameters
+        "2cc133cf",  # ### Phase ... Rename functions
+        "2dae86aa",  # - **Build a mental call tree** — for key functions, trace both u
+        "39e278be",  # ... Skip the toolchain stub ... — it's the first slot on most GC
+        "4226b58c",  # ... **Survey imports and strings** — these reveal libraries, API
+        "45acc326",  # > **Quick-loaded target?** If the binary was opened with `bn loa
+        "5b9065e6",  # Binary Ninja's auto-analysis follows direct ... Two important ca
+        "5bc6b916",  # ... **Scan the function list** — get a sense of scope:
+        "98b2f8c2",  # ... `bn evidence init` finds every ... section ... ... ... …), w
+        "991a98f8",  # ... Decompile each remaining ... Anything that writes to BSS ...
+        "a0373b7c",  # Note the total count, address range, and whether symbols are ...
+        "b9a586c2",  # ... `bn evidence table <table-addr> --entries N` reads the ... t
+        "cc459ea3",  # ... **Orient** — get architecture, platform, and entry point:
+        "ce59e5c8",  # When this comes up most: VM opcode handler tables, FSA predicate
+        "d4ecc83d",  # - **First, if the binary still has demangled C++ symbols, use th
+        "d5b78ae4",  # ... `bn function create <target> --preview` creates and verifies
+        "e20ac70e",  # narrows when you want only ...
+        "fea416ec",  # > **One-shot triage (steps ... in a single consistent ... `bn ev
+    }),
+    "skills/bn-vr/SKILL.md": frozenset({
+        "03b7cda5",  # bn evidence function ... --context ... # raw ABI args at each ..
+        "04f10e8a",  # > `bn taint forward -f ... --source ... — which surfaces the
+        "0b2bd3cc",  # bn strings --regex --query ... --no-crt --min-length ...
+        "0c92c9f8",  # strcat(out, decrypt(chunk)); ... bound = Σ decrypted-chunk lengt
+        "0e36f595",  # ... p + ... ... ... handler runs before the header is proven com
+        "0fef6d54",  # ... **Interesting strings** — format strings, SQL fragments, she
+        "132f4dad",  # **Worked example — ... BusyBox is an applet multiplexer: `main` 
+        "145b57e4",  # bn disasm ... --linear ... # address-linear: confirm ... widths 
+        "152a5d55",  # p += ... + ... ... advances by an ... length
+        "1961f9cb",  # > (backward); reading backward ... as results misreports a real 
+        "1ad7941d",  # ... **For ... APIs, audit EVERY caller** — a ... src)` wrapper i
+        "2c53b547",  # > **`file`=stripped ≠ static ... ... reports "stripped" whenever
+        "2ce56b81",  # code = ... ... ... type
+        "2d6c57a2",  # bn taint backward -f <handler> --sink ... # where does the lengt
+        "35cc74cd",  # > **Shortcut (step ... of sink enumeration):** `bn taint models 
+        "36c9380b",  # Reports **one compact line per flow** by default: the bug class 
+        "43223b71",  # ... **Walk constructor and dispatch ... Static firmware hides en
+        "4344b6fb",  # bn strings --regex --query ... --no-crt --min-length ...
+        "45e9a61b",  # bn disasm ... --linear ... # confirm frame size + register args
+        "48b6ca21",  # bn taint backward -f <handler> --sink ...
+        "4be13115",  # bn taint forward -f <handler> --source ...
+        "526e3eac",  # > ... taint through an object parser or a raw decoder is NOT an 
+        "539306d6",  # ... **Memory layout** — understand which regions are writable, e
+        "545c4dd4",  # > **Quick-loaded target?** If the binary was opened with `bn loa
+        "54717824",  # char ...
+        "59061229",  # bn trace ... ... --arg ... # dest -> its allocation + capacity
+        "5f09cda6",  # > bn trace ... ... --arg ... # what payload the decoder reads
+        "627fcd2b",  # ... **Dangerous imports** — scan for functions with known vulner
+        "637387df",  # ... = ... *)(p + ... ... ... length read PAST a ... tail
+        "654433c2",  # ... **Confirm the bound in disasm — not just ... Stripped + ARM 
+        "69cff84d",  # ... **Trace dest ... to its allocation** — `bn trace <fn> <call>
+        "7097e6ec",  # - **Unknown-option skip** — does an unrecognized `code` advance 
+        "77f417d4",  # remaining -= ... + ...
+        "7e63683e",  # ... **Recover the libc-like sinks by ... You can't `bn xrefs str
+        "7ebbe54b",  # > Sanitized shape: ... → ... → ... → ... decoded)` — taint dies 
+        "82cd26ce",  # bn trace handler ... --arg ... --interprocedural --ip-depth ... 
+        "85e13861",  # > **C ... firmware dispatch registered via a stack descriptor? M
+        "86329388",  # strcpy(tmp, ... ... overflow iff ... >= ...
+        "894e5c7f",  # bn trace ... ... --arg ... # where ... came from (attacker vs co
+        "8a5d70e1",  # Confirm the guard and the field-load widths in `bn disasm` (not 
+        "90ef13c5",  # Then audit each reachable applet (httpd request parsing, telnetd
+        "99782a22",  # bn trace ... ... --arg ... # source -> provenance + max length
+        "9e38d640",  # ... **Confirm the ...
+        "a54806ec",  # ... **Enter from ... Strings are the surviving attack-surface ma
+        "a9619a55",  # Reminder: HLIL misleads beyond ... width — besides field-load si
+        "ac3452de",  # Plain `bn ... thin out when dispatch is indirect or the decompil
+        "b10b433a",  # char ...
+        "b138da91",  # - Decompile the candidate, recognize the idiom (byte-copy loop, 
+        "b28e77be",  # ... **Confirm ABI + alloc sizes in disassembly** — `bn disasm` f
+        "b5627bda",  # ... **Input sources** — identify where external data enters:
+        "b7f8b9bd",  # ... **Trace source ... to provenance + max NUL-terminated length
+        "bf3acbeb",  # ... Identify the sink callsite and its arguments
+        "c0ddc155",  # ... Use `bn xrefs` on the caller to find *its* callers
+        "c80d68ee",  # ... **Treat taint output as frontier guidance, not proof** — a .
+        "c89d94c8",  # - **Loop guard vs fixed-header width** — is the continue conditi
+        "cadf552c",  # libc sink typed by its resolver as ... args, which silently unde
+        "cb01190b",  # Source→sink taint proves *attacker data reaches a modeled ... It
+        "cb9b1402",  # bn trace handler ... --arg ... --interprocedural # follow throug
+        "cfbe0f50",  # ... {"sink": {"class": ... ... ... ... ...
+        "d1c3ac2a",  # ... **For `strcat`, bound dest length + total appends** — the ov
+        "d5c8e51d",  # ... Repeat until you reach an input source or lose the trail
+        "da3874be",  # ... Trace each argument back through the caller's locals and par
+        "dfa07040",  # > bn disasm ... --linear ... # is `decoded` a fixed buffer? boun
+        "e0a2d963",  # bn taint forward -f <handler> --source ...
+        "e6803cea",  # while (remaining > ... { ... BUG: must be `remaining >= ... (the
+        "f847521c",  # > `--source ... (or ... can report **zero propagation** —
     }),
 }
 
@@ -655,6 +864,24 @@ def _doc_lines(doc: str) -> list[tuple[int, int, str, str]]:
 
 def _fingerprint(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+
+
+# A bare fingerprint is unreviewable -- a diff shows that a hash changed and not
+# WHICH line was re-fingerprinted -- so every ledger entry carries its line as a
+# comment. But an agent-facing doc demonstrates commands against example
+# targets, and copying `-i <id> -t <lib>.so`, a `sub_<hex>` or a `0x<hex>` into
+# a test file is a disclosure wherever it is copied, not a nit. So the comment
+# is a REDACTED rendering: any token carrying a digit, an underscore, a dot or a
+# slash is elided, which covers an address, a symbol, a path, a filename and an
+# instance id without a vocabulary of target names to keep up to date.
+# Deliberately broader than the requirement -- eliding `op_registry.py` costs
+# nothing and missing one name is a disclosure.
+_ELIDED = re.compile(r"\S*[0-9_./\\]\S*")
+
+
+def _ledger_comment(normalized: str) -> str:
+    return " ".join("..." if _ELIDED.fullmatch(token) else token
+                    for token in normalized.split())[:64]
 
 
 def _exit_code_claimed(doc: str, text: str) -> bytearray:
@@ -756,6 +983,63 @@ def test_the_non_claim_number_ledger_has_no_stale_entry():
         "these ledger entries excuse lines that no longer exist, so the ledger "
         "is bookkeeping for a document that has moved on; regenerate it against "
         f"the current docs: {stale}"
+    )
+
+
+_LEDGER_ROW = re.compile(r'^        "(?P<key>[0-9a-f]{8})",  # (?P<comment>.*)$')
+
+# The classes rule 11 names, stated HERE and not in the redactor: a guard that
+# asks the redactor what provenance is cannot fail when the redactor loosens.
+_TARGET_PROVENANCE = re.compile(
+    r"0x[0-9a-fA-F]+|sub_[0-9a-fA-F]+|\w+\.(?:so|bndb|bin|elf|exe|dll|dylib)\b")
+
+
+def _ledger_comments() -> dict[str, str]:
+    """The comment beside each ledger entry, read from this module's own source
+    -- the only place a comment exists."""
+    source = Path(__file__).read_text(encoding="utf-8").splitlines()
+    start = source.index("NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {")
+    rows = {}
+    for line in source[start:]:
+        if line == "}":
+            break
+        match = _LEDGER_ROW.match(line)
+        if match:
+            rows[match["key"]] = match["comment"]
+    return rows
+
+
+def test_every_ledger_entry_carries_the_line_it_excuses():
+    """The half a reviewer can check: the comment renders the live document's
+    line, so an entry re-fingerprinted against a changed line shows WHICH line
+    changed instead of only that a hash did."""
+    comments = _ledger_comments()
+    keyed = set().union(*NON_CLAIM_NUMBER_LINES.values())
+    assert set(comments) == keyed, (
+        "every ledger entry must carry its line as a comment and name a key the "
+        f"ledger holds: {sorted(set(comments) ^ keyed)}"
+    )
+    expected = {_ledger_key(normalized, residual): _ledger_comment(normalized)
+                for doc in EXIT_CODE_DOCS
+                for _, normalized, residual in _number_lines(doc)}
+    wrong = {key: (comment, expected.get(key))
+             for key, comment in comments.items() if expected.get(key) != comment}
+    assert not wrong, (
+        "these ledger comments do not render the line their key excuses, so the "
+        f"comment is bookkeeping a reviewer cannot trust: {wrong}"
+    )
+
+
+def test_no_ledger_comment_names_a_target():
+    """...and rendering the line must not carry the line's PROVENANCE into a
+    committed file: an address, a symbol, a target filename or an instance id
+    quoted by a doc's example command is a disclosure wherever it is copied."""
+    leaked = {key: _TARGET_PROVENANCE.findall(comment)
+              for key, comment in _ledger_comments().items()
+              if _TARGET_PROVENANCE.search(comment)}
+    assert not leaked, (
+        "these ledger comments carry target provenance; the comment is a "
+        f"redacted rendering of the line, not the raw line: {leaked}"
     )
 
 

@@ -96,9 +96,15 @@ INDEX_EXEMPT_TOOLING = frozenset({
 })
 
 # Deeper read/write surface the index reaches through its group entry.
-# ASSERTED: each is catalogued somewhere under `skills/`, which is the stated
-# reason. `evidence virtual-call` was in this group while appearing in no
-# reference at all.
+# ASSERTED: each has a catalogue ENTRY under `skills/` -- the invocation form
+# `bn <command>` on a line that is structurally an entry (a list item, a table
+# row, a callout, or a line inside a fenced block). `evidence virtual-call` was
+# in this group while appearing in no reference at all, and the repair then
+# accepted any backticked mention of the bare name, which a sentence SAYING THE
+# COMMAND IS UNDOCUMENTED also satisfies: deleting `evidence surface`'s
+# catalogue line and leaving "The `evidence surface` lane is not documented
+# here." kept all 16 drift tests green (round 11). A prose mention is not a
+# catalogue entry, and the bare name is not an invocation.
 INDEX_EXEMPT_CATALOGUED = frozenset({
     "data retype", "data symbols", "data vars",
     "evidence calls", "evidence orient", "evidence surface", "evidence virtual-call",
@@ -365,6 +371,30 @@ def test_skill_command_index_advertises_every_registered_command(command_paths):
     )
 
 
+# A catalogue entry is an INVOCATION on a line that is structurally an entry.
+# Both halves are load-bearing: the bare name admits a sentence denying the
+# command is documented, and prose admits the same sentence written with `bn `
+# in front of it.
+_ENTRY_PREFIXES = ("- ", "* ", "| ", "> ", "+ ")
+
+
+def _catalogue_entries() -> frozenset[str]:
+    """Every command some doc under `skills/` carries a catalogue entry for."""
+    entries: set[str] = set()
+    for path in sorted(SKILL.parent.parent.rglob("*.md")):
+        fenced = False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                fenced = not fenced
+                continue
+            if not (fenced or stripped.startswith(_ENTRY_PREFIXES)):
+                continue
+            entries |= {command for command in INDEX_EXEMPT_CATALOGUED
+                        if f"bn {command}" in line}
+    return frozenset(entries)
+
+
 def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     """An exemption is a claim, and an unasserted claim is where a real gap
     hides: `evidence virtual-call` sat in the "catalogued in a reference" group
@@ -400,13 +430,13 @@ def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     assert not unresolved, (
         f"these ways in are not registered commands: {unresolved}"
     )
-    skills = "\n".join(path.read_text(encoding="utf-8")
-                       for path in sorted(SKILL.parent.parent.rglob("*.md")))
-    uncatalogued = sorted(command for command in INDEX_EXEMPT_CATALOGUED
-                          if f"bn {command}" not in skills and f"`{command}`" not in skills)
+    catalogued = _catalogue_entries()
+    uncatalogued = sorted(INDEX_EXEMPT_CATALOGUED - catalogued)
     assert not uncatalogued, (
         "these are exempt from the index BECAUSE they are catalogued in a "
-        f"reference, and they are catalogued nowhere under skills/: {uncatalogued}"
+        "reference, and no line under skills/ is a catalogue ENTRY for them -- "
+        "an invocation `bn <command>` on a list item, table row, callout or "
+        f"fenced line: {uncatalogued}"
     )
 
 

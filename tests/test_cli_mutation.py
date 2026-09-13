@@ -1507,8 +1507,14 @@ def _bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef):
     there, which is a false positive waiting for the first such shape.
     """
     for node in ast.walk(fn):
-        if isinstance(node, ast.Assign):
-            yield node.targets, node.value, node, False
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            # An ANNOTATION is not a different binding form, and it was the last
+            # door out of this population: `inner: Callable[[Any], str] | None =
+            # text_renderer` moved a caller's transform to a name no property
+            # tracked, and both static guards stayed green (round 11).
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if node.value is not None:
+                yield targets, node.value, node, False
         elif isinstance(node, ast.NamedExpr):
             yield [node.target], node.value, node, False
         elif isinstance(node, (ast.For, ast.AsyncFor)):
@@ -1519,8 +1525,23 @@ def _bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef):
             for item in node.items:
                 if item.optional_vars is not None:
                     yield [item.optional_vars], item.context_expr, node, True
-        elif isinstance(node, ast.MatchAs) and node.name is not None and node.pattern:
-            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node, False
+        elif isinstance(node, ast.MatchValue | ast.MatchSingleton | ast.MatchClass
+                        | ast.MatchSequence | ast.MatchOr | ast.MatchAs | ast.MatchStar
+                        | ast.MatchMapping):
+            # A capture pattern binds whatever the subject held, and a bare
+            # `case renderer:` (MatchAs with no sub-pattern) yielded nothing at
+            # all. The subject is not reachable from the pattern node, so the
+            # binding carries the pattern itself: conservative, since a captured
+            # name is then only ever guarded by an explicit later rebinding.
+            captured = [ast.Name(id=name, ctx=ast.Store()) for name in (
+                *(p.name for p in ast.walk(node)
+                  if isinstance(p, ast.MatchAs | ast.MatchStar) and p.name),
+                *(p.rest for p in ast.walk(node)
+                  if isinstance(p, ast.MatchMapping) and p.rest),
+            )]
+            if captured:
+                yield captured, node.pattern if isinstance(node, ast.MatchAs) \
+                    and node.pattern is not None else ast.Constant(value=None), node, False
 
 
 def _carried(value: ast.expr, holders: set[str]) -> set[str]:
@@ -1589,16 +1610,98 @@ def _dominates(binding: tuple, use: tuple) -> bool:
     if not binding:
         return True
     if binding[-1] == _HEADER:
-        # A `for`/`with` header binds before its body, so it dominates every
-        # statement inside the compound statement and nothing outside it.
+        # A `for`/`with` header binds before its BODY -- and only its body. A
+        # `for ... else:` clause runs exactly when the iterable was EMPTY, so
+        # the target was never rebound there and the name still holds whatever
+        # it held before the loop. Scoring the header as dominating the whole
+        # compound statement laundered a caller's raw transform through the
+        # `else`, with all 243 properties green (round 11).
         scope = binding[:-1]
-        return len(use) > len(scope) and use[:len(scope)] == scope
+        return (len(use) > len(scope) and use[:len(scope)] == scope
+                and use[len(scope)][0] == "body")
     depth = len(binding) - 1
     if len(use) <= depth or binding[:depth] != use[:depth]:
         return False
     field, index = binding[depth]
     use_field, use_index = use[depth]
     return field == use_field and index < use_index
+
+
+# A function whose only purpose is to exercise the header rule's two sides.
+# Parsed here rather than looked for in `cli.py`, because the point of the rule
+# is to be right about shapes `cli.py` does not contain YET.
+_HEADER_SHAPES = """
+def sample(transform, result):
+    for transform in _guarded_transform(transform, "why"):
+        in_the_loop_body = transform(result)
+    else:
+        in_the_for_else = transform(result)
+    with _guarded_transform(transform, "why") as bound:
+        in_the_with_body = bound(result)
+    after_the_statements = transform(result)
+    return in_the_loop_body, in_the_for_else, in_the_with_body, after_the_statements
+"""
+
+
+def test_a_header_binding_dominates_its_body_and_not_its_for_else():
+    """A `for ... else:` clause runs exactly when the iterable was EMPTY, so the
+    loop target was never rebound and the name still holds what it held before
+    the loop -- the caller's RAW transform. The header rule scored the binding
+    as dominating the whole compound statement, so an invocation moved into the
+    `else` was reported as guarded: a real `for`/`break`/`else` shape in
+    `cli.py` invoked an unbound transform with 243 properties green. The `with`
+    body is the sound half and must stay dominated, or the rule cries wolf
+    instead of catching anything.
+    """
+    fn = ast.parse(_HEADER_SHAPES).body[0]
+    where = _block_paths(fn)
+    headers = {name: (*where[id(node)], _HEADER)
+               for targets, _value, node, header in _bindings(fn) if header
+               for name in _bound_names(targets)}
+    assert set(headers) == {"transform", "bound"}, headers
+    uses = {target.targets[0].id: where[id(target)]
+            for target in ast.walk(fn) if isinstance(target, ast.Assign)
+            and isinstance(target.targets[0], ast.Name)}
+
+    assert _dominates(headers["transform"], uses["in_the_loop_body"])
+    assert _dominates(headers["bound"], uses["in_the_with_body"])
+    assert not _dominates(headers["transform"], uses["in_the_for_else"])
+    assert not _dominates(headers["transform"], uses["after_the_statements"])
+    assert not _dominates(headers["bound"], uses["after_the_statements"])
+
+
+def test_every_name_cli_py_stores_is_a_name_the_population_binds():
+    """The population's totality, stated over `cli.py` itself rather than over a
+    list of binding FORMS -- which is what let an annotation out.
+
+    `_bindings` enumerated forms, so each new syntactic form was a new door:
+    round 7 a loop variable, round 8 a walrus, round 10 a module global, round
+    11 an annotated assignment (`inner: Callable[...] | None = text_renderer`,
+    two green properties and a green suite). A form cannot be missing from a
+    list that is derived instead: every name the module STORES must be a name
+    some binding yields, so the next form fails here on the commit that
+    introduces it rather than in the round after.
+    """
+    unseen = {}
+    for fn in _cli_functions():
+        stored = {node.id for node in ast.walk(fn)
+                  if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+        stored |= {node.name for node in ast.walk(fn)
+                   if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name}
+        stored |= {node.rest for node in ast.walk(fn)
+                   if isinstance(node, ast.MatchMapping) and node.rest}
+        bound = {name for targets, *_ in _bindings(fn) for name in _bound_names(targets)}
+        # An `except ... as name` rebinds to an exception, never to a transform,
+        # so leaving it out only ever makes a later use look UNguarded.
+        bound |= {handler.name for handler in ast.walk(fn)
+                  if isinstance(handler, ast.ExceptHandler) and handler.name}
+        if stored - bound:
+            unseen[fn.name] = sorted(stored - bound)
+    assert not unseen, (
+        "`cli.py` stores these names through a form `_bindings` does not yield, "
+        "so a caller-supplied transform parked on one is outside the population "
+        f"every guard below quantifies over: {unseen}"
+    )
 
 
 def _stores_holder(value: ast.expr, holders: set[str]) -> bool:
@@ -1848,6 +1951,14 @@ def _dispatch_roots(expr: ast.expr, slots: frozenset[str]) -> set[str]:
         return target | _dispatch_roots(expr.value, slots)
     if isinstance(expr, ast.Attribute) and expr.attr in slots:
         return _dispatch_roots(expr.value, slots)
+    if isinstance(expr, ast.BoolOp):
+        # `(t or fallback)(x)` dispatches through EITHER operand, and
+        # `_stores_holder` already reads this shape as carrying a holder -- so
+        # reading it as a value but not as a callee was a hole between two
+        # halves of the same rule.
+        return set().union(*(_dispatch_roots(value, slots) for value in expr.values))
+    if isinstance(expr, ast.IfExp):
+        return _dispatch_roots(expr.body, slots) | _dispatch_roots(expr.orelse, slots)
     return set()
 
 
@@ -1886,6 +1997,84 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
     )
 
 
+# The population is every parameter of every function, so `main`'s own `argv`
+# is a holder and the parsed namespace built from it is one by containment --
+# which makes the command handler `main` reads off that namespace a holder too.
+# It is not a bridge-result transform: it takes the namespace, returns an exit
+# code, and raises `BridgeError`, which `main` already converts. Binding it to
+# the malformed-result rule would be actively wrong -- a genuine `TypeError`
+# from a handler would be reported as "the bridge response was malformed".
+#
+# So it is an EXEMPT SITE, named, with a reason that is executable and not
+# prose: nothing in `cli.py` ever STORES a caller-supplied value under this
+# slot, which is why the name cannot carry one. The site is line-number-free so
+# an unrelated edit does not invalidate it, both halves stale-fail (the site
+# must still be reported, and the slot must still receive nothing), and it was
+# reported only once the annotated-assignment door closed -- before that the
+# annotation hid the binding entirely.
+_NOT_A_RESULT_TRANSFORM = {"handler() in main()": "handler"}
+
+
+def _dispatch_sites() -> list[str]:
+    """Every `cli.py` call that dispatches a holder the boundary does not
+    dominate, as `<callee>() in <function>()` plus its line."""
+    transforms = _transform_holders()
+    sites = []
+    for fn in _cli_functions():
+        if fn.name in _RULE_FUNCTIONS:
+            continue
+        where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
+        sites += [
+            f"{_callee(node)}() in {fn.name}()|cli.py:{node.lineno}"
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            for use in [where.get(id(node), ())]
+            for dispatched in [_callee_roots(node, transforms.slots)
+                               & transforms.holders[id(fn)]]
+            if any(not any(_dominates(binding, use) for binding in bound_at.get(name, ()))
+                   for name in dispatched)
+        ]
+    return sites
+
+
+def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
+    """The exemption's two halves, both able to fail.
+
+    STALE: the site must still be one the property reports, so an exemption
+    cannot outlive the call it excuses and sit there excusing a future one.
+    REASON: no call in `cli.py` may store a holder under the exempted slot --
+    the claim that makes the site safe. Park a caller-supplied transform there
+    and this reds, whatever the site list says.
+    """
+    reported = {site.split("|", 1)[0] for site in _dispatch_sites()}
+    stale = sorted(set(_NOT_A_RESULT_TRANSFORM) - reported)
+    assert not stale, (
+        "these dispatch sites are exempt from the boundary property but the "
+        f"property no longer reports them, so the exemption is dead: {stale}"
+    )
+    transforms = _transform_holders()
+    parked = []
+    for fn in _cli_functions():
+        holders = transforms.holders[id(fn)]
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            for slot in set(_NOT_A_RESULT_TRANSFORM.values()):
+                stores = [keyword.value for keyword in node.keywords
+                          if keyword.arg == slot]
+                after = [argument for at, argument in enumerate(node.args)
+                         if any(isinstance(earlier, ast.Constant)
+                                and earlier.value == slot
+                                for earlier in node.args[:at])]
+                if any(_stores_holder(value, holders) for value in (*stores, *after)):
+                    parked.append(f"{slot} <- {_callee(node)}() in {fn.name}() "
+                                  f"at cli.py:{node.lineno}")
+    assert not parked, (
+        "a caller-supplied value is stored under an EXEMPT slot, so the reason "
+        f"the exempt site is safe is no longer true: {parked}"
+    )
+
+
 def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
     """Property: in `cli.py`, a transform is CALLED only where the boundary
     rebinding DOMINATES the call -- whatever the dispatch shape (a name, a dict
@@ -1897,22 +2086,8 @@ def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
     into an `if` is on an earlier line than every call while running on only one
     path. Dominance is the question line order was standing in for.
     """
-    transforms = _transform_holders()
-    unguarded = []
-    for fn in _cli_functions():
-        if fn.name in _RULE_FUNCTIONS:
-            continue
-        where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
-        unguarded += [
-            f"{_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
-            for node in ast.walk(fn)
-            if isinstance(node, ast.Call)
-            for use in [where.get(id(node), ())]
-            for dispatched in [_callee_roots(node, transforms.slots)
-                               & transforms.holders[id(fn)]]
-            if any(not any(_dominates(binding, use) for binding in bound_at.get(name, ()))
-                   for name in dispatched)
-        ]
+    unguarded = [site.replace("|", " at ") for site in _dispatch_sites()
+                 if site.split("|", 1)[0] not in _NOT_A_RESULT_TRANSFORM]
     assert not unguarded, (
         "these invoke a bridge-result transform on a path the boundary "
         "rebinding does not dominate, so a malformed result escapes the rule "
