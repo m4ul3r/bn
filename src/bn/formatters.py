@@ -71,7 +71,7 @@ def _skew_note(*fields: str) -> str:
     an undetectable wrong answer is worse than the crash it replaced (#619)."""
     plural = "s" if len(fields) > 1 else ""
     return (f"! malformed {', '.join(fields)} field{plural}: not the expected "
-            "container -- rows it holds may be missing or partial "
+            "shape -- the rows or counts it carries may be missing or partial "
             "(use --format json)")
 
 
@@ -170,6 +170,37 @@ def _field_declared(source: Any, key: str) -> bool:
     return key in _as_dict(source)
 
 
+def _count_field(source: Any, key: str) -> int:
+    """``source[key]`` as a count, recording the skew when the key is PRESENT but
+    holds something no count can be read out of.
+
+    The count sibling of ``_field_list``/``_field_dict``, and it exists for both
+    of that pair's failure modes at once. ``int(source.get(key) or 0)`` RAISED on
+    a string or a container -- each of `go rename`'s six counters cost the WHOLE
+    summary, where the same payload with the counter ABSENT rendered cleanly --
+    and quietly answering ``0`` instead is the other half of the same bug: a
+    fabricated zero is indistinguishable from a real one, and a zero on this op
+    is exactly the "nothing changed, don't save" reading that #683 discarded a
+    rename batch to. A numeric string or float still reads, as it always did;
+    anything else is a skew for the enclosing boundary to disclose (#619)."""
+    src = _as_dict(source)
+    if key not in src:
+        return 0
+    raw = src[key]
+    if raw is None:
+        return 0                       # an explicit null claimed nothing
+    if isinstance(raw, bool):
+        _record_skew(key)              # a flag where a count belongs
+        return 0
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        _record_skew(key)
+        return 0
+
+
 def _discloses(fn: Callable[..., str] | None = None, *,
                prefix: bool = False) -> Callable[..., str]:
     """Append the skew disclosure for every container this text renderer coerced
@@ -212,6 +243,43 @@ def _discloses(fn: Callable[..., str] | None = None, *,
             return out + ("\n" if out else "") + note
         return rendered
     return decorate if fn is None else decorate(fn)
+
+
+def _discloses_in_summary(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """``@_discloses`` for a transform that returns the #685 summary DICT rather
+    than text.
+
+    The CLI runs a mutation's compact status as a `result_transform`: the
+    transform consumes the RAW payload and the text renderer is handed its
+    OUTPUT, so by the time ``_discloses`` installs a recorder the payload -- and
+    with it every skew the choke point recorded off it -- is already gone. A
+    present-but-malformed ``results[]`` therefore produced a status
+    byte-identical to one built from no ``results[]`` at all: the confident
+    answer from an unusable payload that ``_discloses`` exists to stop, one hop
+    UPSTREAM of every renderer, on the DEFAULT mutation text path. ``_record_skew``
+    called a summary transform a no-op context; it is the opposite -- the only
+    context where the payload does not survive to a renderer (#619).
+
+    Same drain, different carrier: the note travels in ``first_error``, the one
+    summary key the agent contract already tells a control loop to read, so the
+    text render and the JSON path both carry it and no new key joins the
+    documented schema."""
+    @functools.wraps(fn)
+    def transformed(value: Any, *args: Any, **kwargs: Any) -> Any:
+        token = _SKEWED_FIELDS.set([])
+        try:
+            out = fn(value, *args, **kwargs)
+            skewed = sorted(_SKEWED_FIELDS.get() or ())
+        finally:
+            _SKEWED_FIELDS.reset(token)
+        # `out is value` is the idempotent short-circuit returning the caller's
+        # own dict: never mutate that, and it read nothing to disclose anyway.
+        if not skewed or not isinstance(out, dict) or out is value:
+            return out
+        note = _skew_note(*skewed)
+        existing = out.get("first_error")
+        return {**out, "first_error": f"{existing} ({note})" if existing else note}
+    return transformed
 
 
 def _fmt_count(value: Any) -> str:
@@ -3769,9 +3837,21 @@ def _add_mutation_ok(value: Any) -> Any:
     op status. Additive -- ``success``/``committed`` are unchanged."""
     if not isinstance(value, dict) or "ok" in value:
         return value
-    results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+    # Read inside a capture: this transform runs BEFORE any renderer, so the
+    # choke point has no boundary to record into. `ok` is "the bridge reported
+    # success AND no op row failed"; with the rows unreadable the second half is
+    # not established, so it must not be claimed. Fail safe for the same reason
+    # `dirty_after` does: a spurious `ok: false` costs a look, a fabricated
+    # `ok: true` closes an agent's control loop on a batch nobody checked (#619).
+    token = _SKEWED_FIELDS.set([])
+    try:
+        results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        unusable = bool(_SKEWED_FIELDS.get())
+    finally:
+        _SKEWED_FIELDS.reset(token)
     failed = any(str(r.get("status")) in FAILED_MUTATION_STATUSES for r in results)
-    return {"ok": bool(value.get("success", True)) and not failed, **value}
+    return {"ok": bool(value.get("success", True)) and not failed and not unusable,
+            **value}
 
 
 def _build_mutation_summary(
@@ -3900,6 +3980,7 @@ def _build_mutation_summary(
     return summary
 
 
+@_discloses_in_summary
 def _mutation_summary(value: Any) -> Any:
     """#408: collapse a (single or batch) mutation result into a compact,
     schema-stable status object for an unattended agent control loop -- did
@@ -3949,6 +4030,7 @@ def _mutation_summary(value: Any) -> Any:
     )
 
 
+@_discloses_in_summary
 def _go_rename_summary(value: Any) -> Any:
     """Compact status for `go rename`, which reports through its OWN counters.
 
@@ -3968,11 +4050,11 @@ def _go_rename_summary(value: Any) -> Any:
         return _mutation_summary(value)
     committed = bool(value.get("committed", False))
     preview = bool(value.get("preview", False))
-    candidates = int(value.get("go_renamed_candidates") or 0)
-    committed_count = int(value.get("go_committed_count") or 0)
-    verified = int(value.get("go_verified_count") or 0)
-    failed = int(value.get("go_failed_count") or 0)
-    skipped = int(value.get("skipped_user_named") or 0)
+    candidates = _count_field(value, "go_renamed_candidates")
+    committed_count = _count_field(value, "go_committed_count")
+    verified = _count_field(value, "go_verified_count")
+    failed = _count_field(value, "go_failed_count")
+    skipped = _count_field(value, "skipped_user_named")
     rolled_back = value.get("rolled_back")
 
     # `changed` is what is LIVE in the view when the call returns, never the plan:
@@ -4007,7 +4089,7 @@ def _go_rename_summary(value: Any) -> Any:
         # candidates + scan-time-only skips -- keeping verified+noop+failed <=
         # op_count, the invariant every other mutation summary holds.
         op_count=candidates + skipped
-                 - int(value.get("skipped_changed_during_apply") or 0),
+                 - _count_field(value, "skipped_changed_during_apply"),
         reported_success=bool(value.get("success", True)),
         # `results[]` holds only the FAILURE rows for this op.
         failure_rows=_field_list(value, "results"),

@@ -1563,25 +1563,145 @@ _MALFORMED = {
 # Excluded from the probe BY NAME, each with the reason it is not a payload TEXT
 # renderer. An exclusion that is not named here does not exist: a silent one is
 # how five live renderers left the population at round 8 and two more at round 9.
+#
+# Each entry is `(category, prose)`, and the CATEGORY IS EXECUTABLE: the test
+# below re-derives it from the live module and fails when it stops holding. That
+# is round 11's second lesson. `_go_rename_summary` sat here under "the summary
+# it builds is rendered by a renderer that is itself probed" -- a sentence that
+# is false for EVERY transform, because a transform runs before any renderer
+# exists -- and prose cannot go stale loudly. An exemption whose justification
+# is only prose is an exemption nobody re-checks.
+_EXCLUSION_CATEGORIES = ("not-callable", "takes-more-than-a-payload",
+                         "is-a-renderer-factory", "returns-data-not-text")
 _PROBE_EXCLUSIONS = {
-    "_render_paged_list_text": ("takes its page key and its item renderer as REQUIRED "
-                                "parameters, so the field it reads is an argument rather "
-                                "than a property of the module, and every caller reaches "
-                                "it through a renderer that is itself probed"),
-    "_slice_text_lines": ("its first argument is ALREADY-RENDERED TEXT plus a required "
-                          "line range, not a payload; it reads no payload key at all"),
-    "_text_field": ("a renderer FACTORY: its argument is the KEY, not a payload. The "
-                    "renderer it returns reads that one key and returns it only when it "
-                    "is already a STRING, falling back to the raw dump otherwise -- no "
-                    "container walk, so there is nothing for either differential"),
-    "_xref_buckets": ("returns DATA (the split ref buckets), not text, so there is no "
-                      "rendering to absorb; the CLI counts groups with it for a pipe "
-                      "note, and the same payload's body renderer discloses the skew"),
-    "_group_refs_by_caller": ("returns DATA (grouped rows), not text -- same pipe-note "
-                              "path as the bucket splitter"),
-    "_go_rename_summary": ("returns the #685 summary DICT, not text; the summary it "
-                           "builds is rendered by a renderer that is itself probed"),
+    "_render_paged_list_text": (
+        "takes-more-than-a-payload",
+        "takes its page key and its item renderer as REQUIRED parameters, so the "
+        "field it reads is an argument rather than a property of the module, and "
+        "every caller reaches it through a renderer that is itself probed"),
+    "_slice_text_lines": (
+        "takes-more-than-a-payload",
+        "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
+        "not a payload; it reads no payload key at all"),
+    "_text_field": (
+        "is-a-renderer-factory",
+        "its argument is the KEY, not a payload. The renderer it returns reads "
+        "that one key and returns it only when it is already a STRING, falling "
+        "back to the raw dump otherwise -- no container walk, so there is nothing "
+        "for either differential"),
+    "_xref_buckets": (
+        "returns-data-not-text",
+        "returns DATA (the split ref buckets), not text, so there is no rendering "
+        "to absorb; the CLI counts groups with it for a pipe note and hands the "
+        "SAME RAW payload to the body renderer, which discloses the skew. That "
+        "last clause is what makes this legitimate where a transform's is not"),
+    "_group_refs_by_caller": (
+        "returns-data-not-text",
+        "returns DATA (grouped rows), not text -- same pipe-note path as the "
+        "bucket splitter, and the body renderer likewise still sees the raw "
+        "payload"),
+    "FAILED_MUTATION_STATUSES": (
+        "not-callable",
+        "a set of status STRINGS the CLI compares an op row against, not a "
+        "payload consumer -- there is no render to absorb. Named because "
+        "`_probe_renderers` skipping every non-callable SILENTLY is the defect "
+        "this list exists to stop"),
 }
+
+
+def _exclusion_category_holds(name, category):
+    """Re-derive one exclusion's stated category from the LIVE module.
+
+    The whole point: a reason that stops being true fails a test instead of
+    sitting in a comment. Each category is a property of the symbol itself, so
+    nothing here consults the exclusion list to decide whether the exclusion is
+    warranted."""
+    from bn import formatters
+
+    obj = getattr(formatters, name, None)
+    if category == "not-callable":
+        return not callable(obj)
+    if not callable(obj):
+        return False
+    positional = [p for p in inspect.signature(obj).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    required = [p for p in positional if p.default is p.empty]
+    if category == "takes-more-than-a-payload":
+        return len(required) > 1
+    if len(required) != 1:
+        return False           # the two categories below are about the RETURN
+    if category == "is-a-renderer-factory":
+        return callable(_render_or_exception(obj, "probe"))
+    if category == "returns-data-not-text":
+        out = _render_or_exception(obj, dict(_PROBE_ELEMENT))
+        return not isinstance(out, (str, Exception))
+    return False
+
+
+# A transform the CLI installs is NOT a renderer, and probing it as one measures
+# the harness instead of the code: it returns a DICT, so `str()` of its result
+# differs between a malformed key and an absent one for free, and a differential
+# over that passes while the user still sees nothing. The CLI runs each of these
+# as a `result_transform`/`summary_transform` and then renders the
+# ALREADY-TRANSFORMED value, so the live entry point is the COMPOSITION -- which
+# is exactly where the skew was being dropped, because `@_discloses` installs its
+# recorder inside the renderer, long after the transform has consumed and
+# discarded the payload.
+#
+# The renderer each transform is paired with is DECLARED here; that this table is
+# COMPLETE is not. `_cli_installed_transforms()` reads the transform names out of
+# the CLI's own AST and the inventory test fails if one of them is missing, so a
+# new transform cannot enter the codebase unclassified. Naming one in
+# `_PROBE_EXCLUSIONS` instead is rejected outright: "the summary it builds is
+# rendered by a renderer that is itself probed" was the reason `_go_rename_summary`
+# carried, and it is FALSE for a transform -- the renderer is handed the OUTPUT,
+# never the payload, so nothing downstream can re-read what the transform
+# absorbed. That false premise was round 11's blocker.
+_COMPOSED_ENTRY_POINTS = {
+    "_mutation_summary": "_render_mutation_summary_text",
+    "_go_rename_summary": "_render_mutation_summary_text",
+    "_add_mutation_ok": "_render_mutation_text",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_installed_transforms():
+    """Every `bn.formatters` symbol the CLI installs as a RESULT TRANSFORM, read
+    out of the CLI's own AST.
+
+    A transform's output REPLACES the payload the text renderer is handed, which
+    makes it the one entry-point kind whose choke-point reads can reach no
+    `@_discloses` boundary at all. Derived rather than listed for the usual
+    reason: a table of transforms maintained beside the transforms is a
+    population taken from the thing it guards."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    module = pathlib.Path(formatters.__file__).resolve()
+    names: set[str] = set()
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue
+        tree = ast.parse(path.read_text())
+        imported = {alias.asname or alias.name
+                    for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                    if (node.module or "").endswith("formatters")
+                    for alias in node.names}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                # `spill_status` is the transform; `spill_status_renderer` beside
+                # it is a RENDERER and is probed as one, so match the transform
+                # keyword exactly rather than by prefix.
+                if not kw.arg or ("transform" not in kw.arg
+                                  and kw.arg != "spill_status"):
+                    continue
+                names |= {inner.id for inner in ast.walk(kw.value)
+                          if isinstance(inner, ast.Name) and inner.id in imported}
+    return frozenset(names)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1602,15 +1722,24 @@ def _cli_referenced_formatters():
     that keyword was round 10's minor: a symbol installed under a differently
     named keyword, or called directly inside a pipe-note helper, sat outside the
     inventory -- and an inventory with a spelling rule of its own is the same
-    defect one level up."""
+    defect one level up.
+
+    The walk covers the WHOLE package, not the command modules. Scoping it to
+    `commands/*.py` was round 11's blocker and the same defect a third time: the
+    CLI ENTRY module installs the mutation transforms directly, so three live
+    payload consumers were in neither population and in no named exclusion, and
+    a coercion added to any of them kept every guard in this file green. A
+    directory glob is a spelling rule like any other."""
     import ast
     import pathlib
 
     from bn import formatters
 
-    commands = pathlib.Path(formatters.__file__).resolve().parent / "commands"
+    module = pathlib.Path(formatters.__file__).resolve()
     referenced: set[str] = set()
-    for path in sorted(commands.glob("*.py")):
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue                   # the module under guard is not its own caller
         tree = ast.parse(path.read_text())
         imported = {alias.asname or alias.name
                     for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
@@ -1635,24 +1764,62 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
 
     installed = _cli_referenced_formatters()
     # Anti-vacuity: a broken AST walk returning nothing would satisfy the
-    # subset check below without examining anything. The four names are the ones
-    # the two spelling rules this test exists to replace would each have missed:
-    # a note (no `_render` prefix), a steer (same, plus a REQUIRED keyword-only
-    # flag), a text slicer, and a bucket splitter the CLI calls directly rather
-    # than installing under a `*_renderer=` keyword.
+    # subset check below without examining anything. The six names are the ones
+    # the three spelling rules this test exists to replace would each have
+    # missed: a note (no `_render` prefix), a steer (same, plus a REQUIRED
+    # keyword-only flag), a text slicer, a bucket splitter the CLI calls
+    # directly rather than installing under a `*_renderer=` keyword, and two
+    # transforms that live in the CLI ENTRY module rather than under
+    # `commands/`.
     assert {"_resolution_note", "_disasm_linear_steer_note", "_slice_text_lines",
-            "_xref_buckets", "_render_defuse_text"} <= installed, sorted(installed)
+            "_xref_buckets", "_render_defuse_text", "_mutation_summary",
+            "_add_mutation_ok"} <= installed, sorted(installed)
     probed = {label.split("(")[0] for label, _ in _probe_renderers()}
     missing = sorted(installed - probed - set(_PROBE_EXCLUSIONS))
     assert not missing, (
         f"the CLI references {missing} as payload consumer(s) the probe never "
-        "runs, so no guard below can fail on them. Probe them, or name each one "
-        "in _PROBE_EXCLUSIONS with the reason it is not a payload text renderer.")
-    # A stale exclusion is a silent one: if the named function is gone, or its
-    # reason is empty, the exclusion has stopped meaning anything.
-    for name, reason in _PROBE_EXCLUSIONS.items():
-        assert callable(getattr(formatters, name, None)), f"{name} no longer exists"
+        "runs, so no guard below can fail on them. Probe them, compose them in "
+        "_COMPOSED_ENTRY_POINTS, or name each one in _PROBE_EXCLUSIONS with the "
+        "reason it is not a payload text renderer.")
+    # A transform's output REPLACES the payload, so no downstream renderer can
+    # re-read what it absorbed: it must be COMPOSED, and it may never be waved
+    # through as an exclusion. Both halves are derived from the CLI's AST, so a
+    # new transform arrives here already unclassified rather than silently
+    # uncovered -- round 11's blocker was a transform sitting in the exclusion
+    # list under a reason that was false for its whole category.
+    transforms = set(_cli_installed_transforms())
+    assert transforms == set(_COMPOSED_ENTRY_POINTS), (
+        "the CLI installs these result transforms and _COMPOSED_ENTRY_POINTS "
+        f"declares those: {sorted(transforms)} != "
+        f"{sorted(_COMPOSED_ENTRY_POINTS)}. A transform outside the table is "
+        "probed by nothing.")
+    assert not transforms & set(_PROBE_EXCLUSIONS), (
+        f"{sorted(transforms & set(_PROBE_EXCLUSIONS))} is installed as a result "
+        "transform, so the renderer downstream of it never sees the payload it "
+        "read. It cannot be excluded on the grounds that something else renders "
+        "its output -- compose it.")
+    for transform, renderer in _COMPOSED_ENTRY_POINTS.items():
+        assert callable(getattr(formatters, transform, None)), transform
+        paired = getattr(formatters, renderer, None)
+        assert callable(paired), f"{transform} is paired with a missing {renderer}"
+        assert hasattr(paired, "__wrapped__"), (
+            f"{renderer} renders a transform's output but is no @_discloses "
+            "boundary, so the composition has no drain at all")
+    # A stale exclusion is a silent one, and prose goes stale silently by
+    # definition -- that was round 11's second finding. Every exclusion's stated
+    # CATEGORY is therefore re-derived from the live module here, so a
+    # justification that stops being true fails instead of sitting in a comment.
+    for name, (category, reason) in _PROBE_EXCLUSIONS.items():
+        assert hasattr(formatters, name), f"{name} no longer exists"
         assert reason, f"{name} is excluded without a reason"
+        assert category in _EXCLUSION_CATEGORIES, (
+            f"{name} is excluded under {category!r}, which is not one of the "
+            f"checkable categories {_EXCLUSION_CATEGORIES}. An exclusion whose "
+            "reason cannot be re-derived is prose, and prose does not expire.")
+        assert _exclusion_category_holds(name, category), (
+            f"{name} is excluded as {category!r} and the module no longer agrees: "
+            f"{reason}. Either it became a payload text renderer and must be "
+            "probed, or its category changed and the entry must say which.")
 
 
 def _probe_renderers():
@@ -1708,8 +1875,9 @@ def _probe_renderers():
     candidates = ({name for name in dir(formatters) if name.startswith("_render")}
                   | set(_cli_referenced_formatters()))
     for name in sorted(candidates):
-        if name in _PROBE_EXCLUSIONS or not hasattr(formatters, name):
-            continue                       # named with its reason; see the dict
+        if (name in _PROBE_EXCLUSIONS or name in _COMPOSED_ENTRY_POINTS
+                or not hasattr(formatters, name)):
+            continue                   # named with its reason, or composed below
         fn = getattr(formatters, name)
         if not callable(fn):
             continue
@@ -1748,6 +1916,21 @@ def _probe_renderers():
             out.append((label, call if hasattr(fn, "__wrapped__")
                         or name in _cli_referenced_formatters()
                         else formatters._discloses(call)))
+    # The composed entry points, appended LAST and never wrapped: production
+    # does not wrap them either -- the paired renderer carries its own boundary,
+    # and that boundary is precisely what the transform's reads happen too early
+    # to reach. Labelled with the TRANSFORM's name (the parenthesised tail is
+    # stripped by `fn_of`) so the AST attributes its declared reads to it.
+    for transform_name in sorted(_COMPOSED_ENTRY_POINTS):
+        transform = getattr(formatters, transform_name)
+        renderer = getattr(formatters, _COMPOSED_ENTRY_POINTS[transform_name])
+
+        def composed(payload, _t=transform, _r=renderer):
+            rendered = _r(_t(payload))
+            return rendered if isinstance(rendered, str) else str(rendered)
+
+        out.append((f"{transform_name}(via "
+                    f"{_COMPOSED_ENTRY_POINTS[transform_name]})", composed))
     return out
 
 
@@ -2229,13 +2412,16 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (101, 86, 521, 193), (
+    assert (probed, len(reading), len(population), len(containers)) == (104, 89, 564, 197), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
-        "pairs read as a container. If you ADDED a renderer or a field, update "
-        "these four numbers. If you did not, a renderer stopped reading a field "
-        "it used to read, and the differential below just stopped covering it -- "
+        "pairs read as a container. These are not bookkeeping: every number is "
+        "the SIZE OF THE COVERED SET, so re-baselining one to make this pass is "
+        "how coverage leaves silently. Update them only together with the "
+        "renderer or field you deliberately added or removed, and say which in "
+        "the commit. If you changed no read, a renderer stopped reading a field "
+        "it used to read and the differential below just stopped covering it -- "
         "which is the failure this assertion exists to make visible.")
 
 
@@ -2306,19 +2492,25 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     missed = sorted(f"{name}.{key}" for name, key in declared - classified
                     if (name, key) in read)
     nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 227, f"the module declares {len(declared)} choke-point reads, not 227"
+    assert len(declared) == 227, (
+        f"the module declares {len(declared)} choke-point reads, not 227. The "
+        "count is the size of the covered set: a read that vanishes is a read "
+        "no differential runs any more, so move this number only with the read "
+        "you deliberately added or removed.")
     assert len(sites) == 249, (
         f"the module has {len(sites)} choke-point CALL SITES, not 249. A pair "
         "read at several sites keeps its (function, key) entry when one site is "
-        "converted to a raw coercion, which is why the sites are counted too.")
+        "converted to a raw coercion, which is why the sites are counted too -- "
+        "so a site that disappears here is a coercion that stopped going "
+        "through the choke point, not a number to re-baseline.")
     assert missed == ["_render_defuse_text.other_versions",
                       "_render_leaf_line.dropped_args",
                       "_render_leaf_line.tainted_args"], (
         "a choke-point read the probe reaches at top level is no longer "
         f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 94, (
+    assert len(nested) == 91, (
         f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 94")
+        "reach them, not 91")
     # Counting is not covering, and that was round 9's blocker: the nested reads
     # were counted here and then differentially tested nowhere, so a one-hop
     # helper coercing a nested ref bucket passed every guard in this file. Every
@@ -2339,23 +2531,27 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
         return any(k == key and (r == fn or fn in reach.get(r, ()))
                    for r, k in exercised)
     uncovered = sorted(f"{fn}.{key}" for fn, key in nested if not covered(fn, key))
-    # The residue, named rather than counted. Three families, none of them a
-    # container rendering that could absorb silently: the #685 summary BUILDERS,
-    # whose reads produce a dict rather than text and whose output is asserted
-    # key-for-key by the go-rename sharing test; and helpers behind a branch
+    # The residue, named rather than counted. Two families, neither of them a
+    # container rendering that could absorb silently: helpers behind a branch
     # gated on a value no literal in the module supplies at the position that
     # needs it (a specific op name paired with a specific requested shape, a
-    # truncation cause, a frontier-leaf KIND on the nested ELEMENT rather than on
-    # the payload), each with its
-    # own named test above -- the truncated-taint stats, the affected-types
-    # listing, the blast-radius summary, the mutation operation rows.
-    assert uncovered == ["_add_mutation_ok.results",
-                         "_blast_radius_line.affected_summary",
+    # truncation cause, a frontier-leaf KIND on the nested ELEMENT rather than
+    # on the payload), each with its own named test above -- the truncated-taint
+    # stats, the affected-types listing, the blast-radius summary, the mutation
+    # operation rows.
+    #
+    # The three #685 summary transforms USED to sit here, excused as "reads that
+    # produce a dict rather than text". That excuse was round 11's blocker: the
+    # CLI renders their OUTPUT, so nothing downstream could re-read what they
+    # absorbed, and a malformed `results[]` rendered byte-identically to an
+    # absent one on the default mutation text path. They are composed entry
+    # points now (`_COMPOSED_ENTRY_POINTS`) and are exercised by the top-level
+    # differential like any other renderer, which is why they are gone from
+    # this list rather than re-excused in it.
+    assert uncovered == ["_blast_radius_line.affected_summary",
                          "_format_operation_result.defined_types",
                          "_format_operation_result.requested",
-                         "_go_rename_summary.results",
                          "_leaf_group_key.callee",
-                         "_mutation_summary.results",
                          "_render_callgraph_text.target",
                          "_taint_truncation_note.truncation_cause",
                          "_types_affected_lines.affected_types"], (
@@ -2388,8 +2584,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
     Measured by replaying THIS population against the base module (same keys,
     same contexts, same `_MALFORMED` values; base's renderers are called bare
-    because base has no disclosure boundary to wrap them in): base absorbs 894
-    of these 1158 cases at 190 of the 193 container positions, and raises in
+    because base has no disclosure boundary to wrap them in): base absorbs 918
+    of these 1182 cases at 194 of the 197 container positions, and raises in
     100 more; this commit absorbs 0 and raises 0."""
     from bn import formatters
 
@@ -2428,16 +2624,16 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1158, f"the differential ran {checked} cases, not 1158"
+    assert checked == 1182, f"the differential ran {checked} cases, not 1182"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 521 read keys
-    rather than the 193 the container probe classifies as containers: a renderer
+    """The soft-degrade half of #619, kind-free, so it covers all 564 read keys
+    rather than the 197 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
-    Over these same 4168 renders base raises 153 times across 58 (renderer, key)
+    Over these same 4512 renders base raises 153 times across 58 (renderer, key)
     positions; this commit raises 0. Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -2456,7 +2652,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4168, f"the raise sweep ran {swept} renders, not 4168"
+    assert swept == 4512, f"the raise sweep ran {swept} renders, not 4512"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -2466,12 +2662,12 @@ def test_the_nested_population_is_exactly_this_big():
     nested = _nested_population()
     depths = collections.Counter(len(path) for _, _, path, _, _, _ in nested)
     containers = [rec for rec in nested if rec[4] is not None]
-    assert (len(nested), len(containers)) == (1320, 204), (
+    assert (len(nested), len(containers)) == (1332, 204), (
         f"the nested population changed size: {len(nested)} nested keys read, "
         f"{len(containers)} of them as containers. If you added a nested read, "
         "update these numbers; if you did not, a renderer stopped reading a "
         "nested field and the differential below stopped covering it.")
-    assert dict(sorted(depths.items())) == {1: 785, 2: 343, 3: 114, 4: 48, 5: 24, 6: 6}, (
+    assert dict(sorted(depths.items())) == {1: 797, 2: 343, 3: 114, 4: 48, 5: 24, 6: 6}, (
         f"the nested population's shape changed: {dict(sorted(depths.items()))}")
     # THE convergence proof, and the answer to round 10's second blocker: the
     # descent stopped because a level found no further container, not because it
@@ -2540,8 +2736,8 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
 
     Kind-free because the crash does not need a container: a sampled string
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
-    spec, an unhashable `kind` used as a grouping key. Over these 10560 renders
-    base raises 281 times at 93 nested positions; this commit raises 0."""
+    spec, an unhashable `kind` used as a grouping key. Over these 10656 renders
+    base raises 297 times at 97 nested positions; this commit raises 0."""
     swept, raised = 0, []
     for fn_name, render, path, key, _kind, ctx in _nested_population():
         base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
@@ -2555,7 +2751,7 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-    assert swept == 10560, f"the nested raise sweep ran {swept} renders, not 10560"
+    assert swept == 10656, f"the nested raise sweep ran {swept} renders, not 10656"
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
@@ -2590,7 +2786,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1235, f"the mirror ran {checked} renders, not 1235"
+    assert checked == 1325, f"the mirror ran {checked} renders, not 1325"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -3371,6 +3567,114 @@ def test_the_compact_summary_ok_key_mirrors_success_on_every_outcome():
     # Without this the mirror is satisfiable by a constant: the population has to
     # actually produce BOTH outcomes for the assertion above to have bitten.
     assert seen == {True, False}, f"the outcome population only produced ok={seen}"
+
+
+def test_the_compact_mutation_status_discloses_a_malformed_results_listing():
+    """The DEFAULT mutation text path, and the one place a choke-point read has
+    no renderer to record into.
+
+    The CLI runs the compact status as a `result_transform` and hands the text
+    renderer its OUTPUT, so `@_discloses` installs its recorder after the raw
+    payload is already gone. A present-but-malformed `results[]` therefore
+    produced a status byte-identical to one built from no `results[]` at all, on
+    every mutation subcommand's default view: a confident unmeasured verdict
+    from a payload the code could not read, with nothing saying so. Both
+    transforms, all six wrong shapes -- including the FALSY ones, which is where
+    "present" and "absent" collapse into each other."""
+    from bn import formatters
+
+    def rendered(transform, payload):
+        return formatters._render_mutation_summary_text(transform(payload))
+
+    cases = [
+        (formatters._mutation_summary, {"success": True, "committed": True}),
+        (formatters._go_rename_summary, {"kind": "go_rename", "success": False,
+                                         "go_failed_count": 2,
+                                         "go_renamed_candidates": 5}),
+    ]
+    for transform, base in cases:
+        absent = rendered(transform, dict(base))
+        assert "malformed" not in absent, (
+            f"{transform.__name__} cries malformed on a payload that simply has "
+            f"no results[]: {absent!r}")
+        for bogus in _MALFORMED["list"]:
+            out = rendered(transform, {**base, "results": bogus})
+            assert out != absent, (
+                f"{transform.__name__} renders results={bogus!r} byte-identically "
+                "to that key being absent, with no disclosure -- an unusable "
+                "payload reading as a confident status")
+            assert _disclosed(out, "results"), (
+                f"{transform.__name__} on results={bogus!r} discloses nothing "
+                f"that NAMES the key it could not read: {out!r}")
+
+
+def test_the_verbose_mutation_transform_never_claims_ok_from_unreadable_rows():
+    """`ok` is "the bridge reported success AND no op row failed" (#447), and the
+    second half is derived from `results[]`.
+
+    This transform also runs before any renderer, so a present-but-malformed
+    listing left it reading ZERO failures and answering a confident `ok: true` --
+    the JSON half of the defect the text path discloses above, and the key an
+    agent contract tells a control loop to close on. With the rows unreadable
+    the second half is not established, so it must fail safe the way
+    `dirty_after` already does."""
+    from bn import formatters
+
+    ok_of = lambda payload: formatters._add_mutation_ok(payload)["ok"]
+    # Unchanged where the rows ARE readable: absent, empty, clean, and failed.
+    assert ok_of({"success": True}) is True
+    assert ok_of({"success": True, "results": []}) is True
+    assert ok_of({"success": True, "results": [{"status": "verified"}]}) is True
+    assert ok_of({"success": True,
+                  "results": [{"status": "verification_failed"}]}) is False
+    for bogus in _MALFORMED["list"]:
+        assert ok_of({"success": True, "results": bogus}) is False, (
+            f"ok claimed success from results={bogus!r}, which no op row could be "
+            "read out of -- a fabricated all-clear for a batch nobody checked")
+
+
+def test_the_go_rename_counters_degrade_instead_of_costing_the_whole_summary():
+    """`go rename` reports through its OWN counters, and every one of the six
+    reached a bare `int(...)`: a counter arriving as a string or a container
+    raised ValueError/TypeError and cost the ENTIRE summary, where the same
+    payload with that counter ABSENT rendered cleanly. Quietly reading it as 0
+    is the other half of the same bug -- `changed=0 ... dirty_after=False` is
+    exactly the "nothing happened, don't save" verdict that discards a completed
+    rename batch -- so `_count_field` records the skew and the summary discloses
+    it by name.
+
+    Named rather than left to the aggregate raise sweep, and this is a STATED
+    LIMIT of the probe rather than a preference: these six reads only happen
+    when `kind == "go_rename"`, and the probe records an UNCLASSIFIED key's
+    context as the bare payload, which delegates to the generic summary and
+    never opens this branch. A key behind a branch no filler value satisfies is
+    outside the sweep, so it is covered here instead."""
+    from bn import formatters
+
+    base = {"kind": "go_rename", "success": True, "committed": True}
+    absent = formatters._render_mutation_summary_text(
+        formatters._go_rename_summary(dict(base)))
+    assert "malformed" not in absent, absent
+    for counter in ("go_renamed_candidates", "go_committed_count",
+                    "go_verified_count", "go_failed_count", "skipped_user_named",
+                    "skipped_changed_during_apply"):
+        for bogus in ("bad", {"a": 1}, ["x"], "", False, {}, []):
+            out = formatters._render_mutation_summary_text(
+                formatters._go_rename_summary({**base, counter: bogus}))
+            assert out != absent, (
+                f"{counter}={bogus!r} renders byte-identically to that counter "
+                "being absent")
+            assert _disclosed(out, counter), (
+                f"{counter}={bogus!r} left no note naming the counter that could "
+                f"not be read: {out!r}")
+        # A real count, and the numeric string the bridge has always been allowed
+        # to send, still read as themselves and cry nothing.
+        for genuine in (3, "3"):
+            out = formatters._render_mutation_summary_text(
+                formatters._go_rename_summary({**base, counter: genuine}))
+            assert "malformed" not in out, (
+                f"{counter}={genuine!r} is a readable count and must not disclose: "
+                f"{out!r}")
 
 
 def test_no_renderer_mutates_the_payload_it_was_handed():
