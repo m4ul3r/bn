@@ -435,7 +435,7 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
     Unknowable also covers what the listing cannot REPRESENT, and that
     distinction is the whole safety of this function -- a wrong ``False`` is
     the sole corroboration behind every socket unlink in this module, so it
-    destroys a bridge's own bound-and-listening endpoint. Two shapes:
+    destroys a bridge's own bound-and-listening endpoint. Three shapes:
 
     * The file is line-oriented, so a path containing a newline cannot appear
       in it at all. That is not evidence of nothing being bound, so it answers
@@ -446,6 +446,19 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
       about a serving socket. The comparison is therefore done on BYTES, the
       form the kernel wrote and the form ``bind`` was given, so such a path is
       answered exactly rather than approximately.
+    * The listing holds the string ``bind`` was given and nothing else -- not
+      the binder's working directory. A RELATIVE row is therefore meaningful
+      only in a cwd this reader does not know and the file cannot express, and
+      resolving it against the READER's cwd is the same losing transformation
+      as the other two: under a relative cache root (the supported answer to
+      the AF_UNIX length limit, so the bridge really does bind a relative
+      string) a CLI run from anywhere else answered "nothing is bound" about a
+      live listening socket and ``gc`` unlinked it. A relative row that could
+      be this path -- same basename, and ``bind`` creates the final component
+      so it is never a symlink -- makes the answer ``None``. One with a
+      different basename cannot be this path in any cwd, and is skipped, so an
+      unrelated relative socket elsewhere on the host does not make every
+      question unanswerable.
     """
     wanted = os.fsencode(str(socket_path))
     if b"\n" in wanted:
@@ -467,13 +480,19 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
             continue
         bound_path = fields[7]
         # The record may spell the path differently from the string the bridge
-        # passed to `bind` (a relative cache root, a symlinked `instances/`), so
-        # compare what the two names resolve to -- filtered by basename first,
-        # because a busy host lists thousands of sockets.
-        if bound_path == wanted or (
-            os.path.basename(bound_path) == name
-            and os.path.realpath(bound_path) == resolved
-        ):
+        # passed to `bind` (a symlinked `instances/`), so compare what the two
+        # names resolve to -- filtered by basename first, because a busy host
+        # lists thousands of sockets. An exact byte match needs no resolution
+        # and is taken first: it can only ever REFUSE a destruction.
+        if bound_path == wanted:
+            return True
+        if os.path.basename(bound_path) != name:
+            continue
+        if not os.path.isabs(bound_path):
+            # Resolvable only in the binder's cwd, which this file does not
+            # carry. Never answer the positive "nothing is bound" from it.
+            return None
+        if os.path.realpath(bound_path) == resolved:
             return True
     return False
 

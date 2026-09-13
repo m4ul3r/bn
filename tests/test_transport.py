@@ -5142,12 +5142,14 @@ def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
     """The basename+realpath fallback, pinned in BOTH directions.
 
     The kernel lists the string ``bind`` was given. A record may spell the same
-    endpoint differently -- a symlinked ``instances/``, a relative cache root --
-    and a literal byte comparison then fails on a socket that is bound and
-    listening, which reads as the positive "nothing is bound" and unlinks a
-    serving bridge's own endpoint. The fallback resolves both names; the
-    basename filter is only a cheap pre-filter, so a DIFFERENT socket that
-    happens to share a basename must still answer ``False`` (#618).
+    endpoint differently -- a symlinked ``instances/`` -- and a literal byte
+    comparison then fails on a socket that is bound and listening, which reads
+    as the positive "nothing is bound" and unlinks a serving bridge's own
+    endpoint. The fallback resolves both names; the basename filter is only a
+    cheap pre-filter, so a DIFFERENT socket that happens to share a basename
+    must still answer ``False``. A RELATIVE row is NOT covered here and is not
+    resolvable at all -- see the relative-bound-path test, which is the case
+    this fallback used to get wrong (#618).
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
@@ -5232,3 +5234,70 @@ def test_unlink_if_unchanged_destroys_nothing_for_a_caller_with_no_document(tmp_
     assert path.exists()
     assert _unlink_if_unchanged(path, document) is True          # the one that was judged
     assert not path.exists()
+
+
+def test_a_relative_bound_path_is_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The listing cannot represent the BINDER's cwd, so it cannot be resolved.
+
+    ``/proc/net/unix`` holds the string ``bind()`` was given, verbatim. A
+    relative cache root is a supported configuration -- the documented answer
+    to the AF_UNIX path-length limit -- and the bridge then binds a RELATIVE
+    string, which the kernel records as-is. ``os.path.realpath`` on that row
+    resolves it against the READER's cwd, which is not the binder's and is
+    nowhere in the file, so no row matched and the loop fell through to the
+    positive claim "nothing is bound" about a socket that was bound AND
+    listening: ``gc`` then unlinked a serving bridge's own endpoint and left
+    it serving on an inode reachable by nobody.
+
+    Same shape as the newline and the U+FFFD: a comparison through a
+    transformation that LOSES information, answering ``False`` where the
+    source cannot represent the question. It answers ``None`` instead.
+
+    The other direction is pinned beside it, because "unknowable" that is too
+    broad is its own defect: an unrelated relative row must not make every
+    other path unknowable, so one with a different basename is skipped and
+    that path still answers ``False`` (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache"
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    # The bridge binds the relative string a relative cache root produces.
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time, sys\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('instances/rel.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(root), stdout=subprocess.PIPE, text=True,
+    )
+    sock_path = inst_dir / "rel.sock"
+    try:
+        assert binder.stdout.readline().strip() == "bound"
+        monkeypatch.chdir(tmp_path)        # a CLI run from anywhere but the binder's cwd
+        monkeypatch.setenv("BN_CACHE_DIR", str(root))
+
+        assert _path_has_bound_socket(sock_path) is None
+        # Narrow: the unresolvable row speaks only for its own basename.
+        assert _path_has_bound_socket(inst_dir / "unrelated.sock") is False
+
+        summary = gc_instances()           # the registry-less orphan sweep
+
+        assert summary["sockets_removed"] == 0
+        assert sock_path.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))         # still reachable by name
+        finally:
+            client.close()
+    finally:
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        sock_path.unlink(missing_ok=True)
