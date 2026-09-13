@@ -1309,9 +1309,12 @@ def _render_instance_gc_text(value: Any) -> str:
     # Counts are summed, so a non-numeric one raised a TypeError and cost the
     # whole text view -- the same crash #619 replaced everywhere else, still live
     # here because these fields are scalars rather than containers.
-    logs = _int_or_default(value.get("logs_removed"))
-    socks = _int_or_default(value.get("sockets_removed"))
-    regs = _int_or_default(value.get("registries_purged"))
+    # Through the count choke point: silently defaulting these to 0 stopped the
+    # TypeError but made an unreadable count render as a confident "0 reaped",
+    # which is the other half of the same bug (#619).
+    logs = _count_field(value, "logs_removed")
+    socks = _count_field(value, "sockets_removed")
+    regs = _count_field(value, "registries_purged")
     live = value.get("live_instances", 0)
     reaped = logs + socks + regs
     if reaped == 0:
@@ -1392,14 +1395,37 @@ def _render_go_rename_text(value: Any) -> str:
     `results` carries only failures; the applied names are in the database."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    skipped = value.get("skipped_user_named", 0)
-    targeted = _int_or_default(value.get("go_renamed_candidates"))
+    # Through the COUNT choke point, every one of them. This renderer is what
+    # the CLI installs as the DEFAULT (non---summary) view, and it was reading
+    # the same six counters the compact summary reads -- but through a helper
+    # that silently defaults an unreadable count to 0 and records nothing. A
+    # candidate counter arriving in the wrong shape therefore rendered the
+    # confident "nothing to do -- no auto-named Go functions to rename" for a
+    # batch that had just committed 1783 renames, undisclosed: the #683 harm
+    # again, in the sibling of the transform that was fixed for it. A second
+    # count contract beside the choke point is how this keeps coming back, so
+    # there is now one (#619).
+    skipped = _count_field(value, "skipped_user_named")
+    targeted = _count_field(value, "go_renamed_candidates")
     if not targeted:
+        if _field_skewed("go_renamed_candidates"):
+            # "nothing to do" is an ACTIONABLE claim, not a missing detail: a
+            # caller reads it and stops. A fabricated 0 must never be allowed
+            # to make it, so say what is actually known instead -- the note the
+            # boundary appends says which field could not be read.
+            return ("go rename: cannot say what this run did -- the candidate "
+                    "count was unreadable, so neither the renames nor the "
+                    "skips can be reported; re-read with --format json")
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
-                f"({value.get('defined_count', 0)} defined at pcln addresses, "
+                f"({_count_field(value, 'defined_count')} defined at pcln addresses, "
                 f"{skipped} already user-named)")
     failed = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
-    verified = value.get("go_verified_count", targeted - len(failed))
+    # The default is a MEASUREMENT (targeted minus the failures), so it is used
+    # only when the envelope claimed no verified count at all -- asking
+    # `_count_field` for an absent key would fabricate a 0 over it.
+    verified = (_count_field(value, "go_verified_count")
+                if _field_present(value, "go_verified_count")
+                else targeted - len(failed))
     preview = bool(value.get("preview"))
     committed = bool(value.get("committed", True))
     lines: list[str] = []
@@ -1493,14 +1519,20 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     sections) so the honest-total convention reads identically across them (#59,
     #122). Returns None when the page IS the whole set (no paging happened) or
     the envelope lacks an integer total to report against."""
-    total = value.get("total")
-    if not isinstance(total, int) or isinstance(total, bool):
-        # Dropping the footer for an unusable total is right -- there is nothing
-        # honest to report against -- but dropping it SILENTLY made a skewed
-        # envelope render byte-identically to an unpaged one. A bool is not a
-        # total either, however much `isinstance(x, int)` likes it (#619).
-        if _field_present(value, "total"):
-            _record_skew("total")
+    # ONE count contract for all three of these. Spelling the total's test as
+    # `isinstance(total, int)` made it a THIRD one: it rejected the numeric
+    # string `_count_field` accepts two lines below, and which the go-rename
+    # counter test asserts must NOT disclose, so a bridge reporting counts as
+    # strings got "! malformed total" and no footer at all. Ask the choke point
+    # instead -- and ask it the three-state question, because "absent" is not
+    # "unusable": an envelope with no total has nothing to footer against and
+    # nothing to disclose, while a present-but-unreadable one drops the footer
+    # AND says so. Dropping it silently made a skewed envelope render
+    # byte-identically to an unpaged one (#619).
+    if not _field_present(value, "total"):
+        return None
+    total = _count_field(value, "total")
+    if _field_skewed("total"):
         return None
     # `returned` and `offset` reach ARITHMETIC, so they go through the count
     # choke point like every other count: a string offset made
@@ -2445,7 +2477,22 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             if inner_renderer is not None:
                 try:
                     lines.append(inner_renderer(inner))
+                except BridgeError:
+                    # A `BridgeError` is not a render failure: it is this CLI
+                    # declaring it cannot TRUST the reply, and the documented
+                    # contract for that is exit 2 from `main()`. Swallowing it
+                    # here rendered a silent fallback at exit 0 for a payload
+                    # the tool had just refused -- unparseable data reading as
+                    # a clean result, and worse here than anywhere, because
+                    # `--all-instances` is a SURVEY: a fallback row is
+                    # indistinguishable from a row that genuinely had little to
+                    # say (#619).
+                    raise
                 except Exception:
+                    # Everything else still falls back, and the survey goes on.
+                    # That intent is right: one instance's odd-but-parseable
+                    # payload tripping a renderer must not cost the other nine
+                    # rows. Different cause, different handling.
                     lines.append(_render_fallback_text(inner))
             else:
                 lines.append(_render_fallback_text(inner))
@@ -3557,7 +3604,9 @@ def _render_data_symbols_text(value: Any) -> str:
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
         for sym in syms)
     if value.get("has_more"):
-        shown = _int_or_default(value.get("offset")) + len(syms)
+        # Reaches arithmetic, so it goes through the count choke point rather
+        # than a silent default: one count contract, not two (#619).
+        shown = _count_field(value, "offset") + len(syms)
         body += (f"\n// showing {shown} of {value.get('total', '?')}"
                  f"; resume with --offset {shown}")
     return body
@@ -3900,6 +3949,39 @@ def _add_mutation_ok(value: Any) -> Any:
             **value}
 
 
+# The unmeasured explanation, in ONE place, with the cause as a hole.
+#
+# The text renderer has to name the CAUSE too -- `skills/bn/reference/mutating.md`
+# quotes its warning line verbatim as documented sample output -- and the
+# summary carries no separate key for it, because the key set IS the documented
+# #685 contract. So the cause travels in `first_error` and the renderer reads it
+# back out by splitting on this same template: the format and the parse come
+# from one string, and moving the template moves both.
+# `test_the_unmeasured_cause_round_trips_for_every_cause` asserts that.
+_UNMEASURED_NOTE = (
+    "unmeasured: {cause}, so changed/verified/noop/failed counts could not be "
+    "derived (None, not a confirmed 0) and dirty_after defaults to True as a "
+    "fail-safe -- do not assume nothing changed"
+)
+_UNMEASURED_HEAD, _UNMEASURED_TAIL = _UNMEASURED_NOTE.split("{cause}")
+
+
+def _unmeasured_cause(first_error: Any) -> str:
+    """The cause phrase back out of a summary's ``first_error``, or ``""``.
+
+    Empty when the note is absent or malformed rather than guessing: a renderer
+    that fabricated a cause would be asserting the one thing it does not know,
+    which is exactly what the hardcoded "this op reported no results[] rows"
+    warning did once a second cause existed (#619)."""
+    text = first_error if isinstance(first_error, str) else ""
+    start = text.find(_UNMEASURED_HEAD)
+    if start < 0:
+        return ""
+    rest = text[start + len(_UNMEASURED_HEAD):]
+    end = rest.find(_UNMEASURED_TAIL)
+    return rest[:end] if end >= 0 else ""
+
+
 def _build_mutation_summary(
     *,
     measured: bool,
@@ -3917,6 +3999,7 @@ def _build_mutation_summary(
     proto_residue: bool = False,
     default_error: str = "mutation failed",
     unmeasured_cause: str = "this op reported no results[] rows",
+    unusable: bool = False,
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -3928,7 +4011,14 @@ def _build_mutation_summary(
     documented in `skills/bn/reference/mutating.md`: a key change is a contract
     change.
     """
-    success = reported_success and not failed
+    # `unusable` is the one answer this module gives to "can success be claimed
+    # off a payload we could not read". `_add_mutation_ok` already withholds
+    # `ok` when `results[]` is unreadable; the compact summary claimed
+    # `ok: true` on the same payload, so a uniform `jq '.ok'` -- the entire
+    # point of #447 -- FLIPPED depending on whether `--summary` was passed.
+    # Merely EMPTY rows are not unusable and both paths still say ok there,
+    # which is what keeps this parity rather than a behaviour change (#619).
+    success = reported_success and not failed and not unusable
     # The failure explanation, in the one order both ops share: the first failure
     # ROW's own message/status (an `unsupported` early return puts its only
     # explanation in `results[0]["message"]`), then the top-level `message` (a
@@ -3969,12 +4059,7 @@ def _build_mutation_summary(
         # summary key an agent contract already tells callers to check -- with
         # the same explanation, layered on top of whatever failure message was
         # already found above.
-        unmeasured_explanation = (
-            f"unmeasured: {unmeasured_cause}, so "
-            "changed/verified/noop/failed counts could not be derived (None, "
-            "not a confirmed 0) and dirty_after defaults to True as a "
-            "fail-safe -- do not assume nothing changed"
-        )
+        unmeasured_explanation = _UNMEASURED_NOTE.format(cause=unmeasured_cause)
         first_error = (f"{first_error} ({unmeasured_explanation})" if first_error
                        else unmeasured_explanation)
     summary = {
@@ -4045,7 +4130,18 @@ def _mutation_summary(value: Any) -> Any:
     # but a spilled mutation would print an all-zero status.
     if value.get("kind") == "mutation_summary":
         return value
-    results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+    # Read inside a NESTED capture so this transform can tell an UNREADABLE
+    # listing from an empty one, then re-record so the enclosing drain still
+    # discloses it by name. `_add_mutation_ok` withholds `ok` on exactly this
+    # payload; the compact summary must give the same answer (#447/#619).
+    token = _SKEWED_FIELDS.set([])
+    try:
+        results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        unreadable = list(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
     failed = [r for r in results if str(r.get("status")) in FAILED_MUTATION_STATUSES]
     verified = sum(1 for r in results if r.get("status") == "verified")
     noop = sum(1 for r in results if r.get("status") == "noop")
@@ -4074,6 +4170,7 @@ def _mutation_summary(value: Any) -> Any:
         rolled_back=value.get("rolled_back"),
         message=value.get("message"),
         proto_residue=bool(value.get("prototype_user_type_residue")),
+        unusable=bool(unreadable),
     )
 
 
@@ -4145,12 +4242,29 @@ def _go_rename_summary(value: Any) -> Any:
     # Reporting `candidates` in that last case is the mirror image of the bug
     # this function exists to fix, and `_render_go_rename_text` already refuses
     # to claim "N renamed" for rows that passed readback before a revert.
+    # The counter `changed` is READ FROM is this summary's measurement source,
+    # and the third state matters here exactly as it does for a container:
+    # ABSENT means the op claimed nothing, so there is nothing to report
+    # against. `_count_field` answers 0 for an absent key, which on this op is
+    # the "nothing changed, do not save" verdict -- so a partial or
+    # version-skewed envelope with the counters MISSING produced the decision
+    # keys of a genuine all-noop commit, reaching #683's harm by absence
+    # instead of by wrong shape. `_mutation_summary` already calls its own
+    # missing measurement source unmeasured; both callers of the one builder
+    # must answer that the same way (#619/#685).
     if committed:
         changed = committed_count
+        source = "go_committed_count"
     elif preview:
         changed = verified
+        source = "go_verified_count"
     else:
+        # Nothing landed, and that is established by the revert rather than by
+        # a counter -- so there is no measurement source to require.
         changed = 0
+        source = None
+    measured = (not unreadable
+                and (source is None or _field_present(value, source)))
 
     # The failure explanation (a failure row's message/status, then the top-level
     # `message`) and `dirty_after` come from the shared builder: gating on
@@ -4166,9 +4280,11 @@ def _go_rename_summary(value: Any) -> Any:
         # fabricated 0 from rendering the decision keys of a genuine all-noop
         # commit. Hardcoding True here made that fail-safe unreachable from the
         # one op whose whole reason for existing is #683.
-        measured=not unreadable,
-        unmeasured_cause=("this op's own counters could not be read, so the "
-                          "work it reported cannot be counted"),
+        measured=measured,
+        unusable=bool(unreadable),
+        unmeasured_cause=(
+            "this op's own counters could not be read" if unreadable
+            else "this op reported none of its own counters"),
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
@@ -4220,13 +4336,20 @@ def _render_mutation_summary_text(value: Any) -> str:
         # attempted to), so running it again is a different execution that
         # cannot recover what the first one did, and duplicates state for a
         # non-idempotent op.
-        # It does not state WHY: there is more than one way to be unmeasured
-        # (no `results[]` rows, or an op's own counters arriving in a shape no
-        # count reads out of), and the cause travels in `first_error` below
-        # from the one place that knows it. A renderer asserting the cause
-        # printed the wrong one the moment a second cause existed.
+        # It NAMES the cause, and does not assert it: there is more than one
+        # way to be unmeasured (no `results[]` rows; an op's own counters
+        # arriving in a shape no count reads out of; that op reporting none of
+        # them at all), so the one place that knows puts the cause in
+        # `first_error` and this reads it back through the shared template.
+        # Hardcoding "this op reported no results[] rows" printed the WRONG
+        # cause the moment a second one existed, and dropping the clause
+        # entirely broke the sample output the public reference quotes
+        # verbatim -- for the documented cause this line is byte-identical to
+        # it again.
+        cause = _unmeasured_cause(value.get("first_error"))
         line += ("\nwarning: unmeasured -- "
-                 "the changed/verified/noop/failed counts above are UNKNOWN. "
+                 + (f"{cause}; " if cause else "")
+                 + "the changed/verified/noop/failed counts above are UNKNOWN. "
                  "dirty_after is reported True as a fail-safe, not confirmed. "
                  "Do not assume nothing changed: read the view back (e.g. "
                  "`bn target info` or a targeted readback) and `bn save` "
