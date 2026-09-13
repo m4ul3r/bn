@@ -250,6 +250,33 @@ def _text_value(source: Any, key: str) -> str | None:
     return None
 
 
+def _is_failed_status(row: Any) -> bool:
+    """Does this op result's status NAME a failure? The one place the question is
+    answered -- and it answers it in THREE states, not two.
+
+    Three sites spelled it ``str(row.get("status")) in FAILED_MUTATION_STATUSES``
+    and a fourth tested the RAW value against the set, which is the same
+    second-decider defect this module keeps re-growing -- and this time the two
+    answers did not merely differ, the raw one RAISED: an unhashable status (a
+    dict or list from a malformed or future bridge result) is ``TypeError:
+    cannot use 'dict' as a set element`` and it cost the WHOLE mutation card,
+    where the same row with ``status`` absent rendered cleanly (#619).
+
+    But coercing with ``str()`` is not the fix either, and that is the half the
+    crash hid. ``str({...})`` is not in the set, so an UNREADABLE status would
+    answer "not a failure" -- indistinguishable from a row that genuinely
+    passed, on the value ``ok`` and the summary's ``failed`` count are derived
+    from. That is the fabricated-zero shape (#683) wearing a different coat.
+    The status goes through the text choke point instead, so the third state
+    survives: FAILED (True), NOT-FAILED (False, silent), UNREADABLE (False AND
+    a recorded skew, which the enclosing boundary discloses and which
+    ``_add_mutation_ok`` turns into a withheld ``ok`` rather than a pass).
+
+    ABSENT and an explicit null claim nothing and stay silent, exactly as they
+    did before -- base read them as "not a failure" too."""
+    return _text_value(row, "status") in FAILED_MUTATION_STATUSES
+
+
 def _discloses(fn: Callable[..., str] | None = None, *,
                prefix: bool = False) -> Callable[..., str]:
     """Append the skew disclosure for every container this text renderer coerced
@@ -1879,8 +1906,13 @@ def _context_suffix(context: Any) -> str:
         parts.append(
             f"{label}={_render_string_literal(string['value'], truncated=bool(string.get('truncated')))}"
         )
-    disasm = context.get("disasm")
-    if isinstance(disasm, str) and disasm:
+    # Through the text choke point, not an inline isinstance: a
+    # container-shaped `disasm` dropped the clause and left the ref row
+    # byte-identical to a ref carrying NO context at all, undisclosed, on six
+    # renderers -- the same defect as the prototype leaf, at the sub-field the
+    # docstring above claimed already went through it (#619).
+    disasm = _text_value(context, "disasm")
+    if disasm:
         parts.append(f"disasm={disasm}")
     return " | " + " | ".join(parts) if parts else ""
 
@@ -3634,8 +3666,13 @@ def _render_data_vars_text(value: Any) -> str:
     body = "\n".join(lines) if lines else "none"
     if value.get("has_more"):
         hint = ""
-        last = _as_dict(rows[-1]).get("a") if rows else None
-        if isinstance(last, str):
+        # Through the choke point: a container-shaped address on the LAST row
+        # dropped the resume hint, and a paged window with no way to resume is
+        # exactly the confident-looking partial answer this module exists to
+        # stop. The row cell above renders the container's repr, so the value is
+        # not invisible -- the missing HINT was, and now it is named.
+        last = _text_value(rows[-1], "a") if rows else None
+        if last is not None:
             try:
                 hint = f"; resume with --start {hex(int(last, 16) + 1)}"
             except ValueError:
@@ -3726,8 +3763,11 @@ def _render_read_text(value: Any) -> str:
     if not lines:
         lines.append(f"{base:08x}: (no bytes)")
 
-    note = value.get("note")
-    if isinstance(note, str) and note:
+    # Choke point: a container-shaped `note` dropped the note ENTIRELY, so a
+    # truncated or partial read rendered byte-identically to a complete one
+    # (#619).
+    note = _text_value(value, "note")
+    if note:
         lines.append("")
         lines.append(f"note: {note}")
 
@@ -3962,21 +4002,33 @@ def _types_affected_lines(value: dict[str, Any]) -> list[str]:
         # Only prefix the type name when a batch touched more than one type --
         # for a single type the op-summary header already names it.
         prefix = f"{name}: " if multi else ""
+        # All three layout reads go through the text choke point, ONCE each, and
+        # the locals are passed on from there. Read raw, every one of them was an
+        # inline `isinstance(..., str)` filter inside the layout helpers, and a
+        # container-shaped value therefore dropped its clause byte-identically
+        # to the key being ABSENT with nothing disclosed: no size line, no
+        # field deltas. The unchanged branch was worse than silent -- `after`
+        # kept the container (a dict is truthy, so `or ""` never fired) and
+        # `after.strip()` was `AttributeError: 'dict' object has no attribute
+        # 'strip'`, which cost the WHOLE mutation card where the same entry
+        # without `after_layout` rendered cleanly (#619).
+        before_layout = _text_value(entry, "before_layout")
+        after_layout = _text_value(entry, "after_layout")
         if entry.get("changed"):
-            before_sz = _layout_size(entry.get("before_layout"))
-            after_sz = _layout_size(entry.get("after_layout"))
-            deltas = _layout_field_deltas(entry.get("layout_diff"))
+            before_sz = _layout_size(before_layout)
+            after_sz = _layout_size(after_layout)
+            deltas = _layout_field_deltas(_text_value(entry, "layout_diff"))
             if before_sz is not None and after_sz is not None and before_sz != after_sz:
-                out.append(f"  {prefix}{_size_delta(entry.get('before_layout'), entry.get('after_layout'))}")
+                out.append(f"  {prefix}{_size_delta(before_layout, after_layout)}")
             elif not deltas:
                 # No field/size delta to show (e.g. a decl-only change) -- fall back
                 # to the size so the line isn't empty.
-                out.append(f"  {prefix}{_size_delta(entry.get('before_layout'), entry.get('after_layout')) or 'changed'}")
+                out.append(f"  {prefix}{_size_delta(before_layout, after_layout) or 'changed'}")
             # else: size unchanged but fields moved (e.g. a rename) -- the +/- field
             # lines below carry the change; a 'size 0xNN' line would just be noise.
             out.extend(deltas)
         else:
-            after = entry.get("after_layout") or ""
+            after = after_layout or ""
             head = after.splitlines()[0].strip() if after.strip() else f"struct {name}"
             count = _layout_field_count(after)
             out.append(f"  {head}, {count} field{'s' if count != 1 else ''}")
@@ -4052,10 +4104,14 @@ def _add_mutation_ok(value: Any) -> Any:
     token = _SKEWED_FIELDS.set([])
     try:
         results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        # INSIDE the capture, not after it. A row whose `status` is unreadable
+        # is not a row that passed, and reading it outside the capture put its
+        # skew in the default (absent) recorder: `unusable` stayed False and the
+        # batch claimed `ok: true` over a row nobody could classify.
+        failed = any(_is_failed_status(r) for r in results)
         unusable = bool(_SKEWED_FIELDS.get())
     finally:
         _SKEWED_FIELDS.reset(token)
-    failed = any(str(r.get("status")) in FAILED_MUTATION_STATUSES for r in results)
     return {"ok": bool(value.get("success", True)) and not failed and not unusable,
             **value}
 
@@ -4253,7 +4309,7 @@ def _mutation_summary(value: Any) -> Any:
         _SKEWED_FIELDS.reset(token)
     for key in unreadable:
         _record_skew(key)
-    failed = [r for r in results if str(r.get("status")) in FAILED_MUTATION_STATUSES]
+    failed = [r for r in results if _is_failed_status(r)]
     verified = sum(1 for r in results if r.get("status") == "verified")
     noop = sum(1 for r in results if r.get("status") == "noop")
     # #684: every genuine `mutation_engine` op populates at least one `results[]`
@@ -4457,7 +4513,11 @@ def _render_mutation_summary_text(value: Any) -> str:
         # entirely broke the sample output the public reference quotes
         # verbatim -- for the documented cause this line is byte-identical to
         # it again.
-        cause = _unmeasured_cause(value.get("first_error"))
+        # Through the choke point. Read raw, an unreadable `first_error` dropped
+        # the CAUSE clause silently: the warning came out byte-identical to one
+        # carrying no cause at all, on the one line whose whole job is to say
+        # why the counts are unknown (#619).
+        cause = _unmeasured_cause(_text_value(value, "first_error"))
         line += ("\nwarning: unmeasured -- "
                  + (f"{cause}; " if cause else "")
                  + "the changed/verified/noop/failed counts above are UNKNOWN. "
@@ -4479,7 +4539,7 @@ def _render_mutation_text(value: Any) -> str:
     success = bool(value.get("success", True))
     committed = bool(value.get("committed", False))
     results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
-    failed = [r for r in results if str(r.get("status")) in FAILED_MUTATION_STATUSES]
+    failed = [r for r in results if _is_failed_status(r)]
 
     lines: list[str] = []
 
@@ -4536,7 +4596,7 @@ def _render_mutation_text(value: Any) -> str:
     # result (not only single-op batches) so a mixed batch still surfaces it.
     if not failed:
         for item in results:
-            if item.get("op") == "set_prototype" and item.get("status") not in FAILED_MUTATION_STATUSES:
+            if item.get("op") == "set_prototype" and not _is_failed_status(item):
                 lines.extend(_set_prototype_detail(item))
 
     # Type and direct detail are independent: a mixed batch shows BOTH the type's
@@ -4578,8 +4638,10 @@ def _render_py_exec_text(value: Any) -> str:
         return _render_fallback_text(value)
 
     parts: list[str] = []
-    stdout = value.get("stdout")
-    if isinstance(stdout, str) and stdout:
+    # Choke point: a container-shaped `stdout` rendered the EMPTY STRING, which
+    # is exactly what a run that printed nothing renders, undisclosed (#619).
+    stdout = _text_value(value, "stdout")
+    if stdout:
         parts.append(stdout.rstrip("\n"))
 
     result = value.get("result")
