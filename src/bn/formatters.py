@@ -1646,6 +1646,29 @@ def _render_go_functions_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+# The conditions under which a page's three counts cannot describe any window,
+# stated as a SET rather than as a chain of comparisons inside the footer.
+#
+# The first cut of this refusal was one comparison, `offset + returned > total`,
+# and it was incomplete on its own stated terms: a readable NEGATIVE count
+# walked past it and printed "showing -5 of 100 (105 more); rerun with --offset
+# -5" -- a remaining count larger than the whole set and a resume offset no
+# pager can use, with every count readable so no shape refusal fired either. A
+# chain also cannot be enumerated: a test can only re-list the comparisons it
+# believes are there, which is the second-declaration drift this module keeps
+# growing. A named set can be walked, so
+# `test_the_paging_footer_refuses_every_impossible_page_it_names` asserts each
+# member actually refuses and is NAMED in the refusal -- a member that is
+# deleted because a sibling happens to catch the same payload still fails (#619).
+_IMPOSSIBLE_PAGE: tuple[tuple[str, Callable[[int, int, int], bool]], ...] = (
+    ("total is negative", lambda total, returned, offset: total < 0),
+    ("returned is negative", lambda total, returned, offset: returned < 0),
+    ("offset is negative", lambda total, returned, offset: offset < 0),
+    ("offset + returned exceeds total",
+     lambda total, returned, offset: offset + returned > total),
+)
+
+
 def _paging_footer(value: dict[str, Any], items: list[Any],
                    page_unreadable: bool) -> str | None:
     """Build the "// showing N of TOTAL" footer for a paged-list envelope.
@@ -1656,6 +1679,10 @@ def _paging_footer(value: dict[str, Any], items: list[Any],
     envelope lacks a total to report against, any of the three counts it states
     arrived in a shape no count reads out of, or the PAGE ITSELF did -- a footer
     states no count and no resume offset it could not derive (#619).
+
+    Counts that are all readable but cannot describe any window (`_IMPOSSIBLE_PAGE`)
+    get a stated refusal naming each condition instead of a footer, so a
+    self-contradicting envelope does not render like an unpaged one.
 
     *page_unreadable* is the third state of the page, which only the caller can
     answer because the page key is a runtime argument."""
@@ -1720,17 +1747,21 @@ def _paging_footer(value: dict[str, Any], items: list[Any],
         _record_skew(key)
     if unreadable or page_unreadable:
         return None
-    # The three counts must also agree with EACH OTHER. All three readable and
-    # mutually impossible (a window that starts past the end of the set) put a
-    # negative remaining count and a negative `--offset -4` into an actionable
-    # instruction, and that arithmetic is not a measurement of anything. The
-    # payload's own numbers are stated instead of a derivation from them, for
-    # the same reason `go rename` refuses a counter its own rows contradict --
-    # and stated rather than dropped, because a silent drop renders a
-    # self-contradicting envelope byte-identically to an unpaged one (#619).
-    if offset + returned > total:
-        return (f"// page position not stated: offset {offset} + returned "
-                f"{returned} exceeds total {total}")
+    # The three counts must also agree with EACH OTHER, and with themselves.
+    # Readable and impossible put a negative remaining count and a negative
+    # `--offset -4` into an actionable instruction, and that arithmetic is not
+    # a measurement of anything. Every refused condition is NAMED in the line,
+    # and the payload's own numbers are stated instead of a derivation from
+    # them, for the same reason `go rename` refuses a counter its own rows
+    # contradict -- and stated rather than dropped, because a silent drop
+    # renders a self-contradicting envelope byte-identically to an unpaged one.
+    # The conditions live in `_IMPOSSIBLE_PAGE` so they can be enumerated by a
+    # test rather than re-listed by one (#619).
+    impossible = [name for name, holds in _IMPOSSIBLE_PAGE
+                  if holds(total, returned, offset)]
+    if impossible:
+        return (f"// page position not stated: {'; '.join(impossible)} "
+                f"(total {total}, returned {returned}, offset {offset})")
     if more:
         remaining = total - (offset + returned)
         next_offset = offset + returned
@@ -4534,10 +4565,13 @@ def _mutation_summary(value: Any) -> Any:
     unmeasured = not results or bool(unreadable)
     return _build_mutation_summary(
         measured=not unmeasured,
-        # The rows that could be READ, which is why it stays an int while the
-        # four derived counts go unknown: it is the size of what this summary
-        # actually saw, and the unmeasured warning beside it says the batch was
-        # larger than that.
+        # The rows this summary could READ, which is why it stays an int while
+        # the four derived counts go unknown: it is a literal count of what
+        # reached the classifier, not a claim about how many ops the batch
+        # requested. When the summary is unmeasured that distinction matters
+        # and the warning beside it names the CAUSE -- no rows, an unreadable
+        # row set, an unclassifiable status -- without asserting any size for
+        # the batch, because nothing here measured one.
         op_count=len(results),
         reported_success=bool(value.get("success", True)),
         failure_rows=failed,
@@ -4674,20 +4708,22 @@ def _go_rename_summary(value: Any) -> Any:
         # a counter -- so there is no measurement source to require.
         changed = 0
         source = None
-    # The rows and the counter answer the SAME question on this op -- its
-    # `results[]` holds only the FAILURE rows -- so they may not disagree in
-    # the direction where the rows are the harder evidence: a counter that
-    # names FEWER failures than the payload actually carries rows for is not a
-    # measurement of this run, whichever of the two is wrong, and a zero
-    # counter beside a failure row is only the loudest case of it. Refusing is
-    # the only answer available here, because inventing a count from the rows
-    # would be the mirror fabrication.
+    # The rows and the counter answer the SAME question on this op, and the
+    # bridge builds them from ONE list: `"results": failed_rows` beside
+    # `"go_failed_count": len(failed_rows)`. So they may not disagree in
+    # EITHER direction, and refusing is the only answer available here --
+    # inventing a count from whichever side looks more trustworthy would be
+    # the mirror fabrication.
     #
-    # The other direction is legitimate and stays measured: `results[]` is a
-    # CAPPED failure listing (the text view prints 50 and says "... and N
-    # more"), so a counter LARGER than the rows in hand is the count the rows
-    # were sampled from, not a contradiction.
-    rows_contradict = len(row_failures) > failed
+    # The earlier cut refused only `rows > counter` and excused the other
+    # direction as a CAPPED failure listing. The payload is not capped: only
+    # the DEFAULT text view's display is (it prints 50 rows and then "... and
+    # N more"), and the failure count it states beside them is the full row
+    # count. Believing the larger counter therefore let that text view and
+    # this compact summary state DIFFERENT failure counts for one payload
+    # while both read `measured` -- the drift between an op's two views that
+    # #685 exists to close, one key over from `ok`.
+    rows_contradict = len(row_failures) != failed
     measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
 

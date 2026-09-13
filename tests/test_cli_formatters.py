@@ -5278,9 +5278,17 @@ def test_an_unreadable_go_rename_counter_can_never_read_as_a_finished_run():
         # measurement source for a COMMITTED run (`go_committed_count`) is
         # supplied here because its ABSENCE is itself unmeasured -- see
         # `test_a_go_rename_summary_with_no_counters_is_not_a_measured_noop`.
+        # `go_failed_count` is the one counter the payload also carries the
+        # EVIDENCE for: the bridge builds it as `len(failed_rows)` beside
+        # `"results": failed_rows`, so a readable 3 with no failure rows is a
+        # self-contradicting envelope rather than a readable measurement, and
+        # is refused -- the refusal itself is pinned in
+        # `test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read`.
         for genuine, expected in ((3, 3), ("3", 3)):
-            read = formatters._go_rename_summary(
-                {**base, "go_committed_count": 7, counter: genuine})
+            payload = {**base, "go_committed_count": 7, counter: genuine}
+            if counter == "go_failed_count":
+                payload["results"] = [{"status": "verification_failed"}] * 3
+            read = formatters._go_rename_summary(payload)
             assert read["measured"] is True, (
                 f"{counter}={genuine!r} is a readable count and the summary "
                 f"reports it unmeasured: {read!r}")
@@ -6502,14 +6510,36 @@ def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
         f"{understated!r}")
     assert understated["failed_count"] is None and understated["ok"] is False, understated
     assert "warning: unmeasured" in formatters._render_mutation_summary_text(understated)
-    # The OTHER direction stays measured, and it has to: `results[]` is a
-    # CAPPED failure listing (the text view prints 50 rows and then "... and N
-    # more"), so a counter LARGER than the rows in hand is the population the
-    # rows were sampled from, not a contradiction.
-    capped = formatters._go_rename_summary(
-        {**envelope([{"status": "verification_failed", "message": "m"}] * 5),
-         "go_failed_count": 60, "success": False, "committed": False})
-    assert capped["measured"] is True and capped["failed_count"] == 60, capped
+    # The OTHER direction is a contradiction too, and the round-22 comment that
+    # excused it was false about the payload: the bridge builds `results` AS
+    # `failed_rows` and `go_failed_count` AS `len(failed_rows)`, so the listing
+    # is not a sample of a larger population. Only the text view's DISPLAY is
+    # capped -- it prints 50 rows and then "... and N more" -- and the count it
+    # states beside them is the FULL row count. Believing the larger counter
+    # therefore let this op's DEFAULT text view and its compact summary state
+    # DIFFERENT failure counts while both read `measured`, which is the drift
+    # #685 exists to close rather than a wording problem.
+    overstated_value = {**envelope([{"status": "verification_failed", "message": "m"}] * 5),
+                        "go_failed_count": 60, "success": False, "committed": False}
+    overstated = formatters._go_rename_summary(overstated_value)
+    assert overstated["measured"] is False, (
+        f"go_failed_count 60 beside the 5 failure rows it is built from is not "
+        f"a measurement of this run: {overstated!r}")
+    assert overstated["failed_count"] is None and overstated["ok"] is False, overstated
+    assert "warning: unmeasured" in formatters._render_mutation_summary_text(overstated)
+    # The two surfaces, on the same payload: the text view states the rows it
+    # holds, so no measured summary may state a different number beside it.
+    assert "5 failed" in formatters._render_go_rename_text(overstated_value), (
+        formatters._render_go_rename_text(overstated_value))
+    # The extreme of that direction, and the one an absent listing reaches: a
+    # counter naming failures beside NO failure rows at all. The text view
+    # states "0 failed" for it.
+    bare = {**envelope(_ABSENT), "go_failed_count": 3,
+            "success": False, "committed": False}
+    assert formatters._go_rename_summary(bare)["measured"] is False, (
+        f"go_failed_count 3 with no failure rows anywhere is not a measured "
+        f"run: {formatters._go_rename_summary(bare)!r}")
+    assert "0 failed" in formatters._render_go_rename_text(bare)
 
 
 def test_the_blast_radius_line_never_states_a_count_it_could_not_read():
@@ -7071,7 +7101,8 @@ def test_the_paging_footer_never_states_a_resume_offset_it_could_not_derive():
     # an actionable instruction built out of arithmetic on a self-contradicting
     # envelope. The payload's own numbers are stated; nothing is derived.
     clash = page(total=10)
-    assert "// page position not stated: offset 50 + returned 1 exceeds total 10" in clash, clash
+    assert ("// page position not stated: offset + returned exceeds total "
+            "(total 10, returned 1, offset 50)") in clash, clash
     assert "--offset" not in clash and "more)" not in clash, clash
     # ... and the boundary case is NOT a clash: the last window ends exactly at
     # the total.
@@ -7168,3 +7199,177 @@ def test_an_unreadable_results_ROW_can_never_read_as_ok():
     assert formatters._add_mutation_ok(mixed)["ok"] is False
     card = formatters._render_mutation_text(mixed)
     assert _disclosed(card, "results") and _disclosed(card, "status"), card
+
+
+def test_the_paging_footer_refuses_every_impossible_page_it_names():
+    """The mutual-impossibility refusal was incomplete on its own stated terms.
+
+    Round 22 added it and spelled it as ONE comparison, `offset + returned >
+    total`, while the comment beside it quoted "a negative remaining count and
+    a negative `--offset -4`" as the harm it exists to stop. A readable
+    NEGATIVE count walks straight past a single comparison: `returned: -5`
+    against a total of 100 stated "showing -5 of 100 (105 more); rerun with
+    --offset -5" -- 105 more rows in a set of 100, and a resume offset no pager
+    can use. Every count on that line is readable, so no SHAPE refusal fires
+    and nothing is disclosed either.
+
+    The refused conditions are a SET, so the module states them as one
+    (`_IMPOSSIBLE_PAGE`) and this test enumerates that set rather than
+    re-listing it: a member that stops refusing, or one deleted as redundant
+    because another member happens to catch the same payload, fails here BY
+    NAME."""
+    from bn import formatters
+
+    def page(**over):
+        value = {"functions": [{"name": "a", "address": "0x1"}],
+                 "total": 100, "returned": 1, "offset": 50, "has_more": True}
+        for key, val in over.items():
+            if val is _ABSENT:
+                value.pop(key, None)
+            else:
+                value[key] = val
+        return formatters._render_function_list_text(value)
+
+    # The two shapes a single `offset + returned > total` comparison lets
+    # through, with every count readable in both.
+    negative_returned = page(returned=-5, offset=0)
+    assert "more)" not in negative_returned and "--offset" not in negative_returned, (
+        f"a readable returned=-5 still derived a remaining count exceeding the "
+        f"total and a resume offset out of it: {negative_returned!r}")
+    assert "showing" not in negative_returned, negative_returned
+    negative_offset = page(offset=-9)
+    assert "--offset" not in negative_offset, (
+        f"a readable offset=-9 still derived a resume offset: {negative_offset!r}")
+
+    # One payload per member of the set, each making that member's condition
+    # hold. The refusal must NAME the member, so weakening or deleting it fails
+    # here even when a different member still refuses the same payload.
+    triggers = {
+        "total is negative": dict(total=-1, returned=0, offset=0),
+        "returned is negative": dict(total=100, returned=-5, offset=0),
+        "offset is negative": dict(total=100, returned=1, offset=-9),
+        "offset + returned exceeds total": dict(total=10, returned=1, offset=50),
+    }
+    assert set(triggers) == {name for name, _ in formatters._IMPOSSIBLE_PAGE}, (
+        f"the refused set and the payloads that exercise it have drifted: "
+        f"{[name for name, _ in formatters._IMPOSSIBLE_PAGE]}")
+    for name, over in triggers.items():
+        out = page(**over)
+        assert "// page position not stated:" in out, (
+            f"{over} is not a window any page can have, and the footer stated "
+            f"a position for it anyway: {out!r}")
+        assert name in out, f"{over} was refused without naming `{name}`: {out!r}"
+        assert "--offset" not in out and "more)" not in out and "showing" not in out, out
+        # The payload's own numbers are stated; nothing is derived from them.
+        assert (f"total {over['total']}" in out
+                and f"returned {over['returned']}" in out
+                and f"offset {over['offset']}" in out), out
+        # Refusing the footer is not refusing the page.
+        assert "0x1  a" in out, out
+    # Anti-vacuity: a refusal that fired on every page would satisfy all of the
+    # above. The honest page still pages, and each condition's BOUNDARY is a
+    # page rather than a clash.
+    assert "// showing 1 of 100 (49 more); rerun with --offset 51" in page()
+    assert "// showing 1 of 100" in page(offset=99, has_more=_ABSENT)
+    empty = page(functions=[], total=0, returned=0, offset=0, has_more=_ABSENT)
+    assert "page position not stated" not in empty, (
+        f"a genuinely empty set is a readable page, not an impossible one: {empty!r}")
+
+
+def test_a_rows_own_skew_never_costs_the_page_its_footer():
+    """The footer's nested capture, which nothing in this file executed.
+
+    `_paging_footer` reads its four fields inside a FRESH `_SKEWED_FIELDS`
+    capture so that only ITS OWN reads can suppress the footer. The ambient
+    list holds every skew the whole render recorded -- including one from a
+    ROW, on a key with nothing to do with paging -- and a footer dropped over
+    an unrelated field's skew is the mirror of the fabrication the refusal
+    exists to stop: the page silently loses the resume instruction that is the
+    only actionable thing in it, and a reader takes one window for the whole
+    set.
+
+    Seeding that capture from the ambient list instead of an empty one left
+    the entire file green, so the mechanism shipped with no discriminating
+    test at all -- this PR's own recurring defect, in the hunk added to close
+    the last generation of it."""
+    from bn import formatters
+
+    row = {"address": "0x1", "value": "hi", "length": 2,
+           "format_directives": "oops"}
+
+    def strings(**over):
+        return formatters._render_strings_text(
+            {"items": [row], "total": 100, "returned": 1, "offset": 50,
+             "has_more": True, **over})
+
+    out = strings()
+    assert "// showing 1 of 100 (49 more); rerun with --offset 51" in out, (
+        f"a row's own malformed `format_directives` reached the footer's read "
+        f"and cost the page its resume instruction: {out!r}")
+    # Keeping the footer is not swallowing the row's problem.
+    assert _disclosed(out, "format_directives"), out
+    # The counterpart the nesting must NOT swallow: a skew on one of the
+    # footer's OWN fields still refuses, from inside the same capture, with the
+    # unrelated row skew sitting in the ambient list beside it.
+    skewed = strings(total={"n": 1})
+    assert "showing" not in skewed and "--offset" not in skewed, skewed
+    assert _disclosed(skewed, "total"), skewed
+    assert _disclosed(skewed, "format_directives"), skewed
+
+
+def test_the_compact_first_error_never_states_a_container_where_text_belongs():
+    """`first_error` is the one summary key an agent contract tells a control
+    loop to read, and the top-level `message` is what lands in it whenever the
+    payload carried no failure ROW -- a revert that failed after every op
+    verified, an op that explained itself only at the envelope.
+
+    A raw `value.get("message")` put a dict/list straight into the documented
+    schema and `_render_mutation_summary_text` printed its Python repr there.
+    The failure ROW's message already went through the text choke point; the
+    envelope's did not, and the asymmetry is invisible until the envelope is
+    the only explanation available. Both callers of the one builder are pinned
+    here, because "one builder" means neither caller may answer differently."""
+    from bn import formatters
+
+    def mutation(message):
+        return {"success": False, "committed": False, "message": message,
+                "results": [{"op": "rename", "function": "fn",
+                             "status": "verified"}]}
+
+    def go(message):
+        return {"kind": "go_rename", "success": False, "committed": False,
+                "message": message, "go_renamed_candidates": 1,
+                "go_committed_count": 0, "go_verified_count": 0,
+                "go_failed_count": 0, "skipped_user_named": 0,
+                "skipped_changed_during_apply": 0}
+
+    for bogus in ({"code": 7}, ["boom"], 7, True, 1.5, ()):
+        for payload, default in ((mutation(bogus), "mutation failed"),
+                                 (go(bogus), "go rename failed")):
+            summary = (formatters._go_rename_summary(payload)
+                       if payload.get("kind") == "go_rename"
+                       else formatters._mutation_summary(payload))
+            first_error = summary["first_error"]
+            assert isinstance(first_error, str), (
+                f"message={bogus!r} landed in the documented first_error "
+                f"unchanged: {first_error!r}")
+            assert repr(bogus) not in first_error, (
+                f"message={bogus!r} reached first_error as a Python repr: "
+                f"{first_error!r}")
+            assert default in first_error, (
+                f"message={bogus!r} explained nothing, so the op's own default "
+                f"explanation had to answer instead: {first_error!r}")
+            assert _disclosed(first_error, "message"), (
+                f"message={bogus!r} was dropped with no note naming it: "
+                f"{first_error!r}")
+            text = formatters._render_mutation_summary_text(summary)
+            assert repr(bogus) not in text, text
+    # Anti-vacuity: a readable envelope message is still the explanation, and
+    # is not disclosed as a shape problem.
+    readable = formatters._mutation_summary(mutation("revert failed"))
+    assert readable["first_error"] == "revert failed", readable
+    assert "malformed" not in str(readable["first_error"]), readable
+    # An EMPTY message is a real answer that explains nothing, so the default
+    # answers and nothing is disclosed.
+    blank = formatters._mutation_summary(mutation(""))
+    assert blank["first_error"] == "mutation failed", blank
