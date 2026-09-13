@@ -5682,25 +5682,42 @@ def test_a_socket_path_the_syscall_layer_cannot_express_does_not_crash_gc(tmp_pa
     ``stat`` rejects it, with ``ValueError`` rather than ``OSError``. Uncaught,
     that took ``gc_instances()`` down for every other instance on the host,
     which is the availability class this PR exists to close. Such a name
-    resolves to nothing, so it is treated as conclusively absent: the record is
-    swept when its owner is gone and kept while the owner lives (#618).
+    resolves to nothing, and it is conclusively absent rather than merely
+    unanswered, so both records go -- by the two different routes this module
+    keeps apart. A DEAD owner's record is litter and the next discovery sweeps
+    it. A LIVE owner's record is not litter, is refused by every caller, and
+    is reclaimed by `instance gc` on evidence about the FILE, with its log.
+    Both routes are asserted here, because an earlier version of this docstring
+    claimed they differed in outcome and neither was pinned (#618).
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
     owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    (inst_dir / "nul.json").write_text(
-        json.dumps({"pid": owner.pid, "socket_path": f"{inst_dir}/n\x00ul.sock",
-                    "instance_id": "nul"}),
-        encoding="utf-8",
-    )
-    (inst_dir / "nul.log").write_text("x\n", encoding="utf-8")
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    for sid, pid in (("alive", owner.pid), ("gone", gone.pid)):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": pid, "socket_path": f"{inst_dir}/n\x00ul.sock",
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
     try:
         assert list_instances(include_unreachable=True) == []   # must not raise
+
+        # The dead owner's record is litter: that discovery already swept it.
+        assert not (inst_dir / "gone.json").exists()
+        # The live owner's is kept by discovery and reclaimed by gc instead.
+        assert (inst_dir / "alive.json").exists()
+
         summary = gc_instances()                                # must not raise
 
         assert summary["live_instances"] == 0
-        assert isinstance(summary["registries_purged"], int)
+        assert summary["registries_purged"] == 1
+        assert summary["logs_removed"] == 2
+        assert sorted(p.name for p in inst_dir.iterdir()
+                      if p.name != ".spawn.lock") == []
     finally:
         owner.kill()
         owner.wait()
@@ -5737,3 +5754,91 @@ def test_a_socket_bound_under_a_newline_name_is_unknowable_not_unbound(tmp_path)
         with contextlib.suppress(OSError):
             server.close()
         (plain / "live.sock").unlink(missing_ok=True)
+
+
+def test_an_unreadable_kernel_listing_is_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The source being ABSENT is the off-Linux case, and it was unpinned.
+
+    Every socket unlink in this module rests on this reader's ``False``, and
+    the one input that makes the source unavailable -- the listing cannot be
+    read at all, which is every platform without ``/proc`` -- had no test that
+    exercised the real arm: the two "no /proc" tests monkeypatch
+    ``_path_has_bound_socket`` itself, so they ASSUME the answer under test.
+    Mutating that arm to ``False`` left the whole file green while ``gc``
+    unlinked a bound-and-listening socket. The failure of a SOURCE is not
+    evidence about the question it was asked (#618).
+
+    The other direction is pinned beside it: with the listing readable again,
+    the same sweep still reaps a genuine leftover, so "unknowable" has not
+    become blanket retention.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # bound AND listening, no registry
+    leftover = inst_dir / "leftover.sock"
+    leftover.touch()                       # a real orphan, nothing bound to it
+    real_read_bytes = Path.read_bytes
+    source_unreadable = [True]
+
+    def maybe_unreadable(self, *args, **kwargs):
+        if source_unreadable[0] and str(self) == "/proc/net/unix":
+            raise OSError(errno.ENOENT, "no such file")
+        return real_read_bytes(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(Path, "read_bytes", maybe_unreadable)
+
+        assert _path_has_bound_socket(sock_path) is None
+        assert gc_instances()["sockets_removed"] == 0
+        assert sock_path.exists() and leftover.exists()
+
+        source_unreadable[0] = False       # the source is readable again
+
+        summary = gc_instances()
+
+        assert summary["sockets_removed"] == 1          # the orphan, and only it
+        assert not leftover.exists()
+        assert sock_path.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_name_no_file_can_carry_is_conclusively_absent(tmp_path):
+    """``_path_is_absent``'s conclusive set, asserted rather than described.
+
+    The docstring names four conclusive failures and one that is not. Only
+    ``ENOENT`` and ``ENOTDIR`` were pinned, so the ``ENAMETOOLONG`` arm this
+    round's text newly asserts could be flipped with the file green. A wrong
+    answer here only retains a record, which is the safe direction -- but an
+    unasserted claim in a docstring about destruction evidence is exactly what
+    the last five rounds kept finding (#618).
+    """
+    from bn.transport import _path_is_absent
+
+    present = tmp_path / "present.sock"
+    present.touch()
+
+    assert _path_is_absent(present) is False
+    assert _path_is_absent(tmp_path / "missing.sock") is True
+    assert _path_is_absent(tmp_path / ("L" * 9000)) is True      # ENAMETOOLONG
+    assert _path_is_absent(Path(f"{tmp_path}/n\x00ul.sock")) is True
+    # A raw byte is NOT unnameable: it is how a real name survives a decode.
+    raw = tmp_path / os.fsdecode(b"ra\xffw.sock")
+    raw.touch()
+    assert _path_is_absent(raw) is False
