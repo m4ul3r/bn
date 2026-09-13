@@ -1450,6 +1450,11 @@ def test_the_declared_data_parameters_still_describe_call():
         "stale entry makes the table look complete while a real parameter is "
         "unexercised"
     )
+    # Reached at collection time through the parametrization, so it belongs
+    # here and not in `_cli_functions`, where it would abort the session.
+    assert len(_cli_functions()) > 50, (
+        f"cli.py shrank to {len(_cli_functions())} functions; the static "
+        "properties below quantify over a module that is no longer there")
 
 
 @functools.lru_cache(maxsize=1)
@@ -1471,10 +1476,8 @@ def _cli_functions() -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]:
     dispatch method (`__call__` on an argparse action) was silently outside a
     population whose whole claim is that it is total.
     """
-    functions = tuple(node for node in ast.walk(_cli_tree())
-                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
-    assert len(functions) > 50, f"cli.py shrank to {len(functions)} functions"
-    return functions
+    return tuple(node for node in ast.walk(_cli_tree())
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
 
 
 def _named(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
@@ -1490,26 +1493,34 @@ def _all_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
 
 
 def _bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef):
-    """(targets, value, node) for every binding form in *fn*.
+    """(targets, value, node, header) for every binding form in *fn*.
 
     Not just `ast.Assign`: round 7 invoked a transform through a loop variable
     and round 8 laundered one through a walrus, and an assignment-only walk
     taints neither. The NODE is yielded rather than its line, because where a
     binding SITS decides what it dominates and its line does not.
+
+    `header` marks a binding made by a compound statement's own header -- a
+    `for t in ...:` target or a `with ... as t:` name. Those bind before the
+    statement's body rather than beside it, so they dominate everything inside
+    it; scored at the statement's own position they would dominate nothing
+    there, which is a false positive waiting for the first such shape.
     """
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign):
-            yield node.targets, node.value, node
+            yield node.targets, node.value, node, False
         elif isinstance(node, ast.NamedExpr):
-            yield [node.target], node.value, node
+            yield [node.target], node.value, node, False
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            yield [node.target], node.iter, node
+            yield [node.target], node.iter, node, True
         elif isinstance(node, ast.comprehension):
-            yield [node.target], node.iter, node.target
-        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            yield [node.optional_vars], node.context_expr, node.optional_vars
+            yield [node.target], node.iter, node.target, False
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    yield [item.optional_vars], item.context_expr, node, True
         elif isinstance(node, ast.MatchAs) and node.name is not None and node.pattern:
-            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node
+            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node, False
 
 
 def _carried(value: ast.expr, holders: set[str]) -> set[str]:
@@ -1560,6 +1571,11 @@ def _block_paths(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[int, tuple]
     return paths
 
 
+# Appended to a block path to mark a binding made by a compound statement's
+# HEADER rather than beside it: it runs before the statement's body.
+_HEADER = ("header", -1)
+
+
 def _dominates(binding: tuple, use: tuple) -> bool:
     """Does a rebinding at *binding* certainly run before a use at *use*?
 
@@ -1572,6 +1588,11 @@ def _dominates(binding: tuple, use: tuple) -> bool:
     """
     if not binding:
         return True
+    if binding[-1] == _HEADER:
+        # A `for`/`with` header binds before its body, so it dominates every
+        # statement inside the compound statement and nothing outside it.
+        scope = binding[:-1]
+        return len(use) > len(scope) and use[:len(scope)] == scope
     depth = len(binding) - 1
     if len(use) <= depth or binding[:depth] != use[:depth]:
         return False
@@ -1616,12 +1637,26 @@ def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -
     escaped the property entirely. A holder stored under a name can be invoked
     through that name, so the names holders are stored under are exactly the
     attribute steps worth following -- DERIVED from the module, not listed.
+
+    A slot name does not have to be a keyword or a dict key. `setattr(obj,
+    "render", t)` names it with a positional string, and so do
+    `d.setdefault("render", t)` and any registry helper. So the rule is not a
+    list of storing FORMS: any call that is handed a holder puts every string
+    constant in that same call into the slot set. Over-matching is harmless --
+    a slot only ever matters when something is dispatched through an attribute
+    of that exact name.
     """
     slots: set[str] = set()
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
             slots |= {keyword.arg for keyword in node.keywords
                       if keyword.arg and _stores_holder(keyword.value, holders)}
+            if (any(_stores_holder(argument, holders) for argument in node.args)
+                    or any(_stores_holder(keyword.value, holders)
+                           for keyword in node.keywords)):
+                slots |= {argument.value for argument in node.args
+                          if isinstance(argument, ast.Constant)
+                          and isinstance(argument.value, str)}
         elif isinstance(node, ast.Dict):
             slots |= {key.value for key, value in zip(node.keys, node.values)
                       if isinstance(key, ast.Constant) and isinstance(key.value, str)
@@ -1632,6 +1667,26 @@ def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -
                 slots |= {target.attr for target in targets
                           if isinstance(target, ast.Attribute)}
     return slots
+
+
+def _module_scope_names() -> frozenset[str]:
+    """Names `cli.py` binds at MODULE scope, plus every name a function
+    declares `global`.
+
+    A module-scope name is the third door into the population, after the
+    parameter and the call argument: a transform assigned to one is readable
+    from every function in the file. Round 9's population had a parameter and a
+    call argument and not this, so parking a caller-supplied renderer in a
+    module global and dispatching it from a helper left every property green.
+    """
+    tree = _cli_tree()
+    names = {target.id for node in tree.body if isinstance(node, ast.Assign)
+             for target in node.targets if isinstance(target, ast.Name)}
+    names |= {node.target.id for node in tree.body
+              if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)}
+    names |= {name for node in ast.walk(tree) if isinstance(node, ast.Global)
+              for name in node.names}
+    return frozenset(names)
 
 
 class _Transforms(NamedTuple):
@@ -1656,6 +1711,12 @@ def _transform_holders() -> _Transforms:
     * CALL SITES inside `cli.py`, so an argument taints the callee's
       corresponding parameter: a transform forwarded to a helper is still that
       transform there, under whatever name the helper gave it.
+    * MODULE SCOPE, so a transform parked in a module-level name -- the third
+      door, after the parameter and the call argument -- is a holder in every
+      function that could read it. Nothing orders an assignment in one function
+      against a read in another, so such a name is provably bound NOWHERE
+      outside the function that bound it: parking a transform in a global and
+      dispatching it from a helper is reported, which is what it should be.
 
     Guardedness propagates the same way, so a transform bound once at the
     boundary stays bound everywhere it travels -- and one bound nowhere is
@@ -1666,12 +1727,19 @@ def _transform_holders() -> _Transforms:
     by_name: dict[str, list] = {}
     for fn in functions:
         by_name.setdefault(fn.name, []).append(fn)
+    module_names = _module_scope_names()
     paths = {id(fn): _block_paths(fn) for fn in functions}
     holders: dict[int, set[str]] = {id(fn): {arg.arg for arg in _all_args(fn)}
                                     for fn in functions}
     guarded: dict[int, dict[str, set[tuple]]] = {id(fn): {} for fn in functions}
     slots: set[str] = set()
     assert _named("_call") is not None, "_call is gone; this whole property is unchecked"
+
+    def share(names: set[str]) -> None:
+        """A module-scope name holds its value for the whole module."""
+        for shared in names & module_names:
+            for other in functions:
+                holders[id(other)].add(shared)
 
     def bound_by(fn, names: set[str], use: tuple) -> bool:
         return all(any(_dominates(binding, use) for binding in guarded[id(fn)].get(name, ()))
@@ -1692,24 +1760,45 @@ def _transform_holders() -> _Transforms:
         before = snapshot()
         for fn in functions:
             where = paths[id(fn)]
-            for targets, value, node in _bindings(fn):
+            for targets, value, node, header in _bindings(fn):
                 names = _bound_names(targets)
                 at = where.get(id(node), ())
+                # The `use` position of the binding's own value is the
+                # statement it sits in; what it BINDS covers the body.
+                use_at, at = at, ((*at, _HEADER) if header else at)
                 if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
                         and value.func.id == _BOUNDARY):
                     holders[id(fn)] |= names
                     bind(fn, names, at)
+                    share(names)
                     continue
                 carried = _carried(value, holders[id(fn)])
                 if carried:
                     holders[id(fn)] |= names
-                    if bound_by(fn, carried, at):
+                    if bound_by(fn, carried, use_at):
                         bind(fn, names, at)
+                    share(names)
             slots |= _slot_names(fn, holders[id(fn)])
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
                     continue
                 at = where.get(id(node), ())
+                # A call HANDED a holder can PARK it in another of its
+                # arguments: `setattr(obj, "render", t)` puts the transform on
+                # `obj` without any binding form this walk would see, and the
+                # slot name alone is useless if `obj` is not in the population.
+                # A store NAMES the slot, so the string constant is what tells
+                # this apart from an ordinary call that merely takes a
+                # callable -- `f(t, dict)` parks nothing.
+                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if (any(_stores_holder(argument, holders[id(fn)]) for argument in arguments)
+                        and any(isinstance(argument, ast.Constant)
+                                and isinstance(argument.value, str)
+                                for argument in arguments)):
+                    holders[id(fn)] |= {argument.id for argument in node.args
+                                        if isinstance(argument, ast.Name)}
+                    if isinstance(node.func, ast.Attribute):
+                        holders[id(fn)] |= _dispatch_roots(node.func.value, frozenset(slots))
                 for name in _callee_roots(node, frozenset(slots)):
                     for callee in by_name.get(name, ()):
                         pairs = [*zip([arg.arg for arg in _all_args(callee)], node.args)]
@@ -1720,10 +1809,6 @@ def _transform_holders() -> _Transforms:
                             if not carried:
                                 continue
                             holders[id(callee)].add(param)
-                            if bound_by(fn, carried, at):
-                                # Bound on entry: the callee receives it already
-                                # bound, so every block of the callee is after it.
-                                bind(callee, {param}, ())
         if before == snapshot():
             converged = True
             break
@@ -1952,7 +2037,7 @@ def _dispatched_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef,
     reachable = set(params)
     for _ in range(len(params) + 8):
         before = frozenset(reachable)
-        for targets, value, _node in _bindings(fn):
+        for targets, value, _node, _header in _bindings(fn):
             if _carried(value, reachable):
                 reachable |= _bound_names(targets)
         if before == frozenset(reachable):

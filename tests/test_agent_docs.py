@@ -407,17 +407,20 @@ EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
 # A decimal is one number, not two (`3.11` must not read as a `3` and an `11`),
 # and an issue reference is not a code (`#625`). Everything else counts: a
 # trailing period is sentence punctuation, not a decimal point (excluding it
-# outright let "a refused op returns three." straight through), a hyphen
-# neighbour is still a number ("twenty-five", `utf-8`), and the words run past
-# nine so that spelling one out is not a way around the digits. A multi-digit
-# numeral yields one token, because its later digits follow a word character.
+# outright let "a refused op returns three." straight through), a hyphen or
+# slash neighbour is still a number (`utf-8`, "exit 2/3", "twenty-five"), and
+# the words run past nine so that spelling one out is not a way around the
+# digits. A numeral is matched as a RUN of digits: matching one digit at a
+# time with a word-character guard on both sides meant "Exit 10" produced no
+# token at all, and a claim the population cannot see is a claim the
+# accounting cannot account for.
 _NUMBER_WORDS = (
     "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
     "thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred"
 )
 _NUMBER_TOKEN = re.compile(
-    rf"(?<![\w#$/])(?<!\d\.)(?:\d|{_NUMBER_WORDS})(?![\w/])(?!\.\d)", re.I)
+    rf"(?<![\w#$])(?<!\d\.)(?:\d+|{_NUMBER_WORDS})(?![\w])(?!\.\d)", re.I)
 # Generated, not authored: the fingerprint of every prose line in a fenced doc
 # that carries a number and is not pinned by a cell above. Regenerate with
 # `_fingerprint(" ".join(line.split()))` over the docs. An entry is a claim
@@ -426,68 +429,228 @@ _NUMBER_TOKEN = re.compile(
 # statement silently, by not matching a pattern.
 NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
     "CLAUDE.md": frozenset({
-        "2813ca55", "4177be03", "78629073", "7d6b2776", "80180431", "8597bc7e", "8e4a9610",
-        "bb36a4be", "dadf1f99", "db981a08", "ee61fade", "fa70ea09",
+        "019b39ab",  # BN_REQUIRE_REAL_TESTS=1 uv run pytest tests/test_integrati
+        "0535459a",  # 2. On the bridge, register the op with `@op("name", lock="
+        "06935f28",  # `bn` is an agent-friendly CLI for Binary Ninja. It has two
+        "08df77ee",  # `op_registry.py` is the single source of truth: `@op(name,
+        "0b9e7173",  # When only one target is open, target-required commands can
+        "3f1d7f43",  # 1. Add a handler in the appropriate `src/bn/commands/*.py`
+        "49146e24",  # This file provides guidance to Claude Code (claude.ai/code
+        "5369b91c",  # 3. Add tests in `tests/` (mirror the source layout).
+        "5c14e27a",  # `observed` are `{}` when the failure supplied no detail. A
+        "9a7f2e2c",  # ### Two-Process Model
+        "9bcf19ed",  # - Test files mirror source, split by concern rather than o
+        "ad00bd37",  # uv run pytest tests/test_cli_core.py # one module
+        "b65d6dff",  # **Line count is not a split criterion (#629).** Split a mo
+        "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed
     }),
     "README.md": frozenset({
-        "0a768f64", "18aefee8", "1946ee65", "39297f76", "4a59a3b8", "4f15b254", "589b6b1c",
-        "62c7882b", "70fe4ca5", "767b9f9b", "ae3959b5", "b3987998", "b70bd14f", "d765c702",
+        "1e0f43b6",  # bn local retype sub_401000 0x401000:local:StackVariableSou
+        "35d15f75",  # bn local rename sub_401000 0x401000:local:StackVariableSou
+        "3d833038",  # `bn function list` and `bn function search` return the ful
+        "66b37d2e",  # Omitting `--target` only works when exactly one target is 
+        "76157733",  # - The CLI discovers a bridge, connects to it, and forwards
+        "7d089991",  # When you need counts from BN iterators such as `f.hlil.ins
+        "8b8c9c6a",  # You can run several sessions in parallel. When exactly one
+        "9a80299a",  # Use `--stdin` or `--script` for multiline Python snippets.
+        "9cd96091",  # bytes: 1234
+        "b135db65",  # `bn session start` spawns a `bn-agent` process, registers 
+        "b35752e8",  # `bn callsites` is the direct-call lane for exact return-ad
+        "b78dcc70",  # summary: kind=object count=3
+        "c5fcc64c",  # - `bn` has two parts:
+        "ca1fc685",  # - `call_index`: zero-based ordinal for matching callsites 
+        "d4db75c0",  # - **Peer-credential enforcement (Linux).** Every connectio
+        "d55c4454",  # If exactly one BinaryView is open, target-specific command
+        "e15482b8",  # Run Python inside the Binary Ninja process for one-off ins
+        "ee507a32",  # Single-function escape hatch — analyze just one function w
+        "f1ee3218",  # Any status above other than `verified`/`noop` puts a mutat
+        "f50ed8c8",  # tokens: 456
+        "f6f3e5cb",  # "target_id": "firmware.bin@0",
     }),
     "skills/bn/SKILL.md": frozenset({
-        "3435274a", "351cea9b", "3d99e01e", "476c699a", "61785515", "649eaeac", "66190c94",
-        "718cbccf", "7f2b6f7d", "8909cfbd", "8919c69b", "c094744f", "cc207c7d",
+        "0580e23a",  # > bn -i dogfood-1 -t <sel> xrefs main
+        "12038a20",  # > **Parallel / fan-out agents — HARD rule.** Sticky pins (
+        "2b531c12",  # - **accumulator / shift structure** — a size-parse loop th
+        "34ea1441",  # - **loop-invariant bound pointers** — a hoisted fixed limi
+        "5e15be9b",  # - **HLIL can mislead beyond access width — trust `bn disas
+        "600daf80",  # > bn -i dogfood-1 -t <sel> decompile main
+        "6efe0859",  # ## Two gotchas that cause wrong answers
+        "8bccdffa",  # - **conditional-compare / `csel` / `ccmn` guards** — AArch
+        "94ae359d",  # The full command catalog lives in three files **in this sk
+        "98945b00",  # One open target: omit `-t`. Multiple open: pass `-t <selec
+        "b5f3f247",  # - **access width** — a byte compare can render full-width,
+        "c9765e33",  # > OMP sibling task agents also share one retained eval nam
+        "e8374ea0",  # > bn session start /path/to/bin --instance-id dogfood-1 # 
     }),
     "skills/bn/reference/mutating.md": frozenset({
-        "004be911", "023ef17d", "073c32cb", "21ab0f26", "357b33d7", "3a31edd0", "3ab0e800",
-        "3b705aa6", "4d2bfe51", "4ea5a88f", "73915809", "757a2ce7", "7a963eb3", "7b90ea1f",
-        "7d08894a", "7d87431b", "99a32d48", "abcbb98d", "b01a5a75", "b29746c8", "b570f08e",
-        "c11a3930", "ca2ff185", "dfafc784", "e0108fe1", "e26fd985", "e7bc29dc", "f73aab60",
-        "fe025816",
+        "0501df9a",  # distinct from `3` (a failure — a status in `FAILED_MUTATIO
+        "107f9fec",  # | `first_error` | the first failure's explanation, or the 
+        "10f5e35f",  # against op 1's value. Such a manifest is rejected up front
+        "139a9f88",  # in a write-heavy session (a `proto set` cost ~7 KB; a 115-
+        "18b47674",  # or — like `go rename`, the one op that reports through its
+        "207a375e",  # That is ~225 bytes. The full audit payload — every per-op 
+        "23f868f0",  # ## 7. Bundles
+        "2bb6b7aa",  # ### Step 4 — save before close
+        "2dbbc6bc",  # mutation: committed changed=71 verified=71 noop=0 failed=0
+        "3c817542",  # bn data retype 0x460000 'cmd_help_entry[257]' [--preview]
+        "3dda57c0",  # Every shipped mutation is measurable one of two ways: it p
+        "3f5376fa",  # which fails safe on its own) before trusting a `0`-looking
+        "441109f0",  # typo in op 13 no longer rolls back 12 good ops.
+        "46d085e3",  # `comment set/get/delete` take the address either positiona
+        "474d7d87",  # | `op_count`, `changed_count`, `verified_count`, `noop_cou
+        "48b3a493",  # each call takes exactly one location: an address (position
+        "531bd535",  # ### Step 2 — live writes are verified
+        "5a40c289",  # Mutations print a **one-line status summary** by default:
+        "5b35cedf",  # `set_comment` plus a `delete_comment`) can never verify: o
+        "82ffca8f",  # pairing, since the two are almost always applied together.
+        "87b64a1d",  # It is the one mutation whose bridge result reports the wor
+        "8d2b1a2d",  # Annotations live in the `.bndb`. Always save before closin
+        "9cc9bb4f",  # ### Step 1 — preview first
+        "9e742d4b",  # | `op` | required fields | one of | interactive equivalent
+        "a29b6d0b",  # Split them across two batches — last-write-wins is not exp
+        "bd21de45",  # The mutation surface is built around a four-step safety lo
+        "bfb392d4",  # 261 KB / 87k tokens), so it is **opt-in**:
+        "cca7f348",  # - **One write per key.** Every op is verified against the 
+        "cdf328d4",  # ## 6. Mutation flow
+        "d4b55e60",  # kind of call, so an unmeasured `--preview` is `4` as well 
+        "dbcf469b",  # ### Step 3 — read back
+        "e1e1f0e1",  # write could not be confirmed instead of reading it as a cl
+        "f83e45cf",  # manifest that writes the same key twice (two `set_comment`
+        "fefcdd8b",  # still wins if both apply) and from `0` (a verified or meas
     }),
     "skills/bn/reference/reading.md": frozenset({
-        "075c33cd", "0c9d943c", "1428ab30", "1949d287", "1a70e75d", "1c15c2d2", "1dd5bce8",
-        "25419b43", "2ea1ed0f", "33fd9640", "3716a90b", "43ca5e2b", "4f5394e5", "4fe41c72",
-        "505bed3f", "5221e5b6", "6a4f918d", "6a58a9dc", "6ab53c02", "6ed98be4", "7bc2e390",
-        "86526afb", "91995abd", "965d7b1e", "9971ee4b", "9a98f5ff", "9dbbd6d8", "a916839d",
-        "b71d1544", "b92a2be1", "be1545e3", "be4ef095", "c0610400", "c4b1b451", "d418748d",
-        "dad2603f", "df48aed6", "e9b95184", "eca3534e",
+        "0644faaa",  # bn trace main 0x27e1a --arg 1 --interprocedural # IP: foll
+        "06b091d5",  # All three dispatch under the **shared read lock**, so they
+        "06f979cb",  # - **"Pointers-to-code" means the target's SECTION is code,
+        "0c2b8572",  # ## 5. Caller-static mapping
+        "0c699f6f",  # If you call `bn callsites <callee>` without `--within` / `
+        "163c410d",  # - `bn xrefs` accepts a function name *or* a hex/decimal ad
+        "1d2d1df3",  # - **`row_fields`: in-band row-key discovery.** Row schemas
+        "1e4db595",  # - `bn data vars --start <addr> --end <addr>` lists the **t
+        "1e4fc043",  # - **JSON list-command field map (the `.items[]` idiom and 
+        "2004d8ed",  # - `bn evidence ...` is a read-locked family that surfaces 
+        "20900821",  # bn function list [--sort {address|size|name}] [--reverse] 
+        "224aa0bc",  # bn evidence table <addr> --record-size N --field cmd:u32@0
+        "23940cf6",  # bn disasm <fn> [--lines 40:80 | --count 20]
+        "29c52aa0",  # bn strings [--query <q>] [--regex] [--min-length 5] [--sec
+        "2d2e5021",  # struct CmdDesc desc = {0};
+        "3a2dd5dc",  # `--within-file` accepts one identifier (name or hex addres
+        "3e7166e2",  # - `bn class` is the **C++ object-model lens** (#205): a co
+        "3f16152c",  # bn evidence calls <reg-fn> --arg-struct N --field type:u8@
+        "48853422",  # bn class show <Name> # one class: methods, vtable, size, b
+        "491d1280",  # - **`bn evidence surface`** enumerates the **hidden code s
+        "4a9d61dc",  # bn evidence function <fn> [--context 2] # per-call ABI arg
+        "4acd3a8b",  # `{"kind": <discriminator>, "items": [...], "total": N, "of
+        "4c17ee45",  # - **aarch64 decompiles carry dead `int128_t vN_M` declarat
+        "4cd6e220",  # --field command:u16@0 --field type:u8@2 --field subtype:u8
+        "52c4dfff",  # - **JSON envelope contract (#275).** Every collection-retu
+        "67ce174e",  # bn tag get 0x401000 | --function <fn> # tags at one addres
+        "69200094",  # bn trace handle_l2cap_con_req 0x1c2bc --arg 2 --format jso
+        "6f2cba1d",  # bn evidence calls init_cmd --arg-struct 1 /
+        "71ad85de",  # - **Unconditional (always-unsafe) sinks — no `tainted_args
+        "74a30711",  # - `hlil_statement` resolves for a call whose **return valu
+        "78b987cf",  # **High-fan-in `total` is monotone, not missing.** A callsi
+        "829c1ed6",  # bn decompile <fn> [--addresses] [--lines 40:80] [--force-a
+        "84b0522c",  # bn taint backward -f <fn> --sink arg:memcpy:2 # slice a si
+        "8ee528f5",  # - **Bounded-WRITE sinks — wrapped `recv(len)`/`read(len)` 
+        "926c7cae",  # - **`evidence calls <reg-fn> --arg-struct N --field …`** r
+        "93d922fb",  # - `xrefs` → `.items[]`, each row carrying `.kind` (`code` 
+        "9625a12f",  # ## 4. Read flow
+        "a7f1eea5",  # bn dataflow defuse <fn> --var <name|local_id|name#version>
+        "a9412200",  # - `bn disasm <function> --lines N:M` is a 1-indexed slice 
+        "ab8129a3",  # - `bn trace <fn> <addr> [--arg N] [--interprocedural]` wal
+        "abd1941b",  # bn xrefs <fn-or-addr> [--limit 20]
+        "b06ea8ac",  # bn disasm <addr> --linear [N] # linear disasm of N (defaul
+        "b15c995b",  # - **Nested tables are canonical too:** a pointer table emb
+        "b3400709",  # - **Project-internal wrappers — model them so taint follow
+        "c5e2eebe",  # - `bn function create <address> [--preview]` forces Binary
+        "ceb51492",  # --field flags:u8@4 --field expected_len:u16@6 --field call
+        "d3e7db45",  # - Two more signals from the same demotion logic: `arity_mi
+        "dd81c5c0",  # - **Width-sensitive reads — trust `bn disasm`, not the dec
+        "dfa3a380",  # - **Nothing-found vs incomplete (don't confuse them):** `i
+        "e2f2e169",  # bn trace main 0x27e1a --arg 1 # intra: stops at call bound
+        "ec1c6720",  # bn taint forward -f <fn> --source param:0 [--sink-class re
+        "f0e63d8f",  # - **Addresses in JSON are hex STRINGS**, not integers: `{"
+        "f760dc5e",  # - **Unpaged / fixed-window / presence reads** carry `{kind
+        "fb0af0ab",  # - **Spilled output is NOT the data (#311).** A heavy `--fo
     }),
     "skills/bn/reference/runtime.md": frozenset({
-        "06aad85c", "079c846e", "0a8cddd1", "0ddc02d0", "1fbd64eb", "347a4a13", "34c79efb",
-        "44497fad", "53f0229b", "55a24561", "589fc7e3", "596d0a92", "61785515", "65df27e3",
-        "66190c94", "6a70bcd2", "6f94b989", "7272fe33", "767bdfe8", "8c218bae", "8f382f50",
-        "926f4920", "947fffc7", "98cfec52", "9a1ac7d1", "9cb452f2", "a8fb6baa", "af1d6d85",
-        "b4306499", "b5febfe7", "be5e5584", "bec2b018", "c22c0ad1", "c2335aac", "ca2c1267",
-        "cb4d6e9e", "d20853ec", "d6c30113", "d7f57f32", "e1e09dec", "e45a920a", "e6c69801",
-        "e8bc9423", "eddb9cfa",
+        "0580e23a",  # > bn -i dogfood-1 -t <sel> xrefs main
+        "0d658e61",  # **Predicting spill (#409).** Two signals let you avoid a w
+        "10113c3e",  # **Spill envelopes.** When output exceeds **10 000 estimate
+        "178a8928",  # - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > 
+        "17deb2e4",  # - **No targets ⇒ no `py exec`.** `bn py exec` requires at 
+        "201b6c48",  # ## 3. Output & context
+        "20e2e605",  # s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False
+        "2449caa9",  # > **Global BNDB cache (read-only mounts).** Auto-prefer is
+        "27da9925",  # ## 11. Skill install
+        "2e17cf8a",  # bn decompile main -i myid -t pam_qnx.so.2 # after the leaf
+        "30c54757",  # ## 1. Workflow & target selection
+        "393df258",  # > bn session start /path/to/binary --instance-id dogfood-1
+        "3ecb3444",  # bn session list [-i <id>] # all running instances, or filt
+        "416de700",  # **Fan-out (`--all-instances` / `--all-targets`).** Whole-t
+        "42663a3b",  # bn xrefs <fn-or-addr> --limit 20 # cap text output
+        "42c9764f",  # Requests time out after 600s by default; override with `BN
+        "472980ae",  # bn decompile <fn> --lines 40:80 # 1-indexed inclusive; pri
+        "4c0dc63e",  # 2. Pick a target:
+        "4c3276d9",  # bn bundle -i myid -t pam_qnx.so.2 function main # between 
+        "5083bc40",  # **Stopping is identity-checked and atomically signalled (#
+        "56550fe3",  # ## 10. Known quirks
+        "5ad3c6c3",  # - `--script <file>` for code on disk; `--code` for true on
+        "5d6983de",  # `bn load <raw>` and `bn session start <raw> [...]` auto-pr
+        "5dea8f09",  # shape, so a polling agent never has to index `items[0]` or
+        "600daf80",  # > bn -i dogfood-1 -t <sel> decompile main
+        "63414412",  # The `[N]` prefix is the view id; you can pass `-t N`. If n
+        "64bf870d",  # ## 8. Python escape hatch
+        "6785f03a",  # State lives at `~/.cache/bn/sessions/<sha256(project_root)
+        "680f5025",  # It checks CLI version, plugin staleness (`stale_plugin_ver
+        "6a2f4c3b",  # s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
+        "6b121aa2",  # **Private project associations.** `bn session start` assoc
+        "6bcea80f",  # "count": 1
+        "7ae58359",  # Identity is `(boot id, pid, process start time)`. Start ti
+        "7f52ba89",  # verdict, because one verdict over many jobs would be a lie
+        "8c11c1cb",  # 3. (Optional) Pin sticky defaults — useful for a **single*
+        "959dac82",  # - `-t/--target` and `-i/--instance` work **before or after
+        "9954584e",  # > **HARD rule for parallel / fan-out agents.** Sticky pins
+        "a6ed9d82",  # `--lines START:END` works on `decompile`, `il`, `disasm`, 
+        "a7fc01f4",  # ## 2. Sessions & headless
+        "aa616d1b",  # 1. Discover targets:
+        "ac6214d0",  # Blast radius: a bare, path, or `--all` close resolves agai
+        "b35e947b",  # ## 9. Troubleshooting
+        "b54e57c1",  # - **Threshold override** — set `BN_SPILL_TOKENS` (e.g. `BN
+        "bddeeded",  # **Quick-mode capability matrix.** Per-command behavior on 
+        "c114407a",  # | `evidence function` | **partial** — reads one function's
+        "c1803b96",  # - **Near-spill note** — when a read *fits* but lands withi
+        "ca93b1b0",  # > **`xrefs` text is display-capped (not just spilled).** F
+        "cb024404",  # - **`types declare` verification failures.** The source-pa
+        "cfcd9558",  # | `decompile`, `il` | **partial** — render only already-an
+        "d1ce60b3",  # bn close [<path>] [-t <sel>] [--all] # close one or explic
+        "d6cfb85b",  # - `target`, `instance` — **provenance**: which target and 
+        "dd5822d0",  # s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1,
+        "e0237277",  # When multiple bridge instances exist, flagless `bn load <p
+        "e3475983",  # s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
+        "f2a53a19",  # bn -i myid -t pam_qnx.so.2 decompile main # at root (prefe
     }),
 }
 
 
 
-def _prose_lines(doc: str) -> list[tuple[int, int, str, str]]:
-    """(line number, start offset, raw text, normalized text) for every PROSE
-    line of *doc*.
+def _doc_lines(doc: str) -> list[tuple[int, int, str, str]]:
+    """(line number, start offset, raw text, normalized text) for EVERY line
+    of *doc*, fenced code blocks included.
 
-    Fenced code blocks are excluded: they are transcripts and command syntax,
-    not statements to an agent about what the CLI returns. The normalized form
-    collapses whitespace, so a re-indent or a re-wrap is not a change.
+    They used to be excluded as "transcripts and command syntax", and a
+    contract stated as a `# Exit 5 means ...` comment inside a fenced block is
+    read by an agent exactly like prose. An exclusion is a boundary, and this
+    accounting has run out of patience with boundaries. The normalized form
+    collapses whitespace, so a re-indent is not a change.
     """
     lines: list[tuple[int, int, str, str]] = []
     offset = 0
-    fenced = False
     for at, line in enumerate(_doc_text(REPO / doc).splitlines(), start=1):
         start, offset = offset, offset + len(line) + 1
-        if line.startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
-            lines.append((at, start, line, " ".join(line.split())))
+        lines.append((at, start, line, " ".join(line.split())))
     return lines
-
-
-def _number_lines(doc: str) -> list[tuple[int, int, str, str]]:
-    return [row for row in _prose_lines(doc) if row[3] and _NUMBER_TOKEN.search(row[2])]
 
 
 def _fingerprint(text: str) -> str:
@@ -509,24 +672,41 @@ def _exit_code_claimed(doc: str, text: str) -> bytearray:
     return claimed
 
 
-def _unaccounted_number_lines(doc: str) -> list[str]:
-    """Lines carrying a number that NO cell pins and the ledger does not record.
+def _number_lines(doc: str) -> list[tuple[str, str, list[str]]]:
+    """(where, normalized line, residual tokens) for every line carrying a
+    number that no cell pins.
 
-    Accounting is per NUMBER, not per line: a cell that pins one sentence of a
-    line does not account for a second claim appended to the same line, which
-    is how an unpinned claim rode into a pinned paragraph.
+    The RESIDUAL is what the ledger has to excuse, and it is part of the
+    ledger's key. Keyed on the line alone, one ledger entry excused every
+    number on it: `README.md`'s contract paragraph carries eight cell-pinned
+    digits and the prose word "one", so its fingerprint sat in the ledger and
+    DELETING the cell that ties that paragraph to `_mutation_exit_code` left
+    the module green. An entry now excuses one exact set of leftovers, so
+    removing a pin changes the leftovers and reds.
     """
     text = _doc_text(REPO / doc)
     claimed = _exit_code_claimed(doc, text)
+    rows = []
+    for at, start, raw, normalized in _doc_lines(doc):
+        residual = [match.group(0).lower() for match in _NUMBER_TOKEN.finditer(raw)
+                    if not claimed[start + match.start()]]
+        if residual:
+            rows.append((f"line {at}", normalized, residual))
+    return rows
+
+
+def _ledger_key(normalized: str, residual: list[str]) -> str:
+    return _fingerprint("\x00".join([normalized, *residual]))
+
+
+def _unaccounted_number_lines(doc: str) -> list[str]:
+    """Lines carrying a number that NO cell pins and the ledger does not record."""
     ledger = NON_CLAIM_NUMBER_LINES.get(doc, frozenset())
-    unaccounted = []
-    for at, start, raw, normalized in _number_lines(doc):
-        loose = [match.group(0) for match in _NUMBER_TOKEN.finditer(raw)
-                 if not claimed[start + match.start()]]
-        if not loose or _fingerprint(normalized) in ledger:
-            continue
-        unaccounted.append(f"line {at} ({', '.join(loose)}): {normalized[:140]}")
-    return unaccounted
+    return [
+        f"{where} ({', '.join(residual)}): {normalized[:140]}"
+        for where, normalized, residual in _number_lines(doc)
+        if _ledger_key(normalized, residual) not in ledger
+    ]
 
 
 @pytest.mark.parametrize("doc,claim,literal", _EXIT_CODE_PINS,
@@ -567,7 +747,8 @@ def test_the_non_claim_number_ledger_has_no_stale_entry():
     """...and the ledger stale-fails, so it cannot outlive the lines it excuses
     and quietly become a place to park a claim."""
     stale = {
-        doc: sorted(ledger - {_fingerprint(text) for _, _, _raw, text in _number_lines(doc)})
+        doc: sorted(ledger - {_ledger_key(normalized, residual)
+                              for _, normalized, residual in _number_lines(doc)})
         for doc, ledger in NON_CLAIM_NUMBER_LINES.items()
     }
     stale = {doc: entries for doc, entries in stale.items() if entries}
@@ -841,8 +1022,8 @@ def test_the_lock_model_region_carries_no_unguarded_claim():
     )
 
 
-@pytest.mark.parametrize("doc", EXIT_CODE_DOCS)
-def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
+@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: str(p.relative_to(REPO)))
+def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: Path):
     """...and the paragraph is not the only place the false reading could be
     taught. Every occurrence of the claim in every agent-facing doc must sit
     inside the refutation cell's own span, so moving it to another document --
@@ -851,9 +1032,12 @@ def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
 
     Matched as WORDS, not as the quoted string round 8 pinned: the same reading
     taught without the quotation marks, or across a line wrap, is the same
-    reading.
+    reading. And over EVERY agent-facing doc, not the six that state an exit
+    code: the docstring said "every agent-facing doc" while the
+    parametrization said six of eleven, and the lock model is not an
+    exit-code concern -- an agent reads the other five the same way.
     """
-    text = _doc_text(REPO / doc)
+    text = _doc_text(doc)
     refutation = next(pattern for name, pattern in _LOCK_MODEL_CLAIMS
                       if name == "not-touches-no-bn-state")
     claimed = bytearray(len(text))
@@ -867,7 +1051,7 @@ def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
         if not claimed[match.start()]
     ]
     assert not unrefuted, (
-        f"{doc} states {LOCK_MODEL_FALSE_CLAIM} outside the refutation that "
+        f"{doc} states {LOCK_MODEL_FALSE_CLAIM!r} outside the refutation that "
         "exists to correct it, so an agent reading it there ships a stateful op "
         f"taking no lock: {unrefuted}"
     )
