@@ -64,25 +64,49 @@ REQUIRED_INDEX_GROUPS = {
 # the bug report happened to name, which is fail-OPEN -- deleting the index
 # entries for `evidence`, `trace` and `class` left every doc test green.
 #
-# Each name is asserted live below, so an exemption cannot outlive a rename.
-INDEX_EXEMPT_COMMANDS = frozenset({
-    # Sticky per-repo pins. Advertising these to an agent is actively harmful:
-    # they are one shared file and clobber a concurrent session.
+# Each name is asserted live, so an exemption cannot outlive a rename -- and
+# each group's REASON is asserted too, not merely written down. Round 8 found a
+# real documentation gap parked in the "catalogued in a reference" group, which
+# is exactly what an unasserted reason is for.
+
+# Sticky per-repo pins. Advertising these to an agent is actively harmful: they
+# are one shared file and clobber a concurrent session. ASSERTED: not
+# advertised anywhere in the index.
+INDEX_EXEMPT_STICKY = frozenset({
     "instance use", "instance clear", "target use", "target clear",
-    # Session/instance plumbing an agent reaches through `session start/list/stop`
-    # and `target info/list`, which ARE advertised.
-    "instance list", "instance find", "instance gc",
-    "session restart", "session status", "target close",
-    # Host-side tooling, not analysis surface.
+})
+
+# Reached through an advertised command instead. ASSERTED: the command named as
+# the way in IS advertised in the index.
+INDEX_EXEMPT_REACHED_VIA = {
+    "instance list": "session list",
+    "instance find": "session list",
+    "instance gc": "session stop",
+    "session restart": "session start",
+    "session status": "session list",
+    "target close": "target list",
+    "exports list": "exports",
+    "rename": "symbol rename",
+}
+
+# Host-side tooling, not analysis surface. ASSERTED: live only -- there is no
+# stronger claim to make about a command an agent is not meant to reach for.
+INDEX_EXEMPT_TOOLING = frozenset({
     "doctor", "help", "plugin install", "skill install",
-    # Group-level entries already advertise the only subcommand.
-    "exports list", "rename",
-    # Deeper read surface the index reaches through its group entry; each is
-    # catalogued in the reference the group's line points at.
+})
+
+# Deeper read/write surface the index reaches through its group entry.
+# ASSERTED: each is catalogued somewhere under `skills/`, which is the stated
+# reason. `evidence virtual-call` was in this group while appearing in no
+# reference at all.
+INDEX_EXEMPT_CATALOGUED = frozenset({
     "data retype", "data symbols", "data vars",
     "evidence calls", "evidence orient", "evidence surface", "evidence virtual-call",
     "function cfg", "function structured-il",
 })
+
+INDEX_EXEMPT_COMMANDS = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
+                         | INDEX_EXEMPT_TOOLING | INDEX_EXEMPT_CATALOGUED)
 
 
 @pytest.fixture(scope="module")
@@ -341,6 +365,51 @@ def test_skill_command_index_advertises_every_registered_command(command_paths):
     )
 
 
+def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
+    """An exemption is a claim, and an unasserted claim is where a real gap
+    hides: `evidence virtual-call` sat in the "catalogued in a reference" group
+    while appearing in no reference at all. So each group's stated reason is
+    checked here, and the groups together must be exactly the exemption set."""
+    groups = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
+              | INDEX_EXEMPT_TOOLING | INDEX_EXEMPT_CATALOGUED)
+    assert groups == INDEX_EXEMPT_COMMANDS, (
+        "every exemption must sit in exactly one reason group, or its reason is "
+        f"unchecked: {sorted(groups ^ INDEX_EXEMPT_COMMANDS)}"
+    )
+    stale = sorted(INDEX_EXEMPT_COMMANDS - command_paths)
+    assert not stale, (
+        f"these exemptions name commands the registry does not have: {stale}; a "
+        "stale exemption silently drops a real command from the requirement"
+    )
+    advertised = {command for line in _index_lines()
+                  for command in _advertised_commands(line)}
+    leaked = sorted(INDEX_EXEMPT_STICKY & advertised)
+    assert not leaked, (
+        "these sticky per-repo pins are exempt BECAUSE advertising them is "
+        f"harmful, yet the index advertises them: {leaked}"
+    )
+    missing_way_in = sorted(
+        f"{command} -> {via}" for command, via in INDEX_EXEMPT_REACHED_VIA.items()
+        if via not in advertised
+    )
+    assert not missing_way_in, (
+        "these are exempt because an agent reaches them through another "
+        f"command, but that command is not advertised either: {missing_way_in}"
+    )
+    unresolved = sorted(set(INDEX_EXEMPT_REACHED_VIA.values()) - command_paths)
+    assert not unresolved, (
+        f"these ways in are not registered commands: {unresolved}"
+    )
+    skills = "\n".join(path.read_text(encoding="utf-8")
+                       for path in sorted(SKILL.parent.parent.rglob("*.md")))
+    uncatalogued = sorted(command for command in INDEX_EXEMPT_CATALOGUED
+                          if f"bn {command}" not in skills and f"`{command}`" not in skills)
+    assert not uncatalogued, (
+        "these are exempt from the index BECAUSE they are catalogued in a "
+        f"reference, and they are catalogued nowhere under skills/: {uncatalogued}"
+    )
+
+
 def _index_section() -> str:
     """The Command index body, WITHOUT the remainder of its heading line."""
     text = SKILL.read_text(encoding="utf-8")
@@ -445,7 +514,27 @@ EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Esc
 
 
 def _index_lines() -> list[str]:
-    lines = [line for line in _index_section().splitlines() if line.strip()]
+    """Every non-blank line of the Command index, unfiltered.
+
+    Unfiltered on purpose: filtering to the lines this guard can READ is how a
+    `- ` -> `* ` marker swap took a whole line out of the sweep silently, and
+    the per-line cell below asserts readability itself.
+
+    This used to assert here, at parametrize time -- so a doc slip became
+    `Interrupted: 1 error during collection`, which aborts the whole pytest
+    session and silences every other module's result. One red cell is the
+    correct blast radius; `test_the_command_index_is_shaped_as_this_guard_reads_it`
+    owns the section-level claims.
+    """
+    return [line for line in _index_section().splitlines() if line.strip()]
+
+
+def test_the_command_index_is_shaped_as_this_guard_reads_it():
+    """The section-level claims, as a failing TEST rather than a collection
+    error: every line is readable, and the group set is pinned as a SET rather
+    than a floor ("still at least four lines" is how a line that stopped
+    matching disappeared unnoticed)."""
+    lines = _index_lines()
     unreadable = [line for line in lines if not _INDEX_LINE.match(line)]
     assert not unreadable, (
         "every line in the Command index must be a readable `- **Group** ...` "
@@ -456,7 +545,6 @@ def _index_lines() -> list[str]:
         f"the Command index groups changed: expected {sorted(EXPECTED_INDEX_GROUPS)}, "
         f"parsed {sorted(groups)}"
     )
-    return lines
 
 
 @pytest.mark.parametrize("line", _index_lines(),

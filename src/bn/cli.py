@@ -833,6 +833,14 @@ def _guarded_transform(transform: Callable[[Any], Any] | None, what: str,
     return guarded
 
 
+# The key this CLI WRITES into a fan-out row -- the one legitimate use of the
+# string outside `_unwrap_result`. Named so the guard in
+# tests/test_cli_mutation.py can exempt exactly this one site instead of
+# exempting a syntactic class: "any dict-literal key" was claimable by a raw
+# read dressed as `response.get(*{"result": None})`.
+_RESULT_ROW_KEY = "result"
+
+
 def _unwrap_result(response: Any, op: str) -> Any:
     """The `result` an ok reply must carry.
 
@@ -1202,10 +1210,12 @@ def _mutate(
     stem: str,
     require_target: bool = True,
     preview: bool | None = None,
-    # Annotated, not `Any`: these two ARE bridge-result transforms, and the
-    # guard property in tests/test_cli_mutation.py reads its population off
-    # these annotations. An unannotated transform parameter is one the property
-    # cannot see.
+    # Both ARE bridge-result transforms, and both are forwarded to `_call`,
+    # which is where they are bound to the malformed-result rule. The guard
+    # property in tests/test_cli_mutation.py no longer reads a population off
+    # annotations -- it quantifies over every parameter of every function here
+    # -- so these annotations are documentation, not the thing that makes them
+    # visible.
     detail_renderer: Callable[[Any], str] | None = None,
     summary_transform: Callable[[Any], Any] | None = None,
     **call_kwargs: Any,
@@ -1634,7 +1644,7 @@ def _fanout_call(
                 op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
             )
             row.update({"target": target, "ok": True,
-                        "result": _unwrap_result(response, op)})
+                        _RESULT_ROW_KEY: _unwrap_result(response, op)})
         except BridgeError as exc:
             row.update({"target": tsel, "ok": False, "error": str(exc)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its

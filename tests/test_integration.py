@@ -871,9 +871,25 @@ class TestSessionStartTimeoutDiagnostics:
             return ({name.id for name in ast.walk(call.func) if isinstance(name, ast.Name)}
                     | {attr.attr for attr in ast.walk(call.func) if isinstance(attr, ast.Attribute)})
 
-        # Module-level names whose VALUE carries a cross toolchain, so hoisting
-        # the triple out of the class does not hide the lane.
-        cross_named = {
+        def cross_bound_names(node: ast.AST) -> set[str]:
+            """Names bound INSIDE *node* to a value carrying a cross toolchain."""
+            return {
+                target.id if isinstance(target, ast.Name) else target.attr
+                for child in ast.walk(node)
+                if isinstance(child, (ast.Assign, ast.AnnAssign))
+                for target in (child.targets if isinstance(child, ast.Assign)
+                               else [child.target])
+                if isinstance(target, (ast.Name, ast.Attribute))
+                if child.value is not None and CROSS_TOOLCHAIN in ast.unparse(child.value)
+            }
+
+        # Module-scope bindings only; a name bound inside a class is added for
+        # that class alone. Collecting every binding module-wide into one flat
+        # set made a local name reused by four unrelated classes (`cc`) look
+        # cross-compiling everywhere it appeared, and collecting only
+        # module-scope bindings let a lane hide its triple in a CLASS attribute
+        # reached through `cls.TRIPLE`. Scope is the answer to both.
+        module_named = {
             target.id
             for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
@@ -889,8 +905,11 @@ class TestSessionStartTimeoutDiagnostics:
 
             The toolchain has to reach a CALL's arguments, at any depth, so a
             name inside `subprocess.run([...])`'s list literal counts and this
-            guard's own mention of the marker does not.
+            guard's own mention of the marker does not. The name may be a bare
+            name or an attribute (`cls.TRIPLE`, `self.TRIPLE`), and is resolved
+            in this scope plus module scope.
             """
+            named = module_named | cross_bound_names(node)
             for call in ast.walk(node):
                 if not isinstance(call, ast.Call):
                     continue
@@ -899,7 +918,9 @@ class TestSessionStartTimeoutDiagnostics:
                         if (isinstance(child, ast.Constant) and isinstance(child.value, str)
                                 and CROSS_TOOLCHAIN in child.value):
                             return True
-                        if isinstance(child, ast.Name) and child.id in cross_named:
+                        if isinstance(child, ast.Name) and child.id in named:
+                            return True
+                        if isinstance(child, ast.Attribute) and child.attr in named:
                             return True
                 for name in (names_of(call) & set(helpers)) - seen:
                     if cross_compiles(helpers[name], seen | {name}):

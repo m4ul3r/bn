@@ -224,6 +224,31 @@ def test_every_clause_of_the_exit_code_bullet_is_guarded(clause: str, pattern: s
     )
 
 
+def _unclaimed_runs(text: str, patterns: list[str]) -> list[str]:
+    """The runs of *text* no pattern matches.
+
+    The one implementation of "what is accounted for", used by the exit-code
+    bullet and the lock-model paragraph: two copies of an accounting rule are
+    two rules, and they drift.
+    """
+    claimed = bytearray(len(text))
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.M):
+            claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    runs: list[str] = []
+    run: list[str] = []
+    for index, char in enumerate(text):
+        if claimed[index]:
+            if run:
+                runs.append("".join(run))
+                run = []
+        else:
+            run.append(char)
+    if run:
+        runs.append("".join(run))
+    return runs
+
+
 def test_the_exit_code_bullet_carries_no_unguarded_clause():
     """The other half: the cells above must account for the WHOLE bullet.
 
@@ -241,22 +266,8 @@ def test_the_exit_code_bullet_carries_no_unguarded_clause():
     guards -- however short, and wherever in the bullet it was put.
     """
     bullet = _bullet("- Exit codes:")
-    claimed = bytearray(len(bullet))
-    for _, pattern in _EXIT_CODE_CLAUSES:
-        for match in re.finditer(pattern, bullet):
-            claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
-    unclaimed: list[str] = []
-    run: list[str] = []
-    for index, char in enumerate(bullet):
-        if claimed[index]:
-            if run:
-                unclaimed.append("".join(run))
-                run = []
-        else:
-            run.append(char)
-    if run:
-        unclaimed.append("".join(run))
-    prose = [text for text in unclaimed if re.search(r"\w", text)]
+    prose = [text for text in _unclaimed_runs(bullet, [p for _, p in _EXIT_CODE_CLAUSES])
+             if re.search(r"\w", text)]
     assert not prose, (
         "these runs of the exit-code bullet are claimed by no cell in "
         f"_EXIT_CODE_CLAUSES, so they could be changed or deleted with this "
@@ -306,6 +317,14 @@ def test_the_exit_code_bullet_clauses_are_what_the_cli_actually_does():
 # `_mutation_exit_code` returns for that scenario. A flipped digit fails here;
 # a deleted sentence fails here; and neither can be argued about, because the
 # expected value is executed rather than quoted.
+#
+# Pinning the statements someone NOTICED is the same fail-open list one radius
+# out, so the count is not hand-maintained either: every exit-code claim in
+# every agent-facing doc is detected mechanically below, and a claim no cell
+# accounts for fails. That audit found four more deciders of this one contract
+# -- a fourth full 0/1/2/3/4 list in the mutation reference, the failure rule
+# restated in CLAUDE.md outside its own bullet, the read-vs-mutate split stated
+# twice more, and the session-restart codes in the runtime reference.
 _EXIT_CODE_ECHOES = (
     ("README.md", "mutation-failure",
      r"puts a mutation at exit code `(?P<code>\d)`", "failing"),
@@ -321,6 +340,113 @@ _EXIT_CODE_ECHOES = (
     ("skills/bn/reference/mutating.md", "unsupported-op-kind",
      r"either way exit (?P<code>\d), and a", "failing"),
 )
+
+
+# Exit-code claims whose expected value is not a mutation outcome the helper can
+# be asked for (a read-path refusal, a session-restart code, the reference's own
+# full list). Pinned as LITERAL text INCLUDING the digit, so a flip stops
+# matching and reds -- there is nothing to capture and compare against.
+_EXIT_CODE_PINS = (
+    ("CLAUDE.md", "failure-statuses-put-the-run-at-3",
+     "and any of them puts the run at exit 3."),
+    ("README.md", "own-counters-success-is-0",
+     "so it exits `0` on success like any other."),
+    ("README.md", "measured-all-noop-is-0",
+     "A measured all-`noop` is `0` too."),
+    ("skills/bn/reference/mutating.md", "unknown-op-kind-is-3",
+     "An unknown op kind is `unsupported` and likewise exit 3."),
+    ("skills/bn/reference/mutating.md", "mutation-3-read-or-resolver-2",
+     "a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 "
+     "(#625/#716); only the same status escaping a read/resolver op is exit 2."),
+    ("skills/bn/reference/mutating.md", "exit-2-covers-the-rest",
+     "Exit 2 still covers everything on this path that is *not* one of those "
+     "statuses:"),
+    ("skills/bn/reference/mutating.md", "the-references-own-full-list",
+     "0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a\n"
+     "response this CLI cannot parse) / 3 a mutation status `verification_failed`,\n"
+     "`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an\n"
+     "unmeasured success"),
+    ("skills/bn/reference/reading.md", "bounded-slice-is-a-success",
+     "a provably-bounded constant length (a success, exit 0)"),
+    ("skills/bn/reference/runtime.md", "restart-of-an-unreachable-bridge-is-1",
+     "this way exits **1** rather than 0 whenever the teardown and respawn succeed"),
+    ("skills/bn/reference/runtime.md", "restart-that-cannot-signal-is-2",
+     "the restart refuses to signal and exits **2** instead"),
+)
+
+# Every doc an agent reads for the contract. `skills/bn/SKILL.md` states no exit
+# code today and is in the sweep so that adding one there fails until pinned.
+EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
+                  "skills/bn/reference/mutating.md",
+                  "skills/bn/reference/reading.md",
+                  "skills/bn/reference/runtime.md")
+
+# An exit-code claim: a bare 0-4 within this many characters after the word
+# `exit`. `(?<![\w#])` and `(?!\w)` keep issue references (`#625`, `#118`) and
+# longer numbers out, and the window keeps unrelated digits further down a
+# paragraph out.
+_EXIT_MENTION = re.compile(r"\bexits?\b", re.I)
+_EXIT_CLAIM_DIGIT = re.compile(r"(?<![\w#])[0-4](?!\w)")
+_EXIT_CLAIM_WINDOW = 120
+
+
+def _exit_code_claims(text: str) -> list[int]:
+    """Offsets of every exit-code claim in *text*."""
+    return sorted({mention.start() + digit.start()
+                   for mention in _EXIT_MENTION.finditer(text)
+                   for digit in _EXIT_CLAIM_DIGIT.finditer(
+                       text[mention.start():mention.start() + _EXIT_CLAIM_WINDOW])})
+
+
+def _exit_code_claimed(doc: str, text: str) -> bytearray:
+    """The characters of *text* that some cell pins."""
+    patterns = [pattern for cell_doc, _, pattern, _ in _EXIT_CODE_ECHOES
+                if cell_doc == doc]
+    patterns += [re.escape(literal) for cell_doc, _, literal in _EXIT_CODE_PINS
+                 if cell_doc == doc]
+    if doc == "CLAUDE.md":
+        patterns += [pattern for _, pattern in _EXIT_CODE_CLAUSES]
+    claimed = bytearray(len(text))
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.M):
+            claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    return claimed
+
+
+@pytest.mark.parametrize("doc,claim,literal", _EXIT_CODE_PINS,
+                         ids=[f"{doc}:{claim}" for doc, claim, _ in _EXIT_CODE_PINS])
+def test_every_pinned_exit_code_statement_still_reads_as_pinned(
+        doc: str, claim: str, literal: str):
+    """The deletion half for the statements with nothing to compute: the text is
+    the pin, so a flipped digit or a deleted sentence reds exactly this cell."""
+    assert literal in _doc_text(REPO / doc), (
+        f"{doc} no longer states the {claim!r} exit code as pinned, so this echo "
+        f"of the contract can drift from the code: expected {literal!r}"
+    )
+
+
+@pytest.mark.parametrize("doc", EXIT_CODE_DOCS)
+def test_no_agent_doc_states_an_unpinned_exit_code(doc: str):
+    """The coverage half, over DOCUMENTS instead of one bullet.
+
+    #716's defect was two documents stating the contract while one was guarded.
+    Pinning the statements a reviewer happened to find is the same defect with a
+    longer list, so every exit-code claim in every agent-facing doc must sit
+    inside a span some cell above accounts for. A new sentence about an exit
+    code fails here until it is pinned -- which is the only way the count stops
+    being someone's memory.
+    """
+    text = _doc_text(REPO / doc)
+    claimed = _exit_code_claimed(doc, text)
+    unpinned = [
+        f"line {text.count(chr(10), 0, at) + 1}: ...{text[max(0, at - 60):at + 20]}..."
+        for at in _exit_code_claims(text) if not claimed[at]
+    ]
+    assert not unpinned, (
+        f"{doc} states these exit codes with no cell accounting for them, so "
+        "they can drift from the code with every other guard green -- add a "
+        f"cell to _EXIT_CODE_ECHOES or _EXIT_CODE_PINS: {unpinned}"
+    )
 
 
 def _exit_code_for(scenario: str) -> int:
@@ -465,18 +591,21 @@ _NONE_LOCK_OP = re.compile(r'@op\(\s*"([^"]+)"\s*,\s*lock="none"')
 
 # The `none` semantics an agent reads before choosing a lock class, pinned the
 # same way the exit-code bullet is: one cell per load-bearing claim, plus a
-# coverage half that leaves no prose in the region unaccounted for.
+# coverage half that leaves no prose in the paragraph unaccounted for.
 #
-# Three cuts were escaped before this one, each a proxy for meaning rather than
-# a pin on the text: "some op name anywhere in the paragraph" (satisfied by an
-# incidental parenthetical after the refutation was deleted), `"not" in lead`
+# Four cuts were escaped before this one. Three were proxies for meaning rather
+# than pins on the text: "some op name anywhere in the paragraph" (satisfied by
+# an incidental parenthetical after the refutation was deleted), `"not" in lead`
 # (satisfied by "as a general note"), and a word-boundary `\bnot\b` at every
-# mention (satisfied by "is not merely ...", which AFFIRMS the false reading,
-# and by an appended clause that inherited an earlier mention's negation).
+# mention (satisfied by "is not merely ...", which AFFIRMS the false reading).
+# The fourth was a pin whose ACCOUNTING had a boundary: it covered the paragraph
+# from the first `none` claim onward, so a sentence inserted BEFORE that marker,
+# in the same paragraph, taught the falsehood with every pin green.
 #
-# A proxy for meaning is escapable by construction. A pin is not: changing this
-# region reds its cell, which is the point -- someone has to re-read the claim
-# and move the pin with it.
+# A proxy for meaning is escapable by construction; an accounting with a
+# boundary is escapable just outside it. So the region is now the WHOLE
+# paragraph, and the false claim is additionally accounted for across every
+# agent-facing doc, so it cannot be affirmed somewhere else either.
 #
 # The two `none` ops that really are pure signals: they set an event and must
 # stay deliverable while a write op holds the lock. Everything else declared
@@ -485,11 +614,19 @@ SIGNAL_ONLY_NONE_OPS = frozenset({"shutdown", "cancel_request"})
 
 LOCK_MODEL_SENTENCE_PREFIX = "`op_registry.py` is the single source of truth"
 
-# The region starts at the first claim about `none` ops; everything before it is
-# the registry/dispatch prose the other guards own.
-LOCK_MODEL_REGION_START = "`none` ops run outside"
+# The claim this paragraph exists to refute. Accounted for in EVERY doc: moving
+# it somewhere else is the same defect as affirming it here.
+LOCK_MODEL_FALSE_CLAIM = '"touches no BN state"'
 
 _LOCK_MODEL_CLAIMS = (
+    ("registry-is-the-source-of-truth",
+     r"`op_registry\.py` is the single source of truth: "
+     r"`@op\(name, lock=\"read\"\|\"write\"\|\"none\"\)` declares each op once, and "
+     r"both the lock sets and dispatch routing are derived from it "
+     r"\(`REGISTRY\.read_locked_ops\(\)` / `write_locked_ops\(\)`\)\."),
+    ("read-and-write-ops-dispatch-locked",
+     r"Read ops dispatch under a shared writer-priority `_ReadWriteLock`; "
+     r"write ops under an exclusive lock;"),
     ("none-ops-self-manage",
      r"`none` ops run outside the dispatcher's lock and \*\*self-manage locking\*\*: "
      r"the op body takes the write gate and/or the exclusive target lock itself\."),
@@ -505,18 +642,19 @@ _LOCK_MODEL_CLAIMS = (
 
 
 def _lock_model_region() -> str:
+    """The WHOLE lock-model paragraph.
+
+    It used to be the paragraph from the first `none` claim onward, which left
+    the registry/dispatch prose -- the same paragraph, the same line -- outside
+    the accounting and available for an affirmation of the false reading.
+    """
     sentence = next(
         (line for line in _doc_text().splitlines()
          if line.startswith(LOCK_MODEL_SENTENCE_PREFIX)),
         None,
     )
     assert sentence, f"the lock-model paragraph ({LOCK_MODEL_SENTENCE_PREFIX}...) is gone"
-    at = sentence.find(LOCK_MODEL_REGION_START)
-    assert at >= 0, (
-        f"the lock-model paragraph no longer states {LOCK_MODEL_REGION_START!r}, so "
-        f"this guard cannot find the region it checks: {sentence}"
-    )
-    return sentence[at:]
+    return sentence
 
 
 @pytest.mark.parametrize("claim,pattern", _LOCK_MODEL_CLAIMS,
@@ -533,32 +671,45 @@ def test_every_claim_of_the_lock_model_region_is_guarded(claim: str, pattern: st
 
 
 def test_the_lock_model_region_carries_no_unguarded_claim():
-    """The half that stops the NEXT claim: every character of the region is
-    claimed by a cell above, so a clause appended anywhere in it -- refuting,
-    affirming, or merely stale -- is unclaimed prose and fails here. An
-    affirmation that reused an earlier mention's negation was how the previous
-    two cuts of this guard were escaped."""
+    """The half that stops the NEXT claim: every character of the paragraph is
+    claimed by a cell above, so a clause inserted anywhere in it -- before the
+    `none` claims, between them, or after -- is unclaimed prose and fails here.
+    An affirmation reusing an earlier mention's negation escaped the proxy cuts;
+    an affirmation inserted before the region marker escaped the first pin."""
     region = _lock_model_region()
-    claimed = bytearray(len(region))
-    for _, pattern in _LOCK_MODEL_CLAIMS:
-        for match in re.finditer(pattern, region):
-            claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
-    runs: list[str] = []
-    run: list[str] = []
-    for index, char in enumerate(region):
-        if claimed[index]:
-            if run:
-                runs.append("".join(run))
-                run = []
-        else:
-            run.append(char)
-    if run:
-        runs.append("".join(run))
-    prose = [text for text in runs if re.search(r"\w", text)]
+    prose = [text for text in _unclaimed_runs(region, [p for _, p in _LOCK_MODEL_CLAIMS])
+             if re.search(r"\w", text)]
     assert not prose, (
-        "these runs of the lock-model region are claimed by no cell in "
+        "these runs of the lock-model paragraph are claimed by no cell in "
         f"_LOCK_MODEL_CLAIMS, so they could teach anything with this module "
         f"green: {prose}"
+    )
+
+
+@pytest.mark.parametrize("doc", EXIT_CODE_DOCS)
+def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
+    """...and the paragraph is not the only place the false reading could be
+    taught. Every occurrence of the claim in every agent-facing doc must sit
+    inside the refutation cell's own span, so moving it to another document --
+    or to another paragraph of this one -- fails the same way as affirming it
+    here.
+    """
+    text = _doc_text(REPO / doc)
+    refutation = next(pattern for name, pattern in _LOCK_MODEL_CLAIMS
+                      if name == "not-touches-no-bn-state")
+    claimed = bytearray(len(text))
+    for match in re.finditer(refutation, text):
+        claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    unrefuted = [
+        f"line {text.count(chr(10), 0, match.start()) + 1}: "
+        f"...{text[max(0, match.start() - 70):match.end() + 20]}..."
+        for match in re.finditer(re.escape(LOCK_MODEL_FALSE_CLAIM), text)
+        if not claimed[match.start()]
+    ]
+    assert not unrefuted, (
+        f"{doc} states {LOCK_MODEL_FALSE_CLAIM} outside the refutation that "
+        "exists to correct it, so an agent reading it there ships a stateful op "
+        f"taking no lock: {unrefuted}"
     )
 
 
@@ -571,6 +722,14 @@ def test_the_lock_model_counterexample_is_a_really_stateful_none_op():
     bridge = (REPO / "src" / "bn_agent_bridge" / "bridge.py").read_text(encoding="utf-8")
     none_ops = set(_NONE_LOCK_OP.findall(bridge))
     assert none_ops, 'no lock="none" op declarations found; this guard is unchecked'
+    # SIGNAL_ONLY_NONE_OPS is an exemption, so it is asserted live like the
+    # others: an op renamed away would silently shrink `stateful` and make the
+    # counterexample requirement easier to satisfy rather than failing.
+    retired = sorted(SIGNAL_ONLY_NONE_OPS - none_ops)
+    assert not retired, (
+        'SIGNAL_ONLY_NONE_OPS exempts ops that are no longer declared '
+        f'lock="none": {retired}; a stale exemption weakens this guard silently'
+    )
     stateful = sorted(none_ops - SIGNAL_ONLY_NONE_OPS)
     assert stateful, (
         'every lock="none" op is now a pure signal, so the "touches no BN state" '

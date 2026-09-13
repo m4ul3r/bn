@@ -1370,17 +1370,36 @@ _BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
 # The rule's own implementation is the one place a transform is invoked
 # directly; both halves are self-checked below rather than trusted.
 _RULE_FUNCTIONS = (_GUARD, _BOUNDARY)
-# A bridge-result transform is a callable the CALLER hands `_call`, which is
+# "bound at no line": larger than any line number cli.py will ever have, so an
+# unbound name is treated as unbound everywhere rather than as bound early.
+_UNBOUND = 1 << 30
+# The ONE name cli.py may bind the string `"result"` to outside the unwrap
+# helper: the key it writes into a fan-out row. A named site, not a syntactic
+# class -- round 8 claimed a dict-literal-key exemption with a raw read dressed
+# as `response.get(*{"result": None})`.
+_RESULT_ROW_KEY_NAME = "_RESULT_ROW_KEY"
+# A bridge-result transform is a callable the CALLER hands the CLI, which is
 # then applied to a bridge result. Round 6 defined that population by SHAPE --
 # an annotation, a direct invocation, or a nine-token name vocabulary -- and
 # round 7 escaped all three at once: a parameter typed `Any`, named outside the
 # vocabulary, forwarded to a helper and dispatched there out of a dict.
 #
-# A recogniser is a list with a regex in front of it. So the population is not
-# recognised at all, it is DECLARED -- once -- as "every parameter of `_call`
-# that is not declared data", and propagated from that one place. A parameter
-# added to `_call` is a transform until someone says otherwise, and no renaming
-# or re-annotating can move it out of the population.
+# Round 7 replaced the recogniser with a DECLARATION -- every `_call` parameter
+# not declared data -- and round 8 escaped THAT, because `_call` is not the only
+# door: `_emit_result`, `_render_result` and `_mutation_exit_code` each bind a
+# caller-supplied transform of their own, and none of them was seeded. Removing
+# their boundary bindings left the module green and a raising summary left
+# `main()` as a raw `KeyError`.
+#
+# A declaration with a doorway is a recogniser again. So the static population
+# below is TOTAL: every parameter of every function in `cli.py`, with no
+# annotation, no name, no entry point and no exemption. Precision comes from
+# what is PROVEN GUARDED, not from what was recognised as a transform, and the
+# dispatch shapes are the ones through which a value can be CALLED.
+#
+# `_CALL_DATA_PARAMS` survives for one narrower job: the behavioural
+# parametrization at the bottom of this file, which has to know which of
+# `_call`'s parameters to hand a raising transform to.
 _CALL_DATA_PARAMS = frozenset({
     "args", "op", "params", "require_target", "allow_implicit_target",
     "page_limit", "page_offset", "page_label", "paged_spill", "stem",
@@ -1429,20 +1448,25 @@ def _all_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
 
 
 def _bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef):
-    """(targets, value) for every binding form in *fn*.
+    """(targets, value, lineno) for every binding form in *fn*.
 
-    Not just `ast.Assign`: round 7 invoked a transform through a loop variable,
-    which an assignment-only walk never taints.
+    Not just `ast.Assign`: round 7 invoked a transform through a loop variable
+    and round 8 laundered one through a walrus, and an assignment-only walk
+    taints neither.
     """
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign):
-            yield node.targets, node.value
+            yield node.targets, node.value, node.lineno
+        elif isinstance(node, ast.NamedExpr):
+            yield [node.target], node.value, node.lineno
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            yield [node.target], node.iter
+            yield [node.target], node.iter, node.lineno
         elif isinstance(node, ast.comprehension):
-            yield [node.target], node.iter
+            yield [node.target], node.iter, getattr(node.target, "lineno", fn.lineno)
         elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            yield [node.optional_vars], node.context_expr
+            yield [node.optional_vars], node.context_expr, node.optional_vars.lineno
+        elif isinstance(node, ast.MatchAs) and node.name is not None and node.pattern:
+            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node.lineno
 
 
 def _carried(value: ast.expr, holders: set[str]) -> set[str]:
@@ -1463,51 +1487,62 @@ def _bound_names(targets: list[ast.expr]) -> set[str]:
 
 
 def _transform_holders() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """Per `cli.py` function: (names holding a caller-supplied transform, those
-    bound to the malformed-result rule).
+    """Per `cli.py` function: (names that may hold a caller-supplied transform,
+    those bound to the malformed-result rule).
 
-    Seeded from `_declared_transform_params()` -- the one declaration -- and
-    propagated to a fixpoint two ways, because each was escaped alone:
+    The population is every parameter of every function in the module -- no
+    declaration, no doorway -- and is propagated to a fixpoint two ways, because
+    each was escaped alone:
 
     * CONTAINMENT over every binding form, so `b = a`, `b = (a, x)`,
       `b = {"k": a}`, `for b in (a,)`, `[b for b in ...]` and `with ... as b`
-      all keep the transform in the population and `slots["k"](result)` cannot
+      all keep the value in the population and `slots["k"](result)` cannot
       launder it out.
-    * CALL SITES inside `cli.py`, so an argument carrying a transform taints the
-      callee's corresponding parameter: a transform forwarded to a helper is
-      still that transform there, under whatever name the helper gave it. A
-      per-function scan was escaped exactly by forwarding it.
+    * CALL SITES inside `cli.py`, so an argument taints the callee's
+      corresponding parameter: a transform forwarded to a helper is still that
+      transform there, under whatever name the helper gave it.
 
     Guardedness propagates the same way, so a transform bound once at the
     boundary stays bound everywhere it travels -- and one bound nowhere is
-    reported wherever it is invoked.
+    reported wherever it is invoked. Over-approximating the population costs
+    nothing here: a data parameter is only ever reported if the module CALLS it.
     """
     functions = {fn.name: fn for fn in _cli_functions()}
-    holders: dict[str, set[str]] = {name: set() for name in functions}
-    guarded: dict[str, set[str]] = {name: set() for name in functions}
+    holders: dict[str, set[str]] = {name: {arg.arg for arg in _all_args(fn)}
+                                    for name, fn in functions.items()}
+    # name -> first line at which it is bound to the rule. A call BEFORE that
+    # line is not guarded: round 8 moved an invocation above the boundary block
+    # and a set-valued `guarded` called it bound.
+    guarded: dict[str, dict[str, int]] = {name: {} for name in functions}
     assert "_call" in functions, "_call is gone; this whole property is unchecked"
-    holders["_call"] |= _declared_transform_params()
+
+    def bound_by(name: str, names: set[str], line: int) -> bool:
+        return all(guarded[name].get(candidate, _UNBOUND) <= line for candidate in names)
+
+    def bind(name: str, names: set[str], line: int) -> None:
+        for candidate in names:
+            guarded[name][candidate] = min(guarded[name].get(candidate, _UNBOUND), line)
 
     def snapshot() -> tuple:
         return (tuple(sorted((name, tuple(sorted(names))) for name, names in holders.items())),
-                tuple(sorted((name, tuple(sorted(names))) for name, names in guarded.items())))
+                tuple(sorted((name, tuple(sorted(at.items()))) for name, at in guarded.items())))
 
     converged = False
     for _ in range(len(functions) + 8):
         before = snapshot()
         for name, fn in functions.items():
-            for targets, value in _bindings(fn):
+            for targets, value, line in _bindings(fn):
                 names = _bound_names(targets)
                 if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
                         and value.func.id == _BOUNDARY):
                     holders[name] |= names
-                    guarded[name] |= names
+                    bind(name, names, line)
                     continue
                 carried = _carried(value, holders[name])
                 if carried:
                     holders[name] |= names
-                    if carried <= guarded[name]:
-                        guarded[name] |= names
+                    if bound_by(name, carried, line):
+                        bind(name, names, line)
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
                     continue
@@ -1520,8 +1555,10 @@ def _transform_holders() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                         if not carried:
                             continue
                         holders[callee].add(param)
-                        if carried <= guarded[name]:
-                            guarded[callee].add(param)
+                        if bound_by(name, carried, node.lineno):
+                            # Bound on entry: the callee receives it already
+                            # bound, so every line of the callee is after it.
+                            bind(callee, {param}, functions[callee].lineno)
         if before == snapshot():
             converged = True
             break
@@ -1601,19 +1638,21 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
 def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
     """Property: in `cli.py`, a transform is CALLED only after the boundary
     rebinding -- whatever the dispatch shape (a name, a dict lookup, a loop
-    variable, a returned callable) and in whatever function it was forwarded
-    to, because it is the OBJECT that is guarded and not the site."""
+    variable, a walrus, a returned callable), in whatever function it was
+    forwarded to, and only on lines that come AFTER the rebinding, because it is
+    the OBJECT that is guarded and not the site."""
     holders, guarded = _transform_holders()
     unguarded = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
             continue
-        open_transforms = holders[fn.name] - guarded[fn.name]
+        bound_at = guarded[fn.name]
         unguarded += [
             f"{_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
             for node in ast.walk(fn)
             if isinstance(node, ast.Call)
-            if _callee_roots(node) & open_transforms
+            for dispatched in [_callee_roots(node) & holders[fn.name]]
+            if any(bound_at.get(name, _UNBOUND) > node.lineno for name in dispatched)
         ]
     assert not unguarded, (
         "these invoke a bridge-result transform that was never bound to the "
@@ -1634,24 +1673,39 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
     already in the file deciding the envelope question a second time.
 
     So the population is not a shape: it is EVERY occurrence of the string
-    `"result"` in `cli.py`. Outside the helper the only legitimate one is a key
-    of a row this CLI builds for its own output, so that is the single
-    exemption; a subscript, a `.get`, a `.pop`, an `in` test, or a name bound to
-    the literal and used later is a read, and reads go through the helper.
+    `"result"` in `cli.py`. The second cut then exempted a syntactic CLASS --
+    any key of a dict literal, because the CLI writes that key into a fan-out
+    row -- and a raw read dressed as `response.get(*{"result": None})` claimed
+    the exemption, because its only occurrence of the string is a dict key.
+
+    An exemption for a syntactic class is a hole for anything that can wear the
+    syntax. So the exemption is ONE NAMED SITE: the module-level
+    `_RESULT_ROW_KEY` assignment, which the row builder uses. Any other
+    occurrence -- a subscript, a `.get`, a `.pop`, an `in` test, a dict literal,
+    a starred dict, a name bound to the literal -- is a read, and reads go
+    through the helper.
     """
     source = _CLI.read_text(encoding="utf-8")
     tree = ast.parse(source)
     unwrap = next((fn for fn in _cli_functions() if fn.name == "_unwrap_result"), None)
     assert unwrap is not None, "_unwrap_result is gone; nothing checks the envelope"
-    emitted = {id(key) for node in ast.walk(tree) if isinstance(node, ast.Dict)
-               for key in node.keys
-               if isinstance(key, ast.Constant) and key.value == "result"}
+    declared = [node.value for node in tree.body
+                if isinstance(node, ast.Assign)
+                if any(isinstance(target, ast.Name) and target.id == _RESULT_ROW_KEY_NAME
+                       for target in node.targets)]
+    assert len(declared) == 1 and isinstance(declared[0], ast.Constant), (
+        f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, as a string "
+        "constant at module scope; it is the one exemption this property grants"
+    )
+    assert declared[0].value == "result", (
+        f"{_RESULT_ROW_KEY_NAME} must be the literal 'result'; it is: {declared[0].value!r}"
+    )
     raw = [
         f'"result" at cli.py:{node.lineno}'
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
         if node.value == "result"
-        if id(node) not in emitted
+        if node is not declared[0]
         if not unwrap.lineno <= node.lineno <= (unwrap.end_lineno or unwrap.lineno)
     ]
     assert not raw, (
@@ -1661,32 +1715,83 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
     )
 
 
+def _repo_functions() -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Every function defined under `src/bn`, by name."""
+    functions: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for path in sorted((_CLI.parent).rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.setdefault(node.name, []).append(node)
+    assert len(functions) > 200, f"src/bn shrank to {len(functions)} function names"
+    return functions
+
+
+def _dispatched_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """The parameters *fn* CALLS -- directly or through anything derived from
+    them. This is what makes handing a value to another module dangerous."""
+    params = {arg.arg for arg in _all_args(fn)}
+    reachable = set(params)
+    for _ in range(len(params) + 8):
+        before = frozenset(reachable)
+        for targets, value, _line in _bindings(fn):
+            if _carried(value, reachable):
+                reachable |= _bound_names(targets)
+        if before == frozenset(reachable):
+            break
+    dispatched: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            dispatched |= _callee_roots(node) & reachable
+    return dispatched
+
+
 def test_no_bridge_result_transform_leaves_cli_py_unguarded():
     """...and the other way out: a transform handed to another module is invoked
     THERE, where no scan of `cli.py`'s call sites can see it -- the fan-out text
     renderer already calls its `inner_renderer` directly in `formatters.py`. So
-    whatever leaves this module must already be bound to the rule. Calls to
-    `cli.py`'s own functions are exempt because the property above covers them.
+    whatever leaves this module must already be bound to the rule.
+
+    The population being total, "any name passed out of the module" would flag
+    every `getattr(args, ...)` in the file. So the receiving side answers
+    instead: for each call to a function defined elsewhere under `src/bn`, the
+    argument is a finding only if THAT function dispatches the parameter it
+    lands on. Calls to `cli.py`'s own functions are exempt because the property
+    above covers them, and an unresolvable callee (a builtin, a method) cannot
+    be shown to invoke anything.
     """
     holders, guarded = _transform_holders()
     in_module = {fn.name for fn in _cli_functions()} | {_BOUNDARY, _GUARD}
+    repo = _repo_functions()
+    dispatches = {name: set().union(*(_dispatched_parameters(fn) for fn in defs))
+                  for name, defs in repo.items()}
     leaked = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
             continue
-        open_transforms = holders[fn.name] - guarded[fn.name]
+        bound_at = guarded[fn.name]
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call) or _callee_names(node) & in_module:
                 continue
-            passed = [*node.args, *(keyword.value for keyword in node.keywords)]
-            leaked += [
-                f"{arg.id} -> {_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
-                for arg in passed
-                if isinstance(arg, ast.Name) and arg.id in open_transforms
-            ]
+            for callee in _callee_roots(node) - in_module:
+                if callee not in repo:
+                    continue
+                slots = [arg.arg for arg in _all_args(repo[callee][0])]
+                pairs = [*zip(slots, node.args)]
+                pairs += [(keyword.arg, keyword.value) for keyword in node.keywords
+                          if keyword.arg]
+                leaked += [
+                    f"{argument.id} -> {callee}({slot}=) in {fn.name}() "
+                    f"at cli.py:{node.lineno}"
+                    for slot, argument in pairs
+                    if slot in dispatches[callee]
+                    if isinstance(argument, ast.Name)
+                    if argument.id in holders[fn.name]
+                    if bound_at.get(argument.id, _UNBOUND) > node.lineno
+                ]
     assert not leaked, (
-        "these hand an unguarded bridge-result transform out of cli.py, where "
-        f"it is invoked outside the malformed-result rule: {sorted(leaked)}"
+        "these hand an unguarded bridge-result transform out of cli.py to a "
+        "function that INVOKES it, so a malformed result escapes the rule "
+        f"there: {sorted(leaked)}"
     )
 
 
