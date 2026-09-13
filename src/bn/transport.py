@@ -348,6 +348,32 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
+def _socket_has_no_listener(socket_path: Path, timeout: float = 0.2) -> bool:
+    """Whether a failed probe PROVES nothing is accepting on *socket_path*.
+
+    ``_socket_is_live`` answers "can this be talked to right now", which is the
+    right question for routing and the wrong one for deleting: a bridge that is
+    bound and serving answers ``EAGAIN`` as soon as its accept backlog is full,
+    and a timeout says nothing at all. Only a REFUSED connection -- nothing has
+    the path bound, so it is a crashed bridge's leftover file or a plain file
+    that never was a socket -- or a path that is already gone proves this is not
+    a live endpoint. Measured on Linux: a leftover socket file and a regular
+    file both give ``ECONNREFUSED``, a missing path gives ``ENOENT``, and a
+    listening socket with a full backlog gives ``EAGAIN``. Destroying a socket
+    file on the strength of the weaker answer unlinks a serving bridge's only
+    endpoint and orphans it on an unlinked inode (#618).
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(socket_path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _socket_path_is_confined(socket_path: Path) -> bool:
     """Whether a registry's ``socket_path`` lives under this user's bn cache.
 
@@ -562,9 +588,20 @@ def _load_instance(
         # unresponsiveness into destructive discovery cleanup: request dispatch
         # will report bridge_stopped or the real socket failure. A recorded
         # identity that MISMATCHES is not unresponsiveness -- it is proof the
-        # bridge exited and its pid was reused -- so that entry is swept.
+        # bridge exited and its pid was reused -- so that entry is refused.
+        #
+        # This is the only arm that can unlink a socket that something may
+        # still be BOUND to, and the probe that brought us here is the weakest
+        # evidence in the file: a full accept backlog fails it on a bridge that
+        # is serving. So the record is refused on the shared evidence, and the
+        # unlink additionally requires the probe to be CONCLUSIVE -- a refused
+        # connection or a path already gone. Both halves of `record_is_litter`
+        # are inferences that can be wrong at once (a busy socket plus a pid
+        # this process cannot address), and that combination unlinked a live,
+        # listening socket (#618).
         if record_is_litter:
-            _purge_stale_registry(path, socket_path)
+            if _socket_has_no_listener(socket_path, timeout=socket_timeout):
+                _purge_stale_registry(path, socket_path)
             return None
 
     return BridgeInstance(
@@ -1332,10 +1369,15 @@ def _spawn_instance_unlocked(
         if exit_code is not None:
             message = (
                 f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-                f"exited with code {exit_code} before registering.{leftover_note}"
+                f"exited with code {exit_code} before registering."
             )
+            # The note goes to the CALLER, not into the log: the log is the file
+            # the note is about, and writing it there grows the very thing this
+            # arm is trying not to destroy, once per attempt.
             _append_spawn_diagnostic(log_path, message)
-            raise BridgeError(f"{message}{_log_tail(log_path, start=log_start)}")
+            raise BridgeError(
+                f"{message}{leftover_note}{_log_tail(log_path, start=log_start)}"
+            )
         remaining = _remaining_deadline(deadline, "waiting for bridge registration")
         time.sleep(min(poll_interval, remaining or poll_interval))
 
@@ -1345,11 +1387,11 @@ def _spawn_instance_unlocked(
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
         f"did not register within {timeout:g}s and was terminated. "
         f"Check {log_path}. Retry the same command; on a heavily loaded host, "
-        f"set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time.{leftover_note}"
+        f"set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
     )
     _append_spawn_diagnostic(log_path, message)
     _reap_child(proc)
-    raise BridgeError(message)
+    raise BridgeError(f"{message}{leftover_note}")
 
 
 def wait_for_teardown(

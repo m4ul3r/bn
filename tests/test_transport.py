@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -4178,6 +4179,77 @@ def test_an_unconfined_socket_keeps_an_unprovable_live_owners_record(tmp_path, m
     assert record.exists()                   # refused, never destroyed
     assert bystander.exists()
     assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_a_backlogged_live_socket_is_never_unlinked(tmp_path, monkeypatch):
+    """The weakest evidence in the file guarded the most destructive act.
+
+    This is the only arm that can unlink a socket something may still be BOUND
+    to, and the probe that reaches it fails on a bridge that is serving as soon
+    as its accept backlog is full -- which is exactly why the arm refuses to
+    purge on the probe alone. Both halves of the shared litter predicate are
+    inferences, though, and they can be wrong AT ONCE: a busy socket plus a pid
+    this process cannot address (another pid namespace, or a recycled number)
+    unlinked a live, listening socket and orphaned its bridge on an unlinked
+    inode. The record is still refused; the unlink now needs the probe to be
+    conclusive -- a refused connection, or a path already gone.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "busy.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    # Fill the accept backlog so a probe of this LISTENING socket fails.
+    held = []
+    for _ in range(8):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.2)
+        try:
+            client.connect(str(sock_path))
+            held.append(client)
+        except OSError:
+            client.close()
+            break
+    record = inst_dir / "busy.json"
+    record.write_text(
+        json.dumps(
+            _registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                              instance_id="busy")
+        ),
+        encoding="utf-8",
+    )
+    # The pid reads as gone -- the inference this arm cannot verify.
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    try:
+        from bn.transport import _socket_is_live
+
+        assert not _socket_is_live(sock_path, timeout=0.2)   # the probe DOES fail
+
+        assert list_instances() == []            # refused, as before
+        assert sock_path.exists()                # but the live socket survives
+        assert record.exists()
+
+        # Conclusive evidence still sweeps both: nothing bound to the path.
+        for client in held:
+            client.close()
+        listener.close()
+        sock_path.unlink()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(sock_path))
+        stale.listen(1)
+        stale.close()
+        assert list_instances() == []
+        assert not record.exists()
+        assert not sock_path.exists()
+    finally:
+        for client in held:
+            with contextlib.suppress(OSError):
+                client.close()
+        with contextlib.suppress(OSError):
+            listener.close()
+        sock_path.unlink(missing_ok=True)
 
 
 def test_an_unconfined_socket_still_sweeps_a_dead_owners_record(tmp_path, monkeypatch):
