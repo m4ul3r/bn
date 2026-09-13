@@ -4614,14 +4614,19 @@ def test_gc_reclaims_a_kept_record_that_no_discovery_path_can_use(tmp_path, monk
     assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
 
 
-def test_gc_keeps_a_kept_record_whose_endpoint_is_still_bound(tmp_path, monkeypatch):
+def test_gc_keeps_a_kept_record_whose_endpoint_is_still_serving(tmp_path, monkeypatch):
     """The reclaim needs its own positive evidence, and this is that evidence.
 
     Reclaiming a record because discovery refuses it would be the same mistake
     one level up: refusal is not proof there is nothing there. The record goes
-    only when nothing is bound to the socket it names -- and a socket that is
-    bound but has not reached ``listen`` still refuses connections, so the
-    proof has to come from the kernel rather than from a probe.
+    only when the endpoint it names can no longer serve anyone -- so a socket
+    that ACCEPTS keeps its record, and so does one whose accept backlog is full,
+    because ``EAGAIN`` proves nothing either way.
+
+    A socket that is bound but has not reached ``listen`` is the opposite case
+    and it is deliberate: nobody can be served there, so the unresolvable
+    record goes, while the ENDPOINT -- the part nothing can recreate -- stays,
+    because the kernel says something holds that name.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -4632,14 +4637,29 @@ def test_gc_keeps_a_kept_record_whose_endpoint_is_still_bound(tmp_path, monkeypa
     record = inst_dir / "starting.json"
     # The filename disagrees with the payload's id, so discovery refuses this
     # record on every path; its owner is alive and proves nothing, so the
-    # liveness sweep keeps it. Unresolvable, kept -- and not reclaimable.
-    record.write_text(
-        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")),
-        encoding="utf-8",
+    # liveness sweep keeps it. Unresolvable, kept -- the reclaim's own subject.
+    payload = json.dumps(
+        _registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")
     )
+    record.write_text(payload, encoding="utf-8")
     try:
         assert list_instances(include_unreachable=True) == []
 
+        summary = gc_instances()
+
+        assert not record.exists()             # nobody can be served through it
+        assert sock_path.exists()              # but the endpoint is still held
+        assert summary["sockets_removed"] == 0
+        starting.listen(1)                     # the bridge finishes coming up
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))     # and is reachable by name
+        finally:
+            client.close()
+
+        # Now something IS serving there, and the same record is kept.
+        record.write_text(payload, encoding="utf-8")
         summary = gc_instances()
 
         assert record.exists()
@@ -4763,15 +4783,17 @@ def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp
     assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
 
 
-def test_a_foreign_socket_cannot_veto_reclaiming_records_that_can_never_reach_it(tmp_path, monkeypatch):
-    """Retention has to be justified by an endpoint this code would USE.
+def test_a_record_naming_a_dead_foreign_socket_is_reclaimed_without_touching_it(tmp_path, monkeypatch):
+    """A path this code will not connect to is still one the kernel can report.
 
     A record whose ``socket_path`` is outside the cache is one discovery has
-    already decided it will never connect to, so whether something is bound
-    there says nothing about whether the record is a handle. Asking anyway let
-    one permanently-bound foreign socket pin unboundedly many records -- and
-    each pinned record pins its ``.log`` too. The foreign path is never probed
-    for permission and never touched.
+    already refused to connect to, so the endpoint question is answered by
+    READING the kernel's list of bound paths instead of probing -- no action on
+    a path we did not create, and no unlink of it either. Nothing bound there
+    means the record can never be a handle, and the record is the only thing
+    removed. (A foreign socket that IS bound keeps these records instead; that
+    retention is the disclosed price of never letting a confinement misread
+    authorise a deletion.)
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     inst_dir = instances_dir()
@@ -4779,38 +4801,28 @@ def test_a_foreign_socket_cannot_veto_reclaiming_records_that_can_never_reach_it
     outside = tmp_path / "outside"
     outside.mkdir()
     foreign = outside / "foreign.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(foreign))
-    server.listen(1)                       # bound, listening, and permanent
-    try:
-        for index in range(3):
-            sid = f"pinned{index}"
-            (inst_dir / f"{sid}.json").write_text(
-                json.dumps(_registry_payload(foreign, pid=os.getpid(), instance_id=sid)),
-                encoding="utf-8",
-            )
-            (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(foreign))
+    stale.close()                          # a socket FILE nothing is bound to
+    for index in range(3):
+        sid = f"pinned{index}"
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps(_registry_payload(foreign, pid=os.getpid(), instance_id=sid)),
+            encoding="utf-8",
+        )
+        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
 
-        # Unresolvable on every path: normal discovery and the lifecycle lookup
-        # both refuse an unconfined record whose owner proves nothing.
-        assert list_instances() == []
-        assert list_instances(include_unreachable=True) == []
+    # Unresolvable on every path: normal discovery and the lifecycle lookup
+    # both refuse an unconfined record whose owner proves nothing.
+    assert list_instances() == []
+    assert list_instances(include_unreachable=True) == []
 
-        summary = gc_instances()
+    summary = gc_instances()
 
-        assert summary["registries_purged"] == 3
-        assert summary["logs_removed"] == 3
-        assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
-        assert foreign.exists()            # the foreign endpoint is untouched
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(0.5)
-        try:
-            client.connect(str(foreign))   # and still serving
-        finally:
-            client.close()
-    finally:
-        with contextlib.suppress(OSError):
-            server.close()
+    assert summary["registries_purged"] == 3
+    assert summary["logs_removed"] == 3
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+    assert foreign.exists()                # the foreign path is never unlinked
 
 
 def test_gc_names_every_path_it_removed_including_the_records(tmp_path, monkeypatch):
@@ -4840,3 +4852,99 @@ def test_gc_names_every_path_it_removed_including_the_records(tmp_path, monkeypa
     assert str(log) in summary["removed"]
     assert len(summary["removed"]) == summary["registries_purged"] + summary["logs_removed"] \
         + summary["sockets_removed"]
+
+
+def test_the_reclaim_needs_a_dead_endpoint_not_an_unbound_one(tmp_path, monkeypatch):
+    """The record's reclaim must not wait on the socket's stronger fact either.
+
+    A record nobody can be served through is not a handle, whatever holds the
+    name. Asking for the socket's fact instead -- that the KERNEL says nothing
+    is bound -- makes the answer unobtainable wherever ``/proc/net/unix``
+    cannot be read, so the record, its log and its socket were retained there
+    permanently and invisibly, where base reclaimed all three. That is the
+    coupling ``_socket_probe`` was split to break, and it survived in the
+    reclaim one round longer than it should have (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "mismatch.sock"
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    leftover.bind(str(sock_path))
+    leftover.close()                       # a crashed bridge's leftover socket file
+    record = inst_dir / "mismatch.json"
+    # The filename disagrees with the payload id, so discovery refuses this
+    # record on every path; its owner is alive and proves nothing, so nothing
+    # judges it litter either. Unresolvable, kept -- and the reclaim is the
+    # only thing that can ever remove it.
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")),
+        encoding="utf-8",
+    )
+    (inst_dir / "mismatch.log").write_text("x\n", encoding="utf-8")
+    # No /proc/net/unix: the kernel cannot be asked whether anything is bound.
+    monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
+
+    assert list_instances() == []
+    assert list_instances(include_unreachable=True) == []
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 1
+    assert summary["logs_removed"] == 1
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+
+
+def test_a_misread_confinement_keeps_a_serving_bridges_record(tmp_path, monkeypatch):
+    """"Not proven confined" is a fact about the reader, not about the record.
+
+    ``_socket_path_is_confined`` fails closed on an ``OSError`` from
+    ``resolve()`` and does not case-fold, so it can answer False about a socket
+    that really is in the cache -- and on a case-insensitive filesystem it does
+    so for every bridge. An earlier reclaim treated that as licence to skip the
+    endpoint check, and one transient misread then cost a LIVE, serving bridge
+    its record and log. The cost of not knowing must be a file that is kept
+    (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "serving.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # bound, listening, and serving
+    record = inst_dir / "serving.json"
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="serving")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "serving.log"
+    log.write_text("serving\n", encoding="utf-8")
+    # The reader misreads its own cache: every path reads as unconfined, which
+    # is also what a case-insensitive filesystem does to every bridge.
+    monkeypatch.setattr("bn.transport._socket_path_is_confined", lambda path: False)
+    try:
+        # Unresolvable: the unconfined arm refuses a record whose owner proves
+        # nothing, which is exactly the state the reclaim acts on.
+        assert list_instances(include_unreachable=True) == []
+
+        for no_proc_net in (False, True):
+            if no_proc_net:
+                monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
+            summary = gc_instances()
+
+            assert summary["registries_purged"] == 0
+            assert summary["logs_removed"] == 0
+            assert summary["sockets_removed"] == 0
+            assert record.exists() and log.exists() and sock_path.exists()
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))  # still reachable by name
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)

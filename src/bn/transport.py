@@ -853,18 +853,40 @@ def find_lifecycle_instance(
     return None
 
 
-def _nothing_is_bound_to(socket_path: Path) -> bool:
-    """Positive proof that no socket is bound to *socket_path*.
+def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool:
+    """Whether the endpoint a kept record names can no longer serve anyone.
 
-    Two facts qualify, and neither of them is an absence this process merely
-    failed to look up: the name does not exist at all -- a bound AF_UNIX socket
-    always has a directory entry, on every platform -- or the kernel's own list
-    of bound paths does not hold it. ``_path_has_bound_socket`` answering
-    ``None`` (no ``/proc/net/unix`` to read) is the absence of an answer, not an
-    answer, and does not qualify.
+    This is the fact that makes a RECORD reclaimable, and it is deliberately
+    weaker than the one that makes a socket FILE removable: the reclaim unlinks
+    only the record, and a record nobody can be served through is not a handle.
+    Requiring the socket's stronger fact instead kept a record forever wherever
+    the kernel could not be asked -- the same coupling ``_socket_probe`` exists
+    to break, left behind here (#618).
+
+    A path that does not exist is dead on every platform: a bound AF_UNIX
+    socket always has a directory entry.
+
+    Otherwise the question is who may be ASKED. Inside the cache a connect
+    probe is exactly what discovery already does, and ``nothing_accepting``
+    answers it -- a serving bridge accepts, or answers ``EAGAIN`` with a full
+    backlog, and either one keeps the record. Outside the cache this code
+    refuses to connect at all, so it falls back to READING the kernel's list of
+    bound paths, which requires no action on a path we did not create.
+
+    That fallback being the STRICTER of the two is the point, not an accident.
+    ``_socket_path_is_confined`` can read False for reasons that are about the
+    reader rather than the record -- it fails closed on an ``OSError`` from
+    ``resolve()`` and it does not case-fold -- and an earlier version of this
+    reclaim treated that absence as licence to skip the endpoint check
+    entirely, which destroyed a LIVE serving bridge's record and log on one
+    transient resolution failure. An absence of evidence must lower the chance
+    of destruction, never raise it: the cost of misreading confinement is now a
+    record that is kept.
     """
     if not socket_path.exists():
         return True
+    if _socket_path_is_confined(socket_path):
+        return _socket_probe(socket_path, timeout=timeout).nothing_accepting
     return _path_has_bound_socket(socket_path) is False
 
 
@@ -892,20 +914,25 @@ def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path])
       ``list_instances(include_unreachable=True)``, and membership is checked
       here rather than assumed, so a record that IS somebody's handle can never
       reach the unlink below; and
-    * nothing is bound to the socket it names, proved by the kernel rather than
-      inferred from a refused connection -- a socket that is bound and has not
-      reached ``listen`` refuses one too. That question is only asked about a
-      socket discovery would actually USE: for a path outside the cache the
-      loader has already refused to connect, so what is bound there says
-      nothing about whether this record is a handle, and asking anyway let one
-      permanently-bound foreign socket pin unboundedly many records and their
-      logs. An unconfined path is neither probed for permission nor touched.
+    * the endpoint it names can no longer serve anyone, established the way
+      ``_record_endpoint_is_dead`` explains: a name that does not exist, a
+      conclusive refusal from a socket inside the cache, or -- for a path
+      outside it, which this code will not connect to -- the kernel's own list
+      of bound paths not holding it. What this deliberately does NOT ask is
+      whether anything is bound to a socket the loader has already refused to
+      use: one permanently-bound foreign socket could otherwise pin
+      unboundedly many records and their logs. The foreign path is never
+      connected to and never unlinked.
 
-    The last two checks are also what protects the window: ``resolvable`` was
-    measured before this call, but a record that became somebody's handle
-    inside that window has its socket bound (a bridge binds before it
-    registers) and has different bytes on disk (the writer uses ``os.replace``),
-    and either one alone refuses the unlink.
+    Both checks are taken inside this call rather than trusted from the
+    caller, which is also what bounds the window: ``resolvable`` was measured
+    before it, and a record that became somebody's handle since then either
+    answers the endpoint probe (a bridge that has reached ``listen`` accepts)
+    or has different bytes on disk (the writer registers through
+    ``os.replace``), and either one alone refuses the unlink. A bridge that
+    has bound but not yet registered is the one case where the OLD record here
+    still goes: it is not that bridge's record, that bridge writes its own,
+    and its socket is never touched by this function.
 
     A record this function cannot interpret is left alone: that retention
     predates this module's destruction rule, is not part of it, and is pinned
@@ -924,7 +951,7 @@ def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path])
                                             payload.get("instance_id")):
         return False
     socket_path = _record_socket_path(registry_path, raw_socket_path)
-    if _socket_path_is_confined(socket_path) and not _nothing_is_bound_to(socket_path):
+    if not _record_endpoint_is_dead(socket_path):
         return False
     return _unlink_if_unchanged(registry_path, document)
 
