@@ -255,9 +255,11 @@ def _row_list(source: Any, key: str) -> list[dict[str, Any]]:
     present but is not a row anything here can read.
 
     The ELEMENT-granularity sibling of ``_field_list``, and it exists because
-    the field-level answer was only half of one. Five sites spelled this
-    ``[r for r in _field_list(v, "results") if isinstance(r, dict)]``, which
-    silently DISCARDS the unreadable element -- so a batch carrying one row
+    the field-level answer was only half of one. Four sites spelled it
+    ``[r for r in _field_list(v, "results") if isinstance(r, dict)]``; the
+    fifth (`go rename`'s failure list) took the list raw and let the shared
+    builder's own ``isinstance`` filter drop the element instead. Either way it
+    is DISCARDED silently -- so a batch carrying one row
     nobody could classify beside one that verified reported ``ok: true``,
     ``failed_count: 0`` and ``first_error: null``, and the text card showed
     only the readable row with nothing anywhere saying a row had been dropped.
@@ -1607,15 +1609,29 @@ def _render_go_functions_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
+def _paging_footer(value: dict[str, Any], items: list[Any],
+                   page_unreadable: bool) -> str | None:
     """Build the "// showing N of TOTAL" footer for a paged-list envelope.
 
     Shared by every paged list renderer (function list/search, strings, imports,
     sections) so the honest-total convention reads identically across them (#59,
     #122). Returns None when the page IS the whole set (no paging happened), the
-    envelope lacks a total to report against, or any of the three counts it
-    states arrived in a shape no count reads out of -- a footer states no count
-    and no resume offset it could not derive (#619)."""
+    envelope lacks a total to report against, any of the three counts it states
+    arrived in a shape no count reads out of, or the PAGE ITSELF did -- a footer
+    states no count and no resume offset it could not derive (#619).
+
+    *page_unreadable* is the third state of the page, which only the caller can
+    answer because the page key is a runtime argument."""
+    # A page the caller could not read makes the third count a fabrication:
+    # `returned` defaults to the length of *items*, and that is a MEASUREMENT
+    # only while the page was readable -- the choke point hands back an empty
+    # list for a page it could not use, so an unreadable page rendered
+    # "showing 0 of 100 (50 more); rerun with --offset 50" from an offset of
+    # 50, the non-advancing resume loop again, reached without any of the three
+    # named counts being wrong. The skew is already recorded by the caller's
+    # read, so the boundary still names the field (#619). Refused BELOW rather
+    # than here, so that every key this helper consults is consulted on every
+    # path and the read set does not depend on which refusal fired.
     # ONE count contract for all three of these. Spelling the total's test as
     # `isinstance(total, int)` made it a THIRD one: it rejected the numeric
     # string `_count_field` accepts two lines below, and which the go-rename
@@ -1639,8 +1655,8 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     # on page one. A count nobody could derive is not stated, exactly as the
     # op row, the type row and the blast-radius line refuse theirs; the
     # enclosing boundary names the field. `returned` keeps its item-count
-    # default, which is a MEASUREMENT rather than a fabricated zero, so it is
-    # asked for only when the envelope actually claimed one.
+    # default, which is a measurement of a page the caller established was
+    # readable, so it is asked for only when the envelope actually claimed one.
     #
     # Nested rather than asking `_field_skewed` three times: the ambient set
     # holds every skew this render recorded, including a `total`/`offset` key
@@ -1650,16 +1666,17 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     try:
         total = _count_field(value, "total")
         returned = (_count_field(value, "returned") if _field_present(value, "returned")
-                    else (len(items) if isinstance(items, list) else 0))
+                    else len(items))
         offset = _count_field(value, "offset")
         unreadable = sorted(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
     for key in unreadable:
         _record_skew(key)
-    if unreadable:
+    more = bool(value.get("has_more"))
+    if unreadable or page_unreadable:
         return None
-    if value.get("has_more"):
+    if more:
         remaining = total - (offset + returned)
         next_offset = offset + returned
         return (
@@ -1687,8 +1704,14 @@ def _render_paged_list_text(
     # listing renderers -- and a raw `or []` here was invisible to the coercion
     # guard precisely because the key is not a literal (#619).
     items = _field_list(value, page_key)
+    # The third state of the PAGE, asked HERE because the page key is a runtime
+    # argument and this is the only site that knows it -- and asked BEFORE the
+    # item renderer runs, so a row's own same-named field cannot answer for the
+    # page. A footer measured off a page nobody could read is the fabrication
+    # `_paging_footer` refuses for its three named counts (#619).
+    page_unreadable = _field_skewed(page_key)
     body = item_renderer(items)
-    footer = _paging_footer(value, items)
+    footer = _paging_footer(value, items, page_unreadable)
     if footer is None:
         return body
     return footer if body == "none" else f"{body}\n\n{footer}"
@@ -4443,6 +4466,10 @@ def _mutation_summary(value: Any) -> Any:
     unmeasured = not results or rows_unreadable
     return _build_mutation_summary(
         measured=not unmeasured,
+        # The rows that could be READ, which is why it stays an int while the
+        # four derived counts go unknown: it is the size of what this summary
+        # actually saw, and the unmeasured warning beside it says the batch was
+        # larger than that.
         op_count=len(results),
         reported_success=bool(value.get("success", True)),
         failure_rows=failed,
@@ -4456,6 +4483,12 @@ def _mutation_summary(value: Any) -> Any:
         message=value.get("message"),
         proto_residue=bool(value.get("prototype_user_type_residue")),
         unusable=bool(unreadable),
+        # The public reference quotes the no-rows phrase verbatim as the
+        # meaning "this op reports through its own counters instead", so an
+        # unreadable ROW must not borrow it: a reader sent to look for a
+        # missing `results[]` would find one, populated, and stop.
+        unmeasured_cause=("a results[] row could not be read" if rows_unreadable
+                          else "this op reported no results[] rows"),
     )
 
 
@@ -4515,6 +4548,17 @@ def _go_rename_summary(value: Any) -> Any:
         # caller asked for detail -- the same half-parity #447 forbids, on the
         # second caller of the one builder (#619/#685).
         failure_rows = _row_list(value, "results")
+        # And the row STATUSES are classified here, which closing the list
+        # granularity alone still left out. `ok` and `failed_count` came off
+        # `go_failed_count` ALONE, so a row that NAMES a failure -- or one whose
+        # status nobody could read -- beside a counter saying zero produced
+        # `ok: true, failed_count: 0, first_error: null` with no disclosure,
+        # while `_add_mutation_ok` classifies those same rows and refuses. The
+        # compact path is this op's DEFAULT, so `jq '.ok'` flipped on the detail
+        # flag again, one granularity in. Both of `_add_mutation_ok`'s
+        # derivations now happen here: the unreadable status records its own
+        # skew inside this capture, and a readable failure row is counted below.
+        row_failures = [r for r in failure_rows if _is_failed_status(r)]
         unreadable = list(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
@@ -4557,7 +4601,14 @@ def _go_rename_summary(value: Any) -> Any:
         # a counter -- so there is no measurement source to require.
         changed = 0
         source = None
-    measured = (not unreadable
+    # The rows and the counter answer the SAME question on this op -- its
+    # `results[]` holds only the FAILURE rows -- so they may not disagree: a
+    # `go_failed_count` of 0 beside a row that names a failure is not a
+    # measurement of this run, whichever of the two is wrong. Refusing is the
+    # only answer available here, because inventing a count from the rows would
+    # be the mirror fabrication.
+    rows_contradict = bool(row_failures) and not failed
+    measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
 
     # The failure explanation (a failure row's message/status, then the top-level
@@ -4575,9 +4626,16 @@ def _go_rename_summary(value: Any) -> Any:
         # commit. Hardcoding True here made that fail-safe unreachable from the
         # one op whose whole reason for existing is #683.
         measured=measured,
-        unusable=bool(unreadable),
+        unusable=bool(unreadable) or rows_contradict,
+        # Named precisely, because this phrase is what the compact TEXT prints
+        # and what `_unmeasured_cause` reads back out: saying "counters" for an
+        # unreadable ROW sends a reader to the wrong field.
         unmeasured_cause=(
-            "this op's own counters could not be read" if unreadable
+            "this op's own counters could not be read"
+            if any(key in _GO_RENAME_COUNTERS for key in unreadable)
+            else "this op's failure rows could not be read" if unreadable
+            else "this op's failure rows contradict its own counters"
+            if rows_contradict
             else "this op reported none of its own counters"),
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
@@ -4707,8 +4765,7 @@ def _render_mutation_text(value: Any) -> str:
         lines.append("")
 
     has_type_op = any(_is_type_result(r) for r in results)
-    has_direct_op = any(r.get("op") and not _is_type_result(r)
-                        for r in results if isinstance(r, dict))
+    has_direct_op = any(r.get("op") and not _is_type_result(r) for r in results)
 
     if results:
         if len(results) == 1 and success and not failed and not preview:
