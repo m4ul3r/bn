@@ -481,19 +481,35 @@ def _load_instance(
         socket_path = path.with_name(f"{own_id}.sock")
     pid = raw_pid
 
-    if path.parent == instances_dir() and instance_id != own_id:
-        # The registry filename is the caller's explicit selector. Never trust a
-        # payload that claims a different identity, and never unlink the socket
-        # named by that foreign payload.
-        with contextlib.suppress(OSError):
-            path.unlink()
-        return None
-
     process_state = _process_state(pid)
     owner_alive = _process_alive(pid) and process_state not in {"Z", "X", "x"}
     # Liveness alone cannot tell a running bridge from an unrelated process that
     # recycled its pid, so discovery consults the durable identity too (#694).
     verdict = identity_verdict(payload, pid)
+    # One rule for every arm below: REFUSING a record costs a lookup, DELETING
+    # it can cost a live bridge its only handle, so nothing here unlinks without
+    # positive evidence that the record is litter -- the owner is gone, or its
+    # recorded identity MISMATCHES, which is proof the bridge exited and its pid
+    # was reused. "unrecorded" is the ABSENCE of evidence: it is what a pre-#694
+    # bridge reports, and what every bridge reports on a platform with no
+    # ``/proc`` (Darwin, which ``cache_home`` branches for), including one that
+    # is serving right now. Four separate members of this defect class were
+    # deletions taken on that absence (#618).
+    record_is_litter = not owner_alive or verdict == "mismatch"
+
+    if path.parent == instances_dir() and instance_id != own_id:
+        # The registry filename is the caller's explicit selector. Never trust a
+        # payload that claims a different identity, and never unlink the socket
+        # named by that foreign payload. The DISAGREEMENT, though, can be an
+        # artifact of our own reading rather than of the record: on a
+        # case-insensitive filesystem `Foo.json` and `foo.json` are one file, so
+        # a caller's spelling alone made a live bridge's own record read as
+        # foreign -- and this arm then deleted it. Refuse always; delete only on
+        # the evidence above.
+        if record_is_litter:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return None
 
     unreachable = False
     if not _socket_path_is_confined(socket_path):
@@ -501,29 +517,20 @@ def _load_instance(
         # cache: never connect to it, and never let the stale sweep unlink it.
         # Whether to delete the RECORD is a separate question, and this arm
         # cannot tell "the payload is bogus" from "our reading of the layout is
-        # wrong" -- the symlinked-cache purge proved the second happens. So
-        # DESTRUCTION here requires positive evidence that the record is litter,
-        # the same evidence the not-live-socket arm below demands: the owner is
-        # gone, or its recorded identity MISMATCHES (proof the bridge exited and
-        # its pid was reused). "unrecorded" is not evidence -- it is what a
-        # pre-#694 bridge, or any platform without /proc, produces for a bridge
-        # that is serving right now -- and deleting on it is how this arm
-        # deleted live bridges twice. The missing-socket arm may demand more
-        # because it HAS more: start() binds the socket before writing the
-        # registry, so an absent socket is itself evidence of a bridge that is
-        # not serving; nothing about an unconfined path says anything about the
-        # bridge.
+        # wrong" -- the symlinked-cache purge proved the second happens -- so it
+        # destroys only on the shared evidence above.
         #
         # A PROVEN live owner also RESOLVES for the lifecycle lookup, exactly as
-        # that arm does (#694): keeping the file without returning it made it a
-        # handle for nothing -- `session stop` could not name the process and
-        # spawn collision detection could not see the id, so a re-spawn
-        # truncated that live bridge's log where refusing the id outright had
-        # left it intact. A handle is not a connection: `unreachable` is what
-        # stops dispatch (`_send_request_to_instance` refuses it), and normal
-        # discovery keeps hiding it. An alive owner that proves nothing gets
-        # neither the handle nor the purge: refused, and left alone.
-        if not owner_alive or verdict == "mismatch":
+        # the missing-socket arm does (#694): keeping the file without returning
+        # it made it a handle for nothing -- `session stop` could not name the
+        # process and spawn collision detection could not see the id, so a
+        # re-spawn truncated that live bridge's log where refusing the id
+        # outright had left it intact. A handle is not a connection:
+        # `unreachable` is what stops dispatch (`_send_request_to_instance`
+        # refuses it), and normal discovery keeps hiding it. An alive owner that
+        # proves nothing gets neither the handle nor the purge: refused, and
+        # left alone.
+        if record_is_litter:
             _purge_stale_registry(path)
             return None
         if not include_unreachable or verdict != "proven":
@@ -533,16 +540,20 @@ def _load_instance(
         # start() binds the socket BEFORE writing the registry, so "registry with
         # no socket" is never a legitimate startup window: it is a bridge that
         # died hard, or a phantom kept listed only by whatever owns its pid now.
-        # A dead or unproven owner is purged outright; a PROVEN live owner is an
-        # unreachable bridge -- no request can reach it, so normal discovery and
-        # `bn session list` must not advertise it, but its record is the only
-        # handle `bn session stop` has on a process that is still holding memory,
-        # so lifecycle lookups (include_unreachable=True) still resolve it. Once
-        # that process is gone the next discovery purges the record (#694).
-        if not owner_alive or verdict != "proven":
+        # That absence is evidence about SERVICE, not about the handle: a bridge
+        # nothing can reach is exactly the process `bn session stop` must still
+        # be able to name, so normal discovery and `bn session list` hide it
+        # while lifecycle lookups (include_unreachable=True) resolve it, and the
+        # next discovery after that process is gone purges the record (#694).
+        # Deleting it demands the same positive evidence as everywhere else:
+        # purging on "unrecorded" took the only handle to a LIVE process away
+        # from every pre-#694 bridge, and -- since `identity_verdict` needs
+        # `/proc` for both halves of its proof -- from every bridge on a platform
+        # that has none.
+        if record_is_litter:
             _purge_stale_registry(path, socket_path)
             return None
-        if not include_unreachable:
+        if not include_unreachable or verdict != "proven":
             return None
         unreachable = True
     elif not _socket_is_live(socket_path, timeout=socket_timeout):
@@ -552,7 +563,7 @@ def _load_instance(
         # will report bridge_stopped or the real socket failure. A recorded
         # identity that MISMATCHES is not unresponsiveness -- it is proof the
         # bridge exited and its pid was reused -- so that entry is swept.
-        if not owner_alive or verdict == "mismatch":
+        if record_is_litter:
             _purge_stale_registry(path, socket_path)
             return None
 
@@ -1238,25 +1249,35 @@ def _spawn_instance_unlocked(
     log_path = inst_dir / f"{instance_id}.log"
     reg_path = bridge_registry_path(instance_id)
     # A registry file still on disk after the collision pass above is one
-    # discovery could neither read nor prove dead: an unparseable document, or a
-    # field whose type rules it out, is deliberately kept -- which also keeps it
-    # invisible to that pass -- and the bridge that wrote it may be listening
-    # right now (the child then refuses to displace its socket and exits). So
-    # truncating `<id>.log` here would destroy that process's only recorded
-    # output on evidence that says nothing about whether the id is free: append
-    # instead, and bound the diagnostic tail to what THIS child wrote so the
-    # error never quotes the previous bridge's lines as its own (#618).
+    # discovery refused without being able to prove it litter: an unparseable
+    # document, a field whose type rules it out, or a record this loader keeps
+    # on purpose because deleting it could cost a live bridge its only handle.
+    # Every one of those is also invisible to that pass, and the bridge that
+    # wrote it may be listening right now (the child then refuses to displace
+    # its socket and exits). So truncating `<id>.log` here would destroy that
+    # process's only recorded output on evidence that says nothing about whether
+    # the id is free: append instead, and bound the diagnostic tail to what THIS
+    # child wrote so the error never quotes the previous bridge's lines as its
+    # own (#618).
     keep_log = reg_path.exists()
     log_start = 0
-    # Nothing in this code ever removes a record it could not interpret, so the
-    # append above can otherwise repeat forever with no statement of why the
-    # spawn keeps failing. Name the file and the action in the failure, so the
-    # one thing that ends the condition is something the operator can see.
+    # Nothing in this code removes a record it refuses, so the append above can
+    # otherwise repeat with no statement of why the spawn keeps failing. Say what
+    # is actually known -- a registry file under this id that discovery did not
+    # resolve to a running bridge -- and NOT why, because this arm cannot tell an
+    # uninterpretable document from a record deliberately refused and kept
+    # (an unconfined socket with an alive owner that proves no identity parses
+    # perfectly). "Remove it" is not the advice either: in this state the record
+    # is hidden from `session list`, so the operator cannot check it through the
+    # CLI, and removing a LIVE bridge's record leaves `instance gc` free to
+    # unlink that bridge's socket.
     leftover_note = (
-        f" A registry file for {instance_id!r} was already on disk at {reg_path} "
-        f"and discovery could not interpret it, so this log was appended to "
-        f"rather than replaced; if no bridge is running under that id, remove "
-        f"that file."
+        f" A registry file for {instance_id!r} is already on disk at {reg_path} "
+        f"and discovery did not resolve it to a running bridge, so this log was "
+        f"appended to rather than replaced. It is kept deliberately: it may "
+        f"belong to a bridge that is still running under this id. Inspect that "
+        f"file (and the pid and socket it names) before removing it -- removing "
+        f"it while that bridge is alive lets `bn instance gc` unlink its socket."
         if keep_log
         else ""
     )

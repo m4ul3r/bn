@@ -210,6 +210,13 @@ def test_send_request_rejects_foreign_socket_pid_before_dispatch(tmp_path, monke
 
 
 def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, monkeypatch):
+    # A payload claiming an identity its filename disagrees with is never
+    # adopted, and its socket is never unlinked. DELETING the record is a
+    # separate decision that now needs positive evidence the record is litter --
+    # the disagreement itself can be an artifact of the caller's spelling on a
+    # case-insensitive filesystem, where it cost a live bridge its record. The
+    # destructive half, and that live-record case, are pinned by
+    # test_a_filename_mismatch_does_not_delete_a_live_bridges_record.
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     socket_path = tmp_path / "foreign.sock"
     server = _Server(str(socket_path), _Handler)
@@ -230,11 +237,12 @@ def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, mo
 
     try:
         assert list_instances() == []
-        assert not registry.exists()
+        assert list_instances(include_unreachable=True) == []
         assert socket_path.exists()
     finally:
         server.shutdown()
         server.server_close()
+
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -2600,12 +2608,26 @@ def test_socketless_registry_is_never_listed(tmp_path, monkeypatch, identity):
 
 
 @pytest.mark.parametrize(
-    "identity",
-    [lambda: _identity(ticks_delta=5), lambda: _identity(omit_boot=True), dict],
-    ids=["reused-pid", "no-boot-id", "no-identity"],
+    "identity,owner_alive",
+    [
+        (lambda: _identity(ticks_delta=5), True),
+        (lambda: _identity(omit_boot=True), False),
+        (dict, False),
+    ],
+    ids=["reused-pid", "dead-owner-no-boot-id", "dead-owner-no-identity"],
 )
-def test_socketless_registry_without_proof_self_heals(tmp_path, monkeypatch, identity):
+def test_socketless_registry_self_heals_on_positive_evidence(
+    tmp_path, monkeypatch, identity, owner_alive
+):
+    # A socket-less record is swept when something PROVES it is litter: the
+    # owner is gone, or its recorded identity mismatches (the pid was reused).
+    # The two unprovable-but-ALIVE cases this used to sweep are now kept -- that
+    # record is the only handle on a live process, and "unrecorded" is what
+    # every bridge reports on a platform without /proc -- and they are pinned by
+    # test_a_socketless_registry_is_kept_when_its_owner_proves_nothing.
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    if not owner_alive:
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(
@@ -3937,8 +3959,12 @@ def test_a_record_discovery_cannot_read_keeps_its_bridges_spawn_log(tmp_path, mo
     message = str(excinfo.value)
     assert "no module named binaryninja" in message
     assert "listening on" not in message   # the tail is this child's output only
-    # The one action that ends the condition, named where the operator sees it.
-    assert "could not interpret it" in message and str(inst_dir / "corrupt.json") in message
+    # What is known, named where the operator sees it -- and no instruction to
+    # delete a record that may be a live bridge's.
+    assert str(inst_dir / "corrupt.json") in message
+    assert "did not resolve it to a running bridge" in message
+    assert "before removing it" in message
+    assert "could not interpret" not in message
 
 
 def test_a_spawn_with_no_leftover_record_still_starts_a_fresh_log(tmp_path, monkeypatch):
@@ -3977,7 +4003,141 @@ def test_a_spawn_with_no_leftover_record_still_starts_a_fresh_log(tmp_path, monk
     text = log.read_text(encoding="utf-8")
     assert "long gone" not in text          # truncated: nothing was at risk
     assert text.startswith("ImportError: no module named binaryninja")
-    assert "could not interpret" not in str(excinfo.value)
+    assert "already on disk" not in str(excinfo.value)
+
+
+def test_the_leftover_note_does_not_call_a_refused_record_corrupt(tmp_path, monkeypatch):
+    """The note fires for every kept record, so it must not guess WHY.
+
+    ``keep_log`` asks only whether a registry file survived discovery, and the
+    set that survives is wider than "uninterpretable": an unconfined socket
+    with a live owner that proves no identity parses perfectly, validates every
+    field, and is kept on purpose. Telling the operator that record is corrupt
+    is false, and telling them to remove it is worse -- in this state it is
+    hidden from `session list`, so they cannot check it through the CLI, and
+    removing a live bridge's record leaves `instance gc` free to unlink that
+    bridge's socket.
+    """
+    import bn.transport as transport
+
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = inst_dir / "refused.json"
+    record.write_text(
+        json.dumps(_registry_payload(bystander, pid=os.getpid(), instance_id="refused")),
+        encoding="utf-8",
+    )
+    assert json.loads(record.read_text(encoding="utf-8"))["pid"] == os.getpid()
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("RuntimeError: Another bridge is already serving\n")
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("refused", timeout=1.0, poll_interval=0.01)
+
+    message = str(excinfo.value)
+    assert "could not interpret" not in message          # it parsed; it was refused
+    assert "may belong to a bridge that is still running" in message
+    assert "before removing it" in message
+    assert record.exists()
+
+
+def test_a_socketless_registry_is_kept_when_its_owner_proves_nothing(tmp_path, monkeypatch):
+    """The missing-socket arm destroys on evidence too, or not at all.
+
+    An absent socket is evidence about SERVICE -- `start()` binds before it
+    writes the registry -- and says nothing about whether the record is the
+    only handle on a live process. Purging it on ``"unrecorded"`` therefore
+    took that handle away from every pre-#694 bridge, and, because
+    ``identity_verdict`` needs ``/proc`` for both halves of its proof, from
+    every bridge on a platform that has none. Positive evidence still sweeps:
+    a dead owner, or a MISMATCH proving the pid was reused.
+    """
+    import bn.transport as transport
+    from bn.proc_identity import identity_verdict
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    unprovable = inst_dir / "noproof.json"
+    unprovable.write_text(
+        json.dumps(
+            _registry_payload(inst_dir / "noproof.sock", pid=os.getpid(),
+                              identity=_identity(omit_boot=True), instance_id="noproof")
+        ),
+        encoding="utf-8",
+    )
+    reused = inst_dir / "reused.json"
+    reused.write_text(
+        json.dumps(
+            _registry_payload(inst_dir / "reused.sock", pid=os.getpid(),
+                              identity=_identity(ticks_delta=5), instance_id="reused")
+        ),
+        encoding="utf-8",
+    )
+    assert identity_verdict(json.loads(unprovable.read_text()), os.getpid()) == "unrecorded"
+    assert identity_verdict(json.loads(reused.read_text()), os.getpid()) == "mismatch"
+
+    assert list_instances() == []                       # neither is ever advertised
+    assert list_instances(include_unreachable=True) == []   # and neither is proven
+    assert transport.find_lifecycle_instance("noproof") is None
+    assert unprovable.exists()      # no evidence: refused, not destroyed
+    assert not reused.exists()      # pid reuse proven: swept
+
+
+def test_a_filename_mismatch_does_not_delete_a_live_bridges_record(tmp_path, monkeypatch):
+    """The DISAGREEMENT can be an artifact of our reading, not of the record.
+
+    On a case-insensitive filesystem ``Foo.json`` and ``foo.json`` are one
+    file, so the caller's spelling alone made a live bridge's own record read
+    as foreign -- and this arm deleted it, after which `instance gc` reaped the
+    live socket. The record is still refused (a payload claiming another
+    identity is never adopted, and its socket is never unlinked), but deleting
+    it needs the same positive evidence as every other arm.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock = inst_dir / "live.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    record = inst_dir / "Live.json"          # the caller's spelling
+    record.write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="live")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        assert list_instances() == []        # still refused: identities disagree
+        assert record.exists()               # and no longer deleted
+        assert sock.exists()                 # its socket was never ours to unlink
+
+        # Positive evidence still sweeps the same record.
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+        assert list_instances() == []
+        assert not record.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_an_unconfined_socket_keeps_an_unprovable_live_owners_record(tmp_path, monkeypatch):
