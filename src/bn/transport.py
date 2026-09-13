@@ -682,9 +682,9 @@ def _registry_own_id(registry_path: Path) -> str:
     -- the registry of the legal id ``...`` -- stems to the whole name. Read
     that way the record looks foreign and gets deleted while its bridge is
     still listening, and its leftovers reverse-map to no id and can never be
-    reaped. Three readers need this id (the loader, the reclaim, and the
-    orphan sweep), and a second spelling of the derivation is a second answer
-    waiting to disagree with the first.
+    reaped. Two readers need this id -- the loader and the orphan sweep -- and
+    a second spelling of the derivation is a second answer waiting to disagree
+    with the first.
     """
     return registry_path.name.removesuffix(".json")
 
@@ -947,23 +947,22 @@ def find_lifecycle_instance(
 def _path_is_absent(path: Path) -> bool:
     """Whether *path* PROVABLY names nothing, rather than merely not answering.
 
-    Two destructive routes read "there is no socket file" as evidence: the
-    reclaim of a kept record, and the loader arm that sweeps a dead owner's
-    registry. Both took that reading from ``Path.exists()``, which answers
-    ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and ``ESTALE`` exactly as it
-    does for ``ENOENT`` -- so one unreadable directory turned a probe that
-    could not be TAKEN into positive evidence, and a live owner's record and
-    log went with it. The question is about the NAME this record carries, so
-    what settles it is ``ENOENT``, ``ENOTDIR``, ``ENAMETOOLONG`` -- nothing is
-    reachable THROUGH that name, whatever the same inode may be reachable as
-    under a shorter one -- and a name the syscall layer cannot express at all,
-    which raises ``ValueError`` rather than ``OSError``: an embedded NUL, or a
-    surrogate outside the ``surrogateescape`` range. (A ``\\udc80``-``\\udcff``
-    surrogate is NOT one of those: it is how a raw byte survives a decode, and
-    ``os.fsencode`` turns it straight back into that byte, so such a path names
-    a real file and is stat'ed normally.) Every other error is the READER's
-    problem, not the path's, and answers ``False``, which costs a record that
-    is kept (#618).
+    The loader arm that sweeps a dead owner's registry reads "there is no
+    socket file" as evidence, and it took that reading from ``Path.exists()``,
+    which answers ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and ``ESTALE``
+    exactly as it does for ``ENOENT`` -- so one unreadable directory turned a
+    probe that could not be TAKEN into positive evidence, and a live owner's
+    record and log went with it. The question is about the NAME this record
+    carries, so what settles it is ``ENOENT``, ``ENOTDIR``, ``ENAMETOOLONG``
+    -- nothing is reachable THROUGH that name, whatever the same inode may be
+    reachable as under a shorter one -- and a name the syscall layer cannot
+    express at all, which raises ``ValueError`` rather than ``OSError``: an
+    embedded NUL, or a surrogate outside the ``surrogateescape`` range. (A
+    ``\\udc80``-``\\udcff`` surrogate is NOT one of those: it is how a raw byte
+    survives a decode, and ``os.fsencode`` turns it straight back into that
+    byte, so such a path names a real file and is stat'ed normally.) Every
+    other error is the READER's problem, not the path's, and answers
+    ``False``, which costs a record that is kept (#618).
     """
     try:
         path.stat()
@@ -974,116 +973,6 @@ def _path_is_absent(path: Path) -> bool:
     except ValueError:
         return True
     return False
-
-
-def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool:
-    """Whether the endpoint a kept record names can no longer serve anyone.
-
-    This is the fact that makes a RECORD reclaimable, and it is deliberately
-    weaker than the one that makes a socket FILE removable: the reclaim unlinks
-    only the record, and a record nobody can be served through is not a handle.
-    Requiring the socket's stronger fact instead kept a record forever wherever
-    the kernel could not be asked -- the same coupling ``_socket_probe`` exists
-    to break, left behind here (#618).
-
-    A path that does not exist is dead on every platform: a bound AF_UNIX
-    socket always has a directory entry. That absence has to be ESTABLISHED,
-    though, and ``Path.exists()`` cannot: it answers ``False`` for ``EACCES``,
-    ``EIO``, ``ELOOP`` and ``ESTALE`` exactly as it does for ``ENOENT``, so one
-    unreadable directory turned a probe that could not be TAKEN into positive
-    evidence and this reclaim took a live owner's record and log on it. The
-    same rule as everywhere else in this module: a failed probe is evidence
-    only when conclusive, and an unreadable name is not conclusive, so the
-    record is kept.
-
-    Otherwise the question is who may be ASKED. Inside the cache a connect
-    probe is exactly what discovery already does, and ``nothing_accepting``
-    answers it -- a serving bridge accepts, or answers ``EAGAIN`` with a full
-    backlog, and either one keeps the record. Outside the cache this code
-    refuses to connect at all, so it falls back to READING the kernel's list of
-    bound paths, which requires no action on a path we did not create.
-
-    That fallback being the STRICTER of the two is the point, not an accident.
-    ``_socket_path_is_confined`` can read False for reasons that are about the
-    reader rather than the record -- it fails closed on an ``OSError`` from
-    ``resolve()`` and it does not case-fold -- and an earlier version of this
-    reclaim treated that absence as licence to skip the endpoint check
-    entirely, which destroyed a LIVE serving bridge's record and log on one
-    transient resolution failure. An absence of evidence must lower the chance
-    of destruction, never raise it: the cost of misreading confinement is now a
-    record that is kept.
-    """
-    if _path_is_absent(socket_path):
-        return True
-    if _socket_path_is_confined(socket_path):
-        return _socket_probe(socket_path, timeout=timeout).nothing_accepting
-    return _path_has_bound_socket(socket_path) is False
-
-
-def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path]) -> bool:
-    """Remove a KEPT record that no discovery path can turn into a handle.
-
-    Retention is the other half of "destruction requires positive evidence",
-    and it had nobody paying its bill: a record whose owner is alive but proves
-    nothing is refused on every path and deleted on none, and because a
-    surviving registry marks its id live, ``gc_instances`` spared its ``.log``
-    and ``.sock`` as well. Nothing in the product reclaimed it -- the recovery
-    that argument assumed, a later spawn under the same id overwriting the
-    record, cannot happen for an auto-generated id, which is
-    ``secrets.token_hex(4)`` -- so the files were permanent while
-    ``list_instances()`` did not even show them. A destruction bug had become
-    an unbounded-litter bug (#618).
-
-    So this reclaim carries positive evidence of its own. It is evidence about
-    the FILE, not about the owner, because the owner is precisely what cannot
-    be judged here:
-
-    * discovery resolves this record for NOTHING -- not for dispatch, not for
-      the lifecycle lookup behind ``bn session stop``, not for spawn collision
-      detection. ``resolvable`` is that measurement, taken by the caller from
-      ``list_instances(include_unreachable=True)``, and membership is checked
-      here rather than assumed, so a record that IS somebody's handle can never
-      reach the unlink below; and
-    * the endpoint it names can no longer serve anyone, established the way
-      ``_record_endpoint_is_dead`` explains: a name that does not exist, a
-      conclusive refusal from a socket inside the cache, or -- for a path
-      outside it, which this code will not connect to -- the kernel's own list
-      of bound paths not holding it. What this deliberately does NOT ask is
-      whether anything is bound to a socket the loader has already refused to
-      use: one permanently-bound foreign socket could otherwise pin
-      unboundedly many records and their logs. The foreign path is never
-      connected to and never unlinked.
-
-    Both checks are taken inside this call rather than trusted from the
-    caller, which is also what bounds the window: ``resolvable`` was measured
-    before it, and a record that became somebody's handle since then either
-    answers the endpoint probe (a bridge that has reached ``listen`` accepts)
-    or has different bytes on disk (the writer registers through
-    ``os.replace``), and either one alone refuses the unlink. A bridge that
-    has bound but not yet registered is the one case where the OLD record here
-    still goes: it is not that bridge's record, that bridge writes its own,
-    and its socket is never touched by this function.
-
-    A record this function cannot interpret is left alone: that retention
-    predates this module's destruction rule, is not part of it, and is pinned
-    by its own test.
-    """
-    if registry_path in resolvable:
-        return False
-    try:
-        document = registry_path.read_bytes()
-        payload = json.loads(document.decode("utf-8"))
-        raw_socket_path = payload["socket_path"]
-        raw_pid = payload["pid"]
-    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return False
-    if not _registry_fields_are_well_formed(raw_socket_path, raw_pid,
-                                            payload.get("instance_id")):
-        return False
-    socket_path = _record_socket_path(registry_path, raw_socket_path)
-    if not _record_endpoint_is_dead(socket_path):
-        return False
-    return _unlink_if_unchanged(registry_path, document)
 
 
 def gc_instances() -> dict[str, Any]:
@@ -1097,15 +986,24 @@ def gc_instances() -> dict[str, Any]:
     every instance that no longer has a live registry, leaving live instances
     and the shared spawn lock untouched.
 
-    It is also the one reclaim path for the records discovery deliberately
-    KEEPS: a record nothing can judge is never purged lazily, and holding its
-    registry held its ``.log`` and ``.sock`` here too. This is where such a
-    record goes, on evidence of its own -- see ``_reclaim_unusable_registry``.
+    What it deliberately does NOT do is remove a registry discovery chose to
+    keep. Every destructive arm in this module demands positive evidence that
+    the thing it destroys is litter, and a record whose owner pid is alive but
+    cannot be proven to BE this bridge -- a pre-#694 bridge, any bridge on a
+    platform with no ``/proc``, or a recycled pid -- is refused on every path
+    and judged litter on none. This call has no evidence the loader lacks, and
+    every version that manufactured some destroyed a live bridge's handle in
+    one narrowing or another. So such a record, and the ``.log`` its surviving
+    registry shields here, are RETAINED; the residual that costs is measured
+    and disclosed in the PR body, and pinned by
+    ``test_gc_retains_the_record_discovery_cannot_judge``. Retention is
+    recoverable, a destroyed handle is not (#618).
 
     Returns a summary: ``live_instances``, ``registries_purged`` (dead
-    registries the liveness sweep removed, plus the kept-but-unusable ones
-    reclaimed here), ``logs_removed``, ``sockets_removed``, and ``removed``
-    (the list of removed paths).
+    registries the liveness sweep removed), ``logs_removed``,
+    ``sockets_removed``, and ``removed`` (the list of removed paths, the
+    purged registries included -- reporting those as a count alone hid a
+    destructive action behind a number).
     """
     inst_dir = instances_dir()
     summary: dict[str, Any] = {
@@ -1127,25 +1025,18 @@ def gc_instances() -> dict[str, Any]:
         # Triggers the lazy liveness sweep: dead registries + their sockets are
         # unlinked as a side effect, leaving only live registries behind.
         summary["live_instances"] = len(list_instances())
-        # What survived that sweep is not all live. Discovery keeps every record
-        # it cannot judge, and resolves only some of what it keeps; one it
-        # resolves for nothing is a handle to nothing, and its registry was
-        # keeping this sweep off its .log and .sock. Reclaim those here, where
-        # the spawn lock is held and the operator asked for it, and never on the
-        # refusal alone (#618).
-        resolvable = frozenset(
-            inst.registry_path for inst in list_instances(include_unreachable=True)
-        )
-        for registry in sorted(inst_dir.glob("*.json")):
-            _reclaim_unusable_registry(registry, resolvable)
         registries_after = set(inst_dir.glob("*.json"))
-        # ``removed`` is the only per-path account of this call, so a registry
-        # that went -- whether the liveness sweep took it or the reclaim above
-        # did -- is named here too. Reporting it as a count alone hid the
-        # newest destructive action behind a number (#618).
+        # ``removed`` is documented as the list of removed paths and is the only
+        # per-path account this call gives, so the registries the liveness sweep
+        # took are named here, not merely counted (#618).
         purged_registries = sorted(registries_before - registries_after)
         summary["registries_purged"] = len(purged_registries)
         summary["removed"].extend(str(p) for p in purged_registries)
+        # Same derivation the loader uses, for the same reason: ``Path.stem``
+        # and ``Path.suffix`` read a leading dot run as part of the name, so a
+        # legal all-dot id (``...`` -> ``....json`` / ``....sock``) reverse-maps
+        # to nothing and its leftovers could never be reaped. One id per
+        # filename, derived one way, on both sides of this sweep.
         live_ids = {_registry_own_id(p) for p in registries_after}
         for entry in sorted(inst_dir.iterdir()):
             # Never touch the shared spawn lock or any surviving (live) registry.

@@ -4305,6 +4305,8 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
         ),
         encoding="utf-8",
     )
+    live_log = inst_dir / "....log"               # the live instance's OWN log
+    live_log.write_text("bridge output\n", encoding="utf-8")
     orphan_sock = inst_dir / ".....sock"          # id '....', no registry
     orphan_log = inst_dir / ".....log"
     orphan_sock.write_text("", encoding="utf-8")
@@ -4323,6 +4325,14 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
     assert live_socket_survived                   # never reaped out from under
     assert str(live_sock) not in summary["removed"]
     assert bridge_registry_path("...").exists()
+    # The live instance's LOG is the half of the reverse map with no second
+    # guard behind it: the socket is additionally spared by the kernel-proof
+    # check in the sweep, so a wrong id derivation costs the log first and
+    # silently. Reverting `_registry_own_id` to `Path.stem` leaves every other
+    # assertion here green while this one goes red (#618).
+    assert live_log.exists()
+    assert live_log.read_text(encoding="utf-8") == "bridge output\n"
+    assert str(live_log) not in summary["removed"]
     assert not orphan_sock.exists()
     assert not orphan_log.exists()
 
@@ -4576,102 +4586,6 @@ def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkey
         sock_path.unlink(missing_ok=True)
 
 
-def test_gc_reclaims_a_kept_record_that_no_discovery_path_can_use(tmp_path, monkeypatch):
-    """Retention must not be permanent: something has to reclaim it.
-
-    Every destructive arm in discovery now demands positive evidence, so a
-    record nothing can judge is KEPT -- and a surviving registry marks its id
-    live, so ``gc_instances`` spared its ``.log`` too. The result was litter no
-    command could reclaim and ``list_instances()`` would not even show: the
-    disclosed recovery ("the next spawn under that id") cannot happen for an
-    auto-generated id, which is ``secrets.token_hex(4)``. ``instance gc`` is the
-    explicit, spawn-lock-holding reclaim path, and this is exactly the litter it
-    exists for (#618).
-    """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    # Five crashed bridges whose pids were recycled: each record is well formed,
-    # its pid is ALIVE (this process), its socket is gone, and nothing in it
-    # proves whose pid that is -- the shape EVERY record has on a platform with
-    # no /proc, and the shape a pre-#694 record has everywhere.
-    for index in range(5):
-        sid = f"gone{index}"
-        (inst_dir / f"{sid}.json").write_text(
-            json.dumps(_registry_payload(inst_dir / f"{sid}.sock",
-                                         pid=os.getpid(), instance_id=sid)),
-            encoding="utf-8",
-        )
-        (inst_dir / f"{sid}.log").write_text("bridge starting\n", encoding="utf-8")
-
-    assert list_instances() == []                            # invisible to the operator
-    assert list_instances(include_unreachable=True) == []    # and to lifecycle lookups
-
-    summary = gc_instances()
-
-    assert summary["registries_purged"] == 5
-    assert summary["logs_removed"] == 5
-    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
-
-
-def test_gc_keeps_a_kept_record_whose_endpoint_is_still_serving(tmp_path, monkeypatch):
-    """The reclaim needs its own positive evidence, and this is that evidence.
-
-    Reclaiming a record because discovery refuses it would be the same mistake
-    one level up: refusal is not proof there is nothing there. The record goes
-    only when the endpoint it names can no longer serve anyone -- so a socket
-    that ACCEPTS keeps its record, and so does one whose accept backlog is full,
-    because ``EAGAIN`` proves nothing either way.
-
-    A socket that is bound but has not reached ``listen`` is the opposite case
-    and it is deliberate: nobody can be served there, so the unresolvable
-    record goes, while the ENDPOINT -- the part nothing can recreate -- stays,
-    because the kernel says something holds that name.
-    """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    sock_path = inst_dir / "starting.sock"
-    starting = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    starting.bind(str(sock_path))              # bound, and deliberately not listening
-    record = inst_dir / "starting.json"
-    # The filename disagrees with the payload's id, so discovery refuses this
-    # record on every path; its owner is alive and proves nothing, so the
-    # liveness sweep keeps it. Unresolvable, kept -- the reclaim's own subject.
-    payload = json.dumps(
-        _registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")
-    )
-    record.write_text(payload, encoding="utf-8")
-    try:
-        assert list_instances(include_unreachable=True) == []
-
-        summary = gc_instances()
-
-        assert not record.exists()             # nobody can be served through it
-        assert sock_path.exists()              # but the endpoint is still held
-        assert summary["sockets_removed"] == 0
-        starting.listen(1)                     # the bridge finishes coming up
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(0.5)
-        try:
-            client.connect(str(sock_path))     # and is reachable by name
-        finally:
-            client.close()
-
-        # Now something IS serving there, and the same record is kept.
-        record.write_text(payload, encoding="utf-8")
-        summary = gc_instances()
-
-        assert record.exists()
-        assert sock_path.exists()
-        assert summary["registries_purged"] == 0
-        assert summary["sockets_removed"] == 0
-    finally:
-        with contextlib.suppress(OSError):
-            starting.close()
-        sock_path.unlink(missing_ok=True)
-
-
 def test_gc_never_unlinks_an_orphan_socket_the_kernel_says_is_bound(tmp_path, monkeypatch):
     """A registry-less socket is not evidence of a dead instance.
 
@@ -4705,14 +4619,15 @@ def test_gc_never_unlinks_an_orphan_socket_the_kernel_says_is_bound(tmp_path, mo
 
 
 def test_gc_keeps_the_unreachable_handle_a_lifecycle_lookup_resolves(tmp_path, monkeypatch):
-    """"Nothing is bound to it" is not enough; something may still need it.
+    """The residual's visibility, and the handle gc must never take.
 
     A record whose socket is gone but whose owner is PROVEN is the one thing
     ``bn session stop`` must still be able to name -- that unreachable process
-    is exactly the one a user needs to kill (#694) -- and its socket is absent,
-    which is precisely what the reclaim reads as "no endpoint". So the reclaim
-    asks discovery what it resolves before it destroys anything, and this is
-    the record that makes the difference observable.
+    is exactly the one a user needs to kill (#694). From the outside it is
+    also indistinguishable from litter: nothing is bound to its socket and
+    nothing ever will be. So ``gc_instances`` retains it, and it stays
+    nameable afterwards, which is what makes this corner of the disclosed
+    retention recoverable rather than invisible.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -4789,17 +4704,22 @@ def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp
     assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock", "crashed.sock"]
 
 
-def test_a_record_naming_a_dead_foreign_socket_is_reclaimed_without_touching_it(tmp_path, monkeypatch):
-    """A path this code will not connect to is still one the kernel can report.
+def test_gc_retains_the_record_discovery_cannot_judge(tmp_path, monkeypatch):
+    """The disclosed residual, pinned as retention rather than as a deletion.
 
-    A record whose ``socket_path`` is outside the cache is one discovery has
-    already refused to connect to, so the endpoint question is answered by
-    READING the kernel's list of bound paths instead of probing -- no action on
-    a path we did not create, and no unlink of it either. Nothing bound there
-    means the record can never be a handle, and the record is the only thing
-    removed. (A foreign socket that IS bound keeps these records instead; that
-    retention is the disclosed price of never letting a confinement misread
-    authorise a deletion.)
+    A record whose owner pid is alive but cannot be proven to BE this bridge
+    -- a pre-#694 bridge, any bridge on a platform with no ``/proc``, or a
+    recycled pid -- is refused by every discovery path and judged litter by
+    none. ``gc_instances`` is no exception to that rule: the evidence it would
+    need to delete such a record is exactly the evidence nobody here has, and
+    every version that manufactured some destroyed a live bridge's handle in
+    one narrowing or another. The record stays, and the ``.log`` its surviving
+    registry shields stays with it -- a measured, disclosed residual instead
+    of a deletion taken on an inference (#618).
+
+    Both shapes that reach this state are pinned: a ``socket_path`` outside
+    the cache, which this code never connects to and must never unlink, and a
+    confined socket that is simply gone.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     inst_dir = instances_dir()
@@ -4810,41 +4730,55 @@ def test_a_record_naming_a_dead_foreign_socket_is_reclaimed_without_touching_it(
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale.bind(str(foreign))
     stale.close()                          # a socket FILE nothing is bound to
+    expected = {".spawn.lock"}
     for index in range(3):
-        sid = f"pinned{index}"
+        sid = f"unconfined{index}"
         (inst_dir / f"{sid}.json").write_text(
             json.dumps(_registry_payload(foreign, pid=os.getpid(), instance_id=sid)),
             encoding="utf-8",
         )
         (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+        expected |= {f"{sid}.json", f"{sid}.log"}
+    # The other shape: confined, and the socket file is gone.
+    (inst_dir / "nosocket.json").write_text(
+        json.dumps(_registry_payload(inst_dir / "nosocket.sock", pid=os.getpid(),
+                                     instance_id="nosocket")),
+        encoding="utf-8",
+    )
+    (inst_dir / "nosocket.log").write_text("x\n", encoding="utf-8")
+    expected |= {"nosocket.json", "nosocket.log"}
 
     # Unresolvable on every path: normal discovery and the lifecycle lookup
-    # both refuse an unconfined record whose owner proves nothing.
+    # both refuse a record whose owner proves nothing.
     assert list_instances() == []
     assert list_instances(include_unreachable=True) == []
 
     summary = gc_instances()
 
-    assert summary["registries_purged"] == 3
-    assert summary["logs_removed"] == 3
-    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+    assert summary["registries_purged"] == 0
+    assert summary["logs_removed"] == 0
+    assert summary["sockets_removed"] == 0
+    assert summary["removed"] == []
+    assert {p.name for p in inst_dir.iterdir()} == expected
     assert foreign.exists()                # the foreign path is never unlinked
 
 
-def test_gc_names_every_path_it_removed_including_the_records(tmp_path, monkeypatch):
+def test_gc_names_every_path_it_removed_including_the_registries(tmp_path, monkeypatch):
     """A destructive action has to be visible in its own report.
 
     ``removed`` is documented as the list of removed paths and is the only
-    per-path account the operator gets, so a reclaim that shows up in
-    ``registries_purged`` but not in ``removed`` hides the newest destructive
-    action behind a count.
+    per-path account the operator gets, so a registry the liveness sweep took
+    during this very call has to be named there rather than merely counted in
+    ``registries_purged``.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()                            # a pid that is provably not alive
     record = inst_dir / "gone.json"
     record.write_text(
-        json.dumps(_registry_payload(inst_dir / "gone.sock", pid=os.getpid(),
+        json.dumps(_registry_payload(inst_dir / "gone.sock", pid=gone.pid,
                                      instance_id="gone")),
         encoding="utf-8",
     )
@@ -4858,106 +4792,6 @@ def test_gc_names_every_path_it_removed_including_the_records(tmp_path, monkeypa
     assert str(log) in summary["removed"]
     assert len(summary["removed"]) == summary["registries_purged"] + summary["logs_removed"] \
         + summary["sockets_removed"]
-
-
-def test_the_reclaim_needs_a_dead_endpoint_not_an_unbound_one(tmp_path, monkeypatch):
-    """The record's reclaim must not wait on the socket's stronger fact either.
-
-    A record nobody can be served through is not a handle, whatever holds the
-    name. Asking for the socket's fact instead -- that the KERNEL says nothing
-    is bound -- makes the answer unobtainable wherever ``/proc/net/unix``
-    cannot be read, so the record, its log and its socket were retained there
-    permanently and invisibly, where base reclaimed all three. That is the
-    coupling ``_socket_probe`` was split to break, and it survived in the
-    reclaim one round longer than it should have (#618).
-    """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    sock_path = inst_dir / "mismatch.sock"
-    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    leftover.bind(str(sock_path))
-    leftover.close()                       # a crashed bridge's leftover socket file
-    record = inst_dir / "mismatch.json"
-    # The filename disagrees with the payload id, so discovery refuses this
-    # record on every path; its owner is alive and proves nothing, so nothing
-    # judges it litter either. Unresolvable, kept -- and the reclaim is the
-    # only thing that can ever remove it.
-    record.write_text(
-        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")),
-        encoding="utf-8",
-    )
-    (inst_dir / "mismatch.log").write_text("x\n", encoding="utf-8")
-    # No /proc/net/unix: the kernel cannot be asked whether anything is bound.
-    monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
-
-    assert list_instances() == []
-    assert list_instances(include_unreachable=True) == []
-
-    summary = gc_instances()
-
-    assert summary["registries_purged"] == 1
-    assert summary["logs_removed"] == 1
-    # The socket file outlives them where the kernel cannot be asked: the
-    # record's reclaim no longer waits on the socket's fact, and the socket's
-    # unlink still demands it.
-    assert summary["sockets_removed"] == 0
-    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock", "mismatch.sock"]
-
-
-def test_a_misread_confinement_keeps_a_serving_bridges_record(tmp_path, monkeypatch):
-    """"Not proven confined" is a fact about the reader, not about the record.
-
-    ``_socket_path_is_confined`` fails closed on an ``OSError`` from
-    ``resolve()`` and does not case-fold, so it can answer False about a socket
-    that really is in the cache -- and on a case-insensitive filesystem it does
-    so for every bridge. An earlier reclaim treated that as licence to skip the
-    endpoint check, and one transient misread then cost a LIVE, serving bridge
-    its record and log. The cost of not knowing must be a file that is kept
-    (#618).
-    """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    sock_path = inst_dir / "serving.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(sock_path))
-    server.listen(1)                       # bound, listening, and serving
-    record = inst_dir / "serving.json"
-    record.write_text(
-        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="serving")),
-        encoding="utf-8",
-    )
-    log = inst_dir / "serving.log"
-    log.write_text("serving\n", encoding="utf-8")
-    # The reader misreads its own cache: every path reads as unconfined, which
-    # is also what a case-insensitive filesystem does to every bridge.
-    monkeypatch.setattr("bn.transport._socket_path_is_confined", lambda path: False)
-    try:
-        # Unresolvable: the unconfined arm refuses a record whose owner proves
-        # nothing, which is exactly the state the reclaim acts on.
-        assert list_instances(include_unreachable=True) == []
-
-        for no_proc_net in (False, True):
-            if no_proc_net:
-                monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
-            summary = gc_instances()
-
-            assert summary["registries_purged"] == 0
-            assert summary["logs_removed"] == 0
-            assert summary["sockets_removed"] == 0
-            assert record.exists() and log.exists() and sock_path.exists()
-
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(0.5)
-        try:
-            client.connect(str(sock_path))  # still reachable by name
-        finally:
-            client.close()
-    finally:
-        with contextlib.suppress(OSError):
-            server.close()
-        sock_path.unlink(missing_ok=True)
 
 
 def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path, monkeypatch):
@@ -5004,40 +4838,6 @@ def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path
             with contextlib.suppress(OSError):
                 server.close()
             sock_path.unlink(missing_ok=True)
-
-
-def test_the_reclaim_keeps_a_record_whose_fields_fail_validation(tmp_path, monkeypatch):
-    """The exemption's SAFE direction, pinned -- not just its presence.
-
-    ``_reclaim_unusable_registry`` runs every candidate through the same
-    type-strict validator the loader uses, and until this test nothing pinned
-    what happens when it FIRES: removing the call left the suite green while
-    ``gc_instances`` both raised on a non-``str`` ``socket_path`` and deleted
-    records the loader deliberately keeps. A property that proves a guard
-    EXISTS says nothing about what it does when it fires the other way (#618).
-    """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    records = {
-        "wrongtype": {"pid": 4321, "socket_path": {"not": "a string"}, "instance_id": "wrongtype"},
-        "badpid": {"pid": "nope", "socket_path": str(inst_dir / "badpid.sock"),
-                   "instance_id": "badpid"},
-        "badid": {"pid": 4321, "socket_path": str(inst_dir / "badid.sock"),
-                  "instance_id": "../escape"},
-    }
-    for sid, payload in records.items():
-        (inst_dir / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
-        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
-
-    summary = gc_instances()               # must not raise, and must not delete
-
-    assert summary["registries_purged"] == 0
-    assert summary["logs_removed"] == 0
-    assert sorted(p.name for p in inst_dir.iterdir() if p.name != ".spawn.lock") == [
-        "badid.json", "badid.log", "badpid.json", "badpid.log",
-        "wrongtype.json", "wrongtype.log",
-    ]
 
 
 def test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage(tmp_path, monkeypatch):
@@ -5419,84 +5219,6 @@ def test_an_at_prefixed_row_is_unknowable_because_the_listing_conflates_two_thin
         live.unlink(missing_ok=True)
 
 
-def test_a_probe_that_could_not_be_taken_is_not_proof_the_endpoint_is_dead(tmp_path):
-    """``exists()`` swallows EVERY error, and this predicate destroys on it.
-
-    ``_record_endpoint_is_dead`` gates the reclaim of a KEPT record -- the one
-    destructive path for a record whose owner is alive and proves nothing --
-    and it read a missing name as "nobody can ever be served here". But
-    ``Path.exists()`` answers ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and
-    ``ESTALE`` exactly as it does for ``ENOENT``, so one unreadable directory
-    turned a probe that could not be TAKEN into positive evidence and took a
-    live owner's record and log. This module's own rule is that a failed probe
-    is evidence only when CONCLUSIVE; an unreadable path is not conclusive, so
-    the record is kept.
-
-    Both directions, because "keep everything" would be its own defect: a name
-    that genuinely does not exist is still conclusive, and the record is still
-    reclaimed (#618).
-    """
-    if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
-    from bn.transport import _record_endpoint_is_dead
-
-    unreadable = tmp_path / "unreadable"
-    unreadable.mkdir()
-    blocked = unreadable / "live.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(blocked))
-    server.listen(1)
-    unreadable.chmod(0o000)
-    try:
-        assert _record_endpoint_is_dead(blocked) is False        # unknowable, so kept
-    finally:
-        unreadable.chmod(0o700)
-        with contextlib.suppress(OSError):
-            server.close()
-        blocked.unlink(missing_ok=True)
-
-    assert _record_endpoint_is_dead(tmp_path / "never-existed.sock") is True
-
-
-def test_gc_keeps_a_live_owners_record_when_the_socket_cannot_be_probed(tmp_path, monkeypatch):
-    """The consumer-side proof of the predicate above: nothing is destroyed.
-
-    A live owner that proves nothing is the class ``instance gc`` reclaims, and
-    that reclaim is allowed only on positive evidence about the FILE. An
-    unreadable directory is not that evidence -- it is the absence of a
-    reading -- and taking the record plus the log on it is the sixteen-member
-    defect class in its original form: destroying on an absence (#618).
-    """
-    if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    unreadable = inst_dir / "unreadable"
-    unreadable.mkdir()
-    sock_path = unreadable / "kept.sock"
-    record = inst_dir / "kept.json"
-    record.write_text(
-        json.dumps({"pid": owner.pid, "socket_path": str(sock_path),
-                    "instance_id": "kept"}),
-        encoding="utf-8",
-    )
-    log = inst_dir / "kept.log"
-    log.write_text("output worth keeping\n", encoding="utf-8")
-    unreadable.chmod(0o000)
-    try:
-        summary = gc_instances()
-
-        assert summary["registries_purged"] == 0
-        assert summary["logs_removed"] == 0
-        assert record.exists() and log.exists()
-    finally:
-        unreadable.chmod(0o700)
-        owner.kill()
-        owner.wait()
-
-
 def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, monkeypatch):
     """The same conflation, one screen away, in the loader's own arm.
 
@@ -5683,12 +5405,12 @@ def test_a_socket_path_the_syscall_layer_cannot_express_does_not_crash_gc(tmp_pa
     that took ``gc_instances()`` down for every other instance on the host,
     which is the availability class this PR exists to close. Such a name
     resolves to nothing, and it is conclusively absent rather than merely
-    unanswered, so both records go -- by the two different routes this module
-    keeps apart. A DEAD owner's record is litter and the next discovery sweeps
-    it. A LIVE owner's record is not litter, is refused by every caller, and
-    is reclaimed by `instance gc` on evidence about the FILE, with its log.
-    Both routes are asserted here, because an earlier version of this docstring
-    claimed they differed in outcome and neither was pinned (#618).
+    unanswered. What each record's OWNER is doing then decides its fate, by
+    the two routes this module keeps apart: a DEAD owner's record is litter
+    and the next discovery sweeps it, while a LIVE owner's record is refused
+    by every caller and destroyed by nobody -- the disclosed retention, whose
+    log gc leaves alone with it. Both routes are asserted here, because an
+    earlier version of this docstring claimed an outcome neither pinned (#618).
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -5708,16 +5430,18 @@ def test_a_socket_path_the_syscall_layer_cannot_express_does_not_crash_gc(tmp_pa
 
         # The dead owner's record is litter: that discovery already swept it.
         assert not (inst_dir / "gone.json").exists()
-        # The live owner's is kept by discovery and reclaimed by gc instead.
+        # The live owner's is kept by discovery, and gc keeps it too.
         assert (inst_dir / "alive.json").exists()
 
         summary = gc_instances()                                # must not raise
 
         assert summary["live_instances"] == 0
-        assert summary["registries_purged"] == 1
-        assert summary["logs_removed"] == 2
+        assert summary["registries_purged"] == 0
+        # ``gone.log`` outlived its registry and goes; the retained record's
+        # log is shielded by the registry gc refuses to delete.
+        assert summary["logs_removed"] == 1
         assert sorted(p.name for p in inst_dir.iterdir()
-                      if p.name != ".spawn.lock") == []
+                      if p.name != ".spawn.lock") == ["alive.json", "alive.log"]
     finally:
         owner.kill()
         owner.wait()
