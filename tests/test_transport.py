@@ -4341,7 +4341,7 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
 # UNPINNED GUARD, DISCLOSED — the `expected_record=record_document` WIRING.
 #
 # Read this before editing the two tests below, and before touching
-# `_load_instance`'s three `_purge_stale_registry(..., expected_record=...)`
+# `_load_instance`'s FOUR `_purge_stale_registry(..., expected_record=...)`
 # callsites in src/bn/transport.py. It is a coverage gap, not coverage.
 #
 # What IS pinned: the SWEEP's own rule. `_purge_stale_registry` refuses to
@@ -4353,9 +4353,10 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
 # Replacing `expected_record=record_document` with a callsite
 # `path.read_bytes()` -- a plausible refactor, since the comment at that read
 # says the record is re-read as late as possible -- leaves all three fenced
-# test files GREEN at the dead-socket arm, the foreign-id arm and the
-# unconfined/missing-socket arm. The test below survives that mutation
-# because it stages its respawn INSIDE a monkeypatched
+# test files GREEN at every one of the four: the foreign-id arm, the
+# unconfined arm, the missing-socket arm and the dead-socket arm, each
+# measured individually as well as together. The test below survives that
+# mutation because it stages its respawn INSIDE a monkeypatched
 # `_purge_stale_registry`, i.e. after the mutated read has already happened,
 # so only the innermost boundary is held -- not the loader's whole decision
 # window, which opens at the `path.read_bytes()` on entry.
