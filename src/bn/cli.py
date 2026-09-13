@@ -1071,7 +1071,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    result = response.get("result") if isinstance(response, dict) else None
+    result = _unwrap_result(response, "list_targets")
     if not isinstance(result, list):
         raise BridgeError(
             "malformed bridge reply to list_targets (no target list); the "

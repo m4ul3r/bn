@@ -849,34 +849,66 @@ class TestSessionStartTimeoutDiagnostics:
         green -- the shape #718 was filed against. The first cut of this
         property named ONE class and matched one call shape, so a second
         cross-arch class, or a start routed through a module-level helper, both
-        escaped it.
+        escaped it. The second recognised a lane only by a toolchain name in a
+        DIRECT positional argument -- so a lane whose name sits in a list
+        literal (this module's dominant idiom, `subprocess.run([...])`) or in a
+        module-level constant was not a lane at all, and ran on the general
+        budget with all five #718 guards green.
 
-        So: the population is every class that CROSS-COMPILES (what makes a
-        start slow is the cross-built probe, not the class's name), the call
-        shape is any expression naming `_session_start`, and reachability
-        follows module-level helpers the class calls.
+        So: the population is every class that CROSS-COMPILES, recognised from
+        any string constant it reaches -- wherever it sits in the expression,
+        and through the module-level constants and helpers the class names --
+        the call shape is any expression naming `_session_start`, and
+        reachability follows module-level helpers the class calls.
         """
         import ast
 
         tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         helpers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-
-        def cross_compiles(node: ast.AST) -> bool:
-            """Does this class reach for a cross toolchain? That -- not the class
-            name -- is what makes its `session start` slow enough to need the
-            bigger budget."""
-            return any(isinstance(argument, ast.Constant)
-                       and isinstance(argument.value, str) and "-linux-gnu-" in argument.value
-                       for call in ast.walk(node) if isinstance(call, ast.Call)
-                       for argument in call.args)
-
-        lanes = [node for node in tree.body
-                 if isinstance(node, ast.ClassDef) and cross_compiles(node)]
-        assert lanes, "no cross-compiling lane class found; update this guard"
+        CROSS_TOOLCHAIN = "-linux-gnu-"
 
         def names_of(call: ast.Call) -> set[str]:
             return ({name.id for name in ast.walk(call.func) if isinstance(name, ast.Name)}
                     | {attr.attr for attr in ast.walk(call.func) if isinstance(attr, ast.Attribute)})
+
+        # Module-level names whose VALUE carries a cross toolchain, so hoisting
+        # the triple out of the class does not hide the lane.
+        cross_named = {
+            target.id
+            for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+            if node.value is not None and CROSS_TOOLCHAIN in ast.unparse(node.value)
+        }
+
+        def cross_compiles(node: ast.AST, seen: frozenset[str] = frozenset()) -> bool:
+            """Does this class INVOKE a cross toolchain? That -- not the class
+            name, and not where in the argument expression the name happens to
+            sit -- is what makes its `session start` slow enough to need the
+            bigger budget.
+
+            The toolchain has to reach a CALL's arguments, at any depth, so a
+            name inside `subprocess.run([...])`'s list literal counts and this
+            guard's own mention of the marker does not.
+            """
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                for argument in [*call.args, *(keyword.value for keyword in call.keywords)]:
+                    for child in ast.walk(argument):
+                        if (isinstance(child, ast.Constant) and isinstance(child.value, str)
+                                and CROSS_TOOLCHAIN in child.value):
+                            return True
+                        if isinstance(child, ast.Name) and child.id in cross_named:
+                            return True
+                for name in (names_of(call) & set(helpers)) - seen:
+                    if cross_compiles(helpers[name], seen | {name}):
+                        return True
+            return False
+
+        lanes = [node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and cross_compiles(node)]
+        assert lanes, "no cross-compiling lane class found; update this guard"
 
         def unbudgeted(node: ast.AST, seen: frozenset[str]) -> list[str]:
             found: list[str] = []

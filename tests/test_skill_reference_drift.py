@@ -57,6 +57,33 @@ REQUIRED_INDEX_GROUPS = {
     "go": ("Read", "Mutate"),
 }
 
+# Commands deliberately NOT advertised in the Command index. This is the
+# complement of the population below: every registered command path must appear
+# in the index unless it is named here, so a new command is a documentation
+# failure until someone classifies it. The previous cut listed the six groups
+# the bug report happened to name, which is fail-OPEN -- deleting the index
+# entries for `evidence`, `trace` and `class` left every doc test green.
+#
+# Each name is asserted live below, so an exemption cannot outlive a rename.
+INDEX_EXEMPT_COMMANDS = frozenset({
+    # Sticky per-repo pins. Advertising these to an agent is actively harmful:
+    # they are one shared file and clobber a concurrent session.
+    "instance use", "instance clear", "target use", "target clear",
+    # Session/instance plumbing an agent reaches through `session start/list/stop`
+    # and `target info/list`, which ARE advertised.
+    "instance list", "instance find", "instance gc",
+    "session restart", "session status", "target close",
+    # Host-side tooling, not analysis surface.
+    "doctor", "help", "plugin install", "skill install",
+    # Group-level entries already advertise the only subcommand.
+    "exports list", "rename",
+    # Deeper read surface the index reaches through its group entry; each is
+    # catalogued in the reference the group's line points at.
+    "data retype", "data symbols", "data vars",
+    "evidence calls", "evidence orient", "evidence surface", "evidence virtual-call",
+    "function cfg", "function structured-il",
+})
+
 
 @pytest.fixture(scope="module")
 def stub_engine():
@@ -118,6 +145,14 @@ TESTS = Path(__file__).resolve().parent
 # first only `setdefault`, then only `sys.modules` spelled literally, while
 # `m = sys.modules; m[name] = stub`, `from sys import modules`,
 # `vars(sys)["modules"]` and `getattr(sys, "modules")` all reach the same dict.
+# Round 7 escaped it twice more: `sys.__dict__["modules"][k] = v` was a route
+# the scan did not know, and `sys.modules |= {...}` writes the mapping WHOLE
+# rather than a subscript of it, which the write side did not look for.
+#
+# So the route test accepts any `[...]["modules"]` lookup (a namespace dict by
+# any spelling), and the write test accepts the mapping itself as a target, not
+# only a subscript of it.
+#
 # `monkeypatch.setitem(sys.modules, ...)` and `MonkeyPatch.context()` pass the
 # mapping as an ARGUMENT and put it back, so they are not writes ON it and are
 # correctly invisible here.
@@ -154,10 +189,13 @@ def _is_modules_mapping(node: ast.expr, aliases: frozenset[str] | set[str] = fro
         return True                                   # sys.modules, s.modules
     if isinstance(node, ast.Name) and node.id in aliases:
         return True                                   # m = sys.modules
-    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name) and node.value.func.id == "vars"
+    if (isinstance(node, ast.Subscript)
             and isinstance(node.slice, ast.Constant) and node.slice.value == "modules"):
-        return True                                   # vars(sys)["modules"]
+        # vars(sys)["modules"], sys.__dict__["modules"], globals-style lookups:
+        # a namespace dict by any spelling. Naming the spellings one at a time
+        # is what let `sys.__dict__` through, and nothing under tests/ indexes
+        # anything else by "modules".
+        return True
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "getattr" and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
@@ -178,7 +216,14 @@ def _unrestored_sys_modules_writes(path: Path) -> list[str]:
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
             targets = [node.target]
         for target in targets:
-            if isinstance(target, ast.Subscript) and _is_modules_mapping(target.value, aliases):
+            if _is_modules_mapping(target, aliases):
+                # The mapping itself rather than a key of it: `sys.modules |=
+                # {...}`, `sys.modules = {...}`, `del sys.modules`. `m =
+                # sys.modules` BINDS the alias and writes nothing, so a plain
+                # name target is only a write when it is augmented in place.
+                if isinstance(node, ast.AugAssign) or not isinstance(target, ast.Name):
+                    yield f"{path.name}:{node.lineno} the module table written whole"
+            elif isinstance(target, ast.Subscript) and _is_modules_mapping(target.value, aliases):
                 yield f"{path.name}:{node.lineno} the module table written by subscript"
 
 
@@ -215,6 +260,35 @@ def test_an_engine_stub_is_installed_only_in_a_form_that_restores():
     )
 
 
+def _advertised_commands(line: str) -> list[str]:
+    """Every command path an index LINE advertises, through the one parser.
+
+    The placement check used to `re.search` the raw line, which includes the
+    tail after the `->` pointer that `_index_entries` never reads -- so a whole
+    read-side entry could be deleted and re-satisfied by a bare backticked
+    token in the tail. Two deciders of "where the index advertises a group",
+    disagreeing. This is the only one.
+    """
+    entries = _index_entries(line)
+    assert entries, f"index line advertises nothing: {line}"
+    unreadable = [entry for entry in entries if not _INDEX_ENTRY.fullmatch(entry)]
+    assert not unreadable, (
+        "these index entries are not a plain backticked command, so this guard "
+        f"cannot check them and must not pretend it did: {unreadable}"
+    )
+    return [full for entry in entries
+            for full in _expand(_INDEX_ENTRY.fullmatch(entry))]
+
+
+def _index_lines_by_group() -> dict[str, str]:
+    lines: dict[str, str] = {}
+    for line in _index_section().splitlines():
+        heading = _INDEX_LINE.match(line)
+        if heading:
+            lines[heading.group("group").strip()] = line
+    return lines
+
+
 def test_skill_command_index_names_every_required_group(command_groups):
     """#627: `skills/bn/SKILL.md` is the first thing an agent reads, and its
     Command index silently omitted `tag`, `taint`, `dataflow`, `exports`, `go`
@@ -222,23 +296,17 @@ def test_skill_command_index_names_every_required_group(command_groups):
     source->sink analysis never reached `bn tag add --type Bookmarks` or
     `bn taint forward`.
 
-    Scoped to the index section (the Reference block names files, not groups),
-    per index LINE (a read-side entry deleted while the mutate-side one remains
-    is still a group an agent cannot find where it looks), and paired with the
-    registry so the requirement fails if a group is renamed away rather than
-    pinning a name that no longer exists.
+    This half is PLACEMENT: a read-side entry deleted while the mutate-side one
+    remains is still a group an agent cannot find where it looks. Decided from
+    the entries the index parser reads, never from the raw line.
     """
-    index = _index_section()
-    lines = {}
-    for line in index.splitlines():
-        heading = _INDEX_LINE.match(line)
-        if heading:
-            lines[heading.group("group").strip()] = line
+    lines = _index_lines_by_group()
     missing = sorted(
         f"{group} under **{where}**"
         for group, placements in REQUIRED_INDEX_GROUPS.items()
         for where in placements
-        if where not in lines or not re.search(rf"`{group}\b", lines[where])
+        if where not in lines
+        or group not in {command.split()[0] for command in _advertised_commands(lines[where])}
     )
     assert not missing, (
         f"the SKILL.md Command index does not advertise these where an agent "
@@ -246,6 +314,31 @@ def test_skill_command_index_names_every_required_group(command_groups):
     )
     renamed = sorted(set(REQUIRED_INDEX_GROUPS) - command_groups)
     assert not renamed, f"the index requires groups the CLI registry does not have: {renamed}"
+
+
+def test_skill_command_index_advertises_every_registered_command(command_paths):
+    """...and this half is POPULATION, derived from the registry rather than from
+    the names one bug report happened to list.
+
+    Requiring only those six names is fail-open: `evidence`, `trace`, `class`,
+    `struct show` and `struct field set/rename/delete` were all deleted from the
+    index with every doc test green. So every registered command path must be
+    advertised unless it is declared exempt, and a new command is a
+    documentation failure until someone classifies it either way.
+    """
+    advertised = {command for line in _index_lines()
+                  for command in _advertised_commands(line)}
+    stale = sorted(INDEX_EXEMPT_COMMANDS - command_paths)
+    assert not stale, (
+        f"these exemptions name commands the registry does not have: {stale}; a "
+        "stale exemption silently drops a real command from the requirement"
+    )
+    unadvertised = sorted(command_paths - advertised - INDEX_EXEMPT_COMMANDS)
+    assert not unadvertised, (
+        "the SKILL.md Command index -- the map an agent reads first -- does not "
+        f"advertise these registered commands: {unadvertised}. Add an index "
+        "entry, or declare the exemption in INDEX_EXEMPT_COMMANDS with a reason"
+    )
 
 
 def _index_section() -> str:
