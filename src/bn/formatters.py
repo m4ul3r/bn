@@ -4066,8 +4066,26 @@ def _blast_radius_line(value: dict[str, Any]) -> str | None:
     summary = _field_dict(value, "affected_summary")
     if not summary:
         return None
-    referenced = int(summary.get("referenced") or 0)
-    reflowed = int(summary.get("reflowed") or 0)
+    # Through the COUNT choke point, and refusing rather than fabricating. Both
+    # of `int(source.get(key) or 0)`'s failure modes were live here -- the exact
+    # expression `_count_field`'s docstring quotes as the bug it replaces. A
+    # string, dict or list `referenced` RAISED, and the CLI degrades that to
+    # exit 2 with empty stdout, so a mutation that COMMITTED reported no card at
+    # all; a bool silently fabricated "referenced by 1 fn, 2 reflowed" with no
+    # note, in the same render where the op row prints `<count not stated>`.
+    # One count contract in this module, on every surface that states one.
+    token = _SKEWED_FIELDS.set([])
+    try:
+        referenced = _count_field(summary, "referenced")
+        reflowed = _count_field(summary, "reflowed")
+        unreadable = sorted(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    if unreadable:
+        return ("  blast radius not stated: " + ", ".join(unreadable)
+                + " could not be read")
     if referenced <= 0:
         return None
     # A directly-mutated function (set_prototype/rename target, tagged `direct`)
@@ -4418,6 +4436,15 @@ def _go_rename_summary(value: Any) -> Any:
     token = _SKEWED_FIELDS.set([])
     try:
         counters = {key: _count_field(value, key) for key in _GO_RENAME_COUNTERS}
+        # The failure ROWS are read inside the capture too. Read in the
+        # builder's argument list -- after the reset -- an unreadable
+        # `results[]` still DISCLOSED through the enclosing summary drain but
+        # never reached `unusable`, so this op's compact status claimed
+        # `ok: true` on the payload `_add_mutation_ok` refuses. The compact path
+        # is the DEFAULT for `go rename`, so `jq '.ok'` flipped on whether the
+        # caller asked for detail -- the same half-parity #447 forbids, on the
+        # second caller of the one builder (#619/#685).
+        failure_rows = _field_list(value, "results")
         unreadable = list(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
@@ -4492,7 +4519,7 @@ def _go_rename_summary(value: Any) -> Any:
                  - counters["skipped_changed_during_apply"],
         reported_success=bool(value.get("success", True)),
         # `results[]` holds only the FAILURE rows for this op.
-        failure_rows=_field_list(value, "results"),
+        failure_rows=failure_rows,
         failed=failed,
         changed=changed,
         verified=verified,

@@ -5632,27 +5632,28 @@ _STRING_SHAPE_GUARD_CATEGORIES = (
     "chokepoint", "routed", "routed_in", "reaches_the_output")
 
 _STRING_SHAPE_GUARDS = {
-    ("_text_value", "raw"): "chokepoint",
-    ("_clean_prototype", "proto"): "routed_in",
-    ("_layout_field_count", "layout"): "routed_in",
-    ("_layout_field_deltas", "layout_diff"): "routed_in",
-    ("_layout_size", "layout"): "routed_in",
-    ("_unmeasured_cause", "first_error"): "routed_in",
-    ("_leaf_group_key", "kind"): "reaches_the_output",
-    ("_operation_row_text", "op"): "reaches_the_output",
-    ("_render_comment_text", "comment"): "reaches_the_output",
-    ("_render_fallback_text", "value"): "reaches_the_output",
-    ("_render_mutation_text", "msg"): "reaches_the_output",
-    ("_render_orient_text", "raw"): "reaches_the_output",
-    ("_render_proto_text", "prototype"): "reaches_the_output",
-    ("_render_py_exec_text", "result"): "reaches_the_output",
-    ("_render_read_text", "hex_str"): "reaches_the_output",
-    ("_render_sections_text", "n"): "reaches_the_output",
-    ("_render_trace_frontiers", "reason"): "reaches_the_output",
-    ("_render_type_info_text", "decl"): "reaches_the_output",
-    ("_render_type_info_text", "layout"): "reaches_the_output",
-    ("render", "text"): "reaches_the_output",
-    ("rendered", "out"): "reaches_the_output",
+    ("_text_value", "raw", 0): "chokepoint",
+    ("_clean_prototype", "proto", 0): "routed_in",
+    ("_layout_field_count", "layout", 0): "routed_in",
+    ("_layout_field_deltas", "layout_diff", 0): "routed_in",
+    ("_layout_size", "layout", 0): "routed_in",
+    ("_unmeasured_cause", "first_error", 0): "routed_in",
+    ("_leaf_group_key", "kind", 0): "reaches_the_output",
+    ("_operation_row_text", "op", 0): "reaches_the_output",
+    ("_render_comment_text", "comment", 0): "reaches_the_output",
+    ("_render_fallback_text", "value", 0): "reaches_the_output",
+    ("_render_mutation_text", "msg", 0): "reaches_the_output",
+    ("_render_mutation_text", "msg", 1): "reaches_the_output",
+    ("_render_orient_text", "raw", 0): "reaches_the_output",
+    ("_render_proto_text", "prototype", 0): "reaches_the_output",
+    ("_render_py_exec_text", "result", 0): "reaches_the_output",
+    ("_render_read_text", "hex_str", 0): "reaches_the_output",
+    ("_render_sections_text", "n", 0): "reaches_the_output",
+    ("_render_trace_frontiers", "reason", 0): "reaches_the_output",
+    ("_render_type_info_text", "decl", 0): "reaches_the_output",
+    ("_render_type_info_text", "layout", 0): "reaches_the_output",
+    ("render", "text", 0): "reaches_the_output",
+    ("rendered", "out", 0): "reaches_the_output",
 }
 
 
@@ -5866,7 +5867,14 @@ def _classify_string_shape_guards(source):
                     return "reaches_the_output"
         return "DROPS"
 
-    found: dict[tuple[str, str], str] = {}
+    # EVERY guard NODE, not one per (function, expression). Keying the
+    # population by name alone silently discarded the second and later guards
+    # over the same expression -- `_render_mutation_text` tests `msg` twice --
+    # so a dropping filter placed at the discarded site left the refusal green.
+    # That is the same "cannot fail" defect as the whole-function scan it just
+    # replaced, one disguise along, so the occurrence INDEX is part of the key
+    # and the count of nodes is the count of rows.
+    guards = []
     for node in calls.get("isinstance", ()):
         if len(node.args) != 2:
             continue
@@ -5875,9 +5883,15 @@ def _classify_string_shape_guards(source):
                     if isinstance(classes, (ast.Tuple, ast.List)) else [classes])
         if not any(isinstance(c, ast.Name) and c.id == "str" for c in elements):
             continue
+        guards.append((node.lineno, node.col_offset, node))
+    found: dict[tuple[str, str, int], str] = {}
+    occurrences: dict[tuple[str, str], int] = {}
+    for _line, _col, node in sorted(guards, key=lambda g: (g[0], g[1])):
         fn = owner_of[id(node)]
         expr = ast.unparse(node.args[0])
-        found.setdefault((fn.name, expr), classify(fn, node, expr))
+        index = occurrences.get((fn.name, expr), 0)
+        occurrences[(fn.name, expr)] = index + 1
+        found[(fn.name, expr, index)] = classify(fn, node, expr)
     return found
 
 
@@ -5948,13 +5962,13 @@ def test_every_string_shape_guard_either_shows_the_value_or_routes_it():
         "    return ''",
         ""))
     verdicts = _classify_string_shape_guards(probe)
-    assert verdicts[("drops", "note")] == "DROPS", (
+    assert verdicts[("drops", "note", 0)] == "DROPS", (
         "the classifier cannot see the module's dominant #619 shape -- a value "
         "rendered ONLY in the branch where it was usable, and dropped in "
         f"silence otherwise: {verdicts}")
-    assert verdicts[("shows", "text")] == "reaches_the_output", (
+    assert verdicts[("shows", "text", 0)] == "reaches_the_output", (
         f"a value the refusing path still dumps is not a drop: {verdicts}")
-    assert verdicts[("routes", "note")] == "routed", (
+    assert verdicts[("routes", "note", 0)] == "routed", (
         f"a value taken from the choke point is already disclosed: {verdicts}")
     # And the population itself, since the categories a rule collapse would
     # empty are the ones doing the work here.
@@ -6285,6 +6299,89 @@ def test_a_type_row_never_states_a_field_count_it_could_not_measure():
             f"derived from it is fabricated -- and 0 is the dangerous one: {out!r}")
         assert _disclosed(out, "after_layout"), (
             f"after_layout={unreadable!r} was refused with no note naming it: {out!r}")
+    # The refusal is attributed to the ENTRY it came from, not to the render.
+    # `_field_skewed` answers for the whole card, so a batch whose FIRST type
+    # arrived unreadable would otherwise suppress the count of every later type
+    # in the same batch -- the mirror of the fabrication, and just as wrong:
+    # a row that WAS measured must still state its zero or its two.
+    batch = formatters._render_mutation_text({
+        "success": True, "committed": True,
+        "results": [{"op": "types_declare", "status": "verified", "count": 2}],
+        "affected_types": [
+            {"type_name": "broken_t", "changed": False, "after_layout": {"f": [1]}},
+            {"type_name": "widget_t", "changed": False,
+             "after_layout": "struct widget_t size=0x8\n    0x0 int a\n    0x4 int b"},
+        ]})
+    assert "struct widget_t size=0x8, 2 fields" in batch, (
+        "a readable entry beside an unreadable one must still state its own "
+        f"measured count: {batch!r}")
+    assert "struct broken_t, field count not stated" in batch, (
+        f"the unreadable entry must be the one refused: {batch!r}")
+
+def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
+    """#447 parity on the OTHER caller of the one builder.
+
+    `go rename` reports through its own counters, and its `results[]` holds only
+    the FAILURE rows. Read in the builder's argument list -- outside the
+    recorder capture -- an unreadable failure list still disclosed through
+    `first_error` but never reached `unusable`, so the compact status claimed
+    `ok: true` on the payload `_add_mutation_ok` refuses. The compact path is
+    this op's DEFAULT, so `jq '.ok'` flipped on whether the caller asked for
+    detail -- the same half-parity round 18 closed on the generic summary,
+    surviving one caller along. The whole point of one builder is that the two
+    callers cannot answer differently."""
+    from bn import formatters
+
+    def envelope(results):
+        value = {"kind": "go_rename", "success": True, "committed": True,
+                 "go_renamed_candidates": 3, "go_committed_count": 3,
+                 "go_verified_count": 3, "go_failed_count": 0,
+                 "skipped_user_named": 0, "skipped_changed_during_apply": 0}
+        if results is not _ABSENT:
+            value["results"] = results
+        return value
+
+    assert formatters._go_rename_summary(envelope(_ABSENT))["ok"] is True
+    assert formatters._go_rename_summary(envelope([]))["ok"] is True
+    for unreadable in ({"row": 1}, "boom", 7, True):
+        summary = formatters._go_rename_summary(envelope(unreadable))
+        assert summary["ok"] is False and summary["success"] is False, (
+            f"results={unreadable!r} is a failure list nobody could read, so "
+            f"'nothing failed' is not established and ok must not be: {summary!r}")
+        assert "malformed" in str(summary.get("first_error")), summary
+        assert (summary["ok"]
+                is formatters._add_mutation_ok(envelope(unreadable))["ok"]), (
+            f"`jq '.ok'` flips with the detail flag on results={unreadable!r}")
+
+
+def test_the_blast_radius_line_never_states_a_count_it_could_not_read():
+    """The THIRD count surface, and the one still spelled the way `_count_field`
+    exists to replace.
+
+    `int(summary.get("referenced") or 0)` had both of that expression's failure
+    modes live at once: a string, dict or list RAISED out of the whole mutation
+    card (the CLI degrades that to exit 2 with empty stdout, so a mutation that
+    COMMITTED reported no card at all), and a bool silently fabricated
+    "referenced by 1 fn, 2 reflowed" with no note -- in the same render where
+    the op row prints `<count not stated>` and the type row refuses its own
+    fabricated zero. One count contract, on every surface that states one."""
+    from bn import formatters
+
+    def card(referenced, reflowed=2):
+        return formatters._render_mutation_text({
+            "success": True, "committed": True,
+            "results": [{"op": "types_declare", "status": "verified", "count": 1}],
+            "affected_summary": {"referenced": referenced, "reflowed": reflowed}})
+
+    assert "referenced by 4 fns, 2 reflowed" in card(4)
+    assert "referenced by" not in card(0), "a measured zero states no blast radius"
+    for unreadable in ("many", {"n": 4}, [4], True):
+        out = card(unreadable)
+        assert "referenced by" not in out, (
+            f"referenced={unreadable!r} could not be read, so a blast radius "
+            f"derived from it is fabricated: {out!r}")
+        assert _disclosed(out, "referenced"), (
+            f"referenced={unreadable!r} was refused with no note naming it: {out!r}")
 
 
 def test_an_op_row_never_states_a_count_the_payload_did_not():
@@ -6381,19 +6478,20 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
     assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
 
     digits = re.compile(r"\d+")
-    fabricated, checked = [], 0
+    fabricated, rendered, checked = [], 0, 0
     for builder_name in builders:
         builder = getattr(formatters, builder_name)
         for op in sorted(ops):
             for key in sorted(keys):
                 for bogus in ("bad", ["bad"], {"a": 1}, 0, "", False, {}, [], True):
                     item = {"op": op, key: bogus}
-                    checked += 1
+                    rendered += 1
                     out = builder(item)
                     # A readable container IS the measurement, empty or not, so a
                     # count beside one is the payload's own and not a fabrication.
                     if isinstance(bogus, (dict, list)) and key != "count":
                         continue
+                    checked += 1
                     stated = set()
                     for value in item.values():
                         stated |= set(digits.findall(str(value)))
@@ -6404,7 +6502,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert checked == 1980, f"the op-row count sweep ran {checked} cases, not 1980"
+    assert (rendered, checked) == (1980, 1188), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
+        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips 792 "
+        "renders before any assertion, and pinning only the larger number "
+        "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a
     # number": a count the payload DID state must still be stated, or the
     # refusal would be a silent cap on every honest row.
