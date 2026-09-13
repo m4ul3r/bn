@@ -5528,7 +5528,12 @@ def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, mon
     unreadable.mkdir()
     blocked = unreadable / "blocked.sock"
     blocked.touch()
-    for sid, sock_path in (("blocked", blocked), ("absent", inst_dir / "absent.sock")):
+    # An ancestor that is a regular file: ENOTDIR, and no file can live there.
+    wall = inst_dir / "wall"
+    wall.write_text("not a directory\n", encoding="utf-8")
+    for sid, sock_path in (("blocked", blocked),
+                           ("absent", inst_dir / "absent.sock"),
+                           ("notdir", wall / "notdir.sock")):
         (inst_dir / f"{sid}.json").write_text(
             json.dumps({"pid": gone.pid, "socket_path": str(sock_path),
                         "instance_id": sid}),
@@ -5542,5 +5547,193 @@ def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, mon
         assert (inst_dir / "blocked.json").exists()
         # Genuinely absent, owner gone: swept exactly as before.
         assert not (inst_dir / "absent.json").exists()
+        # ENOTDIR is as conclusive as ENOENT: no file can carry that name.
+        assert not (inst_dir / "notdir.json").exists()
     finally:
         unreadable.chmod(0o700)
+
+
+def test_an_unprobeable_record_is_hidden_rather_than_offered_as_a_bridge(tmp_path, monkeypatch):
+    """Routing and destroying need different readings of the same absence.
+
+    Narrowing what counts as "no socket" was right for the PURGE and wrong for
+    the ROUTE: a record whose socket cannot even be stat'ed stopped being
+    hidden and became a fully reachable instance, so a host with one healthy
+    bridge suddenly had two and ``choose_instance`` failed with ambiguity --
+    every discovery-backed command down, on a record nothing can reach. A
+    socket this process cannot stat is one it certainly cannot serve through,
+    which is what base did with it; the narrow reading belongs only on the arm
+    that DELETES (#618).
+
+    Both directions in one measurement: the healthy bridge beside it is still
+    listed and still selected, and the unprobeable record is still on disk.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    good_sock = inst_dir / "good.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(good_sock))
+    server.listen(1)
+    unreadable = inst_dir / "unreadable"
+    unreadable.mkdir()
+    for sid, sock_path in (("good", good_sock), ("blocked", unreadable / "blocked.sock")):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": owner.pid, "socket_path": str(sock_path),
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+    unreadable.chmod(0o000)
+    try:
+        assert [inst.instance_id for inst in list_instances()] == ["good"]
+        assert choose_instance(auto_start=False).instance_id == "good"
+        assert (inst_dir / "blocked.json").exists()      # hidden, never destroyed
+    finally:
+        unreadable.chmod(0o700)
+        with contextlib.suppress(OSError):
+            server.close()
+        good_sock.unlink(missing_ok=True)
+        owner.kill()
+        owner.wait()
+
+
+def test_a_relative_row_is_unknowable_even_where_the_readers_cwd_resolves_it(tmp_path, monkeypatch):
+    """The cwd-relative refusal, pinned on the input that isolates it.
+
+    A relative row is normally rescued by the later "this name no longer
+    resolves" arm, which is why deleting the relative refusal alone left the
+    whole suite green. The input that separates them is a reader whose OWN cwd
+    makes the row resolve -- to a different file with the same basename -- and
+    there the fallback returns the destructive ``False`` about a socket that is
+    bound and listening somewhere else entirely. The listing cannot carry the
+    binder's cwd, so the row is unanswerable however well it resolves here
+    (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    binder_root = tmp_path / "binder"
+    (binder_root / "instances").mkdir(parents=True)
+    reader_root = tmp_path / "reader"
+    (reader_root / "instances").mkdir(parents=True)
+    decoy = reader_root / "instances" / "rel.sock"
+    decoy.touch()                          # the reader's cwd DOES resolve the row
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('instances/rel.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(binder_root), stdout=subprocess.PIPE, text=True,
+    )
+    live = binder_root / "instances" / "rel.sock"
+    try:
+        assert binder.stdout.readline().strip() == "bound"
+        monkeypatch.chdir(reader_root)
+
+        assert _path_has_bound_socket(live) is None
+    finally:
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        live.unlink(missing_ok=True)
+
+
+def test_a_bound_socket_whose_basename_holds_a_raw_byte_is_found(tmp_path):
+    """The bytes comparison, pinned where only bytes can answer.
+
+    Decoding the listing with ``errors="replace"`` was the round-18 blocker,
+    and until this test the guard against it was pinned only where the odd byte
+    sat in the cache ROOT -- there the mangled row stops resolving and the
+    "name no longer exists" arm answers ``None`` anyway, so restoring the lossy
+    decode left the suite green. With the byte in the BASENAME the mangled row
+    still resolves to an existing directory and the basename filter simply
+    fails, which falls through to the destructive ``False`` about a socket that
+    is bound AND listening (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    sock_path = tmp_path / os.fsdecode(b"od\xffd.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is True
+        assert _path_has_bound_socket(tmp_path / os.fsdecode(b"ot\xffr.sock")) is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_socket_path_the_syscall_layer_cannot_express_does_not_crash_gc(tmp_path, monkeypatch):
+    """An unnameable path is a refusal, never a traceback.
+
+    A registry may carry a ``socket_path`` no syscall can take -- an embedded
+    NUL survives JSON, a Path and every comparison in this module, and only
+    ``stat`` rejects it, with ``ValueError`` rather than ``OSError``. Uncaught,
+    that took ``gc_instances()`` down for every other instance on the host,
+    which is the availability class this PR exists to close. Such a name
+    resolves to nothing, so it is treated as conclusively absent: the record is
+    swept when its owner is gone and kept while the owner lives (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    (inst_dir / "nul.json").write_text(
+        json.dumps({"pid": owner.pid, "socket_path": f"{inst_dir}/n\x00ul.sock",
+                    "instance_id": "nul"}),
+        encoding="utf-8",
+    )
+    (inst_dir / "nul.log").write_text("x\n", encoding="utf-8")
+    try:
+        assert list_instances(include_unreachable=True) == []   # must not raise
+        summary = gc_instances()                                # must not raise
+
+        assert summary["live_instances"] == 0
+        assert isinstance(summary["registries_purged"], int)
+    finally:
+        owner.kill()
+        owner.wait()
+
+
+def test_a_socket_bound_under_a_newline_name_is_unknowable_not_unbound(tmp_path):
+    """The FIRST newline refusal, pinned on the only input that isolates it.
+
+    Two guards refuse a newline: one on the name as asked, one on what it
+    resolves to. Where both hold the newline either one covers the case, which
+    is why deleting the first alone left the suite green. Separate them with a
+    SYMLINK whose own name carries the newline and whose target does not: the
+    bridge binds through the link, so the kernel's row holds the newline and is
+    torn across two lines -- neither of which parses as a row -- while the
+    resolved name is newline-free and the second guard never fires. The reader
+    then sees no match and would answer the destructive ``False`` about a
+    socket that is bound AND listening (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    link = tmp_path / "link\nnewline"      # the NAME holds it; the target does not
+    os.symlink(plain, link)
+    sock_path = link / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))            # the kernel records the newline spelling
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is None
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        (plain / "live.sock").unlink(missing_ok=True)

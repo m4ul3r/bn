@@ -789,14 +789,20 @@ def _load_instance(
         if not include_unreachable or verdict != "proven":
             return None
         unreachable = True
-    elif _path_is_absent(socket_path):
+    elif not socket_path.exists():
         # start() binds the socket BEFORE writing the registry, so "registry with
         # no socket" is never a legitimate startup window: it is a bridge that
         # died hard, or a phantom kept listed only by whatever owns its pid now.
-        # The absence is ESTABLISHED rather than assumed: `Path.exists()` reads
-        # an unreadable directory exactly like a missing name, and this arm
-        # sweeps a dead owner's record without probing the socket at all, so
-        # that conflation destroyed a record whose real probe is inconclusive.
+        # ROUTING and DESTROYING part company here, and keeping them together
+        # cost a defect in each direction. `Path.exists()` reads an unreadable
+        # directory exactly like a missing name, which is the right answer for
+        # routing -- a socket this process cannot even stat is one it certainly
+        # cannot serve a request through, and hiding it is what base did -- and
+        # the wrong answer for deleting, because the arm below sweeps without
+        # probing the socket at all. Routing keeps the broad reading; the purge
+        # takes the narrow one. Making BOTH narrow adopted a record nothing can
+        # reach as a healthy instance, which broke `choose_instance` on a host
+        # whose other bridge was fine.
         # That absence is evidence about SERVICE, not about the handle: a bridge
         # nothing can reach is exactly the process `bn session stop` must still
         # be able to name, so normal discovery and `bn session list` hide it
@@ -807,10 +813,12 @@ def _load_instance(
         # from every pre-#694 bridge, and -- since `identity_verdict` needs
         # `/proc` for both halves of its proof -- from every bridge on a platform
         # that has none.
-        if record_is_litter:
+        if record_is_litter and _path_is_absent(socket_path):
             # No socket to sweep: this arm was reached BECAUSE nothing was at
-            # that path. Anything bound to it now arrived after the check, and
-            # unlinking it would destroy an endpoint never judged here.
+            # that path, and `_path_is_absent` is what ESTABLISHES that rather
+            # than inferring it from a probe that could not be taken. Anything
+            # bound to it now arrived after the check, and unlinking it would
+            # destroy an endpoint never judged here.
             _purge_stale_registry(path, expected_record=record_document)
             return None
         if not include_unreachable or verdict != "proven":
@@ -945,12 +953,17 @@ def _path_is_absent(path: Path) -> bool:
     ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and ``ESTALE`` exactly as it
     does for ``ENOENT`` -- so one unreadable directory turned a probe that
     could not be TAKEN into positive evidence, and a live owner's record and
-    log went with it. What establishes that the name resolves to nothing is
-    ``ENOENT``, ``ENOTDIR``, ``ENAMETOOLONG`` (no file can carry that name) and
-    a path the syscall layer cannot even express (an embedded NUL, a lone
-    surrogate -- what a non-UTF-8 byte becomes once JSON has decoded it).
-    Every other error is the READER's problem, not the path's, and answers
-    ``False``, which costs a record that is kept (#618).
+    log went with it. The question is about the NAME this record carries, so
+    what settles it is ``ENOENT``, ``ENOTDIR``, ``ENAMETOOLONG`` -- nothing is
+    reachable THROUGH that name, whatever the same inode may be reachable as
+    under a shorter one -- and a name the syscall layer cannot express at all,
+    which raises ``ValueError`` rather than ``OSError``: an embedded NUL, or a
+    surrogate outside the ``surrogateescape`` range. (A ``\\udc80``-``\\udcff``
+    surrogate is NOT one of those: it is how a raw byte survives a decode, and
+    ``os.fsencode`` turns it straight back into that byte, so such a path names
+    a real file and is stat'ed normally.) Every other error is the READER's
+    problem, not the path's, and answers ``False``, which costs a record that
+    is kept (#618).
     """
     try:
         path.stat()
