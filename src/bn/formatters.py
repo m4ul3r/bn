@@ -2458,7 +2458,7 @@ def _render_init_arrays_text(value: Any) -> str:
         for item in _field_list(table, "items"):  # #275: embedded table is canonical too
             if not isinstance(item, dict):
                 continue
-            prefix = f"  [{item.get('index', '?'):>2}] {item.get('entry_address', '<unknown>')}"
+            prefix = f"  [{_fmt_count(item.get('index', '?')):>2}] {item.get('entry_address', '<unknown>')}"
             if not item.get("readable", True):
                 lines.append(f"{prefix}  <unreadable>")
                 continue
