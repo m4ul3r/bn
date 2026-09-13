@@ -3805,33 +3805,138 @@ def _unconfined_record(inst_dir, name, target):
     return path
 
 
-def test_an_unconfined_socket_never_deletes_a_proven_live_record(tmp_path, monkeypatch):
-    """Refusing a payload is a judgement; deleting the record is destruction.
+def test_an_unconfined_socket_keeps_a_proven_live_records_handle(tmp_path, monkeypatch):
+    """Refusing a payload is a judgement; destroying the record is destruction.
 
     This arm cannot tell "the payload is bogus" from "our reading of the
     layout is wrong" -- the symlinked-cache purge proved the second happens --
-    so when the owner is alive and its identity PROVEN the record stays on
-    disk, exactly as the missing-socket arm keeps an unreachable bridge's only
-    handle (#694). The payload is still refused, and nothing outside the cache
-    is touched.
+    so when the owner is alive and its identity PROVEN the record stays. File
+    existence is not the property, though: a kept file no consumer can resolve
+    is a handle for nothing. What #694 actually promises is pinned here -- the
+    lifecycle lookup resolves it as unreachable, spawn collision detection
+    sees the id, and the live bridge's own log survives the re-spawn attempt
+    that the collision now refuses. Normal discovery still hides it, the
+    payload is still refused, and nothing outside the cache is touched.
     """
+    import bn.transport as transport
+
     cache = tmp_path / "cache"
     outside = tmp_path / "outside"
     outside.mkdir(parents=True)
     cache.mkdir(parents=True)
     monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["/bin/true"])
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
     bystander = outside / "bystander.sock"
     bystander.write_text("", encoding="utf-8")
     record = _unconfined_record(inst_dir, "alive", bystander)
+    log = inst_dir / "alive.log"
+    breadcrumb = "BN Agent Bridge listening on alive.sock\n" * 6
+    log.write_text(breadcrumb, encoding="utf-8")
 
-    instances = list_instances()
+    assert list_instances() == []            # never advertised, never connected to
 
-    assert [inst.instance_id for inst in instances] == []
+    admin = list_instances(include_unreachable=True)
+    assert [inst.instance_id for inst in admin] == ["alive"]
+    assert admin[0].unreachable is True
+    found = transport.find_lifecycle_instance("alive")
+    assert found is not None and found.unreachable is True
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("alive", timeout=1.0, poll_interval=0.01)
+    assert "already exists with id: alive" in str(excinfo.value)
+
     assert record.exists()                   # proven-live owner: never deleted
+    assert log.read_text(encoding="utf-8") == breadcrumb   # and never truncated
     assert bystander.exists()
     assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_an_unreachable_instance_is_a_handle_not_a_connection(tmp_path, monkeypatch):
+    """``unreachable`` promises nothing can be dispatched to it -- enforce it.
+
+    The lifecycle lookup hands `session stop`/`session restart` a handle on a
+    bridge normal discovery hides, and `session restart` dispatches
+    `list_targets` to whatever handle it resolves before tearing it down. For
+    the confinement arm that handle names a socket OUTSIDE this user's cache --
+    the file the loader refused to trust -- and something may well be listening
+    on it, so the refusal cannot rest on connect() failing the way it does for
+    a socket-less bridge. It lives at the one chokepoint every dispatch takes.
+    """
+    import bn.transport as transport
+    from bn.transport import BridgeInstance
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    foreign = tmp_path / "foreign.sock"
+    server = _Server(str(foreign), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    instance = BridgeInstance(
+        pid=os.getpid(),
+        socket_path=foreign,
+        registry_path=instances_dir() / "unreach.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={"instance_token": "identity-token"},
+        instance_id="unreach",
+        instance_token="identity-token",
+        unreachable=True,
+    )
+    try:
+        with pytest.raises(BridgeError, match="bridge_unreachable"):
+            transport._send_request_to_instance(instance, "list_targets", timeout=1.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert server.requests == []         # never connected, let alone dispatched
+
+
+def test_a_record_discovery_cannot_read_keeps_its_bridges_spawn_log(tmp_path, monkeypatch):
+    """Truncating ``<id>.log`` is destruction; "no resolvable record" is no evidence.
+
+    A record whose document is unparseable, or whose fields are the wrong
+    type, is deliberately NOT purged -- which also makes it invisible to spawn
+    collision detection, while the bridge that wrote it may be listening right
+    now (its socket then refuses to be displaced and the child exits). So the
+    one destructive step left in that path -- opening ``<id>.log`` with ``w``
+    and wiping the only recorded output of that process -- is taken on
+    evidence that says nothing about whether the id is free. The log is kept,
+    and the spawn error still quotes only what THIS child wrote.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "corrupt.json").write_text("{not json", encoding="utf-8")
+    log = inst_dir / "corrupt.log"
+    breadcrumb = "BN Agent Bridge listening on corrupt.sock\n" * 6
+    log.write_text(breadcrumb, encoding="utf-8")
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("ImportError: no module named binaryninja\n")
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("corrupt", timeout=1.0, poll_interval=0.01)
+
+    assert (inst_dir / "corrupt.json").exists()          # still not purged
+    text = log.read_text(encoding="utf-8")
+    assert text.startswith(breadcrumb)                   # kept, not truncated
+    assert "no module named binaryninja" in text
+    message = str(excinfo.value)
+    assert "no module named binaryninja" in message
+    assert "listening on" not in message   # the tail is this child's output only
 
 
 def test_an_unconfined_socket_still_sweeps_a_dead_owners_record(tmp_path, monkeypatch):

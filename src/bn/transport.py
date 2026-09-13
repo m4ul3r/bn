@@ -495,22 +495,30 @@ def _load_instance(
     # recycled its pid, so discovery consults the durable identity too (#694).
     verdict = identity_verdict(payload, pid)
 
+    unreachable = False
     if not _socket_path_is_confined(socket_path):
         # The payload points at a socket this code cannot place inside the
         # cache: never connect to it, and never let the stale sweep unlink it.
         # Whether to delete the RECORD is a separate question, and this arm
         # cannot tell "the payload is bogus" from "our reading of the layout is
-        # wrong" -- the symlinked-cache purge proved the second happens. So a
-        # proven live owner keeps its file, exactly as the missing-socket arm
-        # below keeps an unreachable bridge's only handle (#694); a dead or
-        # unproven owner is corruption or litter, and the registry under our own
-        # cache is swept (#618).
+        # wrong" -- the symlinked-cache purge proved the second happens. A dead
+        # or unproven owner is corruption or litter, and the registry under our
+        # own cache is swept (#618). A PROVEN live owner keeps its file AND
+        # resolves for the lifecycle lookup, exactly as the missing-socket arm
+        # below does (#694): keeping the file without returning it made it a
+        # handle for nothing -- `session stop` could not name the process and
+        # spawn collision detection could not see the id, so a re-spawn
+        # truncated that live bridge's log where refusing the id outright had
+        # left it intact. A handle is not a connection: `unreachable` is what
+        # stops dispatch (`_send_request_to_instance` refuses it), and normal
+        # discovery keeps hiding it.
         if not owner_alive or verdict != "proven":
             _purge_stale_registry(path)
-        return None
-
-    unreachable = False
-    if not socket_path.exists():
+            return None
+        if not include_unreachable:
+            return None
+        unreachable = True
+    elif not socket_path.exists():
         # start() binds the socket BEFORE writing the registry, so "registry with
         # no socket" is never a legitimate startup window: it is a bridge that
         # died hard, or a phantom kept listed only by whatever owns its pid now.
@@ -965,6 +973,21 @@ def _send_request_to_instance(
             f"{instance_selector(instance)!r} (pid {instance.pid}) is in "
             f"process state {process_state}; restart the instance"
         )
+    if instance.unreachable:
+        # `unreachable` is a promise: this record resolved for the lifecycle
+        # lookup ONLY (#694) and nothing may be dispatched to it. Enforced here
+        # instead of left to connect() failing, because the confinement arm
+        # resolves records whose recorded path may well have something listening
+        # on it -- a socket outside this user's cache, which is exactly the file
+        # discovery refused to trust (#618) -- and `session restart` dispatches
+        # `list_targets` to the handle it resolves. The refusal belongs at the
+        # one chokepoint every dispatch goes through.
+        raise BridgeError(
+            f"bridge_unreachable: Binary Ninja bridge instance "
+            f"{instance_selector(instance)!r} (pid {instance.pid}) has no "
+            f"reachable socket; nothing can be dispatched to it -- stop it with "
+            f"`bn session stop {instance_selector(instance)}`"
+        )
     expected_identity = _instance_identity(instance)
     payload: dict[str, Any] = {
         "id": str(uuid.uuid4()),
@@ -1108,10 +1131,19 @@ def _find_bn_agent() -> list[str]:
     return [sys.executable, "-m", "bn.headless"]
 
 
-def _log_tail(log_path: Path, lines: int = 20) -> str:
-    """Return the last *lines* of the spawn log, formatted for an error message."""
+def _log_tail(log_path: Path, lines: int = 20, *, start: int = 0) -> str:
+    """Return the last *lines* of the spawn log, formatted for an error message.
+
+    *start* is a byte offset: when the log was APPENDED to rather than
+    truncated (see ``_spawn_instance_unlocked``), only the bytes this spawn
+    produced may be quoted, or the error attributes the previous bridge's
+    output to the child that just failed.
+    """
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        with log_path.open("rb") as stream:
+            if start:
+                stream.seek(start)
+            text = stream.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
     tail = [line for line in text.splitlines() if line.strip()][-lines:]
@@ -1192,7 +1224,22 @@ def _spawn_instance_unlocked(
     inst_dir = ensure_private_dir(instances_dir())
 
     log_path = inst_dir / f"{instance_id}.log"
-    log_file = open(log_path, "w")  # noqa: SIM115
+    reg_path = bridge_registry_path(instance_id)
+    # A registry file still on disk after the collision pass above is one
+    # discovery could neither read nor prove dead: an unparseable document, or a
+    # field whose type rules it out, is deliberately kept -- which also keeps it
+    # invisible to that pass -- and the bridge that wrote it may be listening
+    # right now (the child then refuses to displace its socket and exits). So
+    # truncating `<id>.log` here would destroy that process's only recorded
+    # output on evidence that says nothing about whether the id is free: append
+    # instead, and bound the diagnostic tail to what THIS child wrote so the
+    # error never quotes the previous bridge's lines as its own (#618).
+    keep_log = reg_path.exists()
+    log_start = 0
+    if keep_log:
+        with contextlib.suppress(OSError):
+            log_start = log_path.stat().st_size
+    log_file = open(log_path, "a" if keep_log else "w")  # noqa: SIM115
 
     cmd = _find_bn_agent() + ["--instance-id", instance_id]
     try:
@@ -1212,7 +1259,6 @@ def _spawn_instance_unlocked(
         # caller that formats it later -- keeps the fd alive with it (#618).
         log_file.close()
 
-    reg_path = bridge_registry_path(instance_id)
     while time.monotonic() < deadline:
         if reg_path.exists():
             remaining = _remaining_deadline(deadline, "waiting for bridge registration")
@@ -1244,7 +1290,7 @@ def _spawn_instance_unlocked(
                 f"exited with code {exit_code} before registering."
             )
             _append_spawn_diagnostic(log_path, message)
-            raise BridgeError(f"{message}{_log_tail(log_path)}")
+            raise BridgeError(f"{message}{_log_tail(log_path, start=log_start)}")
         remaining = _remaining_deadline(deadline, "waiting for bridge registration")
         time.sleep(min(poll_interval, remaining or poll_interval))
 
