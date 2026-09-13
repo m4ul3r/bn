@@ -399,13 +399,34 @@ def _registered_handlers() -> dict[str, object]:
 # rather than by bare name, and a handler that reaches the writer through a
 # chain of resolvable calls counts too -- a wrapper is not an escape.
 #
-# LIMIT, stated rather than implied: this resolves REFERENCES, so a call made
-# through a value instead of a name -- a variable holding the function,
-# `getattr(module, "update")`, a dispatch table looked up at run time -- is not
-# resolvable from source and is not detected. The exemption set is asserted to
-# be EXACTLY the detected writers, so the failure mode of that limit is a new
-# pin writer going unnoticed, never an unrelated command being parked here.
-_PIN_WRITER = "bn.session_state.update"
+# LIMIT, stated rather than implied -- and stated in BOTH directions, because
+# round 15 measured the earlier one-directional statement ("never an unrelated
+# command being parked here") false in the direction it excluded:
+#
+#   NOT DETECTED. This resolves REFERENCES, so a call made through a value
+#   instead of a name -- a variable holding the function, `getattr(module,
+#   "update")`, a dispatch table looked up at run time -- is not resolvable from
+#   source. And a route to the pin FILE that never passes through the seed below
+#   is invisible too; the seed is the function that performs the write rather
+#   than the public wrapper, and
+#   `test_nothing_outside_the_pin_module_can_reach_the_pin_file` is what stops
+#   that second direction from being merely asserted.
+#
+#   NOT CLAIMED. Over-detection is not the benign direction: the exemption set
+#   is asserted to be EXACTLY the detected writers, so a command wrongly
+#   detected has to be parked in INDEX_EXEMPT_STICKY, which drops a real command
+#   from the index requirement (#627) -- the precise harm the exemption exists to
+#   prevent. So a nested `def` is a scope of its own, folded in only when the
+#   enclosing body invokes it, and a name a function BINDS itself (a parameter,
+#   an assignment target) is not the module of the same spelling.
+#
+# Both directions are pinned by
+# `test_the_pin_writer_resolution_states_its_limit_in_both_directions`, against
+# a corpus carrying the shapes the real tree happens not to have.
+#
+# The one remaining over-approximation: two nested `def`s of the SAME name in one
+# function share an entry, so invoking either folds in both.
+_PIN_WRITER = "bn.session_state._atomic_write"
 
 
 def _module_name(path: Path, root: Path) -> str:
@@ -489,6 +510,83 @@ def _corpus_functions(tree: ast.Module):
                     yield f"{node.name}.{member.name}", member
 
 
+def _bound_names(scope: ast.AST) -> frozenset[str]:
+    """The names *scope* binds itself: parameters and assignment targets.
+
+    A bound name is NOT the module-level object of the same spelling, so
+    `def h(session_state): session_state.update(1)` reaches nothing this corpus
+    can resolve -- reading it as the pin writer mis-attributed a command that
+    cannot touch the pin. Import-bound names are deliberately excluded: a
+    function-local `from bn.session_state import update as pin` is exactly the
+    aliased write `_module_bindings` exists to resolve.
+    """
+    bound: set[str] = set()
+    args = getattr(scope, "args", None)
+    if args is not None:
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                    args.vararg, args.kwarg):
+            if arg is not None:
+                bound.add(arg.arg)
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+    imported = {alias.asname or alias.name.split(".")[0]
+                for node in ast.walk(scope)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                for alias in node.names}
+    return frozenset(bound - imported)
+
+
+def _invoked_callees(fn: ast.AST, module: str,
+                     bindings: dict[str, dict[str, str]]) -> set[str]:
+    """The canonical callees *fn* can actually invoke.
+
+    A nested `def`/`lambda` is a scope of its OWN, folded in only when some
+    reached scope calls it by name (transitively, so a chain of nested helpers
+    still counts). Attributing an UNCALLED nested writer to its enclosing
+    function classified a handler that cannot write the pin, and over-detection
+    is not the benign direction here -- see the LIMIT above. An immediately
+    applied lambda IS invoked, so it is folded in; a lambda stored and called
+    through the value is a call through a value, the stated limit.
+    """
+    nested: dict[str, ast.AST] = {}
+    raw: dict[str, set[str]] = {}
+
+    def collect(scope: ast.AST, key: str) -> None:
+        found: set[str] = set()
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                nested[node.name] = node
+                collect(node, node.name)
+                continue
+            if isinstance(node, ast.Call):
+                dotted = _dotted_callee(node.func)
+                if dotted:
+                    found.add(dotted)
+                if isinstance(node.func, ast.Lambda):
+                    pending.extend(ast.iter_child_nodes(node.func))
+            elif isinstance(node, ast.Lambda):
+                continue
+            pending.extend(ast.iter_child_nodes(node))
+        raw[key] = found
+
+    collect(fn, "")
+    reached, frontier = {""}, [""]
+    while frontier:
+        for name in raw[frontier.pop()] & nested.keys():
+            if name not in reached:
+                reached.add(name)
+                frontier.append(name)
+    # A nested `def` also SHADOWS a module-level name it repeats, so a bare call
+    # to it must not resolve to the module-level function of that name.
+    shadowed = _bound_names(fn) | nested.keys()
+    return {_canonical(dotted, module, bindings)
+            for key in reached for dotted in raw[key]
+            if dotted.split(".")[0] not in shadowed}
+
+
 def _pin_writing_functions(sources: dict[str, str]) -> frozenset[str]:
     """Module-qualified names of every function in *sources* that reaches the
     pin writer -- directly, or through a chain of calls the corpus resolves.
@@ -502,11 +600,7 @@ def _pin_writing_functions(sources: dict[str, str]) -> frozenset[str]:
     calls: dict[str, set[str]] = {}
     for module, tree in trees.items():
         for qualname, fn in _corpus_functions(tree):
-            calls[f"{module}.{qualname}"] = {
-                _canonical(dotted, module, bindings)
-                for node in ast.walk(fn) if isinstance(node, ast.Call)
-                for dotted in [_dotted_callee(node.func)] if dotted
-            }
+            calls[f"{module}.{qualname}"] = _invoked_callees(fn, module, bindings)
     writers = {name for name, targets in calls.items() if _PIN_WRITER in targets}
     while True:
         reaching = {name for name, targets in calls.items()
@@ -547,7 +641,12 @@ def test_the_sticky_pin_writer_is_matched_by_identity_not_by_name():
     because the real tree not having them today is why both cuts looked right.
     """
     writers = _pin_writing_functions({
-        "bn.session_state": "def update(**fields):\n    return fields\n",
+        # The real module's shape: a public wrapper over the function that
+        # performs the write, which is what `_PIN_WRITER` seeds on.
+        "bn.session_state": ("def update(**fields):\n"
+                             "    _atomic_write(fields)\n"
+                             "def _atomic_write(state):\n"
+                             "    pass\n"),
         "bn.commands.admin": (
             "from bn import session_state\n"
             "def pin(selector):\n"
@@ -566,7 +665,10 @@ def test_the_sticky_pin_writer_is_matched_by_identity_not_by_name():
         ),
     })
     assert writers == {
-        # the direct write...
+        # the wrapper in the pin module itself, which is what makes reaching
+        # `update` reach the write...
+        "bn.session_state.update",
+        # ...the direct write...
         "bn.commands.admin.pin",
         # ...the wrapper that reaches it...
         "bn.commands.admin.wrapper",
@@ -576,6 +678,101 @@ def test_the_sticky_pin_writer_is_matched_by_identity_not_by_name():
         # bn.commands.admin.unrelated (an attribute chain on a parameter that
         # merely ends in the writer's two names).
     }, sorted(writers)
+
+
+# The pin module as the real one is shaped: the public entry point and the
+# function that performs the write. Shared by the cells below so a corpus cannot
+# quietly disagree with the seed about which of the two is the writer.
+_PIN_MODULE = ("def update(**fields):\n"
+               "    _atomic_write(fields)\n"
+               "def _atomic_write(state):\n"
+               "    pass\n")
+
+
+@pytest.mark.parametrize("detected,body", [
+    # --- DETECTED ---
+    pytest.param(True, "def h(a):\n    session_state.update(target=a)\n",
+                 id="a-plain-dotted-write"),
+    # The direction round 15 measured the old one-line residual wrong about: a
+    # call straight to the function that writes the file, made through a plain
+    # NAME, which the old seed (`update`, the wrapper) could not see at all.
+    pytest.param(True, "def h(a):\n    session_state._atomic_write({'target': a})\n",
+                 id="a-write-that-skips-the-wrapper"),
+    pytest.param(True, ("def h(a):\n"
+                        "    def inner():\n"
+                        "        session_state.update(target=a)\n"
+                        "    inner()\n"),
+                 id="a-nested-scope-the-body-invokes"),
+    pytest.param(True, ("def h(a):\n"
+                        "    def outer():\n"
+                        "        def deeper():\n"
+                        "            session_state.update(target=a)\n"
+                        "        deeper()\n"
+                        "    outer()\n"),
+                 id="a-chain-of-invoked-nested-scopes"),
+    pytest.param(True, "def h(a):\n    (lambda: session_state.update(target=a))()\n",
+                 id="an-immediately-applied-lambda"),
+    # --- NOT DETECTED ---
+    # The other direction it was wrong about: two shapes that CANNOT write the
+    # pin and were classified as writers, which forces an unrelated command into
+    # INDEX_EXEMPT_STICKY and drops it from the index requirement.
+    pytest.param(False, ("def h(a):\n"
+                         "    def never():\n"
+                         "        session_state.update(target=a)\n"
+                         "    return 0\n"),
+                 id="a-nested-scope-nothing-invokes"),
+    pytest.param(False, "def h(session_state):\n    return session_state.update(1)\n",
+                 id="a-parameter-shadowing-the-module"),
+    # ...and the limit that remains stated: resolution is by REFERENCE, so a
+    # call made through a value is not visible in the source.
+    pytest.param(False, ("def h(a):\n"
+                         "    writer = session_state.update\n"
+                         "    writer(target=a)\n"),
+                 id="a-call-through-a-value"),
+    pytest.param(False, "def h(a):\n    getattr(session_state, 'update')(target=a)\n",
+                 id="a-call-through-getattr"),
+])
+def test_the_pin_writer_resolution_states_its_limit_in_both_directions(
+        detected: bool, body: str):
+    """The residual limit above, executed in both directions.
+
+    Round 15 measured the previous one-line residual ("a call made through a
+    value instead of a name ... never an unrelated command being parked here")
+    false BOTH ways: it missed a write made through a plain dotted name, and it
+    classified two shapes that cannot write the pin at all. A residual wrong in
+    both directions is worse than an unstated one, because a reader trusts it to
+    bound the failure mode -- so each side of the restated limit is a parameter
+    here, and a resolver that drifts either way reds the parameter that names
+    the drift.
+    """
+    writers = _pin_writing_functions({
+        "bn.session_state": _PIN_MODULE,
+        "bn.commands.admin": f"from bn import session_state\n{body}",
+    })
+    assert ("bn.commands.admin.h" in writers) is detected, sorted(writers)
+
+
+def test_nothing_outside_the_pin_module_can_reach_the_pin_file():
+    """The half of the restated limit a corpus cannot check.
+
+    The resolver seeds on ONE function, so a second route to the pin file --
+    another module resolving `session_state_path()` and writing it itself --
+    would be invisible to every cell above while a new sticky-pin command went
+    unexempted. That route does not exist, and this is what makes "not detected"
+    a fact about the tree rather than a hope: the path helper is referenced only
+    by the module that defines it and the module that owns the pin.
+    """
+    root = SKILL.parents[2] / "src" / "bn"
+    reached = sorted(
+        _module_name(path, root) for path in sorted(root.rglob("*.py"))
+        if "session_state_path" in path.read_text(encoding="utf-8")
+    )
+    assert reached == ["bn.paths", "bn.session_state"], (
+        "the sticky pin's path helper is referenced outside the module that "
+        f"defines it and the module that owns the pin: {reached}. Either route "
+        f"the write through {_PIN_WRITER} or widen the seed -- as it stands, a "
+        "pin-writing command there is invisible to the sticky exemption check"
+    )
 
 
 def test_every_index_exemption_states_a_reason_that_is_true(command_paths):

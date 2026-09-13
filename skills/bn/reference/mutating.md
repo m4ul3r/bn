@@ -60,12 +60,25 @@ in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cos
 | full detail written to a file | `--out detail.json` (stdout keeps a small envelope) |
 
 `--format` picks the medium; `--verbose`/`--summary` pick the detail level. No
-combination changes the exit code (each computes it from the same full result):
+combination changes how the outcome is CLASSIFIED (each classifies the same
+full result, before anything is rendered):
 0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a
 response this CLI cannot parse) / 3 a mutation status `verification_failed`,
 `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
 unmeasured success (`measured: false` — applied but unverifiable; see
 "Unmeasured mutations").
+
+An output flag cannot reclassify the outcome, but it CAN fail to deliver, and
+that is the divergence. The classification is made before any output is
+produced, so a combination asking for output this CLI cannot deliver
+reports the documented `2` instead — an `--out` destination it cannot write, or
+a reply too deeply nested for `--format json`/`ndjson` to serialize. The
+default status line prints named fields and never walks such a reply, so the
+same response exits `0` there. The divergence moves in a single direction: an
+undeliverable output replaces the code with 2 and can never turn a failed or an
+unmeasured mutation into a clean zero. So a 2 on a mutation says the *requested
+output* did not arrive, not that the write did not land — re-read the view
+before concluding anything about the write itself.
 
 ### Compact status keys
 

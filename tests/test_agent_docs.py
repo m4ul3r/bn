@@ -10,9 +10,12 @@ and an exit-code list that silently falls behind `FAILED_MUTATION_STATUSES`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import os
 import re
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -340,6 +343,16 @@ _EXIT_CODE_ECHOES = (
      r"so a clean run is exit `(?P<code>\d)`, not the unmeasured `4`", "own-summary"),
     ("skills/bn/reference/mutating.md", "unsupported-op-kind",
      r"either way exit (?P<code>\d), and a", "failing"),
+    # Round 15 measured the "No combination changes the exit code" sentence FALSE
+    # (#716): the same reply exits 0 on the default status line and 2 when the
+    # requested output cannot be delivered. The sentence now states the
+    # divergence, and these two echoes measure BOTH of its digits by running the
+    # command -- the divergence lives strictly after the classification, so
+    # asking `_mutation_exit_code` for it would quote the doc back at itself.
+    ("skills/bn/reference/mutating.md", "undeliverable-output-is-2",
+     r"reports the documented `(?P<code>\d)` instead", "undeliverable-output"),
+    ("skills/bn/reference/mutating.md", "the-status-line-never-walks-it",
+     r"same response exits `(?P<code>\d)` there", "unserializable-reply-as-text"),
 )
 
 
@@ -374,6 +387,16 @@ _EXIT_CODE_PINS = (
      "response this CLI cannot parse) / 3 a mutation status `verification_failed`,\n"
      "`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an\n"
      "unmeasured success"),
+    # The direction of the one divergence, which is the part a $?-only consumer
+    # depends on: an output failure can only ever replace the code with 2.
+    # Behaviourally pinned by
+    # tests/test_cli_mutation.py::test_no_output_flag_can_turn_a_nonzero_classification_into_zero.
+    ("skills/bn/reference/mutating.md", "an-output-failure-only-moves-toward-2",
+     "undeliverable output replaces the code with 2 and can never turn a failed or an\n"
+     "unmeasured mutation into a clean zero."),
+    ("skills/bn/reference/mutating.md", "a-2-does-not-mean-the-write-missed",
+     "So a 2 on a mutation says the *requested\n"
+     "output* did not arrive, not that the write did not land"),
     ("skills/bn/reference/reading.md", "bounded-slice-is-a-success",
      "a provably-bounded constant length (a success, exit 0)"),
     # Found by widening the sweep to the whole agent-facing set: this doc states
@@ -558,7 +581,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "560d20bb",  # ("applied but unverifiable"), so a script that only checks `$?` 
         "5a40c289",  # Mutations print a **one-line status summary** by default:
         "5b35cedf",  # ... plus a ... can never verify: op ... would be judged
-        "6a54edaa",  # combination changes the exit code (each computes it from the sam
         "6f8e7c3f",  # - ... — the request was refused: a bad field *value*, a missing 
         "82ffca8f",  # pairing, since the two are almost always applied ...
         "87b64a1d",  # It is the one mutation whose bridge result reports the work thro
@@ -1121,9 +1143,63 @@ def test_the_non_claim_number_ledger_only_names_fenced_docs():
     )
 
 
+def _unserializable_reply() -> dict[str, object]:
+    """An ok, classifiable mutation reply that `json.dumps` cannot encode.
+
+    Depth is a property of the RESPONSE, and it is what makes the divergence
+    observable: the default status line prints named fields and never walks
+    this, while a machine format has to encode all of it."""
+    nested: dict[str, object] = {}
+    cursor = nested
+    for _ in range(100_000):
+        child: dict[str, object] = {}
+        cursor["next"] = child
+        cursor = child
+    return {"success": True, "committed": True,
+            "results": [{"status": "verified"}], "detail": nested}
+
+
+def _exit_code_of_a_run(argv: list[str], result: dict[str, object]) -> int:
+    """What `bn` really EXITS with for *argv* against a fixed bridge reply.
+
+    The two output-divergence echoes state a code no classifier call can
+    produce: that divergence lives strictly after the classification, in the
+    step that delivers the output. Asking `_mutation_exit_code` for it would
+    quote the document back at itself, so the command is run.
+    """
+    import bn.cli
+
+    reply = {"ok": True, "result": result}
+    original = bn.cli.send_request
+    bn.cli.send_request = lambda op, **kwargs: reply
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return bn.cli.main(argv)
+    finally:
+        bn.cli.send_request = original
+
+
+_RENAME_ARGV = ["symbol", "rename", "--target", "active", "sub_401000", "x"]
+
+
 def _exit_code_for(scenario: str) -> int:
     """What the CLI really returns for the scenario an echo describes."""
     from bn.cli import _mutation_exit_code
+
+    if scenario == "undeliverable-output":
+        # A destination that cannot exist: the parent path is a FILE. Chosen over
+        # a read-only directory because it needs no mode change to set up and
+        # none to clean up.
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp, "not-a-directory")
+            blocker.write_text("", encoding="utf-8")
+            return _exit_code_of_a_run(
+                [*_RENAME_ARGV, "--out", str(blocker / "detail.json")],
+                {"success": True, "committed": True,
+                 "results": [{"status": "verified"}]})
+    if scenario == "unserializable-reply-as-text":
+        return _exit_code_of_a_run(_RENAME_ARGV, _unserializable_reply())
 
     shapes = {
         "verified": ({"success": True, "committed": True,

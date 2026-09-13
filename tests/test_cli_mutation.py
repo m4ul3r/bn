@@ -1096,6 +1096,75 @@ def test_unmeasured_mutation_still_exits_four_in_verbose_mode(monkeypatch):
     assert rc == 4
 
 
+# The three classifications the mutation contract distinguishes, and the output
+# combinations the mutation reference tabulates. Both are the reference's own
+# lists, and this cell is the measurement behind the sentence there.
+_CLASSIFICATIONS = {
+    0: {"success": True, "committed": True, "results": [{"status": "verified"}]},
+    3: {"success": False, "committed": False,
+        "results": [{"status": "invalid_request"}]},
+    4: {"success": True, "committed": True, "results": []},
+}
+_OUTPUT_COMBINATIONS = {
+    "text": [],
+    "summary": ["--summary"],
+    "verbose": ["--verbose"],
+    "json": ["--format", "json"],
+    "ndjson": ["--format", "ndjson"],
+}
+
+
+@pytest.mark.parametrize("expected", sorted(_CLASSIFICATIONS))
+def test_no_output_flag_can_turn_a_nonzero_classification_into_zero(
+        monkeypatch, tmp_path, capsys, expected):
+    """The sentence `skills/bn/reference/mutating.md` states about output flags,
+    measured rather than asserted in prose.
+
+    Round 15 measured the old sentence -- "No combination changes the exit code"
+    -- FALSE: the same reply exits 0 under the default status line and 2 under
+    `--out` on a destination the CLI cannot write. The divergence is legitimate
+    (a command asked for a file it could not produce did not do what was asked,
+    and reporting 0 there would be the lie), so the DOC was the defect. What is
+    true, and what a `$?`-only consumer actually depends on, is the direction:
+    every deliverable combination reports the same classification, and an
+    undeliverable output can only replace it with the documented 2 -- never with
+    0.
+
+    Red under the repair that would make the doc's first sentence false again:
+    handing `_mutation_exit_code` its summary only on the compact path (so
+    `--verbose`/`--format json` lose the `measured` verdict) reds the `4` row.
+    """
+    result = _CLASSIFICATIONS[expected]
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, **kwargs):
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    argv = ["symbol", "rename", "--target", "active", "sub_401000", "x"]
+
+    deliverable = {
+        name: bn.cli.main([*argv, *flags])
+        for name, flags in _OUTPUT_COMBINATIONS.items()
+    }
+    deliverable["out"] = bn.cli.main(
+        [*argv, "--out", str(tmp_path / "detail.json")])
+    capsys.readouterr()
+    assert set(deliverable.values()) == {expected}, deliverable
+
+    # ...and the one divergence, in the one direction the doc allows: the parent
+    # of this destination is a FILE, so the write cannot land however the
+    # mutation itself was classified.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    undeliverable = bn.cli.main([*argv, "--out", str(blocker / "detail.json")])
+    assert "Failed to write --out file" in capsys.readouterr().err
+    assert undeliverable == 2, (
+        f"an undeliverable output must report the documented 2, not "
+        f"{undeliverable}"
+    )
+
+
 def test_invariant_guard_unmeasured_mutation_failure_still_exits_three(monkeypatch):
     """Ordering: an unmeasured envelope that also reports failure is a failure
     (exit 3), not "applied but unverifiable" (exit 4)."""
@@ -1802,11 +1871,18 @@ def _stores_holder(value: ast.expr, holders: set[str]) -> bool:
 #
 # What is actually load-bearing does not depend on any of this:
 #
-#   * `src/bn/cli.py` has ONE guarded boundary. Every transform the CLI receives
-#     is bound to the malformed-result rule there, once, before anything can
-#     invoke it -- so the shape of the later call site is irrelevant to whether
-#     it is guarded. The static properties police that boundary staying the only
-#     door; they are not the guarantee.
+#   * Every transform `cli.py` receives is bound to the malformed-result rule by
+#     the function that RECEIVES it, before anything can invoke it -- so the
+#     shape of the later call site is irrelevant to whether it is guarded. It is
+#     one RULE applied at every door, NOT one door: round 15 measured the
+#     earlier "ONE guarded boundary" phrasing false (the module carries ten
+#     `_guarded_transform` bindings across five receiving functions), and a
+#     reader auditing this disclosure against the source has to find what is
+#     actually there. The population that establishes it is not a list of those
+#     doors either -- `test_no_bridge_result_transform_leaves_cli_py_unguarded`
+#     quantifies over every parameter of every function in the module, so a new
+#     door that forgets to bind is a finding by existing. The static properties
+#     police that; they are not the guarantee.
 #   * `test_every_transform_parameter_of_call_survives_a_malformed_result` RUNS
 #     `main()` once per transform parameter with a transform that raises on a
 #     malformed result, and asserts the documented BridgeError and exit code
@@ -1814,9 +1890,9 @@ def _stores_holder(value: ast.expr, holders: set[str]) -> bool:
 #     by a syntactic form, and it is what proved one of the nine boundary
 #     bindings inert (an unmeasured `formatters.py` guard, routed to #722).
 #
-# An injection that defeats a BEHAVIOURAL cell, or that bypasses the one
-# boundary at RUNTIME, is a real finding. An injection that merely finds form
-# eight of the static sweep is this paragraph.
+# An injection that defeats a BEHAVIOURAL cell, or that bypasses a receiving
+# function's binding at RUNTIME, is a real finding. An injection that merely
+# finds form eight of the static sweep is this paragraph.
 
 
 def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -> set[str]:
@@ -2889,7 +2965,30 @@ def test_an_unhashable_escaped_status_exits_2_instead_of_tracebacking(monkeypatc
         assert bn.cli.main(["function", "list"]) == 2
 
 
-def test_an_unhashable_result_row_status_is_a_clean_bridge_error(monkeypatch, capsys):
+# The unreadable row status these cells send, kept next to the reason coercing
+# it is the wrong repair: `str()` of a structured status is not any member of
+# FAILED_MUTATION_STATUSES, so a row that SAID `verification_failed` and could
+# not be read would be classified "not a failure".
+_UNREADABLE_ROW_STATUS = {"kind": "verification_failed"}
+
+
+@pytest.mark.parametrize("argv,result", [
+    pytest.param(
+        ["go", "rename", "--target", "active"],
+        {"kind": "go_rename", "success": True, "committed": True,
+         "go_renamed_candidates": 1, "go_committed_count": 1,
+         "go_verified_count": 1, "results": [{"status": _UNREADABLE_ROW_STATUS}]},
+        id="own-summary-op",
+    ),
+    pytest.param(
+        ["symbol", "rename", "--target", "active", "sub_401000", "x"],
+        {"success": True, "committed": True,
+         "results": [{"status": _UNREADABLE_ROW_STATUS}]},
+        id="generic-summary-op",
+    ),
+])
+def test_an_unhashable_result_row_status_is_a_clean_bridge_error(
+        monkeypatch, capsys, argv, result):
     """The SAME shape one boundary in, where the answer is deliberately
     different and must stay that way.
 
@@ -2901,14 +3000,27 @@ def test_an_unhashable_result_row_status_is_a_clean_bridge_error(monkeypatch, ca
     silently reclassify a row this CLI could not read as NOT a failure, letting
     an unreadable mutation response continue toward exit 0 or 4. That is exactly
     what the function's docstring refuses to do.
+
+    `own-summary-op` is the parameter that makes this a pin instead of an
+    advertisement, and it exists because the `generic-summary-op` one ALONE was
+    vacuous: `symbol rename` renders through `_mutation_summary`, which raises on
+    the same unreadable row by itself, so exit 2 arrived with the coercion in
+    place as readily as without it. `go rename` registers its own summary over
+    its own counters and never reads `results[]` on a success, so
+    `_mutation_reports_failure` is the ONLY reader of the row: coercing it made
+    this command exit 0 and print `committed changed=1 ... failed=0` over a row
+    that said `verification_failed`. Both parameters are kept -- one pins the
+    generic path's answer, the other detects the change the docstring forbids.
     """
+    # The premise, executed: coercion really would classify this row as clean.
+    assert str(_UNREADABLE_ROW_STATUS) not in bn.cli.FAILED_MUTATION_STATUSES
+
     def fake_send_request(op, *, params=None, target=None, timeout=30.0,
                           instance_id=None, **kwargs):
-        return {"ok": True, "result": {"success": True, "committed": True,
-                                       "results": [{"status": {"kind": "verified"}}]}}
+        return {"ok": True, "result": result}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
-    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x"])
+    rc = bn.cli.main(argv)
     assert rc == 2
     assert "classify the mutation result" in capsys.readouterr().err
 
