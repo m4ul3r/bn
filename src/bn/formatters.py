@@ -465,8 +465,8 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
 
     # Surface unlifted instructions (#206) -- a function whose computation BN
     # couldn't model otherwise reads as fully analyzed.
-    unimpl = value.get("unimplemented_instructions")
-    if isinstance(unimpl, dict) and unimpl.get("count"):
+    unimpl = _field_dict(value, "unimplemented_instructions")
+    if unimpl.get("count"):
         addrs = _field_list(unimpl, "addresses")
         shown = ", ".join(addrs)
         if unimpl.get("truncated"):
@@ -497,8 +497,12 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         else:
             lines.append("locals: none")
 
-    blocks = value.get("blocks")
-    if isinstance(blocks, list):
+    # PRESENT through the choke point: a present-but-wrong-shaped `blocks`
+    # dropped the whole block listing, so a huge dispatcher rendered exactly
+    # like a function whose blocks were never reported (#619). A present-and-
+    # EMPTY list still prints the section, the way base printed it.
+    blocks = _field_list(value, "blocks")
+    if _field_present(value, "blocks"):
         # #653.10: block ranges make a huge dispatcher readable a region at a time
         # (`disasm --linear <start>` / `--lines` once you know where you are)
         # instead of forcing a 6000-line decompile first.
@@ -1626,13 +1630,13 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         lines.insert(1, "")
     # Ambiguous same-name collision (thunk/real): surface the note so a zero-caller
     # member is never mistaken for dead code (#220).
-    amb = value.get("ambiguous_symbol")
-    if isinstance(amb, dict) and amb.get("note"):
+    amb = _field_dict(value, "ambiguous_symbol")
+    if amb.get("note"):
         lines.insert(0, f"note: {amb['note']}")
         lines.insert(1, "")
     # Data-symbol resolution fallback (#224b).
-    rsym = value.get("resolved_symbol")
-    if isinstance(rsym, dict) and rsym.get("kind") == "data":
+    rsym = _field_dict(value, "resolved_symbol")
+    if rsym.get("kind") == "data":
         lines.insert(0, f"note: resolved '{rsym.get('name')}' as a data symbol @ {rsym.get('address')}")
         lines.insert(1, "")
     lines.extend(_render_group(code_refs, total_code, "code refs"))
@@ -1683,8 +1687,7 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines = [f"xrefs to {value.get('address', '<unknown>')}"]
-    target_context = value.get("target_context")
-    suffix = _context_suffix(target_context)
+    suffix = _context_suffix(_field_dict(value, "target_context"))
     if suffix:
         lines.append(f"target{suffix}")
 
@@ -2935,8 +2938,9 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = _field_list(value, "reached_sinks")
         lines.append(_taint_forward_verdict(value))
-        if not findings and value.get("diagnostics"):
-            lines.extend(_render_forward_diagnostics(value["diagnostics"]))
+        diagnostics = _field_dict(value, "diagnostics")
+        if not findings and diagnostics:
+            lines.extend(_render_forward_diagnostics(diagnostics))
         if findings:
             lines.append("")
             lines.append(f"flows ({len(findings)}):")
@@ -3018,8 +3022,8 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             for s in unseeded:
                 lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
 
-    by_source = value.get("by_source")
-    if direction == "forward" and isinstance(by_source, dict) and by_source:
+    by_source = _field_dict(value, "by_source")
+    if direction == "forward" and by_source:
         lines.append("")
         lines.append(f"PER-SOURCE ({len(by_source)} call site(s)):")
         for addr, br in by_source.items():
@@ -3049,7 +3053,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
-    msrc = _render_model_sources(value.get("model_sources"))
+    msrc = _render_model_sources(_field_list(value, "model_sources"))
     if msrc:
         lines.append("")
         lines.append(msrc)
@@ -4442,7 +4446,15 @@ def _render_one_class(rec: Any) -> str:
     # (#619). Not a choke-point read: a scalar is a legitimate shape here, not a
     # skew, so every PRESENT value renders rather than disclosing.
     size = rec.get("size")
-    size_s = size.get("value") if isinstance(size, dict) else size
+    if isinstance(size, dict):
+        # An envelope that carries no `value` still CLAIMED a size, so it
+        # renders `?` rather than vanishing: dropping it made the card
+        # byte-identical to a class whose size was never stated (#619).
+        size_s = size.get("value")
+        if size_s is None:
+            size_s = "?"
+    else:
+        size_s = size
     # Through the choke point, so a malformed `vtable` container discloses
     # itself instead of rendering byte-identically to a class that simply has
     # none -- the cluster #619 names. `{}` is what absent and malformed both

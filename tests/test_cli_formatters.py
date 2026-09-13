@@ -1279,12 +1279,48 @@ def _container_key_decisions():
             return node.left.value
         return None
 
-    membership, before_read = [], []
+    def answers_presence(node):
+        """Is this expression an ANSWER to "is this field there?" -- as opposed to
+        a value, or a classification of a value?
+
+        `bool(<lookup>)`, `<lookup> is None`, `<lookup> is not None` and
+        `"<key>" in <mapping>` all are. `kind in ("ctor", "dtor")` is NOT: the
+        right-hand side is a literal set of values, so it classifies a value
+        rather than testing a mapping for a field."""
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return answers_presence(node.operand)
+        if isinstance(node, ast.BoolOp):
+            return any(answers_presence(v) for v in node.values)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "bool" and node.args):
+            return raw_key(node.args[0]) is not None or answers_presence(node.args[0])
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            op, right = node.ops[0], node.comparators[0]
+            if (isinstance(op, (ast.In, ast.NotIn))
+                    and isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str)
+                    and not isinstance(right, (ast.Tuple, ast.List, ast.Set))):
+                return True
+            if (isinstance(op, (ast.Is, ast.IsNot)) and isinstance(right, ast.Constant)
+                    and right.value is None):
+                return raw_key(node.left) is not None
+        return False
+
+    membership, before_read, delegated = [], [], []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if fn.name in HELPERS:
             continue
+        # A second definition moved ONE FUNCTION AWAY. The two rules below are
+        # both intra-function and lexical, so a renderer that gates its recorded
+        # read on `_has_callees(value)` -- a helper that returns a raw presence
+        # answer -- passed both while being exactly the drift they exist to
+        # stop. The question, not the call site, is what may not be duplicated.
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Return) and node.value is not None \
+                    and answers_presence(node.value):
+                delegated.append((fn.name, ast.unparse(node)))
         first_read: dict[str, int] = {}
         for node in ast.walk(fn):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -1307,7 +1343,7 @@ def _container_key_decisions():
                     if key in first_read and getattr(sub, "lineno", 1 << 30) < first_read[key]:
                         before_read.append((fn.name, ast.unparse(sub)))
     assert container_keys, "no container key found -- the scan is blind"
-    return membership, before_read
+    return membership, before_read, delegated
 
 
 def test_exactly_the_choke_point_decides_what_present_means():
@@ -1327,8 +1363,16 @@ def test_exactly_the_choke_point_decides_what_present_means():
     AFTER that key's recorded read, because a branch that returns or skips first
     means the skew was never recorded and a malformed value renders as a
     confident result. That is precisely how the class-listing count-only
-    envelope stayed silent on a falsy wrong-shaped listing."""
-    membership, before_read = _container_key_decisions()
+    envelope stayed silent on a falsy wrong-shaped listing.
+
+    The third half -- and the reason the first two were not enough -- is that
+    both of those rules are intra-function and lexical, so the SAME second
+    definition simply moved one function away and passed: a helper
+    `def _has_callees(value): return bool(_as_dict(value).get("callees"))`, used
+    to gate the recorded read, is a second definition of PRESENT with a name on
+    it. What may not be duplicated is the QUESTION, not the call site, so no
+    function outside the choke point may RETURN a presence answer at all."""
+    membership, before_read, delegated = _container_key_decisions()
     assert not membership, (
         f"{len(membership)} raw `key in mapping` test(s) on a container key -- a "
         f"second definition of PRESENT that will drift from the helpers' one; "
@@ -1337,6 +1381,12 @@ def test_exactly_the_choke_point_decides_what_present_means():
         f"{len(before_read)} branch(es) decide on a container key BEFORE its "
         f"recorded read, so a malformed value there never reaches the "
         f"disclosure: {before_read[:6]}")
+    assert not delegated, (
+        f"{len(delegated)} function(s) outside the choke point RETURN a presence "
+        f"answer about a payload field, which is a second definition of PRESENT "
+        f"with a name on it -- the intra-function rules above cannot see it "
+        f"because it is one hop away; return _field_present/_field_declared's "
+        f"answer instead of re-deriving it: {delegated[:6]}")
 
 
 # Every spelling the guard sees, one probe module each, enumerated as DATA so the
@@ -1509,8 +1559,29 @@ _MALFORMED = {
 
 
 def _probe_renderers():
-    """Every renderer in the module, discovered by INSPECTING THE MODULE, not by
-    asking the coercion guard which functions it found a site in.
+    """Every renderer in the module, crossed with every combination of its
+    boolean flags. Discovered by INSPECTING THE MODULE, not by asking the
+    coercion guard which functions it found a site in.
+
+    The arity rule is ONE REQUIRED positional parameter -- the payload. An
+    earlier version required exactly one positional parameter FULL STOP, which
+    silently dropped six renderers that take a defaulted flag beside their
+    payload (`full`, `verbose`, `demangle`, `limit`, `prefer_caller_static`,
+    `inner_renderer`), five of them live top-level CLI text renderers. Their
+    top-level reads were then mis-filed as unreachable-nested. A signature
+    filter that quietly removes a renderer from the population is the same
+    defect as a population taken from the guard: it reports success over the
+    part it never examined.
+
+    The flags are probed at BOTH values rather than only their defaults,
+    because a flag gates whole blocks of reads (`--verbose` locals, `--full`
+    SSA paths) that the default call never reaches.
+
+    Exactly one function is excluded, by name and with its reason:
+    `_render_paged_list_text` takes its page key and its item renderer as
+    REQUIRED parameters, so the field it reads is an argument rather than a
+    property of the module, and every caller reaches it through a renderer that
+    is itself probed.
 
     A renderer that returns lines instead of a string is rendered the way its
     caller renders it, and one that is not itself a `@_discloses` boundary is
@@ -1519,6 +1590,8 @@ def _probe_renderers():
     Wrapping is not a shortcut past the property: the boundary drains what the
     CHOKE POINT recorded, so a coercion that bypasses the choke point still
     produces no note and still fails below."""
+    import itertools
+
     from bn import formatters
 
     out = []
@@ -1529,26 +1602,33 @@ def _probe_renderers():
         if not callable(fn):
             continue
         try:
-            params = inspect.signature(fn).parameters.values()
+            params = list(inspect.signature(fn).parameters.values())
         except (TypeError, ValueError):                    # pragma: no cover
             continue
         positional = [p for p in params
                       if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-        if len(positional) != 1:          # a row/column helper, not a payload renderer
-            continue
-        if hasattr(fn, "__wrapped__"):
-            out.append((name, fn))
-            continue
+        if len([p for p in positional if p.default is p.empty]) != 1:
+            continue                       # not a payload renderer; see docstring
+        flags = [p.name for p in params
+                 if p.default is not p.empty and isinstance(p.default, bool)]
+        for values in itertools.product((False, True), repeat=len(flags)):
+            kwargs = dict(zip(flags, values))
+            label = name + ("" if not kwargs else
+                            "(" + ", ".join(f"{k}={v}" for k, v in kwargs.items()) + ")")
 
-        def as_text(payload, _fn=fn):
-            rendered = _fn(payload)
-            if isinstance(rendered, str):
-                return rendered
-            if isinstance(rendered, (list, tuple)):
-                return "\n".join(str(line) for line in rendered)
-            return str(rendered)
+            def call(payload, _fn=fn, _kwargs=kwargs):
+                rendered = _fn(payload, **_kwargs)
+                if isinstance(rendered, str):
+                    return rendered
+                if isinstance(rendered, (list, tuple)):
+                    return "\n".join(str(line) for line in rendered)
+                return str(rendered)
 
-        out.append((name, formatters._discloses(as_text)))
+            # An already-decorated renderer appends its own note from inside
+            # `call`; an undecorated helper needs the boundary its caller
+            # supplies in production.
+            out.append((label, call if hasattr(fn, "__wrapped__")
+                        else formatters._discloses(call)))
     return out
 
 
@@ -1712,12 +1792,52 @@ def _render_or_exception(render, payload):
 
 
 @functools.lru_cache(maxsize=1)
+def _comparison_constants():
+    """Per function, every constant the module COMPARES a value against.
+
+    Test inputs, not a population. A read behind `if rec.get("confidence") ==
+    "rtti":` only happens when that exact string is in the payload, so the probe
+    needs the string -- and the module itself is where the string lives, which
+    means a NEW value-gated branch brings its own opener with it instead of
+    waiting for someone to notice and hand-add a filler. `==`, `!=`, `is`,
+    `in` and `not in` all count, and a tuple/list/set on either side is
+    unpacked, so `in ("ctor", "dtor")` yields both."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    out: dict[str, tuple] = {}
+    for fn in ast.walk(ast.parse(inspect.getsource(formatters))):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        found: list = []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Compare):
+                continue
+            for side in (node.left, *node.comparators):
+                parts = (side.elts if isinstance(side, (ast.Tuple, ast.List, ast.Set))
+                         else [side])
+                for part in parts:
+                    if (isinstance(part, ast.Constant)
+                            and isinstance(part.value, (str, int, bool))
+                            and part.value not in found):
+                        found.append(part.value)
+        out[fn.name] = tuple(found)
+    return out
+
+
+def _comparison_literals(fn_name):
+    return _comparison_constants().get(fn_name, ())
+
+
+@functools.lru_cache(maxsize=1)
 def _runtime_population():
     """THE differential's population: every `(renderer, key)` the module reads at
     RUNTIME, the container kind observed at that read, and the payload context
     the read happens in.
 
-    Three things it deliberately does not do:
+    Four things it deliberately does not do:
 
     * It does not ask `_coercion_sites()` anything. The AST guard has declared
       blind spots (`_GUARD_BLIND`), and a population taken from it cannot fail
@@ -1731,7 +1851,19 @@ def _runtime_population():
     * It does not assume a key is readable in an empty payload. The context is
       the one the read was OBSERVED in, so a key behind a mutually exclusive
       branch (a resolved `function` hides the `context` fallback) is probed in
-      the payload that reaches it rather than being silently skipped."""
+      the payload that reaches it rather than being silently skipped.
+    * It does not assume a branch opens for a container. A read behind
+      `if rec.get("confidence") == "rtti":` needs that exact STRING to be
+      present, so the fillers include every constant the module compares
+      against, harvested per function from the module's own AST
+      (`_comparison_literals`). That harvest supplies test INPUTS, not the
+      population -- the population is still only what a renderer was observed
+      reading -- and it grows by itself: a new value-gated branch brings its own
+      opener with it.
+
+    What it still cannot open, stated rather than implied: a branch gated on a
+    value that appears nowhere as a literal in the module (a computed threshold,
+    a value copied out of another field, a length test)."""
     from bn import formatters
 
     real_json = formatters.json
@@ -1739,10 +1871,21 @@ def _runtime_population():
     try:
         population = []
         for name, render in _probe_renderers():
+            literals = _comparison_literals(name.split("(")[0])
             seen: set[str] = set()
             for _ in range(6):                        # fixed point: gated branches open
                 before = frozenset(seen)
-                for filler in (None, "list", "dict"):
+                fillers = [None, "list", "dict"]
+                for filler in fillers:
+                    ctx = {k: copy.deepcopy(_PROBE_WELL_FORMED[filler]) for k in sorted(seen)}
+                    _render_or_exception(render, _KeyProbe(ctx, seen))
+                # Value-gated branches: one pass per harvested constant, that
+                # constant in every slot, so a read behind an equality test on
+                # it is reached and enters the population.
+                for literal in literals:
+                    ctx = {k: literal for k in sorted(seen)}
+                    _render_or_exception(render, _KeyProbe(ctx, seen))
+                for filler in fillers:
                     ctx = {k: copy.deepcopy(_PROBE_WELL_FORMED[filler]) for k in sorted(seen)}
                     _render_or_exception(render, _KeyProbe(ctx, seen))
                 if frozenset(seen) == before:
@@ -1768,7 +1911,9 @@ def _runtime_population():
                                  for k in keys if k != key},
                                 {k: copy.deepcopy(_PROBE_WELL_FORMED["dict"])
                                  for k in keys if k != key},
-                                {k: "probe" for k in keys if k != key}]
+                                {k: "probe" for k in keys if k != key},
+                                *({k: literal for k in keys if k != key}
+                                  for literal in literals)]
                     observed = None
                     for ctx in contexts:
                         for kind in ("list", "dict"):
@@ -1808,7 +1953,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (85, 73, 385, 125), (
+    assert (probed, len(reading), len(population), len(containers)) == (98, 84, 507, 190), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -1818,7 +1963,7 @@ def test_the_runtime_population_is_exactly_this_big():
         "which is the failure this assertion exists to make visible.")
 
 
-def test_the_container_probe_misses_exactly_one_top_level_read():
+def test_the_container_probe_misses_exactly_three_top_level_reads():
     """What the runtime probe CANNOT classify, named rather than left as a
     number. The round-7 differential said "consumed under-detects at 18 of 92
     sites" and stopped there, which is an unexplained hole; this is the same
@@ -1832,14 +1977,17 @@ def test_the_container_probe_misses_exactly_one_top_level_read():
 
     Two gaps, both structural and both stated exactly:
 
-    * `_render_defuse_text.other_versions` is read at top level but not
-      classified, because its ONLY use is `if others:` followed by `{others}` in
-      an f-string. Truthiness is deliberately not counted as container use -- a
-      list and a scalar are indistinguishable under `bool()`, and counting it
-      reported 936 scalar fields as containers -- and `__repr__` does not walk
-      the object. It is still swept for raises, and its skew still discloses
-      through the choke point; it is only outside the disclosure differential.
-    * 91 of the 194 declared reads sit where a TOP-LEVEL key probe cannot reach
+    * Three top-level reads are not CLASSIFIED, and all three for one reason:
+      the container's contents reach the output only by INTERPOLATION --
+      `f"(tainted arg(s) {args})"`, `f"... {others}"` -- never by a walk.
+      `__repr__` does not go through `__iter__`, and truthiness is deliberately
+      not counted either, because `bool()` cannot tell a list from a scalar and
+      counting it reported 936 scalar fields as containers. They are
+      `_render_defuse_text.other_versions`, `_render_leaf_line.dropped_args`
+      and `_render_leaf_line.tainted_args`. All three are still swept for
+      raises, and all three still DISCLOSE a skew, because they read through the
+      choke point; they are only outside the disclosure differential.
+    * The remaining declared reads sit where a TOP-LEVEL key probe cannot reach
       them: a key of a callee ROW, a per-block `insns`, a flow's `leaves`, or a
       read inside a helper that is handed a nested object rather than the
       renderer's payload. Those are covered by the named nested tests above.
@@ -1864,18 +2012,26 @@ def test_the_container_probe_misses_exactly_one_top_level_read():
                         declared.add((fn.name, arg.value))
 
     population = _runtime_population()
-    classified = {(name, key) for name, _, key, kind, _ in population if kind is not None}
-    read = {(name, key) for name, _, key, _, _ in population}
+    # A population label carries the flag combination it was probed under
+    # (`_render_taint_text(full=True)`); the module's AST knows only the
+    # function name, so compare on that.
+    def fn_of(label):
+        return label.split("(")[0]
+    classified = {(fn_of(name), key) for name, _, key, kind, _ in population
+                  if kind is not None}
+    read = {(fn_of(name), key) for name, _, key, _, _ in population}
     missed = sorted(f"{name}.{key}" for name, key in declared - classified
                     if (name, key) in read)
     nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 194, f"the module declares {len(declared)} choke-point reads, not 194"
-    assert missed == ["_render_defuse_text.other_versions"], (
+    assert len(declared) == 202, f"the module declares {len(declared)} choke-point reads, not 202"
+    assert missed == ["_render_defuse_text.other_versions",
+                      "_render_leaf_line.dropped_args",
+                      "_render_leaf_line.tainted_args"], (
         "a choke-point read the probe reaches at top level is no longer "
         f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 91, (
+    assert len(nested) == 72, (
         f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 91")
+        "reach them, not 72")
 
 
 def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
@@ -1931,7 +2087,6 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
                     f"disclosure -- an unusable payload reading as a confident result")
             else:
                 visible.add(f"{fn_name}.{key}")
-    assert checked == 750, f"the differential ran {checked} cases, not 750"
     assert not absorbed, absorbed[:8]
     # The residue: PRESENT, rendered visibly, not disclosed. Legitimate only for
     # a union-typed field, where a scalar is a real shape and not a skew. Pinned
@@ -1939,6 +2094,9 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     assert sorted(visible) == ["_render_class_show_text.size", "_render_one_class.size"], (
         "a field renders a wrong-shaped container visibly but without disclosing; "
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
+    # Last, so a real absorption reports itself rather than being masked by the
+    # anti-vacuity count it also changes.
+    assert checked == 1140, f"the differential ran {checked} cases, not 1140"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -1960,7 +2118,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
                 raised.append(f"{fn_name}({key}={bogus!r}) raised "
                               f"{type(out).__name__} where the absent payload "
                               f"rendered cleanly")
-    assert swept == 3080, f"the raise sweep ran {swept} renders, not 3080"
+    assert swept == 4056, f"the raise sweep ran {swept} renders, not 4056"
     assert not raised, raised[:8]
 
 
@@ -1996,7 +2154,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 895, f"the mirror ran {checked} renders, not 895"
+    assert checked == 1204, f"the mirror ran {checked} renders, not 1204"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
