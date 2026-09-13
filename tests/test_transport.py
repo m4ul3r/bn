@@ -2918,6 +2918,64 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # ---------------------------------------------------------------------------
 # #618 — registry socket confinement + spawn log-fd hygiene
 # ---------------------------------------------------------------------------
+#
+# INVENTORY — what in this section's subject is NOT held by anything here.
+#
+# Everything below pins a rule. This block names what does NOT, so the two
+# can be told apart without re-deriving it, and so a guard that can regress
+# silently is at least written down somewhere a maintainer will look. Both
+# lists were produced by mutating the guard and running the three fenced test
+# files (tests/test_transport.py, tests/test_paths.py, tests/test_cli_misc.py);
+# GREEN below means nothing in them would notice that guard breaking.
+#
+# UNPINNED GUARDS — three, and they do NOT carry the same risk:
+#
+#  1. `_load_instance`'s `expected_record=record_document` at all FOUR
+#     `_purge_stale_registry` callsites (the foreign-id, unconfined,
+#     missing-socket and dead-socket arms), which makes each arm destroy the
+#     document it JUDGED. Mutation: a callsite `path.read_bytes()`, green at
+#     each of the four individually and at all four together. DESTRUCTIVE
+#     direction: a legitimate re-spawn inside the loader's decision window
+#     loses its brand-new registry while its socket keeps serving. Detail
+#     block above
+#     `test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket`.
+#
+#  2. `_process_state`'s `rfind(b")")` comm-skip. Mutation: `find`, green.
+#     DESTRUCTIVE direction: a live owner whose executable basename contains
+#     `)` reads as a zombie, so a running bridge's record and log become
+#     litter. Detail block above
+#     `test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage`.
+#
+#  3. `owner_alive`'s zombie half, `process_state not in {"Z", "X", "x"}`.
+#     Mutation: drop it (`owner_alive = _process_alive(pid)`), green at 337
+#     passed, 1 skipped. This one fails SAFE, and that is the whole reason it
+#     is listed third rather than first: an unreaped zombie's owner then
+#     reads as ALIVE, so its record is RETAINED, not destroyed -- litter
+#     rather than data loss. Same category as 1 and 2, opposite risk; a
+#     reader who lumps all three together will misjudge which to pin first.
+#     The OTHER half of that same predicate -- reading an unknowable state as
+#     dead -- is pinned, and destructively, by
+#     `test_a_live_owner_whose_state_cannot_be_read_is_not_litter`.
+#
+# For 1 and 2 a pin was written, did not discriminate, and was deleted rather
+# than shipped with a docstring claiming a guard it does not hold; both are
+# ruled disclosed coverage gaps on the condition that they are named here. 3
+# was measured by a review lens and is recorded on the same terms.
+#
+# UNREACHABLE DEFENSIVE CODE — one category, not three notes scattered across
+# two files. No mutation can redden these because no input on this platform
+# reaches them; they stay as statements of the contract, and a green mutation
+# here is NOT evidence that the line is dead weight:
+#   - `_unlink_if_unchanged`'s `if expected is None: return False` -- the byte
+#     comparison below it also answers `False` for `None`.
+#   - `_unlink_if_unchanged`'s `ValueError` in `except (OSError, ValueError)`
+#     -- every `registry_path` that reaches it comes from a directory scan
+#     and can never carry an embedded NUL.
+#   - `_socket_path_is_confined`'s `TypeError` in
+#     `except (OSError, TypeError, ValueError)`, documented there as "an empty
+#     final component" -- on this Python `Path("/").parent.resolve() / ""`
+#     answers `/` instead of raising (measured on 3.14.2).
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("socket_is_live", [True, False])
