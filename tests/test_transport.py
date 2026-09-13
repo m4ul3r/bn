@@ -4511,11 +4511,17 @@ def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkey
 
     A socket that is bound but has not reached ``listen`` refuses connections
     exactly like a crashed bridge's leftover file, and every bridge passes
-    through that state on its way up. So the errno alone cannot authorise an
-    unlink: taken as proof that nothing is bound, it destroys a STARTING
-    bridge's own endpoint and leaves it serving on an unlinked inode -- the
-    failure this arm exists to prevent. The kernel's own account of which
-    paths are bound is what makes the answer conclusive.
+    through that state on its way up. So the errno alone cannot authorise
+    unlinking the SOCKET: taken as proof that nothing is bound, it destroys a
+    STARTING bridge's own endpoint and leaves it serving on an unlinked inode
+    -- the failure this arm exists to prevent. The kernel's own account of
+    which paths hold a socket is what makes that answer conclusive.
+
+    The record is a different object with a different question. A refused
+    connection does prove nothing is ACCEPTING here, and a record whose owner
+    is also gone can never serve again, so it goes -- the bridge coming up
+    writes its own. What must survive is the endpoint, because that is the
+    part nothing can recreate.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -4538,8 +4544,8 @@ def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkey
         assert not _socket_is_live(sock_path, timeout=0.2)    # refuses, as a leftover does
 
         assert list_instances() == []          # refused, exactly as before
-        assert sock_path.exists()              # but the endpoint survives
-        assert record.exists()
+        assert sock_path.exists()              # and the ENDPOINT survives
+        assert not record.exists()             # the dead owner's record does not
         starting.listen(1)                     # the bridge finishes coming up
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(0.5)
@@ -4548,12 +4554,19 @@ def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkey
         finally:
             client.close()
 
-        # A leftover nothing is bound to is still swept: same errno, different fact.
+        # A leftover nothing is bound to loses its socket too: same errno, the
+        # other fact. The record is re-written because the arm above already
+        # reclaimed it.
         starting.close()
         sock_path.unlink()
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(sock_path))
         stale.close()
+        record.write_text(
+            json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                         instance_id="starting")),
+            encoding="utf-8",
+        )
         assert list_instances() == []
         assert not record.exists()
         assert not sock_path.exists()
@@ -4705,3 +4718,125 @@ def test_gc_keeps_the_unreachable_handle_a_lifecycle_lookup_resolves(tmp_path, m
     from bn.transport import find_lifecycle_instance
 
     assert find_lifecycle_instance("orphaned") is not None
+
+
+def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp_path, monkeypatch):
+    """One probe was answering two questions, and the record paid for it.
+
+    A refused connection proves nothing is ACCEPTING at that name -- a serving
+    bridge answers ``EAGAIN`` when its backlog fills, never ``ECONNREFUSED`` --
+    and a record whose owner is also gone can therefore never serve again.
+    Whether the SOCKET may be unlinked is a different question about a
+    different object, and it needs the kernel. Gating both on the stronger fact
+    meant that on a platform with no ``/proc/net/unix`` a crashed bridge's
+    record, socket and log were retained permanently and invisibly, where base
+    reclaimed all three (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "crashed.sock"
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    leftover.bind(str(sock_path))
+    leftover.close()                       # a SIGKILLed bridge's leftover socket file
+    record = inst_dir / "crashed.json"
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="crashed")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "crashed.log"
+    log.write_text("bridge died\n", encoding="utf-8")
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    # No /proc/net/unix to read: the platform this PR has already shipped two
+    # defects to. The kernel cannot be asked, so the answer is UNKNOWABLE.
+    monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
+
+    assert list_instances() == []
+    assert not record.exists()             # the record goes on its own evidence
+    assert sock_path.exists()              # the socket keeps the benefit of the doubt
+
+    summary = gc_instances()               # explicit, lock-holding, operator-invoked
+
+    assert summary["sockets_removed"] == 1
+    assert summary["logs_removed"] == 1
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+
+
+def test_a_foreign_socket_cannot_veto_reclaiming_records_that_can_never_reach_it(tmp_path, monkeypatch):
+    """Retention has to be justified by an endpoint this code would USE.
+
+    A record whose ``socket_path`` is outside the cache is one discovery has
+    already decided it will never connect to, so whether something is bound
+    there says nothing about whether the record is a handle. Asking anyway let
+    one permanently-bound foreign socket pin unboundedly many records -- and
+    each pinned record pins its ``.log`` too. The foreign path is never probed
+    for permission and never touched.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    foreign = outside / "foreign.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(foreign))
+    server.listen(1)                       # bound, listening, and permanent
+    try:
+        for index in range(3):
+            sid = f"pinned{index}"
+            (inst_dir / f"{sid}.json").write_text(
+                json.dumps(_registry_payload(foreign, pid=os.getpid(), instance_id=sid)),
+                encoding="utf-8",
+            )
+            (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+
+        # Unresolvable on every path: normal discovery and the lifecycle lookup
+        # both refuse an unconfined record whose owner proves nothing.
+        assert list_instances() == []
+        assert list_instances(include_unreachable=True) == []
+
+        summary = gc_instances()
+
+        assert summary["registries_purged"] == 3
+        assert summary["logs_removed"] == 3
+        assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+        assert foreign.exists()            # the foreign endpoint is untouched
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(foreign))   # and still serving
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+
+
+def test_gc_names_every_path_it_removed_including_the_records(tmp_path, monkeypatch):
+    """A destructive action has to be visible in its own report.
+
+    ``removed`` is documented as the list of removed paths and is the only
+    per-path account the operator gets, so a reclaim that shows up in
+    ``registries_purged`` but not in ``removed`` hides the newest destructive
+    action behind a count.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    record = inst_dir / "gone.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "gone.sock", pid=os.getpid(),
+                                     instance_id="gone")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "gone.log"
+    log.write_text("x\n", encoding="utf-8")
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 1
+    assert str(record) in summary["removed"]
+    assert str(log) in summary["removed"]
+    assert len(summary["removed"]) == summary["registries_purged"] + summary["logs_removed"] \
+        + summary["sockets_removed"]

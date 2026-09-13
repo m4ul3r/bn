@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .paths import (
     bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
@@ -378,12 +378,13 @@ def _purge_stale_registry(
     Both halves destroy only what they can still see for themselves, because
     the caller's evidence is older than this call: the registry must still hold
     ``expected_record`` (see ``_unlink_if_unchanged``), and the socket must
-    answer a CONCLUSIVE probe taken here -- the last moment before the unlink,
-    rather than upstream where a re-spawn could bind over it afterwards. A
-    socket nothing proves dead, and a record no caller identified, are kept.
+    still be one nothing is bound to when asked HERE -- the last moment before
+    the unlink, rather than upstream where a re-spawn could bind over it
+    afterwards. A socket nothing proves unbound, and a record no caller
+    identified, are kept.
     """
     _unlink_if_unchanged(registry_path, expected_record)
-    if socket_path is not None and _socket_has_no_listener(socket_path, timeout=socket_timeout):
+    if socket_path is not None and _socket_probe(socket_path, timeout=socket_timeout).nothing_bound:
         with contextlib.suppress(OSError):
             socket_path.unlink()
 
@@ -440,32 +441,63 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
     return False
 
 
-def _socket_has_no_listener(socket_path: Path, timeout: float = 0.2) -> bool:
-    """Whether a failed probe PROVES nothing is bound to *socket_path*.
+class _SocketFacts(NamedTuple):
+    """What a probe of a socket path actually established, kept apart.
+
+    One probe was answering two questions for two different destructions, and
+    the record paid for the socket's stricter evidence: on a platform with no
+    ``/proc/net/unix`` a crashed bridge's record was retained forever because
+    its SOCKET could not be proved unbound. These are facts about different
+    objects and they need different strength, so they are returned separately
+    (#618).
+
+    ``nothing_accepting``
+        Nobody can be served at this name, and that is proof rather than an
+        absence: a bound and serving bridge answers ``EAGAIN`` once its accept
+        backlog fills, and a timeout says nothing at all, while a refused
+        connection or a missing path says nobody is accepting. This is what
+        makes a RECORD litter -- with its owner gone too, it can never serve
+        again, whatever is or is not at that path.
+    ``nothing_bound``
+        No socket holds the name at all, so the FILE is not an endpoint and may
+        be unlinked. ``ECONNREFUSED`` does not establish that: a socket bound
+        but not yet past ``listen`` refuses exactly like a crashed bridge's
+        leftover file, and every bridge passes through that state coming up. So
+        it takes the kernel's own list of bound paths, or a name that does not
+        exist -- a bound AF_UNIX socket always has a directory entry, which is
+        why that half needs no ``/proc``.
+    """
+
+    nothing_accepting: bool
+    nothing_bound: bool
+
+
+def _socket_probe(socket_path: Path, timeout: float = 0.2) -> _SocketFacts:
+    """Probe *socket_path* once and report both facts a failure establishes.
 
     ``_socket_is_live`` answers "can this be talked to right now", which is the
-    right question for routing and the wrong one for deleting: a bridge that is
-    bound and serving answers ``EAGAIN`` as soon as its accept backlog is full,
-    and a timeout says nothing at all. Measured on Linux: a listening socket
-    with a full backlog gives ``EAGAIN``, a missing path gives ``ENOENT``, and
-    ``ECONNREFUSED`` covers THREE states that have to be told apart -- a
+    right question for routing and the wrong one for deleting. Measured on this
+    kernel: a listening socket with a full backlog gives ``EAGAIN``, a missing
+    path gives ``ENOENT``, and ``ECONNREFUSED`` covers THREE states -- a
     crashed bridge's leftover file, a plain file that never was a socket, and a
-    socket that is bound but has not reached ``listen`` yet. The last one is a
-    bridge coming up, so the errno alone cannot authorise an unlink; only a
-    path that is already gone, or one the kernel says has no socket bound to
-    it, proves this is not an endpoint (#618).
+    socket bound but not yet listening. The first two are litter; the third is
+    a bridge coming up, which is why that errno can condemn the record but
+    never the socket.
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(str(socket_path))
-    except ConnectionRefusedError:
-        return _path_has_bound_socket(socket_path) is False
     except FileNotFoundError:
-        return True
+        return _SocketFacts(nothing_accepting=True, nothing_bound=True)
+    except ConnectionRefusedError:
+        return _SocketFacts(
+            nothing_accepting=True,
+            nothing_bound=_path_has_bound_socket(socket_path) is False,
+        )
     except OSError:
-        return False
-    return False
+        return _SocketFacts(nothing_accepting=False, nothing_bound=False)
+    return _SocketFacts(nothing_accepting=False, nothing_bound=False)
 
 
 def _socket_path_is_confined(socket_path: Path) -> bool:
@@ -712,22 +744,26 @@ def _load_instance(
         # This is the only arm that can unlink a socket that something may
         # still be BOUND to, and the probe that brought us here is the weakest
         # evidence in the file: a full accept backlog fails it on a bridge that
-        # is serving. So the record is refused on the shared evidence, and the
-        # unlink additionally requires the probe to be CONCLUSIVE -- a refused
-        # connection or a path already gone. Both halves of `record_is_litter`
-        # are inferences that can be wrong at once (a busy socket plus a pid
-        # this process cannot address), and that combination unlinked a live,
-        # listening socket (#618).
+        # is serving. So the record is refused on the shared evidence, and
+        # anything destroyed needs a probe that PROVES something -- both halves
+        # of `record_is_litter` are inferences that can be wrong at once (a busy
+        # socket plus a pid this process cannot address), and that combination
+        # unlinked a live, listening socket (#618).
         if record_is_litter:
             # Two probes, two different questions. This one decides whether
-            # anything here is litter at all: an inconclusive answer (a serving
-            # bridge whose accept backlog is full) leaves the record AND the
-            # socket alone. The sweep then asks again immediately before it
-            # unlinks, because this answer is already stale by then -- a
-            # re-spawn can bind over the name inside the window, and a
-            # conclusive answer about the file it replaced is not evidence
-            # about the one now bound (#618).
-            if _socket_has_no_listener(socket_path, timeout=socket_timeout):
+            # anything here is litter at all, and it asks for the fact that fits
+            # each object: nobody is ACCEPTING at this name, which -- with the
+            # owner gone -- means the RECORD can never serve again whatever is at
+            # that path, while the SOCKET additionally needs nothing to be bound
+            # to it (decided inside the sweep). An inconclusive answer, the
+            # serving bridge whose accept backlog is full, still leaves both
+            # alone. Gating the record on the socket's stricter fact retained a
+            # crashed bridge's record forever wherever the kernel cannot be
+            # asked. The sweep re-probes immediately before it unlinks, because
+            # this answer is already stale by then -- a re-spawn can bind over
+            # the name inside the window, and an answer about the file it
+            # replaced is not evidence about the one now bound (#618).
+            if _socket_probe(socket_path, timeout=socket_timeout).nothing_accepting:
                 _purge_stale_registry(
                     path,
                     socket_path,
@@ -858,7 +894,12 @@ def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path])
       reach the unlink below; and
     * nothing is bound to the socket it names, proved by the kernel rather than
       inferred from a refused connection -- a socket that is bound and has not
-      reached ``listen`` refuses one too.
+      reached ``listen`` refuses one too. That question is only asked about a
+      socket discovery would actually USE: for a path outside the cache the
+      loader has already refused to connect, so what is bound there says
+      nothing about whether this record is a handle, and asking anyway let one
+      permanently-bound foreign socket pin unboundedly many records and their
+      logs. An unconfined path is neither probed for permission nor touched.
 
     The last two checks are also what protects the window: ``resolvable`` was
     measured before this call, but a record that became somebody's handle
@@ -882,7 +923,8 @@ def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path])
     if not _registry_fields_are_well_formed(raw_socket_path, raw_pid,
                                             payload.get("instance_id")):
         return False
-    if not _nothing_is_bound_to(_record_socket_path(registry_path, raw_socket_path)):
+    socket_path = _record_socket_path(registry_path, raw_socket_path)
+    if _socket_path_is_confined(socket_path) and not _nothing_is_bound_to(socket_path):
         return False
     return _unlink_if_unchanged(registry_path, document)
 
@@ -940,7 +982,13 @@ def gc_instances() -> dict[str, Any]:
         for registry in sorted(inst_dir.glob("*.json")):
             _reclaim_unusable_registry(registry, resolvable)
         registries_after = set(inst_dir.glob("*.json"))
-        summary["registries_purged"] = len(registries_before - registries_after)
+        # ``removed`` is the only per-path account of this call, so a registry
+        # that went -- whether the liveness sweep took it or the reclaim above
+        # did -- is named here too. Reporting it as a count alone hid the
+        # newest destructive action behind a number (#618).
+        purged_registries = sorted(registries_before - registries_after)
+        summary["registries_purged"] = len(purged_registries)
+        summary["removed"].extend(str(p) for p in purged_registries)
         live_ids = {_registry_own_id(p) for p in registries_after}
         for entry in sorted(inst_dir.iterdir()):
             # Never touch the shared spawn lock or any surviving (live) registry.
