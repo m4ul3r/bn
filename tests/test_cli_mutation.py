@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import collections
 import functools
 import inspect
 import json
@@ -1370,8 +1371,13 @@ _CLI = REPO / "src" / "bn" / "cli.py"
 _GUARD = "_apply_result_transform"      # the rule
 _BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
 # The rule's own implementation is the one place a transform is invoked
-# directly; both halves are self-checked below rather than trusted.
-_RULE_FUNCTIONS = (_GUARD, _BOUNDARY)
+# directly, so it is the ONLY function the dispatch sweeps skip. The boundary
+# was skipped too, and that exemption was true of nothing: `_guarded_transform`
+# invokes no transform -- it closes over one and delegates to the rule -- so it
+# needed no exemption, and having one meant a raw `transform(probe)` injected
+# into the boundary itself was unreported, in the one function whose stated
+# purpose is that this cannot happen (round 13).
+_RULE_FUNCTIONS = (_GUARD,)
 # The ONE name cli.py may bind the string `"result"` to outside the unwrap
 # helper: the key it writes into a fan-out row. Round 8 made that name the
 # exemption, and the name itself then became the dodge -- `response.get(
@@ -1793,7 +1799,97 @@ def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -
             if node.value is not None and _stores_holder(node.value, holders):
                 slots |= {target.attr for target in targets
                           if isinstance(target, ast.Attribute)}
+                # `d["render"] = t` names a slot exactly as `d.render = t` does.
+                # Missing it is how `slots = globals(); slots["parked"] = t`
+                # paired with `globals()["parked"](result)` escaped: the two
+                # sides name the same container with different expressions, so
+                # no container-rooted rule can connect them -- the SLOT can.
+                slots |= {target.slice.value for target in targets
+                          if isinstance(target, ast.Subscript)
+                          and isinstance(target.slice, ast.Constant)
+                          and isinstance(target.slice.value, str)}
     return slots
+
+
+def _slot_dispatch_sites(fn, slots: frozenset[str], guarded_slots: frozenset[str]):
+    """Calls in *fn* dispatched through a slot name, whatever holds the slot.
+
+    The container-rooted rule needs the container to be in the population, and
+    a module namespace fetched by `globals()` in one function and by a local
+    alias in another is the same container under two expressions that no such
+    rule can relate. A SLOT is the relation: a name a holder was stored under
+    can be invoked through that name, so an invocation through an
+    unguarded-slot name is reported wherever it appears and whatever it hangs
+    off. Over-matching costs nothing -- a slot only exists because something
+    stored a holder under it.
+    """
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = None
+        if isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        elif (isinstance(node.func, ast.Subscript)
+              and isinstance(node.func.slice, ast.Constant)
+              and isinstance(node.func.slice.value, str)):
+            name = node.func.slice.value
+        if name in slots and name not in guarded_slots:
+            yield node, name
+
+
+def _guarded_slots(transforms: "_Transforms") -> frozenset[str]:
+    """Slots every store of which parks a value already bound to the rule.
+
+    A slot is only as safe as its worst store, so one unguarded store makes
+    every dispatch through that name a finding.
+    """
+    unguarded: set[str] = set()
+    for fn in _cli_functions():
+        holders = transforms.holders[id(fn)]
+        bound_at = transforms.guarded[id(fn)]
+        where = transforms.paths[id(fn)]
+        for targets, value, node, header in _bindings(fn):
+            if not _stores_holder(value, holders):
+                continue
+            names = {target.attr for target in targets
+                     if isinstance(target, ast.Attribute)}
+            names |= {target.slice.value for target in targets
+                      if isinstance(target, ast.Subscript)
+                      and isinstance(target.slice, ast.Constant)
+                      and isinstance(target.slice.value, str)}
+            if not names:
+                continue
+            use = where.get(id(node), ())
+            stored = _carried(value, holders)
+            if not stored or not all(
+                    any(_dominates(binding, use) for binding in bound_at.get(name, ()))
+                    for name in stored):
+                unguarded |= names
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            use = where.get(id(node), ())
+            for keyword in node.keywords:
+                if keyword.arg and _stores_holder(keyword.value, holders):
+                    stored = _carried(keyword.value, holders)
+                    if not stored or not all(
+                            any(_dominates(binding, use)
+                                for binding in bound_at.get(name, ()))
+                            for name in stored):
+                        unguarded.add(keyword.arg)
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            and _stores_holder(value, holders)):
+                        stored = _carried(value, holders)
+                        use = where.get(id(node), ())
+                        if not stored or not all(
+                                any(_dominates(binding, use)
+                                    for binding in bound_at.get(name, ()))
+                                for name in stored):
+                            unguarded.add(key.value)
+    return frozenset(transforms.slots) - frozenset(unguarded)
 
 
 def _module_scope_names() -> frozenset[str]:
@@ -1980,6 +2076,15 @@ def _dispatch_roots(expr: ast.expr, slots: frozenset[str]) -> set[str]:
         return {expr.id}
     if isinstance(expr, (ast.Subscript, ast.Starred)):
         return _dispatch_roots(expr.value, slots)
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        # `[t][0](result)` and `(t,)[0](result)` root in the DISPLAY, which used
+        # to root in nothing: a dict LOOKUP on a name was covered and a
+        # container built inline and subscripted was invisible (round 13).
+        return set().union(*(_dispatch_roots(element, slots)
+                             for element in expr.elts), set())
+    if isinstance(expr, ast.Dict):
+        return set().union(*(_dispatch_roots(value, slots)
+                             for value in expr.values if value is not None), set())
     if isinstance(expr, ast.Call):
         # `factory()(x)` dispatches through whatever the factory returns, and a
         # factory handed a holder can return it wrapped:
@@ -2065,8 +2170,18 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
 # disappearing reds too, because then the exemption is describing a module that
 # has moved on.
 _NOT_A_RESULT_TRANSFORM = {
-    "handler() in main()": ("handler",
-                            frozenset({"handler <- dict literal in decorator()"})),
+    "handler() in main()": ("handler", {
+        # The command registry parks the function `@_command` decorates...
+        "handler @ Expr in decorator()": 1,
+        # ...and the parser build hands each registered spec's own handler to
+        # argparse, which is the registry again, one layer out.
+        "handler @ Expr in _build_from_commands()": 1,
+        # ...and `main` READS it back off the parsed namespace. A read is in the
+        # coarse population too, because telling a read from a store is exactly
+        # the kind-specific reasoning that kept failing; declaring it is cheaper
+        # and it stale-fails the same way.
+        "handler @ AnnAssign in main()": 1,
+    }),
 }
 
 
@@ -2074,6 +2189,7 @@ def _dispatch_sites() -> list[str]:
     """Every `cli.py` call that dispatches a holder the boundary does not
     dominate, as `<callee>() in <function>()` plus its line."""
     transforms = _transform_holders()
+    guarded_slots = _guarded_slots(transforms)
     sites = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
@@ -2089,46 +2205,82 @@ def _dispatch_sites() -> list[str]:
             if any(not any(_dominates(binding, use) for binding in bound_at.get(name, ()))
                    for name in dispatched)
         ]
-    return sites
+        # ...and the same question asked of the SLOT rather than the container,
+        # which is what relates two expressions naming one namespace.
+        sites += [f"{_callee(node)}() in {fn.name}()|cli.py:{node.lineno}"
+                  for node, _slot in _slot_dispatch_sites(
+                      fn, transforms.slots, guarded_slots)]
+    return sorted(set(sites))
 
 
-def _slot_stores(slot: str) -> list[str]:
-    """Every place `cli.py` stores a holder under the attribute/key *slot*.
+def _own_statements(fn) -> list[ast.stmt]:
+    """Every statement *fn* itself contains, not those of a function nested in
+    it -- `_cli_functions()` lists a nested definition separately, so walking
+    the outer one attributed the same statement to both."""
+    owned: list[ast.stmt] = []
+    stack = list(fn.body)
+    while stack:
+        statement = stack.pop()
+        owned.append(statement)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for field in ("body", "orelse", "finalbody"):
+            stack += getattr(statement, field, []) or []
+        for handler in getattr(statement, "handlers", []):
+            stack += handler.body
+        for case in getattr(statement, "cases", []):
+            stack += case.body
+    return owned
 
-    Not just calls. `setattr(args, "handler", t)` was covered and the
-    semantically identical `args.handler = t` was not, so the reason forbade one
-    spelling of the thing it forbids (round 12).
+
+def _own_nodes(statement: ast.stmt):
+    """*statement* and the expressions that belong to IT, not to a statement
+    nested inside it -- `ast.walk` on a `def` drags in the whole body."""
+    yield statement
+    stack = [child for child in ast.iter_child_nodes(statement)
+             if not isinstance(child, ast.stmt)]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack += [child for child in ast.iter_child_nodes(node)
+                  if not isinstance(child, ast.stmt)]
+
+
+def _slot_traffic(slot: str) -> collections.Counter:
+    """Every STATEMENT of `cli.py` that both names *slot* and handles a holder.
+
+    Four storage kinds have defeated this sweep -- a module global, a dict
+    value, a class attribute, a subscript store -- and enumerating the kinds is
+    losing to whoever writes the fifth. Identity would end the class, but this
+    property is static: `cli.py` is parsed and never run, so a name has no
+    runtime object to follow. So the POPULATION is deliberately coarse and
+    kind-blind -- a statement that mentions the slot (as a string constant or an
+    attribute) and stores a holder anywhere inside it -- and the precision comes
+    from the declared set the exemption carries. A fifth storage kind lands in
+    the coarse population and reds for want of a declaration, instead of
+    vanishing.
+
+    Counted, not collected into a set: two statements whose descriptors render
+    identically are two statements, and a set silently collapsed the second
+    onto the first (round 13).
     """
     transforms = _transform_holders()
-    stores = []
+    traffic: collections.Counter = collections.Counter()
     for fn in _cli_functions():
         holders = transforms.holders[id(fn)]
-        for node in ast.walk(fn):
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if node.value is not None and _stores_holder(node.value, holders):
-                    stores += [f"{slot} <- {ast.unparse(target)} in {fn.name}() "
-                               f"at cli.py:{node.lineno}"
-                               for target in targets
-                               if isinstance(target, ast.Attribute) and target.attr == slot]
-            elif isinstance(node, ast.Dict):
-                stores += [f"{slot} <- dict literal in {fn.name}() "
-                           f"at cli.py:{node.lineno}"
-                           for key, value in zip(node.keys, node.values)
-                           if isinstance(key, ast.Constant) and key.value == slot
-                           if _stores_holder(value, holders)]
-            elif isinstance(node, ast.Call):
-                keyed = [keyword.value for keyword in node.keywords
-                         if keyword.arg == slot]
-                after = [argument for at, argument in enumerate(node.args)
-                         if any(isinstance(earlier, ast.Constant)
-                                and earlier.value == slot
-                                for earlier in node.args[:at])]
-                stores += [f"{slot} <- {_callee(node)}() in {fn.name}() "
-                           f"at cli.py:{node.lineno}"
-                           for value in (*keyed, *after)
-                           if _stores_holder(value, holders)]
-    return stores
+        for statement in _own_statements(fn):
+            inner = list(_own_nodes(statement))
+            names = any(
+                (isinstance(node, ast.Constant) and node.value == slot)
+                or (isinstance(node, ast.Attribute) and node.attr == slot)
+                or (isinstance(node, ast.keyword) and node.arg == slot)
+                for node in inner)
+            if not names:
+                continue
+            if any(_stores_holder(node, holders) for node in inner
+                   if isinstance(node, ast.expr)):
+                traffic[f"{slot} @ {type(statement).__name__} in {fn.name}()"] += 1
+    return traffic
 
 
 def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
@@ -2173,11 +2325,13 @@ def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
         f"unguarded dispatch wearing the exemption's name: {renamed}"
     )
     for _site, (slot, allowed) in _NOT_A_RESULT_TRANSFORM.items():
-        found = {store.rsplit(" at cli.py:", 1)[0] for store in _slot_stores(slot)}
-        assert found == allowed, (
-            f"the sites storing a caller-supplied value under the exempt slot "
-            f"{slot!r} are not the ones the exemption's reason names, so the "
-            f"reason no longer describes this module: {sorted(found ^ allowed)}"
+        found = _slot_traffic(slot)
+        assert found == collections.Counter(allowed), (
+            f"the statements that name the exempt slot {slot!r} and handle a "
+            "caller-supplied value are not the ones the exemption's reason "
+            "names, so the reason no longer describes this module (a COUNT "
+            "change means a second statement of a kind already declared): "
+            f"found {dict(found)}, declared {dict(allowed)}"
         )
 
 

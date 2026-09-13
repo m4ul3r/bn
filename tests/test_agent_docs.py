@@ -669,6 +669,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "7ae58359",  # Identity is `(boot id, pid, process start ... Start times count 
         "7f52ba89",  # verdict, because one verdict over many jobs would be a lie, and 
         "8c11c1cb",  # ... (Optional) Pin sticky defaults — useful for a **single** ...
+        "91758875",  # bn instance find <substring> # resolve one instance id by partia
         "9308d393",  # **Unreachable bridges are hidden, not ... The bridge binds its s
         "959dac82",  # - ... and ... work **before or after** the subcommand, and for t
         "9954584e",  # > **HARD rule for parallel ... fan-out ... Sticky pins are **one
@@ -1044,7 +1045,7 @@ _LEDGER_ROW = re.compile(r'^        "(?P<key>[0-9a-f]{8})",  # (?P<comment>.*)$'
 # distinguishable from prose by any rule, so the redactor is deliberately
 # broader than this check and a reviewer reads the diff for that one case.
 _TARGET_PROVENANCE = re.compile(
-    r"0x[0-9a-fA-F]+|sub_[0-9a-fA-F]+|\w+\.(?:so|bndb|bin|elf|exe|dll|dylib)\b"
+    r"0x[0-9a-fA-F]+|[A-Za-z]\w*_\w+|\w+\.(?:so|bndb|bin|elf|exe|dll|dylib)\b"
     r"|[a-z][A-Z]|(?:-i|--instance|--instance-id|-t|--target) +[^ .]+")
 
 

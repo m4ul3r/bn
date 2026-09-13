@@ -69,31 +69,37 @@ REQUIRED_INDEX_GROUPS = {
 # real documentation gap parked in the "catalogued in a reference" group, which
 # is exactly what an unasserted reason is for.
 
-# Sticky per-repo pins. Advertising these to an agent is actively harmful: they
-# are one shared file and clobber a concurrent session. ASSERTED: not
-# advertised anywhere in the index.
+# Sticky per-repo pins. Advertising these is actively harmful: they write one
+# shared per-project file and clobber a concurrent session.
+#
+# The old reason was "not advertised anywhere in the index", which is satisfied
+# by the very act of removing an entry -- so ANY command could be dropped into
+# this group and the guard stayed green (round 13). The reason is now POSITIVE
+# and derived from the code in BOTH directions: an exempt command's handler must
+# write the sticky state, and every registered command whose handler writes it
+# must be here. A command that does not touch the pin cannot be parked in this
+# group, which is what makes the group an exemption rather than a free pass.
 INDEX_EXEMPT_STICKY = frozenset({
     "instance use", "instance clear", "target use", "target clear",
 })
 
-# Reached through an advertised command instead. ASSERTED: the command named as
-# the way in IS advertised in the index.
-INDEX_EXEMPT_REACHED_VIA = {
-    "instance list": "session list",
-    "instance find": "session list",
-    "instance gc": "session stop",
-    "session restart": "session start",
-    "session status": "session list",
-    "target close": "target list",
+# A true ALIAS: the same registered handler under a second path, so advertising
+# the other path advertises this behaviour.
+#
+# This group used to hold eight commands whose stated way-in was a DIFFERENT
+# command, asserted only to be advertised itself -- never to actually reach the
+# exempt one, so `"<any read command>": "session list"` passed (round 13). The
+# six that were not aliases are now advertised in the index like everything
+# else; the two that remain are aliases the registry itself proves, because
+# both paths resolve to one handler function.
+INDEX_EXEMPT_ALIASES = {
     "exports list": "exports",
     "rename": "symbol rename",
 }
 
-# Host-side tooling, not analysis surface. ASSERTED: live only -- there is no
-# stronger claim to make about a command an agent is not meant to reach for.
-INDEX_EXEMPT_TOOLING = frozenset({
-    "doctor", "help", "plugin install", "skill install",
-})
+# `doctor`, `help`, `plugin install` and `skill install` used to sit in an
+# INDEX_EXEMPT_TOOLING group whose stated reason was "live only -- there is no
+# stronger claim to make", i.e. nothing. They are advertised now.
 
 # There used to be a fourth group here: nine deeper read/write commands exempt
 # BECAUSE they were "catalogued in a reference". Its reason failed three times.
@@ -109,8 +115,7 @@ INDEX_EXEMPT_TOOLING = frozenset({
 # advertised in the Command index like every other registered command, which is
 # what #627 asked for in the first place -- the exemption was papering over the
 # very issue it was meant to serve.
-INDEX_EXEMPT_COMMANDS = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
-                         | INDEX_EXEMPT_TOOLING)
+INDEX_EXEMPT_COMMANDS = INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_ALIASES)
 
 
 @pytest.fixture(scope="module")
@@ -369,13 +374,49 @@ def test_skill_command_index_advertises_every_registered_command(command_paths):
     )
 
 
+def _registered_handlers() -> dict[str, object]:
+    """Command path -> the handler function the registry holds for it."""
+    importlib.import_module("bn.commands")
+    cli = importlib.import_module("bn.cli")
+    return {" ".join(spec["path"]): spec["handler"] for spec in cli._COMMANDS}
+
+
+# The one call that writes the shared per-project pin. Named here so the sticky
+# exemption's reason is a fact about the CODE rather than about the index.
+_STICKY_WRITE = "session_state.update"
+
+
+def _sticky_state_writers() -> frozenset[str]:
+    """Every registered command whose handler writes the sticky pin.
+
+    Derived from the handler's own source, so the group cannot be used to park a
+    command that does not touch the pin, and a new pin-writing command is a
+    documentation decision that fails here until it is made.
+    """
+    sources = {}
+    for path in sorted((SKILL.parents[2] / "src" / "bn").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(isinstance(node, ast.Call)
+                   and _STICKY_WRITE in ast.unparse(node.func)
+                   for node in ast.walk(fn)):
+                sources[fn.name] = path
+    assert sources, (
+        f"no function under src/bn calls {_STICKY_WRITE}; the sticky exemption's "
+        "reason is unchecked, so the pin writer has been renamed"
+    )
+    return frozenset(command for command, handler in _registered_handlers().items()
+                     if handler.__name__ in sources)
+
+
 def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     """An exemption is a claim, and an unasserted claim is where a real gap
     hides: `evidence virtual-call` sat in the "catalogued in a reference" group
     while appearing in no reference at all. So each group's stated reason is
     checked here, and the groups together must be exactly the exemption set."""
-    groups = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
-              | INDEX_EXEMPT_TOOLING)
+    groups = INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_ALIASES)
     assert groups == INDEX_EXEMPT_COMMANDS, (
         "every exemption must sit in exactly one reason group, or its reason is "
         f"unchecked: {sorted(groups ^ INDEX_EXEMPT_COMMANDS)}"
@@ -393,16 +434,33 @@ def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
         f"harmful, yet the index advertises them: {leaked}"
     )
     missing_way_in = sorted(
-        f"{command} -> {via}" for command, via in INDEX_EXEMPT_REACHED_VIA.items()
+        f"{command} -> {via}" for command, via in INDEX_EXEMPT_ALIASES.items()
         if via not in advertised
     )
     assert not missing_way_in, (
-        "these are exempt because an agent reaches them through another "
+        "these are exempt because they are a second path to an advertised "
         f"command, but that command is not advertised either: {missing_way_in}"
     )
-    unresolved = sorted(set(INDEX_EXEMPT_REACHED_VIA.values()) - command_paths)
+    unresolved = sorted(set(INDEX_EXEMPT_ALIASES.values()) - command_paths)
     assert not unresolved, (
-        f"these ways in are not registered commands: {unresolved}"
+        f"these alias targets are not registered commands: {unresolved}"
+    )
+    handlers = _registered_handlers()
+    not_an_alias = sorted(
+        f"{command} -> {via}" for command, via in INDEX_EXEMPT_ALIASES.items()
+        if handlers.get(command) is not handlers.get(via)
+    )
+    assert not not_an_alias, (
+        "these are exempt BECAUSE they are a second path to the same handler, "
+        "and the registry says they resolve to different functions -- the "
+        f"exemption's reason is false: {not_an_alias}"
+    )
+    writers = _sticky_state_writers()
+    assert INDEX_EXEMPT_STICKY == writers, (
+        "the sticky-pin exemption must be exactly the registered commands whose "
+        "handler writes the shared per-project pin: a command that does not "
+        "write it cannot be exempt for being harmful to advertise, and one that "
+        f"does must be: {sorted(INDEX_EXEMPT_STICKY ^ writers)}"
     )
 
 
@@ -506,7 +564,8 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
 # is satisfied by "still at least four lines", which is exactly how a line that
 # stopped matching disappeared unnoticed. `_INDEX_LINE` refusing what it cannot
 # read covers the other half -- nothing silently leaves the sweep.
-EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Escape hatch"})
+EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Tooling",
+                                   "Escape hatch"})
 
 
 def _index_lines() -> list[str]:
