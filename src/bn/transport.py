@@ -435,7 +435,7 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
     Unknowable also covers what the listing cannot REPRESENT, and that
     distinction is the whole safety of this function -- a wrong ``False`` is
     the sole corroboration behind every socket unlink in this module, so it
-    destroys a bridge's own bound-and-listening endpoint. Three shapes:
+    destroys a bridge's own bound-and-listening endpoint. Four shapes:
 
     * The file is line-oriented, so a path containing a newline cannot appear
       in it at all. That is not evidence of nothing being bound, so it answers
@@ -458,7 +458,20 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
       so it is never a symlink -- makes the answer ``None``. One with a
       different basename cannot be this path in any cwd, and is skipped, so an
       unrelated relative socket elsewhere on the host does not make every
-      question unanswerable.
+      question unanswerable. An ABSTRACT-namespace row is not a relative path
+      and is not treated as one: the kernel prints it as ``@`` followed by a
+      name that may itself contain slashes, so it can present a real cache
+      socket's basename while naming no file at all. It provably holds no
+      filesystem name, so it answers about no file and is skipped -- treating
+      it as unknowable let any process pin a chosen orphan socket against the
+      sweep forever by binding an abstract name ending in that socket's name.
+    * The listing holds the name ``bind`` was given, not the name that file
+      has NOW. Rename the directory of a socket that is still bound and
+      listening -- an ordinary operator action -- and the row goes on naming a
+      path that no longer resolves to anything, so the comparison fails on a
+      SERVING socket and the sweep unlinked it. A row whose name has ceased to
+      exist cannot be compared to anything, which is not evidence that nothing
+      is bound, so it too answers ``None``.
     """
     wanted = os.fsencode(str(socket_path))
     if b"\n" in wanted:
@@ -486,14 +499,22 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
         # and is taken first: it can only ever REFUSE a destruction.
         if bound_path == wanted:
             return True
+        if bound_path.startswith(b"@"):
+            continue
         if os.path.basename(bound_path) != name:
             continue
         if not os.path.isabs(bound_path):
             # Resolvable only in the binder's cwd, which this file does not
             # carry. Never answer the positive "nothing is bound" from it.
             return None
-        if os.path.realpath(bound_path) == resolved:
+        target = os.path.realpath(bound_path)
+        if target == resolved:
             return True
+        if not os.path.lexists(target):
+            # The name this row was bound under is gone (its directory was
+            # renamed or moved while the socket kept serving), so there is
+            # nothing left to compare it to -- and this file may well BE it.
+            return None
     return False
 
 
@@ -920,7 +941,14 @@ def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool
     to break, left behind here (#618).
 
     A path that does not exist is dead on every platform: a bound AF_UNIX
-    socket always has a directory entry.
+    socket always has a directory entry. That absence has to be ESTABLISHED,
+    though, and ``Path.exists()`` cannot: it answers ``False`` for ``EACCES``,
+    ``EIO``, ``ELOOP`` and ``ESTALE`` exactly as it does for ``ENOENT``, so one
+    unreadable directory turned a probe that could not be TAKEN into positive
+    evidence and this reclaim took a live owner's record and log on it. The
+    same rule as everywhere else in this module: a failed probe is evidence
+    only when conclusive, and an unreadable name is not conclusive, so the
+    record is kept.
 
     Otherwise the question is who may be ASKED. Inside the cache a connect
     probe is exactly what discovery already does, and ``nothing_accepting``
@@ -939,8 +967,12 @@ def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool
     of destruction, never raise it: the cost of misreading confinement is now a
     record that is kept.
     """
-    if not socket_path.exists():
+    try:
+        socket_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
         return True
+    except OSError:
+        return False
     if _socket_path_is_confined(socket_path):
         return _socket_probe(socket_path, timeout=timeout).nothing_accepting
     return _path_has_bound_socket(socket_path) is False

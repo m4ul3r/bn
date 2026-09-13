@@ -5301,3 +5301,167 @@ def test_a_relative_bound_path_is_unknowable_not_unbound(tmp_path, monkeypatch):
         binder.wait()
         binder.stdout.close()
         sock_path.unlink(missing_ok=True)
+
+
+def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The listing holds the name ``bind`` was given, not the name it has now.
+
+    Rename the directory of a socket that is still bound and LISTENING -- an
+    ordinary operator action, no attacker and no unsupported configuration --
+    and the kernel goes on listing the path the bridge bound. ``realpath`` then
+    compares against a name that no longer resolves to anything, the row is
+    passed over, and the loop falls through to the positive "nothing is bound"
+    about a socket that is serving: ``gc`` reclaims the now registry-less file
+    and leaves the bridge on an unlinked inode reachable by nobody.
+
+    The fourth shape this listing cannot represent, after the newline, the
+    non-UTF-8 byte and the relative row -- and the same rule answers all four:
+    a name that cannot be compared is not evidence that nothing is bound, so
+    the answer is ``None``.
+
+    Narrow, in the other direction: only a row whose basename could be this
+    path is unanswerable. A different basename is still ``False``, so one
+    unlinked-but-bound socket elsewhere on the host cannot stop the sweep
+    reaping anything (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache"
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    sock_path = inst_dir / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # bound AND listening, and stays that way
+    moved = tmp_path / "cache-moved"
+    try:
+        os.rename(root, moved)             # the operator moves the cache
+        moved_sock = moved / "instances" / "live.sock"
+        monkeypatch.setenv("BN_CACHE_DIR", str(moved))
+
+        assert _path_has_bound_socket(moved_sock) is None
+        # Only same-basename rows are unanswerable.
+        assert _path_has_bound_socket(moved / "instances" / "other.sock") is False
+
+        summary = gc_instances()           # the registry-less orphan sweep
+
+        assert summary["sockets_removed"] == 0
+        assert moved_sock.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(moved_sock))        # still serving, still reachable
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        (moved / "instances" / "live.sock").unlink(missing_ok=True)
+
+
+def test_an_abstract_namespace_row_can_never_name_a_file(tmp_path):
+    """``@name`` holds no filesystem name, so it answers nothing about a file.
+
+    The kernel prints an abstract-namespace socket as ``@`` followed by its
+    name, and an abstract name may contain slashes -- so a row can present the
+    basename of a real cache socket while naming no file at all. It is not a
+    relative path and must not be treated as one: answering ``None`` for it let
+    any process on the host pin a chosen orphan socket against ``gc`` forever
+    by binding an abstract name that ends in that socket's own name. An
+    abstract socket provably holds no filesystem name, so ``False`` is the
+    correct answer and the sweep is not blocked (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    orphan = tmp_path / "orphan.sock"
+    orphan.touch()                         # a leftover file, nothing bound to it
+    pinner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pinner.bind("\0" + str(orphan))        # abstract, and ends in the same name
+    pinner.listen(1)
+    try:
+        assert _path_has_bound_socket(orphan) is False
+    finally:
+        with contextlib.suppress(OSError):
+            pinner.close()
+
+
+def test_a_probe_that_could_not_be_taken_is_not_proof_the_endpoint_is_dead(tmp_path):
+    """``exists()`` swallows EVERY error, and this predicate destroys on it.
+
+    ``_record_endpoint_is_dead`` gates the reclaim of a KEPT record -- the one
+    destructive path for a record whose owner is alive and proves nothing --
+    and it read a missing name as "nobody can ever be served here". But
+    ``Path.exists()`` answers ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and
+    ``ESTALE`` exactly as it does for ``ENOENT``, so one unreadable directory
+    turned a probe that could not be TAKEN into positive evidence and took a
+    live owner's record and log. This module's own rule is that a failed probe
+    is evidence only when CONCLUSIVE; an unreadable path is not conclusive, so
+    the record is kept.
+
+    Both directions, because "keep everything" would be its own defect: a name
+    that genuinely does not exist is still conclusive, and the record is still
+    reclaimed (#618).
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    from bn.transport import _record_endpoint_is_dead
+
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    blocked = unreadable / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(blocked))
+    server.listen(1)
+    unreadable.chmod(0o000)
+    try:
+        assert _record_endpoint_is_dead(blocked) is False        # unknowable, so kept
+    finally:
+        unreadable.chmod(0o700)
+        with contextlib.suppress(OSError):
+            server.close()
+        blocked.unlink(missing_ok=True)
+
+    assert _record_endpoint_is_dead(tmp_path / "never-existed.sock") is True
+
+
+def test_gc_keeps_a_live_owners_record_when_the_socket_cannot_be_probed(tmp_path, monkeypatch):
+    """The consumer-side proof of the predicate above: nothing is destroyed.
+
+    A live owner that proves nothing is the class ``instance gc`` reclaims, and
+    that reclaim is allowed only on positive evidence about the FILE. An
+    unreadable directory is not that evidence -- it is the absence of a
+    reading -- and taking the record plus the log on it is the sixteen-member
+    defect class in its original form: destroying on an absence (#618).
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    unreadable = inst_dir / "unreadable"
+    unreadable.mkdir()
+    sock_path = unreadable / "kept.sock"
+    record = inst_dir / "kept.json"
+    record.write_text(
+        json.dumps({"pid": owner.pid, "socket_path": str(sock_path),
+                    "instance_id": "kept"}),
+        encoding="utf-8",
+    )
+    log = inst_dir / "kept.log"
+    log.write_text("output worth keeping\n", encoding="utf-8")
+    unreadable.chmod(0o000)
+    try:
+        summary = gc_instances()
+
+        assert summary["registries_purged"] == 0
+        assert summary["logs_removed"] == 0
+        assert record.exists() and log.exists()
+    finally:
+        unreadable.chmod(0o700)
+        owner.kill()
+        owner.wait()
