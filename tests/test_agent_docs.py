@@ -10,6 +10,7 @@ and an exit-code list that silently falls behind `FAILED_MUTATION_STATUSES`.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -353,6 +354,13 @@ _EXIT_CODE_PINS = (
      "so it exits `0` on success like any other."),
     ("README.md", "measured-all-noop-is-0",
      "A measured all-`noop` is `0` too."),
+    # Found by the per-number accounting: both sit on the same line as two
+    # already-pinned statements, so a line-level sweep read them as covered.
+    ("README.md", "unmeasured-does-not-outrank-a-failure",
+     "`4` is distinct from `3` (a failure, which still wins when both apply) "
+     "and from `0`,"),
+    ("README.md", "an-unmeasured-preview-is-4-too",
+     "a `--preview` that comes back unmeasured is `4` as well"),
     ("skills/bn/reference/mutating.md", "unknown-op-kind-is-3",
      "An unknown op kind is `unsupported` and likewise exit 3."),
     ("skills/bn/reference/mutating.md", "mutation-3-read-or-resolver-2",
@@ -381,21 +389,102 @@ EXIT_CODE_DOCS = ("CLAUDE.md", "README.md", "skills/bn/SKILL.md",
                   "skills/bn/reference/reading.md",
                   "skills/bn/reference/runtime.md")
 
-# An exit-code claim: a bare 0-4 within this many characters after the word
-# `exit`. `(?<![\w#])` and `(?!\w)` keep issue references (`#625`, `#118`) and
-# longer numbers out, and the window keeps unrelated digits further down a
-# paragraph out.
-_EXIT_MENTION = re.compile(r"\bexits?\b", re.I)
-_EXIT_CLAIM_DIGIT = re.compile(r"(?<![\w#])[0-4](?!\w)")
-_EXIT_CLAIM_WINDOW = 120
+# Round 8 replaced a hand-listed echo table with a sweep, and the sweep was a
+# RECOGNISER: a bare 0-4 within 120 characters after the word `exit`. Both
+# round 9 lenses walked past it in one line -- "a failed mutation returns `2`
+# to the shell", "a refused op returns three", "Exit 5 is reserved ... exit 9
+# for a bridge that refuses to start" -- because the phrasing avoided the word,
+# or the digit was outside the range, or the number was spelled out.
+#
+# A recogniser for natural language is escapable by construction, so there is
+# no vocabulary here at all. The population is EVERY line of every fenced doc
+# that carries a number, and each is accounted for exactly one of two ways: a
+# cell above pins it to what the CLI really returns, or it is in the ledger
+# below of lines that carry a number for some other reason. A new sentence
+# about an exit code fails here in ANY phrasing, because it is a new line with
+# a number in it and nothing accounts for it yet.
+#
+# A decimal is one number, not two (`3.11` must not read as a `3` and an `11`),
+# and an issue reference is not a code (`#625`). A TRAILING period is sentence
+# punctuation though -- excluding it outright let "a refused op returns three."
+# straight through, which is the same escape one character further along.
+_NUMBER_TOKEN = re.compile(
+    r"(?<![\w#$/-])(?<!\d\.)"
+    r"(?:\d|zero|one|two|three|four|five|six|seven|eight|nine)"
+    r"(?![\w/-])(?!\.\d)",
+    re.I)
+# Generated, not authored: the fingerprint of every prose line in a fenced doc
+# that carries a number and is not pinned by a cell above. Regenerate with
+# `_fingerprint(" ".join(line.split()))` over the docs. An entry is a claim
+# that this line's number is NOT an exit code; adding one is a deliberate
+# statement in a diff, which is the point -- the previous accounting made that
+# statement silently, by not matching a pattern.
+NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
+    "CLAUDE.md": frozenset({
+        "2813ca55", "4177be03", "78629073", "7d6b2776", "80180431", "8597bc7e", "8e4a9610",
+        "dadf1f99", "db981a08", "ee61fade", "fa70ea09",
+    }),
+    "README.md": frozenset({
+        "0a768f64", "18aefee8", "1946ee65", "39297f76", "4a59a3b8", "589b6b1c", "70fe4ca5",
+        "767b9f9b", "ae3959b5", "b3987998", "b70bd14f",
+    }),
+    "skills/bn/SKILL.md": frozenset({
+        "3435274a", "3d99e01e", "476c699a", "649eaeac", "718cbccf", "7f2b6f7d", "8919c69b",
+        "c094744f",
+    }),
+    "skills/bn/reference/mutating.md": frozenset({
+        "004be911", "023ef17d", "073c32cb", "21ab0f26", "357b33d7", "3a31edd0", "3ab0e800",
+        "3b705aa6", "4d2bfe51", "4ea5a88f", "73915809", "757a2ce7", "7a963eb3", "7b90ea1f",
+        "7d08894a", "7d87431b", "99a32d48", "abcbb98d", "b01a5a75", "b29746c8", "c11a3930",
+        "ca2ff185", "dfafc784", "e0108fe1", "e26fd985", "f73aab60", "fe025816",
+    }),
+    "skills/bn/reference/reading.md": frozenset({
+        "0c9d943c", "1949d287", "1a70e75d", "1c15c2d2", "1dd5bce8", "25419b43", "2ea1ed0f",
+        "33fd9640", "3716a90b", "43ca5e2b", "4f5394e5", "4fe41c72", "505bed3f", "5221e5b6",
+        "6a4f918d", "6a58a9dc", "6ab53c02", "6ed98be4", "7bc2e390", "86526afb", "965d7b1e",
+        "9971ee4b", "9a98f5ff", "9dbbd6d8", "a916839d", "b71d1544", "b92a2be1", "be1545e3",
+        "be4ef095", "c0610400", "c4b1b451", "d418748d", "dad2603f", "df48aed6", "e9b95184",
+        "eca3534e",
+    }),
+    "skills/bn/reference/runtime.md": frozenset({
+        "06aad85c", "079c846e", "0a8cddd1", "1fbd64eb", "347a4a13", "34c79efb", "44497fad",
+        "53f0229b", "55a24561", "589fc7e3", "596d0a92", "65df27e3", "6a70bcd2", "6f94b989",
+        "7272fe33", "767bdfe8", "8c218bae", "8f382f50", "926f4920", "947fffc7", "98cfec52",
+        "9a1ac7d1", "9cb452f2", "a8fb6baa", "b4306499", "b5febfe7", "bec2b018", "c22c0ad1",
+        "c2335aac", "ca2c1267", "cb4d6e9e", "d20853ec", "d6c30113", "d7f57f32", "e1e09dec",
+        "e45a920a", "e6c69801", "e8bc9423", "eddb9cfa",
+    }),
+}
 
 
-def _exit_code_claims(text: str) -> list[int]:
-    """Offsets of every exit-code claim in *text*."""
-    return sorted({mention.start() + digit.start()
-                   for mention in _EXIT_MENTION.finditer(text)
-                   for digit in _EXIT_CLAIM_DIGIT.finditer(
-                       text[mention.start():mention.start() + _EXIT_CLAIM_WINDOW])})
+
+def _prose_lines(doc: str) -> list[tuple[int, int, str, str]]:
+    """(line number, start offset, raw text, normalized text) for every PROSE
+    line of *doc*.
+
+    Fenced code blocks are excluded: they are transcripts and command syntax,
+    not statements to an agent about what the CLI returns. The normalized form
+    collapses whitespace, so a re-indent or a re-wrap is not a change.
+    """
+    lines: list[tuple[int, int, str, str]] = []
+    offset = 0
+    fenced = False
+    for at, line in enumerate(_doc_text(REPO / doc).splitlines(), start=1):
+        start, offset = offset, offset + len(line) + 1
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            lines.append((at, start, line, " ".join(line.split())))
+    return lines
+
+
+def _number_lines(doc: str) -> list[tuple[int, int, str, str]]:
+    return [row for row in _prose_lines(doc) if row[3] and _NUMBER_TOKEN.search(row[2])]
+
+
+def _fingerprint(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
 
 
 def _exit_code_claimed(doc: str, text: str) -> bytearray:
@@ -413,6 +502,26 @@ def _exit_code_claimed(doc: str, text: str) -> bytearray:
     return claimed
 
 
+def _unaccounted_number_lines(doc: str) -> list[str]:
+    """Lines carrying a number that NO cell pins and the ledger does not record.
+
+    Accounting is per NUMBER, not per line: a cell that pins one sentence of a
+    line does not account for a second claim appended to the same line, which
+    is how an unpinned claim rode into a pinned paragraph.
+    """
+    text = _doc_text(REPO / doc)
+    claimed = _exit_code_claimed(doc, text)
+    ledger = NON_CLAIM_NUMBER_LINES.get(doc, frozenset())
+    unaccounted = []
+    for at, start, raw, normalized in _number_lines(doc):
+        loose = [match.group(0) for match in _NUMBER_TOKEN.finditer(raw)
+                 if not claimed[start + match.start()]]
+        if not loose or _fingerprint(normalized) in ledger:
+            continue
+        unaccounted.append(f"line {at} ({', '.join(loose)}): {normalized[:140]}")
+    return unaccounted
+
+
 @pytest.mark.parametrize("doc,claim,literal", _EXIT_CODE_PINS,
                          ids=[f"{doc}:{claim}" for doc, claim, _ in _EXIT_CODE_PINS])
 def test_every_pinned_exit_code_statement_still_reads_as_pinned(
@@ -426,26 +535,48 @@ def test_every_pinned_exit_code_statement_still_reads_as_pinned(
 
 
 @pytest.mark.parametrize("doc", EXIT_CODE_DOCS)
-def test_no_agent_doc_states_an_unpinned_exit_code(doc: str):
-    """The coverage half, over DOCUMENTS instead of one bullet.
+def test_no_agent_doc_carries_a_number_nothing_accounts_for(doc: str):
+    """The coverage half, over every NUMBER instead of over a phrasing.
 
     #716's defect was two documents stating the contract while one was guarded.
     Pinning the statements a reviewer happened to find is the same defect with a
-    longer list, so every exit-code claim in every agent-facing doc must sit
-    inside a span some cell above accounts for. A new sentence about an exit
-    code fails here until it is pinned -- which is the only way the count stops
-    being someone's memory.
+    longer list, and pinning the statements a REGEX happened to find is the same
+    defect with a longer reach. So no line of these documents may carry a number
+    unless a cell pins it or the ledger records why it is not a claim -- and a
+    new sentence stating an exit code is a new line with a number in it,
+    whatever words it uses to say so.
     """
-    text = _doc_text(REPO / doc)
-    claimed = _exit_code_claimed(doc, text)
-    unpinned = [
-        f"line {text.count(chr(10), 0, at) + 1}: ...{text[max(0, at - 60):at + 20]}..."
-        for at in _exit_code_claims(text) if not claimed[at]
-    ]
-    assert not unpinned, (
-        f"{doc} states these exit codes with no cell accounting for them, so "
-        "they can drift from the code with every other guard green -- add a "
-        f"cell to _EXIT_CODE_ECHOES or _EXIT_CODE_PINS: {unpinned}"
+    unaccounted = _unaccounted_number_lines(doc)
+    assert not unaccounted, (
+        f"{doc} carries numbers no cell pins and the ledger does not record, so "
+        "an exit code stated here can drift from the code with every other "
+        "guard green. If it states one, add a cell to _EXIT_CODE_ECHOES or "
+        "_EXIT_CODE_PINS; if it does not, add its fingerprint to "
+        f"NON_CLAIM_NUMBER_LINES: {unaccounted}"
+    )
+
+
+def test_the_non_claim_number_ledger_has_no_stale_entry():
+    """...and the ledger stale-fails, so it cannot outlive the lines it excuses
+    and quietly become a place to park a claim."""
+    stale = {
+        doc: sorted(ledger - {_fingerprint(text) for _, _, _raw, text in _number_lines(doc)})
+        for doc, ledger in NON_CLAIM_NUMBER_LINES.items()
+    }
+    stale = {doc: entries for doc, entries in stale.items() if entries}
+    assert not stale, (
+        "these ledger entries excuse lines that no longer exist, so the ledger "
+        "is bookkeeping for a document that has moved on; regenerate it against "
+        f"the current docs: {stale}"
+    )
+
+
+def test_the_non_claim_number_ledger_only_names_fenced_docs():
+    """A ledger entry for a document outside the sweep excuses nothing and
+    hides the fact that the document is unswept."""
+    assert set(NON_CLAIM_NUMBER_LINES) <= set(EXIT_CODE_DOCS), (
+        "the ledger names documents the exit-code sweep does not read: "
+        f"{sorted(set(NON_CLAIM_NUMBER_LINES) - set(EXIT_CODE_DOCS))}"
     )
 
 
@@ -583,6 +714,13 @@ def test_cli_layout_names_every_top_level_module():
     assert modules, "no src/bn/*.py modules found"
     missing = [name for name in modules if name not in introduced]
     assert not missing, f"top-level modules missing from the CLI Layout list: {missing}"
+    stale = sorted(name for name in CLI_LAYOUT_INTERNAL_MODULES
+                   if not (REPO / "src" / "bn" / name).is_file())
+    assert not stale, (
+        "CLI_LAYOUT_INTERNAL_MODULES skips modules src/bn no longer has: "
+        f"{stale}. Every other exemption in this file stale-fails; a skip list "
+        "that outlives its subject silently shrinks what this guard covers"
+    )
 
 
 # The lock class is declared at the `@op` decorator, so the declarations are the
@@ -603,9 +741,13 @@ _NONE_LOCK_OP = re.compile(r'@op\(\s*"([^"]+)"\s*,\s*lock="none"')
 # in the same paragraph, taught the falsehood with every pin green.
 #
 # A proxy for meaning is escapable by construction; an accounting with a
-# boundary is escapable just outside it. So the region is now the WHOLE
-# paragraph, and the false claim is additionally accounted for across every
-# agent-facing doc, so it cannot be affirmed somewhere else either.
+# boundary is escapable just outside it. Round 8 made the region "the whole
+# paragraph" and got the paragraph wrong -- it took the one LINE the sentence
+# starts on, and a markdown paragraph is every line up to the blank one, so an
+# affirmation on the next line sat inside the same paragraph and outside the
+# accounting. The cross-document half had the mirror-image hole: it matched the
+# claim only in its QUOTED form, so the same words without the quotes were
+# invisible.
 #
 # The two `none` ops that really are pure signals: they set an event and must
 # stay deliverable while a write op holds the lock. Everything else declared
@@ -614,9 +756,10 @@ SIGNAL_ONLY_NONE_OPS = frozenset({"shutdown", "cancel_request"})
 
 LOCK_MODEL_SENTENCE_PREFIX = "`op_registry.py` is the single source of truth"
 
-# The claim this paragraph exists to refute. Accounted for in EVERY doc: moving
-# it somewhere else is the same defect as affirming it here.
-LOCK_MODEL_FALSE_CLAIM = '"touches no BN state"'
+# The claim this paragraph exists to refute, as WORDS rather than as a quoted
+# string. Accounted for in every doc: moving it somewhere else -- or dropping
+# the quotation marks -- is the same defect as affirming it here.
+LOCK_MODEL_FALSE_CLAIM = "touches no BN state"
 
 _LOCK_MODEL_CLAIMS = (
     ("registry-is-the-source-of-truth",
@@ -642,19 +785,24 @@ _LOCK_MODEL_CLAIMS = (
 
 
 def _lock_model_region() -> str:
-    """The WHOLE lock-model paragraph.
+    """The WHOLE lock-model paragraph -- every line of it, to the blank line.
 
-    It used to be the paragraph from the first `none` claim onward, which left
-    the registry/dispatch prose -- the same paragraph, the same line -- outside
-    the accounting and available for an affirmation of the false reading.
+    Two earlier cuts each stopped short of the paragraph's real edge: one began
+    at the first `none` claim, leaving the registry prose on the same line
+    unaccounted; the next took that whole LINE and called it the paragraph, so
+    an affirmation on the NEXT line -- same paragraph, no blank line between --
+    sat outside the accounting again. A markdown paragraph ends at a blank
+    line, so that is where this region ends.
     """
-    sentence = next(
-        (line for line in _doc_text().splitlines()
-         if line.startswith(LOCK_MODEL_SENTENCE_PREFIX)),
-        None,
-    )
-    assert sentence, f"the lock-model paragraph ({LOCK_MODEL_SENTENCE_PREFIX}...) is gone"
-    return sentence
+    lines = _doc_text().splitlines()
+    start = next((at for at, line in enumerate(lines)
+                  if line.startswith(LOCK_MODEL_SENTENCE_PREFIX)), None)
+    assert start is not None, (
+        f"the lock-model paragraph ({LOCK_MODEL_SENTENCE_PREFIX}...) is gone")
+    end = start
+    while end + 1 < len(lines) and lines[end + 1].strip():
+        end += 1
+    return "\n".join(lines[start:end + 1])
 
 
 @pytest.mark.parametrize("claim,pattern", _LOCK_MODEL_CLAIMS,
@@ -693,6 +841,10 @@ def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
     inside the refutation cell's own span, so moving it to another document --
     or to another paragraph of this one -- fails the same way as affirming it
     here.
+
+    Matched as WORDS, not as the quoted string round 8 pinned: the same reading
+    taught without the quotation marks, or across a line wrap, is the same
+    reading.
     """
     text = _doc_text(REPO / doc)
     refutation = next(pattern for name, pattern in _LOCK_MODEL_CLAIMS
@@ -700,10 +852,11 @@ def test_no_agent_doc_states_the_false_lock_reading_unrefuted(doc: str):
     claimed = bytearray(len(text))
     for match in re.finditer(refutation, text):
         claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    claim = r"\s+".join(re.escape(word) for word in LOCK_MODEL_FALSE_CLAIM.split())
     unrefuted = [
         f"line {text.count(chr(10), 0, match.start()) + 1}: "
         f"...{text[max(0, match.start() - 70):match.end() + 20]}..."
-        for match in re.finditer(re.escape(LOCK_MODEL_FALSE_CLAIM), text)
+        for match in re.finditer(claim, text, re.I)
         if not claimed[match.start()]
     ]
     assert not unrefuted, (

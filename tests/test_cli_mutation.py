@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
 import json
 import re
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import bn.cli
 import pytest
@@ -1370,13 +1372,13 @@ _BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
 # The rule's own implementation is the one place a transform is invoked
 # directly; both halves are self-checked below rather than trusted.
 _RULE_FUNCTIONS = (_GUARD, _BOUNDARY)
-# "bound at no line": larger than any line number cli.py will ever have, so an
-# unbound name is treated as unbound everywhere rather than as bound early.
-_UNBOUND = 1 << 30
 # The ONE name cli.py may bind the string `"result"` to outside the unwrap
-# helper: the key it writes into a fan-out row. A named site, not a syntactic
-# class -- round 8 claimed a dict-literal-key exemption with a raw read dressed
-# as `response.get(*{"result": None})`.
+# helper: the key it writes into a fan-out row. Round 8 made that name the
+# exemption, and the name itself then became the dodge -- `response.get(
+# _RESULT_ROW_KEY)` reads the key carrying no `"result"` token at all. So the
+# exemption is no longer the NAME: it is the one WRITE that pairs this key with
+# the helper's return value, and every read of the key, by constant or by
+# alias, is a finding.
 _RESULT_ROW_KEY_NAME = "_RESULT_ROW_KEY"
 # A bridge-result transform is a callable the CALLER hands the CLI, which is
 # then applied to a bridge result. Round 6 defined that population by SHAPE --
@@ -1416,27 +1418,67 @@ def _declared_transform_params() -> frozenset[str]:
     declaration and not two. `test_the_malformed_result_rule_is_implemented...`
     pins the parsed signature to the imported one.
 
-    Fail-closed both ways -- a new parameter is a transform whatever it is
-    called and however it is annotated, and a data parameter that leaves the
-    signature stale-fails here rather than quietly shrinking the population.
+    Deliberately assertion-free: this runs at COLLECTION time to build the
+    parametrization, and an assertion there is an `Interrupted: 1 error during
+    collection` that runs no test in the session and reports the whole tree as
+    neither passed nor failed. Every invariant it used to raise is owned by
+    `test_the_declared_data_parameters_still_describe_call` below, which fails
+    as one red cell.
     """
-    call = next((fn for fn in _cli_functions() if fn.name == "_call"), None)
+    call = _named("_call")
+    if call is None:
+        return frozenset()
+    return frozenset({arg.arg for arg in _all_args(call)} - _CALL_DATA_PARAMS)
+
+
+def test_the_declared_data_parameters_still_describe_call():
+    """Fail-closed both ways -- a new parameter is a transform whatever it is
+    called and however it is annotated, and a data parameter that leaves the
+    signature stale-fails HERE rather than quietly shrinking the population."""
+    call = _named("_call")
     assert call is not None, "_call is gone; this whole property is unchecked"
-    declared = {arg.arg for arg in _all_args(call)}
-    stale = sorted(_CALL_DATA_PARAMS - declared)
+    stale = sorted(_CALL_DATA_PARAMS - {arg.arg for arg in _all_args(call)})
     assert not stale, (
         f"_CALL_DATA_PARAMS declares parameters _call no longer has: {stale}; "
         "a stale entry silently removes a real parameter from the population"
     )
-    return frozenset(declared - _CALL_DATA_PARAMS)
+    params = _declared_transform_params()
+    assert len(params) >= 6, f"_call's transform parameters vanished: {sorted(params)}"
+    orphans = sorted(set(_TRANSFORM_ARRANGEMENTS) - params)
+    assert not orphans, (
+        f"these arrangements name parameters _call no longer has: {orphans}; a "
+        "stale entry makes the table look complete while a real parameter is "
+        "unexercised"
+    )
 
 
-def _cli_functions() -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
-    functions = [node for node in ast.walk(tree)
-                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+@functools.lru_cache(maxsize=1)
+def _cli_tree() -> ast.Module:
+    """`cli.py`, parsed ONCE.
+
+    Cached so every property quantifies over the same node objects: guardedness
+    is keyed on a node's position, and two parses produce two sets of nodes.
+    """
+    return ast.parse(_CLI.read_text(encoding="utf-8"))
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_functions() -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]:
+    """Every function in `cli.py`, as NODES rather than keyed by name.
+
+    Round 8 keyed the population on the function NAME, and `cli.py` defines two
+    `__init__`s and two `__call__`s -- so four of its functions were two, and a
+    dispatch method (`__call__` on an argparse action) was silently outside a
+    population whose whole claim is that it is total.
+    """
+    functions = tuple(node for node in ast.walk(_cli_tree())
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
     assert len(functions) > 50, f"cli.py shrank to {len(functions)} functions"
     return functions
+
+
+def _named(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    return next((fn for fn in _cli_functions() if fn.name == name), None)
 
 
 def _all_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
@@ -1448,25 +1490,26 @@ def _all_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
 
 
 def _bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef):
-    """(targets, value, lineno) for every binding form in *fn*.
+    """(targets, value, node) for every binding form in *fn*.
 
     Not just `ast.Assign`: round 7 invoked a transform through a loop variable
     and round 8 laundered one through a walrus, and an assignment-only walk
-    taints neither.
+    taints neither. The NODE is yielded rather than its line, because where a
+    binding SITS decides what it dominates and its line does not.
     """
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign):
-            yield node.targets, node.value, node.lineno
+            yield node.targets, node.value, node
         elif isinstance(node, ast.NamedExpr):
-            yield [node.target], node.value, node.lineno
+            yield [node.target], node.value, node
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            yield [node.target], node.iter, node.lineno
+            yield [node.target], node.iter, node
         elif isinstance(node, ast.comprehension):
-            yield [node.target], node.iter, getattr(node.target, "lineno", fn.lineno)
+            yield [node.target], node.iter, node.target
         elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            yield [node.optional_vars], node.context_expr, node.optional_vars.lineno
+            yield [node.optional_vars], node.context_expr, node.optional_vars
         elif isinstance(node, ast.MatchAs) and node.name is not None and node.pattern:
-            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node.lineno
+            yield [ast.Name(id=node.name, ctx=ast.Store())], node.pattern, node
 
 
 def _carried(value: ast.expr, holders: set[str]) -> set[str]:
@@ -1486,9 +1529,121 @@ def _bound_names(targets: list[ast.expr]) -> set[str]:
             for name in ast.walk(target) if isinstance(name, ast.Name)}
 
 
-def _transform_holders() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """Per `cli.py` function: (names that may hold a caller-supplied transform,
-    those bound to the malformed-result rule).
+def _block_paths(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[int, tuple]:
+    """Every node of *fn*, mapped to the BLOCK PATH of the statement holding it.
+
+    A path names a statement by the chain of (block field, index) steps taken
+    from the function body to reach it, so `(("body", 3), ("orelse", 0))` is the
+    first statement of the fourth statement's `else`. Unlike a line number it
+    says which CONTROL-FLOW BLOCK a statement is in, which is what decides
+    whether one statement certainly runs before another.
+    """
+    paths: dict[int, tuple] = {}
+
+    def descend(body: list[ast.stmt], field: str, prefix: tuple) -> None:
+        for index, stmt in enumerate(body):
+            path = (*prefix, (field, index))
+            # Outer to inner, so a nested statement overwrites the path it
+            # inherited from its parent with its own: the innermost write wins.
+            for node in ast.walk(stmt):
+                paths[id(node)] = path
+            for inner in ("body", "orelse", "finalbody"):
+                block = getattr(stmt, inner, None)
+                if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+                    descend(block, inner, path)
+            for at, handler in enumerate(getattr(stmt, "handlers", [])):
+                descend(handler.body, f"handler{at}", path)
+            for at, case in enumerate(getattr(stmt, "cases", [])):
+                descend(case.body, f"case{at}", path)
+
+    descend(fn.body, "body", ())
+    return paths
+
+
+def _dominates(binding: tuple, use: tuple) -> bool:
+    """Does a rebinding at *binding* certainly run before a use at *use*?
+
+    Round 8 answered this with line order, and line order is not execution
+    order: a boundary rebinding moved inside an `if` stays textually above every
+    call site while running on only one path, and the calls on the other path
+    read the caller's raw transform. So the rebinding must DOMINATE the use --
+    sit in a block that encloses it, earlier in that same block. The empty path
+    means "bound on entry", which dominates the whole function.
+    """
+    if not binding:
+        return True
+    depth = len(binding) - 1
+    if len(use) <= depth or binding[:depth] != use[:depth]:
+        return False
+    field, index = binding[depth]
+    use_field, use_index = use[depth]
+    return field == use_field and index < use_index
+
+
+def _stores_holder(value: ast.expr, holders: set[str]) -> bool:
+    """Can *value* evaluate TO one of *holders* -- not merely mention one?
+
+    `_carried` is deliberately loose, because a transform tucked inside a
+    wrapper is still reachable. A SLOT is a stricter question: parking
+    `str(exc)` under `"error"` does not make `.error` a way to call `exc`,
+    and treating it as one flagged two `parser.error(...)` calls -- exactly the
+    crying-wolf that got the attribute step dropped in the first place.
+    """
+    if isinstance(value, ast.Name):
+        return value.id in holders
+    if isinstance(value, ast.Starred):
+        return _stores_holder(value.value, holders)
+    if isinstance(value, ast.IfExp):
+        return (_stores_holder(value.body, holders)
+                or _stores_holder(value.orelse, holders))
+    if isinstance(value, ast.BoolOp):
+        return any(_stores_holder(operand, holders) for operand in value.values)
+    if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        return any(_stores_holder(element, holders) for element in value.elts)
+    if isinstance(value, ast.Dict):
+        return any(element is not None and _stores_holder(element, holders)
+                   for element in value.values)
+    return False
+
+
+def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -> set[str]:
+    """The attribute/key names a caller-supplied transform is STORED under in *fn*.
+
+    `_dispatch_roots` deliberately does not follow every attribute step: with a
+    total population `p.method(x)` would flag every `parser.add_argument` in the
+    module, and a guard that cries wolf gets loosened instead of fixed. But a
+    transform parked on an object and dispatched as `holder.render(result)`
+    escaped the property entirely. A holder stored under a name can be invoked
+    through that name, so the names holders are stored under are exactly the
+    attribute steps worth following -- DERIVED from the module, not listed.
+    """
+    slots: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            slots |= {keyword.arg for keyword in node.keywords
+                      if keyword.arg and _stores_holder(keyword.value, holders)}
+        elif isinstance(node, ast.Dict):
+            slots |= {key.value for key, value in zip(node.keys, node.values)
+                      if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                      if _stores_holder(value, holders)}
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if node.value is not None and _stores_holder(node.value, holders):
+                slots |= {target.attr for target in targets
+                          if isinstance(target, ast.Attribute)}
+    return slots
+
+
+class _Transforms(NamedTuple):
+    holders: dict[int, set[str]]                # id(fn) -> names that may hold a transform
+    guarded: dict[int, dict[str, set[tuple]]]   # id(fn) -> name -> paths binding it to the rule
+    paths: dict[int, dict[int, tuple]]          # id(fn) -> id(node) -> block path
+    slots: frozenset[str]                       # names a holder is stored under
+
+
+def _transform_holders() -> _Transforms:
+    """Per `cli.py` function: the names that may hold a caller-supplied
+    transform, and WHERE each is bound to the malformed-result rule.
 
     The population is every parameter of every function in the module -- no
     declaration, no doorway -- and is propagated to a fixpoint two ways, because
@@ -1507,63 +1662,73 @@ def _transform_holders() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     reported wherever it is invoked. Over-approximating the population costs
     nothing here: a data parameter is only ever reported if the module CALLS it.
     """
-    functions = {fn.name: fn for fn in _cli_functions()}
-    holders: dict[str, set[str]] = {name: {arg.arg for arg in _all_args(fn)}
-                                    for name, fn in functions.items()}
-    # name -> first line at which it is bound to the rule. A call BEFORE that
-    # line is not guarded: round 8 moved an invocation above the boundary block
-    # and a set-valued `guarded` called it bound.
-    guarded: dict[str, dict[str, int]] = {name: {} for name in functions}
-    assert "_call" in functions, "_call is gone; this whole property is unchecked"
+    functions = _cli_functions()
+    by_name: dict[str, list] = {}
+    for fn in functions:
+        by_name.setdefault(fn.name, []).append(fn)
+    paths = {id(fn): _block_paths(fn) for fn in functions}
+    holders: dict[int, set[str]] = {id(fn): {arg.arg for arg in _all_args(fn)}
+                                    for fn in functions}
+    guarded: dict[int, dict[str, set[tuple]]] = {id(fn): {} for fn in functions}
+    slots: set[str] = set()
+    assert _named("_call") is not None, "_call is gone; this whole property is unchecked"
 
-    def bound_by(name: str, names: set[str], line: int) -> bool:
-        return all(guarded[name].get(candidate, _UNBOUND) <= line for candidate in names)
+    def bound_by(fn, names: set[str], use: tuple) -> bool:
+        return all(any(_dominates(binding, use) for binding in guarded[id(fn)].get(name, ()))
+                   for name in names)
 
-    def bind(name: str, names: set[str], line: int) -> None:
-        for candidate in names:
-            guarded[name][candidate] = min(guarded[name].get(candidate, _UNBOUND), line)
+    def bind(fn, names: set[str], at: tuple) -> None:
+        for name in names:
+            guarded[id(fn)].setdefault(name, set()).add(at)
 
     def snapshot() -> tuple:
-        return (tuple(sorted((name, tuple(sorted(names))) for name, names in holders.items())),
-                tuple(sorted((name, tuple(sorted(at.items()))) for name, at in guarded.items())))
+        return (tuple(sorted((key, tuple(sorted(names))) for key, names in holders.items())),
+                tuple(sorted((key, tuple(sorted((name, len(at)) for name, at in bound.items())))
+                             for key, bound in guarded.items())),
+                tuple(sorted(slots)))
 
     converged = False
     for _ in range(len(functions) + 8):
         before = snapshot()
-        for name, fn in functions.items():
-            for targets, value, line in _bindings(fn):
+        for fn in functions:
+            where = paths[id(fn)]
+            for targets, value, node in _bindings(fn):
                 names = _bound_names(targets)
+                at = where.get(id(node), ())
                 if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
                         and value.func.id == _BOUNDARY):
-                    holders[name] |= names
-                    bind(name, names, line)
+                    holders[id(fn)] |= names
+                    bind(fn, names, at)
                     continue
-                carried = _carried(value, holders[name])
+                carried = _carried(value, holders[id(fn)])
                 if carried:
-                    holders[name] |= names
-                    if bound_by(name, carried, line):
-                        bind(name, names, line)
+                    holders[id(fn)] |= names
+                    if bound_by(fn, carried, at):
+                        bind(fn, names, at)
+            slots |= _slot_names(fn, holders[id(fn)])
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
                     continue
-                for callee in _callee_roots(node) & set(functions):
-                    pairs = [*zip([arg.arg for arg in _all_args(functions[callee])], node.args)]
-                    pairs += [(keyword.arg, keyword.value)
-                              for keyword in node.keywords if keyword.arg]
-                    for param, expr in pairs:
-                        carried = _carried(expr, holders[name])
-                        if not carried:
-                            continue
-                        holders[callee].add(param)
-                        if bound_by(name, carried, node.lineno):
-                            # Bound on entry: the callee receives it already
-                            # bound, so every line of the callee is after it.
-                            bind(callee, {param}, functions[callee].lineno)
+                at = where.get(id(node), ())
+                for name in _callee_roots(node, frozenset(slots)):
+                    for callee in by_name.get(name, ()):
+                        pairs = [*zip([arg.arg for arg in _all_args(callee)], node.args)]
+                        pairs += [(keyword.arg, keyword.value)
+                                  for keyword in node.keywords if keyword.arg]
+                        for param, expr in pairs:
+                            carried = _carried(expr, holders[id(fn)])
+                            if not carried:
+                                continue
+                            holders[id(callee)].add(param)
+                            if bound_by(fn, carried, at):
+                                # Bound on entry: the callee receives it already
+                                # bound, so every block of the callee is after it.
+                                bind(callee, {param}, ())
         if before == snapshot():
             converged = True
             break
     assert converged, "the transform population did not converge; widen the bound"
-    return holders, guarded
+    return _Transforms(holders, guarded, paths, frozenset(slots))
 
 
 def _callee_names(node: ast.Call) -> set[str]:
@@ -1578,29 +1743,31 @@ def _callee_names(node: ast.Call) -> set[str]:
             | {attr.attr for attr in ast.walk(node.func) if isinstance(attr, ast.Attribute)})
 
 
-def _callee_roots(node: ast.Call) -> set[str]:
-    """The single name a call DISPATCHES THROUGH: `f(x)`, `slots["f"](x)`,
-    `factory()(x)` and `handlers[i][j](x)` all root in one name.
+def _dispatch_roots(expr: ast.expr, slots: frozenset[str]) -> set[str]:
+    """The names a callee expression DISPATCHES THROUGH.
 
-    An attribute step is deliberately NOT followed: `p.method(x)` invokes a
-    method OF `p` and says nothing about `p` being a transform. With the
-    population declared rather than recognised, following it flagged every
-    `parser.add_argument` in the module -- and a guard that cries wolf gets
-    loosened instead of fixed. A caller-supplied object whose METHOD is the
-    transform is covered behaviourally instead, by the per-parameter
-    arrangement below, which drives a malformed result through each one.
+    `f(x)`, `slots["f"](x)`, `factory()(x)` and `handlers[i][j](x)` root in one
+    name. `(tr := t)(x)` dispatches through both the walrus target and its
+    value. An attribute step is followed only when the attribute is a name some
+    holder is STORED under, so `holder.render(x)` is a dispatch and
+    `parser.add_argument(x)` is not.
     """
-    callee: ast.expr = node.func
-    while True:
-        if isinstance(callee, ast.Name):
-            return {callee.id}
-        if isinstance(callee, (ast.Subscript, ast.Starred)):
-            callee = callee.value
-            continue
-        if isinstance(callee, ast.Call):
-            callee = callee.func
-            continue
-        return set()
+    if isinstance(expr, ast.Name):
+        return {expr.id}
+    if isinstance(expr, (ast.Subscript, ast.Starred)):
+        return _dispatch_roots(expr.value, slots)
+    if isinstance(expr, ast.Call):
+        return _dispatch_roots(expr.func, slots)
+    if isinstance(expr, ast.NamedExpr):
+        target = {expr.target.id} if isinstance(expr.target, ast.Name) else set()
+        return target | _dispatch_roots(expr.value, slots)
+    if isinstance(expr, ast.Attribute) and expr.attr in slots:
+        return _dispatch_roots(expr.value, slots)
+    return set()
+
+
+def _callee_roots(node: ast.Call, slots: frozenset[str] = frozenset()) -> set[str]:
+    return _dispatch_roots(node.func, slots)
 
 
 def _callee(node: ast.Call) -> str:
@@ -1610,8 +1777,7 @@ def _callee(node: ast.Call) -> str:
 def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is():
     """Both halves of the mechanism, checked -- otherwise the two properties
     below could be satisfied by renaming the rule out of existence."""
-    functions = {fn.name: fn for fn in _cli_functions()}
-    rule = functions.get(_GUARD)
+    rule = _named(_GUARD)
     assert rule is not None, f"{_GUARD} is gone; this whole property is unchecked"
     handlers = [handler for node in ast.walk(rule) if isinstance(node, ast.Try)
                 for handler in node.handlers]
@@ -1619,13 +1785,13 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
                and handler.type.id == "_MALFORMED_RESULT_ERRORS" for handler in handlers), (
         f"{_GUARD} no longer catches _MALFORMED_RESULT_ERRORS, so binding a "
         "transform to it guards nothing")
-    boundary = functions.get(_BOUNDARY)
+    boundary = _named(_BOUNDARY)
     assert boundary is not None, f"{_BOUNDARY} is gone; nothing binds a transform to the rule"
     assert any(_callee_names(node) & {_GUARD} for node in ast.walk(boundary)
                if isinstance(node, ast.Call)), (
         f"{_BOUNDARY} must delegate to {_GUARD}; otherwise it returns an "
         "unguarded transform under a reassuring name")
-    call = functions.get("_call")
+    call = _named("_call")
     assert call is not None, "_call is gone; this whole property is unchecked"
     assert ({arg.arg for arg in _all_args(call)}
             == set(inspect.signature(bn.cli._call).parameters)), (
@@ -1636,28 +1802,68 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
 
 
 def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
-    """Property: in `cli.py`, a transform is CALLED only after the boundary
-    rebinding -- whatever the dispatch shape (a name, a dict lookup, a loop
-    variable, a walrus, a returned callable), in whatever function it was
-    forwarded to, and only on lines that come AFTER the rebinding, because it is
-    the OBJECT that is guarded and not the site."""
-    holders, guarded = _transform_holders()
+    """Property: in `cli.py`, a transform is CALLED only where the boundary
+    rebinding DOMINATES the call -- whatever the dispatch shape (a name, a dict
+    lookup, an attribute a transform was parked on, a loop variable, a walrus, a
+    returned callable), in whatever function it was forwarded to, because it is
+    the OBJECT that is guarded and not the site.
+
+    "After the rebinding" used to mean "on a later line", and a rebinding moved
+    into an `if` is on an earlier line than every call while running on only one
+    path. Dominance is the question line order was standing in for.
+    """
+    transforms = _transform_holders()
     unguarded = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
             continue
-        bound_at = guarded[fn.name]
+        where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
         unguarded += [
             f"{_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
             for node in ast.walk(fn)
             if isinstance(node, ast.Call)
-            for dispatched in [_callee_roots(node) & holders[fn.name]]
-            if any(bound_at.get(name, _UNBOUND) > node.lineno for name in dispatched)
+            for use in [where.get(id(node), ())]
+            for dispatched in [_callee_roots(node, transforms.slots)
+                               & transforms.holders[id(fn)]]
+            if any(not any(_dominates(binding, use) for binding in bound_at.get(name, ()))
+                   for name in dispatched)
         ]
     assert not unguarded, (
-        "these invoke a bridge-result transform that was never bound to the "
-        f"malformed-result rule, so a malformed result escapes there: {sorted(unguarded)}"
+        "these invoke a bridge-result transform on a path the boundary "
+        "rebinding does not dominate, so a malformed result escapes the rule "
+        f"there: {sorted(unguarded)}"
     )
+
+
+def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
+    """Every occurrence of the reply's result key in `cli.py`, and the names
+    bound to it.
+
+    An occurrence is a `"result"` constant OR a load of a name bound to one:
+    the population used to be constants alone, so the exemption's own name read
+    the key with no `"result"` token anywhere in the expression.
+    """
+    aliases: set[str] = set()
+    for _ in range(8):
+        before = set(aliases)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            if ((isinstance(value, ast.Constant) and value.value == "result")
+                    or (isinstance(value, ast.Name) and value.id in aliases)):
+                aliases |= {target.id for target in node.targets
+                            if isinstance(target, ast.Name)}
+        if before == aliases:
+            break
+    occurrences = [
+        node for node in ast.walk(tree)
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and node.value == "result")
+        or (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            and node.id in aliases)
+    ]
+    return occurrences, aliases
 
 
 def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
@@ -1666,52 +1872,64 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
     indexed the reply raw, so `{"ok": true}` with no `result` left `main()` as a
     bare `KeyError`.
 
-    The first cut of this property matched one read SHAPE -- `ast.Subscript`
-    with a constant `"result"` slice -- so `response.get("result")` (which reads
-    the same key and answers `None`, for a silent exit 0 on an unreadable reply)
-    and `_k = "result"; response[_k]` both walked past it, and one of those was
-    already in the file deciding the envelope question a second time.
+    Three cuts were escaped. Matching one read SHAPE let `response.get("result")`
+    past. Quantifying over every `"result"` CONSTANT but exempting a syntactic
+    class -- any dict-literal key -- let `response.get(*{"result": None})` wear
+    the syntax. Exempting ONE NAME let `response.get(_RESULT_ROW_KEY)` read the
+    key with no constant to find.
 
-    So the population is not a shape: it is EVERY occurrence of the string
-    `"result"` in `cli.py`. The second cut then exempted a syntactic CLASS --
-    any key of a dict literal, because the CLI writes that key into a fan-out
-    row -- and a raw read dressed as `response.get(*{"result": None})` claimed
-    the exemption, because its only occurrence of the string is a dict key.
-
-    An exemption for a syntactic class is a hole for anything that can wear the
-    syntax. So the exemption is ONE NAMED SITE: the module-level
-    `_RESULT_ROW_KEY` assignment, which the row builder uses. Any other
-    occurrence -- a subscript, a `.get`, a `.pop`, an `in` test, a dict literal,
-    a starred dict, a name bound to the literal -- is a read, and reads go
-    through the helper.
+    A name can be borrowed, so the exemption is not a name: it is the one WRITE
+    that pairs this key with the helper's own return value, outside any `*`
+    unpacking. Everything else that mentions the key -- a subscript, a `.get`, a
+    `.pop`, an `in` test, a starred dict, an alias of an alias -- is a read, and
+    reads go through the helper.
     """
-    source = _CLI.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    unwrap = next((fn for fn in _cli_functions() if fn.name == "_unwrap_result"), None)
+    tree = _cli_tree()
+    unwrap = _named("_unwrap_result")
     assert unwrap is not None, "_unwrap_result is gone; nothing checks the envelope"
-    declared = [node.value for node in tree.body
+    declared = [node for node in tree.body
                 if isinstance(node, ast.Assign)
                 if any(isinstance(target, ast.Name) and target.id == _RESULT_ROW_KEY_NAME
                        for target in node.targets)]
-    assert len(declared) == 1 and isinstance(declared[0], ast.Constant), (
-        f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, as a string "
-        "constant at module scope; it is the one exemption this property grants"
+    assert (len(declared) == 1 and isinstance(declared[0].value, ast.Constant)
+            and declared[0].value.value == "result"), (
+        f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, at module "
+        "scope, as the literal 'result'; it names the one write this property exempts"
     )
-    assert declared[0].value == "result", (
-        f"{_RESULT_ROW_KEY_NAME} must be the literal 'result'; it is: {declared[0].value!r}"
+    occurrences, aliases = _result_key_reads(tree)
+    assert aliases == {_RESULT_ROW_KEY_NAME}, (
+        "cli.py binds the reply's result key to more names than the one this "
+        f"property knows about, and each is a read it cannot see: {sorted(aliases)}"
     )
-    raw = [
-        f'"result" at cli.py:{node.lineno}'
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        if node.value == "result"
-        if node is not declared[0]
+    starred = {id(inner) for node in ast.walk(tree) if isinstance(node, ast.Starred)
+               for inner in ast.walk(node)}
+    exempt = {
+        id(key)
+        for node in ast.walk(tree) if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if key is not None and id(key) not in starred
+        # The write is exempt because its VALUE came from the helper: code that
+        # claims this exemption has already put the reply through the envelope
+        # check, which is the whole invariant.
+        if isinstance(value, ast.Call) and _callee_names(value) & {"_unwrap_result"}
+        if id(key) in {id(occurrence) for occurrence in occurrences}
+    }
+    raw = sorted(
+        f"{ast.unparse(node)} at cli.py:{node.lineno}"
+        for node in occurrences
+        if id(node) not in exempt
+        if node is not declared[0].value
         if not unwrap.lineno <= node.lineno <= (unwrap.end_lineno or unwrap.lineno)
-    ]
+    )
     assert not raw, (
         "these decide what a bridge reply's `result` is without the envelope "
         "helper, so a reply that carries none is read as a raw KeyError or as a "
         f"silent None: {raw}"
+    )
+    assert len(exempt) == 1, (
+        "the one exempt write -- the fan-out row keyed to `_unwrap_result`'s "
+        f"return value -- is claimed by {len(exempt)} sites; an exemption no "
+        "site uses is stale, and two sites is two contracts"
     )
 
 
@@ -1726,14 +1944,15 @@ def _repo_functions() -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
     return functions
 
 
-def _dispatched_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+def _dispatched_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef,
+                           slots: frozenset[str]) -> set[str]:
     """The parameters *fn* CALLS -- directly or through anything derived from
     them. This is what makes handing a value to another module dangerous."""
     params = {arg.arg for arg in _all_args(fn)}
     reachable = set(params)
     for _ in range(len(params) + 8):
         before = frozenset(reachable)
-        for targets, value, _line in _bindings(fn):
+        for targets, value, _node in _bindings(fn):
             if _carried(value, reachable):
                 reachable |= _bound_names(targets)
         if before == frozenset(reachable):
@@ -1741,7 +1960,7 @@ def _dispatched_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[st
     dispatched: set[str] = set()
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
-            dispatched |= _callee_roots(node) & reachable
+            dispatched |= _callee_roots(node, slots) & reachable
     return dispatched
 
 
@@ -1759,34 +1978,37 @@ def test_no_bridge_result_transform_leaves_cli_py_unguarded():
     above covers them, and an unresolvable callee (a builtin, a method) cannot
     be shown to invoke anything.
     """
-    holders, guarded = _transform_holders()
+    transforms = _transform_holders()
     in_module = {fn.name for fn in _cli_functions()} | {_BOUNDARY, _GUARD}
     repo = _repo_functions()
-    dispatches = {name: set().union(*(_dispatched_parameters(fn) for fn in defs))
+    dispatches = {name: set().union(*(_dispatched_parameters(fn, transforms.slots)
+                                      for fn in defs))
                   for name, defs in repo.items()}
     leaked = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
             continue
-        bound_at = guarded[fn.name]
+        where, bound_at = transforms.paths[id(fn)], transforms.guarded[id(fn)]
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call) or _callee_names(node) & in_module:
                 continue
-            for callee in _callee_roots(node) - in_module:
+            use = where.get(id(node), ())
+            for callee in _callee_roots(node, transforms.slots) - in_module:
                 if callee not in repo:
                     continue
-                slots = [arg.arg for arg in _all_args(repo[callee][0])]
-                pairs = [*zip(slots, node.args)]
+                params = [arg.arg for arg in _all_args(repo[callee][0])]
+                pairs = [*zip(params, node.args)]
                 pairs += [(keyword.arg, keyword.value) for keyword in node.keywords
                           if keyword.arg]
                 leaked += [
-                    f"{argument.id} -> {callee}({slot}=) in {fn.name}() "
+                    f"{argument.id} -> {callee}({param}=) in {fn.name}() "
                     f"at cli.py:{node.lineno}"
-                    for slot, argument in pairs
-                    if slot in dispatches[callee]
+                    for param, argument in pairs
+                    if param in dispatches[callee]
                     if isinstance(argument, ast.Name)
-                    if argument.id in holders[fn.name]
-                    if bound_at.get(argument.id, _UNBOUND) > node.lineno
+                    if argument.id in transforms.holders[id(fn)]
+                    if not any(_dominates(binding, use)
+                               for binding in bound_at.get(argument.id, ()))
                 ]
     assert not leaked, (
         "these hand an unguarded bridge-result transform out of cli.py to a "
@@ -1842,15 +2064,7 @@ def _call_transform_params() -> list[str]:
     previous cut derived it from an annotation-and-name recogniser, which an
     `Any`-typed parameter walked straight past.
     """
-    params = sorted(_declared_transform_params())
-    assert len(params) >= 6, f"_call's transform parameters vanished: {params}"
-    orphans = sorted(set(_TRANSFORM_ARRANGEMENTS) - set(params))
-    assert not orphans, (
-        f"these arrangements name parameters _call no longer has: {orphans}; a "
-        "stale entry makes the table look complete while a real parameter is "
-        "unexercised"
-    )
-    return params
+    return sorted(_declared_transform_params())
 
 
 @pytest.mark.parametrize("param", _call_transform_params())
