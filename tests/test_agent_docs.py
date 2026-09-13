@@ -480,7 +480,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "1e0f43b6",  # bn local retype ... ... float --preview
         "35d15f75",  # bn local rename ... ... speed --preview
         "3d833038",  # `bn function list` and `bn function search` return the full matc
-        "66b37d2e",  # Omitting `--target` only works when exactly one target is ... If
+        "66b37d2e",  # Omitting `--target` ... works when exactly one target is ... If 
         "6be09cc8",  # Any status above other than ... puts a mutation at exit code ...
         "76157733",  # - The CLI discovers a bridge, connects to it, and forwards ... W
         "7d089991",  # When you need counts from BN iterators such as ... materialize t
@@ -494,23 +494,23 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "c5fcc64c",  # - `bn` has two parts:
         "ca1fc685",  # - ... zero-based ordinal for matching callsites in the containin
         "d4db75c0",  # - **Peer-credential enforcement ... Every connection to the brid
-        "d55c4454",  # If exactly one BinaryView is open, target-specific commands can 
+        "d55c4454",  # If exactly one ... is open, target-specific commands can omit `-
         "e15482b8",  # Run Python inside the Binary Ninja process for one-off inspectio
         "ee507a32",  # Single-function escape hatch — analyze just one function without
         "f50ed8c8",  # tokens: ...
         "f6f3e5cb",  # ... ...
     }),
     "skills/bn/SKILL.md": frozenset({
-        "0580e23a",  # > bn -i ... -t <sel> xrefs main
+        "0580e23a",  # > bn -i ... -t ... xrefs main
         "12038a20",  # > **Parallel ... fan-out agents — HARD ... Sticky pins (`instanc
         "2b531c12",  # - **accumulator ... shift structure** — a size-parse loop that s
         "34ea1441",  # - **loop-invariant bound pointers** — a hoisted fixed limit (`ad
         "5e15be9b",  # - **HLIL can mislead beyond access width — trust `bn ... Pseudo-
-        "600daf80",  # > bn -i ... -t <sel> decompile main
+        "600daf80",  # > bn -i ... -t ... decompile main
         "6efe0859",  # ## Two gotchas that cause wrong answers
         "8bccdffa",  # - **conditional-compare ... `csel` ... `ccmn` guards** — ... fla
         "94ae359d",  # The full command catalog lives in three files **in this skill's 
-        "98945b00",  # One open target: omit ... Multiple open: pass `-t <selector>` (f
+        "98945b00",  # One open target: omit ... ... open: pass `-t ... (from `bn targe
         "b5f3f247",  # - **access width** — a byte compare can render full-width, and a
         "c9765e33",  # > OMP sibling task agents also share one retained eval ... They 
         "e8374ea0",  # > bn session start ... --instance-id ... # spawn name (not globa
@@ -591,7 +591,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "224aa0bc",  # bn evidence table <addr> --record-size N --field ... --field ...
         "23940cf6",  # bn disasm <fn> [--lines ... | --count ...
         "29c52aa0",  # bn strings [--query <q>] [--regex] [--min-length ... [--section 
-        "2d2e5021",  # struct CmdDesc desc = ...
+        "2d2e5021",  # struct ... desc = ...
         "3a2dd5dc",  # `--within-file` accepts one identifier (name or hex address) per
         "3e7166e2",  # - `bn class` is the **C++ object-model lens** ... a correlation 
         "3f16152c",  # bn evidence calls <reg-fn> --arg-struct N --field ... --field ..
@@ -626,6 +626,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "d3e7db45",  # - Two more signals from the same demotion logic: ... true` when 
         "dd81c5c0",  # - **Width-sensitive reads — trust `bn disasm`, not the ... Pseud
         "dfa3a380",  # - **Nothing-found vs incomplete (don't confuse them):** `items: 
+        "e190b0f0",  # bn evidence orient # one-shot triage digest under a single read 
         "e2f2e169",  # bn trace main ... --arg ... # intra: stops at call boundary
         "ec1c6720",  # bn taint forward -f <fn> --source ... [--sink-class ... # untrus
         "f0e63d8f",  # - **Addresses in JSON are hex STRINGS**, not integers: `{"addres
@@ -633,7 +634,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "fb0af0ab",  # - **Spilled output is NOT the data ... A heavy `--format json` r
     }),
     "skills/bn/reference/runtime.md": frozenset({
-        "0580e23a",  # > bn -i ... -t <sel> xrefs main
+        "0580e23a",  # > bn -i ... -t ... xrefs main
         "0d658e61",  # **Predicting spill ... Two signals let you avoid a wasted full r
         "10113c3e",  # **Spill ... When output exceeds ... ... estimated tokens** ... .
         "178a8928",  # - **Instance:** CLI ... > env ... > sticky > sole live instance 
@@ -643,20 +644,20 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "2449caa9",  # > **Global BNDB cache (read-only ... Auto-prefer isn't limited t
         "27da9925",  # ## ... Skill install
         "2b10a25d",  # **Stopping is identity-checked and atomically signalled ... `ses
-        "2e17cf8a",  # bn decompile main -i myid -t ... # after the leaf
+        "2e17cf8a",  # bn decompile main -i ... -t ... # after the leaf
         "30c54757",  # ## ... Workflow & target selection
         "393df258",  # > bn session start ... --instance-id ... # spawn naming
-        "3ecb3444",  # bn session list [-i <id>] # all running instances, or filter one
+        "3ecb3444",  # bn session list [-i ... # all running instances, or filter one
         "42663a3b",  # bn xrefs <fn-or-addr> --limit ... # cap text output
         "42c9764f",  # Requests time out after ... by default; override with ... ... ..
         "472980ae",  # bn decompile <fn> --lines ... # ... inclusive; prints ... lines 
         "4c0dc63e",  # ... Pick a target:
-        "4c3276d9",  # bn bundle -i myid -t ... function main # between group and leaf 
+        "4c3276d9",  # bn bundle -i ... -t ... function main # between group and leaf (
         "56550fe3",  # ## ... Known quirks
         "5ad3c6c3",  # - `--script <file>` for code on disk; `--code` for true ...
         "5d6983de",  # `bn load <raw>` and `bn session start <raw> ... auto-prefer a si
         "5dea8f09",  # shape, so a polling agent never has to index ... or re-derive te
-        "600daf80",  # > bn -i ... -t <sel> decompile main
+        "600daf80",  # > bn -i ... -t ... decompile main
         "63414412",  # The `[N]` prefix is the view id; you can pass `-t ... If no brid
         "64bf870d",  # ## ... Python escape hatch
         "6785f03a",  # State lives at ... Project root walks up to the nearest ... (cwd
@@ -683,25 +684,25 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "ca93b1b0",  # > **`xrefs` text is display-capped (not just ... For a hot symbo
         "cb024404",  # - **`types declare` verification ... The source-parser path hand
         "cfcd9558",  # | `decompile`, `il` | **partial** — render only already-analyzed
-        "d1ce60b3",  # bn close [<path>] [-t <sel>] [--all] # close one or explicitly -
+        "d1ce60b3",  # bn close [<path>] [-t ... [--all] # close one or explicitly --al
         "d6cfb85b",  # - `target`, `instance` — **provenance**: which target and bridge
         "dd5822d0",  # ... ... sign=False)), ...
         "e0237277",  # When multiple bridge instances exist, flagless `bn load <path>` 
         "e3475983",  # ... sign=False), ...
-        "f2a53a19",  # bn -i myid -t ... decompile main # at root (preferred for agents
+        "f2a53a19",  # bn -i ... -t ... decompile main # at root (preferred for agents)
     }),
     "skills/bn-kernel/SKILL.md": frozenset({
         "031591a9",  # reports ... and ... keeps the bridge-owned `kind`, `total` and
         "0ab592f9",  # wire this is an internal one-row **probe** at your requested `of
         "1016956a",  # On every reachable exit, close only the exact selector returned 
-        "13d5a877",  # ... bn session start ... --instance-id worker --detach
+        "13d5a877",  # ... bn session start ... --instance-id ... --detach
         "19e6cec0",  # ... asks for the schema, not the ... Passing ... to a curated
         "1a60fe9a",  # run, every start and load succeeded with that budget, but two st
         "1b9cffb0",  # band, including on a **zero-hit** page for any pre-declared kind
         "26b229c0",  # Python process safe for sibling task ... A sibling exit ... can 
         "27e9ecca",  # returns only after attempting that exact teardown on every reach
         "292ab6e0",  # ... on the same agent-owned spawn, never a substitute for ...
-        "3804218c",  # ... bn session start ... --instance-id worker
+        "3804218c",  # ... bn session start ... --instance-id ...
         "3a2677e0",  # ... ...
         "3bd6c497",  # spawn budget (for example ... and give the surrounding tool a
         "3ff3109a",  # HLIL and decompilation can distort access width, conditional gua
@@ -717,7 +718,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "71820845",  # Use this skill for high-volume reads that benefit from OMP's ret
         "742c5bd1",  # more than ... seconds (maximum ... ...
         "74a85e20",  # ... is always normalized to ... A non-zero `offset` means the
-        "7e6433f3",  # bn -i worker session status "$JOB" --format json # one job: mach
+        "7e6433f3",  # bn -i ... session status "$JOB" --format json # one job: machine
         "7ed9f73a",  # - `await ... reports offending comment locations; ... is the exp
         "90230d5e",  # Paged reads also require each page to publish an integer `offset
         "92bdec53",  # - `await ... exposes ... ... (the exact `imports` row count), an
@@ -728,7 +729,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "a46e3990",  # - `await ... count=N)` ... `lines=(START, END)` returns an addre
         "b5ecda74",  # - `await ... ... defaults to ... rows to avoid latency cliffs; p
         "b817911f",  # rows = await ...
-        "be1fbfeb",  # diagnostic channel for a failure: read the raised `BnError` for 
+        "be1fbfeb",  # diagnostic channel for a failure: read the raised ... for ... Th
         "c197cd77",  # A deliberate alternative timeout must be positive; never use ...
         "c515afa2",  # - `await ... ... ... defaults to ... ... A bounded high-fan-in p
         "ccd87225",  # When two or more concurrent children will use bn-kernel, launch 
@@ -750,7 +751,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
     }),
     "skills/bn-re/SKILL.md": frozenset({
         "02a15c24",  # ... **Map the C++ type lattice (RTTI ... symbolicated C++ target
-        "0a6d25f3",  # bn class show <ClassName> # one class: methods, vtable slots, ba
+        "0a6d25f3",  # bn class show ... # one class: methods, vtable slots, bases, con
         "131433a5",  # > **One-shot sweep: `bn evidence ... It composes this whole sect
         "133b9367",  # ### Phase ... Struct reconstruction
         "13d6d847",  # ### Phase ... Retype locals and parameters
@@ -779,7 +780,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "0c92c9f8",  # strcat(out, decrypt(chunk)); ... bound = Σ decrypted-chunk lengt
         "0e36f595",  # ... p + ... ... ... handler runs before the header is proven com
         "0fef6d54",  # ... **Interesting strings** — format strings, SQL fragments, she
-        "132f4dad",  # **Worked example — ... BusyBox is an applet multiplexer: `main` 
+        "132f4dad",  # **Worked example — ... ... is an applet multiplexer: `main` disp
         "145b57e4",  # bn disasm ... --linear ... # address-linear: confirm ... widths 
         "152a5d55",  # p += ... + ... ... advances by an ... length
         "1961f9cb",  # > (backward); reading backward ... as results misreports a real 
@@ -877,25 +878,69 @@ def _fingerprint(text: str) -> str:
 # Deliberately broader than the requirement -- eliding `op_registry.py` costs
 # nothing and missing one name is a disclosure.
 _ELIDED = re.compile(r"\S*[0-9_./\\]\S*")
+# A symbol or a target name need carry none of those: `PlayerUpdate` is a
+# CamelCase identifier and nothing else. An inner lower-to-upper transition is
+# what makes it one, and eliding `BinaryView` as collateral costs nothing.
+_CAMEL = re.compile(r"[a-z][A-Z]")
+# ...and an instance id or target selector is identified by the flag in front of
+# it rather than by its own spelling, so the token AFTER one of these is elided
+# whatever it looks like.
+_TARGET_FLAGS = frozenset({"-i", "--instance", "--instance-id", "-t", "--target"})
 
 
 def _ledger_comment(normalized: str) -> str:
-    return " ".join("..." if _ELIDED.fullmatch(token) else token
-                    for token in normalized.split())[:64]
+    rendered, elide_next = [], False
+    for token in normalized.split():
+        rendered.append("..." if (elide_next or _ELIDED.fullmatch(token)
+                                  or _CAMEL.search(token)) else token)
+        elide_next = token.strip("`\"'<>()[],.") in _TARGET_FLAGS
+    return " ".join(rendered)[:64]
+
+
+def _bullet_span(prefix: str, text: str) -> tuple[int, int]:
+    """The character range of the `prefix` bullet, continuation lines folded in.
+
+    `_bullet` returns the bullet's TEXT; the sweep needs its EXTENT, because a
+    cell that pins a clause of that bullet pins it THERE and nowhere else.
+    """
+    offset, span = 0, None
+    for line in text.splitlines(keepends=True):
+        if span is None and line.startswith(prefix):
+            span = [offset, offset + len(line)]
+        elif span is not None:
+            if not line.startswith((" ", "\t")) or not line.strip():
+                break
+            span[1] = offset + len(line)
+        offset += len(line)
+    assert span is not None, f"{prefix!r} bullet is gone, so its clauses pin nothing"
+    return span[0], span[1]
 
 
 def _exit_code_claimed(doc: str, text: str) -> bytearray:
-    """The characters of *text* that some cell pins."""
+    """The characters of *text* that some cell pins.
+
+    A clause pattern of the exit-code bullet is applied to THAT BULLET only.
+    Applied document-wide it pre-claimed every other line that reused a guarded
+    clause's wording, so appending "0 = success even when every instance
+    failed" to `CLAUDE.md` -- a false contract -- produced no residual token and
+    the sweep never saw the line (round 12). A cell pins one statement in one
+    place; letting its wording immunise the rest of the document is the
+    fail-open echo this accounting exists to retire.
+    """
     patterns = [pattern for cell_doc, _, pattern, _ in _EXIT_CODE_ECHOES
                 if cell_doc == doc]
     patterns += [re.escape(literal) for cell_doc, _, literal in _EXIT_CODE_PINS
                  if cell_doc == doc]
-    if doc == "CLAUDE.md":
-        patterns += [pattern for _, pattern in _EXIT_CODE_CLAUSES]
     claimed = bytearray(len(text))
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.M):
             claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    if doc == "CLAUDE.md":
+        start, end = _bullet_span("- Exit codes:", text)
+        for _, pattern in _EXIT_CODE_CLAUSES:
+            for match in re.finditer(pattern, text[start:end], re.M):
+                at = start + match.start()
+                claimed[at:start + match.end()] = b"\x01" * (match.end() - match.start())
     return claimed
 
 
@@ -988,24 +1033,47 @@ def test_the_non_claim_number_ledger_has_no_stale_entry():
 
 _LEDGER_ROW = re.compile(r'^        "(?P<key>[0-9a-f]{8})",  # (?P<comment>.*)$')
 
-# The classes rule 11 names, stated HERE and not in the redactor: a guard that
-# asks the redactor what provenance is cannot fail when the redactor loosens.
+# The requirement, stated HERE and not in the redactor: a guard that asks the
+# redactor what provenance is cannot fail when the redactor loosens. It names
+# the four classes that are machine-recognisable in isolation or by position --
+# an address, an underscored or CamelCase symbol, a target filename, and a value
+# introduced by an instance/target flag.
+#
+# What it CANNOT recognise, stated rather than claimed away: a bare lowercase
+# word that happens to be a symbol or an instance id (`prfleetseven`) is not
+# distinguishable from prose by any rule, so the redactor is deliberately
+# broader than this check and a reviewer reads the diff for that one case.
 _TARGET_PROVENANCE = re.compile(
-    r"0x[0-9a-fA-F]+|sub_[0-9a-fA-F]+|\w+\.(?:so|bndb|bin|elf|exe|dll|dylib)\b")
+    r"0x[0-9a-fA-F]+|sub_[0-9a-fA-F]+|\w+\.(?:so|bndb|bin|elf|exe|dll|dylib)\b"
+    r"|[a-z][A-Z]|(?:-i|--instance|--instance-id|-t|--target) +[^ .]+")
 
 
-def _ledger_comments() -> dict[str, str]:
-    """The comment beside each ledger entry, read from this module's own source
-    -- the only place a comment exists."""
+_LEDGER_DOC = re.compile(r'^    "(?P<doc>[^"]+)": frozenset\({$')
+
+
+def _ledger_comments() -> dict[tuple[str, str], str]:
+    """The comment beside each ledger entry, keyed by (document, fingerprint).
+
+    Keyed by fingerprint alone, two docs sharing an identical line and residual
+    shared one dict entry, so the earlier row's comment was SHADOWED and read by
+    neither guard -- a provenance string could be committed in it and both cells
+    stayed green (round 12). The ledger is per-document and so is this.
+    """
     source = Path(__file__).read_text(encoding="utf-8").splitlines()
     start = source.index("NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {")
-    rows = {}
-    for line in source[start:]:
+    rows: dict[tuple[str, str], str] = {}
+    doc = None
+    for line in source[start + 1:]:
         if line == "}":
             break
+        heading = _LEDGER_DOC.match(line)
+        if heading:
+            doc = heading["doc"]
+            continue
         match = _LEDGER_ROW.match(line)
         if match:
-            rows[match["key"]] = match["comment"]
+            assert doc is not None, f"a ledger row sits outside any document: {line}"
+            rows[(doc, match["key"])] = match["comment"]
     return rows
 
 
@@ -1014,12 +1082,13 @@ def test_every_ledger_entry_carries_the_line_it_excuses():
     line, so an entry re-fingerprinted against a changed line shows WHICH line
     changed instead of only that a hash did."""
     comments = _ledger_comments()
-    keyed = set().union(*NON_CLAIM_NUMBER_LINES.values())
+    keyed = {(doc, key) for doc, ledger in NON_CLAIM_NUMBER_LINES.items()
+             for key in ledger}
     assert set(comments) == keyed, (
         "every ledger entry must carry its line as a comment and name a key the "
-        f"ledger holds: {sorted(set(comments) ^ keyed)}"
+        f"ledger holds, per document: {sorted(set(comments) ^ keyed)}"
     )
-    expected = {_ledger_key(normalized, residual): _ledger_comment(normalized)
+    expected = {(doc, _ledger_key(normalized, residual)): _ledger_comment(normalized)
                 for doc in EXIT_CODE_DOCS
                 for _, normalized, residual in _number_lines(doc)}
     wrong = {key: (comment, expected.get(key))

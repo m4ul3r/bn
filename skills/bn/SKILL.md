@@ -52,8 +52,8 @@ One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target
 
 ## Command index (what exists — flags live in reference)
 
-- **Read** — `target info/list`, `function list/search/info`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `evidence function/xrefs/table/message/init`, `trace`, `dataflow defuse/callgraph/values`, `taint forward/backward/models`, `go functions`, `proto get`, `local list`, `read`, `types [show]`, `struct show`, `class list/show`, `strings`, `imports`, `exports`, `sections`, `tag list/get/types`, `comment list/get` → **`reference/reading.md`**
-- **Mutate** (verified; preview first) — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `function create`, `tag add/remove`, `tag type create/remove`, `go rename`, `batch apply`, `bundle function` → **`reference/mutating.md`**
+- **Read** — `target info/list`, `function list/search/info/cfg/structured-il`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `evidence function/xrefs/table/message/init/calls/orient/surface/virtual-call`, `trace`, `dataflow defuse/callgraph/values`, `taint forward/backward/models`, `go functions`, `proto get`, `local list`, `data vars/symbols`, `read`, `types [show]`, `struct show`, `class list/show`, `strings`, `imports`, `exports`, `sections`, `tag list/get/types`, `comment list/get` → **`reference/reading.md`**
+- **Mutate** (verified; preview first) — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `data retype`, `function create`, `tag add/remove`, `tag type create/remove`, `go rename`, `batch apply`, `bundle function` → **`reference/mutating.md`**
 - **Discover** — `capabilities` (no target; the registry-derived JSON index of every command + when to pick it — prefer it over guessing from this partial map) → **`reference/runtime.md`**
 - **Session** — `load`, `save`, `close`, `refresh`, `session start/list/stop` → **`reference/runtime.md`**
 - **Escape hatch** — `py exec` (only when a built-in won't do; exclusive write lock) → **`reference/runtime.md`**

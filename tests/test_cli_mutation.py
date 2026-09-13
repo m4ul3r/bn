@@ -1690,11 +1690,35 @@ def test_every_name_cli_py_stores_is_a_name_the_population_binds():
                    if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name}
         stored |= {node.rest for node in ast.walk(fn)
                    if isinstance(node, ast.MatchMapping) and node.rest}
+        # The three forms that bind a name WITHOUT an `ast.Name` store, listed
+        # here so the claim in this test's name is literally true rather than
+        # true of the nodes it happened to walk.
+        stored |= {node.name for node in ast.walk(fn)
+                   if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef
+                                 | ast.ClassDef)} - {fn.name}
+        stored |= {(alias.asname or alias.name).split(".")[0]
+                   for node in ast.walk(fn)
+                   if isinstance(node, ast.Import | ast.ImportFrom)
+                   for alias in node.names}
+        stored |= {handler.name for handler in ast.walk(fn)
+                   if isinstance(handler, ast.ExceptHandler) and handler.name}
         bound = {name for targets, *_ in _bindings(fn) for name in _bound_names(targets)}
-        # An `except ... as name` rebinds to an exception, never to a transform,
-        # so leaving it out only ever makes a later use look UNguarded.
+        # The carve-outs, each with a reason that is a fact about the value the
+        # name receives rather than about the syntax that binds it:
+        #   * `except ... as name` receives an EXCEPTION, never a transform;
+        #   * a nested `def`/`class` receives an object `cli.py` defines, and its
+        #     own body is a member of `_cli_functions()` scanned in its own right;
+        #   * an `import` receives a module.
+        # Each can only make a later use look UNguarded, never guarded.
         bound |= {handler.name for handler in ast.walk(fn)
                   if isinstance(handler, ast.ExceptHandler) and handler.name}
+        bound |= {node.name for node in ast.walk(fn)
+                  if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef
+                                | ast.ClassDef)}
+        bound |= {(alias.asname or alias.name).split(".")[0]
+                  for node in ast.walk(fn)
+                  if isinstance(node, ast.Import | ast.ImportFrom)
+                  for alias in node.names}
         if stored - bound:
             unseen[fn.name] = sorted(stored - bound)
     assert not unseen, (
@@ -1773,7 +1797,7 @@ def _slot_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, holders: set[str]) -
 
 
 def _module_scope_names() -> frozenset[str]:
-    """Names `cli.py` binds at MODULE scope, plus every name a function
+    """Every name in `cli.py`'s module namespace, plus every name a function
     declares `global`.
 
     A module-scope name is the third door into the population, after the
@@ -1781,15 +1805,23 @@ def _module_scope_names() -> frozenset[str]:
     from every function in the file. Round 9's population had a parameter and a
     call argument and not this, so parking a caller-supplied renderer in a
     module global and dispatching it from a helper left every property green.
+
+    The first cut of THIS function enumerated the binding kinds that reach
+    module scope -- `Assign`, `AnnAssign`, `global` -- and a `class` at module
+    scope is none of them, so `_RenderSlot.render = text_renderer` in one
+    function and `_RenderSlot.render(result)` in another escaped the population
+    entirely and `main()` raised a raw `ValueError` (round 12). That is the
+    third time a STORAGE LOCATION rather than a call shape defeated this sweep,
+    after the module global and the dict value, so the kinds are no longer
+    enumerated: the module namespace is asked directly, which is total over
+    every storage form the language has -- `class`, `def`, `import`, assignment,
+    annotation, or one added to Python next year. `global` names are unioned in
+    because a name a function creates at runtime need not exist at import.
     """
-    tree = _cli_tree()
-    names = {target.id for node in tree.body if isinstance(node, ast.Assign)
-             for target in node.targets if isinstance(target, ast.Name)}
-    names |= {node.target.id for node in tree.body
-              if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)}
-    names |= {name for node in ast.walk(tree) if isinstance(node, ast.Global)
-              for name in node.names}
-    return frozenset(names)
+    return frozenset(vars(bn.cli)) | {
+        name for node in ast.walk(_cli_tree()) if isinstance(node, ast.Global)
+        for name in node.names
+    }
 
 
 class _Transforms(NamedTuple):
@@ -1821,10 +1853,14 @@ def _transform_holders() -> _Transforms:
       outside the function that bound it: parking a transform in a global and
       dispatching it from a helper is reported, which is what it should be.
 
-    Guardedness propagates the same way, so a transform bound once at the
-    boundary stays bound everywhere it travels -- and one bound nowhere is
-    reported wherever it is invoked. Over-approximating the population costs
-    nothing here: a data parameter is only ever reported if the module CALLS it.
+    Guardedness does NOT propagate across a call site -- only the population
+    does. A transform bound at one caller's boundary and forwarded to a helper
+    is reported again IN the helper unless the helper re-binds, because a second
+    caller handing that same helper a raw transform would otherwise be laundered
+    by the first (round 10). The cost is over-strictness, which `cli.py` pays by
+    binding at each boundary; the cost of the alternative was a real escape.
+    Over-approximating the POPULATION likewise costs little: a data parameter is
+    only ever reported if the module CALLS it.
     """
     functions = _cli_functions()
     by_name: dict[str, list] = {}
@@ -1945,7 +1981,15 @@ def _dispatch_roots(expr: ast.expr, slots: frozenset[str]) -> set[str]:
     if isinstance(expr, (ast.Subscript, ast.Starred)):
         return _dispatch_roots(expr.value, slots)
     if isinstance(expr, ast.Call):
-        return _dispatch_roots(expr.func, slots)
+        # `factory()(x)` dispatches through whatever the factory returns, and a
+        # factory handed a holder can return it wrapped:
+        # `functools.partial(text_renderer)(result)` rooted in `partial` alone,
+        # so the holder in the ARGUMENTS was invisible and the call was not a
+        # dispatch at all (round 12). Every argument is a root too.
+        return _dispatch_roots(expr.func, slots).union(*(
+            _dispatch_roots(argument, slots)
+            for argument in (*expr.args, *(kw.value for kw in expr.keywords))
+        ), set())
     if isinstance(expr, ast.NamedExpr):
         target = {expr.target.id} if isinstance(expr.target, ast.Name) else set()
         return target | _dispatch_roots(expr.value, slots)
@@ -2012,7 +2056,18 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
 # must still be reported, and the slot must still receive nothing), and it was
 # reported only once the annotated-assignment door closed -- before that the
 # annotation hid the binding entirely.
-_NOT_A_RESULT_TRANSFORM = {"handler() in main()": "handler"}
+# site -> (slot, the sites `cli.py` may store a holder under that slot).
+# The store set is part of the reason, not an afterthought: `@_command` parks the
+# function it decorates under `handler`, and by a total population a decorator's
+# own parameter is a holder, so "nothing is stored here" is simply false. What is
+# true is that the slot is written at ONE site, the command registry, and it
+# stale-fails in both directions -- a new store reds, and the registry store
+# disappearing reds too, because then the exemption is describing a module that
+# has moved on.
+_NOT_A_RESULT_TRANSFORM = {
+    "handler() in main()": ("handler",
+                            frozenset({"handler <- dict literal in decorator()"})),
+}
 
 
 def _dispatch_sites() -> list[str]:
@@ -2037,42 +2092,93 @@ def _dispatch_sites() -> list[str]:
     return sites
 
 
-def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
-    """The exemption's two halves, both able to fail.
+def _slot_stores(slot: str) -> list[str]:
+    """Every place `cli.py` stores a holder under the attribute/key *slot*.
 
-    STALE: the site must still be one the property reports, so an exemption
-    cannot outlive the call it excuses and sit there excusing a future one.
-    REASON: no call in `cli.py` may store a holder under the exempted slot --
-    the claim that makes the site safe. Park a caller-supplied transform there
-    and this reds, whatever the site list says.
+    Not just calls. `setattr(args, "handler", t)` was covered and the
+    semantically identical `args.handler = t` was not, so the reason forbade one
+    spelling of the thing it forbids (round 12).
     """
-    reported = {site.split("|", 1)[0] for site in _dispatch_sites()}
-    stale = sorted(set(_NOT_A_RESULT_TRANSFORM) - reported)
-    assert not stale, (
-        "these dispatch sites are exempt from the boundary property but the "
-        f"property no longer reports them, so the exemption is dead: {stale}"
-    )
     transforms = _transform_holders()
-    parked = []
+    stores = []
     for fn in _cli_functions():
         holders = transforms.holders[id(fn)]
         for node in ast.walk(fn):
-            if not isinstance(node, ast.Call):
-                continue
-            for slot in set(_NOT_A_RESULT_TRANSFORM.values()):
-                stores = [keyword.value for keyword in node.keywords
-                          if keyword.arg == slot]
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if node.value is not None and _stores_holder(node.value, holders):
+                    stores += [f"{slot} <- {ast.unparse(target)} in {fn.name}() "
+                               f"at cli.py:{node.lineno}"
+                               for target in targets
+                               if isinstance(target, ast.Attribute) and target.attr == slot]
+            elif isinstance(node, ast.Dict):
+                stores += [f"{slot} <- dict literal in {fn.name}() "
+                           f"at cli.py:{node.lineno}"
+                           for key, value in zip(node.keys, node.values)
+                           if isinstance(key, ast.Constant) and key.value == slot
+                           if _stores_holder(value, holders)]
+            elif isinstance(node, ast.Call):
+                keyed = [keyword.value for keyword in node.keywords
+                         if keyword.arg == slot]
                 after = [argument for at, argument in enumerate(node.args)
                          if any(isinstance(earlier, ast.Constant)
                                 and earlier.value == slot
                                 for earlier in node.args[:at])]
-                if any(_stores_holder(value, holders) for value in (*stores, *after)):
-                    parked.append(f"{slot} <- {_callee(node)}() in {fn.name}() "
-                                  f"at cli.py:{node.lineno}")
-    assert not parked, (
-        "a caller-supplied value is stored under an EXEMPT slot, so the reason "
-        f"the exempt site is safe is no longer true: {parked}"
+                stores += [f"{slot} <- {_callee(node)}() in {fn.name}() "
+                           f"at cli.py:{node.lineno}"
+                           for value in (*keyed, *after)
+                           if _stores_holder(value, holders)]
+    return stores
+
+
+def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
+    """The exemption's three halves, each able to fail on its own.
+
+    IDENTITY: the exemption must match EXACTLY ONE reported site. Keyed on the
+    rendered callee plus the enclosing function name, it was matched by PATTERN,
+    so a second `def main(handler, result): return handler(result)` -- or one
+    more `handler(...)` call anywhere in the real `main` -- inherited it
+    silently with every property green. An exemption is a hole you promised not
+    to look through, and the promise has to be unique as well as executable.
+    NAME: the exempt name may not be BOUND to a holder inside the function that
+    dispatches it, which is how a caller-supplied transform was renamed onto it.
+    SLOT: nothing in `cli.py` may store a holder under the exempted slot, in any
+    binding form -- the claim that makes the site safe in the first place.
+    """
+    reported = [site.split("|", 1)[0] for site in _dispatch_sites()]
+    wrong = {site: reported.count(site) for site in _NOT_A_RESULT_TRANSFORM
+             if reported.count(site) != 1}
+    assert not wrong, (
+        "each exemption must name exactly ONE reported dispatch site: a count "
+        "of 0 means the exemption is dead and outliving the call it excuses, "
+        "and a count above 1 means a second site is inheriting it under the "
+        f"same rendered name: {wrong}"
     )
+    transforms = _transform_holders()
+    renamed = []
+    for site, (slot, _allowed) in _NOT_A_RESULT_TRANSFORM.items():
+        owner = site.rsplit(" in ", 1)[1].removesuffix("()")
+        for fn in _cli_functions():
+            if fn.name != owner:
+                continue
+            holders = transforms.holders[id(fn)]
+            renamed += [
+                f"{slot} <- {ast.unparse(value)} in {fn.name}() at cli.py:{node.lineno}"
+                for targets, value, node, _header in _bindings(fn)
+                if slot in _bound_names(targets) and _stores_holder(value, holders)
+            ]
+    assert not renamed, (
+        "the exempt name is bound to a caller-supplied value inside the very "
+        "function that dispatches it, so the exempt site is now a real "
+        f"unguarded dispatch wearing the exemption's name: {renamed}"
+    )
+    for _site, (slot, allowed) in _NOT_A_RESULT_TRANSFORM.items():
+        found = {store.rsplit(" at cli.py:", 1)[0] for store in _slot_stores(slot)}
+        assert found == allowed, (
+            f"the sites storing a caller-supplied value under the exempt slot "
+            f"{slot!r} are not the ones the exemption's reason names, so the "
+            f"reason no longer describes this module: {sorted(found ^ allowed)}"
+        )
 
 
 def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
@@ -2260,15 +2366,21 @@ def test_no_bridge_result_transform_leaves_cli_py_unguarded():
                 pairs = [*zip(params, node.args)]
                 pairs += [(keyword.arg, keyword.value) for keyword in node.keywords
                           if keyword.arg]
+                # NOT `isinstance(argument, ast.Name)`: the argument only had
+                # to be WRAPPED to leave the module unguarded --
+                # `inner_renderer=functools.partial(text_renderer)`, `[t][0]`,
+                # `t if c else u` -- and `_stores_holder`/`_carried` already read
+                # every one of those as carrying a holder. Two halves of one
+                # rule disagreeing is the same defect round 11 fixed for
+                # `_dispatch_roots` and BoolOp, one property over.
                 leaked += [
-                    f"{argument.id} -> {callee}({param}=) in {fn.name}() "
+                    f"{name} -> {callee}({param}=) in {fn.name}() "
                     f"at cli.py:{node.lineno}"
                     for param, argument in pairs
                     if param in dispatches[callee]
-                    if isinstance(argument, ast.Name)
-                    if argument.id in transforms.holders[id(fn)]
+                    for name in _carried(argument, transforms.holders[id(fn)])
                     if not any(_dominates(binding, use)
-                               for binding in bound_at.get(argument.id, ()))
+                               for binding in bound_at.get(name, ()))
                 ]
     assert not leaked, (
         "these hand an unguarded bridge-result transform out of cli.py to a "

@@ -95,24 +95,22 @@ INDEX_EXEMPT_TOOLING = frozenset({
     "doctor", "help", "plugin install", "skill install",
 })
 
-# Deeper read/write surface the index reaches through its group entry.
-# ASSERTED: each has a catalogue ENTRY under `skills/` -- the invocation form
-# `bn <command>` on a line that is structurally an entry (a list item, a table
-# row, a callout, or a line inside a fenced block). `evidence virtual-call` was
-# in this group while appearing in no reference at all, and the repair then
-# accepted any backticked mention of the bare name, which a sentence SAYING THE
-# COMMAND IS UNDOCUMENTED also satisfies: deleting `evidence surface`'s
-# catalogue line and leaving "The `evidence surface` lane is not documented
-# here." kept all 16 drift tests green (round 11). A prose mention is not a
-# catalogue entry, and the bare name is not an invocation.
-INDEX_EXEMPT_CATALOGUED = frozenset({
-    "data retype", "data symbols", "data vars",
-    "evidence calls", "evidence orient", "evidence surface", "evidence virtual-call",
-    "function cfg", "function structured-il",
-})
-
+# There used to be a fourth group here: nine deeper read/write commands exempt
+# BECAUSE they were "catalogued in a reference". Its reason failed three times.
+# Round 8 found `evidence virtual-call` in the group while it appeared in no
+# reference at all. Round 11 found the repair accepting any backticked mention
+# of the bare name -- which a sentence saying the command is UNDOCUMENTED also
+# satisfies. Round 12 found the second repair, which required that sentence to
+# be a structural entry, satisfied by writing the denial as a `> ` callout.
+#
+# A reason that keeps being satisfiable is not a reason that needs hardening
+# again: an exemption is a hole someone promised not to look through, and the
+# only reliable way to close it is to stop making the promise. All nine are now
+# advertised in the Command index like every other registered command, which is
+# what #627 asked for in the first place -- the exemption was papering over the
+# very issue it was meant to serve.
 INDEX_EXEMPT_COMMANDS = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
-                         | INDEX_EXEMPT_TOOLING | INDEX_EXEMPT_CATALOGUED)
+                         | INDEX_EXEMPT_TOOLING)
 
 
 @pytest.fixture(scope="module")
@@ -371,37 +369,13 @@ def test_skill_command_index_advertises_every_registered_command(command_paths):
     )
 
 
-# A catalogue entry is an INVOCATION on a line that is structurally an entry.
-# Both halves are load-bearing: the bare name admits a sentence denying the
-# command is documented, and prose admits the same sentence written with `bn `
-# in front of it.
-_ENTRY_PREFIXES = ("- ", "* ", "| ", "> ", "+ ")
-
-
-def _catalogue_entries() -> frozenset[str]:
-    """Every command some doc under `skills/` carries a catalogue entry for."""
-    entries: set[str] = set()
-    for path in sorted(SKILL.parent.parent.rglob("*.md")):
-        fenced = False
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                fenced = not fenced
-                continue
-            if not (fenced or stripped.startswith(_ENTRY_PREFIXES)):
-                continue
-            entries |= {command for command in INDEX_EXEMPT_CATALOGUED
-                        if f"bn {command}" in line}
-    return frozenset(entries)
-
-
 def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     """An exemption is a claim, and an unasserted claim is where a real gap
     hides: `evidence virtual-call` sat in the "catalogued in a reference" group
     while appearing in no reference at all. So each group's stated reason is
     checked here, and the groups together must be exactly the exemption set."""
     groups = (INDEX_EXEMPT_STICKY | frozenset(INDEX_EXEMPT_REACHED_VIA)
-              | INDEX_EXEMPT_TOOLING | INDEX_EXEMPT_CATALOGUED)
+              | INDEX_EXEMPT_TOOLING)
     assert groups == INDEX_EXEMPT_COMMANDS, (
         "every exemption must sit in exactly one reason group, or its reason is "
         f"unchecked: {sorted(groups ^ INDEX_EXEMPT_COMMANDS)}"
@@ -430,14 +404,6 @@ def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     assert not unresolved, (
         f"these ways in are not registered commands: {unresolved}"
     )
-    catalogued = _catalogue_entries()
-    uncatalogued = sorted(INDEX_EXEMPT_CATALOGUED - catalogued)
-    assert not uncatalogued, (
-        "these are exempt from the index BECAUSE they are catalogued in a "
-        "reference, and no line under skills/ is a catalogue ENTRY for them -- "
-        "an invocation `bn <command>` on a list item, table row, callout or "
-        f"fenced line: {uncatalogued}"
-    )
 
 
 def _index_section() -> str:
@@ -461,7 +427,7 @@ def _index_section() -> str:
 # drops every entry it cannot read, which is the same "advertised but
 # undocumented" hole this guard exists to close.
 _INDEX_ENTRY = re.compile(
-    r"`(?P<cmd>[a-z][a-z ]*(?:/[a-z]+)*)(?: \[(?P<optional>[a-z]+)\])?`(?: \([^)]*\))?"
+    r"`(?P<cmd>[a-z][a-z -]*(?:/[a-z-]+)*)(?: \[(?P<optional>[a-z]+)\])?`(?: \([^)]*\))?"
 )
 
 # Any list item introducing a group, whatever the marker or indentation. The
