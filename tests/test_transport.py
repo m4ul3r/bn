@@ -4325,3 +4325,182 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
     assert bridge_registry_path("...").exists()
     assert not orphan_sock.exists()
     assert not orphan_log.exists()
+
+
+def test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket(
+    tmp_path, monkeypatch
+):
+    """Destruction must remove the FILE that was judged, not the NAME it had.
+
+    Every arm decides before it destroys: the registry's bytes, a pid's
+    liveness, an errno from a ``connect()`` that may take the whole probe
+    timeout. ``unlink`` acts on a name, and discovery holds no spawn lock --
+    ``gc_instances`` takes one for this exact hazard, while a discovery-backed
+    command cannot without blocking the spawns that call it. So a legitimate
+    re-spawn under that id can bind a new socket and replace the registry
+    inside the window, and the sweep then destroys a LIVE bridge's only handle
+    and the endpoint it is serving on, on evidence about a file already gone.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "respawn.sock"
+    record = inst_dir / "respawn.json"
+    # The state discovery judges: a crashed bridge's leftover socket file
+    # (a plain file answers the probe conclusively) and a dead owner.
+    sock_path.write_text("", encoding="utf-8")
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="respawn")),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    real_purge = transport._purge_stale_registry
+    # What a new bridge writes: its own token, so the document differs from the
+    # one discovery judged.
+    fresh_payload = _registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                      instance_id="respawn")
+    fresh_payload["instance_token"] = "respawned-token"
+    fresh_document = json.dumps(fresh_payload).encode("utf-8")
+
+    def respawn_then_purge(*args, **kwargs):
+        # The window: every piece of the caller's evidence is already gathered,
+        # and a bridge now starts under this id -- binding its own socket over
+        # the leftover name and replacing the registry through `os.replace`,
+        # exactly as `bn session start` does while holding the spawn lock that
+        # discovery cannot take.
+        sock_path.unlink()
+        listener.bind(str(sock_path))
+        listener.listen(1)
+        staged = inst_dir / ".tmp-respawn.json"
+        staged.write_bytes(fresh_document)
+        os.replace(staged, record)
+        return real_purge(*args, **kwargs)
+
+    monkeypatch.setattr("bn.transport._purge_stale_registry", respawn_then_purge)
+
+    try:
+        assert list_instances() == []              # the record it read is refused
+        assert record.read_bytes() == fresh_document   # the NEW record survives
+        assert sock_path.exists()                  # and so does the live endpoint
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))         # still reachable by name
+        finally:
+            client.close()
+        # The new bridge is a usable handle on the next scan, not a survivor
+        # of a race that left it unlisted.
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: True)
+        monkeypatch.setattr("bn.transport._purge_stale_registry", real_purge)
+        assert [inst.instance_id for inst in list_instances()] == ["respawn"]
+    finally:
+        with contextlib.suppress(OSError):
+            listener.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_the_stale_sweep_removes_only_what_it_can_still_see_itself(tmp_path):
+    """The chokepoint's evidence is the document, and a probe taken HERE.
+
+    Both callers gather their evidence upstream of the unlink, so the sweep
+    re-establishes it: the record must still hold the document that was
+    judged, and the socket must answer a conclusive probe at this moment. A
+    name that now holds a different document, or has something listening on
+    it, is kept -- deleting it would be destruction on evidence about
+    something else.
+    """
+    import bn.transport as transport
+
+    registry = tmp_path / "judged.json"
+    sock = tmp_path / "judged.sock"
+    judged_document = b'{"pid": 1}'
+    registry.write_bytes(judged_document)
+    sock.write_text("", encoding="utf-8")
+
+    # A re-spawn in the window: the same names, a new record and a live socket.
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b'{"pid": 2}')
+    os.replace(replacement, registry)
+    sock.unlink()
+    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    live.bind(str(sock))
+    live.listen(1)
+    try:
+        transport._purge_stale_registry(registry, sock, expected_record=judged_document)
+        assert registry.exists()          # a different document: not ours to delete
+        assert sock.exists()              # something is listening: not litter
+
+        # No document to compare is not a licence to destroy either.
+        transport._purge_stale_registry(registry, sock)
+        assert registry.exists()
+        assert sock.exists()
+
+        # What the sweep can still see for itself is still swept.
+        live.close()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(tmp_path / "other.sock"))    # nothing bound to `sock` now
+        stale.close()
+        transport._purge_stale_registry(
+            registry, sock, expected_record=registry.read_bytes()
+        )
+        assert not registry.exists()
+        assert not sock.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            live.close()
+        sock.unlink(missing_ok=True)
+
+
+def test_the_leftover_note_never_enters_the_log_it_protects(tmp_path, monkeypatch):
+    """The note is ABOUT the log, so writing it there grows what it preserves.
+
+    This arm exists because truncating ``<id>.log`` would destroy the only
+    recorded output of a bridge that may still be running, so it appends
+    instead -- and the note explaining that has to reach the operator, not the
+    file. Sent to the log it was paid once per failed attempt, which is the
+    largest single contributor to the growth this arm is criticised for.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "kept.json").write_text("{not json", encoding="utf-8")
+    log = inst_dir / "kept.log"
+    log.write_text("BN Agent Bridge listening on kept.sock\n", encoding="utf-8")
+    child_line = "ImportError: no module named binaryninja\n"
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write(child_line)
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    sizes = [log.stat().st_size]
+    notes = []
+    for _ in range(3):
+        with pytest.raises(BridgeError) as excinfo:
+            transport._spawn_instance_unlocked("kept", timeout=1.0, poll_interval=0.01)
+        message = str(excinfo.value)
+        # The operator is still told, on every attempt.
+        notes.append(message[message.index(" A registry file for"):])
+        assert "before removing it" in notes[-1]
+        sizes.append(log.stat().st_size)
+
+    growth = [sizes[i + 1] - sizes[i] for i in range(3)]
+    text = log.read_text(encoding="utf-8")
+    assert "already on disk at" not in text     # never in the file it is about
+    assert text.count("[bn-cli]") == 3          # one diagnostic line per attempt
+    assert len(set(growth)) == 1                # a constant cost per attempt
+    assert growth[0] < len(notes[0])            # and it is not the note's cost

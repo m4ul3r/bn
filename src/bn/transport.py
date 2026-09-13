@@ -322,7 +322,51 @@ def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeErr
     return BridgeError(" ".join(parts))
 
 
-def _purge_stale_registry(registry_path: Path, socket_path: Path | None = None) -> None:
+def _unlink_if_unchanged(path: Path, expected: bytes | None) -> bool:
+    """Unlink *path* only while it still holds the document *expected*.
+
+    Every destructive decision in ``_load_instance`` is taken on evidence read
+    BEFORE the unlink: the registry's bytes, a pid's liveness, an errno from a
+    ``connect()`` that may take the whole probe timeout. ``unlink`` acts on a
+    NAME, and discovery holds no lock -- ``gc_instances`` takes ``_spawn_lock()``
+    for this exact hazard, while a discovery-backed command cannot without
+    blocking every spawn that calls it. So a legitimate re-spawn under that id
+    replaces the registry inside that window (the bridge writes it through
+    ``os.replace``), and the unlink then destroys a LIVE bridge's only handle on
+    evidence about a document that is already gone (#618).
+
+    The record is therefore re-read as late as possible and destroyed only if
+    it is still the document that was judged. Comparing the BYTES rather than
+    ``stat`` metadata is deliberate: inode numbers are recycled immediately on
+    the filesystems the cache lives on, and a tmpfs timestamp is coarse enough
+    that a replacement within the same tick can present the same
+    ``(st_dev, st_ino, st_mtime_ns, st_size)`` as the file it replaced -- a
+    false match measured while developing this check. A caller with no document
+    to compare judged no file, and nothing is removed.
+    """
+    if expected is None:
+        return False
+    try:
+        with path.open("rb") as stream:
+            if stream.read() != expected:
+                return False
+        path.unlink()
+    except (OSError, ValueError):
+        # A registry's own path comes from the directory scan, but ValueError
+        # belongs here anyway: an unnameable path (embedded NUL, lone
+        # surrogate) must not take a discovery-backed command down, and
+        # refusing to destroy is the safe answer for it.
+        return False
+    return True
+
+
+def _purge_stale_registry(
+    registry_path: Path,
+    socket_path: Path | None = None,
+    *,
+    expected_record: bytes | None = None,
+    socket_timeout: float = 0.2,
+) -> None:
     """Drop a registry whose owning process is gone, plus its orphaned socket.
 
     A SIGKILL or native crash leaves the unix socket file on disk (only a clean
@@ -330,10 +374,16 @@ def _purge_stale_registry(registry_path: Path, socket_path: Path | None = None) 
     swept here. The sibling ``.log`` is intentionally left behind: an instance
     is only purged after its socket goes dead -- frequently a crash -- and the
     log is the one breadcrumb worth keeping for the empty-response diagnostic.
+
+    Both halves destroy only what they can still see for themselves, because
+    the caller's evidence is older than this call: the registry must still hold
+    ``expected_record`` (see ``_unlink_if_unchanged``), and the socket must
+    answer a CONCLUSIVE probe taken here -- the last moment before the unlink,
+    rather than upstream where a re-spawn could bind over it afterwards. A
+    socket nothing proves dead, and a record no caller identified, are kept.
     """
-    with contextlib.suppress(OSError):
-        registry_path.unlink()
-    if socket_path is not None:
+    _unlink_if_unchanged(registry_path, expected_record)
+    if socket_path is not None and _socket_has_no_listener(socket_path, timeout=socket_timeout):
         with contextlib.suppress(OSError):
             socket_path.unlink()
 
@@ -477,7 +527,12 @@ def _load_instance(
     include_unreachable: bool = False,
 ) -> BridgeInstance | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        # The exact bytes THIS decision is taken on: every destructive arm
+        # below re-reads the record immediately before unlinking and destroys
+        # it only if it still holds this document, so a record replaced in the
+        # window is never deleted on its predecessor's evidence (#618).
+        record_document = path.read_bytes()
+        payload = json.loads(record_document.decode("utf-8"))
         raw_socket_path = payload["socket_path"]
         raw_pid = payload["pid"]
     except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
@@ -533,8 +588,7 @@ def _load_instance(
         # foreign -- and this arm then deleted it. Refuse always; delete only on
         # the evidence above.
         if record_is_litter:
-            with contextlib.suppress(OSError):
-                path.unlink()
+            _purge_stale_registry(path, expected_record=record_document)
         return None
 
     unreachable = False
@@ -557,7 +611,7 @@ def _load_instance(
         # proves nothing gets neither the handle nor the purge: refused, and
         # left alone.
         if record_is_litter:
-            _purge_stale_registry(path)
+            _purge_stale_registry(path, expected_record=record_document)
             return None
         if not include_unreachable or verdict != "proven":
             return None
@@ -577,7 +631,10 @@ def _load_instance(
         # `/proc` for both halves of its proof -- from every bridge on a platform
         # that has none.
         if record_is_litter:
-            _purge_stale_registry(path, socket_path)
+            # No socket to sweep: this arm was reached BECAUSE nothing was at
+            # that path. Anything bound to it now arrived after the check, and
+            # unlinking it would destroy an endpoint never judged here.
+            _purge_stale_registry(path, expected_record=record_document)
             return None
         if not include_unreachable or verdict != "proven":
             return None
@@ -600,8 +657,21 @@ def _load_instance(
         # this process cannot address), and that combination unlinked a live,
         # listening socket (#618).
         if record_is_litter:
+            # Two probes, two different questions. This one decides whether
+            # anything here is litter at all: an inconclusive answer (a serving
+            # bridge whose accept backlog is full) leaves the record AND the
+            # socket alone. The sweep then asks again immediately before it
+            # unlinks, because this answer is already stale by then -- a
+            # re-spawn can bind over the name inside the window, and a
+            # conclusive answer about the file it replaced is not evidence
+            # about the one now bound (#618).
             if _socket_has_no_listener(socket_path, timeout=socket_timeout):
-                _purge_stale_registry(path, socket_path)
+                _purge_stale_registry(
+                    path,
+                    socket_path,
+                    expected_record=record_document,
+                    socket_timeout=socket_timeout,
+                )
             return None
 
     return BridgeInstance(
@@ -1387,7 +1457,7 @@ def _spawn_instance_unlocked(
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
         f"did not register within {timeout:g}s and was terminated. "
         f"Check {log_path}. Retry the same command; on a heavily loaded host, "
-        f"set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
+        "set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
     )
     _append_spawn_diagnostic(log_path, message)
     _reap_child(proc)
