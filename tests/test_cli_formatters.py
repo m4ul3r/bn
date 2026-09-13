@@ -1134,7 +1134,7 @@ def test_the_green_on_base_declaration_is_not_stale():
 # for four rounds after this PR deleted it, and a guard row naming a helper that
 # does not exist tests a spelling nobody can write. Harmless is not the same as
 # checked.
-_RECORDERS = ("_field_list", "_field_dict")
+_RECORDERS = ("_field_list", "_field_dict", "_row_list")
 _COERCERS = ("_as_dict",)
 
 
@@ -1361,7 +1361,7 @@ def _coercion_sites(source: str | None = None):
                     base = node.args[0] if node.args else None
                     top = isinstance(base, ast.Name) and base.id == "value"
                     keys = [a.value for a in node.args[1:] if isinstance(a, ast.Constant)]
-                    kind = "list" if node.func.id == "_field_list" else "dict"
+                    kind = "dict" if node.func.id == "_field_dict" else "list"
                     sites.append((fn_name, tuple(keys), kind, top))
                 elif node.func.id in COERCERS and node.args and suspect_within(node.args[0]):
                     raw.append((fn_name, "R1 " + ast.unparse(node)))          # R1
@@ -1465,7 +1465,7 @@ def _container_key_decisions():
     from bn import formatters
 
     tree = ast.parse(inspect.getsource(formatters))
-    RECORDERS = ("_field_list", "_field_dict")
+    RECORDERS = _RECORDERS
     HELPERS = RECORDERS + ("_field_present", "_field_declared")
     container_keys = {
         a.value
@@ -3820,7 +3820,7 @@ def test_every_uncovered_read_is_covered_directly():
             continue
         for node in ast.walk(fn):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id in ("_field_list", "_field_dict")):
+                    and node.func.id in _RECORDERS):
                 for arg in node.args[1:]:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         sites.append((fn.name, arg.value, node.lineno))
@@ -3933,7 +3933,7 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
             continue
         for node in ast.walk(fn):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id in ("_field_list", "_field_dict")):
+                    and node.func.id in _RECORDERS):
                 for arg in node.args[1:]:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         declared.add((fn.name, arg.value))
@@ -6693,3 +6693,194 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
     assert not mutated, (
         "a renderer mutated the payload it was handed, which is the CALLER's "
         f"object and is what the JSON path emits: {mutated[:6]}")
+
+
+# --- ROUTED OUT OF #619/#685, NAMED RATHER THAN LEFT IMPLIED ------------------
+#
+# Two findings on this module survive this PR by RULING, not by oversight. Both
+# are pre-existing at base, neither is on the go-rename/mutation-summary path
+# #619 and #685 describe, and an exhaustive module-wide count-and-shape answer
+# is a separate audit -- it is routed to a follow-up PR rather than half-done
+# here, because the honest version of it changes every count surface in the
+# file at once and would land unreviewed on the back of this one:
+#
+#   1. COUNT SURFACES OUTSIDE THE GO-RENAME/MUTATION PATH still state a number
+#      read out of a counter they could not read, disclosing beside it rather
+#      than refusing it. `_render_go_rename_text` is the named instance -- an
+#      unreadable `go_verified_count` renders its first line ("go rename: 0
+#      renamed, 0 failed, 0 skipped") byte-identically to a genuine all-noop
+#      run, with the note on a following line -- and `_render_class_list_text`
+#      is the named family, where six scalar counts are still spelled
+#      `value.get(k) or 0` and bypass `_count_field` entirely. The CLASS is
+#      "every surface in this module that prints a numeral", and the fix is one
+#      contract applied to all of them plus a population test that discovers
+#      them, not six more hand-written refusals. What IS fixed here is every
+#      count surface the two issues name: the go-rename summary's decision keys
+#      (`test_an_unreadable_go_rename_counter_can_never_read_as_a_finished_run`),
+#      the op row, the type row, the blast-radius line and -- below -- the
+#      paging footer's resume offset.
+#   2. THE STRING-SHAPE GUARD POPULATION is blind to a shape test spelled
+#      through a class held in a VARIABLE (`_TEXT_TYPES = (str,)` at module
+#      level, then `isinstance(x, _TEXT_TYPES)`). The STATED LIMITATION above
+#      `_STRING_SHAPE_GUARDS` claims that spelling is "asserted absent from the
+#      module below"; it is not -- the anti-drift assertion flags a non-Name
+#      class argument, and a bare alias Name is neither harvested nor flagged.
+#      No shipped guard in this module uses that spelling (the population's
+#      three size pins fire if one arrives, which is how it was found), so the
+#      live property holds today; the GUARD's coverage claim is the thing that
+#      overstates, and correcting it means resolving module-level aliases in the
+#      classifier -- the same routed audit.
+
+
+def test_the_paging_footer_never_states_a_resume_offset_it_could_not_derive():
+    """The footer names three counts and refused on only one of them.
+
+    `total` arriving unreadable drops the footer and discloses. `returned` and
+    `offset` reach ARITHMETIC through the same choke point, and a skew there
+    was absorbed into the fabricated 0 the choke point returns -- so the footer
+    went on to state a resume instruction DERIVED from the fabrication. Two
+    shapes of harm, both worse than the dropped footer:
+
+      * `offset` unreadable -> "showing 1 of 100 (99 more); rerun with --offset
+        1" on a page that actually started at 50: a pager re-reads the window
+        it already has and never reaches the tail;
+      * `returned` unreadable -> "--offset 0" with `has_more` true, which does
+        not ADVANCE: an unattended pager loops forever on page one.
+
+    A number in this footer is the one thing in it a loop acts on, so the
+    refusal has to be the same one the count claims already make -- state
+    nothing rather than state a count nobody could derive, and let the boundary
+    name the field. ONE count contract for all three, which is what the
+    helper's own comment already claimed."""
+    from bn import formatters
+
+    def page(**over):
+        value = {"functions": [{"name": "a", "address": "0x1"}],
+                 "total": 100, "returned": 1, "offset": 50, "has_more": True}
+        for key, val in over.items():
+            if val is _ABSENT:
+                value.pop(key, None)
+            else:
+                value[key] = val
+        return formatters._render_function_list_text(value)
+
+    # Anti-vacuity: the honest page must still page, and the resume offset must
+    # still be the NEXT window -- a footer that always refused would satisfy
+    # every refusal below.
+    assert "// showing 1 of 100 (49 more); rerun with --offset 51" in page(), page()
+    # `returned` absent is a MEASUREMENT off the rows, not a fabrication, and
+    # stays exactly as it was.
+    assert "rerun with --offset 51" in page(returned=_ABSENT), page(returned=_ABSENT)
+    # A last page states its position without a resume instruction.
+    assert "// showing 1 of 100" in page(has_more=_ABSENT)
+    for unreadable in ("many", {"n": 1}, [1], True, ()):
+        for key in ("total", "returned", "offset"):
+            out = page(**{key: unreadable})
+            assert "--offset" not in out, (
+                f"{key}={unreadable!r} could not be read, so the resume offset "
+                f"is derived from a fabricated count: {out!r}")
+            assert "showing" not in out, (
+                f"{key}={unreadable!r} could not be read, so the page's own "
+                f"counts are fabricated too: {out!r}")
+            assert _disclosed(out, key), (
+                f"{key}={unreadable!r} cost the footer with no note naming "
+                f"it: {out!r}")
+            # The same refusal on the LAST page, where the footer states counts
+            # with no resume instruction to hide behind.
+            tail = page(has_more=_ABSENT, **{key: unreadable})
+            assert "showing" not in tail, (
+                f"{key}={unreadable!r} on a last page still states a count it "
+                f"could not read: {tail!r}")
+            assert _disclosed(tail, key), tail
+    # The rows themselves are untouched by the refusal: dropping the footer is
+    # not dropping the page.
+    assert "0x1  a" in page(offset={"n": 1})
+
+
+def test_an_unreadable_results_ROW_can_never_read_as_ok():
+    """#683's harm in the `ok` field, one granularity in from where round 18
+    fixed it.
+
+    `results` arriving as the WRONG FIELD (a string, a dict) is a skew, and
+    both `ok` derivations withhold on it. An ELEMENT of a well-formed `results`
+    list that is not a row was silently DROPPED by an `isinstance(r, dict)`
+    filter at every site that reads it -- so a batch carrying one row nobody
+    could classify beside one that verified reported `ok: true`,
+    `failed_count: 0`, `first_error: null` and a text card showing only the
+    readable row, with nothing anywhere saying a row had been discarded. A
+    control loop reads that and closes.
+
+    This is the same three-state question `_is_failed_status` answers for a
+    row's STATUS -- FAILED / not-failed / UNREADABLE -- asked about the ROW
+    itself, so it gets the same answer and the two must not disagree: an
+    unreadable row is not a row that passed. Dropping the element is still the
+    right RENDER (there is nothing in it to show), but it is a skew, and the
+    counts derived from the surviving rows are no longer a measurement of the
+    batch -- `measured` goes False for exactly the reason an unreadable
+    `results` FIELD already makes it False."""
+    from bn import formatters
+
+    good = {"op": "rename", "function": "fn", "status": "verified"}
+
+    def batch(rows):
+        return {"success": True, "committed": True, "results": rows}
+
+    def go(rows):
+        value = {"kind": "go_rename", "success": True, "committed": True,
+                 "go_renamed_candidates": 3, "go_committed_count": 3,
+                 "go_verified_count": 3, "go_failed_count": 0,
+                 "skipped_user_named": 0, "skipped_changed_during_apply": 0}
+        if rows is not _ABSENT:
+            value["results"] = rows
+        return value
+
+    # Anti-vacuity: readable rows still pass, and an EMPTY list is still the
+    # measured zero it always was -- the refusal must not become a blanket
+    # "never claim ok".
+    assert formatters._add_mutation_ok(batch([good]))["ok"] is True
+    ok_summary = formatters._mutation_summary(batch([good]))
+    assert (ok_summary["ok"], ok_summary["measured"], ok_summary["failed_count"]) \
+        == (True, True, 0), ok_summary
+    assert formatters._go_rename_summary(go(_ABSENT))["ok"] is True
+    assert formatters._go_rename_summary(go([]))["ok"] is True
+    for junk in ("<unreadable row>", ["rename"], 7, True, 1.5, ()):
+        payload = batch([junk, dict(good)])
+        summary = formatters._mutation_summary(payload)
+        verbose = formatters._add_mutation_ok(payload)
+        assert summary["ok"] is False and summary["success"] is False, (
+            f"results=[{junk!r}, <verified row>] carries a row nobody could "
+            f"classify, so 'nothing failed' is not established: {summary!r}")
+        assert verbose["ok"] is False, (
+            f"results=[{junk!r}, ...] claimed ok on the verbose path: {verbose!r}")
+        assert summary["ok"] is verbose["ok"], (
+            f"`jq '.ok'` flips with --summary on results=[{junk!r}, ...]")
+        assert summary["measured"] is False and summary["failed_count"] is None, (
+            f"the surviving rows are not a measurement of a batch one of whose "
+            f"rows was discarded: {summary!r}")
+        assert "malformed" in str(summary.get("first_error")), summary
+        card = formatters._render_mutation_text(payload)
+        assert "fn" in card, f"the READABLE row must still render: {card!r}"
+        assert _disclosed(card, "results"), (
+            f"a discarded row left the card with no note naming the field it "
+            f"was discarded from: {card!r}")
+        # The other caller of the one builder, on the key it reads for its
+        # FAILURE rows.
+        gr = formatters._go_rename_summary(go([junk]))
+        assert gr["ok"] is False and gr["measured"] is False, (
+            f"go rename's failure list held {junk!r}, which is not a row, so "
+            f"'nothing failed' is not established either: {gr!r}")
+        assert (gr["ok"]
+                is formatters._add_mutation_ok(go([junk]))["ok"]), (
+            f"`jq '.ok'` flips with the detail flag on results=[{junk!r}]")
+        text = formatters._render_go_rename_text(go([junk]))
+        assert _disclosed(text, "results"), (
+            f"the default go-rename view discarded a row silently: {text!r}")
+    # The row-level decider and the element-level one must agree rather than
+    # cancel: a batch with BOTH an unreadable row and an unreadable status on a
+    # surviving row withholds ok once, names both fields, and never reads as a
+    # pass.
+    mixed = batch([7, {"op": "rename", "function": "fn", "status": {"code": 7}}])
+    assert formatters._mutation_summary(mixed)["ok"] is False
+    assert formatters._add_mutation_ok(mixed)["ok"] is False
+    card = formatters._render_mutation_text(mixed)
+    assert _disclosed(card, "results") and _disclosed(card, "status"), card

@@ -250,6 +250,41 @@ def _text_value(source: Any, key: str) -> str | None:
     return None
 
 
+def _row_list(source: Any, key: str) -> list[dict[str, Any]]:
+    """``source[key]``'s ROWS, recording the skew when an ELEMENT of it is
+    present but is not a row anything here can read.
+
+    The ELEMENT-granularity sibling of ``_field_list``, and it exists because
+    the field-level answer was only half of one. Five sites spelled this
+    ``[r for r in _field_list(v, "results") if isinstance(r, dict)]``, which
+    silently DISCARDS the unreadable element -- so a batch carrying one row
+    nobody could classify beside one that verified reported ``ok: true``,
+    ``failed_count: 0`` and ``first_error: null``, and the text card showed
+    only the readable row with nothing anywhere saying a row had been dropped.
+    That is #683's fabrication at the row set: the same payload with the whole
+    ``results`` field unreadable is already refused, and a list of the WRONG
+    ELEMENTS is the shape this module's own element sweep calls the one "an
+    older bridge version actually sends".
+
+    Skipping the element is still the right RENDER -- there is nothing in it to
+    show -- so what this adds is the third state: the enclosing boundary names
+    the field, ``_add_mutation_ok`` and the compact summary withhold ``ok``
+    rather than claiming it, and a count derived from the survivors is no
+    longer a measurement of the whole batch. Exactly the answer
+    ``_is_failed_status`` gives for an unreadable row STATUS, asked one level
+    out about the row itself (#619/#685)."""
+    rows: list[dict[str, Any]] = []
+    dropped = False
+    for item in _field_list(source, key):
+        if isinstance(item, dict):
+            rows.append(item)
+        else:
+            dropped = True
+    if dropped:
+        _record_skew(key)
+    return rows
+
+
 def _is_failed_status(row: Any) -> bool:
     """Does this op result's status NAME a failure? The one place the question is
     answered -- and it answers it in THREE states, not two.
@@ -1479,7 +1514,7 @@ def _render_go_rename_text(value: Any) -> str:
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
                 f"({_count_field(value, 'defined_count')} defined at pcln addresses, "
                 f"{skipped} already user-named)")
-    failed = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+    failed = _row_list(value, "results")
     # The default is a MEASUREMENT (targeted minus the failures), so it is used
     # only when the envelope claimed no verified count at all -- asking
     # `_count_field` for an absent key would fabricate a 0 over it.
@@ -1577,8 +1612,10 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
 
     Shared by every paged list renderer (function list/search, strings, imports,
     sections) so the honest-total convention reads identically across them (#59,
-    #122). Returns None when the page IS the whole set (no paging happened) or
-    the envelope lacks an integer total to report against."""
+    #122). Returns None when the page IS the whole set (no paging happened), the
+    envelope lacks a total to report against, or any of the three counts it
+    states arrived in a shape no count reads out of -- a footer states no count
+    and no resume offset it could not derive (#619)."""
     # ONE count contract for all three of these. Spelling the total's test as
     # `isinstance(total, int)` made it a THIRD one: it rejected the numeric
     # string `_count_field` accepts two lines below, and which the go-rename
@@ -1591,19 +1628,37 @@ def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     # byte-identically to an unpaged one (#619).
     if not _field_present(value, "total"):
         return None
-    total = _count_field(value, "total")
-    if _field_skewed("total"):
+    # All three inside ONE capture, and every one of them refusing. The
+    # comment above claimed one count contract for the three counts this footer
+    # names, and only `total` actually had it: `returned` and `offset` reach
+    # ARITHMETIC, so a skew there was absorbed into the 0 the choke point
+    # returns and the footer went on to state a resume instruction DERIVED from
+    # that fabrication -- `--offset 1` for a page that began at 50 (a pager
+    # re-reads the window it already holds), or `--offset 0` with `has_more`
+    # true, which does not ADVANCE at all and loops an unattended pager forever
+    # on page one. A count nobody could derive is not stated, exactly as the
+    # op row, the type row and the blast-radius line refuse theirs; the
+    # enclosing boundary names the field. `returned` keeps its item-count
+    # default, which is a MEASUREMENT rather than a fabricated zero, so it is
+    # asked for only when the envelope actually claimed one.
+    #
+    # Nested rather than asking `_field_skewed` three times: the ambient set
+    # holds every skew this render recorded, including a `total`/`offset` key
+    # on some unrelated ROW, and a footer suppressed by another field's skew
+    # would be the mirror fabrication (#619).
+    token = _SKEWED_FIELDS.set([])
+    try:
+        total = _count_field(value, "total")
+        returned = (_count_field(value, "returned") if _field_present(value, "returned")
+                    else (len(items) if isinstance(items, list) else 0))
+        offset = _count_field(value, "offset")
+        unreadable = sorted(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    if unreadable:
         return None
-    # `returned` and `offset` reach ARITHMETIC, so they go through the count
-    # choke point like every other count: a string offset made
-    # `total - (offset + returned)` raise TypeError and cost all six paged
-    # listings entirely, where the same envelope with `offset` absent rendered
-    # cleanly. `returned` keeps its item-count default, which is a measurement
-    # rather than a fabricated zero, so it is asked for only when the envelope
-    # actually claimed one.
-    returned = (_count_field(value, "returned") if _field_present(value, "returned")
-                else (len(items) if isinstance(items, list) else 0))
-    offset = _count_field(value, "offset")
     if value.get("has_more"):
         remaining = total - (offset + returned)
         next_offset = offset + returned
@@ -4143,7 +4198,7 @@ def _add_mutation_ok(value: Any) -> Any:
     # `ok: true` closes an agent's control loop on a batch nobody checked (#619).
     token = _SKEWED_FIELDS.set([])
     try:
-        results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        results = _row_list(value, "results")
         # INSIDE the capture, not after it. A row whose `status` is unreadable
         # is not a row that passed, and reading it outside the capture put its
         # skew in the default (absent) recorder: `unusable` stayed False and the
@@ -4343,7 +4398,13 @@ def _mutation_summary(value: Any) -> Any:
     # payload; the compact summary must give the same answer (#447/#619).
     token = _SKEWED_FIELDS.set([])
     try:
-        results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+        results = _row_list(value, "results")
+        # The THIRD state of the row set, asked of the choke point rather than
+        # spelled here: a second decider over "was this readable" is the defect
+        # this module keeps re-growing, and `_field_skewed` is where that
+        # question already lives. Asked INSIDE the capture, so it answers about
+        # THIS read and not about some same-named key an outer render recorded.
+        rows_unreadable = _field_skewed("results")
         # The ROW STATUSES are classified inside the capture too, for exactly the
         # reason the listing is. Read outside it, an unreadable `status` still
         # DISCLOSED -- the enclosing summary drain caught it -- but it never
@@ -4370,7 +4431,16 @@ def _mutation_summary(value: Any) -> Any:
     # matched the current name already) still comes through as a `noop` STATUS ROW
     # inside a non-empty `results[]` -- it stays measured and distinct from the
     # unmeasured case the builder fails safe on.
-    unmeasured = not results
+    #
+    # An unreadable ROW SET is unmeasured for the same reason an empty one is,
+    # and at BOTH granularities: `results` arriving as the wrong FIELD already
+    # landed here (the choke point hands back an empty list), while a list one
+    # ELEMENT of which is not a row used to leave the four derived counts
+    # stated off the SURVIVORS -- `failed_count: 0` over a batch one of whose
+    # rows was discarded, which is the fabricated zero the builder's fail-safe
+    # exists to stop. `ok` alone is not enough here: a loop that branches on
+    # `dirty_after` or reads `failed_count` never looks at it (#619/#685).
+    unmeasured = not results or rows_unreadable
     return _build_mutation_summary(
         measured=not unmeasured,
         op_count=len(results),
@@ -4444,7 +4514,7 @@ def _go_rename_summary(value: Any) -> Any:
         # is the DEFAULT for `go rename`, so `jq '.ok'` flipped on whether the
         # caller asked for detail -- the same half-parity #447 forbids, on the
         # second caller of the one builder (#619/#685).
-        failure_rows = _field_list(value, "results")
+        failure_rows = _row_list(value, "results")
         unreadable = list(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
@@ -4595,7 +4665,7 @@ def _render_mutation_text(value: Any) -> str:
     preview = bool(value.get("preview"))
     success = bool(value.get("success", True))
     committed = bool(value.get("committed", False))
-    results = [r for r in (_field_list(value, "results")) if isinstance(r, dict)]
+    results = _row_list(value, "results")
     failed = [r for r in results if _is_failed_status(r)]
 
     lines: list[str] = []
