@@ -7253,19 +7253,37 @@ def test_the_paging_footer_refuses_every_impossible_page_it_names():
     assert set(triggers) == {name for name, _ in formatters._IMPOSSIBLE_PAGE}, (
         f"the refused set and the payloads that exercise it have drifted: "
         f"{[name for name, _ in formatters._IMPOSSIBLE_PAGE]}")
+    # ... across every paging SHAPE, because the refusal is a property of the
+    # COUNTS and not of the paging state. Every payload above carries
+    # `has_more: True` and one item, so a refusal narrowed to
+    # `if impossible and more:` -- or to `and items:` -- would state the
+    # fabricated footer again on a last page or an empty one with the pin
+    # still green.
+    shapes = {"paging": {},
+              "last page": {"has_more": _ABSENT},
+              "empty page": {"has_more": _ABSENT, "functions": []}}
     for name, over in triggers.items():
-        out = page(**over)
-        assert "// page position not stated:" in out, (
-            f"{over} is not a window any page can have, and the footer stated "
-            f"a position for it anyway: {out!r}")
-        assert name in out, f"{over} was refused without naming `{name}`: {out!r}"
-        assert "--offset" not in out and "more)" not in out and "showing" not in out, out
-        # The payload's own numbers are stated; nothing is derived from them.
-        assert (f"total {over['total']}" in out
-                and f"returned {over['returned']}" in out
-                and f"offset {over['offset']}" in out), out
-        # Refusing the footer is not refusing the page.
-        assert "0x1  a" in out, out
+        for shape, extra in shapes.items():
+            out = page(**over, **extra)
+            assert "// page position not stated:" in out, (
+                f"{over} on a {shape} is not a window any page can have, and "
+                f"the footer stated a position for it anyway: {out!r}")
+            assert name in out, (
+                f"{over} on a {shape} was refused without naming `{name}`: {out!r}")
+            assert "--offset" not in out and "more)" not in out and "showing" not in out, out
+            # The payload's own numbers are stated; nothing is derived from them.
+            assert (f"total {over['total']}" in out
+                    and f"returned {over['returned']}" in out
+                    and f"offset {over['offset']}" in out), out
+            # Refusing the footer is not refusing the page.
+            if shape != "empty page":
+                assert "0x1  a" in out, out
+    # TWO conditions at once, which is what the set exists for: a member is not
+    # excused because a sibling catches the same payload, so the line names
+    # BOTH. Collapsing the join to the first name alone fails here.
+    both = page(total=-1, returned=0, offset=0)
+    assert ("// page position not stated: total is negative; offset + returned "
+            "exceeds total (total -1, returned 0, offset 0)") in both, both
     # Anti-vacuity: a refusal that fired on every page would satisfy all of the
     # above. The honest page still pages, and each condition's BOUNDARY is a
     # page rather than a clash.
