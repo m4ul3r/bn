@@ -2105,11 +2105,13 @@ def _cli_invoked_formatters():
     a coercion added to any of them kept every guard in this file green. A
     directory glob is a spelling rule like any other.
 
-    Kept apart from the identity inventory for ONE reason, and it is not
-    cosmetic: a symbol the package MENTIONS is one production invokes at that
-    spelling -- bare, with no boundary but its own -- and `_probe_renderers`
-    must therefore probe it bare. A symbol only BOUND (a re-export) is invoked
-    by nothing, so probing it bare would measure a caller that does not exist."""
+    Every symbol in this inventory is probed BARE (see `_probe_renderers`).
+    Splitting it into "invoked" and "merely bound" and wrapping the second class
+    in a manufactured boundary was round 14's own defect: `bn.cli` re-exports
+    `_format_operation_result` precisely so tests and scripts CAN call it, an
+    existing test does, and a direct caller installs no boundary -- so the
+    wrapper hid a live absorption the widening had just uncovered. An entry
+    point that cannot disclose on its own surface must be FIXED, not wrapped."""
     import ast
     import pathlib
 
@@ -2174,24 +2176,25 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
         "_COMPOSED_ENTRY_POINTS, or name each one in _PROBE_EXCLUSIONS with the "
         "reason it is not a payload text renderer.")
     # The identity sweep's residue: names the package BINDS but never mentions
-    # again. They are probed WRAPPED (see `_probe_renderers`) on the claim that
-    # production reaches them only as a fragment under the boundary of the
-    # renderer that composes them -- so that claim is executed here rather than
-    # asserted, because an exemption whose reason nobody re-checks is how four
-    # of this PR's rounds ended. Some PROBED `@_discloses` renderer must reach
-    # each one, or the fragment has no boundary anywhere and the wrapped probe
-    # is measuring the harness.
-    reach = _module_reach()
-    for name in sorted(installed - _cli_invoked_formatters()):
-        holders = sorted(
-            renderer for renderer in probed
-            if name in reach.get(renderer, ())
-            and hasattr(getattr(formatters, renderer, None), "__wrapped__"))
-        assert holders, (
-            f"{name} is bound by the package but invoked by nothing, and no "
-            "probed @_discloses renderer reaches it either -- so the skew it "
-            "records drains nowhere and probing it under a manufactured "
-            "boundary proves nothing. Give it a real caller, or probe it bare.")
+    # again. Round 14 probed them WRAPPED, on the claim that production reaches
+    # them only as a fragment under the boundary of the renderer that composes
+    # them -- and that claim was FALSE for the one name it applied to, because
+    # `bn.cli` re-exports `_format_operation_result` so callers can reach it and
+    # one already does. The manufactured boundary then hid the absorption the
+    # widening had just uncovered: an exemption that suppresses the finding it
+    # was invented for. There is no such class any more, and this asserts it
+    # STAYS gone -- every name in the inventory is probed on the surface a
+    # caller actually gets.
+    bare = {label.split("(")[0] for label, probe in _probe_renderers()
+            if getattr(probe, "__wrapped__", None) is None}
+    wrapped = sorted(name for name in installed
+                     if name not in bare and name not in _PROBE_EXCLUSIONS
+                     and name not in _COMPOSED_ENTRY_POINTS
+                     and not hasattr(getattr(formatters, name, None), "__wrapped__"))
+    assert not wrapped, (
+        f"{wrapped} is in the inventory but probed under a boundary the module "
+        "does not install, so a skew it cannot disclose on its own surface "
+        "reads as disclosed here. Probe it bare and fix the renderer.")
     # A transform's output REPLACES the payload, so no downstream renderer can
     # re-read what it absorbed: it must be COMPOSED, and it may never be waved
     # through as an exclusion. Both halves are derived from the CLI's AST, so a
@@ -2337,7 +2340,7 @@ def _probe_renderers():
             # falls on is asserted in
             # `test_every_renderer_the_cli_installs_is_in_the_population`.
             out.append((label, call if hasattr(fn, "__wrapped__")
-                        or name in _cli_invoked_formatters()
+                        or name in _cli_referenced_formatters()
                         else formatters._discloses(call)))
     # The composed entry points, appended LAST and never wrapped: production
     # does not wrap them either -- the paired renderer carries its own boundary,
@@ -2914,12 +2917,20 @@ def _disclosed(out, key):
 def _payload_for(ctx, path, leaf):
     """The renderer's payload with `leaf` placed at the end of `path`.
 
-    A path step is `(key, kind)`: a list-kind step wraps the node as the single
-    ELEMENT of the list at that key, a dict-kind step puts the node AT the key,
-    because that is what the renderer walks in each case."""
+    A path step is `(key, kind)` or `(key, kind, siblings)`: a list-kind step
+    wraps the node as the single ELEMENT of the list at that key, a dict-kind
+    step puts the node AT the key, because that is what the renderer walks in
+    each case. `siblings` is the context the node CARRYING that key was observed
+    with, so an intermediate element is rebuilt as it was SEEN rather than as a
+    one-key dict -- a read gated on a sibling of an intermediate key is
+    otherwise never reached at the level below it. The first step needs none:
+    the node carrying it is the renderer's own payload, which is `ctx`."""
     node = leaf
-    for key, kind in reversed(path):
-        node = {key: [node] if kind == "list" else node}
+    for step in reversed(path):
+        key, kind = step[0], step[1]
+        siblings = step[2] if len(step) > 2 else {}
+        node = {**copy.deepcopy(siblings),
+                key: [node] if kind == "list" else node}
     return {**copy.deepcopy(ctx), **node}
 
 
@@ -2964,38 +2975,128 @@ def _nested_population():
             for name, render, step, ctx in frontier:
                 path = step if isinstance(step[0], tuple) else (step,)
                 literals = _comparison_literals(name.split("(")[0])
+                keyed = _keyed_literals(name.split("(")[0])
                 seen: set[str] = set()
+                # The leaf each key was FIRST asked in. The discovery's fixed
+                # point grows `seen` one pass at a time, so it necessarily
+                # passes through intermediate leaves -- and some reads happen
+                # ONLY there: `variadic.get("format_string")` is an `elif` after
+                # `under_recovered and warning`, so a leaf with every sibling
+                # filled takes the other branch and no all-or-nothing ladder can
+                # reach it. Keeping the leaf the read was observed in makes the
+                # recorded context reachable BY CONSTRUCTION rather than by a
+                # ladder that happens to be long enough.
+                first_leaf: dict[str, dict] = {}
+
+                def _discover(base, _first=first_leaf):
+                    asked: set[str] = set()
+                    _render_or_exception(
+                        render, _payload_for(ctx, path, _KeyProbe(base, asked)))
+                    for key in asked:
+                        _first.setdefault(
+                            key, {k: v for k, v in base.items() if k != key})
+                    return asked
+
                 for _ in range(4):                    # fixed point, as at top level
                     before = frozenset(seen)
                     for filler in (None, "list", "dict"):
-                        leaf = _KeyProbe(
+                        seen |= _discover(
                             {**_PROBE_ELEMENT,
-                             **{k: copy.deepcopy(_PROBE_WELL_FORMED[filler]) for k in sorted(seen)}},
-                            seen)
-                        _render_or_exception(render, _payload_for(ctx, path, leaf))
+                             **{k: copy.deepcopy(_PROBE_WELL_FORMED[filler])
+                                for k in sorted(seen)}})
                     for literal in literals:
-                        leaf = _KeyProbe({**_PROBE_ELEMENT, **{k: literal for k in sorted(seen)}}, seen)
-                        _render_or_exception(render, _payload_for(ctx, path, leaf))
+                        seen |= _discover(
+                            {**_PROBE_ELEMENT, **{k: literal for k in sorted(seen)}})
+                    for gate in _gated_contexts(sorted(seen), keyed):
+                        for filler in (None, "list", "dict"):
+                            seen |= _discover(
+                                {**_PROBE_ELEMENT,
+                                 **{k: copy.deepcopy(_PROBE_WELL_FORMED[filler])
+                                    for k in sorted(seen)}, **gate})
                     if frozenset(seen) == before:
                         break
+                # The leaf context ladder, least-perturbing first, and for the
+                # same reason the top level has one: the sweeps below REBUILD
+                # the leaf from what is recorded here, so a key read only when a
+                # SIBLING is present (`if args:` before the argument tag, a
+                # `value` beside the `type`) has to be recorded in a leaf that
+                # HAS that sibling. Rebuilding every leaf from a bare probe
+                # element left 187 of the nested rows swept in a branch they
+                # never entered -- round 13's top-level defect one level down,
+                # and it hid three live raises that this ladder surfaces.
+                leaf_kinds: dict[str, str | None] = {}
+                records: dict[str, tuple] = {}
+                for _round in (0, 1):
+                    records = {}
+                    for nkey in sorted(seen):
+                        bare = {k: v for k, v in _PROBE_ELEMENT.items() if k != nkey}
+                        siblings = [s for s in sorted(seen) if s != nkey]
+                        leaves = [
+                            bare,
+                            {**bare, **{s: copy.deepcopy(_PROBE_WELL_FORMED[leaf_kinds.get(s)])
+                                        for s in siblings}},
+                            {**bare, **{s: copy.deepcopy(_PROBE_WELL_FORMED["dict"])
+                                        for s in siblings}},
+                            {**bare, **{s: copy.deepcopy(_PROBE_WELL_FORMED["list"])
+                                        for s in siblings}},
+                            {**bare, **{s: "probe" for s in siblings}},
+                            *({**bare, **{s: literal for s in siblings}}
+                              for literal in literals),
+                            # Conjunction gates, as at top level: a nested read
+                            # behind two DIFFERENT sibling values (a format
+                            # string beside a conversion list, a variadic callee
+                            # beside its kind) is opened by no single filler, so
+                            # each key gets a constant IT is compared against.
+                            *({**bare, **{g: v for g, v in gate.items() if g != nkey}}
+                              for gate in _gated_contexts(sorted(seen), keyed)),
+                            *({**bare,
+                               **{s: copy.deepcopy(_PROBE_WELL_FORMED["dict"])
+                                  for s in siblings},
+                               **{g: v for g, v in gate.items() if g != nkey}}
+                              for gate in _gated_contexts(sorted(seen), keyed)),
+                            # LAST, and the rung that makes the recorded context
+                            # reachable by construction: the leaf this key was
+                            # observed being asked in. Every rung above is a
+                            # guess that happens to be less perturbing; this one
+                            # is a measurement.
+                            first_leaf.get(nkey, bare)]
+                        observed = None
+                        read_in = None
+                        for leaf_ctx in leaves:
+                            for kind in ("list", "dict"):
+                                probe = _watched(kind)
+                                _render_or_exception(render, _payload_for(
+                                    ctx, path, {**copy.deepcopy(leaf_ctx), nkey: probe}))
+                                if probe.hits & _CONTAINER_USE:
+                                    observed = (leaf_ctx, kind)
+                                    break
+                            if observed:
+                                break
+                            if read_in is None:
+                                asked: set[str] = set()
+                                _render_or_exception(render, _payload_for(
+                                    ctx, path,
+                                    _KeyProbe({**copy.deepcopy(leaf_ctx), nkey: "probe"}, asked)))
+                                if nkey in asked:
+                                    read_in = leaf_ctx
+                        records[nkey] = observed if observed else (
+                            leaves[0] if read_in is None else read_in, None)
+                    leaf_kinds = {k: rec[1] for k, rec in records.items()}
                 for nkey in sorted(seen):
-                    observed = None
-                    for kind in ("list", "dict"):
-                        probe = _watched(kind)
-                        leaf = {**_PROBE_ELEMENT, nkey: probe}
-                        _render_or_exception(render, _payload_for(ctx, path, leaf))
-                        if probe.hits & _CONTAINER_USE:
-                            observed = kind
-                            break
+                    leaf_ctx, kind = records[nkey]
                     # Kind-free, exactly like the top level: an UNCLASSIFIED
                     # nested key still gets swept for raises, because a scalar
                     # read that dies on a wrong shape is the same #619 defect --
                     # a sampled string sliced as `(s.get("value") or "")[:80]`
                     # raised on a dict and cost the whole card. Only a classified
                     # container is descended into and differentiated.
-                    nested.append((name, render, path, nkey, observed, ctx))
-                    if observed is not None:
-                        next_frontier.append((name, render, path + ((nkey, observed),), ctx))
+                    nested.append((name, render, path, nkey, kind, ctx, leaf_ctx))
+                    if kind is not None:
+                        # The step carries the leaf context it was observed in, so
+                        # the level below rebuilds this element as it was SEEN and
+                        # not as a bare probe element.
+                        next_frontier.append(
+                            (name, render, path + ((nkey, kind, leaf_ctx),), ctx))
             frontier = next_frontier
             if not frontier:                  # converged: nothing left to descend into
                 break
@@ -3144,13 +3245,6 @@ def test_every_count_the_go_rename_summary_decides_on_is_covered_by_measured():
 _RESIDUE_DIRECT_COVER = {
     "_blast_radius_line.affected_summary":
         ("dict", [lambda v: {"affected_summary": v}]),
-    "_leaf_group_key.callee":
-        ("dict", [lambda v: {"kind": "unmodeled_callee", "callee": v},
-                  lambda v: {"kind": "arg_under_recovered", "callee": v}]),
-    "_render_callgraph_text.target":
-        ("dict", [lambda v: {"callees": [{"kind": "direct", "target": v}]}]),
-    "_taint_truncation_note.truncation_cause":
-        ("list", [lambda v: {"truncated": True, "truncation_cause": v}]),
     "_types_affected_lines.affected_types":
         ("list", [lambda v: {"affected_types": v}]),
 }
@@ -3213,13 +3307,16 @@ def test_every_uncovered_read_is_covered_directly():
             "different gate inherits it silently. Give the new site its own "
             "builder, or get it into a population.")
         covered += len(matching)
-    assert covered == 6, (
-        f"the residue cover accounts for {covered} reads, not 6 -- the size of "
+    assert covered == 2, (
+        f"the residue cover accounts for {covered} reads, not 2 -- the size of "
         "the exempted set, which moves only with an entry you deliberately "
-        "added or removed. It shrank by two when the identity sweep put "
-        "`_format_operation_result` in the population: an exempted read that "
-        "gets a real differential must LEAVE this table, or the exemption "
-        "outlives the hole it was written for.")
+        "added or removed. It has shrunk from eight to two in this round alone: "
+        "the identity sweep put `_format_operation_result` in the top-level "
+        "population, and the nested descent -- once it rebuilt each leaf from "
+        "the context the read was OBSERVED in -- started exercising three more "
+        "of these directly. An exempted read that gets a real differential "
+        "must LEAVE this table, or the exemption outlives the hole it was "
+        "written for.")
 
     for label, (kind, builders) in sorted(_RESIDUE_DIRECT_COVER.items()):
         fn_name, key = label.rsplit(".", 1)
@@ -3325,13 +3422,13 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     missed = sorted(f"{name}.{key}" for name, key in declared - classified
                     if (name, key) in read)
     nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 227, (
-        f"the module declares {len(declared)} choke-point reads, not 227. The "
+    assert len(declared) == 228, (
+        f"the module declares {len(declared)} choke-point reads, not 228. The "
         "count is the size of the covered set: a read that vanishes is a read "
         "no differential runs any more, so move this number only with the read "
         "you deliberately added or removed.")
-    assert len(sites) == 249, (
-        f"the module has {len(sites)} choke-point CALL SITES, not 249. A pair "
+    assert len(sites) == 250, (
+        f"the module has {len(sites)} choke-point CALL SITES, not 250. A pair "
         "read at several sites keeps its (function, key) entry when one site is "
         "converted to a raw coercion, which is why the sites are counted too -- "
         "so a site that disappears here is a coercion that stopped going "
@@ -3341,9 +3438,9 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
                       "_render_leaf_line.tainted_args"], (
         "a choke-point read the probe reaches at top level is no longer "
         f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 89, (
+    assert len(nested) == 92, (
         f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 89")
+        "reach them, not 92")
     # Counting is not covering, and that was round 9's blocker: the nested reads
     # were counted here and then differentially tested nowhere, so a one-hop
     # helper coercing a nested ref bucket passed every guard in this file. Every
@@ -3357,7 +3454,7 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     # credited a read in one function to a same-named key in an unrelated one.
     exercised = ({(fn_of(name), key) for name, _, key, kind, _ in population
                   if kind is not None}
-                 | {(fn_of(name), key) for name, _, _, key, kind, _ in _nested_population()
+                 | {(fn_of(name), key) for name, _, _, key, kind, _, _ in _nested_population()
                     if kind is not None})
     reach = _module_reach()
     def covered(fn, key):
@@ -3497,14 +3594,14 @@ def test_the_nested_population_is_exactly_this_big():
     containers down. A nested position that VANISHES is otherwise
     indistinguishable from one that passed."""
     nested = _nested_population()
-    depths = collections.Counter(len(path) for _, _, path, _, _, _ in nested)
+    depths = collections.Counter(len(path) for _, _, path, _, _, _, _ in nested)
     containers = [rec for rec in nested if rec[4] is not None]
-    assert (len(nested), len(containers)) == (1333, 204), (
+    assert (len(nested), len(containers)) == (1368, 218), (
         f"the nested population changed size: {len(nested)} nested keys read, "
         f"{len(containers)} of them as containers. If you added a nested read, "
         "update these numbers; if you did not, a renderer stopped reading a "
         "nested field and the differential below stopped covering it.")
-    assert dict(sorted(depths.items())) == {1: 798, 2: 343, 3: 114, 4: 48, 5: 24, 6: 6}, (
+    assert dict(sorted(depths.items())) == {1: 801, 2: 360, 3: 128, 4: 48, 5: 25, 6: 6}, (
         f"the nested population's shape changed: {dict(sorted(depths.items()))}")
     # THE convergence proof, and the answer to round 10's second blocker: the
     # descent stopped because a level found no further container, not because it
@@ -3513,6 +3610,43 @@ def test_the_nested_population_is_exactly_this_big():
         f"the nested descent reached the runaway cap ({max(depths)} of "
         f"{_NEST_DEPTH_CAP}), so it was CUT OFF rather than converging, and a "
         "read below it is outside every differential")
+
+
+def test_every_NESTED_population_context_actually_reaches_the_read_it_was_recorded_for():
+    """The nested population's third promise, made executable -- the same guard
+    the top level has, which the nested half went five rounds without.
+
+    It is not a formality: the nested sweeps REBUILD their leaf from what the
+    population recorded, and rebuilding it from a bare probe element left 187 of
+    1333 rows swept in a payload that never entered the read. A read gated on a
+    SIBLING of its own key (`if args:` before the argument tag, a `value` beside
+    the `type`) could not fail there, and three live raises sat behind exactly
+    that -- found by replaying the identical sweep with the siblings the descent
+    had already discovered.
+
+    So every recorded (path, key, leaf) triple is re-run and the renderer must
+    ACTUALLY ASK for that key in that leaf, which is the property the sweeps
+    depend on and the one nobody could see was broken."""
+    unreached = []
+    for label, render, path, key, kind, ctx, leaf in _nested_population():
+        asked: set[str] = set()
+        _render_or_exception(render, _payload_for(
+            ctx, path, _KeyProbe({**copy.deepcopy(leaf), key: "probe"}, asked)))
+        if key in asked:
+            continue
+        # A container position may only be read when a container is what sits
+        # there, exactly as at top level: give it the kind it was classified as
+        # before calling the context unreachable.
+        probe = _KeyProbe(copy.deepcopy(leaf), asked)
+        probe[key] = _watched(kind or "list")
+        _render_or_exception(render, _payload_for(ctx, path, probe))
+        if key not in asked:
+            where = ".".join(k for k, *_ in path)
+            unreached.append(f"{label}.{where}[].{key}")
+    assert not unreached, (
+        f"{len(unreached)} nested population entries record a leaf the renderer "
+        "never reads the key in, so every nested sweep runs a branch it does "
+        f"not enter and cannot fail there: {unreached[:8]}")
 
 
 def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
@@ -3531,20 +3665,21 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
     covering.
 
     Replayed against the base module the way the top-level differential is
-    (base's own nested population: 1225 keys, 187 of them containers, because
-    the descent is derived from the module it runs on): base absorbs 936 of its
-    1122 nested cases at 176 of those 187 positions and raises in 110 more;
-    this commit absorbs 0 of 1224."""
+    (base's own nested population: 1262 keys, 201 of them containers, because
+    the descent is derived from the module it runs on): base absorbs 1012 of its
+    1206 nested cases at 190 of those 201 positions; this commit absorbs 0 of
+    1308."""
     from bn import formatters
 
     echoes = formatters._render_fallback_text
     absorbed, checked = [], 0
-    for fn_name, render, path, key, kind, ctx in _nested_population():
+    for fn_name, render, path, key, kind, ctx, leaf in _nested_population():
         if kind is None:
             continue
-        # The baseline drops the key from the ELEMENT, so "absent" really is
-        # absent even for a key the probe element carries by default.
-        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+        # The baseline drops the key from the ELEMENT the read was OBSERVED in,
+        # so "absent" really is absent even for a key the probe element carries
+        # by default, and the siblings that OPEN the read are still there.
+        base = {k: v for k, v in leaf.items() if k != key}
         absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
         empty = _render_or_exception(
             render, _payload_for(ctx, path, {**base, key: [] if kind == "list" else {}}))
@@ -3559,13 +3694,13 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
             if out == echoes(payload) or echoes(payload) in out:
                 continue
             if out == absent or out == empty:
-                where = ".".join(k for k, _ in path)
+                where = ".".join(k for k, *_ in path)
                 absorbed.append(
                     f"{fn_name}({where}[].{key}={bogus!r}) renders byte-identically "
                     f"to that nested field being "
                     f"{'absent' if out == absent else 'empty'}, with no disclosure")
     assert not absorbed, absorbed[:8]
-    assert checked == 1224, f"the nested differential ran {checked} cases, not 1224"
+    assert checked == 1308, f"the nested differential ran {checked} cases, not 1308"
 
 
 def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
@@ -3576,22 +3711,22 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
     Kind-free because the crash does not need a container: a sampled string
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
     spec, an unhashable `kind` used as a grouping key. Base, swept over its own
-    nested population the same way, raises 250 times at 79 nested positions in
-    9800 renders; this commit raises 0 in 10664."""
+    nested population the same way, raises 306 times at 99 nested positions in
+    10096 renders; this commit raises 0 in 10944."""
     swept, raised = 0, []
-    for fn_name, render, path, key, _kind, ctx in _nested_population():
-        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+    for fn_name, render, path, key, _kind, ctx, leaf in _nested_population():
+        base = {k: v for k, v in leaf.items() if k != key}
         absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
         for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
             swept += 1
             out = _render_or_exception(render, _payload_for(ctx, path, {**base, key: bogus}))
             if isinstance(out, Exception) and not isinstance(absent, Exception):
-                where = ".".join(k for k, _ in path)
+                where = ".".join(k for k, *_ in path)
                 raised.append(f"{fn_name}({where}[].{key}={bogus!r}) raised "
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-    assert swept == 10664, f"the nested raise sweep ran {swept} renders, not 10664"
+    assert swept == 10944, f"the nested raise sweep ran {swept} renders, not 10944"
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
@@ -4956,29 +5091,29 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
     Same property as at top level -- an unusable element may render as a
     placeholder or be skipped, never RAISE -- and the same junk set, shared with
     it so the two sweeps cannot drift into covering different shapes. Base,
-    swept over its own nested population, raises 216 times at 25 positions in
-    720 renders; this commit raises 0 in 873."""
+    swept over its own nested population, raises 216 times at 31 positions in
+    756 renders; this commit raises 0 in 909."""
     raised = []
     swept = 0
-    for label, render, path, key, kind, ctx in _nested_population():
+    for label, render, path, key, kind, ctx, leaf in _nested_population():
         if kind != "list":
             continue
-        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+        base = {k: v for k, v in leaf.items() if k != key}
         absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
         for element in _ELEMENT_JUNK:
             swept += 1
             out = _render_or_exception(
                 render, _payload_for(ctx, path, {**base, key: [copy.deepcopy(element)]}))
             if isinstance(out, BaseException) and not isinstance(absent, BaseException):
-                where = ".".join(k for k, _ in path)
+                where = ".".join(k for k, *_ in path)
                 raised.append(f"{label}({where}[].{key}=[{element!r}]) raised "
                               f"{type(out).__name__}: {out}")
     assert not raised, (
         "a wrong-shaped ELEMENT of a NESTED list cost the whole render where "
         "the same payload with that list absent rendered cleanly: "
         f"{raised[:6]}")
-    assert swept == 873, (
-        f"the nested element sweep ran {swept} renders, not 873 -- the size of "
+    assert swept == 909, (
+        f"the nested element sweep ran {swept} renders, not 909 -- the size of "
         "the covered set (every nested list position the descent discovered x "
         "every junk element kind), so move it only with a nested list position "
         "you deliberately added or removed")

@@ -742,9 +742,12 @@ def _render_field_xrefs_text(value: Any) -> str:
     lines.extend(["", "data refs:"])
     if data_refs:
         for ref in data_refs:
-            details = [ref.get("address", "<unknown>")]
+            # Every part is str()'d before the join: the code-ref block above
+            # already learned that one wrong-typed part costs the WHOLE listing,
+            # and the data-ref block was the same bug with the lesson missing.
+            details = [str(ref.get("address", "<unknown>"))]
             if ref.get("symbol"):
-                details.append(ref["symbol"])
+                details.append(str(ref["symbol"]))
             if ref.get("type"):
                 details.append(f"type={ref['type']}")
             lines.append("- " + " | ".join(details))
@@ -2039,7 +2042,10 @@ def _render_function_evidence_text(value: Any) -> str:
             # #549: mark whether `arguments` is canonical (authoritative HLIL/ABI) or a
             # heuristic lower-IL fallback, so an agent traces the right field.
             confidence = call.get("argument_confidence")
-            tag = " ".join(x for x in (source, confidence) if x)
+            # The tag is joined, so a non-string source or confidence cost the
+            # WHOLE evidence card -- and it renders cleanly with the field
+            # absent, which is the asymmetry #619 is about.
+            tag = " ".join(str(x) for x in (source, confidence) if x)
             lines.append("  arguments:" + (f" ({tag})" if tag else ""))
             for arg in args:
                 lines.append(f"    {arg.get('text', '')}"
@@ -2060,7 +2066,10 @@ def _render_function_evidence_text(value: Any) -> str:
                 # from `source` rather than hard-coding "HLIL" so this note can never
                 # attribute the list to a layer that did not actually produce it.
                 declared = call.get("declared_arity")
-                layer = source.upper() if source else "the rendered list"
+                # `str()` first: the layer name is only a LABEL, and a non-string
+                # `argument_source` made `.upper()` an AttributeError that cost
+                # the whole evidence card (#619).
+                layer = str(source).upper() if source else "the rendered list"
                 if isinstance(declared, int):
                     note = (f"  arity: MISMATCH — {layer} rendered {len(args)} argument(s) but "
                             f"the callee's recovered prototype declares {declared}")
@@ -2872,7 +2881,10 @@ def _render_values_text(value: Any) -> str:
                      if value.get("possible_values")
                      else "possible values: <unavailable>")
         return "\n".join(lines)
-    summary = pvs.get("type", "?")
+    # `str()` because the type is INTERPOLATED and then appended to: a non-string
+    # `type` beside a readable `value` made `summary +=` a TypeError and cost the
+    # whole values card, where the same payload without the type renders (#619).
+    summary = str(pvs.get("type", "?"))
     if "value" in pvs:
         summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
     if pvs.get("values"):
@@ -3747,7 +3759,34 @@ def _render_doctor_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _operation_row(item: dict[str, Any]) -> tuple[str, list[str]]:
+    """One mutation op result as a row, plus the fields it could not read.
+
+    The keys are read under a LOCAL recorder and handed back, because both
+    callers need the answer and neither can rely on a boundary: `bn.cli`
+    re-exports `_format_operation_result` so tests and scripts can call it
+    DIRECTLY, and a direct caller installs no ``@_discloses`` boundary at all --
+    so a skew recorded here drained nowhere and a malformed ``requested``
+    rendered byte-identically to the field being absent (#619). Same idiom as
+    ``_add_mutation_ok`` and the go-rename summary: decide locally, disclose in
+    the row, and let the row say WHICH op could not be read, which an aggregate
+    note at the end of the card cannot."""
+    token = _SKEWED_FIELDS.set([])
+    try:
+        row = _operation_row_text(item)
+        unreadable = sorted(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    return row, unreadable
+
+
 def _format_operation_result(item: dict[str, Any]) -> str:
+    """The op row a DIRECT caller gets, disclosure included."""
+    row, unreadable = _operation_row(item)
+    return f"{row}  {_skew_note(*unreadable)}" if unreadable else row
+
+
+def _operation_row_text(item: dict[str, Any]) -> str:
     op = item.get("op", "<unknown>")
     if not isinstance(op, str):                    # an unhashable op crashed the `in` test
         op = str(op)
@@ -3789,31 +3828,22 @@ def _format_operation_result(item: dict[str, Any]) -> str:
         # Name the type(s) defined, not a bare count -- "which type?" is the first
         # thing an agent needs. Parser bookkeeping (parsed functions/variables) is
         # internal noise and moves out of the default line.
-        #
-        # Both reads happen under a LOCAL recorder because the refusal below may
-        # not depend on a boundary being installed: `bn.cli` re-exports this
-        # helper precisely so tests and scripts can call it DIRECTLY, and a
-        # direct caller has no `@_discloses` boundary at all -- so `_field_skewed`
-        # would answer False and the line would fabricate its zero again. Same
-        # idiom as `_add_mutation_ok` and the go-rename summary. The skew is
-        # re-recorded, so an enclosing render still discloses it.
-        token = _SKEWED_FIELDS.set([])
-        try:
-            declared = _field_dict(item, "defined_types")
-            count = _count_field(item, "count")
-            unreadable = sorted(_SKEWED_FIELDS.get() or ())
-        finally:
-            _SKEWED_FIELDS.reset(token)
-        for key in unreadable:
-            _record_skew(key)
+        declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
         if names:
             return f"types_declare {', '.join(names)}"
-        if unreadable:
-            # "0 types" off a listing we could not read is the fabricated zero
-            # #683 discarded a committed rename batch to, one op over: the row
-            # would read as a declare that defined nothing.
-            return f"types_declare <unreadable {', '.join(unreadable)}>"
+        # No names, so the COUNT is the whole claim -- and it may only be stated
+        # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
+        # listing printed "types_declare 0 types", which reads as a declare that
+        # defined nothing: the fabricated zero #683 discarded a committed rename
+        # batch to, one op over. Disclosing it is not enough either, because the
+        # count is what a control loop reads and the note is not. So the row
+        # REFUSES the claim, exactly as the go-rename view does.
+        if _field_skewed("defined_types") and not _field_present(item, "count"):
+            return "types_declare <unreadable defined_types>"
+        count = _count_field(item, "count")
+        if _field_skewed("count"):
+            return "types_declare <unreadable count>"
         return f"types_declare {count} types"
     return _render_fallback_text(item)
 
@@ -3829,9 +3859,11 @@ def _clean_prototype(proto: Any) -> str | None:
 
 
 def _set_prototype_detail(item: dict[str, Any]) -> list[str]:
-    observed = item.get("observed")
-    proto = observed.get("prototype") if isinstance(observed, dict) else None
-    proto = _clean_prototype(proto)
+    # Through the choke point, not an inline isinstance: an unusable `observed`
+    # dropped the prototype line and left the row byte-identical to a row that
+    # carried no observation at all -- the renderer's whole subject is that the
+    # prototype it SET was verified (#619).
+    proto = _clean_prototype(_field_dict(item, "observed").get("prototype"))
     return ["  " + proto] if proto else []
 
 
@@ -3943,14 +3975,17 @@ def _is_type_result(result: Any) -> bool:
 
 
 def _format_op_summary(item: dict[str, Any]) -> str:
-    summary = _format_operation_result(item)
+    # The row's own status/message suffixes go on the ROW, and the disclosure
+    # note goes last -- calling `_format_operation_result` here would append the
+    # note first and leave ` [verified]` dangling after it.
+    summary, unreadable = _operation_row(item)
     if item.get("status"):
         summary += f" [{item['status']}]"
     if item.get("changed") is False and item.get("status") not in (None, "noop"):
         summary += " [no change]"
     if item.get("message"):
         summary += f" ({item['message']})"
-    return summary
+    return f"{summary}  {_skew_note(*unreadable)}" if unreadable else summary
 
 
 def _add_mutation_ok(value: Any) -> Any:
