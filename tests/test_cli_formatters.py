@@ -968,9 +968,6 @@ _GREEN_ON_BASE_BY_DESIGN = {
         "declared form stops being matched",
     "test_the_coercion_guards_blind_spots_are_the_ones_it_declares":
         "same -- red if a declared blind spot is silently closed or widened",
-    "test_the_compact_summary_ok_key_mirrors_success_on_every_outcome":
-        "#447's mirror already held; red if `ok` is hardcoded or stops "
-        "tracking `success`",
     "test_well_formed_realistic_payloads_carry_no_disclosure":
         "the no-false-positive half of the disclosure -- red if a legitimately "
         "empty container starts recording a skew",
@@ -5080,6 +5077,33 @@ def test_the_compact_summary_ok_key_mirrors_success_on_every_outcome():
     # Without this the mirror is satisfiable by a constant: the population has to
     # actually produce BOTH outcomes for the assertion above to have bitten.
     assert seen == {True, False}, f"the outcome population only produced ok={seen}"
+    # `first_error` is the one key an agent contract tells callers to read, so
+    # it is TEXT or nothing on both callers -- never a container whose Python
+    # repr the compact renderer prints. The explanation goes through the text
+    # choke point, so an unreadable one means "this row explained nothing" and
+    # the next fallback answers, with the boundary naming the field.
+    for unreadable in ({"code": 7}, ["boom"], 7, 1.5, ()):
+        generic = formatters._mutation_summary({
+            "success": False, "committed": False,
+            "results": [{"op": "rename", "status": "verification_failed",
+                         "message": unreadable}]})
+        go = formatters._go_rename_summary({
+            "kind": "go_rename", "success": False, "committed": False,
+            "go_renamed_candidates": 1, "go_committed_count": 0,
+            "go_verified_count": 0, "go_failed_count": 1,
+            "skipped_user_named": 0, "message": unreadable,
+            "results": [{"status": "verification_failed"}]})
+        for name, summary in (("mutation", generic), ("go rename", go)):
+            assert isinstance(summary["first_error"], str), (
+                f"{name} summary put a {type(summary['first_error']).__name__} in "
+                f"first_error for message={unreadable!r}: {summary!r}")
+            assert "malformed message" in summary["first_error"], (
+                f"{name} summary dropped an unreadable message with no note "
+                f"naming it: {summary!r}")
+        # And the message still READS when it is text, on both.
+        assert formatters._mutation_summary({
+            "success": False, "committed": False, "message": "revert failed",
+            "results": [{"status": "verified"}]})["first_error"] == "revert failed"
 
 
 def test_the_compact_mutation_status_discloses_a_malformed_results_listing():
@@ -5358,11 +5382,14 @@ def test_the_unmeasured_cause_round_trips_for_every_cause():
         "this op reported none of its own counters":
             formatters._go_rename_summary({"kind": "go_rename", "success": True,
                                            "committed": True}),
-        # The three states this round added, each named for the field a reader
-        # would go look at: a row of a populated `results[]` that could not be
+        # The states this round added, each named for the field a reader would
+        # go look at: a populated `results[]` one row of which could not be
         # read is NOT "no rows", and go rename's rows being unreadable is not
-        # its counters being unreadable.
-        "a results[] row could not be read":
+        # its counters being unreadable. The results[] phrase covers BOTH
+        # granularities it can be unreadable at -- the whole field and one
+        # element of it -- because naming a ROW for a field that arrived as a
+        # string would send the reader looking for the wrong thing.
+        "this op's results[] could not be read":
             formatters._mutation_summary({"success": True, "committed": True,
                                           "results": [7, {"status": "verified"}]}),
         "this op's failure rows could not be read":
@@ -5376,6 +5403,10 @@ def test_the_unmeasured_cause_round_trips_for_every_cause():
                                            "go_committed_count": 3,
                                            "go_failed_count": 0,
                                            "results": [{"status": "verification_failed"}]}),
+        "an op row's status could not be read":
+            formatters._mutation_summary({"success": True, "committed": True,
+                                          "results": [{"op": "rename",
+                                                       "status": {"code": 7}}]}),
     }
     for cause, summary in causes.items():
         assert summary["measured"] is False, summary
@@ -5385,6 +5416,13 @@ def test_the_unmeasured_cause_round_trips_for_every_cause():
         warning = [ln for ln in formatters._render_mutation_summary_text(summary)
                    .splitlines() if ln.startswith("warning: unmeasured")]
         assert warning and cause in warning[0], warning
+    # The same phrase for the FIELD granularity, which is the half a
+    # row-naming phrase got wrong: `results` arriving as a string carries no
+    # rows to name.
+    field = formatters._mutation_summary({"success": True, "committed": True,
+                                          "results": "not a listing"})
+    assert (formatters._unmeasured_cause(field["first_error"])
+            == "this op's results[] could not be read"), field
     # The documented sample output in the public reference quotes this line
     # verbatim for the generic cause, so it is a contract, not wording.
     generic = formatters._render_mutation_summary_text(
@@ -6288,6 +6326,28 @@ def test_an_unreadable_op_status_is_neither_a_crash_nor_a_pass():
         assert "malformed" in str(summary.get("first_error")), (
             f"status={unreadable!r} must reach the compact summary a control "
             f"loop reads, not just the text card: {summary!r}")
+        # And the count keys, not only `ok`: a row nobody could classify is not
+        # a row that passed, so `failed_count: 0` over it is the fabricated
+        # zero in the SECONDARY keys -- and the sibling caller of the one
+        # builder already refused it there, which made the two answer
+        # `measured` differently for the identical defect.
+        assert summary["measured"] is False and summary["failed_count"] is None, (
+            f"status={unreadable!r} left the compact summary stating counts "
+            f"derived from a row it could not classify: {summary!r}")
+        go = formatters._go_rename_summary({
+            "kind": "go_rename", "success": True, "committed": True,
+            "go_committed_count": 1, "go_failed_count": 0,
+            "results": [{"status": unreadable}]})
+        assert (go["measured"], go["failed_count"]) == (summary["measured"],
+                                                        summary["failed_count"]), (
+            f"the two callers of the one builder answer `measured`/"
+            f"`failed_count` differently for status={unreadable!r}: "
+            f"{go!r} vs {summary!r}")
+    # Anti-vacuity for the pair above: a readable batch is still measured and
+    # still states its zero.
+    clean_summary = formatters._mutation_summary(card("verified"))
+    assert (clean_summary["measured"], clean_summary["failed_count"]) == (True, 0), (
+        clean_summary)
 
 
 def test_a_type_row_never_states_a_field_count_it_could_not_measure():
@@ -6429,6 +6489,27 @@ def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
     # readable and names no failure) does not contradict a zero counter.
     quiet = formatters._go_rename_summary(envelope([{"status": "noop"}]))
     assert quiet["ok"] is True and quiet["measured"] is True, quiet
+    # The counter need not be ZERO to be contradicted, and that was the half a
+    # `not failed` test could never see: the bridge builds this counter AS
+    # `len(failed_rows)`, so a counter naming FEWER failures than the payload
+    # carries rows for is not a measurement either -- and the op's DEFAULT text
+    # view states the ROW count, so the two surfaces would disagree out loud.
+    understated = formatters._go_rename_summary(
+        {**envelope([{"status": "verification_failed"}] * 5),
+         "go_failed_count": 2, "success": False, "committed": False})
+    assert understated["measured"] is False, (
+        f"5 failure rows beside go_failed_count 2 is not a measured run: "
+        f"{understated!r}")
+    assert understated["failed_count"] is None and understated["ok"] is False, understated
+    assert "warning: unmeasured" in formatters._render_mutation_summary_text(understated)
+    # The OTHER direction stays measured, and it has to: `results[]` is a
+    # CAPPED failure listing (the text view prints 50 rows and then "... and N
+    # more"), so a counter LARGER than the rows in hand is the population the
+    # rows were sampled from, not a contradiction.
+    capped = formatters._go_rename_summary(
+        {**envelope([{"status": "verification_failed", "message": "m"}] * 5),
+         "go_failed_count": 60, "success": False, "committed": False})
+    assert capped["measured"] is True and capped["failed_count"] == 60, capped
 
 
 def test_the_blast_radius_line_never_states_a_count_it_could_not_read():
@@ -6774,8 +6855,8 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 
 # --- ROUTED OUT OF #619/#685, NAMED RATHER THAN LEFT IMPLIED ------------------
 #
-# Two findings on this module survive this PR by RULING, not by oversight. Both
-# are pre-existing at base, neither is on the go-rename/mutation-summary path
+# Three findings on this module survive this PR by RULING, not by oversight.
+# All are pre-existing at base, none is on the go-rename/mutation-summary path
 # #619 and #685 describe, and an exhaustive module-wide count-and-shape answer
 # is a separate audit -- it is routed to a follow-up PR rather than half-done
 # here, because the honest version of it changes every count surface in the
@@ -6802,17 +6883,35 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 #   2. THE STRING-SHAPE GUARD POPULATION is blind to a shape test spelled
 #      through a class held in a VARIABLE (`_TEXT_TYPES = (str,)` at module
 #      level, then `isinstance(x, _TEXT_TYPES)`). The STATED LIMITATION above
-#      `_STRING_SHAPE_GUARDS` claims that spelling is "asserted absent from the
-#      module below"; it is not -- the anti-drift assertion flags a non-Name
-#      class argument, and a bare alias Name is neither harvested nor flagged.
-#      Correcting the classifier means resolving module-level aliases in it,
-#      which is the same routed audit. What holds TODAY is narrower and is
-#      asserted rather than asserted-about, because a claim nobody re-runs is
-#      exactly what this file keeps correcting: no shipped guard uses that
-#      spelling, and `test_no_shape_guard_hides_behind_a_module_level_alias`
-#      below fails the moment one arrives. The earlier parenthetical here said
-#      the population's size pins catch it; they do not -- an alias guard
-#      inside a function no probe reaches moves no size at all.
+#      `_STRING_SHAPE_GUARDS` says that spelling is "asserted absent from the
+#      module below". That sentence is TRUE of the module and FALSE of the
+#      classifier, which is the distinction worth keeping straight: the
+#      spelling really is absent, and the assertion that keeps it absent is
+#      the AST walk in `test_no_shape_guard_hides_behind_a_module_level_alias`
+#      below -- not the guard population, whose harvest skips a non-`str` Name
+#      and whose anti-drift assertion only flags a class argument that is
+#      neither a Name, a Tuple nor a List. So the population is blind to the
+#      spelling while the module is clean of it; teaching the classifier to
+#      resolve module-level aliases is the routed audit's job, and until then
+#      the absence is asserted rather than asserted-about, because a claim
+#      nobody re-runs is exactly what this file keeps correcting. The earlier
+#      parenthetical here credited the population's size pins with catching
+#      one; they do not -- an alias guard inside a function no probe reaches
+#      moves no size at all.
+#   3. FLAG AND ARITHMETIC SURFACES have the shape contract only where this
+#      PR's harm reached them. `_flag_field` exists because `has_more` decides
+#      whether the paging footer states a resume instruction, and a raw
+#      truthiness test on a flag reads `"false"` as True; every OTHER flag read
+#      in this module (`preview`, `committed`, `truncated`, `changed`,
+#      `direct`, `has_more` on the renderers that do their own paging) is still
+#      `bool(value.get(k))` or a bare `value.get(k)`, which is the same class
+#      one field over. Likewise the arithmetic: the footer now refuses counts
+#      that contradict each other, while `_go_rename_summary`'s
+#      `op_count = candidates + skipped - skipped_changed_during_apply` can
+#      still go negative on an inconsistent envelope. Both belong to the same
+#      routed audit, for the same reason: the fix is one contract over every
+#      flag read and every derived count, discovered by a population rather
+#      than listed by hand.
 
 
 def test_no_shape_guard_hides_behind_a_module_level_alias():
@@ -6951,6 +7050,32 @@ def test_the_paging_footer_never_states_a_resume_offset_it_could_not_derive():
     element = page(functions=[1])
     assert "// showing 1 of 100 (49 more); rerun with --offset 51" in element, element
     assert "1" in element.splitlines()[0], element
+    # The flag that decides whether a resume instruction exists at all, which
+    # had no shape contract while the three counts beside it had one -- and it
+    # is the one field a raw truthiness test reads BACKWARDS: `"false"` is True
+    # to Python, so a LAST page printed "rerun with --offset 51" and sent a
+    # pager after a window that does not exist.
+    for bogus in ("false", "no", {"more": False}, ["x"], 1.5, ()):
+        out = page(has_more=bogus)
+        assert "--offset" not in out and "showing" not in out, (
+            f"has_more={bogus!r} could not be read, so whether more rows exist "
+            f"is not established and no resume instruction follows from it: {out!r}")
+        assert _disclosed(out, "has_more"), out
+    # A real bool, and the 0/1 a wire format may number its booleans with, both
+    # still READ -- refusing those would drop the footer on every honest page.
+    assert "rerun with --offset 51" in page(has_more=1)
+    assert "// showing 1 of 100" in page(has_more=0)
+    assert "malformed" not in page(has_more=0)
+    # Counts that are all readable and mutually impossible: a window starting
+    # past the end of the set derived "(-41 more)" and "--offset -4", which is
+    # an actionable instruction built out of arithmetic on a self-contradicting
+    # envelope. The payload's own numbers are stated; nothing is derived.
+    clash = page(total=10)
+    assert "// page position not stated: offset 50 + returned 1 exceeds total 10" in clash, clash
+    assert "--offset" not in clash and "more)" not in clash, clash
+    # ... and the boundary case is NOT a clash: the last window ends exactly at
+    # the total.
+    assert "// showing 1 of 100" in page(offset=99, has_more=_ABSENT)
 
 
 def test_an_unreadable_results_ROW_can_never_read_as_ok():

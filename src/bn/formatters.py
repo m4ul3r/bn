@@ -250,6 +250,37 @@ def _text_value(source: Any, key: str) -> str | None:
     return None
 
 
+def _flag_field(source: Any, key: str) -> bool | None:
+    """``source[key]`` as a FLAG, recording the skew when the key is PRESENT but
+    holds something no boolean reads out of.
+
+    The flag sibling of ``_count_field``/``_text_value``, and it exists for the
+    one shape a raw truthiness test gets exactly BACKWARDS: the string
+    ``"false"`` is True to Python. ``has_more`` decides whether a paged view
+    states a resume instruction at all -- the one actionable claim in the
+    footer -- so a ``"false"`` there printed "rerun with --offset 51" on the
+    LAST page, sending a pager after a window that does not exist, while the
+    three counts beside it had just been given a shape contract (#619).
+
+    A real bool reads as itself and so does the 0/1 a bridge may send for a
+    flag -- ``bool`` IS an ``int`` and a wire format that numbers its booleans
+    is stating one, exactly as ``_count_field`` accepts a numeric string.
+    ``None`` means "no flag here" (ABSENT or an explicit null, neither of which
+    claimed anything); anything else present is the third state and the
+    enclosing boundary says so.
+    """
+    src = _as_dict(source)
+    if key not in src:
+        return None
+    raw = src[key]
+    if raw is None:
+        return None                    # an explicit null claimed nothing
+    if isinstance(raw, (bool, int)):
+        return bool(raw)
+    _record_skew(key)
+    return None
+
+
 def _row_list(source: Any, key: str) -> list[dict[str, Any]]:
     """``source[key]``'s ROWS, recording the skew when an ELEMENT of it is
     present but is not a row anything here can read.
@@ -1636,8 +1667,10 @@ def _paging_footer(value: dict[str, Any], items: list[Any],
     # 50, the non-advancing resume loop again, reached without any of the three
     # named counts being wrong. The skew is already recorded by the caller's
     # read, so the boundary still names the field (#619). Refused BELOW rather
-    # than here, so that every key this helper consults is consulted on every
-    # path and the read set does not depend on which refusal fired.
+    # than here, so that ONCE A TOTAL IS PRESENT the same keys are consulted
+    # whichever refusal fires -- the no-total return above reads only `total`,
+    # which is the one path that has nothing to footer against at all.
+
     # ONE count contract for all three of these. Spelling the total's test as
     # `isinstance(total, int)` made it a THIRD one: it rejected the numeric
     # string `_count_field` accepts two lines below, and which the go-rename
@@ -1674,14 +1707,30 @@ def _paging_footer(value: dict[str, Any], items: list[Any],
         returned = (_count_field(value, "returned") if _field_present(value, "returned")
                     else len(items))
         offset = _count_field(value, "offset")
+        # The flag goes through a choke point too, and inside the same capture:
+        # it decides whether the footer states a resume instruction at all, so
+        # a raw truthiness test on it was the one shape that reads BACKWARDS --
+        # `has_more: "false"` is True to Python and printed "rerun with
+        # --offset 51" on the last page.
+        more = _flag_field(value, "has_more")
         unreadable = sorted(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
     for key in unreadable:
         _record_skew(key)
-    more = bool(value.get("has_more"))
     if unreadable or page_unreadable:
         return None
+    # The three counts must also agree with EACH OTHER. All three readable and
+    # mutually impossible (a window that starts past the end of the set) put a
+    # negative remaining count and a negative `--offset -4` into an actionable
+    # instruction, and that arithmetic is not a measurement of anything. The
+    # payload's own numbers are stated instead of a derivation from them, for
+    # the same reason `go rename` refuses a counter its own rows contradict --
+    # and stated rather than dropped, because a silent drop renders a
+    # self-contradicting envelope byte-identically to an unpaged one (#619).
+    if offset + returned > total:
+        return (f"// page position not stated: offset {offset} + returned "
+                f"{returned} exceeds total {total}")
     if more:
         remaining = total - (offset + returned)
         next_offset = offset + returned
@@ -4316,13 +4365,18 @@ def _build_mutation_summary(
     # revert that failed AFTER every op verified has no failure row at all), then
     # a per-op default. Gating on `not success` rather than on `failed` is what
     # keeps the last two reachable while `failed` is 0.
-    first_error = None
+    # The explanation goes through the TEXT choke point, not a raw read: a
+    # container `message` on a failure row landed in the documented schema's
+    # `first_error` as a dict, and the compact renderer printed its Python
+    # repr where an agent reads the one key its contract tells it to check.
+    # Unreadable therefore means "this row explained nothing" -- the next
+    # fallback answers instead -- and the boundary names the field (#619/#685).
+    first_error: Any = None
     if not success:
         for row in failure_rows:
-            if isinstance(row, dict):
-                first_error = row.get("message") or row.get("status")
-                if first_error:
-                    break
+            first_error = _text_value(row, "message") or _text_value(row, "status")
+            if first_error:
+                break
         if first_error is None:
             first_error = message or default_error
     if proto_residue:
@@ -4462,14 +4516,22 @@ def _mutation_summary(value: Any) -> Any:
     # unmeasured case the builder fails safe on.
     #
     # An unreadable ROW SET is unmeasured for the same reason an empty one is,
-    # and at BOTH granularities: `results` arriving as the wrong FIELD already
-    # landed here (the choke point hands back an empty list), while a list one
-    # ELEMENT of which is not a row used to leave the four derived counts
-    # stated off the SURVIVORS -- `failed_count: 0` over a batch one of whose
-    # rows was discarded, which is the fabricated zero the builder's fail-safe
-    # exists to stop. `ok` alone is not enough here: a loop that branches on
-    # `dirty_after` or reads `failed_count` never looks at it (#619/#685).
-    unmeasured = not results or rows_unreadable
+    # and at EVERY granularity it can be unreadable at: `results` arriving as
+    # the wrong FIELD already landed here (the choke point hands back an empty
+    # list), while a list one ELEMENT of which is not a row, or a row whose
+    # STATUS nobody could read, used to leave the four derived counts stated
+    # off what survived -- `failed_count: 0` over a batch carrying a row that
+    # could not be classified, which is the fabricated zero the builder's
+    # fail-safe exists to stop, with `dirty_after` falling to False beside it.
+    # `ok` alone is not enough: a loop that branches on `dirty_after` or reads
+    # `failed_count` never looks at it.
+    #
+    # Derived from the whole capture rather than from the row-set read alone,
+    # because the sibling caller of the one builder derives it that way
+    # (`_go_rename_summary`: `measured = not unreadable and ...`) and the two
+    # answering `measured` differently for the same defect is the same drift
+    # #685 exists to close, one key over from `ok` (#619/#685).
+    unmeasured = not results or bool(unreadable)
     return _build_mutation_summary(
         measured=not unmeasured,
         # The rows that could be READ, which is why it stays an int while the
@@ -4486,14 +4548,19 @@ def _mutation_summary(value: Any) -> Any:
         committed=bool(value.get("committed", False)),
         preview=bool(value.get("preview", False)),
         rolled_back=value.get("rolled_back"),
-        message=value.get("message"),
+        # Through the text choke point for the same reason the failure row's
+        # message is: this value IS the documented `first_error` on the
+        # no-failure-row path, and a container there printed as a repr.
+        message=_text_value(value, "message"),
         proto_residue=bool(value.get("prototype_user_type_residue")),
         unusable=bool(unreadable),
         # The public reference quotes the no-rows phrase verbatim as the
         # meaning "this op reports through its own counters instead", so an
         # unreadable ROW must not borrow it: a reader sent to look for a
         # missing `results[]` would find one, populated, and stop.
-        unmeasured_cause=("a results[] row could not be read" if rows_unreadable
+        unmeasured_cause=("this op's results[] could not be read"
+                          if rows_unreadable
+                          else "an op row's status could not be read" if unreadable
                           else "this op reported no results[] rows"),
     )
 
@@ -4608,12 +4675,19 @@ def _go_rename_summary(value: Any) -> Any:
         changed = 0
         source = None
     # The rows and the counter answer the SAME question on this op -- its
-    # `results[]` holds only the FAILURE rows -- so they may not disagree: a
-    # `go_failed_count` of 0 beside a row that names a failure is not a
-    # measurement of this run, whichever of the two is wrong. Refusing is the
-    # only answer available here, because inventing a count from the rows would
-    # be the mirror fabrication.
-    rows_contradict = bool(row_failures) and not failed
+    # `results[]` holds only the FAILURE rows -- so they may not disagree in
+    # the direction where the rows are the harder evidence: a counter that
+    # names FEWER failures than the payload actually carries rows for is not a
+    # measurement of this run, whichever of the two is wrong, and a zero
+    # counter beside a failure row is only the loudest case of it. Refusing is
+    # the only answer available here, because inventing a count from the rows
+    # would be the mirror fabrication.
+    #
+    # The other direction is legitimate and stays measured: `results[]` is a
+    # CAPPED failure listing (the text view prints 50 and says "... and N
+    # more"), so a counter LARGER than the rows in hand is the count the rows
+    # were sampled from, not a contradiction.
+    rows_contradict = len(row_failures) > failed
     measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
 
@@ -4663,7 +4737,7 @@ def _go_rename_summary(value: Any) -> Any:
         committed=committed,
         preview=preview,
         rolled_back=rolled_back,
-        message=value.get("message"),
+        message=_text_value(value, "message"),
         default_error="go rename failed",
     )
 
