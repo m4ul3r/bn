@@ -978,6 +978,26 @@ _GREEN_ON_BASE_BY_DESIGN = {
         "the measurement below is of git and a child process, not of the "
         "module, so it holds at either commit -- and it was the SEVENTH green "
         "test the six-name declaration did not name",
+    "test_no_renderer_mutates_the_payload_it_was_handed":
+        "the no-mutate invariant already held at base; red if a renderer "
+        "appends to, or edits an element of, the caller's own list. It used to "
+        "read as RED on base for a HARNESS reason and not a coverage one -- the "
+        "probe wrapped a helper in `formatters._discloses`, which base does not "
+        "define, so the population raised AttributeError before the invariant "
+        "was ever checked. Keying the wrap on `_boundary_free_helpers` fixed "
+        "that by accident and correctly: base decorates nothing, so nothing is "
+        "wrapped there and the invariant is now genuinely MEASURED on base",
+    "test_every_NESTED_population_context_actually_reaches_the_read_it_was_recorded_for":
+        "asserts the nested population's own promise about itself, so it holds "
+        "at either commit -- and for the same reason as the entry above it was "
+        "previously red on base only because the probe could not build a "
+        "population there at all; red if a recorded leaf stops reaching its read",
+    "test_no_consumer_reaches_the_formatters_module_by_a_computed_name":
+        "its subject is the CALLERS, not this module, so it holds at either "
+        "commit -- base's command modules resolve no formatters symbol by a "
+        "computed name either. It is the executable form of a docstring caveat "
+        "two rounds left as prose; red the moment a `getattr(formatters, name)` "
+        "with a non-literal name enters the package",
 }
 
 # The PR's base commit: what "green on base" is measured AGAINST. A parameter of
@@ -1949,23 +1969,34 @@ def _formatters_identities():
 
 @functools.lru_cache(maxsize=1)
 def _formatters_identity_inventory():
-    """Every formatters symbol BOUND anywhere in the package, found by `id()`.
+    """Every formatters symbol a package module BINDS AT MODULE LEVEL, found by
+    `id()`.
 
     THE answer to "is this inventory a spelling rule", and the reason it is not
     widened a sixth time. Rounds 8-13 each closed one more spelling -- a bare
     name, a module attribute, a non-`_render` prefix, a directory glob, a
     keyword other than `*_renderer=` -- and each widening exposed live payload
-    consumers the previous one had certified. `id()` does not care how a binding
-    was written: a symbol re-exported through a shim (`from .shim import
-    _render_x`), one bound by `getattr(formatters, name)`, one renamed on the way
-    in, and one reached through an alias of an alias are all the SAME OBJECT.
+    consumers the previous one had certified. `id()` does not care how the
+    binding was WRITTEN: a symbol re-exported through a shim (`from .shim import
+    _render_x`), one renamed on the way in, one bound by a module-level
+    `getattr(formatters, "_render_x")`, and one reached through an alias of an
+    alias are all the SAME OBJECT in `vars(module)`.
 
     The live case this found: `bn.cli` re-exports `_format_operation_result` so
     tests and scripts can monkeypatch it, and then never mentions the name
     again. No AST reference walk can see that -- there is no reference -- so a
     payload consumer that renders every mutation's op rows sat in no inventory,
     no population and no exclusion, and its malformed `defined_types` rendered
-    byte-identically to the field being absent."""
+    byte-identically to the field being absent.
+
+    What `id()` CANNOT see, stated rather than implied, because the previous
+    version of this docstring claimed the opposite and a reviewer had to prove
+    it: a symbol resolved INSIDE A FUNCTION by a computed name
+    (`getattr(formatters, name)`) is bound to no module global, so it is in
+    neither half of the inventory. That is not left as a caveat --
+    `test_no_consumer_reaches_the_formatters_module_by_a_computed_name` asserts
+    the package contains no such spelling, so the gap cannot open quietly. An
+    unexecutable promise is exactly what this file spent five rounds deleting."""
     from bn import formatters
 
     owned = _formatters_identities()
@@ -2019,12 +2050,21 @@ def _formatters_bindings(tree, module=None):
 
 
 def _formatters_refs(node, symbols, modules):
-    """Every formatters symbol REFERENCED anywhere under `node`, by either
-    spelling: a bare name bound from the module, or an attribute taken off the
-    module itself (`_fmt._x`, `bn.formatters._x`). An attribute is only counted
-    when the live module really has it, so `_fmt.json` is not mistaken for an
-    entry point. A bare name resolves through `symbols` to its CANONICAL name,
-    so a renamed import is not reported under the local spelling."""
+    """Every formatters symbol REFERENCED anywhere under `node`, by any of three
+    spellings: a bare name bound from the module, an attribute taken off the
+    module itself (`_fmt._x`, `bn.formatters._x`), or a `getattr` on the module
+    with a LITERAL name. An attribute is only counted when the live module
+    really has it, so `_fmt.json` is not mistaken for an entry point. A bare
+    name resolves through `symbols` to its CANONICAL name, so a renamed import
+    is not reported under the local spelling.
+
+    The `getattr` spelling is here because the docstring of
+    `_formatters_identity_inventory` used to claim `id()` covered it and it does
+    not: a module-level `getattr` binding is in `vars(module)` and so IS seen by
+    identity, but one inside a function is bound to nothing. A literal name is
+    readable from the AST, so it is read here; the computed form is asserted not
+    to exist at all, by
+    `test_no_consumer_reaches_the_formatters_module_by_a_computed_name`."""
     import ast
 
     from bn import formatters
@@ -2040,7 +2080,143 @@ def _formatters_refs(node, symbols, modules):
                         and base.attr == "formatters")):
                 if hasattr(formatters, inner.attr):
                     found.add(inner.attr)
+        elif (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+                and inner.func.id == "getattr" and len(inner.args) >= 2
+                and _is_formatters_module(inner.args[0], modules)
+                and isinstance(inner.args[1], ast.Constant)
+                and isinstance(inner.args[1].value, str)
+                and hasattr(formatters, inner.args[1].value)):
+            found.add(inner.args[1].value)
     return found
+
+
+def _is_formatters_module(node, modules):
+    """Is this expression the formatters MODULE, by either spelling a package
+    module can bind it under?"""
+    import ast
+
+    return ((isinstance(node, ast.Name) and node.id in modules)
+            or (isinstance(node, ast.Attribute) and node.attr == "formatters"))
+
+
+def _computed_formatters_getattrs(tree, modules):
+    """Line numbers of every `getattr(<the formatters module>, <not a literal>)`
+    under `tree`. The detector, separated from the walk of the package so the
+    test below can prove it fires on a source that contains one."""
+    import ast
+
+    return [node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr" and len(node.args) >= 2
+            and _is_formatters_module(node.args[0], modules)
+            and not (isinstance(node.args[1], ast.Constant)
+                     and isinstance(node.args[1].value, str))]
+
+
+# Every package module that binds the formatters MODULE OBJECT, as opposed to
+# importing symbols out of it. MEASURED, and it is not empty: the package's own
+# `__init__` carries it, because importing a submodule sets it as an attribute
+# of the package whether anyone wrote that binding or not. Every command module
+# spells `from ..formatters import (...)` instead, so the object is in scope
+# nowhere else.
+#
+# Declared because this set is the entire surface on which the inventory's one
+# real blind spot can open -- a `getattr(formatters, name)` with a runtime name
+# can only be written where that object is in scope. If another module starts
+# binding it, the test below fails, the name goes in here, and the
+# computed-name rule starts applying to it.
+_MODULES_BINDING_THE_FORMATTERS_MODULE = frozenset({"__init__.py"})
+
+
+def test_no_consumer_reaches_the_formatters_module_by_a_computed_name():
+    """The one gap `id()` cannot close, made executable instead of caveated.
+
+    A symbol resolved inside a function by a COMPUTED name -- `getattr(
+    formatters, name)` off a table, a prefix, or a subcommand string -- is bound
+    to no module global, so the identity inventory cannot see it and the AST
+    reference walk cannot read it. It would be a live payload consumer in
+    NEITHER half of the inventory, and inventory membership is exactly what
+    decides whether a helper is probed on the surface a caller receives.
+
+    Round 14 left this as a docstring caveat and round 15 left it as a minor.
+    A caveat does not expire when it stops being true, so it is measured here in
+    two halves, because the first half alone would be vacuous today:
+
+    * WHERE it could be written. No package module binds the formatters module
+      object at all, so today there is no expression to `getattr` on. That is
+      not a rule imposed on the codebase -- it is a measurement, declared, and
+      the failure asks you to update the declaration.
+    * THAT THE DETECTOR WORKS. Asserted against synthetic sources rather than
+      against the package, for the reason every guard in this file is: an
+      emptiness claim over a detector nobody exercised is free. This is the same
+      discipline as the coercion guard's own probe modules."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    # Half two first, so a broken detector fails HERE rather than silently
+    # certifying the package below.
+    caught = _computed_formatters_getattrs(
+        *_probe_tree_and_modules('from . import formatters\n'
+                                 'def use(name):\n'
+                                 '    return formatters.getattr_probe\n'
+                                 'def reach(name):\n'
+                                 '    return getattr(formatters, name)\n'))
+    assert caught == [5], (
+        "the computed-name detector no longer fires on a module that binds the "
+        f"formatters module and getattrs it by a runtime name: {caught}")
+    missed = _computed_formatters_getattrs(
+        *_probe_tree_and_modules('import bn.formatters as F\n'
+                                 'def fine():\n'
+                                 '    return getattr(F, "_render_fallback_text")\n'))
+    assert missed == [], (
+        "the detector fires on a LITERAL name, which is readable from the AST "
+        f"and counted by `_formatters_refs`: {missed}")
+    aliased = _computed_formatters_getattrs(
+        *_probe_tree_and_modules('import bn.formatters as F\n'
+                                 'def reach(name):\n'
+                                 '    return getattr(F, name)\n'))
+    assert aliased == [3], (
+        f"the detector misses the `import ... as` spelling of the module: {aliased}")
+
+    # Half one: the package itself.
+    module = pathlib.Path(formatters.__file__).resolve()
+    binding, computed = set(), []
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue
+        tree = ast.parse(path.read_text())
+        _symbols, modules = _formatters_bindings(
+            tree, _package_modules().get(path.resolve()))
+        if not modules:
+            continue
+        binding.add(path.name)
+        computed += [f"{path.name}:{line}"
+                     for line in _computed_formatters_getattrs(tree, modules)]
+    assert binding == set(_MODULES_BINDING_THE_FORMATTERS_MODULE), (
+        f"{sorted(binding)} binds the formatters MODULE OBJECT and "
+        f"{sorted(_MODULES_BINDING_THE_FORMATTERS_MODULE)} is declared. That is "
+        "the surface a computed-name lookup can be written on, so put the new "
+        "one in _MODULES_BINDING_THE_FORMATTERS_MODULE -- the rule below then "
+        "applies to it.")
+    assert not computed, (
+        f"{computed} resolves a formatters symbol by a name computed at "
+        "runtime, which puts a live payload consumer in NEITHER half of the "
+        "inventory: `id()` sees only module-level bindings and the AST walk can "
+        "only read a literal. Bind it at module level, spell the name as a "
+        "literal, or add the resolved names to the inventory explicitly -- do "
+        "not leave it to a docstring.")
+
+
+def _probe_tree_and_modules(source):
+    """Parse a synthetic consumer module and resolve which of its names hold the
+    formatters MODULE, using the same binding walk the package walk uses."""
+    import ast
+
+    tree = ast.parse(source)
+    _symbols, modules = _formatters_bindings(tree)
+    return tree, modules
 
 
 @functools.lru_cache(maxsize=1)
@@ -2187,14 +2363,32 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
     # caller actually gets.
     bare = {label.split("(")[0] for label, probe in _probe_renderers()
             if getattr(probe, "__wrapped__", None) is None}
-    wrapped = sorted(name for name in installed
-                     if name not in bare and name not in _PROBE_EXCLUSIONS
-                     and name not in _COMPOSED_ENTRY_POINTS
-                     and not hasattr(getattr(formatters, name, None), "__wrapped__"))
-    assert not wrapped, (
-        f"{wrapped} is in the inventory but probed under a boundary the module "
-        "does not install, so a skew it cannot disclose on its own surface "
-        "reads as disclosed here. Probe it bare and fix the renderer.")
+    wrapped = {label.split("(")[0] for label, probe in _probe_renderers()
+               if getattr(probe, "__wrapped__", None) is not None}
+    # THE property, and it is no longer asked of the set that decides it. Round
+    # 15 compared `wrapped` against `installed` -- the very set the wrap rule
+    # keys off -- so the answer was empty by construction while 19 helpers were
+    # still probed under a manufactured boundary, two of them reachable from a
+    # live entry point through nothing but undecorated callers. The population
+    # comes from the module's call graph now (`_boundary_free_helpers`).
+    exposed = set(_boundary_free_helpers())
+    manufactured = sorted(wrapped & exposed)
+    assert not manufactured, (
+        f"{manufactured} is probed under a boundary the module does not install "
+        "on any path that reaches it, so a skew it cannot disclose on its own "
+        "surface reads as disclosed here. Probe it bare and fix the renderer.")
+    # Anti-vacuity, because the assertion above is an emptiness claim and an
+    # emptiness claim over a broken walk is free. These two are the names the
+    # walk found already probed on a manufactured boundary: a per-row target
+    # choice reached from the list renderer the CLI calls bare, and the
+    # raw-payload dumper reached from four undecorated entry points. If the walk
+    # silently stops returning them, this goes red instead.
+    assert {"_render_target_choice", "_render_fallback_text"} <= exposed, (
+        "the boundary-free walk no longer reaches the two helpers it was "
+        f"written for, so its emptiness claim above proves nothing: {sorted(exposed)}")
+    assert {"_render_target_choice", "_render_fallback_text"} <= bare, (
+        "a helper with a boundary-free production path must be probed on that "
+        "surface, which is the whole point of the assertion above")
     # A transform's output REPLACES the payload, so no downstream renderer can
     # re-read what it absorbed: it must be COMPOSED, and it may never be waved
     # through as an exclusion. Both halves are derived from the CLI's AST, so a
@@ -2339,8 +2533,16 @@ def _probe_renderers():
             # or it measures the harness instead of the code. Which side a name
             # falls on is asserted in
             # `test_every_renderer_the_cli_installs_is_in_the_population`.
-            out.append((label, call if hasattr(fn, "__wrapped__")
-                        or name in _cli_referenced_formatters()
+            # Wrapped only when NO production path reaches this helper without
+            # crossing a boundary (`_boundary_free_helpers`). Keying it on
+            # inventory membership was round 15's residue: it made the assertion
+            # that checks it a tautology, and it left two helpers the CLI reaches
+            # through undecorated callers probed under a disclosure production
+            # never installs.
+            out.append((label, call
+                        if (hasattr(fn, "__wrapped__")
+                            or name in _cli_referenced_formatters()
+                            or name in _boundary_free_helpers())
                         else formatters._discloses(call)))
     # The composed entry points, appended LAST and never wrapped: production
     # does not wrap them either -- the paired renderer carries its own boundary,
@@ -2509,7 +2711,12 @@ _PROBE_ELEMENT = {"name": "probe", "address": "0x1", "kind": "code", "symbol": "
 # Keyed by the observed kind; `None` (no container use observed) gets a plain
 # string, so filling a renderer's OTHER keys does not shove a container into a
 # scalar field and send it down a branch it would never take in production.
-_PROBE_WELL_FORMED = {"list": [_PROBE_ELEMENT], "dict": dict(_PROBE_ELEMENT), None: "probe"}
+# The list filler carries TWO elements for the cardinality reason `_payload_for`
+# states: a one-element filler cannot open a branch gated on a SECOND row
+# (`len(rows) > 1`, a "... and N more" tail, a separator), so a read behind one
+# was never discovered at all.
+_PROBE_WELL_FORMED = {"list": [_PROBE_ELEMENT, _PROBE_ELEMENT],
+                      "dict": dict(_PROBE_ELEMENT), None: "probe"}
 
 
 def _render_or_exception(render, payload):
@@ -2517,6 +2724,67 @@ def _render_or_exception(render, payload):
         return render(payload)
     except Exception as exc:                   # noqa: BLE001 - the sweep's subject
         return exc
+
+
+# Four values that differ in TYPE and in TRUTH, so a position gated on either
+# can be told apart. Deliberately all well-formed-ish: the question here is
+# whether the read reaches the output at all, not whether it degrades.
+_DEPENDENCE_PROBES = ("probe-a", "probe-b", {"a": 1}, 0)
+
+
+def _value_reaches_the_output(render, build):
+    """Does the value at this position reach the RENDER, or is it merely ASKED?
+
+    "The key was asked here" is a weaker property than the sweeps need; "a
+    different value here renders differently" is the one they need, and it is a
+    measurement rather than a guess.
+
+    An exception counts as a rendering, because a raise is exactly the observable
+    the raise sweeps hunt: a context in which a wrong shape can raise is a
+    context in which the read is live."""
+    seen = set()
+    for value in _DEPENDENCE_PROBES:
+        out = _render_or_exception(render, build(copy.deepcopy(value)))
+        seen.add(f"{type(out).__name__}:{out}" if isinstance(out, BaseException)
+                 else str(out))
+        if len(seen) > 1:
+            return True
+    return False
+
+
+def _most_failable_context(render, contexts, reaches, with_value):
+    """Of the contexts in which this key is READ, the one a sweep can FAIL in.
+
+    Taking the FIRST such context -- the round-15 ladder -- is the defect this
+    replaces, and it was still live in two different ways.
+
+    * The first context may read the key and do nothing with the answer, so no
+      value placed there can change any observable. Measured by
+      `_value_reaches_the_output`, which ranks above everything else here.
+    * The first context may read the key and USE it only in a shape the sweeps
+      cannot make fail. `possible_values.get("type")` renders into the summary
+      in the bare leaf -- value-dependent, genuinely read -- but the `summary +=`
+      that a wrong-shaped type kills only runs when a `value` sits BESIDE it, so
+      reverting the coercion that fixed it left 924 tests green with four live
+      TypeErrors restored. The leaf has to be the SIBLING-COMPLETE one, when the
+      read survives there.
+
+    So: among the contexts the key is actually read in, prefer a value-dependent
+    one, and among those the RICHEST -- the most siblings present. Richness is a
+    proxy for "the most of the renderer's own branches are open", and it is
+    bounded by reachability rather than by a ladder position: a context that
+    hides the read (a retained alias only consulted when the canonical key is
+    ABSENT, an `elif` after a sibling gate) never enters `reached` at all, which
+    is why filling siblings cannot repeat round 12's classification defect here.
+    Ties keep the caller's order, so the least-perturbing of two equals wins."""
+    reached = [ctx for ctx in contexts if reaches(ctx)]
+    if not reached:
+        return None
+    ranked = sorted(enumerate(reached), key=lambda pair: (-len(pair[1]), pair[0]))
+    for _rank, ctx in ranked:
+        if _value_reaches_the_output(render, lambda v, _c=ctx: with_value(_c, v)):
+            return ctx
+    return ranked[0][1]
 
 
 @functools.lru_cache(maxsize=1)
@@ -2721,6 +2989,74 @@ def _module_reach():
     return reach
 
 
+_BOUNDARY_DECORATORS = ("_discloses", "_discloses_in_summary")
+
+
+@functools.lru_cache(maxsize=1)
+def _boundary_free_helpers():
+    """Every module function a live ENTRY POINT reaches without crossing a
+    disclosure boundary.
+
+    THE question `_probe_renderers` has to answer before it may wrap a helper in
+    a manufactured `@_discloses`, and the question round 15's assertion could
+    not ask. That assertion compared the wrapped probes against the INVENTORY,
+    which is the same set the wrap rule keys off -- so it was satisfied by
+    construction and reported zero over the 19 helpers that are still wrapped.
+    A guard whose population comes from the thing it guards cannot fail; this
+    file's own rule, applied one level up from where it was last applied.
+
+    The population here comes from the MODULE's call graph instead. A helper the
+    package can reach from an entry point through only undecorated functions has
+    no boundary in production, so a skew it records drains nowhere and wrapping
+    it in the probe manufactures a disclosure the user never gets -- exactly the
+    class round 14 deleted for `_format_operation_result`, which this found
+    surviving for two more helpers. Such a helper must be probed BARE and fixed.
+
+    Edges are `_module_reach`'s -- any NAME reference, so a callback handed to a
+    paged renderer counts as reachable -- and the walk stops AT a boundary: a
+    decorated function drains what everything under it recorded, so nothing
+    below it is boundary-free through that path."""
+    import ast
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    funcs = {node.name: node for node in ast.walk(tree)
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def is_boundary(name):
+        node = funcs.get(name)
+        if node is None:
+            return False
+        for deco in node.decorator_list:
+            target = deco.func if isinstance(deco, ast.Call) else deco
+            spelling = getattr(target, "attr", getattr(target, "id", None))
+            if spelling in _BOUNDARY_DECORATORS:
+                return True
+        return False
+
+    edges: dict[str, set[str]] = {name: set() for name in funcs}
+    for name, fn in funcs.items():
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and node.id in funcs and node.id != name:
+                edges[name].add(node.id)
+
+    exposed: set[str] = set()
+    for entry in sorted(_cli_referenced_formatters()):
+        if entry not in funcs or is_boundary(entry):
+            continue
+        seen, stack = {entry}, [entry]
+        while stack:
+            for callee in sorted(edges[stack.pop()]):
+                if callee in seen:
+                    continue
+                seen.add(callee)
+                exposed.add(callee)
+                if not is_boundary(callee):
+                    stack.append(callee)
+    return frozenset(exposed)
+
+
 def _comparison_literals(fn_name):
     """The fillers for one renderer: the constants it compares against, plus the
     constants of every function it reaches. Scoping this to the renderer's OWN
@@ -2852,7 +3188,6 @@ def _runtime_population():
                                    **{g: v for g, v in gate.items() if g != key}}
                                   for gate in _gated_contexts(keys, keyed))]
                     observed = None
-                    read_in = None
                     for ctx in contexts:
                         for kind in ("list", "dict"):
                             probe = _watched(kind)
@@ -2862,31 +3197,33 @@ def _runtime_population():
                                 break
                         if observed:
                             break
-                        if read_in is None:
-                            # Not a container position in this context -- but was
-                            # the key READ here at all? Falling straight back to
-                            # the BARE payload for every unclassified key was a
-                            # live bypass and not a detail: a read behind a
-                            # value-gated branch (`kind == "go_rename"`, and all
-                            # six of that op's counters behind it) happens in
-                            # exactly one of these contexts and in none of the
-                            # others, so the sweeps below swept a branch they
-                            # never entered and the only tripwire left for a read
-                            # added there was a re-baselineable size counter.
-                            # The context has to be one the read actually
-                            # happens in, which is what the docstring above
-                            # claims and what this makes true.
-                            asked: set[str] = set()
-                            _render_or_exception(
-                                render,
-                                _KeyProbe({**copy.deepcopy(ctx), key: "probe"}, asked))
-                            if key in asked:
-                                read_in = ctx
                     if observed:
                         records[key] = observed
-                    else:
-                        records[key] = (contexts[0] if read_in is None else read_in,
-                                        None)
+                        continue
+                    # Not a container position anywhere -- so WHERE is this key
+                    # read? Falling straight back to the BARE payload for every
+                    # unclassified key was a live bypass and not a detail: a read
+                    # behind a value-gated branch (`kind == "go_rename"`, and all
+                    # six of that op's counters behind it) happens in exactly one
+                    # of these contexts and in none of the others, so the sweeps
+                    # below swept a branch they never entered and the only
+                    # tripwire left for a read added there was a re-baselineable
+                    # size counter.
+                    #
+                    # And the FIRST context that reads it is not good enough
+                    # either -- that was round 15's residue. See
+                    # `_most_failable_context`.
+                    def _reaches(ctx, _key=key, _render=render):
+                        asked: set[str] = set()
+                        _render_or_exception(
+                            _render,
+                            _KeyProbe({**copy.deepcopy(ctx), _key: "probe"}, asked))
+                        return _key in asked
+
+                    chosen = _most_failable_context(
+                        render, contexts, _reaches,
+                        lambda ctx, v, _key=key: {**copy.deepcopy(ctx), _key: v})
+                    records[key] = (contexts[0] if chosen is None else chosen, None)
                 kinds = {key: rec[1] for key, rec in records.items()}
             for key in keys:
                 ctx, kind = records[key]
@@ -2897,7 +3234,14 @@ def _runtime_population():
 
 
 def _watched(kind):
-    return (_WatchedList([dict(_PROBE_ELEMENT)]) if kind == "list"
+    """The container placed at a candidate position to see whether it is WALKED.
+
+    TWO elements, for the reason `_payload_for` gives: a one-element list makes
+    every element both the first and the last, so a read reached only at a
+    non-terminal or non-initial position was discovered by nothing and entered
+    no population. Two identical elements put the probe on both sides of every
+    position gate in a single render."""
+    return (_WatchedList([dict(_PROBE_ELEMENT), dict(_PROBE_ELEMENT)]) if kind == "list"
             else _WatchedDict(_PROBE_ELEMENT))
 
 
@@ -2918,19 +3262,35 @@ def _payload_for(ctx, path, leaf):
     """The renderer's payload with `leaf` placed at the end of `path`.
 
     A path step is `(key, kind)` or `(key, kind, siblings)`: a list-kind step
-    wraps the node as the single ELEMENT of the list at that key, a dict-kind
-    step puts the node AT the key, because that is what the renderer walks in
-    each case. `siblings` is the context the node CARRYING that key was observed
-    with, so an intermediate element is rebuilt as it was SEEN rather than as a
-    one-key dict -- a read gated on a sibling of an intermediate key is
-    otherwise never reached at the level below it. The first step needs none:
-    the node carrying it is the renderer's own payload, which is `ctx`."""
+    puts the node in the list at that key, a dict-kind step puts the node AT the
+    key, because that is what the renderer walks in each case. `siblings` is the
+    context the node CARRYING that key was observed with, so an intermediate
+    element is rebuilt as it was SEEN rather than as a one-key dict -- a read
+    gated on a sibling of an intermediate key is otherwise never reached at the
+    level below it. The first step needs none: the node carrying it is the
+    renderer's own payload, which is `ctx`.
+
+    A list step carries the node TWICE, and that is not a detail. Every
+    population and every sweep in this file used to build lists of cardinality
+    exactly ONE, so an element was always simultaneously the first and the last
+    and a read gated on POSITION -- `if i != last`, `if idx`, `rows[1:]`, a
+    separator between elements, `len(rows) > 1` -- was outside all six sweeps.
+    That is the eighth axis: not depth, not siblings, CARDINALITY. Two entries
+    make the node non-last at index 0 and non-first at index 1, so both halves
+    of every position gate are entered by the node under test in one render.
+
+    The SAME object is placed at both positions rather than a copy, because the
+    leaf may be a recording probe whose `hits`/`asked` are read back by identity
+    afterwards -- a deep copy at the second position would silently drop a read
+    that only happens at the last element, which is the very thing this covers.
+    A renderer that mutates it is caught by
+    `test_no_renderer_mutates_the_payload_it_was_handed`."""
     node = leaf
     for step in reversed(path):
         key, kind = step[0], step[1]
         siblings = step[2] if len(step) > 2 else {}
         node = {**copy.deepcopy(siblings),
-                key: [node] if kind == "list" else node}
+                key: [node, node] if kind == "list" else node}
     return {**copy.deepcopy(ctx), **node}
 
 
@@ -3061,7 +3421,6 @@ def _nested_population():
                             # is a measurement.
                             first_leaf.get(nkey, bare)]
                         observed = None
-                        read_in = None
                         for leaf_ctx in leaves:
                             for kind in ("list", "dict"):
                                 probe = _watched(kind)
@@ -3072,15 +3431,29 @@ def _nested_population():
                                     break
                             if observed:
                                 break
-                            if read_in is None:
-                                asked: set[str] = set()
-                                _render_or_exception(render, _payload_for(
-                                    ctx, path,
-                                    _KeyProbe({**copy.deepcopy(leaf_ctx), nkey: "probe"}, asked)))
-                                if nkey in asked:
-                                    read_in = leaf_ctx
-                        records[nkey] = observed if observed else (
-                            leaves[0] if read_in is None else read_in, None)
+                        if observed:
+                            records[nkey] = observed
+                            continue
+                        # Same question as at top level, and the same answer:
+                        # the first leaf that merely ASKS is not a leaf the
+                        # sweeps can fail in. See `_most_failable_context` --
+                        # `possible_values.get("type")` is the case it was
+                        # written for.
+                        def _reaches(leaf_ctx, _nkey=nkey, _render=render,
+                                     _ctx=ctx, _path=path):
+                            asked: set[str] = set()
+                            _render_or_exception(_render, _payload_for(
+                                _ctx, _path,
+                                _KeyProbe({**copy.deepcopy(leaf_ctx), _nkey: "probe"},
+                                          asked)))
+                            return _nkey in asked
+
+                        chosen = _most_failable_context(
+                            render, leaves, _reaches,
+                            lambda leaf_ctx, v, _nkey=nkey, _ctx=ctx, _path=path:
+                                _payload_for(_ctx, _path,
+                                             {**copy.deepcopy(leaf_ctx), _nkey: v}))
+                        records[nkey] = (leaves[0] if chosen is None else chosen, None)
                     leaf_kinds = {k: rec[1] for k, rec in records.items()}
                 for nkey in sorted(seen):
                     leaf_ctx, kind = records[nkey]
@@ -3134,10 +3507,19 @@ def test_the_runtime_population_is_exactly_this_big():
     # COUNT of pairs whose recorded context is not the bare payload. A silent
     # regression to `{}` for every unclassified read -- which is what round 12
     # blocked on -- moves this number, so it cannot happen quietly again.
+    #
+    # 156 -> 390 when the recorded context stopped being "the FIRST context in
+    # which the key is ASKED" and became "the context a sweep can FAIL in"
+    # (`_most_failable_context`): value-dependent before richest, both measured.
+    # Fourteen pairs were being swept in a payload that read them and did
+    # nothing with the answer -- one of those contexts was hiding a live
+    # `int(value.get("offset") or 0)` that raised on a string and cost a whole
+    # evidence card -- and 220 more were swept with their siblings absent, which
+    # is the leaf-level form of the same defect.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 156, (
+    assert len(situated) == 390, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 156. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 390. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -3566,8 +3948,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
-    Base, swept the same way over its own population, raises 182 times across
-    69 (renderer, key) positions in 4544 renders; this commit raises 0 in 4640.
+    Base, swept the same way over its own population, raises 166 times across
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4640.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -3667,7 +4049,7 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
     Replayed against the base module the way the top-level differential is
     (base's own nested population: 1262 keys, 201 of them containers, because
     the descent is derived from the module it runs on): base absorbs 1012 of its
-    1206 nested cases at 190 of those 201 positions; this commit absorbs 0 of
+    1206 nested cases at 132 of those 201 positions; this commit absorbs 0 of
     1308."""
     from bn import formatters
 
@@ -3711,7 +4093,7 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
     Kind-free because the crash does not need a container: a sampled string
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
     spec, an unhashable `kind` used as a grouping key. Base, swept over its own
-    nested population the same way, raises 306 times at 99 nested positions in
+    nested population the same way, raises 320 times at 86 nested positions in
     10096 renders; this commit raises 0 in 10944."""
     swept, raised = 0, []
     for fn_name, render, path, key, _kind, ctx, leaf in _nested_population():
@@ -5031,6 +5413,165 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
             f"definition={bogus!r} left no note naming the field: {out!r}")
 
 
+# Every `_text_value` read in the module, and the test below runs each one.
+# A scalar read has no enumerated differential the way a container read does,
+# and it CANNOT have one on the same property: a present-but-wrong-shaped
+# scalar rendering like an absent one is usually correct -- a `.get(k, "")`
+# interpolated into a line legitimately renders nothing -- and the measurement
+# says so, 534 of the 1150 unclassified nested positions absorb by design. So
+# the choke point is where the promise lives, and this table is the population
+# that keeps it honest: a new `_text_value` site with no case here fails.
+_TEXT_VALUE_SITES = {("_set_prototype_detail", "prototype")}
+
+
+def test_a_wrong_shaped_text_field_never_renders_as_if_nothing_was_observed():
+    """The leaf under the container round 15 said it had closed.
+
+    `set_prototype`'s "what landed" line IS the renderer's subject: an agent
+    reads it to confirm the prototype it set is live. `_field_dict(item,
+    "observed")` discloses an unusable OBSERVATION, but the `prototype` INSIDE a
+    well-formed observation was read inline, so a non-string one dropped the
+    line and the row came out byte-identical to an op that reported no
+    observation at all -- the #619 defect exactly, one level in, and undisclosed.
+
+    Three states, as everywhere else in this module. A usable string renders the
+    line; ABSENT, an explicit null and an empty string are "nothing was
+    observed" and render as such WITHOUT a note (over-disclosing would destroy
+    the signal); anything present that is not a string is a skew that must be
+    both visibly different and named."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    sites = set()
+    tree = ast.parse(inspect.getsource(formatters))
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "_text_value"):
+                for arg in node.args[1:]:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        sites.add((fn.name, arg.value))
+    assert sites == _TEXT_VALUE_SITES, (
+        f"the module reads {sorted(sites)} through the text choke point and this "
+        f"test covers {sorted(_TEXT_VALUE_SITES)}. A scalar read has no "
+        "enumerated differential, so an uncovered site is a promise nothing "
+        "executes -- give it a case here.")
+
+    def row(observed):
+        item = {"op": "set_prototype", "status": "verified",
+                "function": "fn", "address": "0x1"}
+        if observed is not None:
+            item["observed"] = observed
+        return formatters._render_mutation_text({"results": [item]})
+
+    nothing_observed = row(None)
+    assert "int fn()" in row({"prototype": "int fn()"}), (
+        "a usable observed prototype must render the what-landed line")
+    # The mirror: the three shapes that really do claim nothing.
+    for quiet in ({}, {"prototype": None}, {"prototype": ""}):
+        out = row(quiet)
+        assert out == nothing_observed, (
+            f"observed={quiet!r} claims no prototype and must render exactly "
+            f"like an op that reported no observation: {out!r}")
+        assert "malformed" not in out, (
+            f"observed={quiet!r} is not a skew and must not disclose: {out!r}")
+    for bogus in (7, 0, True, ["int fn()"], {"decl": "int fn()"}, (), 1.5):
+        out = row({"prototype": bogus})
+        assert out != nothing_observed, (
+            f"observed carrying prototype={bogus!r} is an observation the "
+            "renderer could not read, and it rendered byte-identically to an op "
+            f"that observed nothing: {out!r}")
+        assert _disclosed(out, "prototype"), (
+            f"prototype={bogus!r} was dropped with no note naming it: {out!r}")
+
+
+def test_an_op_row_never_states_a_count_the_payload_did_not():
+    """#683's harm, stated as the property instead of as one row's wording, and
+    the assertion three rounds of this PR shipped a fix without.
+
+    A count is the one thing in these rows a CONTROL LOOP reads: "0 types
+    defined" is "nothing landed, do not save", and that reading is what #683
+    discarded a committed rename batch to. So a numeral in an op row must be
+    traceable to the payload -- either the payload STATED the count, or it
+    handed over a readable listing, which is a measurement even when it is
+    empty ("we looked, and defined none"). A count derived from a field the
+    renderer could not READ is a fabrication, and disclosing it beside the
+    number is not enough, because the note is not what the loop reads.
+
+    Enumerated over every op the row handler names -- harvested from the
+    module's own AST, so an op that starts stating a count arrives covered --
+    crossed with every malformed shape at every key those rows read. Before
+    this, reverting the refusal left all 198 tests in this file and 827 across
+    the types/mutation/core files green while the fabricated zero came back."""
+    import ast
+    import inspect
+    import re
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    ops: set[str] = set()
+    for fn in ast.walk(tree):
+        if not (isinstance(fn, ast.FunctionDef) and fn.name == "_operation_row_text"):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Compare):
+                continue
+            for cmp in node.comparators:
+                if isinstance(cmp, ast.Constant) and isinstance(cmp.value, str):
+                    ops.add(cmp.value)
+                elif isinstance(cmp, (ast.Set, ast.Tuple, ast.List)):
+                    ops.update(elt.value for elt in cmp.elts
+                               if isinstance(elt, ast.Constant)
+                               and isinstance(elt.value, str))
+    assert len(ops) == 11, (
+        f"the op row handles {len(ops)} ops, not 11: {sorted(ops)}. The count is "
+        "the size of the covered set -- an op that leaves this list is an op no "
+        "case below runs.")
+
+    digits = re.compile(r"\d+")
+    # Every key an op row reads a count or a listing out of, plus `requested`,
+    # which every row falls back through.
+    keys = ("defined_types", "count", "requested", "affected_functions", "results")
+    fabricated, checked = [], 0
+    for op in sorted(ops):
+        for key in keys:
+            for bogus in ("bad", ["bad"], {"a": 1}, 0, "", False, {}, [], True):
+                item = {"op": op, key: bogus}
+                checked += 1
+                out = formatters._format_operation_result(item)
+                # A readable container IS the measurement, empty or not, so a
+                # count beside one is the payload's own and not a fabrication.
+                if isinstance(bogus, (dict, list)) and key != "count":
+                    continue
+                stated = set()
+                for value in item.values():
+                    stated |= set(digits.findall(str(value)))
+                invented = [n for n in digits.findall(out) if n not in stated]
+                if invented:
+                    fabricated.append(
+                        f"{op} with {key}={bogus!r} rendered {out!r}, which states "
+                        f"{invented} -- a count the payload never did")
+    assert not fabricated, fabricated[:6]
+    assert checked == 495, f"the op-row count sweep ran {checked} cases, not 495"
+    # The other half, and the reason this is not a blanket "never print a
+    # number": a count the payload DID state must still be stated, or the
+    # refusal would be a silent cap on every honest row.
+    assert formatters._format_operation_result(
+        {"op": "types_declare", "defined_types": "bad", "count": 3}
+    ).startswith("types_declare 3 types"), "a stated count must still be stated"
+    assert formatters._format_operation_result(
+        {"op": "types_declare", "defined_types": {}}) == "types_declare 0 types", (
+        "a readable EMPTY listing is a measured zero and must keep rendering as one")
+    assert formatters._format_operation_result(
+        {"op": "types_declare", "defined_types": {"widget_t": "struct widget_t"}}
+    ) == "types_declare widget_t", "a readable listing must name what it defined"
+
+
 def test_no_list_ELEMENT_costs_the_whole_render():
     """The granularity at which #619 names half its defects, and the one no
     other population here varies.
@@ -5047,9 +5588,17 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     The property is the sweep's, not the differential's: an element the
     renderer cannot use may legitimately render as a placeholder or be skipped,
     but it may never RAISE where the same payload with that list absent
-    renders cleanly. Base raises 213 times at 30 of its list positions over the
-    same 1134 renders; this commit raises 0. Sizes are exact, for the reason
-    every size here is."""
+    renders cleanly. Base raises 426 times at 30 of its list positions over the
+    same 2268 renders; this commit raises 0. Sizes are exact, for the reason
+    every size here is.
+
+    Swept at TWO cardinalities, and that is the eighth axis (see
+    `_payload_for`). A one-element list makes its element both the first and
+    the last, so a read reached only at a non-terminal or non-initial position
+    -- a separator, an `if i != last` tail, a `rows[1:]` slice -- was outside
+    every sweep in this file. `[junk, junk]` puts the junk on both sides of
+    every position gate; `[junk]` is kept beside it because a single-element
+    list is a real shape too and a renderer may only mishandle THAT one."""
     raised = []
     swept = 0
     for label, render, key, kind, ctx in _runtime_population():
@@ -5057,20 +5606,22 @@ def test_no_list_ELEMENT_costs_the_whole_render():
             continue
         absent = _render_or_exception(render, copy.deepcopy(ctx))
         for element in _ELEMENT_JUNK:
-            payload = {**copy.deepcopy(ctx), key: [copy.deepcopy(element)]}
-            swept += 1
-            out = _render_or_exception(render, payload)
-            if isinstance(out, BaseException) and not isinstance(absent, BaseException):
-                raised.append(f"{label}({key}=[{element!r}]) raised "
-                              f"{type(out).__name__}: {out}")
+            for rows in ([copy.deepcopy(element)],
+                         [copy.deepcopy(element), copy.deepcopy(element)]):
+                payload = {**copy.deepcopy(ctx), key: rows}
+                swept += 1
+                out = _render_or_exception(render, payload)
+                if isinstance(out, BaseException) and not isinstance(absent, BaseException):
+                    raised.append(f"{label}({key}={rows!r}) raised "
+                                  f"{type(out).__name__}: {out}")
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 1134, (
-        f"the element sweep ran {swept} renders, not 1134 -- the size of the "
+    assert swept == 2268, (
+        f"the element sweep ran {swept} renders, not 2268 -- the size of the "
         "covered set (every list position the population discovered x every "
-        "junk element kind), so move it only with a list position you "
-        "deliberately added or removed")
+        "junk element kind x both cardinalities), so move it only with a list "
+        "position you deliberately added or removed")
 
 
 def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
@@ -5089,10 +5640,10 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
     nested list absent rendered cleanly.
 
     Same property as at top level -- an unusable element may render as a
-    placeholder or be skipped, never RAISE -- and the same junk set, shared with
-    it so the two sweeps cannot drift into covering different shapes. Base,
-    swept over its own nested population, raises 216 times at 31 positions in
-    756 renders; this commit raises 0 in 909."""
+    placeholder or be skipped, never RAISE -- and the same junk set and the same
+    two cardinalities, shared with it so the two sweeps cannot drift into
+    covering different shapes. Base, swept over its own nested population,
+    raises 432 times at 24 positions in 1512 renders; this commit raises 0 in 1818."""
     raised = []
     swept = 0
     for label, render, path, key, kind, ctx, leaf in _nested_population():
@@ -5101,22 +5652,24 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
         base = {k: v for k, v in leaf.items() if k != key}
         absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
         for element in _ELEMENT_JUNK:
-            swept += 1
-            out = _render_or_exception(
-                render, _payload_for(ctx, path, {**base, key: [copy.deepcopy(element)]}))
-            if isinstance(out, BaseException) and not isinstance(absent, BaseException):
-                where = ".".join(k for k, *_ in path)
-                raised.append(f"{label}({where}[].{key}=[{element!r}]) raised "
-                              f"{type(out).__name__}: {out}")
+            for rows in ([copy.deepcopy(element)],
+                         [copy.deepcopy(element), copy.deepcopy(element)]):
+                swept += 1
+                out = _render_or_exception(
+                    render, _payload_for(ctx, path, {**base, key: rows}))
+                if isinstance(out, BaseException) and not isinstance(absent, BaseException):
+                    where = ".".join(k for k, *_ in path)
+                    raised.append(f"{label}({where}[].{key}={rows!r}) raised "
+                                  f"{type(out).__name__}: {out}")
     assert not raised, (
         "a wrong-shaped ELEMENT of a NESTED list cost the whole render where "
         "the same payload with that list absent rendered cleanly: "
         f"{raised[:6]}")
-    assert swept == 909, (
-        f"the nested element sweep ran {swept} renders, not 909 -- the size of "
+    assert swept == 1818, (
+        f"the nested element sweep ran {swept} renders, not 1818 -- the size of "
         "the covered set (every nested list position the descent discovered x "
-        "every junk element kind), so move it only with a nested list position "
-        "you deliberately added or removed")
+        "every junk element kind x both cardinalities), so move it only with a "
+        "nested list position you deliberately added or removed")
 
 
 

@@ -220,6 +220,36 @@ def _count_field(source: Any, key: str) -> int:
         return 0
 
 
+def _text_value(source: Any, key: str) -> str | None:
+    """``source[key]`` as TEXT, recording the skew when the key is PRESENT but
+    holds something no text can be read out of.
+
+    The string sibling of ``_field_list``/``_field_dict``/``_count_field``, and
+    it exists for the same reason they do: a renderer that tests the value's
+    shape inline drops the whole line it was going to render, and the row then
+    reads byte-identically to a row where the payload said NOTHING. The live
+    case: ``set_prototype``'s verification line is the renderer's whole subject
+    -- did the prototype I set actually land -- and an ``observed`` object
+    carrying a non-string ``prototype`` rendered exactly like an op that
+    reported no observation at all, undisclosed (#619).
+
+    ``None`` means "no text here", which covers ABSENT, an explicit null and
+    PRESENT-AND-EMPTY: an empty string is a real answer, so it is not a skew and
+    a caller may legitimately render nothing for it. Anything that is present
+    and is not a string is the third state, and the enclosing boundary says so.
+    """
+    src = _as_dict(source)
+    if key not in src:
+        return None
+    raw = src[key]
+    if raw is None:
+        return None                    # an explicit null claimed nothing
+    if isinstance(raw, str):
+        return raw or None
+    _record_skew(key)
+    return None
+
+
 def _discloses(fn: Callable[..., str] | None = None, *,
                prefix: bool = False) -> Callable[..., str]:
     """Append the skew disclosure for every container this text renderer coerced
@@ -2007,7 +2037,12 @@ def _render_function_evidence_text(value: Any) -> str:
         if matched is not None and matched != total_calls:
             call_hdr += f" in window (of {total_calls} total)"
         if value.get("has_more"):
-            nxt = int(value.get("offset") or 0) + len(calls)
+            # Through the count choke point, like every other arithmetic read of
+            # a paging counter (see the paged-listing footer): `int(x or 0)`
+            # RAISED on a string and on a container, and it cost the WHOLE
+            # evidence card where the same payload with `offset` absent rendered
+            # cleanly (#619). The choke point answers 0 and discloses instead.
+            nxt = _count_field(value, "offset") + len(calls)
             call_hdr += f" -- more: rerun with --offset {nxt}"
     lines.append(call_hdr)
     if not calls:
@@ -3839,11 +3874,21 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # batch to, one op over. Disclosing it is not enough either, because the
         # count is what a control loop reads and the note is not. So the row
         # REFUSES the claim, exactly as the go-rename view does.
-        if _field_skewed("defined_types") and not _field_present(item, "count"):
+        #
+        # Three ways the payload can fail to state it, and the third was still
+        # printing the fabricated zero: an unreadable listing, an unreadable
+        # count, and NEITHER KEY AT ALL. A readable listing is a measurement
+        # even when it is empty -- we looked and defined none -- so that zero
+        # stays; an envelope carrying no listing and no count measured nothing,
+        # and "0 types" is the exact reading #683 acted on.
+        stated = _field_present(item, "count")
+        if _field_skewed("defined_types") and not stated:
             return "types_declare <unreadable defined_types>"
         count = _count_field(item, "count")
         if _field_skewed("count"):
             return "types_declare <unreadable count>"
+        if not stated and not _field_present(item, "defined_types"):
+            return "types_declare <count not stated>"
         return f"types_declare {count} types"
     return _render_fallback_text(item)
 
@@ -3859,11 +3904,14 @@ def _clean_prototype(proto: Any) -> str | None:
 
 
 def _set_prototype_detail(item: dict[str, Any]) -> list[str]:
-    # Through the choke point, not an inline isinstance: an unusable `observed`
-    # dropped the prototype line and left the row byte-identical to a row that
-    # carried no observation at all -- the renderer's whole subject is that the
-    # prototype it SET was verified (#619).
-    proto = _clean_prototype(_field_dict(item, "observed").get("prototype"))
+    # BOTH reads go through a choke point, not an inline isinstance. An unusable
+    # `observed` dropped the prototype line and left the row byte-identical to a
+    # row that carried no observation at all -- the renderer's whole subject is
+    # that the prototype it SET was verified (#619). The same is true one level
+    # in: a well-formed `observed` whose `prototype` is not a string dropped the
+    # same line just as silently, which is the leaf under the container this
+    # comment already claimed to have closed.
+    proto = _clean_prototype(_text_value(_field_dict(item, "observed"), "prototype"))
     return ["  " + proto] if proto else []
 
 
