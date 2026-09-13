@@ -564,6 +564,37 @@ def _registry_fields_are_well_formed(
     return True
 
 
+def _registry_own_id(registry_path: Path) -> str:
+    """The instance id a registry FILENAME names, derived one way for everyone.
+
+    ``Path.stem`` reads a leading dot run as part of the name, so ``....json``
+    -- the registry of the legal id ``...`` -- stems to the whole name. Read
+    that way the record looks foreign and gets deleted while its bridge is
+    still listening, and its leftovers reverse-map to no id and can never be
+    reaped. Three readers need this id (the loader, the reclaim, and the
+    orphan sweep), and a second spelling of the derivation is a second answer
+    waiting to disagree with the first.
+    """
+    return registry_path.name.removesuffix(".json")
+
+
+def _record_socket_path(registry_path: Path, raw_socket_path: str) -> Path:
+    """The socket a record can be reached through, derived one way for everyone.
+
+    A relative ``socket_path`` decides nothing about where the socket is, so it
+    names the socket this record owns by construction, in the directory
+    discovery actually found the record in: `<name>.json` -> `<name>.sock`
+    under ``instances_dir()``, and the legacy fixed pair's `<plugin>.json` ->
+    `<plugin>.sock` in the cache root. Both are exactly what
+    ``bridge_socket_path`` emits for that record, and unlike the CWD the reader
+    and the writer cannot spell it differently.
+    """
+    socket_path = Path(raw_socket_path)
+    if socket_path.is_absolute():
+        return socket_path
+    return registry_path.with_name(f"{_registry_own_id(registry_path)}.sock")
+
+
 def _load_instance(
     path: Path,
     *,
@@ -589,21 +620,8 @@ def _load_instance(
     instance_id = payload.get("instance_id")
     if not _registry_fields_are_well_formed(raw_socket_path, raw_pid, instance_id):
         return None
-    # What the FILENAME says this record is, derived the one way that
-    # round-trips every id the grammar accepts: ``Path.stem`` reads a leading
-    # dot run as part of the name, so ``....json`` -- the registry of the legal
-    # id ``...`` -- stems to the whole name, and the record then reads as
-    # foreign and is deleted while its bridge is still listening.
-    own_id = path.name.removesuffix(".json")
-    socket_path = Path(raw_socket_path)
-    if not socket_path.is_absolute():
-        # The socket this record owns by construction, in the directory
-        # discovery actually found the record in: `<name>.json` -> `<name>.sock`
-        # under `instances_dir()`, and the legacy fixed pair's `<plugin>.json`
-        # -> `<plugin>.sock` in the cache root. Both are exactly what
-        # ``bridge_socket_path`` emits for that record, and unlike the CWD the
-        # reader and the writer cannot spell it differently.
-        socket_path = path.with_name(f"{own_id}.sock")
+    own_id = _registry_own_id(path)
+    socket_path = _record_socket_path(path, raw_socket_path)
     pid = raw_pid
 
     process_state = _process_state(pid)
@@ -799,6 +817,76 @@ def find_lifecycle_instance(
     return None
 
 
+def _nothing_is_bound_to(socket_path: Path) -> bool:
+    """Positive proof that no socket is bound to *socket_path*.
+
+    Two facts qualify, and neither of them is an absence this process merely
+    failed to look up: the name does not exist at all -- a bound AF_UNIX socket
+    always has a directory entry, on every platform -- or the kernel's own list
+    of bound paths does not hold it. ``_path_has_bound_socket`` answering
+    ``None`` (no ``/proc/net/unix`` to read) is the absence of an answer, not an
+    answer, and does not qualify.
+    """
+    if not socket_path.exists():
+        return True
+    return _path_has_bound_socket(socket_path) is False
+
+
+def _reclaim_unusable_registry(registry_path: Path, resolvable: frozenset[Path]) -> bool:
+    """Remove a KEPT record that no discovery path can turn into a handle.
+
+    Retention is the other half of "destruction requires positive evidence",
+    and it had nobody paying its bill: a record whose owner is alive but proves
+    nothing is refused on every path and deleted on none, and because a
+    surviving registry marks its id live, ``gc_instances`` spared its ``.log``
+    and ``.sock`` as well. Nothing in the product reclaimed it -- the recovery
+    that argument assumed, a later spawn under the same id overwriting the
+    record, cannot happen for an auto-generated id, which is
+    ``secrets.token_hex(4)`` -- so the files were permanent while
+    ``list_instances()`` did not even show them. A destruction bug had become
+    an unbounded-litter bug (#618).
+
+    So this reclaim carries positive evidence of its own. It is evidence about
+    the FILE, not about the owner, because the owner is precisely what cannot
+    be judged here:
+
+    * discovery resolves this record for NOTHING -- not for dispatch, not for
+      the lifecycle lookup behind ``bn session stop``, not for spawn collision
+      detection. ``resolvable`` is that measurement, taken by the caller from
+      ``list_instances(include_unreachable=True)``, and membership is checked
+      here rather than assumed, so a record that IS somebody's handle can never
+      reach the unlink below; and
+    * nothing is bound to the socket it names, proved by the kernel rather than
+      inferred from a refused connection -- a socket that is bound and has not
+      reached ``listen`` refuses one too.
+
+    The last two checks are also what protects the window: ``resolvable`` was
+    measured before this call, but a record that became somebody's handle
+    inside that window has its socket bound (a bridge binds before it
+    registers) and has different bytes on disk (the writer uses ``os.replace``),
+    and either one alone refuses the unlink.
+
+    A record this function cannot interpret is left alone: that retention
+    predates this module's destruction rule, is not part of it, and is pinned
+    by its own test.
+    """
+    if registry_path in resolvable:
+        return False
+    try:
+        document = registry_path.read_bytes()
+        payload = json.loads(document.decode("utf-8"))
+        raw_socket_path = payload["socket_path"]
+        raw_pid = payload["pid"]
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+    if not _registry_fields_are_well_formed(raw_socket_path, raw_pid,
+                                            payload.get("instance_id")):
+        return False
+    if not _nothing_is_bound_to(_record_socket_path(registry_path, raw_socket_path)):
+        return False
+    return _unlink_if_unchanged(registry_path, document)
+
+
 def gc_instances() -> dict[str, Any]:
     """Reap dead instances' leftovers from ``instances_dir()``.
 
@@ -810,9 +898,15 @@ def gc_instances() -> dict[str, Any]:
     every instance that no longer has a live registry, leaving live instances
     and the shared spawn lock untouched.
 
+    It is also the one reclaim path for the records discovery deliberately
+    KEEPS: a record nothing can judge is never purged lazily, and holding its
+    registry held its ``.log`` and ``.sock`` here too. This is where such a
+    record goes, on evidence of its own -- see ``_reclaim_unusable_registry``.
+
     Returns a summary: ``live_instances``, ``registries_purged`` (dead
-    registries the liveness sweep removed), ``logs_removed``, ``sockets_removed``,
-    and ``removed`` (the list of removed paths).
+    registries the liveness sweep removed, plus the kept-but-unusable ones
+    reclaimed here), ``logs_removed``, ``sockets_removed``, and ``removed``
+    (the list of removed paths).
     """
     inst_dir = instances_dir()
     summary: dict[str, Any] = {
@@ -834,14 +928,20 @@ def gc_instances() -> dict[str, Any]:
         # Triggers the lazy liveness sweep: dead registries + their sockets are
         # unlinked as a side effect, leaving only live registries behind.
         summary["live_instances"] = len(list_instances())
+        # What survived that sweep is not all live. Discovery keeps every record
+        # it cannot judge, and resolves only some of what it keeps; one it
+        # resolves for nothing is a handle to nothing, and its registry was
+        # keeping this sweep off its .log and .sock. Reclaim those here, where
+        # the spawn lock is held and the operator asked for it, and never on the
+        # refusal alone (#618).
+        resolvable = frozenset(
+            inst.registry_path for inst in list_instances(include_unreachable=True)
+        )
+        for registry in sorted(inst_dir.glob("*.json")):
+            _reclaim_unusable_registry(registry, resolvable)
         registries_after = set(inst_dir.glob("*.json"))
         summary["registries_purged"] = len(registries_before - registries_after)
-        # Same derivation the loader uses, for the same reason: ``Path.stem``
-        # and ``Path.suffix`` read a leading dot run as part of the name, so a
-        # legal all-dot id (``...`` -> ``....json`` / ``....sock``) reverse-maps
-        # to nothing and its leftovers could never be reaped. One id per
-        # filename, derived one way, on both sides of this sweep.
-        live_ids = {p.name.removesuffix(".json") for p in registries_after}
+        live_ids = {_registry_own_id(p) for p in registries_after}
         for entry in sorted(inst_dir.iterdir()):
             # Never touch the shared spawn lock or any surviving (live) registry.
             if entry.name == ".spawn.lock" or entry.name.endswith(".json"):
@@ -852,6 +952,15 @@ def gc_instances() -> dict[str, Any]:
             suffix = next((s for s in (".log", ".sock")
                            if entry.name.endswith(s)), None)
             if suffix is None or entry.name.removesuffix(suffix) in live_ids:
+                continue
+            # A registry-less ``.sock`` is also what an in-flight registration
+            # looks like from here: a bridge binds before it writes its registry
+            # and one the GUI plugin starts takes no spawn lock, so the lock
+            # above cannot order it. Unlinking that name leaves the bridge
+            # serving on an unlinked inode, reachable by nobody. Only a
+            # POSITIVE answer refuses the unlink, so an unknowable one (no
+            # ``/proc/net/unix``) keeps this sweep exactly as it was (#618).
+            if suffix == ".sock" and _path_has_bound_socket(entry) is True:
                 continue
             with contextlib.suppress(OSError):
                 entry.unlink()

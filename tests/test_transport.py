@@ -4561,3 +4561,147 @@ def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkey
         with contextlib.suppress(OSError):
             starting.close()
         sock_path.unlink(missing_ok=True)
+
+
+def test_gc_reclaims_a_kept_record_that_no_discovery_path_can_use(tmp_path, monkeypatch):
+    """Retention must not be permanent: something has to reclaim it.
+
+    Every destructive arm in discovery now demands positive evidence, so a
+    record nothing can judge is KEPT -- and a surviving registry marks its id
+    live, so ``gc_instances`` spared its ``.log`` too. The result was litter no
+    command could reclaim and ``list_instances()`` would not even show: the
+    disclosed recovery ("the next spawn under that id") cannot happen for an
+    auto-generated id, which is ``secrets.token_hex(4)``. ``instance gc`` is the
+    explicit, spawn-lock-holding reclaim path, and this is exactly the litter it
+    exists for (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    # Five crashed bridges whose pids were recycled: each record is well formed,
+    # its pid is ALIVE (this process), its socket is gone, and nothing in it
+    # proves whose pid that is -- the shape EVERY record has on a platform with
+    # no /proc, and the shape a pre-#694 record has everywhere.
+    for index in range(5):
+        sid = f"gone{index}"
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps(_registry_payload(inst_dir / f"{sid}.sock",
+                                         pid=os.getpid(), instance_id=sid)),
+            encoding="utf-8",
+        )
+        (inst_dir / f"{sid}.log").write_text("bridge starting\n", encoding="utf-8")
+
+    assert list_instances() == []                            # invisible to the operator
+    assert list_instances(include_unreachable=True) == []    # and to lifecycle lookups
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 5
+    assert summary["logs_removed"] == 5
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock"]
+
+
+def test_gc_keeps_a_kept_record_whose_endpoint_is_still_bound(tmp_path, monkeypatch):
+    """The reclaim needs its own positive evidence, and this is that evidence.
+
+    Reclaiming a record because discovery refuses it would be the same mistake
+    one level up: refusal is not proof there is nothing there. The record goes
+    only when nothing is bound to the socket it names -- and a socket that is
+    bound but has not reached ``listen`` still refuses connections, so the
+    proof has to come from the kernel rather than from a probe.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "starting.sock"
+    starting = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    starting.bind(str(sock_path))              # bound, and deliberately not listening
+    record = inst_dir / "starting.json"
+    # The filename disagrees with the payload's id, so discovery refuses this
+    # record on every path; its owner is alive and proves nothing, so the
+    # liveness sweep keeps it. Unresolvable, kept -- and not reclaimable.
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), instance_id="elsewhere")),
+        encoding="utf-8",
+    )
+    try:
+        assert list_instances(include_unreachable=True) == []
+
+        summary = gc_instances()
+
+        assert record.exists()
+        assert sock_path.exists()
+        assert summary["registries_purged"] == 0
+        assert summary["sockets_removed"] == 0
+    finally:
+        with contextlib.suppress(OSError):
+            starting.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_gc_never_unlinks_an_orphan_socket_the_kernel_says_is_bound(tmp_path, monkeypatch):
+    """A registry-less socket is not evidence of a dead instance.
+
+    A bridge binds its socket BEFORE it writes the registry, and a bridge the
+    GUI plugin starts takes no spawn lock, so "no registry for this ``.sock``"
+    is also what an in-flight registration looks like from here. Unlinking it
+    leaves that bridge serving on an unlinked inode, unreachable by name. The
+    leftover file of an instance that really is gone has nothing bound to it,
+    and that is the difference the kernel can state.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    coming_up = inst_dir / "coming-up.sock"
+    bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound.bind(str(coming_up))
+    leftover = inst_dir / "crashed.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(leftover))
+    stale.close()                              # a socket FILE nothing is bound to
+    try:
+        summary = gc_instances()
+
+        assert coming_up.exists()              # the endpoint of a bridge coming up
+        assert not leftover.exists()           # the leftover of one long gone
+        assert summary["sockets_removed"] == 1
+    finally:
+        with contextlib.suppress(OSError):
+            bound.close()
+        coming_up.unlink(missing_ok=True)
+
+
+def test_gc_keeps_the_unreachable_handle_a_lifecycle_lookup_resolves(tmp_path, monkeypatch):
+    """"Nothing is bound to it" is not enough; something may still need it.
+
+    A record whose socket is gone but whose owner is PROVEN is the one thing
+    ``bn session stop`` must still be able to name -- that unreachable process
+    is exactly the one a user needs to kill (#694) -- and its socket is absent,
+    which is precisely what the reclaim reads as "no endpoint". So the reclaim
+    asks discovery what it resolves before it destroys anything, and this is
+    the record that makes the difference observable.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    record = inst_dir / "orphaned.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "orphaned.sock", pid=os.getpid(),
+                                     identity=_identity(), instance_id="orphaned")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "orphaned.log"
+    log.write_text("bridge started\n", encoding="utf-8")
+
+    assert list_instances() == []                       # hidden from normal discovery
+    assert [i.instance_id for i in list_instances(include_unreachable=True)] == ["orphaned"]
+
+    summary = gc_instances()
+
+    assert record.exists()
+    assert log.exists()
+    assert summary["registries_purged"] == 0 and summary["logs_removed"] == 0
+    # And it is still nameable afterwards, which is the capability being kept.
+    from bn.transport import find_lifecycle_instance
+
+    assert find_lifecycle_instance("orphaned") is not None
