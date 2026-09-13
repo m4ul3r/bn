@@ -2928,7 +2928,7 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # files (tests/test_transport.py, tests/test_paths.py, tests/test_cli_misc.py);
 # GREEN below means nothing in them would notice that guard breaking.
 #
-# UNPINNED GUARDS — three, and they do NOT carry the same risk:
+# UNPINNED GUARDS — four, and they do NOT carry the same risk:
 #
 #  1. `_load_instance`'s `expected_record=record_document` at all FOUR
 #     `_purge_stale_registry` callsites (the foreign-id, unconfined,
@@ -2941,9 +2941,12 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #     `test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket`.
 #
 #  2. `_process_state`'s `rfind(b")")` comm-skip. Mutation: `find`, green.
-#     DESTRUCTIVE direction: a live owner whose executable basename contains
-#     `)` reads as a zombie, so a running bridge's record and log become
-#     litter. Detail block above
+#     DESTRUCTIVE direction, and the constructible class is narrower than
+#     "any `)` in the name": the token after the FIRST `)` must be exactly
+#     `Z`, `X` or `x`, so a basename like `x) Z (y` reads as a zombie while
+#     `a)b` parses to `b)` and still reads ALIVE. Where it does fire, a
+#     running bridge's record and log become litter on the strength of what
+#     an unrelated neighbour happens to be called. Detail block above
 #     `test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage`.
 #
 #  3. `owner_alive`'s zombie half, `process_state not in {"Z", "X", "x"}`.
@@ -2957,10 +2960,22 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #     dead -- is pinned, and destructively, by
 #     `test_a_live_owner_whose_state_cannot_be_read_is_not_litter`.
 #
+#  4. `_socket_path_is_confined`'s failure-direction answer, the
+#     `except (OSError, TypeError, ValueError): return False`. Mutation:
+#     `return True` -- a resolution failure read as CONFINED -- green at 337
+#     passed, 1 skipped. INERT here rather than safe by design: the only
+#     input that reaches the arm on this platform is an embedded NUL
+#     (`ValueError`/`UnicodeEncodeError`), and such a record is routed to the
+#     same fate by the missing-socket arm downstream, so no destruction is
+#     constructible from the mutation. It is listed because an inventory that
+#     omits a green guard is worth less than no inventory: if some future
+#     input makes that arm reachable with a real path, nothing here notices.
+#
 # For 1 and 2 a pin was written, did not discriminate, and was deleted rather
 # than shipped with a docstring claiming a guard it does not hold; both are
 # ruled disclosed coverage gaps on the condition that they are named here. 3
-# was measured by a review lens and is recorded on the same terms.
+# and 4 were each measured by a review lens and are recorded on the same
+# terms.
 #
 # UNREACHABLE DEFENSIVE CODE — one category, not three notes scattered across
 # two files. No mutation can redden these because no input on this platform
@@ -2969,8 +2984,13 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #   - `_unlink_if_unchanged`'s `if expected is None: return False` -- the byte
 #     comparison below it also answers `False` for `None`.
 #   - `_unlink_if_unchanged`'s `ValueError` in `except (OSError, ValueError)`
-#     -- every `registry_path` that reaches it comes from a directory scan
-#     and can never carry an embedded NUL.
+#     -- unreachable, but NOT for the reason an earlier form of this note
+#     gave: it is not true that every `registry_path` reaching it comes from
+#     a directory scan, because the legacy fixed registry is CONSTRUCTED by
+#     `bridge_registry_path()` and does reach this unlink. It is unreachable
+#     because neither source can carry an embedded NUL -- a scanned name
+#     cannot, and a constructed one derives from the environment, which
+#     cannot either. A true conclusion does not get to keep a false reason.
 #   - `_socket_path_is_confined`'s `TypeError` in
 #     `except (OSError, TypeError, ValueError)`, documented there as "an empty
 #     final component" -- on this Python `Path("/").parent.resolve() / ""`
