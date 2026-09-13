@@ -5361,17 +5361,25 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
         (moved / "instances" / "live.sock").unlink(missing_ok=True)
 
 
-def test_an_abstract_namespace_row_can_never_name_a_file(tmp_path):
-    """``@name`` holds no filesystem name, so it answers nothing about a file.
+def test_an_at_prefixed_row_is_unknowable_because_the_listing_conflates_two_things(tmp_path):
+    """The listing prints an abstract socket and a path the same way.
 
-    The kernel prints an abstract-namespace socket as ``@`` followed by its
-    name, and an abstract name may contain slashes -- so a row can present the
-    basename of a real cache socket while naming no file at all. It is not a
-    relative path and must not be treated as one: answering ``None`` for it let
-    any process on the host pin a chosen orphan socket against ``gc`` forever
-    by binding an abstract name that ends in that socket's own name. An
-    abstract socket provably holds no filesystem name, so ``False`` is the
-    correct answer and the sweep is not blocked (#618).
+    The kernel renders an abstract-namespace socket as ``@`` followed by its
+    name, and that name may contain slashes -- so such a row can present a real
+    cache socket's basename while naming no file at all. The tempting reading
+    is that ``@`` therefore means "no file, answer ``False``". It does not: a
+    PATHNAME socket's path is printed verbatim too, so a relative cache root
+    whose first component begins with ``@`` produces a byte-identical row for a
+    file that very much exists. Skipping every ``@`` row destroyed exactly that
+    bridge's endpoint -- measured, one round after the relative-row fix that
+    was supposed to close this shape.
+
+    The listing cannot tell the two apart, so this reader cannot either, and
+    the rule is the same as for the other four shapes: answer ``None``. The
+    cost is retention -- an abstract socket whose name ends in an orphan's
+    name keeps that orphan file from being reaped -- and that cost is real but
+    it is not destruction, it is bounded by basename, and the same retention is
+    reachable anyway by binding an absolute path and unlinking it (#618).
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
@@ -5382,11 +5390,33 @@ def test_an_abstract_namespace_row_can_never_name_a_file(tmp_path):
     pinner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     pinner.bind("\0" + str(orphan))        # abstract, and ends in the same name
     pinner.listen(1)
+
+    root = tmp_path / "@cache"             # a relative root starting with `@`
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('@cache/instances/live.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(tmp_path), stdout=subprocess.PIPE, text=True,
+    )
+    live = inst_dir / "live.sock"
     try:
-        assert _path_has_bound_socket(orphan) is False
+        assert binder.stdout.readline().strip() == "bound"
+        # Indistinguishable rows, so neither may produce the destructive False.
+        assert _path_has_bound_socket(live) is not False
+        assert _path_has_bound_socket(orphan) is None
     finally:
         with contextlib.suppress(OSError):
             pinner.close()
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        live.unlink(missing_ok=True)
 
 
 def test_a_probe_that_could_not_be_taken_is_not_proof_the_endpoint_is_dead(tmp_path):
@@ -5465,3 +5495,52 @@ def test_gc_keeps_a_live_owners_record_when_the_socket_cannot_be_probed(tmp_path
         unreadable.chmod(0o700)
         owner.kill()
         owner.wait()
+
+
+def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, monkeypatch):
+    """The same conflation, one screen away, in the loader's own arm.
+
+    ``_load_instance`` routes on "registry with no socket", which it read with
+    ``Path.exists()`` -- so an unreadable directory sent a record down the arm
+    reserved for a bridge that died hard, and with its owner gone that arm
+    purges without probing the socket at all. The probe the record would
+    otherwise have faced is INCONCLUSIVE for that errno (``connect`` gives
+    ``EACCES``, which establishes neither fact), so the file survived a real
+    probe and was destroyed by an unreadable one. Absence has to be
+    ESTABLISHED before it can route a destruction (#618).
+
+    Both directions: a socket path that is genuinely gone still routes to that
+    arm and a dead owner's record is still swept, which is the behaviour
+    `#694` put there.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    from bn.transport import _process_alive
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    assert not _process_alive(gone.pid)          # an owner that is provably gone
+
+    unreadable = inst_dir / "unreadable"
+    unreadable.mkdir()
+    blocked = unreadable / "blocked.sock"
+    blocked.touch()
+    for sid, sock_path in (("blocked", blocked), ("absent", inst_dir / "absent.sock")):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": gone.pid, "socket_path": str(sock_path),
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+    unreadable.chmod(0o000)
+    try:
+        assert list_instances(include_unreachable=True) == []
+
+        # Unreadable is not absent: the record stays.
+        assert (inst_dir / "blocked.json").exists()
+        # Genuinely absent, owner gone: swept exactly as before.
+        assert not (inst_dir / "absent.json").exists()
+    finally:
+        unreadable.chmod(0o700)

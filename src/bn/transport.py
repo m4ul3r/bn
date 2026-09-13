@@ -458,13 +458,16 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
       so it is never a symlink -- makes the answer ``None``. One with a
       different basename cannot be this path in any cwd, and is skipped, so an
       unrelated relative socket elsewhere on the host does not make every
-      question unanswerable. An ABSTRACT-namespace row is not a relative path
-      and is not treated as one: the kernel prints it as ``@`` followed by a
-      name that may itself contain slashes, so it can present a real cache
-      socket's basename while naming no file at all. It provably holds no
-      filesystem name, so it answers about no file and is skipped -- treating
-      it as unknowable let any process pin a chosen orphan socket against the
-      sweep forever by binding an abstract name ending in that socket's name.
+      question unanswerable. An ABSTRACT-namespace row is covered by the same
+      arm, and deliberately: the kernel prints it as ``@`` followed by a name
+      that may itself contain slashes, and it prints a PATHNAME socket's path
+      verbatim, so a relative cache root whose first component begins with
+      ``@`` is byte-identical to an abstract row. Skipping every ``@`` row as
+      "names no file" therefore destroyed that bridge's endpoint. The listing
+      cannot tell the two apart and neither can this reader: ``None``, at the
+      cost of retention -- an abstract name ending in an orphan's name keeps
+      that orphan file, which is bounded by basename and reachable anyway by
+      binding an absolute path and unlinking it.
     * The listing holds the name ``bind`` was given, not the name that file
       has NOW. Rename the directory of a socket that is still bound and
       listening -- an ordinary operator action -- and the row goes on naming a
@@ -499,13 +502,12 @@ def _path_has_bound_socket(socket_path: Path) -> bool | None:
         # and is taken first: it can only ever REFUSE a destruction.
         if bound_path == wanted:
             return True
-        if bound_path.startswith(b"@"):
-            continue
         if os.path.basename(bound_path) != name:
             continue
         if not os.path.isabs(bound_path):
             # Resolvable only in the binder's cwd, which this file does not
-            # carry. Never answer the positive "nothing is bound" from it.
+            # carry -- and an abstract row (`@name`) is indistinguishable from
+            # one. Never answer the positive "nothing is bound" from either.
             return None
         target = os.path.realpath(bound_path)
         if target == resolved:
@@ -787,10 +789,14 @@ def _load_instance(
         if not include_unreachable or verdict != "proven":
             return None
         unreachable = True
-    elif not socket_path.exists():
+    elif _path_is_absent(socket_path):
         # start() binds the socket BEFORE writing the registry, so "registry with
         # no socket" is never a legitimate startup window: it is a bridge that
         # died hard, or a phantom kept listed only by whatever owns its pid now.
+        # The absence is ESTABLISHED rather than assumed: `Path.exists()` reads
+        # an unreadable directory exactly like a missing name, and this arm
+        # sweeps a dead owner's record without probing the socket at all, so
+        # that conflation destroyed a record whose real probe is inconclusive.
         # That absence is evidence about SERVICE, not about the handle: a bridge
         # nothing can reach is exactly the process `bn session stop` must still
         # be able to name, so normal discovery and `bn session list` hide it
@@ -930,6 +936,33 @@ def find_lifecycle_instance(
     return None
 
 
+def _path_is_absent(path: Path) -> bool:
+    """Whether *path* PROVABLY names nothing, rather than merely not answering.
+
+    Two destructive routes read "there is no socket file" as evidence: the
+    reclaim of a kept record, and the loader arm that sweeps a dead owner's
+    registry. Both took that reading from ``Path.exists()``, which answers
+    ``False`` for ``EACCES``, ``EIO``, ``ELOOP`` and ``ESTALE`` exactly as it
+    does for ``ENOENT`` -- so one unreadable directory turned a probe that
+    could not be TAKEN into positive evidence, and a live owner's record and
+    log went with it. What establishes that the name resolves to nothing is
+    ``ENOENT``, ``ENOTDIR``, ``ENAMETOOLONG`` (no file can carry that name) and
+    a path the syscall layer cannot even express (an embedded NUL, a lone
+    surrogate -- what a non-UTF-8 byte becomes once JSON has decoded it).
+    Every other error is the READER's problem, not the path's, and answers
+    ``False``, which costs a record that is kept (#618).
+    """
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError as exc:
+        return exc.errno == errno.ENAMETOOLONG
+    except ValueError:
+        return True
+    return False
+
+
 def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool:
     """Whether the endpoint a kept record names can no longer serve anyone.
 
@@ -967,12 +1000,8 @@ def _record_endpoint_is_dead(socket_path: Path, *, timeout: float = 0.2) -> bool
     of destruction, never raise it: the cost of misreading confinement is now a
     record that is kept.
     """
-    try:
-        socket_path.stat()
-    except (FileNotFoundError, NotADirectoryError):
+    if _path_is_absent(socket_path):
         return True
-    except OSError:
-        return False
     if _socket_path_is_confined(socket_path):
         return _socket_probe(socket_path, timeout=timeout).nothing_accepting
     return _path_has_bound_socket(socket_path) is False
