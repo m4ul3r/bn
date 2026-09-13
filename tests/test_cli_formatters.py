@@ -6999,7 +6999,10 @@ def test_an_unreadable_results_ROW_can_never_read_as_ok():
         == (True, True, 0), ok_summary
     assert formatters._go_rename_summary(go(_ABSENT))["ok"] is True
     assert formatters._go_rename_summary(go([]))["ok"] is True
-    for junk in ("<unreadable row>", ["rename"], 7, True, 1.5, ()):
+    # `None` is in this set deliberately: an explicit null FIELD claimed
+    # nothing, but a null INSIDE the row list is a row position the sender
+    # filled with no row -- an op of the batch this summary cannot account for.
+    for junk in ("<unreadable row>", ["rename"], 7, True, 1.5, (), None):
         payload = batch([junk, dict(good)])
         summary = formatters._mutation_summary(payload)
         verbose = formatters._add_mutation_ok(payload)

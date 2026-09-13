@@ -274,7 +274,13 @@ def _row_list(source: Any, key: str) -> list[dict[str, Any]]:
     rather than claiming it, and a count derived from the survivors is no
     longer a measurement of the whole batch. Exactly the answer
     ``_is_failed_status`` gives for an unreadable row STATUS, asked one level
-    out about the row itself (#619/#685)."""
+    out about the row itself (#619/#685).
+
+    A ``None`` ELEMENT is a skew too, and that is not the field-level rule
+    turned around: an explicit null FIELD claimed nothing, while a null INSIDE
+    the list is a row position the sender filled with no row -- one op of the
+    batch that this summary cannot account for, exactly like any other element
+    it cannot read."""
     rows: list[dict[str, Any]] = []
     dropped = False
     for item in _field_list(source, key):
