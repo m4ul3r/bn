@@ -3009,8 +3009,10 @@ def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
     the confinement check must treat it as unconfined instead of letting it
     escape ``_load_instance``/``list_instances``. The owner here is live and its
     identity PROVEN: that is the payload the tolerant loader used to ignore, so
-    discovery must still return without raising and drop the unusable
-    cache-side record, exactly as it does for a socket outside the cache.
+    discovery must still return without raising and must not adopt the record.
+    Its FILE stays, because a proven live owner's record is the only handle its
+    process has and this arm cannot tell a bogus payload from a layout it read
+    wrongly; the dead-owner half is swept, and is pinned separately.
     """
     cache = tmp_path / "cache"
     outside = tmp_path / "outside"
@@ -3033,7 +3035,7 @@ def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
     )
 
     assert not any(inst.instance_id == "nulpath" for inst in list_instances())
-    assert not registry_path.exists()
+    assert registry_path.exists()            # refused, not destroyed
     # The other half of the contract: rejecting the payload must not sweep
     # anything the cache does not own.
     assert bystander.exists()
@@ -3754,3 +3756,154 @@ def test_an_all_dot_instance_id_keeps_its_live_registry(tmp_path, monkeypatch):
 
     assert [inst.instance_id for inst in instances] == ["..."]
     assert bridge_registry_path("...").exists()
+
+
+def test_the_cache_root_pair_reaches_a_symlinked_instances_dir(tmp_path, monkeypatch):
+    """The trusted region is the cache's own layout, not one record's parent.
+
+    A record that lives in the cache ROOT -- the legacy fixed pair -- gets no
+    help from a boundary built out of the directory the record was found in:
+    that directory IS the cache root, so a socket inside a symlinked
+    ``instances/`` still measured as outside, and the purge arm deleted the
+    record of a bridge that was listening. Both of this user's cache
+    directories are the boundary.
+    """
+    cache = tmp_path / "cache"
+    linked = tmp_path / "elsewhere"
+    linked.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    (cache / "instances").symlink_to(linked)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    sock = instances_dir() / "legacy.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    legacy = bridge_registry_path()                  # cache root, no instance id
+    legacy.write_text(
+        json.dumps(_registry_payload(sock, pid=os.getpid(), identity=_identity())),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(instances) == 1
+    assert legacy.exists()                           # and it was not purged
+
+
+def _unconfined_record(inst_dir, name, target):
+    """A record naming a socket outside the cache, with a proven identity."""
+    path = inst_dir / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            _registry_payload(target, pid=os.getpid(), identity=_identity(),
+                              instance_id=name)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_an_unconfined_socket_never_deletes_a_proven_live_record(tmp_path, monkeypatch):
+    """Refusing a payload is a judgement; deleting the record is destruction.
+
+    This arm cannot tell "the payload is bogus" from "our reading of the
+    layout is wrong" -- the symlinked-cache purge proved the second happens --
+    so when the owner is alive and its identity PROVEN the record stays on
+    disk, exactly as the missing-socket arm keeps an unreachable bridge's only
+    handle (#694). The payload is still refused, and nothing outside the cache
+    is touched.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = _unconfined_record(inst_dir, "alive", bystander)
+
+    instances = list_instances()
+
+    assert [inst.instance_id for inst in instances] == []
+    assert record.exists()                   # proven-live owner: never deleted
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_an_unconfined_socket_still_sweeps_a_dead_owners_record(tmp_path, monkeypatch):
+    """The other half: an unusable record whose owner is gone is litter.
+
+    Keeping a proven-live bridge's handle must not turn into keeping every
+    hostile payload forever, and the sweep must still stop at the cache: the
+    file the payload names is not ours to remove.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = _unconfined_record(inst_dir, "dead", bystander)
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not record.exists()               # dead owner: still swept
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, monkeypatch):
+    """``instance gc`` reverse-maps sockets to registries, so it needs the id.
+
+    Reading it with ``Path.stem``/``Path.suffix`` misses the same all-dot ids
+    the loader used to miss, and the two halves of that mistake point opposite
+    ways: leftovers that can never be reaped, and -- if the mapping were fixed
+    on only one side -- a LIVE instance's socket unlinked out from under it,
+    which is the failure ``bridge_socket_path`` refuses to risk. Both
+    directions are pinned here.
+    """
+    from bn.paths import bridge_socket_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    live_sock = bridge_socket_path("...")
+    server = _Server(str(live_sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("...").write_text(
+        json.dumps(
+            _registry_payload(live_sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="...")
+        ),
+        encoding="utf-8",
+    )
+    orphan_sock = inst_dir / ".....sock"          # id '....', no registry
+    orphan_log = inst_dir / ".....log"
+    orphan_sock.write_text("", encoding="utf-8")
+    orphan_log.write_text("", encoding="utf-8")
+
+    try:
+        summary = gc_instances()
+        # `_Server.server_close()` unlinks the pathname, so the live socket has
+        # to be measured before the harness tears it down.
+        live_socket_survived = live_sock.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert summary["live_instances"] == 1
+    assert live_socket_survived                   # never reaped out from under
+    assert str(live_sock) not in summary["removed"]
+    assert bridge_registry_path("...").exists()
+    assert not orphan_sock.exists()
+    assert not orphan_log.exists()

@@ -348,7 +348,7 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
-def _socket_path_is_confined(socket_path: Path, registry_dir: Path) -> bool:
+def _socket_path_is_confined(socket_path: Path) -> bool:
     """Whether a registry's ``socket_path`` lives under this user's bn cache.
 
     A registry is data, not a path we constructed: a corrupted or hand-edited
@@ -364,23 +364,22 @@ def _socket_path_is_confined(socket_path: Path, registry_dir: Path) -> bool:
     whose target happens to be in-cache, and then delete that out-of-cache link.
     Any resolution failure is treated as unconfined.
 
-    The boundary is the cache AS THE USER LAID IT OUT, which is why the
-    directory the record was found in counts as well. ``resolve()`` follows
-    symlinks, so measuring against ``cache_home()`` alone puts every socket
-    under a symlinked ``instances/`` -- a tmpfs, a bigger disk -- outside the
-    cache, and the arm below does not merely skip such a record, it purges it:
-    a listening bridge loses its registry and with it the only handle
-    ``session stop`` has. Discovery reached this record by walking that
-    directory, and an actor able to retarget it can already plant registries
-    in the cache, so trusting it grants nothing and refusing it costs a live
-    bridge.
+    The boundary is the cache AS THE USER LAID IT OUT: both of the directories
+    this code itself writes into, each measured after resolution. ``resolve()``
+    follows symlinks, so measuring against ``cache_home()`` alone puts every
+    socket under a symlinked ``instances/`` -- a tmpfs, a bigger disk, a
+    per-project directory -- outside the cache, and the arm that refuses such a
+    record used to delete it: a listening bridge lost its registry, and with it
+    the only handle ``session stop`` has. An actor who can retarget those
+    directories can already plant registries in them, so admitting them grants
+    nothing, while refusing them costs a live bridge.
     """
     try:
-        roots = (cache_home().resolve(), registry_dir.resolve())
+        roots = (cache_home().resolve(), instances_dir().resolve())
         target = socket_path.resolve()
         entry = socket_path.parent.resolve() / socket_path.name
-        return any(target.is_relative_to(root) and entry.is_relative_to(root)
-                   for root in roots)
+        return all(any(candidate.is_relative_to(root) for root in roots)
+                   for candidate in (target, entry))
     except (OSError, TypeError, ValueError):
         # OSError: the path cannot be stat'd. ValueError: it cannot even be
         # interpreted as a path (an embedded NUL). TypeError: an empty final
@@ -490,18 +489,26 @@ def _load_instance(
             path.unlink()
         return None
 
-    if not _socket_path_is_confined(socket_path, path.parent):
-        # The payload points at a socket outside the cache: never connect to it
-        # and never let the stale sweep unlink it. Drop only the registry file
-        # that lives under our cache (#618).
-        _purge_stale_registry(path)
-        return None
-
     process_state = _process_state(pid)
     owner_alive = _process_alive(pid) and process_state not in {"Z", "X", "x"}
     # Liveness alone cannot tell a running bridge from an unrelated process that
     # recycled its pid, so discovery consults the durable identity too (#694).
     verdict = identity_verdict(payload, pid)
+
+    if not _socket_path_is_confined(socket_path):
+        # The payload points at a socket this code cannot place inside the
+        # cache: never connect to it, and never let the stale sweep unlink it.
+        # Whether to delete the RECORD is a separate question, and this arm
+        # cannot tell "the payload is bogus" from "our reading of the layout is
+        # wrong" -- the symlinked-cache purge proved the second happens. So a
+        # proven live owner keeps its file, exactly as the missing-socket arm
+        # below keeps an unreachable bridge's only handle (#694); a dead or
+        # unproven owner is corruption or litter, and the registry under our own
+        # cache is swept (#618).
+        if not owner_alive or verdict != "proven":
+            _purge_stale_registry(path)
+        return None
+
     unreachable = False
     if not socket_path.exists():
         # start() binds the socket BEFORE writing the registry, so "registry with
@@ -648,22 +655,30 @@ def gc_instances() -> dict[str, Any]:
         summary["live_instances"] = len(list_instances())
         registries_after = set(inst_dir.glob("*.json"))
         summary["registries_purged"] = len(registries_before - registries_after)
-        live_stems = {p.stem for p in registries_after}
+        # Same derivation the loader uses, for the same reason: ``Path.stem``
+        # and ``Path.suffix`` read a leading dot run as part of the name, so a
+        # legal all-dot id (``...`` -> ``....json`` / ``....sock``) reverse-maps
+        # to nothing and its leftovers could never be reaped. One id per
+        # filename, derived one way, on both sides of this sweep.
+        live_ids = {p.name.removesuffix(".json") for p in registries_after}
         for entry in sorted(inst_dir.iterdir()):
             # Never touch the shared spawn lock or any surviving (live) registry.
-            if entry.name == ".spawn.lock" or entry.suffix == ".json":
+            if entry.name == ".spawn.lock" or entry.name.endswith(".json"):
                 continue
             # A .log/.sock whose registry is gone belongs to a dead/long-gone
             # instance -- the registry was purged (now or earlier) or never
             # existed (and, under the lock, is not a spawn in flight).
-            if entry.suffix in (".log", ".sock") and entry.stem not in live_stems:
-                with contextlib.suppress(OSError):
-                    entry.unlink()
-                    summary["removed"].append(str(entry))
-                    if entry.suffix == ".log":
-                        summary["logs_removed"] += 1
-                    else:
-                        summary["sockets_removed"] += 1
+            suffix = next((s for s in (".log", ".sock")
+                           if entry.name.endswith(s)), None)
+            if suffix is None or entry.name.removesuffix(suffix) in live_ids:
+                continue
+            with contextlib.suppress(OSError):
+                entry.unlink()
+                summary["removed"].append(str(entry))
+                if suffix == ".log":
+                    summary["logs_removed"] += 1
+                else:
+                    summary["sockets_removed"] += 1
     return summary
 
 
