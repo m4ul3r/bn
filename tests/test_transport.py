@@ -4504,3 +4504,60 @@ def test_the_leftover_note_never_enters_the_log_it_protects(tmp_path, monkeypatc
     assert text.count("[bn-cli]") == 3          # one diagnostic line per attempt
     assert len(set(growth)) == 1                # a constant cost per attempt
     assert growth[0] < len(notes[0])            # and it is not the note's cost
+
+
+def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkeypatch):
+    """`ECONNREFUSED` covers a bridge coming up, not just a bridge long gone.
+
+    A socket that is bound but has not reached ``listen`` refuses connections
+    exactly like a crashed bridge's leftover file, and every bridge passes
+    through that state on its way up. So the errno alone cannot authorise an
+    unlink: taken as proof that nothing is bound, it destroys a STARTING
+    bridge's own endpoint and leaves it serving on an unlinked inode -- the
+    failure this arm exists to prevent. The kernel's own account of which
+    paths are bound is what makes the answer conclusive.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "starting.sock"
+    starting = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    starting.bind(str(sock_path))          # bound, and deliberately NOT listening
+    record = inst_dir / "starting.json"
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="starting")),
+        encoding="utf-8",
+    )
+    # The owner reads as gone, so the shared predicate says litter: the only
+    # thing standing between this socket and the unlink is the probe.
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    try:
+        from bn.transport import _socket_is_live
+
+        assert not _socket_is_live(sock_path, timeout=0.2)    # refuses, as a leftover does
+
+        assert list_instances() == []          # refused, exactly as before
+        assert sock_path.exists()              # but the endpoint survives
+        assert record.exists()
+        starting.listen(1)                     # the bridge finishes coming up
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))     # and it is reachable by name
+        finally:
+            client.close()
+
+        # A leftover nothing is bound to is still swept: same errno, different fact.
+        starting.close()
+        sock_path.unlink()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(sock_path))
+        stale.close()
+        assert list_instances() == []
+        assert not record.exists()
+        assert not sock_path.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            starting.close()
+        sock_path.unlink(missing_ok=True)

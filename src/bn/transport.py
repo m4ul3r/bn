@@ -398,26 +398,70 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
+def _path_has_bound_socket(socket_path: Path) -> bool | None:
+    """Whether any socket is BOUND to *socket_path*; ``None`` when unknowable.
+
+    ``connect`` cannot answer this question. A socket that is bound but has not
+    yet called ``listen`` refuses connections exactly like a crashed bridge's
+    leftover file -- measured on this kernel, bound-without-listen, a leftover
+    socket file and a plain file that never was a socket all give
+    ``ECONNREFUSED`` -- and every bridge passes through that state on its way
+    up. Treating the errno as proof that nothing is bound therefore unlinks a
+    STARTING bridge's own endpoint and leaves it serving on an unlinked inode,
+    which is the failure this arm exists to prevent (#618).
+
+    The kernel does know, and lists every bound path in ``/proc/net/unix``. Off
+    Linux that file does not exist, and the answer is then UNKNOWABLE rather
+    than "nothing is bound": ``None`` keeps the caller from destroying on an
+    absence, which is the rule the rest of this module follows.
+    """
+    try:
+        listing = Path("/proc/net/unix").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    name = socket_path.name
+    target = os.path.realpath(socket_path)
+    for line in listing.splitlines():
+        # `Num RefCount Protocol Flags Type St Inode Path`, whitespace-separated,
+        # and the trailing path is present only for a BOUND socket. Splitting on
+        # the first seven runs keeps a path containing spaces intact.
+        fields = line.split(None, 7)
+        if len(fields) < 8:
+            continue
+        bound_path = fields[7]
+        # The record may spell the path differently from the string the bridge
+        # passed to `bind` (a relative cache root, a symlinked `instances/`), so
+        # compare what the two names resolve to -- filtered by basename first,
+        # because a busy host lists thousands of sockets.
+        if bound_path == str(socket_path) or (
+            os.path.basename(bound_path) == name and os.path.realpath(bound_path) == target
+        ):
+            return True
+    return False
+
+
 def _socket_has_no_listener(socket_path: Path, timeout: float = 0.2) -> bool:
-    """Whether a failed probe PROVES nothing is accepting on *socket_path*.
+    """Whether a failed probe PROVES nothing is bound to *socket_path*.
 
     ``_socket_is_live`` answers "can this be talked to right now", which is the
     right question for routing and the wrong one for deleting: a bridge that is
     bound and serving answers ``EAGAIN`` as soon as its accept backlog is full,
-    and a timeout says nothing at all. Only a REFUSED connection -- nothing has
-    the path bound, so it is a crashed bridge's leftover file or a plain file
-    that never was a socket -- or a path that is already gone proves this is not
-    a live endpoint. Measured on Linux: a leftover socket file and a regular
-    file both give ``ECONNREFUSED``, a missing path gives ``ENOENT``, and a
-    listening socket with a full backlog gives ``EAGAIN``. Destroying a socket
-    file on the strength of the weaker answer unlinks a serving bridge's only
-    endpoint and orphans it on an unlinked inode (#618).
+    and a timeout says nothing at all. Measured on Linux: a listening socket
+    with a full backlog gives ``EAGAIN``, a missing path gives ``ENOENT``, and
+    ``ECONNREFUSED`` covers THREE states that have to be told apart -- a
+    crashed bridge's leftover file, a plain file that never was a socket, and a
+    socket that is bound but has not reached ``listen`` yet. The last one is a
+    bridge coming up, so the errno alone cannot authorise an unlink; only a
+    path that is already gone, or one the kernel says has no socket bound to
+    it, proves this is not an endpoint (#618).
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(str(socket_path))
-    except (ConnectionRefusedError, FileNotFoundError):
+    except ConnectionRefusedError:
+        return _path_has_bound_socket(socket_path) is False
+    except FileNotFoundError:
         return True
     except OSError:
         return False
