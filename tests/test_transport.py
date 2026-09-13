@@ -4337,6 +4337,52 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
     assert not orphan_log.exists()
 
 
+# ---------------------------------------------------------------------------
+# UNPINNED GUARD, DISCLOSED — the `expected_record=record_document` WIRING.
+#
+# Read this before editing the two tests below, and before touching
+# `_load_instance`'s three `_purge_stale_registry(..., expected_record=...)`
+# callsites in src/bn/transport.py. It is a coverage gap, not coverage.
+#
+# What IS pinned: the SWEEP's own rule. `_purge_stale_registry` refuses to
+# unlink a record whose bytes are no longer the document it was handed
+# (`test_the_stale_sweep_removes_only_what_it_can_still_see_itself`), and the
+# inner boundary of the window is exercised below.
+#
+# What is NOT pinned: that the LOADER hands down the document it JUDGED.
+# Replacing `expected_record=record_document` with a callsite
+# `path.read_bytes()` -- a plausible refactor, since the comment at that read
+# says the record is re-read as late as possible -- leaves all three fenced
+# test files GREEN at the dead-socket arm, the foreign-id arm and the
+# unconfined/missing-socket arm. The test below survives that mutation
+# because it stages its respawn INSIDE a monkeypatched
+# `_purge_stale_registry`, i.e. after the mutated read has already happened,
+# so only the innermost boundary is held -- not the loader's whole decision
+# window, which opens at the `path.read_bytes()` on entry.
+#
+# What a regression looks like in BEHAVIOUR: a legitimate `bn session start`
+# replaces the registry under an id between the loader gathering its evidence
+# and the sweep acting on it; the sweep then compares fresh bytes against
+# themselves and deletes them. Measured with the mutation applied and the
+# respawn injected one step earlier (after the conclusive `_socket_probe`
+# answers, before the sweep is called -- still inside the window HEAD
+# closes): `respawned_registry_survived false` under the mutation vs `true`
+# at HEAD. The socket survives, so the symptom is a bridge that is up and
+# serving but has no registry: `bn session list` reports nothing while the
+# process answers requests.
+#
+# Why no pin ships: one was written for exactly that outer window and it did
+# not discriminate -- it stayed green with the mutation in place -- so it was
+# deleted rather than shipped with a docstring claiming a guard it does not
+# hold. Reaching the loader's real window means interposing between two
+# private calls without monkeypatching the function under test. Operator
+# ruling waives the gap on the condition that it is named here: an
+# overclaiming test is worse than an acknowledged gap. The wiring is correct
+# at HEAD and measured so; it can regress silently, and nothing in this
+# module will say so (#618).
+# ---------------------------------------------------------------------------
+
+
 def test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket(
     tmp_path, monkeypatch
 ):
@@ -4838,6 +4884,33 @@ def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path
             with contextlib.suppress(OSError):
                 server.close()
             sock_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# UNPINNED GUARD, DISCLOSED — `_process_state`'s `rfind(b")")` comm-skip.
+#
+# Read this before editing the test below or the parse in
+# `src/bn/transport.py::_process_state`. It is a coverage gap, not coverage.
+#
+# What IS pinned: that a non-UTF-8 `comm` does not raise (below). What is NOT
+# pinned: WHERE the parse starts looking for the state character.
+# `stat.rfind(b")")` -> `stat.find(b")")` leaves all three fenced test files
+# GREEN.
+#
+# What a regression looks like in BEHAVIOUR: `comm` is the raw basename of
+# the exec'd file and may itself contain `)`. Measured -- an executable named
+# `x) Z (y` run on this host gives `/proc/<pid>/stat` = `<pid> (x) Z (y) S
+# ...`; the HEAD parse answers `S`, the `find` parse answers `Z`. `Z` is in
+# `_load_instance`'s dead-owner set, so `owner_alive` goes false for a LIVE
+# process and every arm downstream treats that record as litter: a running
+# bridge loses its registry and its log, at the whim of what some unrelated
+# neighbour happens to be called.
+#
+# Why no pin ships: the attempted pin did not discriminate -- it stayed green
+# with `find` in place -- and was deleted rather than shipped overclaiming.
+# Operator ruling waives the gap on the condition that it is named here
+# (#618).
+# ---------------------------------------------------------------------------
 
 
 def test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage(tmp_path, monkeypatch):
