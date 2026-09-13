@@ -10,6 +10,7 @@ and an exit-code list that silently falls behind `FAILED_MUTATION_STATUSES`.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -169,6 +170,60 @@ def test_exit_code_bullet_documents_every_code_the_cli_can_return():
     assert "classify" in bullet, (
         "the exit-2 clause must say a result this CLI cannot classify is 2, "
         f"which is what the malformed-result rule does: {bullet}"
+    )
+
+
+# The CLI package, which IS the population below: the bridge lives outside it,
+# so an integer a function here returns is either a process exit code or a bare
+# magic number that ought to be a named constant.
+_CLI_PACKAGE = REPO / "src" / "bn"
+
+
+def _codes_the_cli_can_return() -> dict[int, list[str]]:
+    """Every integer returned as a LITERAL by any function in the CLI package.
+
+    A total population -- every `return <int>` in every module under
+    `src/bn`, no entry-point list, no exemption -- because the sweep that
+    checked only the functions someone remembered is how a widened contract got
+    past this file in the first place.
+    """
+    codes: dict[int, list[str]] = {}
+    for path in sorted(_CLI_PACKAGE.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Return):
+                continue
+            value = node.value
+            # `type(...) is int` and not isinstance: `True` is an int subclass,
+            # and `return True` is not a claim about an exit code.
+            if isinstance(value, ast.Constant) and type(value.value) is int:
+                codes.setdefault(value.value, []).append(f"{path.name}:{node.lineno}")
+    return codes
+
+
+def test_no_code_the_cli_can_return_is_undocumented():
+    """The direction the bullet's inventory was missing.
+
+    `test_exit_code_bullet_documents_every_code_the_cli_can_return` reds when
+    the DOCUMENT narrows -- a deleted clause -- and stayed green when the CODE
+    widened: round 16's falsification lens injected `return 7` into a registered
+    handler and left this module, `tests/test_cli_mutation.py` and
+    `tests/test_skill_reference_drift.py` all green. A contract that documents
+    the codes someone wrote down rather than the codes the CLI can produce is
+    exactly the #721 defect this file exists to catch, so the two sets are
+    asserted EQUAL and the population is the whole package.
+    """
+    documented = {int(code) for code
+                  in re.findall(r"(?:^|[ ,—-]) ?(\d+) = ", _bullet("- Exit codes:"))}
+    assert documented, "the exit-code bullet no longer lists a single code"
+    returned = _codes_the_cli_can_return()
+    undocumented = {code: returned[code] for code in sorted(set(returned) - documented)}
+    assert set(returned) == documented, (
+        "the exit-code bullet and the CLI package disagree about which codes "
+        f"exist. Documented but returned nowhere: {sorted(documented - set(returned))}. "
+        f"Returned but undocumented: {undocumented}. An undocumented integer "
+        "return here is either an exit code the contract has not caught up with, "
+        "or a magic number that should be a named constant rather than a bare "
+        "`return`"
     )
 
 
@@ -352,7 +407,7 @@ _EXIT_CODE_ECHOES = (
     ("skills/bn/reference/mutating.md", "undeliverable-output-is-2",
      r"reports the documented `(?P<code>\d)` instead", "undeliverable-output"),
     ("skills/bn/reference/mutating.md", "the-status-line-never-walks-it",
-     r"same response exits `(?P<code>\d)` there", "unserializable-reply-as-text"),
+     r"verified reply exits `(?P<code>\d)` there", "unserializable-reply-as-text"),
 )
 
 
@@ -394,9 +449,17 @@ _EXIT_CODE_PINS = (
     ("skills/bn/reference/mutating.md", "an-output-failure-only-moves-toward-2",
      "undeliverable output replaces the code with 2 and can never turn a failed or an\n"
      "unmeasured mutation into a clean zero."),
-    ("skills/bn/reference/mutating.md", "a-2-does-not-mean-the-write-missed",
-     "So a 2 on a mutation says the *requested\n"
-     "output* did not arrive, not that the write did not land"),
+    # Round 16's falsification lens refuted the sentence that stood here ("a 2 on
+    # a mutation says the requested output did not arrive, not that the write did
+    # not land"): an invalid flag VALUE exits 2 at parse time with no request
+    # sent. The replacement says what 2 does NOT tell a consumer, and
+    # tests/test_cli_mutation.py::test_a_rejected_flag_value_is_a_2_with_nothing_sent
+    # measures the counterexample it now names.
+    ("skills/bn/reference/mutating.md", "a-2-alone-does-not-say-the-write-landed",
+     "2 is\n"
+     "also this path's code for a refused request, an unreachable bridge, an\n"
+     "unparseable reply and a flag value rejected before anything was sent, so a 2\n"
+     "alone does not tell you whether the write landed."),
     ("skills/bn/reference/reading.md", "bounded-slice-is-a-success",
      "a provably-bounded constant length (a success, exit 0)"),
     # Found by widening the sweep to the whole agent-facing set: this doc states

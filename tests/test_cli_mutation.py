@@ -1165,6 +1165,73 @@ def test_no_output_flag_can_turn_a_nonzero_classification_into_zero(
     )
 
 
+def test_a_rejected_flag_value_is_a_2_with_nothing_sent(monkeypatch):
+    """The counterexample the mutation reference now names, measured.
+
+    Round 16 wrote "a 2 on a mutation says the requested output did not arrive,
+    not that the write did not land" and pinned it as text. The falsification
+    lens refuted it in one line: an invalid flag VALUE is rejected by the
+    parser, which exits 2 before a request is sent -- so the write did not land,
+    and a consumer following that sentence would re-read the view instead of
+    re-issuing a mutation that never happened. The reference now says what a 2
+    does NOT tell you, and this is the measurement behind it: a 2 with an empty
+    wire log, next to the same command exiting 0 with one request sent.
+    """
+    sent = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, **kwargs):
+        sent.append(op)
+        return {"ok": True, "result": {"success": True, "committed": True,
+                                       "results": [{"status": "verified"}]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    argv = ["symbol", "rename", "--target", "active", "sub_401000", "x"]
+
+    with pytest.raises(SystemExit) as refused:
+        bn.cli.main([*argv, "--format", "jsonn"])
+    assert refused.value.code == 2
+    assert sent == [], f"the parser sent a request before refusing: {sent}"
+
+    # ...and the same command with an accepted value does send and does exit 0,
+    # so the 2 above is the flag value and not the reply behind it.
+    assert bn.cli.main([*argv, "--format", "json"]) == 0
+    assert len(sent) == 1, sent
+
+
+def test_a_locally_built_result_survives_a_renderer_that_cannot_read_it(
+        monkeypatch, capsys):
+    """The receiving function the behavioural half was not covering.
+
+    `_emit_result` is the rendering tail the admin commands share -- they
+    assemble their result from several bridge replies instead of making one
+    `_call`, so they never pass through `_call`'s bindings -- and it binds its
+    own `text_renderer` to the malformed-result rule. Round 16's falsification
+    lens removed that binding and 287 behavioural tests stayed green: the site
+    was load-bearing (a renderer raising there escapes `main()`, which catches
+    only BridgeError, for exit 1 and a traceback) and had no cell anywhere. A
+    guard nothing exercises is the thing this PR is about.
+
+    `capabilities` is the cheapest command on that path: it builds its result
+    from the command registry and needs no bridge at all, so what is measured
+    here is the rule and nothing else.
+    """
+    def renderer_that_cannot_read_it(value):
+        raise TypeError("unhashable type: 'dict'")
+
+    # String form: it imports the handler module, so this cell does not depend
+    # on some earlier import having bound the submodule attribute.
+    monkeypatch.setattr("bn.commands.admin._render_capabilities_text",
+                        renderer_that_cannot_read_it)
+
+    rc = bn.cli.main(["capabilities", "--format", "text"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "could not render the capabilities result as text" in err, err
+    assert "Rerun with --format json" in err, err
+
+
 def test_invariant_guard_unmeasured_mutation_failure_still_exits_three(monkeypatch):
     """Ordering: an unmeasured envelope that also reports failure is a failure
     (exit 3), not "applied but unverifiable" (exit 4)."""

@@ -424,8 +424,13 @@ def _registered_handlers() -> dict[str, object]:
 # `test_the_pin_writer_resolution_states_its_limit_in_both_directions`, against
 # a corpus carrying the shapes the real tree happens not to have.
 #
-# The one remaining over-approximation: two nested `def`s of the SAME name in one
-# function share an entry, so invoking either folds in both.
+# Two over-approximations remain, and they are listed as the ones found rather
+# than as all there are: two nested `def`s of the SAME name in one function share
+# an entry, so invoking either folds in both; and a call written in a DEFAULT
+# ARGUMENT is attributed to the function whose signature carries it, though it
+# runs once at definition time and never when that function is invoked. Both
+# over-detect, which is the direction that costs a real command its index
+# requirement -- so a third one found later is a finding, not a footnote.
 _PIN_WRITER = "bn.session_state._atomic_write"
 
 

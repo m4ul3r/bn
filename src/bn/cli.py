@@ -845,10 +845,19 @@ def _unwrap_result(response: Any, op: str) -> Any:
     """The `result` an ok reply must carry.
 
     A reply of `{"ok": true}` with no `result` key is the same version-skew class
-    as a malformed result -- and `response["result"]` raised a bare `KeyError`
-    out of `main()`, which catches only :class:`BridgeError`, for exit 1 and a
+    as a malformed result, and `response["result"]` raised a bare `KeyError` out
+    of `main()`, which catches only :class:`BridgeError`, for exit 1 and a
     traceback on every output format. The documented code for a response this
     CLI cannot read is 2.
+
+    Stated precisely, because the earlier wording implied more than it should:
+    the production transport already refuses this shape (`send_request` raises
+    :class:`BridgeError` for an ok reply with no `result`), so through that path
+    the `KeyError` was unreachable. This is the CLI-side half of the same
+    guarantee, and it is not redundant -- it is what makes the guarantee a
+    property of this module rather than of one caller's transport, and every
+    place that reads a `result` off a reply goes through here (pinned by
+    `test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper`).
     """
     if not isinstance(response, dict) or "result" not in response:
         raise BridgeError(

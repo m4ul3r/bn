@@ -73,12 +73,15 @@ that is the divergence. The classification is made before any output is
 produced, so a combination asking for output this CLI cannot deliver
 reports the documented `2` instead — an `--out` destination it cannot write, or
 a reply too deeply nested for `--format json`/`ndjson` to serialize. The
-default status line prints named fields and never walks such a reply, so the
-same response exits `0` there. The divergence moves in a single direction: an
+default status line prints named fields and never walks such a reply, so a
+verified reply exits `0` there. The divergence moves in a single direction: an
 undeliverable output replaces the code with 2 and can never turn a failed or an
-unmeasured mutation into a clean zero. So a 2 on a mutation says the *requested
-output* did not arrive, not that the write did not land — re-read the view
-before concluding anything about the write itself.
+unmeasured mutation into a clean zero. But do NOT read that backwards: 2 is
+also this path's code for a refused request, an unreachable bridge, an
+unparseable reply and a flag value rejected before anything was sent, so a 2
+alone does not tell you whether the write landed. The stderr line names which
+of them it was; when it names the delivery step, re-read the view rather than
+re-issuing the mutation.
 
 ### Compact status keys
 
