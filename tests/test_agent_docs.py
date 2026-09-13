@@ -669,7 +669,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "7ae58359",  # Identity is `(boot id, pid, process start ... Start times count 
         "7f52ba89",  # verdict, because one verdict over many jobs would be a lie, and 
         "8c11c1cb",  # ... (Optional) Pin sticky defaults — useful for a **single** ...
-        "91758875",  # bn instance find <substring> # resolve one instance id by partia
         "9308d393",  # **Unreachable bridges are hidden, not ... The bridge binds its s
         "959dac82",  # - ... and ... work **before or after** the subcommand, and for t
         "9954584e",  # > **HARD rule for parallel ... fan-out ... Sticky pins are **one

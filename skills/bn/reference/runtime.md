@@ -66,7 +66,7 @@ bn session status [<job-id>] [-i <id>]   # queued/running/complete/failed
 bn session list [-i <id>]                # all running instances, or filter one
 bn session restart <id>                  # tear down and respawn that bridge for the same target
 bn instance list                         # registered instances and their sockets
-bn instance find <substring>             # resolve one instance id by partial match
+bn instance find <path-or-subname>       # every instance with a matching OPEN BINARY, not an instance-id lookup
 bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
 bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
 bn refresh                               # promote a --quick view to full analysis (see "Quick load" below)
