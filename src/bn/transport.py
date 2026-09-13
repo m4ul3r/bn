@@ -501,21 +501,32 @@ def _load_instance(
         # cache: never connect to it, and never let the stale sweep unlink it.
         # Whether to delete the RECORD is a separate question, and this arm
         # cannot tell "the payload is bogus" from "our reading of the layout is
-        # wrong" -- the symlinked-cache purge proved the second happens. A dead
-        # or unproven owner is corruption or litter, and the registry under our
-        # own cache is swept (#618). A PROVEN live owner keeps its file AND
-        # resolves for the lifecycle lookup, exactly as the missing-socket arm
-        # below does (#694): keeping the file without returning it made it a
+        # wrong" -- the symlinked-cache purge proved the second happens. So
+        # DESTRUCTION here requires positive evidence that the record is litter,
+        # the same evidence the not-live-socket arm below demands: the owner is
+        # gone, or its recorded identity MISMATCHES (proof the bridge exited and
+        # its pid was reused). "unrecorded" is not evidence -- it is what a
+        # pre-#694 bridge, or any platform without /proc, produces for a bridge
+        # that is serving right now -- and deleting on it is how this arm
+        # deleted live bridges twice. The missing-socket arm may demand more
+        # because it HAS more: start() binds the socket before writing the
+        # registry, so an absent socket is itself evidence of a bridge that is
+        # not serving; nothing about an unconfined path says anything about the
+        # bridge.
+        #
+        # A PROVEN live owner also RESOLVES for the lifecycle lookup, exactly as
+        # that arm does (#694): keeping the file without returning it made it a
         # handle for nothing -- `session stop` could not name the process and
         # spawn collision detection could not see the id, so a re-spawn
         # truncated that live bridge's log where refusing the id outright had
         # left it intact. A handle is not a connection: `unreachable` is what
         # stops dispatch (`_send_request_to_instance` refuses it), and normal
-        # discovery keeps hiding it.
-        if not owner_alive or verdict != "proven":
+        # discovery keeps hiding it. An alive owner that proves nothing gets
+        # neither the handle nor the purge: refused, and left alone.
+        if not owner_alive or verdict == "mismatch":
             _purge_stale_registry(path)
             return None
-        if not include_unreachable:
+        if not include_unreachable or verdict != "proven":
             return None
         unreachable = True
     elif not socket_path.exists():
@@ -984,9 +995,10 @@ def _send_request_to_instance(
         # one chokepoint every dispatch goes through.
         raise BridgeError(
             f"bridge_unreachable: Binary Ninja bridge instance "
-            f"{instance_selector(instance)!r} (pid {instance.pid}) has no "
-            f"reachable socket; nothing can be dispatched to it -- stop it with "
-            f"`bn session stop {instance_selector(instance)}`"
+            f"{instance_selector(instance)!r} (pid {instance.pid}) resolved for "
+            f"lifecycle commands only: its recorded socket is either gone or not "
+            f"one this cache can vouch for, so nothing may be dispatched to it "
+            f"-- stop it with `bn session stop {instance_selector(instance)}`"
         )
     expected_identity = _instance_identity(instance)
     payload: dict[str, Any] = {
@@ -1236,6 +1248,18 @@ def _spawn_instance_unlocked(
     # error never quotes the previous bridge's lines as its own (#618).
     keep_log = reg_path.exists()
     log_start = 0
+    # Nothing in this code ever removes a record it could not interpret, so the
+    # append above can otherwise repeat forever with no statement of why the
+    # spawn keeps failing. Name the file and the action in the failure, so the
+    # one thing that ends the condition is something the operator can see.
+    leftover_note = (
+        f" A registry file for {instance_id!r} was already on disk at {reg_path} "
+        f"and discovery could not interpret it, so this log was appended to "
+        f"rather than replaced; if no bridge is running under that id, remove "
+        f"that file."
+        if keep_log
+        else ""
+    )
     if keep_log:
         with contextlib.suppress(OSError):
             log_start = log_path.stat().st_size
@@ -1287,7 +1311,7 @@ def _spawn_instance_unlocked(
         if exit_code is not None:
             message = (
                 f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-                f"exited with code {exit_code} before registering."
+                f"exited with code {exit_code} before registering.{leftover_note}"
             )
             _append_spawn_diagnostic(log_path, message)
             raise BridgeError(f"{message}{_log_tail(log_path, start=log_start)}")
@@ -1300,7 +1324,7 @@ def _spawn_instance_unlocked(
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
         f"did not register within {timeout:g}s and was terminated. "
         f"Check {log_path}. Retry the same command; on a heavily loaded host, "
-        "set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
+        f"set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time.{leftover_note}"
     )
     _append_spawn_diagnostic(log_path, message)
     _reap_child(proc)

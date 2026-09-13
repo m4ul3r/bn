@@ -3937,6 +3937,87 @@ def test_a_record_discovery_cannot_read_keeps_its_bridges_spawn_log(tmp_path, mo
     message = str(excinfo.value)
     assert "no module named binaryninja" in message
     assert "listening on" not in message   # the tail is this child's output only
+    # The one action that ends the condition, named where the operator sees it.
+    assert "could not interpret it" in message and str(inst_dir / "corrupt.json") in message
+
+
+def test_a_spawn_with_no_leftover_record_still_starts_a_fresh_log(tmp_path, monkeypatch):
+    """The other half of the append rule: with no record to protect, truncate.
+
+    Keeping a log that may belong to a live bridge must not turn into never
+    replacing one. When no registry file survived the collision pass there is
+    nothing under that id to protect, and `<id>.log` is a spawn's own output:
+    an unbounded concatenation of every previous run's log would make the
+    breadcrumb useless for the case it exists for.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    log = inst_dir / "fresh.log"
+    log.write_text("output from a run that is long gone\n" * 6, encoding="utf-8")
+    assert not (inst_dir / "fresh.json").exists()
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("ImportError: no module named binaryninja\n")
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("fresh", timeout=1.0, poll_interval=0.01)
+
+    text = log.read_text(encoding="utf-8")
+    assert "long gone" not in text          # truncated: nothing was at risk
+    assert text.startswith("ImportError: no module named binaryninja")
+    assert "could not interpret" not in str(excinfo.value)
+
+
+def test_an_unconfined_socket_keeps_an_unprovable_live_owners_record(tmp_path, monkeypatch):
+    """Destruction needs positive evidence, and "unrecorded" is not evidence.
+
+    ``identity_verdict`` returns ``"unrecorded"`` for a bridge that recorded no
+    identity AND for every bridge on a platform with no ``/proc`` -- including
+    one that is serving right now. Deleting this record on that verdict would
+    make the whole proven-live protection unreachable exactly where it is
+    needed most, so the purge demands what the not-live-socket arm demands: a
+    dead owner, or a MISMATCH that proves the pid was reused. An owner that
+    proves nothing gets neither the purge nor the lifecycle handle -- the
+    payload is refused, and the file is left alone.
+    """
+    import bn.transport as transport
+
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = inst_dir / "noproof.json"
+    record.write_text(
+        json.dumps(_registry_payload(bystander, pid=os.getpid(), instance_id="noproof")),
+        encoding="utf-8",
+    )
+    from bn.proc_identity import identity_verdict
+
+    assert identity_verdict(json.loads(record.read_text()), os.getpid()) == "unrecorded"
+
+    assert list_instances() == []
+    assert list_instances(include_unreachable=True) == []      # no handle either
+    assert transport.find_lifecycle_instance("noproof") is None
+    assert record.exists()                   # refused, never destroyed
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
 
 
 def test_an_unconfined_socket_still_sweeps_a_dead_owners_record(tmp_path, monkeypatch):
