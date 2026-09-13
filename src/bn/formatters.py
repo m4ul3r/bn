@@ -579,7 +579,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
     unimpl = _field_dict(value, "unimplemented_instructions")
     if unimpl.get("count"):
         addrs = _field_list(unimpl, "addresses")
-        shown = ", ".join(addrs)
+        shown = ", ".join(str(addr) for addr in addrs)
         if unimpl.get("truncated"):
             shown += ", …"
         suffix = f" (e.g. {shown})" if shown else ""
@@ -622,7 +622,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         for b in blocks:
             if not isinstance(b, dict):
                 continue
-            out = ", ".join(_field_list(b, "outgoing")) or "-"
+            out = ", ".join(str(edge) for edge in _field_list(b, "outgoing")) or "-"
             # Rows are ADDRESS-ordered (so they are targetable), while `index` is
             # BN's own block index -- label it, or the out-of-order numbers read
             # as a sort bug rather than as CFG order.
@@ -2331,8 +2331,14 @@ def _render_record_table_text(value: Any) -> str:
                 lines.append(f"  {off_s:<6} scalar{nm}  {val_s}  ({f.get('size', '?')}B)")
             elif kind == "null":
                 lines.append(f"  {off_s:<6} null")
-            else:  # unmapped / unreadable
-                lines.append(f"  {off_s:<6} {kind:<7} {f.get('value', '')}".rstrip())
+            # Unmapped / unreadable: `kind` is whatever arrived, and a field row
+            # with no kind at all is the shape an older bridge sends --
+            # `{None:<7}` is a TypeError, so one such ELEMENT cost the whole
+            # table (#619).
+            else:
+                lines.append(
+                    f"  {off_s:<6} {'?' if kind is None else str(kind):<7} "
+                    f"{f.get('value', '')}".rstrip())
     return "\n".join(lines)
 
 
@@ -3202,7 +3208,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                 lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
                 if crossed:
-                    lines.append(f"  crosses: {' <- '.join(crossed)}")
+                    lines.append(f"  crosses: {' <- '.join(str(c) for c in crossed)}")
                 for step in _field_list(sl, "slice"):
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
@@ -3783,10 +3789,32 @@ def _format_operation_result(item: dict[str, Any]) -> str:
         # Name the type(s) defined, not a bare count -- "which type?" is the first
         # thing an agent needs. Parser bookkeeping (parsed functions/variables) is
         # internal noise and moves out of the default line.
-        names = list(_field_dict(item, "defined_types").keys())
+        #
+        # Both reads happen under a LOCAL recorder because the refusal below may
+        # not depend on a boundary being installed: `bn.cli` re-exports this
+        # helper precisely so tests and scripts can call it DIRECTLY, and a
+        # direct caller has no `@_discloses` boundary at all -- so `_field_skewed`
+        # would answer False and the line would fabricate its zero again. Same
+        # idiom as `_add_mutation_ok` and the go-rename summary. The skew is
+        # re-recorded, so an enclosing render still discloses it.
+        token = _SKEWED_FIELDS.set([])
+        try:
+            declared = _field_dict(item, "defined_types")
+            count = _count_field(item, "count")
+            unreadable = sorted(_SKEWED_FIELDS.get() or ())
+        finally:
+            _SKEWED_FIELDS.reset(token)
+        for key in unreadable:
+            _record_skew(key)
+        names = [str(name) for name in declared]
         if names:
             return f"types_declare {', '.join(names)}"
-        return f"types_declare {item.get('count', 0)} types"
+        if unreadable:
+            # "0 types" off a listing we could not read is the fabricated zero
+            # #683 discarded a committed rename batch to, one op over: the row
+            # would read as a declare that defined nothing.
+            return f"types_declare <unreadable {', '.join(unreadable)}>"
+        return f"types_declare {count} types"
     return _render_fallback_text(item)
 
 

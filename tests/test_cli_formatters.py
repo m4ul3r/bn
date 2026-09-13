@@ -947,12 +947,13 @@ def test_the_disclosure_reaches_an_early_return_path():
     assert "malformed function field" in values
 
 
-# The tests this PR adds that PASS against the base commit, declared rather than
-# discovered by whoever next runs the vacuity check. Six of them, and each is
-# green on base BY DESIGN -- a test whose subject is this file's own machinery,
-# or an invariant that already held and must keep holding. The declaration is
-# the point: "green on base" is the first thing a reviewer checks for vacuity,
-# and an undeclared green test costs a round of argument every time.
+# The tests this PR adds that PASS against the base commit -- MEASURED, not
+# declared from memory (see the test below, which re-runs them against the base
+# module and requires this table to match exactly). Each is green on base BY
+# DESIGN: a test whose subject is this file's own machinery, or an invariant
+# that already held and must keep holding. The declaration is the point: "green
+# on base" is the first thing a reviewer checks for vacuity, and an undeclared
+# green test costs a round of argument every time.
 #
 # Each is proven non-vacuous by breaking the exact thing it defends:
 _GREEN_ON_BASE_BY_DESIGN = {
@@ -973,16 +974,134 @@ _GREEN_ON_BASE_BY_DESIGN = {
     "test_well_formed_realistic_payloads_carry_no_disclosure":
         "the no-false-positive half of the disclosure -- red if a legitimately "
         "empty container starts recording a skew",
+    "test_the_green_on_base_declaration_is_not_stale":
+        "the measurement below is of git and a child process, not of the "
+        "module, so it holds at either commit -- and it was the SEVENTH green "
+        "test the six-name declaration did not name",
 }
+
+# The PR's base commit: what "green on base" is measured AGAINST. A parameter of
+# the measurement, not of the module, so it is spelled exactly once.
+_BASE_SHA = "f4ed1fa0dc2bc7c098dc40ebdbeec18e7e52609c"
+
+
+def _tests_added_by_this_branch():
+    """Every `test_*` in this file that the base commit does not have."""
+    import ast
+    import pathlib
+    import subprocess
+
+    here = pathlib.Path(__file__).resolve()
+    root = here.parents[1]
+    base = subprocess.run(
+        ["git", "-C", str(root), "show", f"{_BASE_SHA}:{here.relative_to(root)}"],
+        capture_output=True, text=True, check=True).stdout
+
+    def names(source):
+        return {node.name for node in ast.parse(source).body
+                if isinstance(node, ast.FunctionDef)
+                and node.name.startswith("test_")}
+
+    return names(here.read_text()) - names(base)
+
+
+def _green_against_the_base_module(deselect):
+    """Which tests in this file PASS against the BASE formatters module.
+
+    Measured by RUNNING them: the base module is checked out of git into a
+    shadow package that the child's `pythonpath` points at INSTEAD of `src`,
+    and this same file is re-run against it in a child process. Nothing here
+    consults the declaration it is used to check.
+
+    The shadow is installed through pytest's own `pythonpath` ini rather than
+    through the environment, because this project SETS that ini to `src`: the
+    plugin inserts it at `sys.path[0]` on every run, ahead of anything
+    `PYTHONPATH` can reach, so an env-var shadow silently measured the HEAD
+    module and reported every test green on base."""
+    import os
+    import pathlib
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import xml.etree.ElementTree as ET
+
+    from bn import formatters
+
+    here = pathlib.Path(__file__).resolve()
+    root = here.parents[1]
+    base_source = subprocess.run(
+        ["git", "-C", str(root), "show", f"{_BASE_SHA}:src/bn/formatters.py"],
+        capture_output=True, text=True, check=True).stdout
+    package = pathlib.Path(formatters.__file__).resolve().parent
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = pathlib.Path(tmp) / package.name
+        shutil.copytree(package, shadow,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        (shadow / "formatters.py").write_text(base_source)
+        report = pathlib.Path(tmp) / "base.xml"
+        # The node id is spelled RELATIVE to the run's cwd, because that is what
+        # pytest collects and therefore the only spelling `--deselect` matches.
+        # An absolute one silently matches nothing -- and the test it must
+        # deselect is the one that spawns this child, so a deselect that misses
+        # recurses forever instead of failing. The caller asserts the deselect
+        # took effect, which is why the reported names come back too.
+        node = f"{here.relative_to(root)}::{deselect}"
+        subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "--no-header", "--tb=no", "-o", f"pythonpath={tmp}",
+             f"--junitxml={report}",
+             str(here.relative_to(root)), "--deselect", node],
+            cwd=root, env=os.environ.copy(), capture_output=True, text=True,
+            timeout=900)
+        passed, failed = set(), set()
+        for case in ET.parse(report).iter("testcase"):
+            name = (case.get("name") or "").split("[")[0]
+            target = (failed if any(child.tag in ("failure", "error")
+                                    for child in case) else passed)
+            target.add(name)
+    return passed - failed, passed | failed
 
 
 def test_the_green_on_base_declaration_is_not_stale():
-    """A declaration nobody re-checks is prose, including this one."""
-    missing = [name for name in _GREEN_ON_BASE_BY_DESIGN
-               if name not in globals()]
-    assert not missing, (
-        f"_GREEN_ON_BASE_BY_DESIGN names {missing}, which no longer exist. "
-        "Drop them, or the list certifies tests that are not here.")
+    """A declaration nobody re-checks is prose, including this one.
+
+    Checking that the NAMES exist was not a check at all: the table said six,
+    the measurement says seven, and the seventh is THIS test -- which sat
+    outside its own list for thirteen rounds with the guard green. A
+    declaration whose guard cannot fail is this PR's own recurring defect one
+    level up, so the set is MEASURED: every test this branch adds is re-run
+    against the base module, and the table must equal exactly what passes
+    there. Add a green-on-base test without declaring it and this fails; keep a
+    name that has gone red on base and this fails too.
+
+    ONE exemption, unique by construction: this test is deselected in the child
+    run, because measuring it would re-enter the measurement. Its name comes
+    from the running frame rather than being spelled, so the exemption cannot
+    drift onto a second test, and it is still declared above like any other."""
+    mine = inspect.currentframe().f_code.co_name
+    added = _tests_added_by_this_branch()
+    assert mine in added, (
+        f"{mine} is not new on this branch, so the self-exemption below is "
+        "excusing a test the base already had")
+    green, reported = _green_against_the_base_module(mine)
+    # The exemption, executed: the child must have run this file and must NOT
+    # have run THIS test. A report missing the whole file (a shadow package that
+    # would not import) would otherwise read as "nothing is green on base".
+    assert len(reported) > len(added), (
+        f"the child run reported only {len(reported)} tests, fewer than the "
+        f"{len(added)} this branch adds -- it did not measure the base module, "
+        "so the comparison below would be against nothing")
+    assert mine not in reported, (
+        f"the child run executed {mine}, so the deselect stopped matching and "
+        "the measurement is measuring itself")
+    measured = (green & added) | {mine}
+    assert set(_GREEN_ON_BASE_BY_DESIGN) == measured, (
+        "the green-on-base declaration disagrees with the measurement. "
+        f"undeclared: {sorted(measured - set(_GREEN_ON_BASE_BY_DESIGN))}; "
+        f"declared but red on base: {sorted(set(_GREEN_ON_BASE_BY_DESIGN) - measured)}. "
+        "An undeclared green test reads as vacuous coverage; a declared one "
+        "that has gone red is a reason nobody re-derived.")
     assert all(_GREEN_ON_BASE_BY_DESIGN.values()), (
         "every entry needs the reason it is green on base by design")
 
@@ -1627,6 +1746,13 @@ _MALFORMED = {
     "dict": ("bad", ["bad"], 0, "", False, []),
 }
 
+# The ELEMENT axis of the same idea: a list that arrives with the wrong CONTENTS
+# rather than as the wrong container. Shared by the top-level and the nested
+# element sweeps, so the two cannot drift into covering different shapes -- two
+# sweeps of the same property with two junk sets is one of them silently
+# narrower than the other.
+_ELEMENT_JUNK = (None, 0, 1, True, "s", [], {}, [{"a": 1}], {"a": 1})
+
 
 # Excluded from the probe BY NAME, each with the reason it is not a payload TEXT
 # renderer. An exclusion that is not named here does not exist: a silent one is
@@ -1734,7 +1860,7 @@ def _raw_payload_also_rendered(name):
         if path.resolve() == module:
             continue
         tree = ast.parse(path.read_text())
-        symbols, modules = _formatters_bindings(tree)
+        symbols, modules = _formatters_bindings(tree, _package_modules().get(path.resolve()))
         users = {fn.name for fn in ast.walk(tree)
                  if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and name in _formatters_refs(fn, symbols, modules)}
@@ -1780,28 +1906,111 @@ _COMPOSED_ENTRY_POINTS = {
 }
 
 
-def _formatters_bindings(tree):
-    """Every name in one module's AST that is bound to a formatters SYMBOL, and
-    every name bound to the formatters MODULE.
+@functools.lru_cache(maxsize=1)
+def _package_modules():
+    """Every module of the formatters' own package, IMPORTED, keyed by file.
 
-    Two bindings, because there are two ways to reach a symbol and an inventory
-    that knows only one of them is a spelling rule -- the class of defect rounds
-    8, 9, 10 and 11 each broke on. `from ...formatters import _render_x` binds a
-    symbol and is read as an `ast.Name`; `from .. import formatters as _fmt` and
-    `import bn.formatters` bind the MODULE, and `_fmt._render_x` is an
-    `ast.Attribute` that no Name walk will ever see. A renderer installed that
-    way was in no inventory, no population and no named exclusion."""
+    The identity sweep needs OBJECTS, not source text: a binding is only
+    discoverable by `id()` once the module that holds it exists."""
+    import importlib
+    import pathlib
+    import pkgutil
+
+    from bn import formatters
+
+    package = formatters.__package__
+    root = pathlib.Path(formatters.__file__).resolve().parent
+    names = [package] + [info.name for info in
+                         pkgutil.walk_packages([str(root)], prefix=package + ".")]
+    modules = {}
+    for name in names:
+        module = importlib.import_module(name)
+        if getattr(module, "__file__", None):
+            modules[pathlib.Path(module.__file__).resolve()] = module
+    return modules
+
+
+@functools.lru_cache(maxsize=1)
+def _formatters_identities():
+    """`id()` -> canonical name, for every symbol the formatters module OWNS.
+
+    Ownership is `__module__`, not membership of `vars()`: `formatters.json` is
+    the json module, and a command module's own `import json` binds the very
+    same object, so an identity rule without an ownership filter would report
+    `json` as a formatters entry point. Sorted so an in-module alias resolves to
+    one canonical name deterministically rather than to whichever binding the
+    dict happened to yield last."""
+    from bn import formatters
+
+    return {id(obj): name for name, obj in sorted(vars(formatters).items(), reverse=True)
+            if callable(obj)
+            and getattr(obj, "__module__", None) == formatters.__name__}
+
+
+@functools.lru_cache(maxsize=1)
+def _formatters_identity_inventory():
+    """Every formatters symbol BOUND anywhere in the package, found by `id()`.
+
+    THE answer to "is this inventory a spelling rule", and the reason it is not
+    widened a sixth time. Rounds 8-13 each closed one more spelling -- a bare
+    name, a module attribute, a non-`_render` prefix, a directory glob, a
+    keyword other than `*_renderer=` -- and each widening exposed live payload
+    consumers the previous one had certified. `id()` does not care how a binding
+    was written: a symbol re-exported through a shim (`from .shim import
+    _render_x`), one bound by `getattr(formatters, name)`, one renamed on the way
+    in, and one reached through an alias of an alias are all the SAME OBJECT.
+
+    The live case this found: `bn.cli` re-exports `_format_operation_result` so
+    tests and scripts can monkeypatch it, and then never mentions the name
+    again. No AST reference walk can see that -- there is no reference -- so a
+    payload consumer that renders every mutation's op rows sat in no inventory,
+    no population and no exclusion, and its malformed `defined_types` rendered
+    byte-identically to the field being absent."""
+    from bn import formatters
+
+    owned = _formatters_identities()
+    found: set[str] = set()
+    for module in _package_modules().values():
+        if module is formatters:
+            continue
+        for obj in list(vars(module).values()):
+            if id(obj) in owned:
+                found.add(owned[id(obj)])
+    return frozenset(found)
+
+
+def _formatters_bindings(tree, module=None):
+    """Every name in one module that is bound to a formatters SYMBOL, and every
+    name bound to the formatters MODULE.
+
+    Identity first, import syntax second. The identity half resolves a local
+    name to its CANONICAL formatters name however the binding was spelled (see
+    `_formatters_identity_inventory`), including a module alias of an alias --
+    `import bn.formatters as f; g = f` leaves `g` the same module object, which
+    no name-matching walk can follow. The syntax half is kept for what identity
+    cannot attribute: a NON-CALLABLE like `FAILED_MUTATION_STATUSES` carries no
+    `__module__`, so ownership of it is only visible in the import statement.
+    The union is strictly stronger than either."""
     import ast
 
-    symbols: set[str] = set()
+    from bn import formatters
+
+    owned = _formatters_identities()
+    symbols: dict[str, str] = {}
     modules: set[str] = set()
+    if module is not None:
+        for local, obj in list(vars(module).items()):
+            if id(obj) in owned:
+                symbols[local] = owned[id(obj)]
+            elif obj is formatters:
+                modules.add(local)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 if alias.name == "formatters":          # from . import formatters
                     modules.add(alias.asname or alias.name)
                 elif (node.module or "").endswith("formatters"):
-                    symbols.add(alias.asname or alias.name)
+                    symbols.setdefault(alias.asname or alias.name, alias.name)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.endswith("formatters"):   # import bn.formatters as F
@@ -1814,7 +2023,8 @@ def _formatters_refs(node, symbols, modules):
     spelling: a bare name bound from the module, or an attribute taken off the
     module itself (`_fmt._x`, `bn.formatters._x`). An attribute is only counted
     when the live module really has it, so `_fmt.json` is not mistaken for an
-    entry point."""
+    entry point. A bare name resolves through `symbols` to its CANONICAL name,
+    so a renamed import is not reported under the local spelling."""
     import ast
 
     from bn import formatters
@@ -1822,7 +2032,7 @@ def _formatters_refs(node, symbols, modules):
     found: set[str] = set()
     for inner in ast.walk(node):
         if isinstance(inner, ast.Name) and inner.id in symbols:
-            found.add(inner.id)
+            found.add(symbols[inner.id])
         elif isinstance(inner, ast.Attribute):
             base = inner.value
             if ((isinstance(base, ast.Name) and base.id in modules)
@@ -1854,7 +2064,7 @@ def _cli_installed_transforms():
         if path.resolve() == module:
             continue
         tree = ast.parse(path.read_text())
-        symbols, modules = _formatters_bindings(tree)
+        symbols, modules = _formatters_bindings(tree, _package_modules().get(path.resolve()))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1870,9 +2080,8 @@ def _cli_installed_transforms():
 
 
 @functools.lru_cache(maxsize=1)
-def _cli_referenced_formatters():
-    """Every `bn.formatters` symbol the command modules REFERENCE, read out of
-    their own AST.
+def _cli_invoked_formatters():
+    """Every `bn.formatters` symbol the package MENTIONS, read out of its AST.
 
     An inventory of this module's LIVE ENTRY POINTS that is independent of how
     the module spells its function names and of which functions carry the
@@ -1894,7 +2103,13 @@ def _cli_referenced_formatters():
     CLI ENTRY module installs the mutation transforms directly, so three live
     payload consumers were in neither population and in no named exclusion, and
     a coercion added to any of them kept every guard in this file green. A
-    directory glob is a spelling rule like any other."""
+    directory glob is a spelling rule like any other.
+
+    Kept apart from the identity inventory for ONE reason, and it is not
+    cosmetic: a symbol the package MENTIONS is one production invokes at that
+    spelling -- bare, with no boundary but its own -- and `_probe_renderers`
+    must therefore probe it bare. A symbol only BOUND (a re-export) is invoked
+    by nothing, so probing it bare would measure a caller that does not exist."""
     import ast
     import pathlib
 
@@ -1906,9 +2121,22 @@ def _cli_referenced_formatters():
         if path.resolve() == module:
             continue                   # the module under guard is not its own caller
         tree = ast.parse(path.read_text())
-        symbols, modules = _formatters_bindings(tree)
+        symbols, modules = _formatters_bindings(tree, _package_modules().get(path.resolve()))
         referenced |= _formatters_refs(tree, symbols, modules)
     return frozenset(referenced)
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_referenced_formatters():
+    """THE inventory: every formatters symbol the package reaches, however.
+
+    The AST half is only HALF, because every one of the five earlier widenings
+    was another spelling. This is the union of what the package MENTIONS and
+    what it BINDS BY IDENTITY, so a consumer reachable through a re-export, a
+    `getattr`, a rename or an alias of an alias cannot be outside it -- see
+    `_formatters_identity_inventory`, which is what finally caught `bn.cli`'s
+    re-exported `_format_operation_result`."""
+    return _cli_invoked_formatters() | _formatters_identity_inventory()
 
 
 def test_every_renderer_the_cli_installs_is_in_the_population():
@@ -1924,17 +2152,20 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
     from bn import formatters
 
     installed = _cli_referenced_formatters()
-    # Anti-vacuity: a broken AST walk returning nothing would satisfy the
-    # subset check below without examining anything. The six names are the ones
-    # the three spelling rules this test exists to replace would each have
-    # missed: a note (no `_render` prefix), a steer (same, plus a REQUIRED
-    # keyword-only flag), a text slicer, a bucket splitter the CLI calls
-    # directly rather than installing under a `*_renderer=` keyword, and two
-    # transforms that live in the CLI ENTRY module rather than under
-    # `commands/`.
+    # Anti-vacuity: a broken walk returning nothing would satisfy the subset
+    # check below without examining anything. These names are the ones the
+    # spelling rules this test exists to replace would each have missed: a note
+    # (no `_render` prefix), a steer (same, plus a REQUIRED keyword-only flag),
+    # a text slicer, a bucket splitter the CLI calls directly rather than
+    # installing under a `*_renderer=` keyword, two transforms that live in the
+    # CLI ENTRY module rather than under `commands/`, and -- the one no AST
+    # reference walk can reach at all -- `_format_operation_result`, which
+    # `bn.cli` re-exports for monkeypatching and never references by name.
+    # Only the identity sweep sees that one, and it absorbed a malformed
+    # `defined_types` silently for the whole time it was invisible.
     assert {"_resolution_note", "_disasm_linear_steer_note", "_slice_text_lines",
             "_xref_buckets", "_render_defuse_text", "_mutation_summary",
-            "_add_mutation_ok"} <= installed, sorted(installed)
+            "_add_mutation_ok", "_format_operation_result"} <= installed, sorted(installed)
     probed = {label.split("(")[0] for label, _ in _probe_renderers()}
     missing = sorted(installed - probed - set(_PROBE_EXCLUSIONS))
     assert not missing, (
@@ -1942,6 +2173,25 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
         "runs, so no guard below can fail on them. Probe them, compose them in "
         "_COMPOSED_ENTRY_POINTS, or name each one in _PROBE_EXCLUSIONS with the "
         "reason it is not a payload text renderer.")
+    # The identity sweep's residue: names the package BINDS but never mentions
+    # again. They are probed WRAPPED (see `_probe_renderers`) on the claim that
+    # production reaches them only as a fragment under the boundary of the
+    # renderer that composes them -- so that claim is executed here rather than
+    # asserted, because an exemption whose reason nobody re-checks is how four
+    # of this PR's rounds ended. Some PROBED `@_discloses` renderer must reach
+    # each one, or the fragment has no boundary anywhere and the wrapped probe
+    # is measuring the harness.
+    reach = _module_reach()
+    for name in sorted(installed - _cli_invoked_formatters()):
+        holders = sorted(
+            renderer for renderer in probed
+            if name in reach.get(renderer, ())
+            and hasattr(getattr(formatters, renderer, None), "__wrapped__"))
+        assert holders, (
+            f"{name} is bound by the package but invoked by nothing, and no "
+            "probed @_discloses renderer reaches it either -- so the skew it "
+            "records drains nowhere and probing it under a manufactured "
+            "boundary proves nothing. Give it a real caller, or probe it bare.")
     # A transform's output REPLACES the payload, so no downstream renderer can
     # re-read what it absorbed: it must be COMPOSED, and it may never be waved
     # through as an exclusion. Both halves are derived from the CLI's AST, so a
@@ -2072,10 +2322,22 @@ def _probe_renderers():
 
             # An already-decorated renderer appends its own note from inside
             # `call`; a nested helper needs the boundary its caller supplies in
-            # production. A renderer the CLI installs directly has NO such
-            # caller, so it is probed exactly as bare as production leaves it.
+            # production. A renderer the package INVOKES has no such caller, so
+            # it is probed exactly as bare as production leaves it.
+            #
+            # INVOKED, not merely in the inventory: a symbol that is only BOUND
+            # (`bn.cli` re-exports `_format_operation_result` and never mentions
+            # it again) is called by nothing at that spelling, and every
+            # production path reaches it as the FRAGMENT BUILDER it is, under the
+            # boundary of the renderer that composes its row. Probing such a one
+            # bare would report an absorption no caller can see, and wrapping an
+            # invoked one would manufacture a disclosure the user never gets --
+            # the probe must call a live entry point exactly as its caller does,
+            # or it measures the harness instead of the code. Which side a name
+            # falls on is asserted in
+            # `test_every_renderer_the_cli_installs_is_in_the_population`.
             out.append((label, call if hasattr(fn, "__wrapped__")
-                        or name in _cli_referenced_formatters()
+                        or name in _cli_invoked_formatters()
                         else formatters._discloses(call)))
     # The composed entry points, appended LAST and never wrapped: production
     # does not wrap them either -- the paired renderer carries its own boundary,
@@ -2290,9 +2552,19 @@ def _comparison_constants():
     return out
 
 
-def _lookup_key(node):
-    """The string key a node reads off a mapping, or None. `x.get("k")` and
-    `x["k"]` only -- a variable key names no constant to pair a literal with."""
+def _lookup_key(node, aliases=None):
+    """The string key a node reads off a mapping, or None. `x.get("k")`,
+    `x["k"]`, and a LOCAL bound from one of those.
+
+    The alias hop is not a nicety: `op = item.get("op")` followed by
+    `op == "types_declare"` is the module's DOMINANT gate spelling, and a rule
+    that matched only the inline form harvested no key at all for such a
+    function -- so its gates fell back to "one literal in EVERY slot", which
+    opens the branch and simultaneously fills the earlier alternative of every
+    `or` chain inside it. A key read only on the LATER alternative
+    (`item.get("local_id") or item.get("variable")`) was then read in no context
+    the discovery ever built, which is round 13's conjunction hole reached
+    through a variable instead of a second key."""
     import ast
 
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -2303,7 +2575,30 @@ def _lookup_key(node):
     if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
             and isinstance(node.slice.value, str)):
         return node.slice.value
+    if isinstance(node, ast.Name) and aliases:
+        return aliases.get(node.id)
     return None
+
+
+def _lookup_aliases(fn):
+    """Every local in one function bound to a keyed read, `name -> key`. Last
+    binding wins: `op = item.get("op", "?")` followed by `op = str(op)` keeps
+    the key, because the second binding names none."""
+    import ast
+
+    aliases: dict[str, str] = {}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            key = _lookup_key(node.value)
+            if key:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases[target.id] = key
+        elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+            key = _lookup_key(node.value)
+            if key:
+                aliases[node.target.id] = key
+    return aliases
 
 
 @functools.lru_cache(maxsize=1)
@@ -2331,11 +2626,12 @@ def _keyed_comparison_constants():
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         keyed: dict[str, list] = {}
+        aliases = _lookup_aliases(fn)
         for node in ast.walk(fn):
             if not isinstance(node, ast.Compare):
                 continue
             sides = [node.left, *node.comparators]
-            keys = [k for k in (_lookup_key(side) for side in sides) if k]
+            keys = [k for k in (_lookup_key(side, aliases) for side in sides) if k]
             if not keys:
                 continue
             consts = []
@@ -2534,6 +2830,20 @@ def _runtime_population():
                                 {k: "probe" for k in keys if k != key},
                                 *({k: literal for k in keys if k != key}
                                   for literal in literals),
+                                # The gate ALONE, before the filled variants: a
+                                # filler is a VALUE, and a value satisfies the
+                                # earlier alternative of an `or` fallback --
+                                # `item.get("local_id") or item.get("variable")`
+                                # never reaches `variable` in any context whose
+                                # other keys are filled, so that read was
+                                # recorded against the bare payload (where the
+                                # op gate is absent and it is not read either)
+                                # and its sweep entered no branch at all. Same
+                                # for a dict read only through `.get()` on a
+                                # fallback path: unfilled, `requested` is
+                                # walked and classifies as the container it is.
+                                *({g: v for g, v in gate.items() if g != key}
+                                  for gate in _gated_contexts(keys, keyed)),
                                 *({**{k: copy.deepcopy(_PROBE_WELL_FORMED["dict"])
                                       for k in keys if k != key},
                                    **{g: v for g, v in gate.items() if g != key}}
@@ -2708,7 +3018,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (104, 89, 565, 197), (
+    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 580, 199), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -2724,9 +3034,9 @@ def test_the_runtime_population_is_exactly_this_big():
     # regression to `{}` for every unclassified read -- which is what round 12
     # blocked on -- moves this number, so it cannot happen quietly again.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 142, (
+    assert len(situated) == 156, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 142. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 156. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -2834,10 +3144,6 @@ def test_every_count_the_go_rename_summary_decides_on_is_covered_by_measured():
 _RESIDUE_DIRECT_COVER = {
     "_blast_radius_line.affected_summary":
         ("dict", [lambda v: {"affected_summary": v}]),
-    "_format_operation_result.defined_types":
-        ("dict", [lambda v: {"op": "types_declare", "defined_types": v}]),
-    "_format_operation_result.requested":
-        ("dict", [lambda v: {"op": "set_comment", "requested": v}]),
     "_leaf_group_key.callee":
         ("dict", [lambda v: {"kind": "unmodeled_callee", "callee": v},
                   lambda v: {"kind": "arg_under_recovered", "callee": v}]),
@@ -2907,10 +3213,13 @@ def test_every_uncovered_read_is_covered_directly():
             "different gate inherits it silently. Give the new site its own "
             "builder, or get it into a population.")
         covered += len(matching)
-    assert covered == 8, (
-        f"the residue cover accounts for {covered} reads, not 8 -- the size of "
+    assert covered == 6, (
+        f"the residue cover accounts for {covered} reads, not 6 -- the size of "
         "the exempted set, which moves only with an entry you deliberately "
-        "added or removed")
+        "added or removed. It shrank by two when the identity sweep put "
+        "`_format_operation_result` in the population: an exempted read that "
+        "gets a real differential must LEAVE this table, or the exemption "
+        "outlives the hole it was written for.")
 
     for label, (kind, builders) in sorted(_RESIDUE_DIRECT_COVER.items()):
         fn_name, key = label.rsplit(".", 1)
@@ -3032,9 +3341,9 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
                       "_render_leaf_line.tainted_args"], (
         "a choke-point read the probe reaches at top level is no longer "
         f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 91, (
+    assert len(nested) == 89, (
         f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 91")
+        "reach them, not 89")
     # Counting is not covering, and that was round 9's blocker: the nested reads
     # were counted here and then differentially tested nowhere, so a one-hop
     # helper coercing a nested ref bucket passed every guard in this file. Every
@@ -3108,11 +3417,12 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     ambiguous-count tests -- because it needs a per-site expectation this
     property cannot derive.
 
-    Measured by replaying THIS population against the base module (same keys,
-    same contexts, same `_MALFORMED` values; base's renderers are called bare
-    because base has no disclosure boundary to wrap them in): base absorbs 918
-    of these 1182 cases at 194 of the 197 container positions, and raises in
-    100 more; this commit absorbs 0 and raises 0."""
+    Measured by replaying this differential against the base module (same keys,
+    same contexts, same `_MALFORMED` values, base's own discovered population
+    -- 568 pairs, 199 of them containers; base's renderers are called bare
+    because base has no disclosure boundary to wrap them in): base absorbs 904
+    of its 1194 cases at 191 of those 199 container positions, and raises in
+    130 more; this commit absorbs 0 and raises 0."""
     from bn import formatters
 
     echoes = formatters._render_fallback_text              # the raw-payload dump
@@ -3150,17 +3460,18 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1182, f"the differential ran {checked} cases, not 1182"
+    assert checked == 1194, f"the differential ran {checked} cases, not 1194"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 564 read keys
-    rather than the 197 the container probe classifies as containers: a renderer
+    """The soft-degrade half of #619, kind-free, so it covers all 580 read keys
+    rather than the 199 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
-    Over these same 4512 renders base raises 153 times across 58 (renderer, key)
-    positions; this commit raises 0. Two of those renderers
+    Base, swept the same way over its own population, raises 182 times across
+    69 (renderer, key) positions in 4544 renders; this commit raises 0 in 4640.
+    Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
     that takes a defaulted flag beside its payload -- which is the argument for
@@ -3178,7 +3489,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4520, f"the raise sweep ran {swept} renders, not 4520"
+    assert swept == 4640, f"the raise sweep ran {swept} renders, not 4640"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -3188,12 +3499,12 @@ def test_the_nested_population_is_exactly_this_big():
     nested = _nested_population()
     depths = collections.Counter(len(path) for _, _, path, _, _, _ in nested)
     containers = [rec for rec in nested if rec[4] is not None]
-    assert (len(nested), len(containers)) == (1332, 204), (
+    assert (len(nested), len(containers)) == (1333, 204), (
         f"the nested population changed size: {len(nested)} nested keys read, "
         f"{len(containers)} of them as containers. If you added a nested read, "
         "update these numbers; if you did not, a renderer stopped reading a "
         "nested field and the differential below stopped covering it.")
-    assert dict(sorted(depths.items())) == {1: 797, 2: 343, 3: 114, 4: 48, 5: 24, 6: 6}, (
+    assert dict(sorted(depths.items())) == {1: 798, 2: 343, 3: 114, 4: 48, 5: 24, 6: 6}, (
         f"the nested population's shape changed: {dict(sorted(depths.items()))}")
     # THE convergence proof, and the answer to round 10's second blocker: the
     # descent stopped because a level found no further container, not because it
@@ -3219,9 +3530,11 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
     shape rendered byte-identically to the key being absent. Counting is not
     covering.
 
-    Replayed against the base module the way the top-level differential is: base
-    absorbs 1006 of these 1224 nested cases at 193 of the 204 nested container
-    positions and raises in 141 more; this commit absorbs 0."""
+    Replayed against the base module the way the top-level differential is
+    (base's own nested population: 1225 keys, 187 of them containers, because
+    the descent is derived from the module it runs on): base absorbs 936 of its
+    1122 nested cases at 176 of those 187 positions and raises in 110 more;
+    this commit absorbs 0 of 1224."""
     from bn import formatters
 
     echoes = formatters._render_fallback_text
@@ -3262,8 +3575,9 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
 
     Kind-free because the crash does not need a container: a sampled string
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
-    spec, an unhashable `kind` used as a grouping key. Over these 10656 renders
-    base raises 297 times at 97 nested positions; this commit raises 0."""
+    spec, an unhashable `kind` used as a grouping key. Base, swept over its own
+    nested population the same way, raises 250 times at 79 nested positions in
+    9800 renders; this commit raises 0 in 10664."""
     swept, raised = 0, []
     for fn_name, render, path, key, _kind, ctx in _nested_population():
         base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
@@ -3277,7 +3591,7 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-    assert swept == 10656, f"the nested raise sweep ran {swept} renders, not 10656"
+    assert swept == 10664, f"the nested raise sweep ran {swept} renders, not 10664"
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
@@ -3312,7 +3626,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1327, f"the mirror ran {checked} renders, not 1327"
+    assert checked == 1359, f"the mirror ran {checked} renders, not 1359"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -4598,15 +4912,16 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     The property is the sweep's, not the differential's: an element the
     renderer cannot use may legitimately render as a placeholder or be skipped,
     but it may never RAISE where the same payload with that list absent
-    renders cleanly. Sizes are exact, for the reason every size here is."""
-    junk = [None, 0, 1, True, "s", [], {}, [{"a": 1}], {"a": 1}]
+    renders cleanly. Base raises 213 times at 30 of its list positions over the
+    same 1134 renders; this commit raises 0. Sizes are exact, for the reason
+    every size here is."""
     raised = []
     swept = 0
     for label, render, key, kind, ctx in _runtime_population():
         if kind != "list":
             continue
         absent = _render_or_exception(render, copy.deepcopy(ctx))
-        for element in junk:
+        for element in _ELEMENT_JUNK:
             payload = {**copy.deepcopy(ctx), key: [copy.deepcopy(element)]}
             swept += 1
             out = _render_or_exception(render, payload)
@@ -4621,6 +4936,52 @@ def test_no_list_ELEMENT_costs_the_whole_render():
         "covered set (every list position the population discovered x every "
         "junk element kind), so move it only with a list position you "
         "deliberately added or removed")
+
+
+def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
+    """The element sweep at the positions the top-level one cannot reach, and the
+    last population in this file that covered only its own first level.
+
+    Exactly the repair round 9 made to the container differential, one axis
+    over: the top-level element sweep varies the elements of a list AT the
+    payload, so a list of wrong elements one or six containers DOWN -- a block's
+    `outgoing` edges, a slice's `crossed_functions`, a record row's `fields` --
+    was outside every population by construction. Measured at the head that
+    added the top-level sweep: 74 live raises across 4 code sites and 10
+    (renderer, path) positions, every one of them a `", ".join(...)` or a format
+    spec over an element the payload never promised was a string. One such
+    element cost the WHOLE function card, where the same payload with that
+    nested list absent rendered cleanly.
+
+    Same property as at top level -- an unusable element may render as a
+    placeholder or be skipped, never RAISE -- and the same junk set, shared with
+    it so the two sweeps cannot drift into covering different shapes. Base,
+    swept over its own nested population, raises 216 times at 25 positions in
+    720 renders; this commit raises 0 in 873."""
+    raised = []
+    swept = 0
+    for label, render, path, key, kind, ctx in _nested_population():
+        if kind != "list":
+            continue
+        base = {k: v for k, v in _PROBE_ELEMENT.items() if k != key}
+        absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
+        for element in _ELEMENT_JUNK:
+            swept += 1
+            out = _render_or_exception(
+                render, _payload_for(ctx, path, {**base, key: [copy.deepcopy(element)]}))
+            if isinstance(out, BaseException) and not isinstance(absent, BaseException):
+                where = ".".join(k for k, _ in path)
+                raised.append(f"{label}({where}[].{key}=[{element!r}]) raised "
+                              f"{type(out).__name__}: {out}")
+    assert not raised, (
+        "a wrong-shaped ELEMENT of a NESTED list cost the whole render where "
+        "the same payload with that list absent rendered cleanly: "
+        f"{raised[:6]}")
+    assert swept == 873, (
+        f"the nested element sweep ran {swept} renders, not 873 -- the size of "
+        "the covered set (every nested list position the descent discovered x "
+        "every junk element kind), so move it only with a nested list position "
+        "you deliberately added or removed")
 
 
 
