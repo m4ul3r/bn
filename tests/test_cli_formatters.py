@@ -1844,7 +1844,8 @@ def _runtime_population():
       on a coercion it cannot see -- the bypass leaves the population instead of
       failing in it. Round 5 deleted an 89-row table for this; the round-7
       population repeated it one level up. Derived here by RUNNING renderers, it
-      found 16 live bypasses the guard is blind to.
+      found 16 live bypasses the guard is blind to, and widening the discovery
+      itself at round 8 found 8 more in renderers the probe had been skipping.
     * It does not infer the container kind from the source. A key is a container
       position only if a probe container placed there was actually WALKED --
       iterated, indexed, len'd, or asked for keys/items/values.
@@ -2057,8 +2058,11 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     ambiguous-count tests -- because it needs a per-site expectation this
     property cannot derive.
 
-    Measured across the base commit and this one: base absorbs 506 of 756 cases
-    at 88 sites; this commit absorbs 0."""
+    Measured by replaying THIS population against the base module (same keys,
+    same contexts, same `_MALFORMED` values; base's renderers are called bare
+    because base has no disclosure boundary to wrap them in): base absorbs 876
+    of these 1140 cases at 187 of the 190 container positions, and raises in
+    100 more; this commit absorbs 0 and raises 0."""
     from bn import formatters
 
     echoes = formatters._render_fallback_text              # the raw-payload dump
@@ -2100,14 +2104,17 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 385 read keys
-    rather than the 125 the container probe classifies: a renderer that renders
-    an absent field cleanly and DIES on a present wrong-shaped one has regressed
-    to the crash this change replaced.
+    """The soft-degrade half of #619, kind-free, so it covers all 507 read keys
+    rather than the 190 the container probe classifies as containers: a renderer
+    that renders an absent field cleanly and DIES on a present wrong-shaped one
+    has regressed to the crash this change replaced.
 
-    Base raises 55 times across 24 sites here; this commit raises 0. Four of
-    those base sites are in renderers this PR never edited, which is the
-    argument for deriving the population instead of listing it."""
+    Over these same 4056 renders base raises 153 times across 58 (renderer, key)
+    positions; this commit raises 0. Two of those renderers
+    (`_render_function_info_text`, `_render_taint_text`) are only in the
+    population at all because round 8 fixed the arity rule to admit a renderer
+    that takes a defaulted flag beside its payload -- which is the argument for
+    deriving the population instead of listing it."""
     swept, raised = 0, []
     for fn_name, render, key, _kind, ctx in _runtime_population():
         absent = _render_or_exception(render, copy.deepcopy(ctx))
