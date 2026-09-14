@@ -6896,9 +6896,12 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 # than half-done here, because the honest version of it changes every count
 # surface in the file at once and would land unreviewed on the back of this
 # one. Item 1's own named instance IS on the go-rename path, and is routed
-# anyway: it is a COUNT-SURFACE defect in a renderer this PR does not
-# otherwise change, and fixing it means the same one-contract sweep as the
-# rest of its family. The FOURTH is this PR's own new mechanism and is routed
+# anyway: fixing it means the same one-contract sweep over every count surface
+# in the file that the rest of its family needs -- which is the audit routed
+# above -- so it lands there or nowhere. (Earlier wording here called it "a
+# renderer this PR does not otherwise change". That was false: this PR rewrites
+# every count read in `_render_go_rename_text`. The routing never rested on it.)
+# The FOURTH is this PR's own new mechanism and is routed
 # for a different reason again, stated in its entry:
 #
 #   1. COUNT SURFACES still state a number read out of a counter they could
