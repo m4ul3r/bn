@@ -122,6 +122,52 @@ def _run_fixture_make(env: dict[str, str], out_dir: Path) -> subprocess.Complete
     )
 
 
+def _invalidate_stale_bndb_sidecars(binaries: list[Path]) -> None:
+    """Drop any `<binary>.bndb` whose mtime predates the binary it caches.
+
+    The bridge resolves an adjacent `<binary>.bndb` in preference to the binary
+    itself (`bn_agent_bridge.bridge._resolve_bndb_sidecar`), so a sidecar left
+    behind by an earlier build of a since-changed fixture is analysed instead of
+    the freshly compiled program -- surfacing as an assertion about the *old*
+    program's call graph, indistinguishable from a read-path regression (#717).
+
+    Mtime is the whole test, and only strictly-older sidecars go: a `.bndb`
+    newer than its binary is the legitimate saved analysis. `make -C
+    tests/fixtures clean` removes them too; this catches the long-lived checkout
+    that never ran it.
+
+    Callers hold the build lock (see `build_integration_fixtures`), so no other
+    worker is rebuilding or removing these files -- but a sidecar can still be
+    gone between the `stat()` and the `unlink()`, so the disappearances that
+    race is allowed to produce (`FileNotFoundError`) are treated as "already
+    invalidated" rather than escaping as a fixture-build flake.
+
+    Any OTHER `OSError` is the opposite case and must not be swallowed: a stale
+    database the build cannot remove is exactly the one the lane would go on to
+    load, so it becomes a `FixtureBuildError` -- the type every caller of
+    `build_integration_fixtures` documents and catches -- rather than a raw
+    errno escaping past them.
+    """
+    for binary in binaries:
+        sidecar = Path(str(binary) + ".bndb")
+        try:
+            sidecar_mtime = sidecar.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if sidecar_mtime < binary.stat().st_mtime:
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError as exc:
+                raise FixtureBuildError(
+                    f"a saved analysis database older than the fixture it caches "
+                    f"could not be removed, so the real-BN tests would analyse the "
+                    f"stale database instead of the freshly built program. Remove "
+                    f"it by hand and run: make -C tests/fixtures clean\n"
+                    f"  database: {sidecar}\n"
+                    f"  error: {exc}"
+                ) from exc
+
+
 def build_integration_fixtures(
     *,
     make_env: dict[str, str] | None = None,
@@ -155,6 +201,16 @@ def build_integration_fixtures(
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 proc = _run_fixture_make(env, out_dir)
+                built = [out_dir / n for n in REQUIRED_INTEGRATION_FIXTURES]
+                missing = [n for n in REQUIRED_INTEGRATION_FIXTURES
+                           if not (out_dir / n).is_file()]
+                if proc.returncode == 0 and not missing:
+                    # Under the SAME lock as the build (#717): the
+                    # stat/unlink pair below is only free of cross-process
+                    # races while nobody else is rebuilding or clearing these
+                    # sidecars, and `_BUILD_THREAD_LOCK` alone does not cover
+                    # the other pytest-xdist workers sharing `out_dir`.
+                    _invalidate_stale_bndb_sidecars(built)
             except subprocess.TimeoutExpired as exc:
                 raise FixtureBuildError(
                     "Building the integration fixtures timed out after "
@@ -166,8 +222,6 @@ def build_integration_fixtures(
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    missing = [n for n in REQUIRED_INTEGRATION_FIXTURES
-               if not (out_dir / n).is_file()]
     if proc.returncode != 0 or missing:
         raise FixtureBuildError(
             "Binary Ninja is installed but the integration fixtures could not be "
@@ -178,7 +232,7 @@ def build_integration_fixtures(
             f"  stdout: {proc.stdout.strip()}\n"
             f"  stderr: {proc.stderr.strip()}"
         )
-    return [out_dir / n for n in REQUIRED_INTEGRATION_FIXTURES]
+    return built
 
 
 def _decode(stream: str | bytes | None) -> str:

@@ -276,6 +276,76 @@ def test_building_fixtures_produces_every_required_binary(tmp_path):
         assert path.is_file() and path.stat().st_size > 0
 
 
+def _plant_sidecar(binary: Path, *, offset: float) -> Path:
+    """A stand-in `<binary>.bndb` whose mtime sits *offset* seconds from
+    *binary*'s, which is the only thing the invalidation reads."""
+    sidecar = Path(str(binary) + ".bndb")
+    sidecar.write_bytes(b"stand-in for a saved analysis database")
+    stamp = binary.stat().st_mtime + offset
+    os.utime(sidecar, (stamp, stamp))
+    return sidecar
+
+
+@pytest.mark.skipif(not _cc_available(), reason="cc/make not available")
+def test_a_bndb_older_than_its_binary_is_dropped_by_the_build(tmp_path):
+    """#717: the bridge loads an adjacent `<binary>.bndb` in preference to the
+    binary itself, so a database left behind by an earlier build of a
+    since-changed fixture makes the real-BN lane assert about the OLD program --
+    a failure indistinguishable from a read-path regression, and one that
+    survives `make clean && make` on a long-lived checkout.
+
+    The observable outcome is that the stale database is GONE once the build
+    has run, so the next load falls through to the freshly compiled binary."""
+    built = conftest.build_integration_fixtures(out_dir=tmp_path)
+    stale = _plant_sidecar(built[0], offset=-60)
+    assert stale.is_file()
+
+    conftest.build_integration_fixtures(out_dir=tmp_path)
+
+    assert not stale.exists(), (
+        "a .bndb older than the binary it caches survived the build, so the "
+        "real-BN lane would analyse the stale database instead of the fixture"
+    )
+
+
+@pytest.mark.skipif(not _cc_available(), reason="cc/make not available")
+def test_a_bndb_newer_than_its_binary_survives_the_build(tmp_path):
+    """The other half of #717's conditional, and the reason it has to BE a
+    conditional: a database that post-dates its binary is the legitimate saved
+    analysis OF that binary. Invalidating unconditionally would discard real
+    work on every run and turn a clean re-run into a rebuild instead of a
+    noop -- a regression wearing the fix's clothes."""
+    built = conftest.build_integration_fixtures(out_dir=tmp_path)
+    fresh = [_plant_sidecar(binary, offset=60) for binary in built]
+
+    conftest.build_integration_fixtures(out_dir=tmp_path)
+
+    assert [s.name for s in fresh if not s.is_file()] == [], (
+        "the build invalidated a .bndb that post-dates its binary, so a clean "
+        "re-run is not a noop and saved analysis is discarded every time"
+    )
+
+
+@pytest.mark.skipif(not _cc_available(), reason="cc/make not available")
+def test_make_clean_removes_the_saved_analysis_databases(tmp_path):
+    """#717's other half, in the Makefile: `clean` used to remove only the
+    binaries, so the documented "run make clean" recovery left every `.bndb`
+    in place and the stale analysis survived the one command a developer
+    reaches for. Without `$(BNDBS)` in the `clean` target this is RED."""
+    built = conftest.build_integration_fixtures(out_dir=tmp_path)
+    planted = [_plant_sidecar(binary, offset=60) for binary in built]
+
+    subprocess.run(
+        ["make", "-C", str(conftest.FIXTURES_DIR), f"OUTDIR={tmp_path}", "clean"],
+        capture_output=True, text=True, check=True,
+    )
+
+    assert [s.name for s in planted if s.exists()] == [], (
+        "make clean left saved analysis databases behind, so the documented "
+        "recovery from a stale fixture database does not actually clear it"
+    )
+
+
 @pytest.mark.skipif(not _cc_available(), reason="cc/make not available")
 def test_missing_compiler_raises_before_invoking_make(tmp_path):
     """Positive: BN present + no toolchain must be a loud error, not a skip.
@@ -322,6 +392,29 @@ def test_build_timeout_raises_fixture_build_error(monkeypatch, tmp_path):
         conftest.build_integration_fixtures(out_dir=tmp_path)
     assert "timed out" in str(excinfo.value)
     assert "make -C tests/fixtures" in str(excinfo.value)
+
+
+@pytest.mark.skipif(not _cc_available(), reason="cc/make not available")
+def test_unremovable_stale_bndb_raises_fixture_build_error(tmp_path):
+    """The same error contract over #717's invalidation: a stale database the
+    build cannot remove is precisely the case the lane must NOT proceed from,
+    because proceeding loads it. So it has to surface as FixtureBuildError --
+    the documented type every caller catches -- not as a raw OSError.
+
+    A directory sitting at the `<binary>.bndb` path is a real filesystem state
+    that `stat()`s like a stale sidecar and makes `unlink()` raise, so this
+    needs no monkeypatching of the code under test."""
+    built = conftest.build_integration_fixtures(out_dir=tmp_path)
+    blocked = Path(str(built[0]) + ".bndb")
+    blocked.mkdir()
+    stamp = built[0].stat().st_mtime - 60
+    os.utime(blocked, (stamp, stamp))
+
+    with pytest.raises(conftest.FixtureBuildError) as excinfo:
+        conftest.build_integration_fixtures(out_dir=tmp_path)
+    message = str(excinfo.value)
+    assert blocked.name in message
+    assert "make -C tests/fixtures" in message
 
 
 @pytest.mark.skipif(not _cc_available(), reason="cc/make not available")

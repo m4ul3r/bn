@@ -19,6 +19,9 @@ SRCDIR  := src
 OUTDIR  ?= .
 NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64
 BINS    := $(addprefix $(OUTDIR)/,$(NAMES))
+# The bridge prefers an adjacent <binary>.bndb over the binary it caches, so a
+# sidecar left behind by an earlier build silently shadows the fresh one.
+BNDBS   := $(addsuffix .bndb,$(BINS))
 
 all: $(BINS)
 
@@ -27,6 +30,6 @@ $(OUTDIR)/%_x86_64: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) $(BNDBS)
 
 .PHONY: all clean
