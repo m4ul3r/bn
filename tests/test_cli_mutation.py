@@ -3075,7 +3075,7 @@ def test_a_refused_counter_is_disclosed_and_unmeasured_on_the_compact_path(
 
 def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         monkeypatch, capsys):
-    """The boundary of the whole contract, stated once and quantified.
+    """The boundary of the whole contract, stated once and run in both directions.
 
     The classifier returns 0/3/4 whenever a verdict can be DERIVED from the
     result, and 2 exactly when none can. That is what makes 2 meaningful: it is
@@ -3083,9 +3083,24 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
     is 4, a refused counter beside a clean failure verdict is still 3) but "this
     CLI cannot say whether the write failed, succeeded or applied unmeasured".
 
-    Both directions are quantified here, because presence alone is satisfiable
-    by a list that has stopped keeping up: every shape that yields no verdict is
-    2, and every shape that yields one is NOT 2.
+    Both directions are run, because presence alone is satisfiable by a list
+    that has stopped keeping up: each listed shape that yields no verdict must
+    be 2, and each listed shape that yields one must NOT be 2.
+
+    The two populations are ENUMERATED, and that is a stated limit rather than a
+    claim of totality -- "every possible result shape" is not a set this cell
+    can iterate. What it does cover is every *decision point* the classifier
+    has: the result's type, the `results[]` field's type, a row's type, a row
+    status's readability, a counter's readability (refused and raising, since
+    those diverge), the summary's return type, and the summary's `measured`
+    verdict. A shape that reaches none of those reaches no new code.
+
+    One shape deliberately outside both lists: a row status the CLI does not
+    know (a bridge NEWER than this CLI) classifies as 0, because
+    `_mutation_summary` counts it as neither a failure nor an unread field. That
+    is inherited behaviour -- identical on this PR's base -- and it is decided
+    in `formatters.py`, outside this PR's fence, so it is named here rather than
+    silently absent.
     """
     from bn.formatters import _go_rename_summary, _mutation_summary
     from bn.transport import BridgeError

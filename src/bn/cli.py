@@ -1155,7 +1155,14 @@ def _mutation_reports_failure(result: dict[str, Any]) -> bool:
     return result.get("success") is False
 
 
-def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None) -> int:
+def _mutation_exit_code(result: Any, summary: Callable[[Any], Any]) -> int:
+    # *summary* is REQUIRED, and the round-20 acceptance lens is why: with a
+    # `None` default the helper's own signature reached the #715 defect --
+    # `_mutation_exit_code(result)` returned 0 for an unmeasured mutation,
+    # because "no transform" fell through the `measured` check. No caller ever
+    # wanted that: `_mutate` always hands over `summary_transform or
+    # _mutation_summary`, so the default was dead code whose only reachable
+    # behaviour was the bug this function exists to prevent.
     summary = _guarded_transform(summary, "classify the mutation result")
     if not isinstance(result, dict):
         # The MORE malformed sibling of a non-object compact summary below, and
@@ -1190,38 +1197,38 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     # renders/spills with, so the op is classified by the counters it really
     # reports through rather than by a generic recompute over rows it does not
     # populate.
-    if summary is not None:
-        # A transform that RAISES yields no verdict at all, and "no verdict"
-        # must never read as a confirmed success -- the whole point of #715 --
-        # so it goes out as the documented BridgeError (exit 2). That is the
-        # boundary between 2 and 4: 2 is not "a field was unreadable" (a
-        # refused field still classifies, and is 4), it is "this CLI cannot say
-        # whether the write failed, succeeded, or applied unmeasured".
-        compact = summary(result)
-        if not isinstance(compact, dict):
-            # A registered transform that returns something else has not
-            # classified anything, and "no classification" must not read as a
-            # confirmed success -- the same rule as a transform that raised.
-            raise BridgeError(
-                f"could not classify the mutation result -- the compact summary came "
-                f"back as {type(compact).__name__}, not an object. Compare the bridge "
-                f"and CLI builds with `bn doctor`."
-            )
-        # `measured` must be a VERDICT, not merely "not False": an envelope that
-        # carries no `measured` at all (a summary from a bridge that predates
-        # #684, or one that short-circuited an already-compact result through)
-        # said nothing about whether the write was measured, and reading silence
-        # as measured is how an unverifiable mutation exits 0.
-        measured = compact.get("measured")
-        if not isinstance(measured, bool):
-            raise BridgeError(
-                f"could not classify the mutation result -- the compact summary "
-                f"reports `measured` as {type(measured).__name__}, not a boolean, so "
-                f"whether the write was verified is unknown. Compare the bridge and "
-                f"CLI builds with `bn doctor`."
-            )
-        if measured is False:
-            return 4
+    #
+    # A transform that RAISES yields no verdict at all, and "no verdict" must
+    # never read as a confirmed success -- the whole point of #715 -- so it goes
+    # out as the documented BridgeError (exit 2). That is the boundary between 2
+    # and 4: 2 is not "a field was unreadable" (a refused field still
+    # classifies, and is 4), it is "this CLI cannot say whether the write
+    # failed, succeeded, or applied unmeasured".
+    compact = summary(result)
+    if not isinstance(compact, dict):
+        # A registered transform that returns something else has not classified
+        # anything, and "no classification" must not read as a confirmed
+        # success -- the same rule as a transform that raised.
+        raise BridgeError(
+            f"could not classify the mutation result -- the compact summary came "
+            f"back as {type(compact).__name__}, not an object. Compare the bridge "
+            f"and CLI builds with `bn doctor`."
+        )
+    # `measured` must be a VERDICT, not merely "not False": an envelope that
+    # carries no `measured` at all (a summary from a bridge that predates #684,
+    # or one that short-circuited an already-compact result through) said
+    # nothing about whether the write was measured, and reading silence as
+    # measured is how an unverifiable mutation exits 0.
+    measured = compact.get("measured")
+    if not isinstance(measured, bool):
+        raise BridgeError(
+            f"could not classify the mutation result -- the compact summary "
+            f"reports `measured` as {type(measured).__name__}, not a boolean, so "
+            f"whether the write was verified is unknown. Compare the bridge and "
+            f"CLI builds with `bn doctor`."
+        )
+    if measured is False:
+        return 4
     return 0
 
 

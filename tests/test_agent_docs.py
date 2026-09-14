@@ -448,6 +448,137 @@ def test_the_exit_code_bullet_clauses_are_what_the_cli_actually_does():
         _mutation_exit_code(["verified"], _mutation_summary)
 
 
+def test_the_unmeasured_causes_the_reference_names_are_the_ones_emitted():
+    """The mutation reference quotes three cause strings VERBATIM, so an agent
+    greps its session output for them. They are pinned by running the summaries
+    and reading the strings back out, not by a text pin: a doc that quotes a
+    phrase the code stopped emitting sends a reader looking for a line that is
+    never printed, and the round-20 falsification lens deleted this paragraph
+    whole with 520 tests still green.
+
+    Both directions, as ever: every phrase the code emits must be quoted, and
+    every phrase the doc quotes must be emitted.
+    """
+    from bn.formatters import _render_mutation_summary_text
+
+    doc = _doc_text(REPO / "skills/bn/reference/mutating.md")
+    # Nothing to count: the generic summary over a result with no rows.
+    nothing_to_count = _mutation_summary({"success": True, "committed": True,
+                                          "results": []})
+    # A counter refused: the op that counts through its own counters, with one
+    # of them in a shape no count reads out of.
+    counter_refused = _go_rename_summary(
+        {"kind": "go_rename", "preview": False, "success": True,
+         "committed": True, "go_renamed_candidates": "many", "results": []})
+    causes = {
+        "nothing to count": "this op reported no results[] rows",
+        "a counter refused": "this op's own counters could not be read",
+    }
+    emitted = {
+        "nothing to count": str(nothing_to_count["first_error"]),
+        "a counter refused": str(counter_refused["first_error"]),
+    }
+    for case, phrase in causes.items():
+        assert phrase in emitted[case], (
+            f"the reference quotes {phrase!r} as the {case} cause, but the "
+            f"summary emits {emitted[case]!r}"
+        )
+        assert f"`{phrase}`" in doc, (
+            f"the summary emits {phrase!r} as the {case} cause and the "
+            "reference no longer quotes it, so an agent greps for a line the "
+            "CLI never prints"
+        )
+    # ...and the per-field disclosure line, whose SHAPE is what a reader
+    # matches on: the marker, the word, and the field name in between.
+    rendered = _render_mutation_summary_text(counter_refused)
+    assert "! malformed go_renamed_candidates field" in rendered, rendered
+    assert "`! malformed <field> field`" in doc, (
+        "the reference no longer states the shape of the per-field disclosure "
+        "line the compact status really prints"
+    )
+
+
+def test_the_runtime_reference_word_form_exit_claims_are_what_the_cli_does(
+        monkeypatch, tmp_path):
+    """Two exit-code contracts the sweep could SEE but no cell was measuring.
+
+    Both are stated in WORDS -- "exits non-zero", "nonzero ... zero otherwise"
+    -- so there is no digit for an echo to capture and compare against the
+    code, which is how they came to sit in `NON_CLAIM_NUMBER_LINES`: recorded as
+    not-claims when they are precisely the word-form contracts that ledger's own
+    comment says the sweep exists to catch. A word-form claim is still a claim,
+    so the sentences are pinned in `_EXIT_CODE_PINS` and each is executed here.
+    """
+    import bn.cli
+
+    doc = _doc_text(REPO / "skills/bn/reference/runtime.md")
+
+    # "A START past the last line ... exits non-zero with a stderr diagnostic
+    #  (not a `//` comment on stdout)"
+    body = {"name": "fn", "address": 0x401000, "hlil": "int fn() {\n  return 0;\n}\n"}
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kwargs: {"ok": True, "result": body})
+    argv = ["decompile", "fn", "--target", "active", "--lines"]
+    with contextlib.redirect_stdout(io.StringIO()) as out, \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+        past_end = bn.cli.main([*argv, "999:1000"])
+    assert past_end != 0, "an out-of-range slice must not read as a result"
+    assert "beyond the last line" in err.getvalue(), err.getvalue()
+    assert "//" not in out.getvalue(), out.getvalue()
+    # ...and the claim is only meaningful because an IN-range slice is 0.
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        assert bn.cli.main([*argv, "1:2"]) == 0
+
+    # "Exit code is reachability-only: nonzero if any probed instance is
+    #  unreachable, zero otherwise (staleness ... never affect the exit code;
+    #  zero registered instances is not a failure)."
+    install_dir, source_dir = tmp_path / "install", tmp_path / "source"
+    for directory in (install_dir, source_dir):
+        directory.mkdir()
+        (directory / "bridge.py").write_text("print('b')\n", encoding="utf-8")
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+
+    def instance(pid: int, name: str):
+        return type("FakeInstance", (), {
+            "pid": pid, "socket_path": tmp_path / f"{name}.sock",
+            "plugin_version": bn.cli.VERSION,
+            "started_at": "2026-03-09T00:00:00+00:00", "instance_id": name,
+        })()
+
+    live, dead, stale = instance(1, "live"), instance(2, "dead"), instance(3, "stale")
+
+    def reply(inst, op, params=None, target=None):
+        if inst is dead:
+            raise OSError("connection refused")
+        version = "0.0.0-ancient" if inst is stale else bn.cli.VERSION
+        return {"ok": True, "result": {"plugin_version": version,
+                                       "plugin_build_id": "b", "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", reply)
+
+    def doctor(instances: list) -> int:
+        monkeypatch.setattr(bn.cli, "list_instances", lambda: instances)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return bn.cli.main(["doctor", "--format", "json"])
+
+    assert doctor([live, dead]) != 0, "an unreachable instance must be nonzero"
+    assert doctor([live]) == 0, "every instance reachable must be zero"
+    # "staleness fields are informational and never affect the exit code"
+    assert doctor([live, stale]) == 0, "a stale but reachable bridge is not a failure"
+    # "zero registered instances is not a failure"
+    assert doctor([]) == 0, "no registered instance must not read as unreachable"
+
+    for phrase in ("the command exits non-zero with a stderr diagnostic",
+                   "Exit code is reachability-only"):
+        assert phrase in doc, (
+            f"runtime.md no longer states {phrase!r}, so this word-form exit "
+            "contract can drift from the code with every other guard green"
+        )
+
+
 # The exit-code contract has ONE implementation and several places that state
 # it. Round 7 counted three deciders -- CLAUDE.md's bullet, README.md's status
 # list, and the mutation reference an agent opens to do mutation work -- and
@@ -585,6 +716,21 @@ _EXIT_CODE_PINS = (
      "this way exits **1** rather than 0 whenever the teardown and respawn succeed"),
     ("skills/bn/reference/runtime.md", "restart-that-cannot-signal-is-2",
      "the restart refuses to signal and exits **2** instead"),
+    # Two claims stated in WORDS rather than digits, which is how they came to
+    # sit in NON_CLAIM_NUMBER_LINES: the sweep saw their `exits`/`zero` tokens
+    # and the ledger recorded them as not-claims, while they are exactly the
+    # word-form contracts the ledger's own comment says the sweep exists to
+    # catch. There is no digit to capture, so they are pinned here and
+    # MEASURED by
+    # test_the_runtime_reference_word_form_exit_claims_are_what_the_cli_does.
+    ("skills/bn/reference/runtime.md", "an-out-of-range-line-slice-is-nonzero",
+     "the command exits non-zero with a stderr diagnostic (not a `//` comment "
+     "on stdout), so a scripted consumer can tell an out-of-range slice apart "
+     "from a real result."),
+    ("skills/bn/reference/runtime.md", "doctor-is-reachability-only",
+     "Exit code is reachability-only: nonzero if any probed instance is "
+     "unreachable, zero otherwise (staleness fields are informational and "
+     "never affect the exit code; zero registered instances is not a failure)."),
 )
 
 # The DOCUMENT SET was the last enumerated population left in this accounting,
@@ -866,7 +1012,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "64bf870d",  # ## ... Python escape hatch
         "6785f03a",  # State lives at ... Project root walks up to the nearest ... (cwd
         "6a2f4c3b",  # ... sign=False), ...
-        "6aaa0c2e",  # It checks CLI version, plugin staleness ... ... the Binary Ninja
         "6b121aa2",  # **Private project ... `bn session start` associates the new brid
         "6bcea80f",  # "count": ...
         "78a7e943",  # **Fan-out (`--all-instances` ... ... Whole-target **read survey*
@@ -879,7 +1024,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "a7fc01f4",  # ## ... Sessions & headless
         "aa616d1b",  # ... Discover targets:
         "ac6214d0",  # Blast radius: a bare, path, or `--all` close resolves against **
-        "b2734c06",  # `--lines START:END` works on `decompile`, `il`, `disasm`, and `f
         "b35e947b",  # ## ... Troubleshooting
         "b54e57c1",  # - **Threshold override** — set ... ... ... to ... the spill poin
         "bddeeded",  # **Quick-mode capability ... Per-command behavior on a `--quick` 
