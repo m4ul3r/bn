@@ -3091,9 +3091,12 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
     claim of totality -- "every possible result shape" is not a set this cell
     can iterate. What it does cover is every *decision point* the classifier
     has: the result's type, the `results[]` field's type, a row's type, a row
-    status's readability, a counter's readability (refused and raising, since
-    those diverge), the summary's return type, and the summary's `measured`
-    verdict. A shape that reaches none of those reaches no new code.
+    status's membership in `FAILED_MUTATION_STATUSES`, the top-level `success`
+    flag (which is the OTHER half of the failure verdict, and the half a
+    round-21 lens neutralised while this cell stayed green), a row status's
+    readability, a counter's readability (refused and raising, since those
+    diverge), the summary's return type, and the summary's `measured` verdict.
+    A shape that reaches none of those reaches no new code.
 
     One shape deliberately outside both lists: a row status the CLI does not
     know (a bridge NEWER than this CLI) classifies as 0, because
@@ -3113,6 +3116,16 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         "verified": ({**ok, "results": [{"status": "verified"}]}, _mutation_summary, 0),
         "all-noop": ({**ok, "results": [{"status": "noop"}]}, _mutation_summary, 0),
         "no-rows-to-count": ({**ok, "results": []}, _mutation_summary, 4),
+        # The failure verdict's two halves, separately: a row whose status is in
+        # FAILED_MUTATION_STATUSES ("failing-row" below), and `success: false`
+        # ALONE with no row to read it off -- the branch a lens turned into
+        # `return False` with every other cell here still passing.
+        "failing-by-the-success-flag-alone":
+            ({"success": False, "committed": False, "results": []},
+             _mutation_summary, 3),
+        "failing-row": ({"success": True, "committed": True,
+                         "results": [{"status": "verification_failed"}]},
+                        _mutation_summary, 3),
         "row-status-refused": ({**ok, "results": [{"status": 5}]}, _mutation_summary, 4),
         "counter-refused": ({**go, "go_renamed_candidates": "many", "results": []},
                             _go_rename_summary, 4),

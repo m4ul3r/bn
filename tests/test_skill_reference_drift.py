@@ -1184,3 +1184,157 @@ def test_reading_reference_documents_hex_string_addresses():
     `int(x, 16)`. Consistent, but undocumented -- one traceback to discover."""
     text = READING.read_text(encoding="utf-8")
     assert "hex STRING" in text or "hex strings" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# The mirror of this module's founding defect. Its header records that an
+# OMITTED flag makes agents conclude a shipped feature does not exist -- three
+# re-filed it in one dogfood run. The inverse costs the same and was guarded by
+# nothing: a reference that ADVERTISES a flag the parser has no idea about sends
+# an agent to write `--dry-run` and read the argparse refusal as a broken CLI.
+# A round-21 lens added a nonexistent `--dry-run` to the mutation reference and
+# a nonexistent `--max` to the reading reference, and the suite stayed green.
+#
+# So every long flag these documents NAME is checked against the parser -- in
+# prose and in fenced examples alike, because an agent copies both. A document
+# may also state that a flag does NOT exist (the mutation reference says so of
+# `--comment`, whose natural spelling fails with an argparse error), which is
+# the opposite claim and is asserted in the opposite direction.
+_DOC_FLAG = re.compile(r"--[a-z][a-z0-9-]+")
+_DENIED_FLAG = re.compile(r"no `(--[a-z][a-z0-9-]+)` flag")
+
+
+def _parser_long_flags() -> set[str]:
+    """Every long option the CLI accepts, at any depth of the subcommand tree."""
+    import argparse
+
+    import bn.cli
+
+    flags: set[str] = set()
+
+    def walk(parser: argparse.ArgumentParser) -> None:
+        for action in parser._actions:
+            flags.update(opt for opt in action.option_strings if opt.startswith("--"))
+            if isinstance(action, argparse._SubParsersAction):
+                for sub in action.choices.values():
+                    walk(sub)
+
+    walk(bn.cli.build_parser())
+    return flags
+
+
+@pytest.mark.parametrize("doc", (SKILL, READING, MUTATING, REFERENCE / "runtime.md"),
+                         ids=lambda p: p.name)
+def test_every_flag_the_reference_names_exists(doc: Path):
+    """A flag an agent reads here must be one the CLI accepts."""
+    text = doc.read_text(encoding="utf-8")
+    known = _parser_long_flags()
+    assert known, "the parser exposes no long flags, so this cell proves nothing"
+    denied = set(_DENIED_FLAG.findall(text))
+    named = {match.group(0) for match in _DOC_FLAG.finditer(text)}
+    invented = sorted(named - denied - known)
+    assert not invented, (
+        f"{doc.name} names flags the parser does not accept, so an agent copying "
+        f"them gets an argparse refusal and reads it as a broken CLI: {invented}"
+    )
+
+
+@pytest.mark.parametrize("doc", (SKILL, READING, MUTATING, REFERENCE / "runtime.md"),
+                         ids=lambda p: p.name)
+def test_every_flag_the_reference_denies_really_does_not_exist(doc: Path):
+    """...and the other direction: a flag the reference tells an agent NOT to
+    reach for must stay unreachable, or the document is steering them away from
+    something that now works."""
+    text = doc.read_text(encoding="utf-8")
+    denied = set(_DENIED_FLAG.findall(text))
+    shipped = sorted(denied & _parser_long_flags())
+    assert not shipped, (
+        f"{doc.name} says these flags do not exist, but the parser accepts them: "
+        f"{shipped}"
+    )
+
+
+def test_go_rename_reference_states_the_scope_the_bridge_enforces():
+    """`go rename` is the one bulk mutation, and its safety claim is its SCOPE:
+    auto-named functions only, so a manual name is never overwritten and the op
+    is idempotent. A round-21 lens inverted that sentence -- "renames every
+    function ... NOT idempotent" -- with every guard green, which is a doc an
+    agent could act on to destroy its own naming work.
+
+    Executed against the bridge predicate the claim is about, not quoted.
+    """
+    from bn_agent_bridge.bridge import _is_go_rename_auto_name
+
+    text = MUTATING.read_text(encoding="utf-8")
+    prose = " ".join(text.split())
+    assert "renames **auto-named `sub_*`/`nullsub_*` functions only**" in prose, (
+        "the reference no longer states `go rename`'s scope, which is its only "
+        "safety property"
+    )
+    assert "idempotent and safe to re-run" in prose, (
+        "the reference no longer states that `go rename` is idempotent"
+    )
+    # The predicate really is auto-names-only, in both directions.
+    assert _is_go_rename_auto_name("sub_401000", 0x401000)
+    assert _is_go_rename_auto_name("nullsub_12", 0x401000)
+    assert not _is_go_rename_auto_name("player_update", 0x401000), (
+        "a manual name must never be replaceable, which is what the reference "
+        "promises and what makes a re-run safe"
+    )
+    # ...and "auto" is judged against THIS address, not any sub_ name.
+    assert not _is_go_rename_auto_name("sub_401000", 0x402000)
+
+
+def test_go_rename_reference_lists_exactly_the_flags_it_takes():
+    """The reference says `go rename` takes the standard mutation flags "and
+    nothing else", which is an EXHAUSTIVE claim -- so it is compared against the
+    parser as a set. Presence-only checking let a lens append a nonexistent
+    `--dry-run` to that very list."""
+    import argparse
+
+    import bn.cli
+
+    parser = bn.cli.build_parser()
+    args = parser.parse_args(["go", "rename"])
+    del args
+    prose = " ".join(MUTATING.read_text(encoding="utf-8").split())
+    listed = re.search(
+        r"It takes the standard mutation flags \(([^)]*)\) and nothing else\.", prose)
+    assert listed, (
+        "the reference no longer states `go rename`'s flag list, so it can grow "
+        "a flag the CLI does not have"
+    )
+    claimed = set(re.findall(r"--[a-z][a-z0-9-]+", listed.group(1)))
+
+    def subparser(path: list[str]) -> argparse.ArgumentParser:
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        return current
+
+    real = {opt for action in subparser(["go", "rename"])._actions
+            for opt in action.option_strings if opt.startswith("--")}
+    # The flags every command carries are not this command's own surface.
+    shared = {opt for action in parser._actions
+              for opt in action.option_strings if opt.startswith("--")}
+    # ...nor is an ALIAS of a flag already listed. The same document declares
+    # them (`--verbose` (alias `--diffs`)), so the mapping is read off the doc
+    # rather than hardcoded here: dropping an alias declaration makes this claim
+    # stop adding up, which is the right direction to fail in.
+    # The declaration reads `<flags>` (alias `--x`), and <flags> is sometimes a
+    # PHRASE (`--format json --summary` (alias `--quiet`)), so the alias is tied
+    # to every flag in the run just before it.
+    aliases: dict[str, set[str]] = {}
+    for match in re.finditer(r"(?P<canonical>(?:`[^`]+`[ ]?)+)"
+                             r"\(alias `(?P<alias>--[a-z][a-z0-9-]+)`\)", prose):
+        aliases.setdefault(match["alias"], set()).update(
+            re.findall(r"--[a-z][a-z0-9-]+", match["canonical"]))
+    own = {opt for opt in real - shared
+           if not (aliases.get(opt, set()) & claimed)}
+    assert claimed == own, (
+        f"the reference lists {sorted(claimed)} for `go rename` and says that is "
+        f"all of them; the parser defines {sorted(own)} beyond the shared flags "
+        f"and the aliases the document declares ({aliases})"
+    )

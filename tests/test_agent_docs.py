@@ -456,8 +456,12 @@ def test_the_unmeasured_causes_the_reference_names_are_the_ones_emitted():
     never printed, and the round-20 falsification lens deleted this paragraph
     whole with 520 tests still green.
 
-    Both directions, as ever: every phrase the code emits must be quoted, and
-    every phrase the doc quotes must be emitted.
+    Both directions for the two causes an agent actually meets, and the PAIRING
+    as well as the phrases. Deliberately not a quantifier over the cause
+    population -- `tests/test_cli_formatters.py` holds that, and it fails when a
+    seventh cause string appears or an existing one drifts. This cell's subject
+    is the reference: that it quotes the live strings and attaches each to the
+    condition that produces it.
     """
     from bn.formatters import _render_mutation_summary_text
 
@@ -470,46 +474,94 @@ def test_the_unmeasured_causes_the_reference_names_are_the_ones_emitted():
     counter_refused = _go_rename_summary(
         {"kind": "go_rename", "preview": False, "success": True,
          "committed": True, "go_renamed_candidates": "many", "results": []})
-    causes = {
-        "nothing to count": "this op reported no results[] rows",
-        "a counter refused": "this op's own counters could not be read",
-    }
-    emitted = {
-        "nothing to count": str(nothing_to_count["first_error"]),
-        "a counter refused": str(counter_refused["first_error"]),
-    }
-    for case, phrase in causes.items():
-        assert phrase in emitted[case], (
-            f"the reference quotes {phrase!r} as the {case} cause, but the "
-            f"summary emits {emitted[case]!r}"
+    # (phrase, the condition the reference pairs it with, what really emits it).
+    # The PAIRING is asserted, not merely the presence of both phrases: with
+    # each half checked alone, swapping which phrase describes which condition
+    # left every guard green, and an agent sent to look for a missing
+    # `results[]` on a REFUSED COUNTER finds one, populated, and stops -- the
+    # exact harm `formatters.py` says this wording exists to prevent.
+    causes = (
+        ("this op reported no results[] rows", "there was nothing to count",
+         nothing_to_count),
+        ("this op's own counters could not be read", "a counter was refused",
+         counter_refused),
+    )
+    prose = " ".join(doc.split())
+    for phrase, condition, summary in causes:
+        emitted = str(summary["first_error"])
+        assert phrase in emitted, (
+            f"the reference quotes {phrase!r} for the case {condition!r}, but "
+            f"the summary emits {emitted!r}"
         )
-        assert f"`{phrase}`" in doc, (
-            f"the summary emits {phrase!r} as the {case} cause and the "
-            "reference no longer quotes it, so an agent greps for a line the "
-            "CLI never prints"
+        assert f"`{phrase}` when {condition}" in prose, (
+            f"the reference must pair {phrase!r} with the condition that really "
+            f"produces it ({condition!r}); naming both causes without binding "
+            "each to its case lets the two be swapped, which tells an agent to "
+            "look at the wrong field"
         )
-    # ...and the per-field disclosure line, whose SHAPE is what a reader
-    # matches on: the marker, the word, and the field name in between.
+    # ...and the per-field disclosure line, whose SHAPE is what a reader matches
+    # on: the marker, the word, and the field name in between. A plain substring
+    # check accepts a WIDENED marker -- `!! malformed ...` still contains
+    # `! malformed ...` -- which would leave the doc's quoted shape wrong with
+    # this cell green, so the marker's left edge is asserted too.
     rendered = _render_mutation_summary_text(counter_refused)
-    assert "! malformed go_renamed_candidates field" in rendered, rendered
+    assert re.search(r"(?<!!)! malformed go_renamed_candidates field", rendered), rendered
     assert "`! malformed <field> field`" in doc, (
         "the reference no longer states the shape of the per-field disclosure "
         "line the compact status really prints"
     )
 
 
-def test_the_runtime_reference_word_form_exit_claims_are_what_the_cli_does(
-        monkeypatch, tmp_path):
-    """Two exit-code contracts the sweep could SEE but no cell was measuring.
+def test_every_test_module_an_agent_doc_names_exists():
+    """A doc that cites a guard by filename is telling an agent where the rule
+    lives; a filename that resolves to nothing sends them hunting.
 
-    Both are stated in WORDS -- "exits non-zero", "nonzero ... zero otherwise"
-    -- so there is no digit for an echo to capture and compare against the
-    code, which is how they came to sit in `NON_CLAIM_NUMBER_LINES`: recorded as
-    not-claims when they are precisely the word-form contracts that ledger's own
-    comment says the sweep exists to catch. A word-form claim is still a claim,
-    so the sentences are pinned in `_EXIT_CODE_PINS` and each is executed here.
+    `_PYTEST_PATH` already covers lines that tell an agent to RUN something.
+    This is the other half -- a module named in PROSE as the thing that enforces
+    a claim -- which a round-21 lens falsified by replacing the cited filename
+    with one that does not exist, with every guard green.
+    """
+    module = re.compile(r"`((?:tests/)?test_\w+\.py)`")
+    # A doc may also cite a module to say it is GONE ("`tests/test_cli.py` and
+    # `tests/test_bridge.py` do not exist"), which is the opposite claim and is
+    # asserted by test_test_layout_bullet_retired_modules_stay_gone. Read the
+    # negation off the same sentence rather than hardcoding the two names, so a
+    # third retirement needs no edit here and a POSITIVE citation of a missing
+    # module still fails.
+    cited, retired = set(), set()
+    for doc in AGENT_FACING_DOCS:
+        text = _doc_text(doc)
+        where = str(doc.relative_to(REPO))
+        for clause in re.findall(r"((?:`(?:tests/)?test_\w+\.py`(?:,| and )?)+) "
+                                 r"do(?:es)? not exist", text):
+            retired.update((where, name) for name in module.findall(clause))
+        cited.update((where, name) for name in module.findall(text))
+    assert cited, "no agent-facing doc cites a test module, so this cell proves nothing"
+    missing = sorted(f"{where}: {name}" for where, name in cited - retired
+                     if not (REPO / name).is_file()
+                     and not (REPO / "tests" / name).is_file())
+    assert not missing, (
+        "these agent-facing docs cite a test module that does not exist, so a "
+        f"reader sent to the rule finds nothing: {missing}"
+    )
+
+
+def test_the_word_form_exit_claims_are_what_the_cli_does(monkeypatch, tmp_path):
+    """The exit-code contracts the sweep could SEE but no cell was measuring.
+
+    All of these are stated in WORDS -- "exits non-zero", "nonzero ... zero
+    otherwise", "does not affect the exit code" -- so there is no digit for an
+    echo to capture and compare against the code, which is how they came to sit
+    in `NON_CLAIM_NUMBER_LINES`: recorded as not-claims when they are precisely
+    the word-form contracts that ledger's own comment says the sweep exists to
+    catch. Round 20 found two, round 21 found a third one document over, which
+    is what a per-instance repair looks like -- so the CLASS is closed by
+    `test_no_parked_line_carries_an_undeclared_exit_word` below, and every
+    member is pinned in `_EXIT_CODE_PINS` and executed here.
     """
     import bn.cli
+    from bn.cli import _mutation_exit_code
+    from bn.transport import BridgeError
 
     doc = _doc_text(REPO / "skills/bn/reference/runtime.md")
 
@@ -571,10 +623,57 @@ def test_the_runtime_reference_word_form_exit_claims_are_what_the_cli_does(
     # "zero registered instances is not a failure"
     assert doctor([]) == 0, "no registered instance must not read as unreachable"
 
-    for phrase in ("the command exits non-zero with a stderr diagnostic",
-                   "Exit code is reachability-only"):
-        assert phrase in doc, (
-            f"runtime.md no longer states {phrase!r}, so this word-form exit "
+    # "the command exits non-zero only if **every** result failed" -- a fan-out
+    #  whose rows PARTLY failed is still 0, which is the half a scripted
+    #  consumer depends on and the half a "nonzero on failure" reading gets
+    #  backwards.
+    import types
+
+    fanned = [types.SimpleNamespace(instance_id="a"),
+              types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: fanned)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda inst: inst.instance_id)
+    monkeypatch.setattr(bn.cli, "_resolve_target", lambda args, **kwargs: "active")
+
+    def fanout(failing: set[str]) -> int:
+        def send(op, *, params=None, target=None, instance_id=None, **kwargs):
+            if instance_id in failing:
+                raise BridgeError("down")
+            return {"ok": True, "result": {"kind": "sections", "items": [], "total": 0}}
+        monkeypatch.setattr(bn.cli, "send_request", send)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return bn.cli.main(["sections", "--all-instances", "--format", "json"])
+
+    assert fanout({"a", "b"}) != 0, "a fan-out where every row failed must be nonzero"
+    assert fanout({"a"}) == 0, "a partly-failed fan-out must not read as a failure"
+    assert fanout(set()) == 0
+
+    # "`reverted`, which is **not** a failure and does not affect the exit code"
+    reverted_sibling = {"success": True, "committed": True,
+                        "results": [{"status": "verified"}, {"status": "reverted"}]}
+    assert _mutation_exit_code(reverted_sibling, _mutation_summary) == 0, (
+        "CLAUDE.md says a `reverted` sibling does not affect the exit code"
+    )
+
+    # "If verification fails, the CLI returns a nonzero exit code"
+    verification_failed = {"success": False, "committed": False,
+                           "results": [{"status": "verification_failed"}]}
+    assert _mutation_exit_code(verification_failed, _mutation_summary) != 0, (
+        "README says a failed verification is nonzero"
+    )
+
+    for where, phrase in (
+        ("skills/bn/reference/runtime.md",
+         "the command exits non-zero with a stderr diagnostic"),
+        ("skills/bn/reference/runtime.md", "Exit code is reachability-only"),
+        ("skills/bn/reference/runtime.md",
+         "the command exits non-zero only if **every** result failed"),
+        ("CLAUDE.md", "does not affect the exit code (#118)"),
+        ("README.md", "the CLI returns a nonzero exit code"),
+    ):
+        assert phrase in _doc_text(REPO / where), (
+            f"{where} no longer states {phrase!r}, so this word-form exit "
             "contract can drift from the code with every other guard green"
         )
 
@@ -604,6 +703,12 @@ _EXIT_CODE_ECHOES = (
      r"puts a mutation at exit code `(?P<code>\d)`", "failing"),
     ("README.md", "unmeasured-is-separate",
      r"Exit `(?P<code>\d)` is the separate \"unverifiable\" case", "unmeasured"),
+    # README states the same derivation the mutation reference does, so it gets
+    # the same measured echo: the digit is compared against what the REAL
+    # `_go_rename_summary` makes of an unreadable counter.
+    ("README.md", "own-counter-unreadable-is-4",
+     r"which leaves that run `measured: false` and exit `(?P<code>\d)` like any "
+     r"other unmeasured one", "own-summary-refused"),
     ("skills/bn/reference/mutating.md", "refusal-up-front-or-at-apply",
      r"it is a mutation failure: exit (?P<code>\d) on any mutation command", "failing"),
     ("skills/bn/reference/mutating.md", "unmeasured-live-success",
@@ -716,13 +821,15 @@ _EXIT_CODE_PINS = (
      "this way exits **1** rather than 0 whenever the teardown and respawn succeed"),
     ("skills/bn/reference/runtime.md", "restart-that-cannot-signal-is-2",
      "the restart refuses to signal and exits **2** instead"),
-    # Two claims stated in WORDS rather than digits, which is how they came to
-    # sit in NON_CLAIM_NUMBER_LINES: the sweep saw their `exits`/`zero` tokens
-    # and the ledger recorded them as not-claims, while they are exactly the
-    # word-form contracts the ledger's own comment says the sweep exists to
-    # catch. There is no digit to capture, so they are pinned here and
-    # MEASURED by
-    # test_the_runtime_reference_word_form_exit_claims_are_what_the_cli_does.
+    # Claims stated in WORDS rather than digits, which is how they came to sit
+    # in NON_CLAIM_NUMBER_LINES: the sweep saw their `exits`/`exit`/`zero`
+    # tokens and the ledger recorded them as not-claims, while they are exactly
+    # the word-form contracts the ledger's own comment says the sweep exists to
+    # catch. There is no digit to capture, so they are pinned here and MEASURED
+    # by test_the_word_form_exit_claims_are_what_the_cli_does. The population
+    # itself is closed by test_no_parked_line_carries_an_undeclared_exit_word --
+    # round 20 pinned the first two and round 21 found a third one document
+    # over, which is what pinning the instances instead of the class buys.
     ("skills/bn/reference/runtime.md", "an-out-of-range-line-slice-is-nonzero",
      "the command exits non-zero with a stderr diagnostic (not a `//` comment "
      "on stdout), so a scripted consumer can tell an out-of-range slice apart "
@@ -731,6 +838,19 @@ _EXIT_CODE_PINS = (
      "Exit code is reachability-only: nonzero if any probed instance is "
      "unreachable, zero otherwise (staleness fields are informational and "
      "never affect the exit code; zero registered instances is not a failure)."),
+    # The exit-4 clause's ACTION, which is the whole reason 4 is distinct from
+    # 2: a caller that reads 2 concludes nothing was written, and this sentence
+    # is what tells the reader of a 4 that something was. Deleting it left the
+    # suite green.
+    ("skills/bn/reference/mutating.md", "an-unmeasured-run-must-be-read-back",
+     "It is not a new failure mode: the mutation did apply, so read the view back and\n"
+     "`bn save` before closing."),
+    ("skills/bn/reference/runtime.md", "a-fanout-is-nonzero-only-if-every-row-failed",
+     "the command exits non-zero only if **every** result failed"),
+    ("CLAUDE.md", "a-reverted-sibling-does-not-affect-the-code",
+     "does not affect the exit code (#118)"),
+    ("README.md", "a-failed-verification-is-nonzero",
+     "the CLI returns a nonzero exit code and reverts the whole mutation or batch."),
 )
 
 # The DOCUMENT SET was the last enumerated population left in this accounting,
@@ -819,10 +939,9 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "ad00bd37",  # uv run pytest ... # one module
         "b65d6dff",  # **Line count is not a split criterion ... Split a module only on
         "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed excep
-        "d95c6e1f",  # All mutations support `--preview` (apply → capture diffs → rever
     }),
     "README.md": frozenset({
-        "0e9e0137",  # Any status above other than ... puts a mutation at exit code ...
+        "18744597",  # Any status above other than ... puts a mutation at exit code ...
         "1e0f43b6",  # bn local retype ... ... float --preview
         "35d15f75",  # bn local rename ... ... speed --preview
         "3d833038",  # `bn function list` and `bn function search` return the full matc
@@ -834,7 +953,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "9cd96091",  # bytes: ...
         "b135db65",  # `bn session start` spawns a `bn-agent` process, registers it und
         "b35752e8",  # `bn callsites` is the direct-call lane for exact return-address 
-        "b4a59231",  # Non-preview writes only report success after reading the live BN
         "b78dcc70",  # summary: kind=object ...
         "c5fcc64c",  # - `bn` has two parts:
         "ca1fc685",  # - ... zero-based ordinal for matching callsites in the containin
@@ -1014,7 +1132,6 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "6a2f4c3b",  # ... sign=False), ...
         "6b121aa2",  # **Private project ... `bn session start` associates the new brid
         "6bcea80f",  # "count": ...
-        "78a7e943",  # **Fan-out (`--all-instances` ... ... Whole-target **read survey*
         "7ae58359",  # Identity is `(boot id, pid, process start ... Start times count 
         "7f52ba89",  # verdict, because one verdict over many jobs would be a lie, and 
         "8c11c1cb",  # ... (Optional) Pin sticky defaults — useful for a **single** ...
@@ -1024,6 +1141,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "a7fc01f4",  # ## ... Sessions & headless
         "aa616d1b",  # ... Discover targets:
         "ac6214d0",  # Blast radius: a bare, path, or `--all` close resolves against **
+        "afc8a014",  # **Fan-out (`--all-instances` ... ... Whole-target **read survey*
         "b35e947b",  # ## ... Troubleshooting
         "b54e57c1",  # - **Threshold override** — set ... ... ... to ... the spill poin
         "bddeeded",  # **Quick-mode capability ... Per-command behavior on a `--quick` 
@@ -1376,6 +1494,93 @@ def test_the_non_claim_number_ledger_has_no_stale_entry():
         "these ledger entries excuse lines that no longer exist, so the ledger "
         "is bookkeeping for a document that has moved on; regenerate it against "
         f"the current docs: {stale}"
+    )
+
+
+# The ledger's remaining fail-open edge, and the one both of the last two rounds
+# walked straight through. `_EXIT_WORDS` puts a line in the population for
+# saying `exit` at all -- but `exit` ALSO means "leave the process", and `$?`
+# can be named without stating a code, so a parked line carrying an exit word is
+# sometimes a genuine non-claim. "This one is not a claim" is then a judgement
+# no regex makes, and the ledger recorded it by OMISSION: nothing distinguished
+# "we read this line and it states no code" from "nobody looked". Round 20 found
+# two such lines that WERE claims and pinned them; round 21 found a third, one
+# document over, because pinning the two that were named is a per-instance
+# repair of a population defect.
+#
+# So the judgement is DECLARED, per line, with its reason. A parked line whose
+# residual carries an exit word must appear here or be pinned by a cell, and a
+# NEW one fails until someone states which it is -- in a diff, where it can be
+# argued with.
+DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
+    ("README.md", "351"):
+        "`$?` names the variable a consumer reads; every digit on this line is "
+        "pinned or echoed",
+    ("skills/bn/reference/mutating.md", "37"):
+        "'does not change the exit code' is the lead-in to the pinned sentence "
+        "on the same line, which states both digits",
+    ("skills/bn/reference/mutating.md", "153"):
+        "`$?` names the variable a consumer reads; the digit is echoed",
+    ("skills/bn/reference/mutating.md", "237"):
+        "'exit codes are therefore the same' is the lead-in to the two echoed "
+        "digits on the following lines",
+    ("skills/bn/reference/runtime.md", "192"):
+        "a process EXITING and its pid being reused, not an exit code",
+    ("skills/bn/reference/runtime.md", "198"):
+        "a proven owner EXITING, plus a warning not to key on the code at all; "
+        "the restart digits are pinned two paragraphs down",
+    ("skills/bn-kernel/SKILL.md", "21"):
+        "an eval-kernel exit/reset, not an exit code",
+    ("skills/bn-kernel/SKILL.md", "101"):
+        "'on every reachable exit' is a teardown obligation, not an exit code",
+    ("skills/bn-kernel/SKILL.md", "138"):
+        "'on every reachable exit' is a teardown obligation, not an exit code",
+    ("skills/bn-kernel/SKILL.md", "165"):
+        "'on every reachable exit' is a teardown obligation, not an exit code",
+    ("skills/bn-kernel/SKILL.md", "393"):
+        "a SIGINT-killed sibling process's 130, not a code `bn` itself returns",
+}
+
+# The vocabulary that puts a line in the population for naming an EXIT rather
+# than a number. Read off `_NUMBER_TOKEN`'s own alphabet so the two cannot drift.
+_EXIT_WORD_TOKEN = re.compile(rf"^(?:{_EXIT_WORDS})$", re.I)
+
+
+def _parked_exit_word_lines() -> set[tuple[str, str]]:
+    """Every ledgered line whose residual NAMES an exit rather than a number."""
+    parked = set()
+    for doc in EXIT_CODE_DOCS:
+        ledger = NON_CLAIM_NUMBER_LINES.get(doc, frozenset())
+        for where, normalized, residual in _number_lines(doc):
+            if (_ledger_key(normalized, residual) in ledger
+                    and any(_EXIT_WORD_TOKEN.match(token) for token in residual)):
+                parked.add((doc, where.removeprefix("line ")))
+    return parked
+
+
+def test_no_parked_line_carries_an_undeclared_exit_word():
+    """Every parked line that NAMES an exit must have been read and ruled on.
+
+    The reason is the whole point: an entry says "this line's `exit` is not an
+    exit code", which is a claim a reviewer can check and disagree with. Before
+    this cell the same statement was made by writing nothing.
+    """
+    undeclared = sorted(_parked_exit_word_lines() - set(DECLARED_NON_EXIT_CODE_WORDS))
+    assert not undeclared, (
+        "these parked lines name an exit and no cell pins them, so whether they "
+        "state an exit code has been decided by omission. Pin the line if it "
+        "states one; add it to DECLARED_NON_EXIT_CODE_WORDS with the reason if "
+        f"it does not: {undeclared}"
+    )
+
+
+def test_no_declared_exit_word_entry_is_stale():
+    """...and the declarations stale-fail too, so the list cannot outlive the
+    lines it rules on and become the next place a claim can park."""
+    stale = sorted(set(DECLARED_NON_EXIT_CODE_WORDS) - _parked_exit_word_lines())
+    assert not stale, (
+        "these declarations rule on a parked exit word that is no longer there "
+        f"(the line moved, was pinned, or was rewritten): {stale}"
     )
 
 
