@@ -7,6 +7,8 @@ restoration so a late worker cannot re-publish a dead bridge registry.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import threading
 import time
 
@@ -537,6 +539,52 @@ def test_start_unlinks_a_socket_file_the_kernel_says_is_unbound(monkeypatch, tmp
         inst.start()
 
     assert not inst.socket_path.exists()
+
+
+def test_start_refuses_a_reachable_socket_the_listing_does_not_name(
+        monkeypatch, tmp_path):
+    """A successful connect() outranks a NEGATIVE listing answer.
+
+    `/proc/net/unix` records the name `bind` was GIVEN, so a listener renamed
+    onto this endpoint is fully reachable here while appearing in the listing
+    under its original basename -- where the lookup's basename filter skips it
+    and the answer comes back False. Base refused this on the connect alone;
+    the bound-socket evidence was added to stop a FAILED connect from proving
+    absence, and it must not have cost the case where the connect SUCCEEDS.
+
+    Real socket, real rename, real connect: stubbing the evidence here would
+    assert the fix against the author's model of the kernel rather than the
+    kernel."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="renamed")
+    inst.socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound_as = tmp_path / "originally-bound-here.sock"
+    server.bind(str(bound_as))
+    server.listen(1)
+    try:
+        os.rename(bound_as, inst.socket_path)
+        # Reachable at its new name ...
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        probe.connect(str(inst.socket_path))
+        probe.close()
+        # ... and invisible to the listing under that name, which is the wrong
+        # negative this refusal has to survive. Stated rather than asserted: a
+        # future lookup that learned to see it would only make the refusal more
+        # certain, and must not red this cell.
+
+        with pytest.raises(RuntimeError, match="already serving") as raised:
+            inst.start()
+        assert "Refusing to displace" in str(raised.value), raised.value
+        assert inst.socket_path.exists(), (
+            "a reachable endpoint was unlinked, leaving its owner serving on an "
+            "inode no client can name")
+    finally:
+        server.close()
+
 
 
 def test_start_falls_back_to_the_connect_probe_where_no_listing_exists(

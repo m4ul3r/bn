@@ -1070,28 +1070,41 @@ class BinaryNinjaBridge:
         if self.socket_path.exists():
             # A stale socket file from a crashed bridge is safe to clear, but a
             # live one belongs to another bridge instance; unlinking it would
-            # silently orphan that bridge on an unlinked inode. A FAILED PROBE
-            # IS NOT PROOF OF ABSENCE: a socket bound but not yet past `listen`
-            # refuses a connect() exactly like a leftover file, and every bridge
-            # passes through that state coming up. So this takes the same
-            # positive evidence the CLI side does (#618/#726) -- the kernel's own
-            # list of bound paths -- and a path that listing cannot represent
-            # keeps the file. A platform with no listing at all is the one
-            # documented exception, below.
+            # silently orphan that bridge on an unlinked inode.
+            #
+            # The two evidences are ASYMMETRIC, and each covers the other's
+            # wrong answer:
+            #
+            # * A FAILED connect() is not proof of absence -- a socket bound
+            #   but not yet past `listen` refuses exactly like a leftover file,
+            #   and every bridge passes through that state coming up -- so the
+            #   kernel's own list of bound paths decides that direction
+            #   (#618/#726).
+            # * A SUCCESSFUL connect() IS proof of presence, and it outranks a
+            #   negative listing answer, because the listing records the name
+            #   `bind` was GIVEN: a listener renamed onto this path is
+            #   reachable here and appears in the listing under its original
+            #   basename, where the lookup filters it out and answers False.
+            #   Base refused that case on the connect alone; dropping the
+            #   connect would have unlinked a reachable endpoint and left its
+            #   owner serving with no pathname.
+            #
+            # So: refuse on either positive, and unlink only when BOTH say
+            # nothing is there.
             bound = path_has_bound_socket(self.socket_path)
-            if bound is None and not bound_socket_listing_available():
-                # No bound-socket listing on this platform (Darwin/BSD), so
-                # EVERY path answers None here and the strong rule would make
-                # this bridge permanently unstartable on its OWN fixed socket
-                # path after one unclean shutdown -- with no in-tool recovery,
-                # since `instance gc` retains on an unprovable answer too. A
-                # sweep can skip a file forever at no cost; the process that
-                # must BIND that exact path cannot. Fall back to the weaker
-                # connect() evidence, which is what base did everywhere, and
-                # keep the file whenever it answers.
-                bound = self._socket_is_live()
-            if bound is not False:
-                if bound and self._socket_is_live():
+            live = self._socket_is_live()
+            # `None` means unknowable. Where the listing EXISTS that is a fact
+            # about this path and the file is kept. Where it does not exist at
+            # all (Darwin/BSD) every path answers None, and the strong rule
+            # would make this bridge permanently unstartable on its OWN fixed
+            # socket path after one unclean shutdown, with no in-tool recovery
+            # (`instance gc` retains on an unprovable answer too). A sweep can
+            # skip a file forever at no cost; the process that must BIND that
+            # exact path cannot -- so there the connect() above is the whole
+            # answer, exactly as it was at base.
+            unprovable = bound is None and bound_socket_listing_available()
+            if live or bound or unprovable:
+                if live:
                     detail = "another bridge is already serving there"
                 elif bound:
                     detail = ("something is bound there but is not accepting yet "
