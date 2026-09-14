@@ -2963,13 +2963,14 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #  4. `_socket_path_is_confined`'s failure-direction answer, the
 #     `except (OSError, TypeError, ValueError): return False`. Mutation:
 #     `return True` -- a resolution failure read as CONFINED -- green at 337
-#     passed, 1 skipped. INERT here rather than safe by design: the only
-#     input that reaches the arm on this platform is an embedded NUL
-#     (`ValueError`/`UnicodeEncodeError`), and such a record is routed to the
-#     same fate by the missing-socket arm downstream, so no destruction is
-#     constructible from the mutation. It is listed because an inventory that
-#     omits a green guard is worth less than no inventory: if some future
-#     input makes that arm reachable with a real path, nothing here notices.
+#     passed, 1 skipped. INERT here rather than safe by design: the only two
+#     inputs that reach the arm on this platform are an embedded NUL
+#     (`ValueError`) and a lone surrogate (`UnicodeEncodeError`), and such a
+#     record is routed to the same fate by the missing-socket arm downstream,
+#     so no destruction is constructible from the mutation. It is listed
+#     because an inventory that omits a green guard is worth less than no
+#     inventory: if some future input makes that arm reachable with a real
+#     path, nothing here notices.
 #
 # For 1 and 2 a pin was written, did not discriminate, and was deleted rather
 # than shipped with a docstring claiming a guard it does not hold; both are
@@ -2977,10 +2978,34 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # and 4 were each measured by a review lens and are recorded on the same
 # terms.
 #
-# UNREACHABLE DEFENSIVE CODE — one category, not three notes scattered across
-# two files. No mutation can redden these because no input on this platform
-# reaches them; they stay as statements of the contract, and a green mutation
-# here is NOT evidence that the line is dead weight:
+# There was a FIFTH, and it is now PINNED rather than listed: `_load_instance`'s
+# `TypeError` in `except (OSError, TypeError, ValueError, KeyError,
+# json.JSONDecodeError)`. Dropping it left the whole suite green, and unlike 3
+# and 4 its direction is DESTRUCTIVE and trivially reachable -- a registry
+# document that parses but is not an object (`[1, 2]`, `"hello"`, `123`,
+# `true`) raises out of `payload["socket_path"]`, so one such file hid every
+# healthy sibling instance behind a raw traceback. A round-32 lens found it in
+# this very block's omission; the pin it needed was available and
+# discriminating, so it was written instead of disclosed:
+# `test_a_registry_that_is_not_a_json_object_does_not_hide_its_siblings`. That
+# is the order of preference this block exists to serve -- pin what can be
+# pinned, disclose only what cannot.
+#
+# SAFE OR INERT GREEN GUARDS, named because completeness is the point: a
+# mutation of each leaves the fenced files green, and each fails in a
+# direction that keeps rather than destroys, so none is a coverage risk in the
+# sense 1 and 2 are -- `_path_has_bound_socket`'s exact-byte fast path (can
+# only weaken a `True` to a `None`, and only `False` authorises an unlink),
+# `_socket_probe`'s `nothing_bound=True` on `ENOENT` (there is nothing left to
+# unlink), `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
+# already answers `None` for a `.json`, so the condition is redundant rather
+# than load-bearing), and `src/bn/commands/misc.py::_resolved_out_format`'s
+# `if out is None` short circuit.
+#
+# UNREACHABLE DEFENSIVE CODE — one category, rather than notes scattered
+# across two files. No mutation can redden these because no input on this
+# platform reaches them; they stay as statements of the contract, and a green
+# mutation here is NOT evidence that the line is dead weight:
 #   - `_unlink_if_unchanged`'s `if expected is None: return False` -- the byte
 #     comparison below it also answers `False` for `None`.
 #   - `_unlink_if_unchanged`'s `ValueError` in `except (OSError, ValueError)`
@@ -2995,6 +3020,12 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #     `except (OSError, TypeError, ValueError)`, documented there as "an empty
 #     final component" -- on this Python `Path("/").parent.resolve() / ""`
 #     answers `/` instead of raising (measured on 3.14.2).
+#   - `_process_state`'s `if close < 0: return None`, `if not fields: return
+#     None` and `except UnicodeDecodeError: return None` -- each green under
+#     mutation and each genuinely unreachable, because everything after the
+#     last `)` in `/proc/<pid>/stat` is kernel-written ASCII: the `)` is
+#     always there, the fields are always there, and the state character
+#     always decodes.
 # ---------------------------------------------------------------------------
 
 
@@ -4044,6 +4075,54 @@ def test_a_record_discovery_cannot_read_keeps_its_bridges_spawn_log(tmp_path, mo
     assert "did not resolve it to a running bridge" in message
     assert "before removing it" in message
     assert "could not interpret" not in message
+
+
+@pytest.mark.parametrize("document", ["[1, 2]", '"hello"', "123", "true"])
+def test_a_registry_that_is_not_a_json_object_does_not_hide_its_siblings(
+    tmp_path, monkeypatch, document
+):
+    """One record's SHAPE must not take every discovery-backed command down.
+
+    ``json.loads`` answers whatever the document says, so a registry holding
+    an array, a string, a number or a bare ``true`` parses perfectly and then
+    raises ``TypeError`` out of ``payload["socket_path"]`` -- list indices
+    must be integers, string indices must be integers, and the scalars are
+    not subscriptable at all. That is not a parse failure, so it escapes
+    everything ``json.JSONDecodeError`` covers: ONE such file makes every
+    healthy sibling invisible and turns ``session list`` into a raw traceback
+    for an instance that has nothing to do with it. ``TypeError`` sits in the
+    loader's except tuple for exactly this, and NOTHING pinned it -- dropping
+    it from the tuple left the whole suite green, which is how an availability
+    guard regresses silently (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    healthy_sock = inst_dir / "healthy.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(healthy_sock))
+    server.listen(1)
+    (inst_dir / "healthy.json").write_text(
+        json.dumps(_registry_payload(healthy_sock, pid=os.getpid(),
+                                     identity=_identity(),
+                                     instance_id="healthy")),
+        encoding="utf-8",
+    )
+    # Sorted before "healthy.json", so the bad shape is read FIRST: a raised
+    # TypeError takes the sibling down with it rather than merely trailing it.
+    bad = inst_dir / "aaa-bad-shape.json"
+    bad.write_text(document, encoding="utf-8")
+
+    try:
+        assert [inst.instance_id for inst in list_instances()] == ["healthy"]
+        summary = gc_instances()
+        assert summary["live_instances"] == 1
+        assert bad.exists()          # uninterpretable is refused, not destroyed
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        healthy_sock.unlink(missing_ok=True)
 
 
 def test_a_spawn_with_no_leftover_record_still_starts_a_fresh_log(tmp_path, monkeypatch):

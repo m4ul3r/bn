@@ -368,10 +368,11 @@ def _unlink_if_unchanged(path: Path, expected: bytes | None) -> bool:
                 return False
         path.unlink()
     except (OSError, ValueError):
-        # A registry's own path comes from the directory scan, but ValueError
-        # belongs here anyway: an unnameable path (embedded NUL, lone
-        # surrogate) must not take a discovery-backed command down, and
-        # refusing to destroy is the safe answer for it.
+        # Not every path here comes from the directory scan -- the legacy fixed
+        # registry is constructed by ``bridge_registry_path()`` and reaches this
+        # unlink too -- and ValueError belongs here regardless: an unnameable
+        # path (embedded NUL, lone surrogate) must not take a discovery-backed
+        # command down, and refusing to destroy is the safe answer for it.
         return False
     return True
 
