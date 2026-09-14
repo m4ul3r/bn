@@ -664,6 +664,7 @@ sys.exit(1)
         (1, bn_kernel.CliError),
         (2, bn_kernel.BridgeError),
         (3, bn_kernel.VerificationFailed),
+        (4, bn_kernel.Unmeasured),
         (9, bn_kernel.BnError),
     ],
 )
@@ -693,6 +694,39 @@ sys.exit(1)
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, silent_script)))
     with pytest.raises(bn_kernel.CliError, match="bn failed"):
         _run(bn_kernel.Session(backend="cli").run("bad"))
+
+
+def test_an_unmeasured_mutation_does_not_default_to_claiming_failure(monkeypatch, tmp_path):
+    """Exit 4 means the mutation APPLIED and only its verification is missing,
+    so the silent-stream default cannot be "bn failed" -- a caller reading that
+    closes the view without saving and discards a write that landed, which is
+    the #683 harm the exit code exists to prevent."""
+    silent_script = "import sys; sys.exit(4)\n"
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, silent_script)))
+
+    with pytest.raises(bn_kernel.Unmeasured) as caught:
+        _run(bn_kernel.Session(backend="cli").run("go", "rename"))
+
+    assert "could not measure" in str(caught.value)
+    assert "bn failed" not in str(caught.value)
+    assert caught.value.returncode == 4
+
+
+def test_every_nonzero_exit_code_the_cli_can_return_is_classified():
+    """The population is DERIVED from the CLI package, not listed here: a new
+    documented exit code otherwise reaches this consumer as a bare `BnError` --
+    non-zero and loud, but unclassified, and carrying the default message that
+    is a false statement for an applied-but-unmeasured mutation."""
+    from test_agent_docs import _codes_the_cli_can_return
+
+    produced = {code for code in _codes_the_cli_can_return() if code}
+    assert produced, "the CLI package hands the shell no nonzero literal, so this proves nothing"
+    missing = sorted(produced - set(bn_kernel._EXIT_ERRORS))
+    assert not missing, (
+        "these exit codes the bn CLI can return reach this consumer as an "
+        f"unclassified BnError: {missing}"
+    )
+
 
 
 def test_missing_executable_is_returncode_127(monkeypatch):
