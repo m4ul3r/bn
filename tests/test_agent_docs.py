@@ -499,6 +499,22 @@ def test_the_unmeasured_causes_the_reference_names_are_the_ones_emitted():
             "each to its case lets the two be swapped, which tells an agent to "
             "look at the wrong field"
         )
+    # ...and the pairing must be EXCLUSIVE. Presence alone is satisfied by a
+    # document that states both correct pairings AND both swapped ones, which
+    # restores the whole harm: a reader who meets the wrong sentence first goes
+    # to the wrong field. So every WRONG pairing of these phrases and conditions
+    # must be absent, derived from the same table rather than listed.
+    wrong = [(phrase, condition)
+             for phrase, _, _ in causes
+             for _, condition, _ in causes
+             if (phrase, condition) not in {(p, c) for p, c, _ in causes}]
+    assert wrong, "the cause table has one row, so exclusivity proves nothing"
+    stated = [f"`{phrase}` when {condition}" for phrase, condition in wrong
+              if f"`{phrase}` when {condition}" in prose]
+    assert not stated, (
+        "the reference states these cause-to-condition pairings, which the code "
+        f"does not produce; each sends a reader to the wrong field: {stated}"
+    )
     # ...and the per-field disclosure line, whose SHAPE is what a reader matches
     # on: the marker, the word, and the field name in between. A plain substring
     # check accepts a WIDENED marker -- `!! malformed ...` still contains
@@ -528,16 +544,25 @@ def test_every_test_module_an_agent_doc_names_exists():
     # negation off the same sentence rather than hardcoding the two names, so a
     # third retirement needs no edit here and a POSITIVE citation of a missing
     # module still fails.
-    cited, retired = set(), set()
+    # The negation is read PER SENTENCE, not per document. Read document-wide,
+    # one "`x` does not exist" sentence excused every other citation of `x` in
+    # the same file -- so a doc could name a nonexistent module as the guard
+    # that enforces a claim and stay green, which is the opposite of what this
+    # cell is for.
+    cited = set()
     for doc in AGENT_FACING_DOCS:
-        text = _doc_text(doc)
         where = str(doc.relative_to(REPO))
-        for clause in re.findall(r"((?:`(?:tests/)?test_\w+\.py`(?:,| and )?)+) "
-                                 r"do(?:es)? not exist", text):
-            retired.update((where, name) for name in module.findall(clause))
-        cited.update((where, name) for name in module.findall(text))
+        for sentence in re.split(r"(?<=[.;:])\s+|\n", _doc_text(doc)):
+            names = module.findall(sentence)
+            if not names:
+                continue
+            if re.search(r"do(?:es)? not exist", sentence):
+                # A retirement claim: asserted in the OTHER direction by
+                # test_test_layout_bullet_retired_modules_stay_gone.
+                continue
+            cited.update((where, name) for name in names)
     assert cited, "no agent-facing doc cites a test module, so this cell proves nothing"
-    missing = sorted(f"{where}: {name}" for where, name in cited - retired
+    missing = sorted(f"{where}: {name}" for where, name in cited
                      if not (REPO / name).is_file()
                      and not (REPO / "tests" / name).is_file())
     assert not missing, (
@@ -1513,32 +1538,28 @@ def test_the_non_claim_number_ledger_has_no_stale_entry():
 # NEW one fails until someone states which it is -- in a diff, where it can be
 # argued with.
 DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
-    ("README.md", "351"):
-        "`$?` names the variable a consumer reads; every digit on this line is "
-        "pinned or echoed",
-    ("skills/bn/reference/mutating.md", "37"):
-        "'does not change the exit code' is the lead-in to the pinned sentence "
-        "on the same line, which states both digits",
-    ("skills/bn/reference/mutating.md", "153"):
-        "`$?` names the variable a consumer reads; the digit is echoed",
-    ("skills/bn/reference/mutating.md", "237"):
-        "'exit codes are therefore the same' is the lead-in to the two echoed "
-        "digits on the following lines",
-    ("skills/bn/reference/runtime.md", "192"):
-        "a process EXITING and its pid being reused, not an exit code",
-    ("skills/bn/reference/runtime.md", "198"):
-        "a proven owner EXITING, plus a warning not to key on the code at all; "
-        "the restart digits are pinned two paragraphs down",
-    ("skills/bn-kernel/SKILL.md", "21"):
-        "an eval-kernel exit/reset, not an exit code",
-    ("skills/bn-kernel/SKILL.md", "101"):
+    ("README.md", "18744597"):
+        '`$?` names the variable a consumer reads; every digit on this line is pinned or echoed',
+    ("skills/bn-kernel/SKILL.md", "1016956a"):
         "'on every reachable exit' is a teardown obligation, not an exit code",
-    ("skills/bn-kernel/SKILL.md", "138"):
-        "'on every reachable exit' is a teardown obligation, not an exit code",
-    ("skills/bn-kernel/SKILL.md", "165"):
-        "'on every reachable exit' is a teardown obligation, not an exit code",
-    ("skills/bn-kernel/SKILL.md", "393"):
+    ("skills/bn-kernel/SKILL.md", "26b229c0"):
         "a SIGINT-killed sibling process's 130, not a code `bn` itself returns",
+    ("skills/bn-kernel/SKILL.md", "27e9ecca"):
+        "'on every reachable exit' is a teardown obligation, not an exit code",
+    ("skills/bn-kernel/SKILL.md", "9e322829"):
+        'an eval-kernel exit/reset, not an exit code',
+    ("skills/bn-kernel/SKILL.md", "a32d2524"):
+        "'on every reachable exit' is a teardown obligation, not an exit code",
+    ("skills/bn/reference/mutating.md", "41408e3c"):
+        "'exit codes are therefore the same' is the lead-in to the two echoed digits on the following lines",
+    ("skills/bn/reference/mutating.md", "560d20bb"):
+        '`$?` names the variable a consumer reads; the digit is echoed',
+    ("skills/bn/reference/mutating.md", "6f8e7c3f"):
+        "'does not change the exit code' is the lead-in to the pinned sentence on the same line, which states both digits",
+    ("skills/bn/reference/runtime.md", "2b10a25d"):
+        'a process EXITING and its pid being reused, not an exit code',
+    ("skills/bn/reference/runtime.md", "9308d393"):
+        'a proven owner EXITING, plus a warning not to key on the code at all; the restart digits are pinned two paragraphs down',
 }
 
 # The vocabulary that puts a line in the population for naming an EXIT rather
@@ -1547,14 +1568,22 @@ _EXIT_WORD_TOKEN = re.compile(rf"^(?:{_EXIT_WORDS})$", re.I)
 
 
 def _parked_exit_word_lines() -> set[tuple[str, str]]:
-    """Every ledgered line whose residual NAMES an exit rather than a number."""
+    """Every ledgered line whose residual NAMES an exit rather than a number,
+    keyed by the line's own fingerprint.
+
+    Keyed by LINE NUMBER, a reason followed the position rather than the text:
+    swapping the contents of two declared lines left both cells green with each
+    reason excusing the other line, and inserting a line above one re-pointed
+    its declaration at a stranger. The ledger already keys on content for
+    exactly this reason, and so does this.
+    """
     parked = set()
     for doc in EXIT_CODE_DOCS:
         ledger = NON_CLAIM_NUMBER_LINES.get(doc, frozenset())
-        for where, normalized, residual in _number_lines(doc):
-            if (_ledger_key(normalized, residual) in ledger
-                    and any(_EXIT_WORD_TOKEN.match(token) for token in residual)):
-                parked.add((doc, where.removeprefix("line ")))
+        for _, normalized, residual in _number_lines(doc):
+            key = _ledger_key(normalized, residual)
+            if key in ledger and any(_EXIT_WORD_TOKEN.match(t) for t in residual):
+                parked.add((doc, key))
     return parked
 
 

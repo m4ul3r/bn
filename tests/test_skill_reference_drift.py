@@ -1200,8 +1200,39 @@ def test_reading_reference_documents_hex_string_addresses():
 # may also state that a flag does NOT exist (the mutation reference says so of
 # `--comment`, whose natural spelling fails with an argparse error), which is
 # the opposite claim and is asserted in the opposite direction.
-_DOC_FLAG = re.compile(r"--[a-z][a-z0-9-]+")
-_DENIED_FLAG = re.compile(r"no `(--[a-z][a-z0-9-]+)` flag")
+# The population is a GLOB, not a list. Round 22's lens put an invented long
+# flag in `CLAUDE.md` -- outside the four references that were parametrized --
+# and it stayed green, which is the same enumerated-population defect this PR
+# spent its rounds deleting everywhere else. A document joins by EXISTING.
+AGENT_FACING_DOCS = (
+    REFERENCE.parent.parent.parent / "CLAUDE.md",
+    REFERENCE.parent.parent.parent / "README.md",
+    *sorted((REFERENCE.parent.parent).glob("**/*.md")),
+)
+
+# Any long flag, not just a lowercase one: `--Force`, `--dry_run` and `--O2` are
+# all things a doc can invent and an agent can copy, and the first cut's
+# `[a-z][a-z0-9-]+` saw none of them.
+_DOC_FLAG = re.compile(r"--[A-Za-z0-9][\w-]*")
+
+# A doc may also claim a flag does NOT exist -- the mutation reference says so
+# of `--comment`, whose natural spelling fails with an argparse error. That is
+# the opposite claim and is asserted in the opposite direction. The forms below
+# are ASSERTIONS OF ABSENCE; "do not pass `--preview` here" is advice about a
+# flag that exists and deliberately does not match, while round 22's exploit
+# ("There is no `--preview` option") does.
+_ABSENCE_CLAIM = re.compile(
+    r"`(--[\w-]+)`[^.`]{0,30}do(?:es)? not exist"
+    r"|there is no `(--[\w-]+)`"
+    r"|no such `?(--[\w-]+)`?"
+    r"|no `(--[\w-]+)` (?:flag|option|switch|argument)"
+    r"|`(--[\w-]+)` is not a (?:real )?(?:flag|option)",
+    re.I)
+
+
+def _absence_claims(text: str) -> set[str]:
+    return {group for match in _ABSENCE_CLAIM.finditer(text)
+            for group in match.groups() if group}
 
 
 def _parser_long_flags() -> set[str]:
@@ -1223,31 +1254,35 @@ def _parser_long_flags() -> set[str]:
     return flags
 
 
-@pytest.mark.parametrize("doc", (SKILL, READING, MUTATING, REFERENCE / "runtime.md"),
-                         ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
 def test_every_flag_the_reference_names_exists(doc: Path):
-    """A flag an agent reads here must be one the CLI accepts."""
+    """A flag an agent reads in any agent-facing doc must be one the CLI accepts.
+
+    The mirror of this module's founding defect. Its header records that an
+    OMITTED flag makes agents conclude a shipped feature does not exist -- three
+    re-filed it in one dogfood run. The inverse costs the same and was guarded
+    by nothing: a document that ADVERTISES a flag the parser has never heard of
+    sends an agent to write `--dry-run` and read the argparse refusal as a
+    broken CLI.
+    """
     text = doc.read_text(encoding="utf-8")
     known = _parser_long_flags()
     assert known, "the parser exposes no long flags, so this cell proves nothing"
-    denied = set(_DENIED_FLAG.findall(text))
     named = {match.group(0) for match in _DOC_FLAG.finditer(text)}
-    invented = sorted(named - denied - known)
+    invented = sorted(named - _absence_claims(text) - known)
     assert not invented, (
         f"{doc.name} names flags the parser does not accept, so an agent copying "
         f"them gets an argparse refusal and reads it as a broken CLI: {invented}"
     )
 
 
-@pytest.mark.parametrize("doc", (SKILL, READING, MUTATING, REFERENCE / "runtime.md"),
-                         ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
 def test_every_flag_the_reference_denies_really_does_not_exist(doc: Path):
-    """...and the other direction: a flag the reference tells an agent NOT to
-    reach for must stay unreachable, or the document is steering them away from
-    something that now works."""
+    """...and the other direction: a flag a document tells an agent does NOT
+    exist must stay unreachable, or the doc is steering them away from something
+    that now works."""
     text = doc.read_text(encoding="utf-8")
-    denied = set(_DENIED_FLAG.findall(text))
-    shipped = sorted(denied & _parser_long_flags())
+    shipped = sorted(_absence_claims(text) & _parser_long_flags())
     assert not shipped, (
         f"{doc.name} says these flags do not exist, but the parser accepts them: "
         f"{shipped}"
@@ -1328,11 +1363,39 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
     # to every flag in the run just before it.
     aliases: dict[str, set[str]] = {}
     for match in re.finditer(r"(?P<canonical>(?:`[^`]+`[ ]?)+)"
-                             r"\(alias `(?P<alias>--[a-z][a-z0-9-]+)`\)", prose):
+                             r"\(alias `(?P<alias>--[\w-]+)`\)", prose):
         aliases.setdefault(match["alias"], set()).update(
-            re.findall(r"--[a-z][a-z0-9-]+", match["canonical"]))
+            re.findall(r"--[\w-]+", match["canonical"]))
+    # An alias declaration is itself a claim about the parser, and until round 22
+    # it was taken on the document's word: declaring a FALSE alias dropped a real
+    # flag out of an EXHAUSTIVE list with the suite green. So each declared pair
+    # is checked to be a real alias -- both spellings known, and both carried by
+    # the SAME argparse action, which is what "alias" means.
+    by_option = {opt: action
+                 for action in subparser(["go", "rename"])._actions
+                 for opt in action.option_strings}
+    all_flags = {opt for action in parser._actions
+                 for opt in action.option_strings} | set(by_option)
+    # The canonical side may be a PHRASE naming several flags
+    # (`--format json --summary` (alias `--quiet`)), so the alias must share its
+    # action with at LEAST one of them -- that is what makes it an alias -- and
+    # only those genuine partners may excuse it from the exhaustive list.
+    real_aliases: dict[str, set[str]] = {}
+    for alias, canonicals in aliases.items():
+        if alias not in by_option:
+            continue                  # not one of this command's options
+        partners = {canonical for canonical in canonicals
+                    if by_option.get(canonical) is by_option[alias]}
+        assert partners, (
+            f"the reference declares `{alias}` an alias of "
+            f"{sorted(canonicals)}, but the parser carries it on none of their "
+            "options, so the exhaustive flag list below is excusing a flag it "
+            "should name"
+        )
+        real_aliases[alias] = partners
+    del all_flags
     own = {opt for opt in real - shared
-           if not (aliases.get(opt, set()) & claimed)}
+           if not (real_aliases.get(opt, set()) & claimed)}
     assert claimed == own, (
         f"the reference lists {sorted(claimed)} for `go rename` and says that is "
         f"all of them; the parser defines {sorted(own)} beyond the shared flags "
