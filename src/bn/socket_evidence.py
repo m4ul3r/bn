@@ -20,6 +20,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+_LISTING = Path("/proc/net/unix")
+
+
+def bound_socket_listing_available() -> bool:
+    """Can this kernel be ASKED which paths are bound?
+
+    ``path_has_bound_socket`` answers ``None`` for two different situations,
+    and one consumer has to tell them apart. "This path cannot be represented
+    in the listing" is a fact about the path, and keeping the file costs
+    nothing. "There is no listing on this platform" is a fact about every path
+    on the host -- so a consumer that must DISPLACE the file (the bridge
+    binding its own fixed socket path, as opposed to a sweep that can simply
+    skip) would refuse forever on Darwin/BSD after one unclean shutdown, with
+    no in-tool recovery. It falls back to the weaker connect() evidence there
+    and says so; everywhere a listing exists, the strong rule stands.
+    """
+    try:
+        _LISTING.read_bytes()
+    except OSError:
+        return False
+    return True
+
 
 def path_has_bound_socket(socket_path: Path) -> bool | None:
     """Whether any socket is BOUND to *socket_path*; ``None`` when unknowable.
@@ -89,7 +111,7 @@ def path_has_bound_socket(socket_path: Path) -> bool | None:
     if b"\n" in resolved:
         return None
     try:
-        listing = Path("/proc/net/unix").read_bytes()
+        listing = _LISTING.read_bytes()
     except OSError:
         return None
     name = os.fsencode(socket_path.name)

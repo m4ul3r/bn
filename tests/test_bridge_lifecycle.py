@@ -480,15 +480,18 @@ def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
     assert not inst.socket_path.exists()
 
 
-def _start_gate_bridge(monkeypatch, tmp_path, bound):
+def _start_gate_bridge(monkeypatch, tmp_path, bound, *, listing=True):
     """A bridge whose socket path already holds a file, with the kernel's
-    bound-socket evidence stubbed to *bound*."""
+    bound-socket evidence stubbed to *bound* and the availability of that
+    listing stubbed to *listing* (False = a platform with no `/proc/net/unix`,
+    where every path answers None)."""
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
     inst = module.BinaryNinjaBridge(instance_id="startgate")
     inst.socket_path.parent.mkdir(parents=True, exist_ok=True)
     inst.socket_path.touch()
     monkeypatch.setattr(module, "path_has_bound_socket", lambda path: bound)
+    monkeypatch.setattr(module, "bound_socket_listing_available", lambda: listing)
     return module, inst
 
 
@@ -497,8 +500,8 @@ def test_start_keeps_a_socket_file_whose_status_could_not_be_proved(monkeypatch,
     BOUND but has not reached `listen` refuses exactly like a crashed bridge's
     leftover file, and every bridge passes through that state coming up. Start
     used to unlink on that negative probe, orphaning the starting bridge on an
-    unlinked inode -- destruction on absence of evidence. An unknowable answer
-    must keep the file and say which evidence refused."""
+    unlinked inode -- destruction on absence of evidence. A path the listing
+    cannot represent must keep the file and say which evidence refused."""
     module, inst = _start_gate_bridge(monkeypatch, tmp_path, None)
 
     with pytest.raises(RuntimeError, match="nothing could be proved"):
@@ -534,6 +537,49 @@ def test_start_unlinks_a_socket_file_the_kernel_says_is_unbound(monkeypatch, tmp
         inst.start()
 
     assert not inst.socket_path.exists()
+
+
+def test_start_falls_back_to_the_connect_probe_where_no_listing_exists(
+        monkeypatch, tmp_path):
+    """The one documented exception to "an unprovable answer keeps the file".
+
+    On a platform with no `/proc/net/unix` (Darwin/BSD, both supported) EVERY
+    path answers None, so the strong rule would make this bridge permanently
+    unstartable on its OWN fixed socket path after a single unclean shutdown --
+    and nothing in the tool could recover it, because `instance gc` retains on
+    an unprovable answer too. A sweep can skip a file forever at no cost; the
+    process that must BIND that exact path cannot. So it falls back to the
+    weaker connect() evidence base used everywhere.
+
+    Scoped to the platform, not to the answer: a path the LISTING cannot
+    represent still keeps the file (the test above), because there the listing
+    exists and the rule holds for every other path on the host."""
+    module, inst = _start_gate_bridge(monkeypatch, tmp_path, None, listing=False)
+    monkeypatch.setattr(module.BinaryNinjaBridge, "_socket_is_live", lambda self: False)
+
+    def refuse_bind(*args, **kwargs):
+        raise RuntimeError("bind reached")
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", refuse_bind)
+
+    with pytest.raises(RuntimeError, match="bind reached"):
+        inst.start()
+
+    assert not inst.socket_path.exists()
+
+
+def test_start_without_a_listing_still_refuses_a_socket_that_answers(
+        monkeypatch, tmp_path):
+    """The fallback is weaker evidence, not no evidence: where the connect()
+    probe DOES answer, a serving bridge keeps its endpoint."""
+    module, inst = _start_gate_bridge(monkeypatch, tmp_path, None, listing=False)
+    monkeypatch.setattr(module.BinaryNinjaBridge, "_socket_is_live", lambda self: True)
+
+    with pytest.raises(RuntimeError, match="already serving"):
+        inst.start()
+
+    assert inst.socket_path.exists()
+
 
 
 def test_start_bridge_clears_global_when_start_raises(monkeypatch):

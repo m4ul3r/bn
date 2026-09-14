@@ -3945,6 +3945,36 @@ def test_the_call_window_never_states_a_resume_offset_it_could_not_derive():
     assert "--offset" not in refused.split("\n! malformed")[0], refused
 
 
+def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read():
+    """The one `_stated_count` site the differential above cannot reach: this
+    branch renders only when `go_renamed_candidates` is a readable zero, and the
+    recorded population context opens the detail branch instead.
+
+    The line is the actionable one on this op -- "nothing to do" is what a
+    caller stops on -- so the two numbers it offers as the REASON must not be
+    fabricated. A skewed `defined_count` used to render "(0 defined at pcln
+    addresses)", which reads as "this binary has no Go symbol table" rather
+    than "I could not read that count"."""
+    from bn import formatters
+
+    def nothing_to_do(**over):
+        return formatters._render_go_rename_text({
+            "kind": "go_rename", "success": True, "committed": True,
+            "go_renamed_candidates": 0, "defined_count": 7,
+            "skipped_user_named": 2, **over,
+        })
+
+    readable = nothing_to_do()
+    assert "(7 defined at pcln addresses, 2 already user-named)" in readable, readable
+
+    for key in ("defined_count", "skipped_user_named"):
+        refused = nothing_to_do(**{key: "lots"})
+        body = refused.split("\n! malformed")[0]
+        assert "? " in body or "(? " in body, (key, refused)
+        assert body != readable, (key, refused)
+        assert f"malformed {key} field" in refused, refused
+
+
 
 # The raw numeric spellings this module still carries, MEASURED rather than
 # described. Each is a count read that does not go through `_count_field` --

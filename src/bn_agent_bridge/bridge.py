@@ -62,7 +62,7 @@ from .paths import (
 )
 from .proc_identity import identity_payload
 from .seam import BridgeContext
-from .socket_evidence import path_has_bound_socket
+from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -1075,8 +1075,21 @@ class BinaryNinjaBridge:
             # refuses a connect() exactly like a leftover file, and every bridge
             # passes through that state coming up. So this takes the same
             # positive evidence the CLI side does (#618/#726) -- the kernel's own
-            # list of bound paths -- and an unknowable answer keeps the file.
+            # list of bound paths -- and a path that listing cannot represent
+            # keeps the file. A platform with no listing at all is the one
+            # documented exception, below.
             bound = path_has_bound_socket(self.socket_path)
+            if bound is None and not bound_socket_listing_available():
+                # No bound-socket listing on this platform (Darwin/BSD), so
+                # EVERY path answers None here and the strong rule would make
+                # this bridge permanently unstartable on its OWN fixed socket
+                # path after one unclean shutdown -- with no in-tool recovery,
+                # since `instance gc` retains on an unprovable answer too. A
+                # sweep can skip a file forever at no cost; the process that
+                # must BIND that exact path cannot. Fall back to the weaker
+                # connect() evidence, which is what base did everywhere, and
+                # keep the file whenever it answers.
+                bound = self._socket_is_live()
             if bound is not False:
                 if bound and self._socket_is_live():
                     detail = "another bridge is already serving there"
@@ -1085,7 +1098,7 @@ class BinaryNinjaBridge:
                               "(a bridge starting up, or one whose backlog is full)")
                 else:
                     detail = ("nothing could be proved about it: the kernel's bound-socket "
-                              "listing was unavailable or could not represent this path")
+                              "listing could not represent this path")
                 raise RuntimeError(
                     f"Refusing to displace the socket at {self.socket_path}: {detail}. "
                     "Remove the file by hand only after verifying no bridge owns it."

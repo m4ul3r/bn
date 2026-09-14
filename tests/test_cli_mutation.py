@@ -2746,17 +2746,40 @@ def _module_tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"))
 
 
-# Every module that reads a `result` off a bridge reply. The guard below used to
-# sweep `cli.py` alone, which is why TEN shipped sites in three sibling modules
-# sat outside it -- `target list` raising the documented-as-2 condition as a
-# bare `KeyError` for exit 1 plus a traceback, and `target use` diagnosing a
-# valid selector as unknown off a missing envelope.
-_RESULT_READING_MODULES = (
-    "src/bn/cli.py",
-    "src/bn/commands/admin.py",
-    "src/bn/commands/misc.py",
-    "src/bn/client.py",
-)
+# Every module under `src/bn` that MENTIONS the reply's result key, DISCOVERED
+# rather than listed. The guard used to sweep `cli.py` alone, which is why TEN
+# shipped sites in three sibling modules sat outside it -- `target list` raising
+# the documented-as-2 condition as a bare `KeyError` for exit 1 plus a
+# traceback, and `target use` diagnosing a valid selector as unknown off a
+# missing envelope. A hand-list would repeat exactly that mistake one scope out:
+# the next module to read an envelope joins the population by EXISTING.
+#
+# `formatters.py` is excluded by NAME and by reason: it never sees a reply. Its
+# two mentions of the key are a fan-out ROW's own field and a `py exec` result
+# payload, both of which this CLI wrote. `transport.py` is excluded because it
+# DEFINES the rule: `unwrap_result`'s own body, and the transport-side
+# `if "result" not in response` check it is the caller-side half of.
+#
+# A module leaves this population by no longer spelling the key -- which is
+# what the ten converted sites did -- and REJOINS it the moment a raw read is
+# added back, which is the failure this is here to catch.
+_RESULT_KEY_EXEMPT_MODULES = {"formatters.py", "transport.py"}
+
+
+def _result_reading_modules():
+    package = _CLI.parent
+    found = []
+    for path in sorted(package.rglob("*.py")):
+        if path.name in _RESULT_KEY_EXEMPT_MODULES:
+            continue
+        occurrences, _aliases = _result_key_reads(_module_tree(path))
+        if occurrences:
+            found.append(str(path.relative_to(package.parents[1])))
+    assert found, "no module under src/bn mentions a reply's result key"
+    return found
+
+
+_RESULT_READING_MODULES = _result_reading_modules()
 
 
 @pytest.mark.parametrize("module", _RESULT_READING_MODULES)
