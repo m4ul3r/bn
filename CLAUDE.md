@@ -22,10 +22,14 @@ Requires Python >= 3.14 and uv.
 
 ```bash
 uv run pytest                              # All tests
+uv run pytest -n 8                         # All tests, in parallel (pytest-xdist)
 uv run pytest tests/test_cli_core.py       # one module
 uv run pytest tests/test_cli_mutation.py::test_mutation_summary_committed_noop_is_not_dirty  # single test
 uv run pytest -v                           # Verbose output
+uv run pytest -m "not real_bn"             # skip the lanes that drive a real BN
 ```
+
+The suite is xdist-clean, and parallel is where the wall time is: `-n 8` takes the full run from roughly seven and a half minutes to two and a half on a six-core laptop. It is not in `addopts` because a serial run is the one that gives a readable failure and a usable `-x`.
 
 Tests mock the `binaryninja` module — no BN license needed except for the two real-BN lanes, `test_integration.py` and `test_taint_integration.py`, which need a real BN install plus a C toolchain (`cc`/`gcc` + `make`). BN is discovered the same way the CLI discovers it (platform defaults), except that `BN_INSTALL_DIR` is authoritative here: if it points at a non-install, the lane treats BN as absent rather than falling back to another install.
 
@@ -36,6 +40,16 @@ BN_REQUIRE_REAL_TESTS=1 uv run pytest tests/test_integration.py tests/test_taint
 ```
 
 Without BN the `real_bn`-marked tests skip visibly. Use the strict invocation on any lane that is *supposed* to have BN, so an absent install can't report green. Both real-BN modules carry `pytest.mark.real_bn` — never a bare module-level `skipif`, which bypasses the strict gate entirely.
+
+### The real-BN lane's shared bridge
+
+`shared_bn` (in `tests/conftest.py`) is one headless bridge per pytest session, and every real-BN test that is not *about* process lifecycle uses it. The lane's cost was lifecycle, not the work under test: `bn session start` measures ~2.9s warm (fork + BN import + analysis) and `session stop` ~0.6s, against ~0.2s to `bn load` into a live bridge and ~0.4s for a read command — so a bridge per test spent ~3.5s of startup to run a handful of sub-second commands.
+
+What the fixture keeps is the isolation that mattered: `shared_bn.load(binary)` copies the binary into the test's own scratch directory first, so a retype/rename/tag/comment/create — or a `bn save`, which writes its `.bndb` beside the copy — cannot be observed by another test. Exactly one target is open while a test runs, which is what the lane's commands assume when they omit `--target`; `begin()` refuses a dirty bridge and the teardown closes everything, so that invariant is enforced rather than hoped for, and a leak fails the test that leaked.
+
+Keep spawning a private session when the spawn IS the subject: `session start/stop/restart`, multi-instance selection, and anything proving a BNDB survives a reload. Under `-n` each worker gets its own bridge.
+
+An expensive binary is analysed once and reloaded from its saved database: `_build_and_prime_aarch64_probe` cross-builds the `-static` AArch64 probe, loads it (~20s of analysis), saves the `.bndb` and closes it; each test then loads a copy in under a second, because the bridge prefers an adjacent `<binary>.bndb` (#717) and `SharedBridge.load` copies that sidecar along with the binary.
 
 ## Architecture
 

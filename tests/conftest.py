@@ -14,15 +14,23 @@ same thing on every machine. See `tests/test_suite_isolation.py`.
 `integration_fixtures` + `require_real_bn` own the real-BN lane's gate (#590):
 the generated `tests/fixtures/*_x86_64` binaries stay untracked, so the suite
 builds them itself rather than skipping the only real-BN net silently.
+
+`shared_bn` is one headless bridge for the whole pytest session, because that
+lane's cost was process lifecycle rather than the work under test. Each test
+still loads its own private copy of its binary and the fixture closes it
+again, so the per-test isolation survives the process no longer being
+per-test. Tests whose subject IS the process keep starting their own.
 """
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import bn.cli
@@ -248,6 +256,206 @@ def integration_fixtures() -> list[Path]:
     """Session-scoped owner of fixture generation for the real-BN lane."""
     require_real_bn()
     return build_integration_fixtures()
+
+
+# --- shared real-BN bridge -------------------------------------------------
+
+#: The `bn` console script. The real-BN lane drives the installed entry point
+#: as a subprocess rather than `-m bn.cli`, which the `bn` package name
+#: shadows.
+_BN_CLI = [str(Path(sys.executable).parent / "bn")]
+
+#: Starting the shared bridge loads no binary, so this covers process spawn
+#: plus BN import only.
+_SHARED_BRIDGE_START_TIMEOUT = 120.0
+_SHARED_BRIDGE_STOP_TIMEOUT = 30.0
+
+#: One `bn load` into the LIVE bridge: ~0.2s for a fixture binary. A lane that
+#: analyses something big (a cross-built `-static` probe) passes its own.
+SHARED_LOAD_TIMEOUT = 120.0
+
+
+class SharedBridge:
+    """One headless bridge, reused by every test in the real-BN lane.
+
+    The lane's cost was process lifecycle, not the work under test. Measured
+    on a 6-core laptop, warm: `bn session start` 2.9s (fork + BN import +
+    analysis) and `session stop` 0.6s, against 0.2s for `bn load` into a live
+    bridge and ~0.4s for a read command. A bridge per test therefore spent
+    ~3.5s of startup to run a handful of sub-second commands, 44 times in
+    tests/test_integration.py alone.
+
+    The isolation that mattered is kept: every test gets a private
+    `BinaryView` over a private COPY of its binary, loaded at test start and
+    closed at test end, so a retype/rename/tag/comment/create in one test
+    cannot be observed by another -- and `bn save` writes its `.bndb` beside
+    the copy, never beside the shared fixture binary.
+
+    Exactly one target is open while a test runs, which is what the lane's
+    commands assume when they omit `--target`. `begin()` refuses a bridge that
+    is not clean and `end()` closes everything again, so that invariant is
+    enforced rather than hoped for: a leak is reported against the test that
+    leaked instead of failing the next test.
+
+    NOT for lifecycle tests. `session start/stop/restart`, multi-instance
+    selection and bndb-restore-on-reload are about the process this fixture
+    amortises away; they keep spawning their own bridges.
+    """
+
+    def __init__(self, instance_id: str, cache_dir: Path) -> None:
+        self.instance_id = instance_id
+        self.cache_dir = cache_dir
+        self._scratch: Path | None = None
+        self._loaded: list[str] = []
+
+    def env(self) -> dict[str, str]:
+        """The environment a call against this bridge must carry.
+
+        Built at call time, never snapshotted: the autouse `_hermetic_env`
+        rewrites the environment per test (#589). `BN_CACHE_DIR` is forced
+        because the shared bridge's registry lives in the session-scoped cache,
+        not in the caller's per-test one.
+        """
+        env = dict(os.environ)
+        env["BN_CACHE_DIR"] = str(self.cache_dir)
+        return env
+
+    def run(self, *args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+        """Run `bn --instance <shared> ...`; the returncode is the caller's to assert."""
+        return subprocess.run(
+            [*_BN_CLI, "--instance", self.instance_id, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=self.env(),
+        )
+
+    def json(self, *args: str, timeout: float = 60.0):
+        """Run a command that must succeed and parse its JSON."""
+        res = self.run(*args, "--format", "json", timeout=timeout)
+        assert res.returncode == 0, f"bn {' '.join(args)} failed: {res.stderr}\n{res.stdout}"
+        return json.loads(res.stdout)
+
+    def load(self, binary: Path | str, *, copy: bool = True,
+             timeout: float = SHARED_LOAD_TIMEOUT) -> str:
+        """Load *binary* into the shared bridge; returns its path selector.
+
+        Copied into the test's own scratch directory by default, so a test that
+        mutates or saves cannot reach the shared fixture binary or another
+        test's view. `copy=False` is for a binary the test already built into
+        its own `tmp_path`.
+
+        An adjacent `<binary>.bndb` travels with the copy: the bridge loads a
+        saved database in preference to the binary (#717), so leaving it behind
+        would silently turn a primed sub-second load back into a full analysis.
+        """
+        source = Path(binary)
+        if copy:
+            assert self._scratch is not None, "SharedBridge.load() outside a shared_bn test"
+            path = self._scratch / source.name
+            shutil.copy2(source, path)
+            sidecar = source.with_name(source.name + ".bndb")
+            if sidecar.exists():
+                shutil.copy2(sidecar, path.with_name(path.name + ".bndb"))
+        else:
+            path = source.resolve()
+        res = self.run("load", str(path), "--format", "json", timeout=timeout)
+        assert res.returncode == 0, f"load {path} failed: {res.stderr}\n{res.stdout}"
+        # `path` is what the bridge actually opened -- the `.bndb` when the
+        # sidecar won -- and it is the ONLY spelling `target list` and `close`
+        # agree with, so it is what gets recorded and handed back.
+        opened = json.loads(res.stdout)["path"]
+        self._loaded.append(opened)
+        return opened
+
+    def open_targets(self) -> list[str]:
+        """Absolute paths of every target currently open on the bridge."""
+        res = self.run("target", "list", "--format", "json", timeout=30.0)
+        assert res.returncode == 0, f"target list failed: {res.stderr}\n{res.stdout}"
+        return [item["filename"] for item in json.loads(res.stdout)["items"]]
+
+    def begin(self, scratch: Path) -> None:
+        """Hand the bridge to one test, refusing to hand over a dirty one."""
+        self._scratch = scratch
+        self._loaded = []
+        leaked = self.open_targets()
+        assert not leaked, (
+            f"the shared bridge still has {leaked} open before this test -- a "
+            "previous test left a target behind, which would change target "
+            "resolution here")
+
+    def end(self) -> list[str]:
+        """Close everything and clear sticky state; returns targets nobody declared.
+
+        Closes what `target list` reports rather than only what `load()`
+        recorded: a test that loaded by hand must not be able to poison the
+        rest of the session. The undeclared ones are returned so the test that
+        leaked them is the one that fails.
+        """
+        undeclared = [path for path in self.open_targets() if path not in self._loaded]
+        failures = []
+        for path in [*reversed(self._loaded), *undeclared]:
+            res = self.run("close", path, timeout=30.0)
+            if res.returncode != 0 and path in self.open_targets():
+                failures.append(f"{path}: {res.stderr.strip() or res.stdout.strip()}")
+        self._loaded = []
+        self._scratch = None
+        # Sticky `bn target use` / `bn instance use` pins live under the cache
+        # root, which is shared here; a pin set by one test would silently
+        # redirect the next one's resolution.
+        shutil.rmtree(sessions_dir_for(self.cache_dir), ignore_errors=True)
+        assert not failures, f"the shared bridge could not be cleaned up: {failures}"
+        return undeclared
+
+
+def sessions_dir_for(cache_dir: Path) -> Path:
+    """`bn.paths.sessions_dir()` for a cache root that is not the ambient one."""
+    return cache_dir / "sessions"
+
+
+@pytest.fixture(scope="session")
+def _shared_bridge(tmp_path_factory) -> Iterator[SharedBridge]:
+    require_real_bn()
+    cache_dir = tmp_path_factory.mktemp("bn-shared-bridge")
+    env = dict(os.environ)
+    env["BN_CACHE_DIR"] = str(cache_dir)
+    env["NO_COLOR"] = "1"
+    started = subprocess.run(
+        [*_BN_CLI, "session", "start", "--format", "json"],
+        capture_output=True, text=True, timeout=_SHARED_BRIDGE_START_TIMEOUT, env=env,
+    )
+    assert started.returncode == 0, (
+        f"shared bridge failed to start: {started.stderr}\n{started.stdout}")
+    bridge = SharedBridge(json.loads(started.stdout)["instance_id"], cache_dir)
+    try:
+        yield bridge
+    finally:
+        subprocess.run(
+            [*_BN_CLI, "session", "stop", bridge.instance_id],
+            capture_output=True, text=True, timeout=_SHARED_BRIDGE_STOP_TIMEOUT, env=env,
+        )
+
+
+@pytest.fixture
+def shared_bn(_shared_bridge, tmp_path, monkeypatch) -> Iterator[SharedBridge]:
+    """The shared bridge, scrubbed before and after one test.
+
+    `BN_CACHE_DIR` is re-pointed at the shared cache for the duration: the
+    autouse per-test pin would otherwise hide the bridge from any subprocess
+    the test spawns itself, and `SharedBridge.env()` and the test would then
+    disagree about which cache they are talking to.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(_shared_bridge.cache_dir))
+    scratch = tmp_path / "shared-bn"
+    scratch.mkdir()
+    _shared_bridge.begin(scratch)
+    try:
+        yield _shared_bridge
+    finally:
+        undeclared = _shared_bridge.end()
+    assert not undeclared, (
+        f"this test left {undeclared} open on the shared bridge; load through "
+        "`shared_bn.load()` so the fixture closes it")
 
 
 def pytest_runtest_setup(item):

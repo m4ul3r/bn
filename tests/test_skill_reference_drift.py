@@ -1436,7 +1436,7 @@ def test_an_absence_claim_binds_to_the_name_it_denies():
                                 _DOC_FLAG, _ABSENCE_CLAIM) == set()
 
 
-def test_go_rename_reference_states_the_scope_the_bridge_enforces():
+def test_go_rename_reference_states_the_scope_the_bridge_enforces(monkeypatch):
     """`go rename` is the one bulk mutation, and its safety claim is its SCOPE:
     auto-named functions only, so a manual name is never overwritten and the op
     is idempotent. A round-21 lens inverted that sentence -- "renames every
@@ -1445,7 +1445,14 @@ def test_go_rename_reference_states_the_scope_the_bridge_enforces():
 
     Executed against the bridge predicate the claim is about, not quoted.
     """
-    from bn_agent_bridge.bridge import _is_go_rename_auto_name
+    # Through the `_bridge_fakes` seam, not a bare import: `bn_agent_bridge.
+    # bridge` imports `binaryninja.plugin`, so a bare import only worked when
+    # some earlier module in the same process had already cached the bridge --
+    # which made this test pass serially and fail under `-n` on whichever
+    # worker drew it first.
+    from _bridge_fakes import _load_bridge
+
+    _is_go_rename_auto_name = _load_bridge(monkeypatch)._is_go_rename_auto_name
 
     text = MUTATING.read_text(encoding="utf-8")
     prose = " ".join(text.split())
