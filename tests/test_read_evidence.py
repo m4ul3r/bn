@@ -1149,10 +1149,12 @@ def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    result = instance._scan_for_calls_to(bv, 0x20000)
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
 
-    assert len(result) == 2
-    addresses = [int(r["address"], 16) for r in result]
+    assert truncated is False          # complete under budget -> NOT flagged (#622)
+    assert note is None                # ...and carries no partial-scan note either
+    assert len(refs) == 2
+    addresses = [int(r["address"], 16) for r in refs]
     assert 0x10010 in addresses
     assert 0x10020 in addresses
     assert 0x10030 not in addresses
@@ -1169,9 +1171,56 @@ def test_scan_for_calls_to_deduplicates_same_address(monkeypatch):
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    result = instance._scan_for_calls_to(bv, 0x20000)
+    refs, _truncated, _note = instance._scan_for_calls_to(bv, 0x20000)
 
-    assert len(result) == 1
+    assert len(refs) == 1
+
+
+def _scan_call_fn(start: int, name: str, dest: int):
+    fn = _FakeFunction(start, name)
+    fn.low_level_il = [[_FakeLLILInstruction(start + 0x10, _FakeConstPtr(dest))]]
+    return fn
+
+
+def test_scan_for_calls_to_stops_at_function_budget_and_reports_it(monkeypatch):
+    """#622: the import-xref fallback scan is budgeted by function count so it can
+    no longer walk every function's LLIL on a large view. A capped scan returns
+    what it found AND reports that it stopped early -- an agent must never read
+    the partial set as "no callers"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_scan_call_fn(0x1000, "a", 0x20000),
+                            _scan_call_fn(0x2000, "b", 0x20000)])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 1)
+
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
+
+    assert truncated is True
+    assert note and "budget" in note          # names the actual reason (#622 review)
+    assert [int(r["address"], 16) for r in refs] == [0x1010]   # partial, not all
+
+
+def test_scan_for_calls_to_stops_at_instruction_budget_and_reports_it(monkeypatch):
+    """#622: bounded in BOTH dimensions -- a function's LLIL must not blow the
+    instruction budget either."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "a")
+    fn.low_level_il = [[
+        _FakeLLILInstruction(0x1010, _FakeConstPtr(0x20000)),
+        _FakeLLILInstruction(0x1020, _FakeConstPtr(0x20000)),
+    ]]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 100)
+    monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_INSNS", 1)
+
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
+
+    assert truncated is True
+    assert note and "budget" in note
+    assert [int(r["address"], 16) for r in refs] == [0x1010]   # 1 of 2 examined
 
 
 def test_callsites_requires_refresh_when_quick_loaded(monkeypatch):
@@ -1860,6 +1909,56 @@ def test_function_evidence_slicing_471(monkeypatch):
     # invalid slicing args are clean errors
     with pytest.raises(bridge.OperationFailure):
         instance._function_evidence("active", "dispatch", limit=0)
+
+
+def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
+    """#622: a paged read returns the call PAGE without paying for the full
+    Pseudo-C decompile, and says so -- `decompile_deferred` + a warning line, so
+    the missing decompiler warnings / C++ `this` caveat are disclosed rather than
+    silently absent. An unsliced read is unchanged (full fidelity)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
+    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+                        lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
+    monkeypatch.setattr(instance.ctx, "_resolve_view",
+                        lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
+    monkeypatch.setattr(instance.ctx, "_find_function",
+                        lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
+    monkeypatch.setattr(bridge.il_format, "_function_metadata", lambda f: {})
+    monkeypatch.setattr(bridge.il_format, "_render_warnings", lambda t: [])
+    decompiles: list = []
+    monkeypatch.setattr(bridge.il_format, "_decompile_text",
+                        lambda bv, f: (decompiles.append(1), "")[1])
+
+    for kwargs in ({"limit": 2}, {"offset": 3}, {"address_window": (0x402010, 0x402030)}):
+        decompiles.clear()
+        page = instance._function_evidence("active", "dispatch", context=1, **kwargs)
+        assert decompiles == [], f"decompile ran for a paged read: {kwargs}"
+        assert page["decompile_deferred"] is True
+        assert any("defer" in w.lower() for w in page["warnings"])
+        # #471 paging semantics are untouched by the deferral: totals always
+        # come off the FULL call set, never off the returned page.
+        assert page["total_calls"] == 5
+        assert page["offset"] == kwargs.get("offset", 0)
+
+    page = instance._function_evidence("active", "dispatch", context=1, limit=2)
+    assert [c["callee"] for c in page["calls"]] == ["c0", "c1"]
+    assert page["matched_calls"] == 5
+    assert page["returned"] == 2 and page["has_more"] is True
+
+    win = instance._function_evidence("active", "dispatch", context=1,
+                                      address_window=(0x402010, 0x402030))
+    assert [c["callee"] for c in win["calls"]] == ["c1", "c2"]
+    assert win["matched_calls"] == 2 and win["total_calls"] == 5
+
+    # unsliced -> identical behaviour to before the deferral (decompile + its
+    # warnings collected), and no honesty field is invented for it.
+    decompiles.clear()
+    full = instance._function_evidence("active", "dispatch", context=1)
+    assert decompiles == [1]
+    assert "decompile_deferred" not in full
+    assert full["warnings"] == []
 
 
 def test_parse_field_spec_467(monkeypatch):

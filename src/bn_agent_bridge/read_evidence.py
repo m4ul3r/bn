@@ -741,11 +741,22 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         raise OperationFailure("invalid_request", f"Invalid limit: {limit}")
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
-    text = il_format._decompile_text(bv, func)
-    warnings = list(il_format._render_warnings(text))
-    this_caveat = _cpp_method_this_caveat(func, text)
-    if this_caveat:
-        warnings.append(this_caveat)
+    # #471 slicing/windowing controls so a large call-heavy dispatch function can be
+    # inspected in bounded chunks instead of reading a full spill.
+    slicing = bool(offset or limit is not None or address_window is not None)
+    # #622: the Pseudo-C decompile is expensive and is needed ONLY for the
+    # decompiler warnings and the C++ `this` caveat -- not for the call list. A
+    # paged read therefore defers it and DISCLOSES the deferral, so the missing
+    # warnings/caveat are never silently absent. The unsliced read keeps the
+    # original order (decompile -> calls -> variadic hoist) and full fidelity.
+    decompile_deferred = slicing
+    warnings: list[str] = []
+    if not decompile_deferred:
+        text = il_format._decompile_text(bv, func)
+        warnings = list(il_format._render_warnings(text))
+        this_caveat = _cpp_method_this_caveat(func, text)
+        if this_caveat:
+            warnings.append(this_caveat)
 
     calls = _function_call_evidence(ctx, bv, func, context=context)
     total_calls = len(calls)
@@ -756,11 +767,15 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("under_recovered") and variadic.get("warning"):
             warnings.append(f"{call.get('address', '?')}: {variadic['warning']}")
-    # #471: slicing/windowing controls so a large call-heavy dispatch function can be
-    # inspected in bounded chunks instead of reading a full spill. Only sort by address
-    # when a slice is actually requested -- the default (unsliced) output keeps its
-    # original IL/discovery order so existing consumers see no change.
-    slicing = bool(offset or limit is not None or address_window is not None)
+    if decompile_deferred:
+        warnings.append(
+            "Pseudo-C decompile deferred for this sliced read (offset/limit/address "
+            "window): decompiler warnings and the C++ `this` caveat were not "
+            "collected; an unsliced read gives full fidelity"
+        )
+    # #471: only sort by address when a slice is actually requested -- the default
+    # (unsliced) output keeps its original IL/discovery order so existing consumers
+    # see no change.
     if slicing:
         calls.sort(key=lambda c: int(str(c.get("address", "0x0")), 16))
     if address_window is not None:
@@ -791,6 +806,13 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         "has_more": offset + returned < matched,
         "warnings": warnings,
     }
+    if decompile_deferred:
+        # #622: additive honesty field -- present only when the decompile was
+        # skipped, so an unsliced read's payload is byte-for-byte unchanged. The
+        # field rides the JSON envelope only: the default TEXT renderers
+        # (src/bn/formatters.py) are outside this cluster's fence and do not
+        # surface it yet.
+        result["decompile_deferred"] = True
     # #626: annotate a mid-function (interior) request the same way the decompile
     # READs do (#193 Part 4). Inlined via the seam's `_containment_meta` rather
     # than importing read_decompile's `_annotate_containment`, to keep the

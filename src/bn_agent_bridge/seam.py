@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import difflib
 import re
+import threading
+import weakref
 from typing import Any
 
 try:
@@ -53,6 +55,304 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # ref), not the real body. When a name collision is only such stubs shadowing
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
+
+
+# Nested anonymous aggregates are expanded in the text layout and in the JSON
+# members[] tree so their inner members aren't invisible (#370.2). The depth is
+# capped only to bound recursion on a pathological (even self-referential)
+# aggregate -- deep nesting is real, so the cap is generous -- and hitting it is
+# DISCLOSED, never silent: the text layout renders an explicit
+# "... truncated at depth N" line and the JSON entry whose children were cut
+# carries "truncated": true, so a capped subtree is never read as an empty
+# struct (#674).
+_MAX_NESTED_LAYOUT_DEPTH = 32
+
+
+# #622(b): the "Did you mean" corpus is every spelling of every function, and
+# difflib gates every candidate it is handed (``real_quick_ratio`` then
+# ``quick_ratio``), so the miss path costs O(all spellings) -- measured on this
+# machine at 43 / 85 / 166 / 328 ms for 2.5k / 5k / 10k / 20k functions, i.e.
+# strictly linear in view size and already ~0.4 s before a 50k-function firmware
+# image is in range. The enumeration count is bounded (a warm miss walks the view
+# zero times) but the LATENCY was not, which #622 asks for explicitly ("cap
+# suggestion corpus ... so miss latency is bounded").
+#
+# So the number of candidates difflib sees is capped, and hitting the cap is
+# DISCLOSED in the error message rather than silently changing the hint -- the
+# issue's own rule ("prefer bounded latency + honest truncation over silent
+# incompleteness"). Nothing is dropped below the cap, which covers every view up
+# to ~10k functions; above it the message says how many spellings were searched
+# out of how many exist, so a missing hint is never mistaken for "no near match".
+# The cap is a COUNT, not a filter on which spellings qualify: a first-character
+# typo keeps its hint (the round-1 prefix-filter regression), and the length
+# prefilter stays removed (it only re-ran difflib's own ``real_quick_ratio``
+# gate, measured SLOWER: 0.2986s vs 0.2231s on 20000 spellings, best of 5).
+SUGGESTION_CORPUS_MAX = 20000
+
+# #622 (b): the per-view name index below is a cache, so it needs a cache
+# INVALIDATION signal that cannot be missed. BN supplies one natively: a
+# ``BinaryDataNotification`` subclass registered per view receives the view's own
+# change callbacks. The base class is optional -- this module must import cleanly
+# with no BN runtime and under the test double, and a view with no notification
+# support is simply never cached (every lookup walks, i.e. base behaviour).
+try:
+    _NotificationBase = bn.BinaryDataNotification
+except AttributeError:  # no BN runtime (tests / tooling) or an older core
+    _NotificationBase = object
+
+
+class _ViewChangeState(_NotificationBase):
+    """Per-view change counter + memo slots, driven by BN's own notifications.
+
+    Every name-bearing change BN reports bumps ``generation``, which invalidates
+    every memo slot for that view at once. Over-invalidation is the SAFE
+    direction: a callback fires SYNCHRONOUSLY inside the mutating call (verified
+    against a live ``.bndb`` -- assigning ``fn.name`` delivers ``symbol_updated``
+    before the assignment returns, ``define_user_symbol`` delivers
+    ``symbol_removed`` + ``symbol_updated``, ``update_analysis_and_wait`` delivers
+    ``function_updated`` per function), and the bridge serialises reads against
+    writes, so a read that follows a mutation cannot observe the pre-mutation
+    generation. No callback touches the view: the state holds no reference to it,
+    only its own counter and memo slots.
+
+    A callback is written out explicitly per event rather than funnelled through
+    ``__getattr__``: BN's dispatch resolves the attribute on the CLASS, so an
+    absent method would be an error rather than a catch-all.
+    """
+
+    def __init__(self):
+        self.generation = 0
+        self.values: dict[str, tuple[int, Any]] = {}
+        self.lock = threading.Lock()
+
+    def _changed(self):
+        with self.lock:
+            self.generation += 1
+
+    def symbol_added(self, *_args):
+        self._changed()
+
+    def symbol_removed(self, *_args):
+        self._changed()
+
+    def symbol_updated(self, *_args):
+        self._changed()
+
+    def function_added(self, *_args):
+        self._changed()
+
+    def function_removed(self, *_args):
+        self._changed()
+
+    def function_updated(self, *_args):
+        self._changed()
+
+    def data_var_added(self, *_args):
+        self._changed()
+
+    def data_var_removed(self, *_args):
+        self._changed()
+
+    def data_var_updated(self, *_args):
+        self._changed()
+
+    def data_written(self, *_args):
+        self._changed()
+
+    def type_defined(self, *_args):
+        self._changed()
+
+    def type_undefined(self, *_args):
+        self._changed()
+
+    def rebased(self, *_args):
+        self._changed()
+
+
+# Keyed weakly by the view: the state (and every memo it holds) dies with the
+# view's Python wrapper, so a closed target's index is never retained. That holds
+# only because NO memo value references the view: the name index stores start
+# addresses and spelling strings and resolves them through ``bv.get_function_at``
+# at lookup time, because a stored Function would reach the view back through
+# ``fn.view`` and pin this weak key (see :class:`_NameIndex`).
+_VIEW_STATES: "weakref.WeakKeyDictionary[Any, _ViewChangeState]" = weakref.WeakKeyDictionary()
+_VIEW_STATE_LOCK = threading.Lock()
+
+
+def _view_state(bv) -> _ViewChangeState | None:
+    """The per-view change state, registering this module's notifier on first use.
+
+    Returns None when caching would be UNSOUND, and then every caller walks the
+    view exactly as before: no BN runtime, no view, a view with no callable
+    ``register_notification`` (the test doubles), an unhashable view, or a
+    registration that raises. Registration is attempted inside the try and the
+    state is stored ONLY on success, so a half-registered state can never be
+    handed out.
+
+    The state is a :class:`_ViewChangeState`, which holds only its own counter,
+    memo slots and lock -- no reference to the view -- and (see
+    :func:`_view_memo_entry`) no memo value may hold one either, so the weak entry
+    really is released when the target closes.
+    """
+    if bn is None or bv is None:
+        return None
+    register = getattr(bv, "register_notification", None)
+    if not callable(register):
+        return None
+    try:
+        with _VIEW_STATE_LOCK:
+            state = _VIEW_STATES.get(bv)
+            if state is not None:
+                return state
+            state = _ViewChangeState()
+            try:
+                register(state)
+            except Exception:
+                return None
+            _VIEW_STATES[bv] = state
+            return state
+    except TypeError:  # unhashable view -> not usable as a weak key
+        return None
+
+
+def _view_memo(bv, slot: str, build):
+    """Memoise ``build()`` for *bv*'s CURRENT generation, or call it and cache
+    nothing when *bv* has no sound invalidation signal (:func:`_view_state`).
+
+    The memoised value alone; :func:`_view_memo_entry` holds the machinery, the
+    "built by an earlier call" flag the staleness guards need, and the invariant
+    every memo value must satisfy.
+    """
+    return _view_memo_entry(bv, slot, build)[0]
+
+
+def _view_memo_entry(bv, slot: str, build) -> tuple[Any, bool]:
+    """``(value, served_from_memo)`` behind :func:`_view_memo`.
+
+    The value is tagged with the generation it was built at and is only stored if
+    that generation still stands after the build -- a change landing mid-build can
+    never be tagged fresh, so the next read rebuilds. ``build()`` itself runs
+    OUTSIDE the lock: it enumerates the view, and holding the state lock across
+    that would serialise unrelated readers for no benefit.
+
+    ``served_from_memo`` is True only for a value built by an EARLIER call, i.e.
+    one a change BN did not notify may have overtaken; a value built by THIS call
+    is current by construction. Every memo value must be free of view-derived
+    objects: the state is keyed weakly by the view, so a value that reaches the
+    view back -- a Function reaches it through ``fn.view`` -- would pin that key
+    and retain a closed target for the process lifetime.
+    """
+    state = _view_state(bv)
+    if state is None:
+        return build(), False
+    with state.lock:
+        generation = state.generation
+        cached = state.values.get(slot)
+    if cached is not None and cached[0] == generation:
+        return cached[1], True
+    value = build()
+    with state.lock:
+        if state.generation == generation:
+            state.values[slot] = (generation, value)
+    return value, False
+
+
+def _view_memo_clear(bv, slot: str) -> None:
+    """Drop *slot* from *bv*'s memo so the next lookup rebuilds it.
+
+    The live staleness guards use this when a change BN did NOT notify makes a
+    cached bucket disagree with the view: the generation counter is bypassed on
+    purpose (it is unchanged by definition) while the memo discipline is kept.
+    """
+    try:
+        state = _VIEW_STATES[bv]
+    except (KeyError, TypeError):
+        return
+    with state.lock:
+        state.values.pop(slot, None)
+
+
+class _NameIndex:
+    """Every function's spellings -> the START ADDRESSES carrying them, from ONE pass.
+
+    ``exact``/``folded`` map a spelling (as-is / casefolded) to its bucket of
+    ``int(fn.start)`` addresses, in view order; ``corpus`` is every spelling of
+    every function in view order, for the "did you mean" hint. Buckets are handed
+    out as NEW lists (:meth:`_starts`), resolved back to LIVE functions at lookup
+    time (:meth:`_resolve`).
+
+    That indirection is the retention contract, not a style choice: a Function, a
+    BinaryView, or anything else that reaches the view back MUST NOT be stored
+    here. On real BN a Function strongly references its own view (``fn.view is
+    bv``), so a bucket of Functions would keep the view alive through the
+    ``WeakKeyDictionary`` value keyed on it, and a closed target's spelling corpus
+    would be retained for the process lifetime. Only ints and strings are stored,
+    so the entry dies with the view.
+
+    ``count`` is how many functions the view held when the index was built, taken
+    from the very list the build walked. It is the one staleness signal that is
+    independent of SPELLING and of CASE, which is what makes it the witness of
+    last resort for a change BN did not notify: BN's own name index is
+    case-sensitive, so an addition spelled in a casing nothing asked for cannot be
+    witnessed by name (:meth:`BridgeContext._witnessed_missing_member`).
+    """
+
+    __slots__ = ("exact", "folded", "corpus", "count")
+
+    def __init__(self):
+        self.exact: dict[str, list[int]] = {}
+        self.folded: dict[str, list[int]] = {}
+        self.corpus: list[str] = []
+        self.count: int = 0
+
+    @staticmethod
+    def _starts(mapping: dict[str, list[int]], key: str) -> list[int]:
+        """The start addresses for *key*, deduped by address in view order, as a
+        NEW list (the walk's semantics)."""
+        bucket = mapping.get(key)
+        if not bucket:
+            return []
+        out: list[int] = []
+        seen: set[int] = set()
+        for start in bucket:
+            if start in seen:
+                continue
+            seen.add(start)
+            out.append(start)
+        return out
+
+    @staticmethod
+    def _resolve(bv, starts: list[int]) -> tuple[list[Any], int]:
+        """``(live functions at *starts* in view order, how many did not resolve)``.
+
+        Resolution happens here, at lookup time, rather than being stored: a
+        Function would pin the view (see the class docstring). On real BN
+        ``get_function_at`` is a map lookup, not a ``bv.functions`` walk, and a
+        start the view no longer has resolves to None.
+
+        The unresolved COUNT is returned rather than swallowed: a start this index
+        recorded that the view no longer has is proof the view changed after the
+        index was built, which is exactly what the staleness guards look for. A
+        list built by silently dropping it would be an incomplete group that looks
+        complete."""
+        get_at = getattr(bv, "get_function_at", None)
+        if not callable(get_at):
+            return [], len(starts)
+        out: list[Any] = []
+        missing = 0
+        for start in starts:
+            fn = get_at(start)
+            if fn is None:
+                missing += 1
+            else:
+                out.append(fn)
+        return out, missing
+
+    def exact_matches(self, bv, text: str) -> tuple[list[Any], int]:
+        return self._resolve(bv, self._starts(self.exact, text))
+
+    def folded_matches(self, bv, text: str) -> tuple[list[Any], int]:
+        return self._resolve(bv, self._starts(self.folded, text.lower()))
 
 
 class BridgeContext:
@@ -115,7 +415,22 @@ class BridgeContext:
                 raise RuntimeError(f"No function found at address {hex(addr)}")
 
         text = str(identifier)
-        exact = self._find_functions_by_name(bv, text, case_sensitive=True)
+        # The per-view name index serves the exact match, the casefolded match and
+        # the "did you mean" corpus from ONE pass, and a WARM index serves all
+        # three without enumerating the view at all (#622(b), see
+        # :meth:`_scan_functions_by_name`).
+        #
+        # BN's own name index is deliberately NOT consulted as the answer here.
+        # It is a strict SUBSET of the walk -- it does not carry the demangled
+        # short/full spellings BN keeps only on the symbol (#224a) -- so a unique
+        # non-stub hit from it is no evidence the spelling is unique. Resolving
+        # from it silently auto-picked one of two REAL bodies sharing a spelling
+        # (a C ``handle`` beside a C++ ``handle()`` reached through its demangled
+        # short name), which is precisely what #122 forbids: the walk raises the
+        # ambiguous-identifier error instead. The index stays in use as the
+        # cached group's completeness WITNESS (:meth:`_witnessed_missing_member`),
+        # where a subset can only ever force a rebuild, never pick an answer.
+        exact, folded, corpus = self._scan_functions_by_name(bv, text)
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
@@ -124,7 +439,6 @@ class BridgeContext:
                 return resolved
             raise RuntimeError(_format_ambiguous_function_error(identifier, exact))
 
-        folded = self._find_functions_by_name(bv, text, case_sensitive=False)
         if len(folded) == 1:
             return folded[0]
         if len(folded) > 1:
@@ -139,14 +453,21 @@ class BridgeContext:
             if fn is not None:
                 return fn
 
-        available: list[str] = []
-        for fn in list(bv.functions):
-            available.extend(self._function_name_forms(fn))
-        suggestions = difflib.get_close_matches(text, available, n=5, cutoff=0.5)
+        # Bounded hint cost, disclosed when it bites (SUGGESTION_CORPUS_MAX).
+        capped = len(corpus) > SUGGESTION_CORPUS_MAX
+        searched = corpus[:SUGGESTION_CORPUS_MAX] if capped else corpus
+        budget_note = (
+            f" Hints searched the first {len(searched)} of {len(corpus)} spellings "
+            "(suggestion budget)." if capped else ""
+        )
+        suggestions = difflib.get_close_matches(text, searched, n=5, cutoff=0.5)
         if suggestions:
             raise RuntimeError(
-                f"Function not found: {identifier}. Did you mean: {', '.join(suggestions)}"
+                f"Function not found: {identifier}.{budget_note} "
+                f"Did you mean: {', '.join(suggestions)}"
             )
+        if capped:
+            raise RuntimeError(f"Function not found: {identifier}.{budget_note}")
         raise RuntimeError(f"Function not found: {identifier}")
 
     def _resolve_impl_over_stub(self, matches: list[Any]):
@@ -202,7 +523,11 @@ class BridgeContext:
         mangled name as ``fn.name`` -- the symbol's demangled ``short_name`` /
         ``full_name``. Lets ``foo::bar::recv`` resolve a function whose
         ``fn.name`` is the mangled ``_ZN3foo3bar4recvEi`` (#224a), uniformly
-        across xrefs / callsites / decompile (all route through here)."""
+        across xrefs / callsites / decompile (all route through here).
+
+        Deliberately NOT memoised: reading the four names off a live BinaryView
+        costs far more than the de-duplication this does, so a cache keyed on the
+        read values measured *slower* than re-reading them (#622)."""
         forms: list[str] = []
         for v in (getattr(fn, "name", None), getattr(fn, "raw_name", None)):
             if v:
@@ -218,21 +543,363 @@ class BridgeContext:
                 out.append(f)
         return out
 
-    def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
-        matches = []
-        needle = text if case_sensitive else text.lower()
-        seen: set[int] = set()
+    def _build_name_index(self, bv) -> _NameIndex:
+        """ONE pass over ``list(bv.functions)`` -> the per-view :class:`_NameIndex`.
+
+        Exactly the pass :meth:`_scan_functions_by_name` used to run inline: every
+        form of every function goes into the corpus verbatim, and the function's
+        START ADDRESS into the exact / folded buckets, in view order. Only the
+        address is kept -- never the Function, which would reach the view back
+        through ``fn.view`` and keep a closed target's index alive.
+
+        The function COUNT is taken from the very list this pass walks, so the
+        count and the buckets can never describe different view states."""
+        index = _NameIndex()
+        functions = list(bv.functions)
+        index.count = len(functions)
+        for fn in functions:
+            start = int(fn.start)
+            forms = self._function_name_forms(fn)
+            index.corpus.extend(forms)
+            for form in forms:
+                index.exact.setdefault(form, []).append(start)
+                index.folded.setdefault(form.lower(), []).append(start)
+        return index
+
+    def _name_index(self, bv, *, refresh: bool = False) -> tuple[_NameIndex, bool]:
+        """``(index, memoised)`` for the per-view name index.
+
+        The index is built once per view generation and reused after; ``memoised``
+        is True only when it was built by an EARLIER call, so a change BN did not
+        notify may have overtaken it -- a value built by this call IS the walk and
+        cannot be stale.
+
+        The index is PER VIEW and dies with the view's Python wrapper (a weak
+        key): it holds only start addresses and spelling strings, so no memo value
+        references the view (a stored Function would, through ``fn.view``) and the
+        entry is released when the target closes. It is rebuilt whenever BN
+        reports ANY name-bearing change -- a rename makes a bucket stale, so
+        over-invalidating is the safe direction. A view whose notification surface
+        is unavailable is NEVER cached (every lookup walks, i.e. the behaviour
+        before the index existed). ``refresh=True`` drops the memo slot first, for
+        the live staleness guards."""
+        if refresh:
+            _view_memo_clear(bv, "name_index")
+        return _view_memo_entry(bv, "name_index", lambda: self._build_name_index(bv))
+
+    def _bucket_is_live(self, bucket: list[Any], text: str, *, folded: bool) -> bool:
+        """Does every member of a cached *bucket* still carry the queried spelling?
+
+        The generation counter is the primary invalidation signal, but a change BN
+        does not notify (an unaudited name write) would leave it untouched and let
+        the cached bucket serve a spelling a function no longer has. Re-reading the
+        members' spellings costs a handful of getattrs for the bucket (usually one
+        member) and never a view walk."""
+        needle = text.lower()
+        for fn in bucket:
+            forms = self._function_name_forms(fn)
+            if folded:
+                if not any(needle == form.lower() for form in forms):
+                    return False
+            elif text not in forms:
+                return False
+        return True
+
+    def _scan_functions_by_name(
+        self, bv, text: str
+    ) -> tuple[list[Any], list[Any], list[str]]:
+        """``(exact, folded, corpus)`` for *text* from the per-view name index.
+
+        ``exact`` / ``folded`` are the case-sensitive / casefolded matches,
+        deduped by start address in view order -- the authoritative multi-form
+        match :meth:`_walk_functions_by_name` computes (the demangled short/full
+        spellings live on the symbol, not in BN's name index, #224a). ``corpus``
+        is EVERY spelling of EVERY function, in view order: the same list, in the
+        same order, that the unbounded base revision handed difflib.
+
+        The corpus is deliberately UNFILTERED -- no first-character filter, no
+        sampling, no length prefilter -- because any filter that can drop the
+        intended spelling makes a FIRST-character typo lose the "Did you mean"
+        hint, or replace it with an unrelated name that happens to share the typo
+        (the round-1 regression). The removed length prefilter was also redundant:
+        ``difflib.get_close_matches`` already gates every candidate on
+        ``real_quick_ratio`` itself, so the prefilter only re-ran that gate --
+        measured on 20000 synthetic spellings, 0.2231s for the plain corpus vs
+        0.2986s for the prefiltered one (best of 5). How MANY of these spellings
+        the hint path searches is capped and the cap is disclosed in the error
+        message (``SUGGESTION_CORPUS_MAX``), which is what bounds miss LATENCY;
+        the index itself keeps every spelling, so nothing else reads a partial
+        corpus.
+
+        What this method bounds is the number of view PASSES, not the per-spelling
+        work: the base revision walked ``bv.functions`` THREE times per miss
+        (case-sensitive match, casefolded match, suggestion corpus) and the
+        round-3 single-pass version still walked once per miss, so every lookup
+        paid a full view enumeration. A WARM view needs none of that -- the index
+        above is built once per view generation and reused, and a lookup costs one
+        dict lookup plus the guards below: a ``get_function_at`` map lookup per
+        cached member, one ``len(bv.functions)``, the members' spelling re-read,
+        and one native-index lookup per casing. None of those constructs a
+        ``Function`` per view function or reads any name off one, which is what
+        the walk costs; stated exactly, ``len(bv.functions)`` is one core
+        list-and-count call (see :meth:`_function_count_changed`), so "no
+        enumeration" means no Python-level pass and no per-function name reads,
+        not zero core calls. Measured on a synthetic >=100-function view whose
+        ``functions`` list counts ``__iter__``: base 3 enumerations per miss, 1
+        for round-3, 0 warm here (#622(b)).
+
+        Invalidation is BN's own notification counter: every mutation path that
+        could be exercised -- a direct ``fn.name`` write, undo, redo, the bridge's
+        rename op, a reverted ``bn rename --preview`` and ``bn refresh`` -- fires a
+        handled ``symbol_*``/``function_*`` event, so a read that follows one never
+        serves the pre-change index. That counter is the invalidation signal; the
+        guards below are cheap CORROBORATION for a change BN did not notify at
+        all, run on every lookup served by the memo (an index built by this call
+        IS the walk, so no witness can contradict it) and each costing at most ONE
+        rebuild per lookup -- never a loop:
+
+        * no cached start may have VANISHED: a start this index recorded that the
+          view no longer resolves is proof the view changed, and it needs no
+          spelling, no casing and no count difference to see it;
+        * the view must still hold as many functions as when the index was built
+          (:meth:`_function_count_changed`) -- the one guard that is independent
+          of spelling AND casing, so it catches an unnotified ADDITION or REMOVAL
+          BN's case-sensitive name index cannot be asked about;
+        * every cached member must still carry the queried spelling; and
+        * the cached group must not LACK a member BN's own name index witnesses for
+          the spelling -- the check is symmetric, so a cached NON-empty bucket that
+          is missing a member is rebuilt too, not only an empty one.
+
+        BN's own index is keyed on the view's SPELLINGS and is case-sensitive, so
+        that last witness is fetched once per casing the group is known by and
+        compared against the bucket that casing belongs to
+        (:meth:`_witnessed_missing_member`). It is only ever a WITNESS that the
+        group is incomplete -- never the answer itself (the walk-backed rebuild
+        supplies the COMPLETE group, round-3 blocker rule).
+
+        The RESIDUAL gap. A change BN does not notify escapes all four guards
+        exactly when all three of these hold: it leaves the function COUNT
+        unchanged; every start cached for THE QUERIED spelling still resolves (the
+        vanished-start guard reads the queried buckets, not the whole index); and
+        the spelling it introduces is one BN's case-sensitive index cannot be
+        asked for -- a casing nothing queried and no cached member holds, or a
+        demangled short/full name the index does not carry (#224a). That
+        CONDITION is the boundary; the shapes known to meet it are an unnotified
+        rename, an unnotified addition paired with a removal outside the queried
+        buckets, and an unnotified late symbol attachment that gives an existing
+        function the queried spelling (no rename, no addition, no removal). Any
+        other change meeting the condition escapes too -- the list is the shapes
+        seen, not a proof that no fourth exists.
+
+        What a reader gets in that case: a group missing a member, and -- because
+        the same index backs the suggestion corpus -- a "Did you mean" list built
+        from the same stale spellings, so it can still name a removed function and
+        omit an added one. Closing any of it needs a membership re-read of every
+        function on every warm lookup, i.e. the walk this index exists to remove,
+        so it is disclosed rather than paid for.
+
+        A standing disagreement between BN's name index and ``bv.functions``
+        degrades the warm path to one rebuild per lookup, which is the BASE cost
+        and the safe direction: a group a witness calls incomplete is never
+        served."""
+        if not callable(getattr(bv, "get_function_at", None)):
+            # The index stores START ADDRESSES and resolves them at lookup time
+            # (the retention contract above), so a view that cannot resolve an
+            # address must be WALKED -- never answered with the empty group that
+            # resolution would otherwise produce.
+            return self._walk_scan(bv, text)
+        index, memoised = self._name_index(bv)
+        exact, exact_gone = index.exact_matches(bv, text)
+        folded, folded_gone = index.folded_matches(bv, text)
+        stale = memoised and (
+            # A start this index recorded that the view no longer has is PROOF of
+            # an unnotified change -- cheaper and stronger than any witness,
+            # because it needs no spelling, no casing and no count difference.
+            bool(exact_gone or folded_gone)
+            or self._function_count_changed(bv, index)
+        )
+        if not stale:
+            stale = not self._bucket_is_live(exact, text, folded=False)
+        if not stale:
+            stale = not self._bucket_is_live(folded, text, folded=True)
+        if not stale and memoised:
+            stale = self._witnessed_missing_member(bv, text, exact, folded)
+        if stale:
+            index, _ = self._name_index(bv, refresh=True)
+            exact, _ = index.exact_matches(bv, text)
+            folded, _ = index.folded_matches(bv, text)
+        return exact, folded, index.corpus
+
+    def _walk_scan(self, bv, text: str) -> tuple[list[Any], list[Any], list[str]]:
+        """``(exact, folded, corpus)`` computed by walking the view, for a view the
+        index cannot serve.
+
+        Identical semantics to the index path -- multi-form match, deduped by
+        start address, in view order, with the full spelling corpus -- and the
+        behaviour that predates the index. Reached only when the view cannot
+        resolve a start address back to a function, which no real BinaryView does:
+        one walk is the honest answer there, an empty group is not."""
+        needle = text.lower()
+        exact: list[Any] = []
+        folded: list[Any] = []
+        corpus: list[str] = []
+        seen_exact: set[int] = set()
+        seen_folded: set[int] = set()
         for fn in list(bv.functions):
             forms = self._function_name_forms(fn)
-            haystacks = forms if case_sensitive else [name.lower() for name in forms]
-            if needle not in haystacks:
+            corpus.extend(forms)
+            start = int(fn.start)
+            if text in forms and start not in seen_exact:
+                seen_exact.add(start)
+                exact.append(fn)
+            if start not in seen_folded and any(needle == form.lower() for form in forms):
+                seen_folded.add(start)
+                folded.append(fn)
+        return exact, folded, corpus
+
+    def _function_count_changed(self, bv, index: _NameIndex) -> bool:
+        """Does the view hold a different number of functions than when *index*
+        was built?
+
+        The one staleness signal that depends on neither a spelling nor a casing,
+        which is what makes it the witness of last resort: BN's name index is
+        case-sensitive, so an unnotified addition spelled in a casing nothing
+        queried -- and that no cached member carries -- cannot be witnessed by name
+        at all, but it does change the count.
+
+        Cost, exactly: on the installed BN API ``bv.functions`` is a
+        ``FunctionList`` built by ONE core ``BNGetAnalysisFunctionList`` call that
+        also yields the count, and ``len()`` reads that count -- so this is one
+        core call plus the core's own array allocation, with none of the
+        per-function ``Function`` construction or the four name reads per function
+        the index build pays. It is a fraction of the walk it keeps from being
+        needed, not free, and it is O(n) inside the core.
+
+        A view whose ``functions`` cannot report a length (a double, never a real
+        BinaryView) has no count witness; the other three guards still apply."""
+        try:
+            live = len(bv.functions)
+        except (AttributeError, TypeError):
+            return False
+        return live != index.count
+
+    def _witnessed_missing_member(self, bv, text: str, exact: list[Any],
+                                  folded: list[Any]) -> bool:
+        """Does BN's own name index witness a same-name member the cached group LACKS?
+
+        That index is case-SENSITIVE and keyed on the view's own spellings, so the
+        casing it is asked for decides whether it can answer at all. The QUERIED
+        spelling is witnessed against the exact bucket, and every spelling the LIVE
+        folded members actually carry is witnessed against the folded bucket: both
+        buckets are then checked in a casing BN can answer for. Asking only in the
+        queried casing left a memo-served case-insensitive group with no
+        completeness check whenever the view spelled the name differently -- an
+        unnotified same-name addition was served as an incomplete group, which is
+        how a PLT veneer drops out of the xrefs caller union (#286).
+
+        Costs one native lookup per distinct casing in the group -- normally one,
+        two when the query's casing differs -- and never a ``bv.functions`` walk."""
+        exact_starts = {int(fn.start) for fn in exact}
+        if any(int(fn.start) not in exact_starts
+               for fn in self._native_functions_by_name(bv, text)):
+            return True
+        needle = text.lower()
+        spellings = {
+            form
+            for fn in folded
+            for form in self._function_name_forms(fn)
+            if form.lower() == needle
+        }
+        spellings.discard(text)         # already witnessed, against the stricter bucket
+        if not spellings:
+            return False
+        folded_starts = {int(fn.start) for fn in folded}
+        return any(
+            int(fn.start) not in folded_starts
+            for spelling in spellings
+            for fn in self._native_functions_by_name(bv, spelling)
+        )
+
+    def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        """The COMPLETE same-name group: every function matching *text*.
+
+        Walk-backed, like every other name resolution here: BN's own name index
+        can only ever return a strict SUBSET of the walk, because it does not
+        carry the demangled short/full spellings BN keeps only on the symbol
+        (#224a). Answering from that subset silently drops a same-name member,
+        which is how `xrefs <name>` once read a hot function as zero-caller -- the
+        veneer carrying its call traffic was missing from the index, so the stub
+        union had nothing to union (#286/#220/#201). The group callers:
+        :meth:`_same_name_stub_functions` (the sole input to the xrefs/callsites
+        PLT-veneer caller union), the xrefs name-collection path and
+        ``read_xrefs._xrefs_import_symbol``'s body lookup, and
+        :meth:`_resolve_rename_target` (which must raise on a genuine ambiguity
+        rather than miss a member). :meth:`_find_function`'s single-identifier
+        resolution is walk-backed for the same reason -- a subset hit there
+        suppressed the ambiguous-identifier error (#122) -- so the native index is
+        now used only as the cached group's completeness witness
+        (:meth:`_witnessed_missing_member`), where a subset can force a rebuild
+        but never pick an answer."""
+        return self._walk_functions_by_name(bv, text, case_sensitive=case_sensitive)
+
+    def _native_functions_by_name(self, bv, text: str) -> list[Any]:
+        """Functions BN's own name index resolves for *text*, or [] when the index
+        cannot answer.
+
+        BN keeps a name index (``get_functions_by_name`` + the symbol name
+        lookups), so this costs a keyed lookup rather than a view enumeration
+        (#622). It is a WITNESS only -- :meth:`_witnessed_missing_member` uses it
+        to decide whether a cached group must be rebuilt, and nothing resolves an
+        identifier from it, because it is a strict subset of the walk (#224a) and
+        a subset hit both suppressed the ambiguous-identifier error (#122) and
+        dropped same-name members from a group (#286).
+
+        Two guards keep it honest: ``getattr`` because not every BinaryView-shaped
+        test double implements the index, and a re-check of every candidate
+        against the full spelling set ``_function_name_forms`` produces -- a
+        native candidate only counts if the authoritative walk would have matched
+        it too. An empty result is NOT authoritative (the index does not carry the
+        demangled spellings BN keeps only on the symbol, #224a), so it never
+        witnesses absence, only presence."""
+        candidates: list[Any] = []
+        getter = getattr(bv, "get_functions_by_name", None)
+        if callable(getter):
+            candidates.extend(getter(text) or [])
+        symbol_lookups = []
+        for attr in ("get_symbols_by_name", "get_symbol_by_raw_name"):
+            lookup = getattr(bv, attr, None)
+            if callable(lookup):
+                symbol_lookups.append(lookup(text))
+        for found in symbol_lookups:
+            for symbol in (found if isinstance(found, (list, tuple)) else [found]):
+                if symbol is None:
+                    continue
+                get_at = getattr(bv, "get_function_at", None)
+                fn = get_at(int(getattr(symbol, "address", 0))) if callable(get_at) else None
+                if fn is not None:
+                    candidates.append(fn)
+        matches: list[Any] = []
+        seen: set[int] = set()
+        for fn in candidates:
+            if text not in self._function_name_forms(fn):
                 continue
-            marker = int(fn.start)
+            marker = int(getattr(fn, "start", 0))
             if marker in seen:
                 continue
             seen.add(marker)
             matches.append(fn)
         return matches
+
+    def _walk_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        """The authoritative multi-form match: exact, or casefolded, over every
+        function's spellings. Needs the walk because the demangled short/full
+        names live on the symbol, not in BN's name index (#224a).
+
+        Thin wrapper over :meth:`_scan_functions_by_name`, so the index is built at
+        most once whether the caller wants one of the two match sets or both; the
+        result is unchanged from the per-mode walk this replaced."""
+        exact, folded, _ = self._scan_functions_by_name(bv, text)
+        return exact if case_sensitive else folded
 
     def _resolve_scope_functions(self, bv, identifiers: list[Any]) -> list[tuple[str, Any]]:
         if not identifiers:
@@ -1004,10 +1671,14 @@ class BridgeContext:
                     offset = 0
                 member_type = getattr(member, "type", None)
                 lines.append(f"{pad}0x{offset:04x}: {member_type if member_type is not None else '<unknown>'} {name}")
-                if depth < 4 and self._is_anonymous_aggregate(member_type):
-                    itc = str(getattr(getattr(member_type, "type_class", None), "name", "") or "")
-                    self._append_member_lines(
-                        lines, member_type.members, "Enum" in itc, depth=depth + 1)
+                if self._is_anonymous_aggregate(member_type):
+                    if depth < _MAX_NESTED_LAYOUT_DEPTH:
+                        itc = str(getattr(getattr(member_type, "type_class", None), "name", "") or "")
+                        self._append_member_lines(
+                            lines, member_type.members, "Enum" in itc, depth=depth + 1)
+                    else:
+                        lines.append(
+                            f"{pad}  ... truncated at depth {depth + 1}: further nested members omitted")
 
     def _member_entries(self, type_obj, depth: int = 0) -> list[dict] | None:
         """Structured members[] for the JSON readback, recursing into anonymous
@@ -1031,10 +1702,13 @@ class BridgeContext:
                 entry["type"] = str(mtype)
             if value is not None and offset is None:
                 entry["value"] = int(value) if isinstance(value, int) else str(value)
-            if depth < 4 and self._is_anonymous_aggregate(mtype):
-                inner = self._member_entries(mtype, depth + 1)
-                if inner:
-                    entry["members"] = inner
+            if self._is_anonymous_aggregate(mtype):
+                if depth < _MAX_NESTED_LAYOUT_DEPTH:
+                    inner = self._member_entries(mtype, depth + 1)
+                    if inner:
+                        entry["members"] = inner
+                else:
+                    entry["truncated"] = True
             out.append(entry)
         return out
 
