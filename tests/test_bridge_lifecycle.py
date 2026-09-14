@@ -480,6 +480,62 @@ def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
     assert not inst.socket_path.exists()
 
 
+def _start_gate_bridge(monkeypatch, tmp_path, bound):
+    """A bridge whose socket path already holds a file, with the kernel's
+    bound-socket evidence stubbed to *bound*."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="startgate")
+    inst.socket_path.parent.mkdir(parents=True, exist_ok=True)
+    inst.socket_path.touch()
+    monkeypatch.setattr(module, "path_has_bound_socket", lambda path: bound)
+    return module, inst
+
+
+def test_start_keeps_a_socket_file_whose_status_could_not_be_proved(monkeypatch, tmp_path):
+    """`connect()` cannot answer "is anything bound here": a socket that is
+    BOUND but has not reached `listen` refuses exactly like a crashed bridge's
+    leftover file, and every bridge passes through that state coming up. Start
+    used to unlink on that negative probe, orphaning the starting bridge on an
+    unlinked inode -- destruction on absence of evidence. An unknowable answer
+    must keep the file and say which evidence refused."""
+    module, inst = _start_gate_bridge(monkeypatch, tmp_path, None)
+
+    with pytest.raises(RuntimeError, match="nothing could be proved"):
+        inst.start()
+
+    assert inst.socket_path.exists()
+
+
+def test_start_keeps_a_socket_file_the_kernel_says_is_bound(monkeypatch, tmp_path):
+    """Positive evidence of a binding is a refusal whether or not that binding
+    is accepting yet -- a full accept backlog answers a connect() like a dead
+    bridge too."""
+    module, inst = _start_gate_bridge(monkeypatch, tmp_path, True)
+
+    with pytest.raises(RuntimeError, match="Refusing to displace"):
+        inst.start()
+
+    assert inst.socket_path.exists()
+
+
+def test_start_unlinks_a_socket_file_the_kernel_says_is_unbound(monkeypatch, tmp_path):
+    """The other direction, so the refusals above are not vacuous: proof that
+    NOTHING is bound is what clears a crashed bridge's leftover file. Asserted
+    at the bind attempt, so the test never opens a real listener."""
+    module, inst = _start_gate_bridge(monkeypatch, tmp_path, False)
+
+    def refuse_bind(*args, **kwargs):
+        raise RuntimeError("bind reached")
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", refuse_bind)
+
+    with pytest.raises(RuntimeError, match="bind reached"):
+        inst.start()
+
+    assert not inst.socket_path.exists()
+
+
 def test_start_bridge_clears_global_when_start_raises(monkeypatch):
     module = _load_bridge(monkeypatch)
     monkeypatch.setattr(module, "ui", object())

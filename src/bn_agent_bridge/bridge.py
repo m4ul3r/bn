@@ -62,6 +62,7 @@ from .paths import (
 )
 from .proc_identity import identity_payload
 from .seam import BridgeContext
+from .socket_evidence import path_has_bound_socket
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -1069,11 +1070,25 @@ class BinaryNinjaBridge:
         if self.socket_path.exists():
             # A stale socket file from a crashed bridge is safe to clear, but a
             # live one belongs to another bridge instance; unlinking it would
-            # silently orphan that bridge on an unlinked inode.
-            if self._socket_is_live():
+            # silently orphan that bridge on an unlinked inode. A FAILED PROBE
+            # IS NOT PROOF OF ABSENCE: a socket bound but not yet past `listen`
+            # refuses a connect() exactly like a leftover file, and every bridge
+            # passes through that state coming up. So this takes the same
+            # positive evidence the CLI side does (#618/#726) -- the kernel's own
+            # list of bound paths -- and an unknowable answer keeps the file.
+            bound = path_has_bound_socket(self.socket_path)
+            if bound is not False:
+                if bound and self._socket_is_live():
+                    detail = "another bridge is already serving there"
+                elif bound:
+                    detail = ("something is bound there but is not accepting yet "
+                              "(a bridge starting up, or one whose backlog is full)")
+                else:
+                    detail = ("nothing could be proved about it: the kernel's bound-socket "
+                              "listing was unavailable or could not represent this path")
                 raise RuntimeError(
-                    f"Another bridge is already serving on {self.socket_path}; "
-                    "refusing to displace it"
+                    f"Refusing to displace the socket at {self.socket_path}: {detail}. "
+                    "Remove the file by hand only after verifying no bridge owns it."
                 )
             self.socket_path.unlink()
 
