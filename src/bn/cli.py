@@ -1171,18 +1171,32 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     if _apply_result_transform(_mutation_reports_failure, result,
                                "classify the mutation result"):
         return 3
-    # #715: a successful mutation the compact summary could not MEASURE (no
-    # `results[]` rows to derive counts from, #684) is "applied but
-    # unverifiable", not a confirmed success -- a $?-only consumer must not read
-    # it as one. 4 is deliberately distinct from a failure's 3 (the write did
-    # land) and from 0 (an all-noop or verified run, both measured). *summary* is
-    # the transform this call actually renders/spills with, so an op that
-    # measures through its own counters (`_go_rename_summary` reports
-    # `measured: true` by design) is not mislabelled by a generic recompute.
+    # #715: a successful mutation the compact summary could not MEASURE is
+    # "applied but unverifiable", not a confirmed success -- a $?-only consumer
+    # must not read it as one. 4 is deliberately distinct from a failure's 3
+    # (the write did land) and from 0 (an all-noop or verified run, both
+    # measured).
+    #
+    # `measured: false` has TWO causes and the exit code deliberately does not
+    # distinguish them, because the action they call for is identical (read the
+    # view back, `bn save` before closing): the summary had nothing to count
+    # (no `results[]` rows and no own counters, #684), or a field it counts FROM
+    # arrived in a shape no value reads out of and was refused and disclosed by
+    # name rather than fabricated as a zero (#619). The second cause reaches
+    # here through an op's OWN summary -- `_go_rename_summary` DERIVES
+    # `measured` from whether its six counters read, it does not assert it --
+    # so "this op counts through its own counters" is not the same claim as
+    # "this op is measured". *summary* is the transform this call actually
+    # renders/spills with, so the op is classified by the counters it really
+    # reports through rather than by a generic recompute over rows it does not
+    # populate.
     if summary is not None:
-        # Exit 0 is not an option when this raises -- the whole point of #715 is
-        # that a result the CLI cannot classify must not read as a confirmed
-        # success -- so it goes out as the documented BridgeError (exit 2).
+        # A transform that RAISES yields no verdict at all, and "no verdict"
+        # must never read as a confirmed success -- the whole point of #715 --
+        # so it goes out as the documented BridgeError (exit 2). That is the
+        # boundary between 2 and 4: 2 is not "a field was unreadable" (a
+        # refused field still classifies, and is 4), it is "this CLI cannot say
+        # whether the write failed, succeeded, or applied unmeasured".
         compact = summary(result)
         if not isinstance(compact, dict):
             # A registered transform that returns something else has not
@@ -1282,8 +1296,10 @@ def _mutate(
         # #715: the exit code is computed on the ORIGINAL result, before any
         # transform runs, so it cannot see the `measured` flag `_mutation_summary`
         # derives. Hand it the same transform this call renders/spills with (an
-        # op with its own measurement escape hatch supplies that instead) so an
-        # unmeasured success maps to exit 4 rather than reading as a clean 0.
+        # op that measures through its own counters supplies that instead -- a
+        # different measurement SOURCE, not a bypass: it reports `measured:
+        # false` too when those counters do not read) so an unmeasured success
+        # maps to exit 4 rather than reading as a clean 0.
         result_exit_code=lambda result: _mutation_exit_code(
             result, summary_transform or _mutation_summary,
         ),

@@ -26,7 +26,8 @@ import pytest
 # bridge's taint modules import real symbols from it -- under a randomized
 # collection order that turned into a suite-wide collection error. These two
 # imports are CLI-side and need no engine.
-from bn.formatters import FAILED_MUTATION_STATUSES, _mutation_summary
+from bn.formatters import (FAILED_MUTATION_STATUSES, _go_rename_summary,
+                           _mutation_summary)
 
 REPO = Path(__file__).resolve().parents[1]
 CLAUDE_MD = REPO / "CLAUDE.md"
@@ -305,7 +306,8 @@ _EXIT_CODE_CLAUSES = (
     ("2-read-or-resolver-status",
      r"including a status in `FAILED_MUTATION_STATUSES` on a read/resolver call,"),
     ("2-unclassifiable-mutation",
-     r"and a mutation result this CLI cannot classify — malformed or newer than the CLI\)"),
+     r"and a mutation result this CLI cannot classify AT ALL — malformed or newer "
+     r"than the CLI, so no verdict could be derived\)"),
     ("3-mutation-status",
      r"\b3 = a `_mutate`-marked call whose status is `verification_failed`, `unsupported`, "
      r"`invalid_request`, `rollback_failed`, or `internal_error`"),
@@ -313,13 +315,22 @@ _EXIT_CODE_CLAUSES = (
      r"— the refusal is exit 3 whether it was raised up front or during apply, "
      r"never 2 for a mutation —"),
     ("4-unmeasured",
-     r"\b4 = a `_mutate`-marked call whose compact summary reports `measured: false`, i\.e\."),
-    ("4-no-rows-and-no-own-summary",
+     r"\b4 = a `_mutate`-marked call whose compact summary reports `measured: false`, "
+     r"i\.e\. the counts could not be derived:"),
+    ("4-nothing-to-count",
      r"the op returned no `results\[\]` rows to derive counts from AND registered no "
-     r"summary of its own to count with, so the outcome could not be verified \(#715\);"),
-    ("4-own-summary-stays-measured",
-     r"an op that counts through its own registered summary \(`go rename`\) stays "
-     r"measured and exits 0\."),
+     r"summary of its own to count with,"),
+    ("4-a-counted-field-was-refused",
+     r"or a field the summary counts FROM arrived in a shape no value reads out of, "
+     r"so it was refused and disclosed by name rather than fabricated as a zero "
+     r"\(#715/#619\);"),
+    ("4-own-summary-is-0-only-while-its-counters-read",
+     r"an op that counts through its own registered summary \(`go rename`\) is 0 only "
+     r"while those counters read — one whose counter arrives unreadable is "
+     r"`measured: false` and 4 like any other unmeasured run\."),
+    ("2-one-refused-field-still-classifies",
+     r"So a single refused field is never 2: it still yields a verdict, and that "
+     r"verdict is 3 or 4\."),
     ("4-failure-wins-and-all-noop-is-zero",
      r"A failure still wins over 4 \(3 before 4\), and a measured all-`noop` is 0"),
 )
@@ -412,9 +423,29 @@ def test_the_exit_code_bullet_clauses_are_what_the_cli_actually_does():
     # "the refusal is exit 3 whether it was raised up front or during apply"
     assert _mutation_exit_code(refused_up_front, _mutation_summary) == 3
     assert _mutation_exit_code(failed_at_apply, _mutation_summary) == 3
-    # "an op that counts through its own registered summary stays measured and exits 0"
-    own_counters = lambda result: {"kind": "mutation_summary", "measured": True}
-    assert _mutation_exit_code(unmeasured, own_counters) == 0
+    # "an op that counts through its own registered summary (`go rename`) is 0
+    #  only while those counters read" -- the REAL summary, because it DERIVES
+    #  `measured` from those reads and a stub asserting `measured: True` makes
+    #  the claim unfalsifiable at the point it stops being true.
+    go = {"kind": "go_rename", "preview": False, "success": True,
+          "committed": True, "results": []}
+    assert _mutation_exit_code({**go, "go_renamed_candidates": 7,
+                                "go_committed_count": 7, "go_verified_count": 7,
+                                "go_failed_count": 0}, _go_rename_summary) == 0
+    # "...one whose counter arrives unreadable is `measured: false` and 4"
+    assert _mutation_exit_code({**go, "go_renamed_candidates": "many"},
+                               _go_rename_summary) == 4
+    # "So a single refused field is never 2: it still yields a verdict, and that
+    #  verdict is 3 or 4." -- the failing half of the same arrangement.
+    assert _mutation_exit_code(
+        {**go, "success": False, "committed": False,
+         "go_renamed_candidates": "many",
+         "results": [{"status": "verification_failed"}]}, _go_rename_summary) == 3
+    # "a mutation result this CLI cannot classify AT ALL ... so no verdict could
+    #  be derived" -- and that really is what 2 is reserved for.
+    from bn.transport import BridgeError
+    with pytest.raises(BridgeError, match="could not classify"):
+        _mutation_exit_code(["verified"], _mutation_summary)
 
 
 # The exit-code contract has ONE implementation and several places that state
@@ -447,8 +478,19 @@ _EXIT_CODE_ECHOES = (
     ("skills/bn/reference/mutating.md", "unmeasured-live-success",
      r"An unmeasured \*\*live\*\* success also changes the exit code: it is \*\*`(?P<code>\d)`\*\*",
      "unmeasured"),
-    ("skills/bn/reference/mutating.md", "own-summary-stays-measured",
-     r"so a clean run is exit `(?P<code>\d)`, not the unmeasured `4`", "own-summary"),
+    # Both `own-summary` echoes use `\s+` between words: these references are
+    # hand-wrapped prose, and a claim that reds on a re-wrap is bookkeeping
+    # rather than a guard.
+    ("skills/bn/reference/mutating.md", "own-summary-counters-read",
+     r"so\s+a\s+clean\s+run\s+whose\s+counters\s+read\s+is\s+exit\s+`(?P<code>\d)`",
+     "own-summary"),
+    # The other side of that derivation, stated by the same file. Its own
+    # summary is not a measurement GUARANTEE -- it is a different measurement
+    # SOURCE, and an unreadable counter leaves this op exactly as unmeasured as
+    # an empty `results[]` leaves every other one.
+    ("skills/bn/reference/mutating.md", "own-summary-counter-unreadable",
+     r"a\s+counter\s+that\s+arrives\s+unreadable\s+is\s+disclosed\s+by\s+name\s+and\s+"
+     r"the\s+run\s+is\s+the\s+unmeasured\s+`(?P<code>\d)`", "own-summary-refused"),
     ("skills/bn/reference/mutating.md", "unsupported-op-kind",
      r"either way exit (?P<code>\d), and a", "failing"),
     # Round 15 measured the "No combination changes the exit code" sentence FALSE
@@ -500,9 +542,17 @@ _EXIT_CODE_PINS = (
      "statuses:"),
     ("skills/bn/reference/mutating.md", "the-references-own-full-list",
      "0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a\n"
-     "response this CLI cannot parse) / 3 a mutation status `verification_failed`,\n"
+     "response this CLI cannot classify at all) / 3 a mutation status `verification_failed`,\n"
      "`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an\n"
      "unmeasured success"),
+    # The boundary of exit 2 on this path, stated in the file an agent opens to
+    # do mutation work. Measured, not merely present, by
+    # tests/test_cli_mutation.py::test_the_cases_the_reference_lists_for_exit_2_really_are_2,
+    # which runs a reply carrying one refused field and asserts it is not 2.
+    ("skills/bn/reference/mutating.md", "one-refused-field-is-not-a-2",
+     "And a reply carrying ONE field this CLI cannot\n"
+     "read: that field is refused and disclosed by name, a verdict is still derived\n"
+     "from the rest, and the run exits 3 or 4 accordingly."),
     # The direction of the one divergence, which is the part a $?-only consumer
     # depends on: an output failure can only ever replace the code with 2.
     # Behaviourally pinned by
@@ -626,11 +676,11 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "d95c6e1f",  # All mutations support `--preview` (apply → capture diffs → rever
     }),
     "README.md": frozenset({
+        "0e9e0137",  # Any status above other than ... puts a mutation at exit code ...
         "1e0f43b6",  # bn local retype ... ... float --preview
         "35d15f75",  # bn local rename ... ... speed --preview
         "3d833038",  # `bn function list` and `bn function search` return the full matc
         "66b37d2e",  # Omitting `--target` ... works when exactly one target is ... If 
-        "6be09cc8",  # Any status above other than ... puts a mutation at exit code ...
         "76157733",  # - The CLI discovers a bridge, connects to it, and forwards ... W
         "7d089991",  # When you need counts from BN iterators such as ... materialize t
         "8b8c9c6a",  # You can run several sessions in ... When exactly one live sessio
@@ -686,6 +736,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "eb154184",  # - **Bug class** — buffer overflow ... format string ... integer 
     }),
     "skills/bn/reference/mutating.md": frozenset({
+        "0169bb89",  # on a bulk rename a zero is the "nothing changed, don't save" ver
         "0501df9a",  # distinct from ... (a failure — a status in ... which
         "107f9fec",  # | ... | the first failure's explanation, or the unmeasured expla
         "10f5e35f",  # against op ... ... Such a manifest is rejected up front, naming 
@@ -698,8 +749,8 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "3c817542",  # bn data retype ... ... [--preview]
         "3dda57c0",  # Every shipped mutation is measurable one of two ways: it populat
         "3f5376fa",  # which fails safe on its own) before trusting a ... status line a
+        "41408e3c",  # line and exit codes are therefore the same as every other mutati
         "441109f0",  # typo in op ... no longer rolls back ... good ...
-        "45187bc1",  # line and exit codes are therefore the same as every other mutati
         "46d085e3",  # `comment ... take the address either positionally (`bn comment s
         "474d7d87",  # | ... ... ... ... ... | derived from `results[]`; ... are `null`
         "48b3a493",  # each call takes exactly one location: an address (positional or 
@@ -707,7 +758,9 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "560d20bb",  # ("applied but unverifiable"), so a script that only checks `$?` 
         "5a40c289",  # Mutations print a **one-line status summary** by default:
         "5b35cedf",  # ... plus a ... can never verify: op ... would be judged
+        "61a586ea",  # | `measured` | **false** when the counts below could not be deri
         "6f8e7c3f",  # - ... — the request was refused: a bad field *value*, a missing 
+        "77f8dfa0",  # Two things are NOT in that ... A refusal: on a mutation a refusa
         "82ffca8f",  # pairing, since the two are almost always applied ...
         "87b64a1d",  # It is the one mutation whose bridge result reports the work thro
         "8d2b1a2d",  # Annotations live in the ... Always save before closing — `bn clo
@@ -716,12 +769,15 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "a29b6d0b",  # Split them across two batches — last-write-wins is not expressib
         "bd21de45",  # The mutation surface is built around a four-step safety loop: **
         "bfb392d4",  # ... KB ... ... tokens), so it is **opt-in**:
+        "ca67eb7e",  # measurement source: one that arrived ... A count is only read th
         "cca7f348",  # - **One write per ... Every op is verified against the batch's E
         "cdf328d4",  # ## ... Mutation flow
         "d4b55e60",  # kind of call, so an unmeasured `--preview` is ... as well — ther
         "dbcf469b",  # ### Step ... — read back
         "e1e1f0e1",  # write could not be confirmed instead of reading it as a clean ..
+        "f6312d90",  # than answering ... — a fabricated zero is indistinguishable from
         "f83e45cf",  # manifest that writes the same key twice (two ... on one address,
+        "fecd543b",  # `measured: true` when those six counters read and agree with the
         "fefcdd8b",  # still wins if both apply) and from ... (a verified or measured a
     }),
     "skills/bn/reference/reading.md": frozenset({
@@ -1338,6 +1394,15 @@ def _exit_code_for(scenario: str) -> int:
     if scenario == "unreachable-bridge":
         return _exit_code_of_a_run(_RENAME_ARGV, None)
 
+    # The `own-summary` scenarios run the REAL `_go_rename_summary`, not a stub
+    # that hardcodes `measured: True`. A stub made the doc's claim unfalsifiable
+    # at exactly the point it stopped being true: the summary DERIVES `measured`
+    # from whether its six counters read, so "an op that counts through its own
+    # summary stays measured" is a claim about that derivation, and a fake that
+    # asserts the answer quotes the document back at itself. Both sides of the
+    # derivation are scenarios, because the doc now states both.
+    go = {"kind": "go_rename", "preview": False, "success": True,
+          "committed": True, "results": []}
     shapes = {
         "verified": ({"success": True, "committed": True,
                       "results": [{"status": "verified"}]}, _mutation_summary),
@@ -1345,8 +1410,14 @@ def _exit_code_for(scenario: str) -> int:
                      "results": [{"status": "invalid_request"}]}, _mutation_summary),
         "unmeasured": ({"success": True, "committed": True, "results": []},
                        _mutation_summary),
-        "own-summary": ({"success": True, "committed": True, "results": []},
-                        lambda result: {"kind": "mutation_summary", "measured": True}),
+        "own-summary": ({**go, "go_renamed_candidates": 7, "go_committed_count": 7,
+                         "go_verified_count": 7, "go_failed_count": 0},
+                        _go_rename_summary),
+        # The same op, the same summary, one counter in a shape no count reads
+        # out of: refused and disclosed by name, so a verdict still exists and
+        # it is an unmeasured one.
+        "own-summary-refused": ({**go, "go_renamed_candidates": "many"},
+                                _go_rename_summary),
     }
     result, summary = shapes[scenario]
     return _mutation_exit_code(result, summary)

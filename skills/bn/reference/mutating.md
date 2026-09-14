@@ -63,7 +63,7 @@ in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cos
 combination changes how the outcome is CLASSIFIED (each classifies the same
 full result, before anything is rendered):
 0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a
-response this CLI cannot parse) / 3 a mutation status `verification_failed`,
+response this CLI cannot classify at all) / 3 a mutation status `verification_failed`,
 `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
 unmeasured success (`measured: false` — applied but unverifiable; see
 "Unmeasured mutations").
@@ -78,11 +78,14 @@ verified reply exits `0` there. The divergence moves in a single direction: an
 undeliverable output replaces the code with 2 and can never turn a failed or an
 unmeasured mutation into a clean zero. But do NOT read that backwards: on this
 path a 2 is also the code for a bridge this CLI could not reach, a reply it
-could not parse, and a flag value rejected before anything was sent. A refusal
-is NOT in that list: on a mutation a refusal is exit 3, as the status table
-above says. So a 2 alone does not tell you whether the write landed; the stderr
-line names which of them it was, and when it names the delivery step, re-read
-the view rather than re-issuing the mutation.
+could not classify at all, and a flag value rejected before anything was sent.
+Two things are NOT in that list. A refusal: on a mutation a refusal is exit 3,
+as the status table above says. And a reply carrying ONE field this CLI cannot
+read: that field is refused and disclosed by name, a verdict is still derived
+from the rest, and the run exits 3 or 4 accordingly.
+So a 2 alone does not tell you whether the write landed; the stderr line names
+which of them it was, and when it names the delivery step, re-read the view
+rather than re-issuing the mutation.
 
 ### Compact status keys
 
@@ -97,7 +100,7 @@ true:
 | `ok` / `success` | mirrors the read-command envelope (`ok` is always present, unlike the full result) |
 | `committed` | true for any non-preview mutation that reached apply — including an all-noop |
 | `preview` | true when `--preview` was requested |
-| `measured` | **false** when the op reported no `results[]` rows to derive the fields below from; see "Unmeasured mutations" |
+| `measured` | **false** when the counts below could not be derived — the op reported no `results[]` rows to derive them from, or a field they are derived from arrived in a shape no value reads out of and was refused rather than read as a zero; see "Unmeasured mutations" |
 | `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]`; `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true |
 | `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
 | `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
@@ -110,9 +113,20 @@ Every shipped mutation is measurable one of two ways: it populates `results[]`,
 or — like `go rename`, the one op that reports through its own counters — it
 registers a compact summary that counts those counters instead.
 `test_mutation_summary_wiring.py` statically enforces that pairing for every
-`_mutate`-routed op, so you should never see this. When *neither* holds (a
-bridge older or newer than this CLI, or a wiring regression that slipped the
-sweep), the compact summary cannot derive real counts, and says so:
+`_mutate`-routed op, so a mutation with nothing to count means a bridge older
+or newer than this CLI, or a wiring regression that slipped the sweep.
+
+There is a second way to arrive here, and it does not need a missing
+measurement source: one that arrived UNREADABLE. A count is only read through a
+choke point that refuses a field it cannot use and discloses it by name, rather
+than answering `0` — a fabricated zero is indistinguishable from a real one, and
+on a bulk rename a zero is the "nothing changed, don't save" verdict that
+discards the batch. So a counter or a row status in a shape no value reads out
+of leaves the derived counts exactly as unknown as an empty `results[]` does,
+and is reported the same way. That applies to `go rename` too: registering its
+own summary makes it count from a different SOURCE, not measured by guarantee.
+
+Either way, the compact summary cannot derive real counts, and says so:
 
 ```
 mutation: committed  changed=None  verified=None  noop=None  failed=None  dirty_after=True
@@ -122,6 +136,10 @@ assume nothing changed: read the view back (e.g. `bn target info` or a targeted 
 `bn save` before closing.
 first_error: unmeasured: this op reported no results[] rows, ...
 ```
+
+...with the cause named: `this op reported no results[] rows` when there was
+nothing to count, `this op's own counters could not be read` when a counter was
+refused, and a `! malformed <field> field` line naming each field that was.
 
 `dirty_after` is deliberately reported `true` here rather than `null`: `null` is
 falsy under every truthiness check a control loop actually writes (`jq 'if
@@ -216,8 +234,12 @@ standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`,
 It is the one mutation whose bridge result reports the work through its **own
 counters** rather than a `results[]` row per rename (that array carries only the
 failure rows), so it registers its own compact summary to count them. The status
-line and exit codes are therefore the same as every other mutation — including
-`measured: true` on success, so a clean run is exit `0`, not the unmeasured `4`.
+line and exit codes are therefore the same as every other mutation: it reports
+`measured: true` when those six counters read and agree with the failure rows,
+so a clean run whose counters read is exit `0` — and a counter that arrives
+unreadable is disclosed by name and the run is the unmeasured `4`, exactly as an
+empty `results[]` would be on any other op. Its own summary is a different
+measurement SOURCE, not an exemption from measurement.
 
 ### Data variables — bind a recovered type to an address
 

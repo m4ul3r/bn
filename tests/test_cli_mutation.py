@@ -1232,7 +1232,7 @@ def test_the_cases_the_reference_lists_for_exit_2_really_are_2(monkeypatch, caps
                         raises(BridgeError("Failed to contact Binary Ninja bridge")))
     assert bn.cli.main(argv) == 2
 
-    # "a reply it could not parse" -- a mutation result that is not an object
+    # "a reply it could not classify at all" -- a result that is not an object
     monkeypatch.setattr(bn.cli, "send_request", reply(["verified"]))
     assert bn.cli.main(argv) == 2
 
@@ -1240,14 +1240,27 @@ def test_the_cases_the_reference_lists_for_exit_2_really_are_2(monkeypatch, caps
     # test_a_rejected_flag_value_is_a_2_with_nothing_sent, which also proves the
     # wire log stays empty.
 
-    # ...and the exclusion, which is what the refuted clause got wrong: on a
-    # mutation a refusal is 3, whether it arrives as a row or as a status.
+    # ...and the exclusions. The first is what the refuted clause got wrong: on
+    # a mutation a refusal is 3, whether it arrives as a row or as a status.
     monkeypatch.setattr(bn.cli, "send_request", reply(
         {"success": False, "committed": False,
          "results": [{"status": "invalid_request"}]}))
     assert bn.cli.main(argv) == 3
     monkeypatch.setattr(bn.cli, "send_request",
                         raises(BridgeError("refused", status="invalid_request")))
+    assert bn.cli.main(argv) == 3
+
+    # The second: "a reply carrying ONE field this CLI cannot read" is refused
+    # and disclosed, a verdict is still derived from the rest, and the run exits
+    # by that verdict. Both branches, because the sentence names both -- a row
+    # status no one could read beside a clean success is the unmeasured 4, and
+    # the same beside a reported failure is still 3.
+    monkeypatch.setattr(bn.cli, "send_request", reply(
+        {"success": True, "committed": True, "results": [{"status": 5}]}))
+    assert bn.cli.main(argv) == 4
+    monkeypatch.setattr(bn.cli, "send_request", reply(
+        {"success": False, "committed": False,
+         "results": [{"status": "verification_failed"}, {"status": 5}]}))
     assert bn.cli.main(argv) == 3
     capsys.readouterr()
 
@@ -1353,26 +1366,50 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("counter", ["many", float("inf")],
+# The two shapes a counter can arrive in that no count reads out of -- and they
+# take DIFFERENT documented exits, which is precisely why the contract is keyed
+# on "did a classification survive" rather than on "was some field unreadable":
+#
+#   * `"many"` is REFUSED by the read: the count is left unknown and the field
+#     is disclosed by name, so the summary, the status line and the spill status
+#     are all built. The classification stands, and it is a FAILURE -- read from
+#     `success: false` and from a `results[]` row whose status parsed cleanly,
+#     neither of which is the skewed field. Exit 3.
+#   * `float("inf")` -- what `1e999` decodes to -- makes the read RAISE
+#     (`int(inf)` is an `OverflowError`), so no status could be built on any
+#     format. That is the documented one-directional output override: an
+#     undeliverable status replaces the code with 2 and can never turn a failed
+#     or an unmeasured mutation into a clean zero.
+@pytest.mark.parametrize("counter,expected", [("many", 3), (float("inf"), 2)],
                          ids=["unparseable", "non-finite"])
 @pytest.mark.parametrize("extra", [[], ["--verbose"], ["--summary"],
                                    ["--format", "json"], ["--format", "ndjson"],
                                    ["--out"]],
                          ids=["default", "verbose", "summary", "json", "ndjson", "out"])
-def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys, tmp_path, extra, counter):
-    """A FAILING result short-circuits to exit 3 before the summary transform is
-    ever run, so the exit-code guard never sees it -- and `_call` then feeds that
-    same transform to the renderer AND to the spill-status builder. Every one of
-    those steps must survive an unparseable result on every format: the process
-    must leave with a documented code and a documented message, never a traceback
-    (exit 1) after the exit code was already decided.
+def test_a_failing_mutation_with_an_unreadable_counter_is_still_a_clean_exit(
+        monkeypatch, capsys, tmp_path, extra, counter, expected):
+    """A FAILING result short-circuits before the summary transform is ever run,
+    so the exit-code guard never sees it -- and `_call` then feeds that same
+    transform to the renderer AND to the spill-status builder. Every one of
+    those steps must survive an unreadable counter on every format: the process
+    must leave with a documented code, never a traceback (exit 1) after the exit
+    code was already decided.
 
     Parametrized over every output path, and asserting the exact code, on
-    purpose: the first cut covered only the default format and accepted `2 or 3`,
-    so it stayed green while three machine formats still crashed. The answer is
-    2 and not 3 because a result the CLI cannot read cannot be reported as a
-    verified failure either -- "I could not classify this" outranks a status
-    parsed out of a response that does not parse.
+    purpose: the first cut covered only the default format and accepted `2 or
+    3`, so it stayed green while three machine formats still crashed.
+
+    The refused counter is **3**, not 2. The earlier expectation rested on "a
+    status parsed out of a response that does not parse", and that premise is
+    false here: the response parses, one counter does not, and the counter is
+    not what the failure verdict rests on. `_mutation_reports_failure` reads
+    `success` and the row statuses -- both clean -- so the CLI KNOWS this
+    mutation failed and was reverted. Reporting that as "I could not determine
+    the outcome" would discard a hard fact, and would hand a `$?`-only consumer
+    the code it also gets for an unreachable bridge, inviting a retry of a
+    request that deterministically fails. It is also the precedence this
+    contract already documents: a failure wins over an unmeasured run, 3 before
+    4.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
@@ -1385,8 +1422,15 @@ def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatc
 
     rc = bn.cli.main(["go", "rename", "--target", "active", *argv])
 
-    assert rc == 2, rc
-    assert "malformed or newer than this CLI" in capsys.readouterr().err
+    assert rc == expected, rc
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err, captured.err
+    if expected == 2:
+        assert "malformed or newer than this CLI" in captured.err, captured.err
+    else:
+        # The classification survived the delivery step, so the code the
+        # classifier chose is the code the process leaves with.
+        assert "malformed or newer than this CLI" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize("rows", [5, True, "verified", {"a": 1},
@@ -2937,11 +2981,18 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     message must therefore not send the reader there -- following advice that
     returns the identical error is how a version-skew report turns into a
     "the CLI is broken" bug.
+
+    The arrangement is a counter whose read RAISES (`float("inf")`, what `1e999`
+    decodes to: `int(inf)` is an `OverflowError`). That is what "unclassifiable"
+    now means -- no verdict could be derived at all -- and it is the only input
+    class that still reaches this message. A counter the read can REFUSE is
+    disclosed and classified instead, and is exit 4; see
+    `test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error`.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": True, "committed": True,
-                                       "go_renamed_candidates": "many",
+                                       "go_renamed_candidates": float("inf"),
                                        "results": []}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -2958,19 +3009,31 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     assert "bn doctor" in captured.err, captured.err
 
 
-def test_invariant_guard_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
-    """The #715 exit code is derived by RUNNING the compact-summary transform,
-    and `_call` computes it before the renderer's malformed-result guard (#101).
-    A version-skewed bridge result whose own counters are not numeric therefore
-    reaches that transform first: it must still come out as the documented
-    `BridgeError`/exit 2, never as a raw traceback out of `main()` (which only
-    catches `BridgeError`) and a process exit the exit-code contract does not
-    list. What the message may advise is pinned separately.
+def test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error(
+        monkeypatch, capsys):
+    """A result the bridge delivered, that did not fail, and whose own counter
+    arrived in a shape no count reads out of is exit **4**, not 2.
+
+    This used to be 2, and only because the read RAISED: the CLI produced no
+    verdict, so "I could not determine the outcome" was all it had. The read now
+    refuses that counter and discloses it by name, which means a verdict DOES
+    exist -- this mutation committed, reported no failure, and could not be
+    measured -- and that verdict is exactly what exit 4 says. Calling it 2
+    instead would hand a `$?`-only consumer the same code it gets for an
+    unreachable bridge, an unresolvable target and a refused flag, every one of
+    which means *nothing was written*; the caller would then close without
+    saving and discard a rename batch that had committed, which is the #683 harm
+    this op exists to prevent. 4's instruction -- read the view back and `bn
+    save` -- is the one that matches what happened.
+
+    Nothing diagnostic is lost in the move: the field that could not be read is
+    named in the payload, where a machine consumer can act on it, instead of in
+    a stderr string.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": True, "committed": True,
-                                       # a counter this CLI cannot parse
+                                       # a counter this CLI can refuse but not read
                                        "go_renamed_candidates": "many",
                                        "results": []}}
 
@@ -2978,14 +3041,21 @@ def test_invariant_guard_unclassifiable_mutation_result_is_a_clean_bridge_error(
 
     rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose"])
 
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "malformed or newer than this CLI" in err, err
+    assert rc == 4
+    captured = capsys.readouterr()
+    # No traceback, and no claim that the outcome could not be determined.
+    assert "Traceback" not in captured.err, captured.err
+    assert "malformed or newer than this CLI" not in captured.err, captured.err
+    # The unreadable field is named rather than swallowed.
+    assert "go_renamed_candidates" in captured.out, captured.out
 
 
-def test_unclassifiable_mutation_result_is_a_clean_bridge_error_when_compact(monkeypatch, capsys):
+def test_a_refused_counter_is_disclosed_and_unmeasured_on_the_compact_path(
+        monkeypatch, capsys):
     """Same guarantee on the compact default path, where the transform is also
-    the renderer input: one rule for every detail level."""
+    the renderer input: one rule for every detail level. Here the status line
+    itself has to carry the verdict, so it must state the unknown counts as
+    unknown and the fail-safe `dirty_after`, not a fabricated zero."""
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": True, "committed": True,
@@ -2996,8 +3066,70 @@ def test_unclassifiable_mutation_result_is_a_clean_bridge_error_when_compact(mon
 
     rc = bn.cli.main(["go", "rename", "--target", "active"])
 
-    assert rc == 2
-    assert "malformed or newer than this CLI" in capsys.readouterr().err
+    assert rc == 4
+    out = capsys.readouterr().out
+    assert "malformed or newer than this CLI" not in out, out
+    assert "warning: unmeasured" in out, out
+    assert "changed=None" in out and "dirty_after=True" in out, out
+
+
+def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
+        monkeypatch, capsys):
+    """The boundary of the whole contract, stated once and quantified.
+
+    The classifier returns 0/3/4 whenever a verdict can be DERIVED from the
+    result, and 2 exactly when none can. That is what makes 2 meaningful: it is
+    not "some field was unreadable" (a refused counter is still classifiable and
+    is 4, a refused counter beside a clean failure verdict is still 3) but "this
+    CLI cannot say whether the write failed, succeeded or applied unmeasured".
+
+    Both directions are quantified here, because presence alone is satisfiable
+    by a list that has stopped keeping up: every shape that yields no verdict is
+    2, and every shape that yields one is NOT 2.
+    """
+    from bn.formatters import _go_rename_summary, _mutation_summary
+    from bn.transport import BridgeError
+
+    ok = {"success": True, "committed": True}
+    go = {"kind": "go_rename", "preview": False, "success": True, "committed": True}
+
+    # A verdict exists -- so the code is the verdict, never 2.
+    classifiable = {
+        "verified": ({**ok, "results": [{"status": "verified"}]}, _mutation_summary, 0),
+        "all-noop": ({**ok, "results": [{"status": "noop"}]}, _mutation_summary, 0),
+        "no-rows-to-count": ({**ok, "results": []}, _mutation_summary, 4),
+        "row-status-refused": ({**ok, "results": [{"status": 5}]}, _mutation_summary, 4),
+        "counter-refused": ({**go, "go_renamed_candidates": "many", "results": []},
+                            _go_rename_summary, 4),
+        "counter-refused-while-failing":
+            ({**go, "success": False, "committed": False,
+              "go_renamed_candidates": "many",
+              "results": [{"status": "verification_failed"}]}, _go_rename_summary, 3),
+        "counters-read-clean":
+            ({**go, "go_renamed_candidates": 7, "go_committed_count": 7,
+              "go_verified_count": 7, "go_failed_count": 0, "results": []},
+             _go_rename_summary, 0),
+    }
+    for name, (result, summary, expected) in classifiable.items():
+        assert bn.cli._mutation_exit_code(result, summary) == expected, name
+
+    # No verdict exists -- so the code is 2, and nothing else.
+    unclassifiable = {
+        "result-is-not-an-object": (["verified"], _mutation_summary),
+        "rows-are-not-a-list": ({**ok, "results": 5}, _mutation_summary),
+        "a-row-is-not-an-object": ({**ok, "results": [5]}, _mutation_summary),
+        "a-row-status-is-unhashable":
+            ({**ok, "results": [{"status": ["verification_failed"]}]}, _mutation_summary),
+        "counter-read-raises":
+            ({**go, "go_renamed_candidates": float("inf"), "results": []},
+             _go_rename_summary),
+        "summary-is-not-an-object": ({**ok, "results": []}, lambda result: "nope"),
+        "summary-states-no-verdict": ({**ok, "results": []}, lambda result: {"ok": True}),
+    }
+    for name, (result, summary) in unclassifiable.items():
+        with pytest.raises(BridgeError, match="could not classify"):
+            bn.cli._mutation_exit_code(result, summary)
+    capsys.readouterr()
 
 
 def test_operation_failure_status_maps_to_exit_3_for_mutation(monkeypatch, capsys):
