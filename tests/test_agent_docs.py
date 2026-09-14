@@ -977,6 +977,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "ad00bd37",  # uv run pytest ... # one module
         "b65d6dff",  # **Line count is not a split criterion ... Split a module only on
         "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed excep
+        "db46a3e1",  # - ... — ... the kernel's own answer (from ... to "is anything BO
     }),
     "README.md": frozenset({
         "18744597",  # Any status above other than ... puts a mutation at exit code ...
