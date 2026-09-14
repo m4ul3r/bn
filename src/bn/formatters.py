@@ -2038,6 +2038,19 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     lines.extend(_render_group(code_refs, total_code, "code refs"))
     lines.append("")
     lines.extend(_render_group(data_refs, total_data, "data refs"))
+    # #622's honesty fields reached the JSON envelope only: a caller scan that
+    # stopped at its budget rendered byte-identically to a complete one, so an
+    # empty list read as "no callers" (see the fn_pointer_scan_truncated note
+    # below for the same rule on the evidence card). Both reads go through the
+    # choke point, so a SKEWED flag or note is disclosed rather than dropped.
+    if _flag_field(value, "truncated"):
+        note = _text_value(value, "scan_note")
+        lines.append("")
+        lines.append(
+            "note: the caller scan was TRUNCATED -- this list is partial, so an "
+            "empty or short result is NOT proof there are no callers"
+            + (f" ({note})" if note else "")
+        )
     return "\n".join(lines)
 
 
@@ -2230,6 +2243,24 @@ def _render_function_evidence_text(value: Any) -> str:
         lines.append(f"  tail branch -> {_render_target_line(thunk_target)}")
     else:
         lines.append("thunk: no")
+
+    # The deferral the bridge records when a sliced read skipped the Pseudo-C
+    # decompile: it writes the sentence into `warnings` AND sets the flag, and
+    # TEXT mode printed neither -- it dropped the whole `warnings` list, so a
+    # sliced card read like a full-fidelity one. Placed before the early
+    # `return` on an empty call set, so it is reached either way.
+    warnings = _field_list(value, "warnings")
+    for warning in warnings:
+        lines.append(f"warning: {warning}")
+    if _flag_field(value, "decompile_deferred") and not warnings:
+        # The flag without its sentence: the payload said the decompile was
+        # skipped and carried no text saying so, so state it here rather than
+        # render a sliced card that reads like a full-fidelity one. Guarded on
+        # `not warnings` by design -- the bridge already writes the deferral
+        # sentence there, and printing both states one claim twice.
+        lines.append("warning: Pseudo-C decompile deferred for this sliced read; "
+                     "decompiler warnings were not collected -- re-read unsliced "
+                     "for full fidelity")
 
     calls = _field_list(value, "calls")
     lines.append("")

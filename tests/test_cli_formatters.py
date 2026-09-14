@@ -3645,7 +3645,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 588, 199), (
+    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 592, 200), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -3670,9 +3670,9 @@ def test_the_runtime_population_is_exactly_this_big():
     # evidence card -- and 220 more were swept with their siblings absent, which
     # is the leaf-level form of the same defect.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 398, (
+    assert len(situated) == 401, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 398. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 401. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -3957,13 +3957,13 @@ def test_the_container_probe_misses_exactly_three_top_level_reads():
     missed = sorted(f"{name}.{key}" for name, key in declared - classified
                     if (name, key) in read)
     nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 228, (
-        f"the module declares {len(declared)} choke-point reads, not 228. The "
+    assert len(declared) == 229, (
+        f"the module declares {len(declared)} choke-point reads, not 229. The "
         "count is the size of the covered set: a read that vanishes is a read "
         "no differential runs any more, so move this number only with the read "
         "you deliberately added or removed.")
-    assert len(sites) == 250, (
-        f"the module has {len(sites)} choke-point CALL SITES, not 250. A pair "
+    assert len(sites) == 251, (
+        f"the module has {len(sites)} choke-point CALL SITES, not 251. A pair "
         "read at several sites keeps its (function, key) entry when one site is "
         "converted to a raw coercion, which is why the sites are counted too -- "
         "so a site that disappears here is a coercion that stopped going "
@@ -4092,17 +4092,17 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1194, f"the differential ran {checked} cases, not 1194"
+    assert checked == 1200, f"the differential ran {checked} cases, not 1200"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 588 read keys
-    rather than the 199 the container probe classifies as containers: a renderer
+    """The soft-degrade half of #619, kind-free, so it covers all 592 read keys
+    rather than the 200 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4704.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4736.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4121,7 +4121,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4704, f"the raise sweep ran {swept} renders, not 4704"
+    assert swept == 4736, f"the raise sweep ran {swept} renders, not 4736"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -4296,7 +4296,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1375, f"the mirror ran {checked} renders, not 1375"
+    assert checked == 1384, f"the mirror ran {checked} renders, not 1384"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -4445,6 +4445,28 @@ def test_xref_renderers_disclose_skewed_ref_containers():
     from bn.formatters import _render_xrefs_text
     out = _render_xrefs_text({"symbol": "gets", "code_refs": "bad", "data_refs": "bad"})
     assert "malformed code_refs, data_refs fields" in out
+
+
+def test_xrefs_text_says_so_when_the_caller_scan_was_truncated():
+    """#622 put `truncated` + `scan_note` on the xrefs envelope when the
+    budgeted LLIL caller scan stopped early, and only the JSON envelope carried
+    them: a capped page rendered byte-identically to a complete one, so an empty
+    caller list read as proof of no callers."""
+    from bn.formatters import _render_xrefs_text
+    out = _render_xrefs_text({
+        "address": "0x401000", "code_refs": [], "data_refs": [],
+        "code_ref_count": 0, "data_ref_count": 0,
+        "truncated": True, "scan_note": "scan stopped at its budget",
+    })
+    assert "TRUNCATED" in out, out
+    assert "scan stopped at its budget" in out, out
+    assert "NOT proof there are no callers" in out, out
+
+    # A complete page makes no such claim.
+    clean = _render_xrefs_text({"address": "0x401000", "code_refs": [],
+                                "data_refs": [], "code_ref_count": 0,
+                                "data_ref_count": 0})
+    assert "TRUNCATED" not in clean, clean
 
 
 def test_mutation_renderer_discloses_a_skewed_affected_types_list():
@@ -4658,6 +4680,39 @@ def test_render_evidence_function_shows_recorded_local_tailcall_target_704():
     assert "thunk: no" in out
     assert "candidate" not in out
     assert "init_helper @ 0x461746" in out
+
+
+def test_render_evidence_text_states_the_decompile_deferral():
+    """A sliced evidence read skips the Pseudo-C decompile, and the bridge says
+    so twice -- a sentence in `warnings` and a top-level `decompile_deferred`
+    flag. TEXT mode printed NEITHER (it dropped the whole `warnings` list), so a
+    sliced card read like a full-fidelity one."""
+    from bn.formatters import _render_function_evidence_text
+    base = {
+        "function": {"name": "parse_line", "address": "0x500000"},
+        "prototype": "void parse_line()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 0, "matched_calls": 0, "offset": 0, "limit": None,
+        "calls": [],
+    }
+
+    # The sentence the bridge wrote is what gets printed ...
+    out = _render_function_evidence_text({
+        **base, "decompile_deferred": True,
+        "warnings": ["Pseudo-C decompile deferred for this sliced read"],
+    })
+    assert "warning: Pseudo-C decompile deferred for this sliced read" in out, out
+    # ... once, not alongside the fallback restating the same claim.
+    assert out.count("deferred") == 1, out
+
+    # ... and the flag alone still states it, for a payload whose `warnings`
+    # arrived absent, empty or skewed.
+    flag_only = _render_function_evidence_text({**base, "decompile_deferred": True})
+    assert "decompile deferred" in flag_only, flag_only
+    assert "re-read unsliced" in flag_only, flag_only
+
+    # A full-fidelity read claims nothing.
+    assert "deferred" not in _render_function_evidence_text(base)
 
 
 def test_render_evidence_function_notes_arity_mismatch_704():
@@ -6732,8 +6787,8 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     renderer cannot use may legitimately render as a placeholder or be skipped,
     but it may never RAISE where the same payload with that list absent
     renders cleanly. Base raises 855 times at 30 of its list positions over the
-    same 4536 renders; this commit raises 0. Sizes are exact, for the reason
-    every size here is.
+    4536 renders of its own population; this commit raises 0. Sizes are exact,
+    for the reason every size here is.
 
     Swept at FOUR shapes, and that is the eighth axis (see `_payload_for`). A
     one-element list makes its element both the first and the last, so a read
@@ -6795,8 +6850,8 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4536, (
-        f"the element sweep ran {swept} renders, not 4536 -- the size of the "
+    assert swept == 4572, (
+        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
