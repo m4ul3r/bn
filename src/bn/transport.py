@@ -370,9 +370,10 @@ def _unlink_if_unchanged(path: Path, expected: bytes | None) -> bool:
     except (OSError, ValueError):
         # Not every path here comes from the directory scan -- the legacy fixed
         # registry is constructed by ``bridge_registry_path()`` and reaches this
-        # unlink too -- and ValueError belongs here regardless: an unnameable
-        # path (embedded NUL, lone surrogate) must not take a discovery-backed
-        # command down, and refusing to destroy is the safe answer for it.
+        # unlink too -- and ValueError belongs here regardless: a path the
+        # syscall layer cannot name (an embedded NUL, an unpaired HIGH
+        # surrogate) must not take a discovery-backed command down, and
+        # refusing to destroy is the safe answer for it.
         return False
     return True
 

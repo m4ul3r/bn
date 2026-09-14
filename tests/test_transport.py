@@ -2950,27 +2950,30 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 #     `test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage`.
 #
 #  3. `owner_alive`'s zombie half, `process_state not in {"Z", "X", "x"}`.
-#     Mutation: drop it (`owner_alive = _process_alive(pid)`), green at 337
-#     passed, 1 skipped. This one fails SAFE, and that is the whole reason it
-#     is listed third rather than first: an unreaped zombie's owner then
-#     reads as ALIVE, so its record is RETAINED, not destroyed -- litter
+#     Mutation: drop it (`owner_alive = _process_alive(pid)`) -- the three
+#     fenced files stay GREEN. This one fails SAFE, and that is the whole
+#     reason it is listed third rather than first: an unreaped zombie's owner
+#     then reads as ALIVE, so its record is RETAINED, not destroyed -- litter
 #     rather than data loss. Same category as 1 and 2, opposite risk; a
-#     reader who lumps all three together will misjudge which to pin first.
+#     reader who lumps the four together will misjudge which to pin first.
 #     The OTHER half of that same predicate -- reading an unknowable state as
 #     dead -- is pinned, and destructively, by
 #     `test_a_live_owner_whose_state_cannot_be_read_is_not_litter`.
 #
 #  4. `_socket_path_is_confined`'s failure-direction answer, the
 #     `except (OSError, TypeError, ValueError): return False`. Mutation:
-#     `return True` -- a resolution failure read as CONFINED -- green at 337
-#     passed, 1 skipped. INERT here rather than safe by design: the only two
-#     inputs that reach the arm on this platform are an embedded NUL
-#     (`ValueError`) and a lone surrogate (`UnicodeEncodeError`), and such a
-#     record is routed to the same fate by the missing-socket arm downstream,
-#     so no destruction is constructible from the mutation. It is listed
-#     because an inventory that omits a green guard is worth less than no
-#     inventory: if some future input makes that arm reachable with a real
-#     path, nothing here notices.
+#     `return True` -- a resolution failure read as CONFINED -- the three
+#     fenced files stay GREEN. INERT here rather than safe by design: the only
+#     two inputs that reach the arm on this platform are an embedded NUL
+#     (`ValueError`) and an UNPAIRED HIGH surrogate, `\ud800`-`\udbff`
+#     (`UnicodeEncodeError`). A LOW surrogate is NOT one of them -- `\udc80`-
+#     `\udcff` is how `surrogateescape` carries a raw byte of a name that
+#     really exists on disk, it encodes fine, and `9d40491` in this branch
+#     turns on exactly that distinction. Such a record is routed to the same
+#     fate by the missing-socket arm downstream, so no destruction is
+#     constructible from the mutation. It is listed because an inventory that
+#     omits a green guard is worth less than no inventory: if some future
+#     input makes that arm reachable with a real path, nothing here notices.
 #
 # For 1 and 2 a pin was written, did not discriminate, and was deleted rather
 # than shipped with a docstring claiming a guard it does not hold; both are

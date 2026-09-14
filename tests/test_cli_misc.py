@@ -408,6 +408,8 @@ def test_write_json_artifact_json_out_stays_pretty_single_document(tmp_path):
                             {"name": "b", "address": "0x2"}],
                   "total": 2, "offset": 0, "returned": 2, "has_more": False},
                  id="paged-dict"),
+    pytest.param([{"name": "a"}, {"name": "b"}, {"name": "c"}],
+                 id="top-level-list"),
 ])
 def test_write_json_artifact_ndjson_matches_render_value_for_paged_and_plain_payloads(
         tmp_path, payload):
@@ -425,11 +427,29 @@ def test_write_json_artifact_ndjson_matches_render_value_for_paged_and_plain_pay
     assert lines  # a non-empty payload is never an empty stream
     for line in lines:
         json.loads(line)  # every record stands alone as NDJSON
-    if "items" in payload:
+    if isinstance(payload, list):
+        assert len(lines) == len(payload)      # one record per element, not one line
+    if isinstance(payload, dict) and "items" in payload:
         assert len(lines) == len(payload["items"]) + 1
         meta = json.loads(lines[-1])
         assert meta["_meta"] is True
         assert meta["total"] == payload["total"]
+
+
+def test_write_json_artifact_ndjson_writes_an_empty_payload_as_an_empty_stream(tmp_path):
+    # #670: every line of an NDJSON artifact must be a JSON document, so a
+    # payload with no records is ZERO bytes -- not a file holding a bare
+    # newline, which is a blank line no reader can parse. `render_value` answers
+    # "" for an empty list and the two --out writers must stay interchangeable
+    # at that boundary too, which is the one place the trailing-newline term can
+    # be observed at all.
+    out_path = tmp_path / "bundle.ndjson"
+
+    envelope = _write_json_artifact(str(out_path), [])
+
+    assert out_path.read_bytes() == b""
+    assert out_path.read_text(encoding="utf-8") == render_value([], "ndjson")
+    assert envelope["bytes"] == 0
 
 
 def test_bundle_out_error_matches_the_cli_side_writer(tmp_path):
