@@ -1529,16 +1529,21 @@ def _render_go_rename_text(value: Any) -> str:
     `results` carries only failures; the applied names are in the database."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    # Through the COUNT choke point, every one of them. This renderer is what
-    # the CLI installs as the DEFAULT (non---summary) view, and it was reading
-    # the same six counters the compact summary reads -- but through a helper
-    # that silently defaults an unreadable count to 0 and records nothing. A
-    # candidate counter arriving in the wrong shape therefore rendered the
-    # confident "nothing to do -- no auto-named Go functions to rename" for a
-    # batch that had just committed 1783 renames, undisclosed: the #683 harm
-    # again, in the sibling of the transform that was fixed for it. A second
-    # count contract beside the choke point is how this keeps coming back, so
-    # there is now one (#619).
+    # Through the COUNT choke point, for the three counters this renderer
+    # actually reads. The CLI installs it as the `--verbose` DETAIL view for
+    # `go rename` (the compact status is the default since #645), and it read
+    # `skipped_user_named`, `go_renamed_candidates` and `go_verified_count`
+    # through a helper that silently defaults an unreadable count to 0 and
+    # records nothing. A candidate counter arriving in the wrong shape
+    # therefore rendered the confident "nothing to do -- no auto-named Go
+    # functions to rename" for a batch that had just committed 1783 renames,
+    # undisclosed: the #683 harm again, in the sibling of the transform that
+    # was fixed for it. A second count contract beside the choke point is how
+    # this keeps coming back, so there is now one (#619). The other three
+    # counters -- `go_committed_count`, `go_failed_count` and
+    # `skipped_changed_during_apply` -- this view never reads at all, which is
+    # its own disclosure gap and is routed by name (see the ROUTED block in
+    # `tests/test_cli_formatters.py`, item 1).
     skipped = _count_field(value, "skipped_user_named")
     targeted = _count_field(value, "go_renamed_candidates")
     if not targeted:
@@ -4298,28 +4303,44 @@ def _add_mutation_ok(value: Any) -> Any:
     """Add a top-level ``ok`` boolean to a full mutation/batch result so a uniform
     ``jq '.ok'`` check works across read and mutation commands (#447). ``ok`` is
     the verification-aware success: the bridge-reported ``success`` AND no failed
-    op status -- except on an op that reports through its OWN counters, where the
-    op's compact status decides and this transform does not re-derive it.
-    Additive -- ``success``/``committed`` are unchanged."""
-    if not isinstance(value, dict) or "ok" in value:
+    op status. Additive -- ``success``/``committed`` are unchanged, and an ``ok``
+    the payload already carries is left alone.
+
+    One exception, and it is the whole point of the exception: on an op that
+    reports through its OWN counters (``go rename``) the op's compact status
+    decides ``ok``, this transform does not re-derive it, and it OVERRIDES an
+    ``ok`` already on the payload -- because the compact path overrides it too,
+    and the two must not answer differently (#447)."""
+    if not isinstance(value, dict):
         return value
     # `go rename` reports through its own counters, and this transform reads
     # only `success` and `results[]` -- which for that op holds the failure
     # rows ALONE. A counter arriving in a shape no count reads out of therefore
-    # left `ok: true` HERE while the op's DEFAULT compact view refused the
-    # identical payload, so a uniform `jq '.ok'` flipped on whether the caller
-    # asked for detail: #447's half-parity again, on the one channel
-    # `_go_rename_summary` exists to read. The CLI selects between these two
-    # transforms on `--verbose`/`--out`/an explicit machine `--format`, so the
-    # flip is one flag away on the op whose whole reason for existing is #683.
+    # left `ok: true` HERE while the op's compact status -- the CLI's default
+    # since #645 -- refused the identical payload, so a uniform `jq '.ok'`
+    # flipped on whether the caller asked for detail: #447's half-parity again,
+    # on the one channel `_go_rename_summary` exists to read. The CLI selects
+    # between these two transforms on `--verbose`/`--out`/an explicit machine
+    # `--format`, so the flip is one flag away on the op whose whole reason for
+    # existing is #683.
     #
     # DELEGATED rather than re-derived. A second derivation of this op's `ok`
     # is what drifted in the first place, and it would drift again the next
     # time either side learns a new refusal -- the rows/counter contradiction
-    # already exists on one side only. One decider, so the two paths cannot
-    # answer differently (#447/#619/#685).
+    # already exists on one side only.
+    #
+    # ABOVE the already-has-`ok` short-circuit, and OVERRIDING any `ok` the
+    # payload arrived with, because the compact path overrides it too: the
+    # summary builder states `ok` unconditionally. Left below the
+    # short-circuit, an envelope that carried a stale `ok: true` kept it here
+    # and was refused there -- the same flip the delegation exists to close,
+    # surviving behind the guard that was supposed to make this transform
+    # idempotent. One decider means one on EVERY input (#447/#619/#685).
     if value.get("kind") == "go_rename":
-        return {"ok": bool(_go_rename_summary(value)["ok"]), **value}
+        rest = {key: val for key, val in value.items() if key != "ok"}
+        return {"ok": bool(_go_rename_summary(value)["ok"]), **rest}
+    if "ok" in value:
+        return value
     # Read inside a capture: this transform runs BEFORE any renderer, so the
     # choke point has no boundary to record into. `ok` is "the bridge reported
     # success AND no op row failed"; with the rows unreadable the second half is
@@ -4738,12 +4759,12 @@ def _go_rename_summary(value: Any) -> Any:
     #
     # The earlier cut refused only `rows > counter` and excused the other
     # direction as a CAPPED failure listing. The payload is not capped: only
-    # the DEFAULT text view's display is (it prints 50 rows and then "... and
-    # N more"), and the failure count it states beside them is the full row
-    # count. Believing the larger counter therefore let that text view and
-    # this compact summary state DIFFERENT failure counts for one payload
-    # while both read `measured` -- the drift between an op's two views that
-    # #685 exists to close, one key over from `ok`.
+    # the `--verbose` text view's display is (`_render_go_rename_text` prints
+    # 50 rows and then "... and N more"), and the failure count it states
+    # beside them is the full row count. Believing the larger counter
+    # therefore let that view and this compact summary state DIFFERENT failure
+    # counts for one payload while both read `measured` -- the drift between
+    # an op's two views that #685 exists to close, one key over from `ok`.
     rows_contradict = len(row_failures) != failed
     measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
