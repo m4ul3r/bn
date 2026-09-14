@@ -3645,7 +3645,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 580, 199), (
+    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 582, 199), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -3670,9 +3670,9 @@ def test_the_runtime_population_is_exactly_this_big():
     # evidence card -- and 220 more were swept with their siblings absent, which
     # is the leaf-level form of the same defect.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 390, (
+    assert len(situated) == 391, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 390. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 391. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -4096,13 +4096,13 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 580 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 582 read keys
     rather than the 199 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4640.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4656.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4121,7 +4121,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4640, f"the raise sweep ran {swept} renders, not 4640"
+    assert swept == 4656, f"the raise sweep ran {swept} renders, not 4656"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -4296,7 +4296,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1359, f"the mirror ran {checked} renders, not 1359"
+    assert checked == 1363, f"the mirror ran {checked} renders, not 1363"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -6413,6 +6413,7 @@ def test_a_type_row_never_states_a_field_count_it_could_not_measure():
     assert "struct broken_t, field count not stated" in batch, (
         f"the unreadable entry must be the one refused: {batch!r}")
 
+
 def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
     """#447 parity on the OTHER caller of the one builder, at BOTH granularities
     of the failure list.
@@ -6436,9 +6437,12 @@ def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
     question on this op, so they may not disagree: a `go_failed_count` of 0
     beside a failure row is not a measurement of the run.
 
-    The whole point of one builder is that the two callers cannot answer
-    differently, and "cannot" has to mean on every input, not on the inputs the
-    first cut happened to try."""
+    This test is about the COMPACT status alone. `ok` is now decided in one
+    place for this op -- `_add_mutation_ok` delegates to `_go_rename_summary`
+    for a `go_rename` envelope -- so asserting the two functions agree would be
+    true by construction and could not fail. What a CALLER observes across the
+    CLI's two paths is asserted instead, end to end, in
+    `test_the_go_rename_ok_key_reads_the_same_on_both_cli_paths`."""
     from bn import formatters
 
     def envelope(results):
@@ -6458,9 +6462,6 @@ def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
             f"results={unreadable!r} is a failure list nobody could read, so "
             f"'nothing failed' is not established and ok must not be: {summary!r}")
         assert "malformed" in str(summary.get("first_error")), summary
-        assert (summary["ok"]
-                is formatters._add_mutation_ok(envelope(unreadable))["ok"]), (
-            f"`jq '.ok'` flips with the detail flag on results={unreadable!r}")
     # A readable row that NAMES a failure, and a row whose status nobody could
     # read, both beside `go_failed_count: 0` -- the counter and the rows
     # disagreeing about the one question this summary exists to answer.
@@ -6468,14 +6469,10 @@ def test_the_go_rename_status_withholds_ok_on_rows_it_could_not_read():
                 {"status": {"code": 7}}, {"status": ["verification_failed"]},
                 {"status": 7}, {"status": True}):
         summary = formatters._go_rename_summary(envelope([row]))
-        verbose = formatters._add_mutation_ok(envelope([row]))
         assert summary["ok"] is False and summary["success"] is False, (
             f"results=[{row!r}] with go_failed_count 0: the rows and the "
             f"counter disagree, so 'nothing failed' is not established and ok "
             f"must not be claimed: {summary!r}")
-        assert summary["ok"] is verbose["ok"], (
-            f"`jq '.ok'` flips with the detail flag on results=[{row!r}]: "
-            f"compact {summary['ok']} vs verbose {verbose['ok']}")
         assert summary["measured"] is False and summary["failed_count"] is None, (
             f"a counter contradicted by its own rows is not a measurement: "
             f"{summary!r}")
@@ -6885,19 +6882,28 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 
 # --- ROUTED OUT OF #619/#685, NAMED RATHER THAN LEFT IMPLIED ------------------
 #
-# Three findings on this module survive this PR by RULING, not by oversight.
-# All are pre-existing at base, none is on the go-rename/mutation-summary path
-# #619 and #685 describe, and an exhaustive module-wide count-and-shape answer
-# is a separate audit -- it is routed to a follow-up PR rather than half-done
-# here, because the honest version of it changes every count surface in the
-# file at once and would land unreviewed on the back of this one:
+# Four findings on this module survive this PR by RULING, not by oversight.
+# The first THREE are pre-existing at base, none of them is on the
+# go-rename/mutation-summary path #619 and #685 describe, and an exhaustive
+# module-wide count-and-shape answer is a separate audit -- routed to a
+# follow-up PR rather than half-done here, because the honest version of it
+# changes every count surface in the file at once and would land unreviewed on
+# the back of this one. The FOURTH is this PR's own new mechanism and is routed
+# for a different reason, stated in its entry:
 #
 #   1. COUNT SURFACES OUTSIDE THE GO-RENAME/MUTATION PATH still state a number
 #      read out of a counter they could not read, disclosing beside it rather
 #      than refusing it. `_render_go_rename_text` is the named instance -- an
 #      unreadable `go_verified_count` renders its first line ("go rename: 0
 #      renamed, 0 failed, 0 skipped") byte-identically to a genuine all-noop
-#      run, with the note on a following line. `_render_class_list_text` is the
+#      run, with the note on a following line -- and the same renderer never
+#      reads `go_failed_count` or `go_committed_count` at all (it counts
+#      `results[]` rows and takes `verified` from `go_verified_count`), so a
+#      skew on either of those two renders byte-identically to a healthy run
+#      with NOTHING disclosed, while `_go_rename_summary` reads both and
+#      refuses. Making the DEFAULT text view read what the compact status
+#      reads is the same one-contract change as the rest of this item.
+#      `_render_class_list_text` is the
 #      named family: seven count reads there bypass `_count_field` entirely --
 #      five spelled `value.get(k) or 0` and two spelled `get(k, 0)` -- and
 #      `_render_data_symbols_text` plus the call-window header still build a
@@ -6942,6 +6948,35 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 #      routed audit, for the same reason: the fix is one contract over every
 #      flag read and every derived count, discovered by a population rather
 #      than listed by hand.
+#   4. THE PAGING FOOTER'S IMPOSSIBILITY REFUSAL IS PINNED ON THE COUNTS'
+#      VALUES, NOT ON WHICH KEYS CARRY THEM. This one is not pre-existing at
+#      base -- it is this PR's own new mechanism -- and it is routed for the
+#      other reason: three consecutive rounds widened this pin, each closing
+#      the axis the last lens named and leaving the next, with HEAD
+#      behaviourally CORRECT on every one of them. What is routed is the PIN,
+#      stated here as a limit rather than pinned a fourth time.
+#      `test_the_paging_footer_refuses_every_impossible_page_it_names`
+#      exercises four count triples across three paging shapes, and every one
+#      of those payloads states `total`, `returned` AND `offset` as literal
+#      keys, none with a total of 0. So each of these narrowings of
+#      `if impossible:` in `_paging_footer` leaves the whole file green while
+#      restoring the fabrication, and a reader may run them:
+#        * `if impossible and _field_present(value, "returned"):` -- 214
+#          passed. `{functions: [row], total: 10, offset: 50, has_more: True}`
+#          omits `returned` (which then falls back to the item count, the
+#          default path the helper itself codes) and renders
+#          `// showing 1 of 10 (-41 more); rerun with --offset 51` again.
+#        * `if impossible and total:` -- 214 passed. `{functions: [row],
+#          total: 0, returned: 1, offset: 0, has_more: False}` renders
+#          `// showing 1 of 0`.
+#        * swapping the `returned is negative` and `offset is negative`
+#          members reorders the rendered line -- cosmetic, both names still
+#          appear, and nothing pins the order.
+#      Closing these by enumeration makes the trigger set a product of count
+#      VALUES x key PRESENCE x paging SHAPE, which is the hand-written table
+#      this file has already deleted twice; a discovered population is the
+#      routed audit's answer, and a limit that names the exact mutation to try
+#      is worth more than a fourth pin that closes one more corner of it.
 
 
 def test_no_shape_guard_hides_behind_a_module_level_alias():
@@ -7184,9 +7219,6 @@ def test_an_unreadable_results_ROW_can_never_read_as_ok():
         assert gr["ok"] is False and gr["measured"] is False, (
             f"go rename's failure list held {junk!r}, which is not a row, so "
             f"'nothing failed' is not established either: {gr!r}")
-        assert (gr["ok"]
-                is formatters._add_mutation_ok(go([junk]))["ok"]), (
-            f"`jq '.ok'` flips with the detail flag on results=[{junk!r}]")
         text = formatters._render_go_rename_text(go([junk]))
         assert _disclosed(text, "results"), (
             f"the default go-rename view discarded a row silently: {text!r}")
@@ -7391,3 +7423,62 @@ def test_the_compact_first_error_never_states_a_container_where_text_belongs():
     # answers and nothing is disclosed.
     blank = formatters._mutation_summary(mutation(""))
     assert blank["first_error"] == "mutation failed", blank
+
+
+def test_the_go_rename_ok_key_reads_the_same_on_both_cli_paths(fake_transport, capsys):
+    """`jq '.ok'` is #447's whole promise, and on this op it was one flag deep.
+
+    The CLI picks the result transform from the DETAIL flags: an explicit
+    machine `--format` (or `--verbose`, or `--out`) selects `_add_mutation_ok`,
+    anything else selects the op's compact status. `_add_mutation_ok` derives
+    `ok` from `success` and `results[]` -- and `go rename`'s `results[]` holds
+    the FAILURE rows alone, so an unreadable `go_*` counter never reached it
+    and the detail path answered `ok: true` on the payload the DEFAULT view
+    refuses. An unattended loop that pipes `--format json` into `jq '.ok'`
+    reads true and closes without saving: #683's discard, reached through the
+    one key #447 added to prevent it.
+
+    Asserted on what a CALLER OBSERVES rather than on two functions returning
+    the same value. `ok` now has one decider for this op, so comparing the two
+    transforms directly would be true by construction and could not fail;
+    running the two CLI invocations still can, because the CLI is free to
+    re-split which transform each path gets."""
+    envelope = {"kind": "go_rename", "success": True, "committed": True,
+                "preview": False, "results": [],
+                "go_renamed_candidates": 3, "go_committed_count": 3,
+                "go_verified_count": 3, "go_failed_count": 0,
+                "skipped_user_named": 0, "skipped_changed_during_apply": 0}
+
+    def observed(result, extra_argv):
+        fake_transport({"go_rename": {"ok": True, "result": dict(result)}})
+        argv = ["go", "rename", "--target", "active", "--format", "json"]
+        rc = bn.cli.main(argv + extra_argv)
+        return rc, json.loads(capsys.readouterr().out)["ok"]
+
+    cases = {
+        "healthy": (envelope, True),
+        # The counter channel, which the detail path could not see at all.
+        "unreadable counter": ({**envelope, "go_verified_count": {"n": 1}}, False),
+        "unreadable candidates": ({**envelope, "go_renamed_candidates": "many"}, False),
+        # The counter and its own rows disagreeing, in both directions.
+        "counter under-states": ({**envelope, "success": False, "committed": False,
+                                  "results": [{"status": "verification_failed"}] * 2},
+                                 False),
+        "counter over-states": ({**envelope, "go_failed_count": 2}, False),
+        # The failure list itself unreadable.
+        "unreadable results": ({**envelope, "results": "boom"}, False),
+    }
+    for name, (payload, expected) in cases.items():
+        detail_rc, detail_ok = observed(payload, [])
+        compact_rc, compact_ok = observed(payload, ["--summary"])
+        assert detail_ok is compact_ok, (
+            f"{name}: `jq '.ok'` reads {detail_ok!r} on `--format json` and "
+            f"{compact_ok!r} on `--format json --summary`, so a control loop's "
+            f"verdict depends on whether it asked for detail")
+        assert detail_ok is expected, (
+            f"{name}: both CLI paths agree on {detail_ok!r}, but the payload "
+            f"establishes {expected!r} -- agreeing on the wrong answer is not "
+            f"the property")
+        assert detail_rc == compact_rc, (
+            f"{name}: exit code differs across the detail flag: "
+            f"{detail_rc} vs {compact_rc}")

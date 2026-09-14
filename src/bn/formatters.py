@@ -1676,9 +1676,11 @@ def _paging_footer(value: dict[str, Any], items: list[Any],
     Shared by every paged list renderer (function list/search, strings, imports,
     sections) so the honest-total convention reads identically across them (#59,
     #122). Returns None when the page IS the whole set (no paging happened), the
-    envelope lacks a total to report against, any of the three counts it states
-    arrived in a shape no count reads out of, or the PAGE ITSELF did -- a footer
-    states no count and no resume offset it could not derive (#619).
+    envelope lacks a total to report against, or any field this footer reads
+    arrived in a shape it could not be read out of -- the three counts, the
+    `has_more` flag that decides whether a resume instruction exists at all, or
+    the PAGE ITSELF. A footer states no count and no resume offset it could not
+    derive (#619).
 
     Counts that are all readable but cannot describe any window (`_IMPOSSIBLE_PAGE`)
     get a stated refusal naming each condition instead of a footer, so a
@@ -4296,9 +4298,28 @@ def _add_mutation_ok(value: Any) -> Any:
     """Add a top-level ``ok`` boolean to a full mutation/batch result so a uniform
     ``jq '.ok'`` check works across read and mutation commands (#447). ``ok`` is
     the verification-aware success: the bridge-reported ``success`` AND no failed
-    op status. Additive -- ``success``/``committed`` are unchanged."""
+    op status -- except on an op that reports through its OWN counters, where the
+    op's compact status decides and this transform does not re-derive it.
+    Additive -- ``success``/``committed`` are unchanged."""
     if not isinstance(value, dict) or "ok" in value:
         return value
+    # `go rename` reports through its own counters, and this transform reads
+    # only `success` and `results[]` -- which for that op holds the failure
+    # rows ALONE. A counter arriving in a shape no count reads out of therefore
+    # left `ok: true` HERE while the op's DEFAULT compact view refused the
+    # identical payload, so a uniform `jq '.ok'` flipped on whether the caller
+    # asked for detail: #447's half-parity again, on the one channel
+    # `_go_rename_summary` exists to read. The CLI selects between these two
+    # transforms on `--verbose`/`--out`/an explicit machine `--format`, so the
+    # flip is one flag away on the op whose whole reason for existing is #683.
+    #
+    # DELEGATED rather than re-derived. A second derivation of this op's `ok`
+    # is what drifted in the first place, and it would drift again the next
+    # time either side learns a new refusal -- the rows/counter contradiction
+    # already exists on one side only. One decider, so the two paths cannot
+    # answer differently (#447/#619/#685).
+    if value.get("kind") == "go_rename":
+        return {"ok": bool(_go_rename_summary(value)["ok"]), **value}
     # Read inside a capture: this transform runs BEFORE any renderer, so the
     # choke point has no boundary to record into. `ok` is "the bridge reported
     # success AND no op row failed"; with the rows unreadable the second half is
