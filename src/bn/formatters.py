@@ -201,7 +201,11 @@ def _count_field(source: Any, key: str) -> int:
     fabricated zero is indistinguishable from a real one, and a zero on this op
     is exactly the "nothing changed, don't save" reading that #683 discarded a
     rename batch to. A numeric string or float still reads, as it always did;
-    anything else is a skew for the enclosing boundary to disclose (#619)."""
+    anything else is a skew for the enclosing boundary to disclose (#619) --
+    including a NON-FINITE number, which JSON can spell (``1e999`` decodes to
+    ``inf``, and ``json.dumps`` round-trips it as ``Infinity``) and ``int()``
+    answers with an ``ArithmeticError``. That is refused like any other
+    unreadable shape rather than costing the whole render."""
     src = _as_dict(source)
     if key not in src:
         return 0
@@ -215,7 +219,7 @@ def _count_field(source: Any, key: str) -> int:
         return raw
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except (ArithmeticError, TypeError, ValueError):
         _record_skew(key)
         return 0
 

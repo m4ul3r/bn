@@ -1344,12 +1344,20 @@ def test_invariant_guard_op_with_its_own_summary_is_measured_and_exits_zero(monk
     assert "warning: unmeasured" not in capsys.readouterr().out
 
 
-def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypatch, capsys):
-    """The transform this guard wraps AGGREGATES wire numbers, so its failure
-    surface includes arithmetic, not just parsing. JSON has no bound on a numeric
-    literal: `1e999` decodes to `float("inf")`, and `int(inf)` raises
-    `OverflowError` -- an `ArithmeticError`, outside the exception set a text
-    renderer can throw. It must still be the documented exit 2, not a traceback.
+def test_a_non_finite_wire_counter_is_refused_like_any_other_unreadable_counter(
+        monkeypatch, capsys):
+    """JSON puts no bound on a numeric literal: `1e999` decodes to
+    `float("inf")` (and `json.dumps` round-trips it as `Infinity`), and
+    `int(inf)` is an `ArithmeticError` rather than the `TypeError`/`ValueError`
+    a string-shaped counter raises.
+
+    The read refuses it instead of raising, so the two unreadable shapes no
+    longer diverge: a verdict exists (this mutation committed, reported no
+    failure, and could not be measured), the field is disclosed by name, and the
+    run is the documented exit 4 -- exactly as for the string-shaped counter in
+    `test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error`.
+    Raising cost the whole render for one field's arithmetic, which is the
+    fabricated-verdict harm inverted.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
@@ -1360,34 +1368,34 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["go", "rename", "--target", "active"])
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose"])
 
-    assert rc == 2
-    assert "malformed or newer than this CLI" in capsys.readouterr().err
+    assert rc == 4
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err, captured.err
+    assert "malformed or newer than this CLI" not in captured.err, captured.err
+    # The unreadable field is named rather than swallowed.
+    assert "go_renamed_candidates" in captured.out, captured.out
 
 
-# The two shapes a counter can arrive in that no count reads out of -- and they
-# take DIFFERENT documented exits, which is precisely why the contract is keyed
-# on "did a classification survive" rather than on "was some field unreadable":
-#
-#   * `"many"` is REFUSED by the read: the count is left unknown and the field
-#     is disclosed by name, so the summary, the status line and the spill status
-#     are all built. The classification stands, and it is a FAILURE -- read from
-#     `success: false` and from a `results[]` row whose status parsed cleanly,
-#     neither of which is the skewed field. Exit 3.
-#   * `float("inf")` -- what `1e999` decodes to -- makes the read RAISE
-#     (`int(inf)` is an `OverflowError`), so no status could be built on any
-#     format. That is the documented one-directional output override: an
-#     undeliverable status replaces the code with 2 and can never turn a failed
-#     or an unmeasured mutation into a clean zero.
-@pytest.mark.parametrize("counter,expected", [("many", 3), (float("inf"), 2)],
+# The two shapes a counter can arrive in that no count reads out of -- `"many"`,
+# which no parse reads, and `float("inf")` (what `1e999` decodes to), whose
+# `int()` is an `ArithmeticError`. BOTH are refused by the read: the count is
+# left unknown and the field is disclosed by name, so the summary, the status
+# line and the spill status are all still built. The classification therefore
+# stands on both, and on this FAILING result that classification is a failure --
+# read from `success: false` and from a `results[]` row whose status parsed
+# cleanly, neither of which is the skewed field. Exit 3 for both, which is also
+# the precedence this contract documents: a failure wins over an unmeasured run,
+# 3 before 4.
+@pytest.mark.parametrize("counter", ["many", float("inf")],
                          ids=["unparseable", "non-finite"])
 @pytest.mark.parametrize("extra", [[], ["--verbose"], ["--summary"],
                                    ["--format", "json"], ["--format", "ndjson"],
                                    ["--out"]],
                          ids=["default", "verbose", "summary", "json", "ndjson", "out"])
 def test_a_failing_mutation_with_an_unreadable_counter_is_still_a_clean_exit(
-        monkeypatch, capsys, tmp_path, extra, counter, expected):
+        monkeypatch, capsys, tmp_path, extra, counter):
     """A FAILING result short-circuits before the summary transform is ever run,
     so the exit-code guard never sees it -- and `_call` then feeds that same
     transform to the renderer AND to the spill-status builder. Every one of
@@ -1422,15 +1430,12 @@ def test_a_failing_mutation_with_an_unreadable_counter_is_still_a_clean_exit(
 
     rc = bn.cli.main(["go", "rename", "--target", "active", *argv])
 
-    assert rc == expected, rc
+    assert rc == 3, rc
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err, captured.err
-    if expected == 2:
-        assert "malformed or newer than this CLI" in captured.err, captured.err
-    else:
-        # The classification survived the delivery step, so the code the
-        # classifier chose is the code the process leaves with.
-        assert "malformed or newer than this CLI" not in captured.err, captured.err
+    # The classification survived the delivery step, so the code the
+    # classifier chose is the code the process leaves with.
+    assert "malformed or newer than this CLI" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize("rows", [5, True, "verified", {"a": 1},
@@ -2982,18 +2987,19 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     returns the identical error is how a version-skew report turns into a
     "the CLI is broken" bug.
 
-    The arrangement is a counter whose read RAISES (`float("inf")`, what `1e999`
-    decodes to: `int(inf)` is an `OverflowError`). That is what "unclassifiable"
-    now means -- no verdict could be derived at all -- and it is the only input
-    class that still reaches this message. A counter the read can REFUSE is
-    disclosed and classified instead, and is exit 4; see
+    The arrangement is a malformed ENVELOPE -- a `results[]` row whose `status`
+    is unhashable, so the classifier's set membership test cannot even be
+    asked. That is what "unclassifiable" now means: no verdict could be derived
+    at all, and after the non-finite fix the malformed-envelope shapes are the
+    classes that still reach this message. EVERY counter shape a read cannot
+    use -- parsing and arithmetic alike -- is refused, disclosed and classified
+    instead; see
     `test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error`.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": True, "committed": True,
-                                       "go_renamed_candidates": float("inf"),
-                                       "results": []}}
+                                       "results": [{"status": ["verification_failed"]}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -3003,7 +3009,7 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     # The advertised escape hatch really is closed on this path ...
     assert rc == 2
     assert json.loads(captured.out).get("ok") is False
-    assert "go_renamed_candidates" not in captured.out
+    assert "verification_failed" not in captured.out
     # ... so the message must not advertise it.
     assert "--format json" not in captured.err, captured.err
     assert "bn doctor" in captured.err, captured.err
@@ -3094,9 +3100,10 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
     status's membership in `FAILED_MUTATION_STATUSES`, the top-level `success`
     flag (which is the OTHER half of the failure verdict, and the half a
     round-21 lens neutralised while this cell stayed green), a row status's
-    readability, a counter's readability (refused and raising, since those
-    diverge), the summary's return type, and the summary's `measured` verdict.
-    A shape that reaches none of those reaches no new code.
+    readability, a counter's readability (every unreadable shape, parsing and
+    arithmetic alike, is refused -- both spellings stay in the population for
+    that reason), the summary's return type, and the summary's `measured`
+    verdict. A shape that reaches none of those reaches no new code.
 
     One shape deliberately outside both lists: a row status the CLI does not
     know (a bridge NEWER than this CLI) classifies as 0, because
@@ -3129,6 +3136,9 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         "row-status-refused": ({**ok, "results": [{"status": 5}]}, _mutation_summary, 4),
         "counter-refused": ({**go, "go_renamed_candidates": "many", "results": []},
                             _go_rename_summary, 4),
+        "counter-refused-non-finite":
+            ({**go, "go_renamed_candidates": float("inf"), "results": []},
+             _go_rename_summary, 4),
         "counter-refused-while-failing":
             ({**go, "success": False, "committed": False,
               "go_renamed_candidates": "many",
@@ -3148,9 +3158,6 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         "a-row-is-not-an-object": ({**ok, "results": [5]}, _mutation_summary),
         "a-row-status-is-unhashable":
             ({**ok, "results": [{"status": ["verification_failed"]}]}, _mutation_summary),
-        "counter-read-raises":
-            ({**go, "go_renamed_candidates": float("inf"), "results": []},
-             _go_rename_summary),
         "summary-is-not-an-object": ({**ok, "results": []}, lambda result: "nope"),
         "summary-states-no-verdict": ({**ok, "results": []}, lambda result: {"ok": True}),
     }

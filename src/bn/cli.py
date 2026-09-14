@@ -763,9 +763,12 @@ def _render_result(
 # escaping one of those steps leaves as a raw traceback and a process exit the
 # documented 0/1/2/3/4 contract does not list (#101). `ArithmeticError` is in
 # the set because these steps also AGGREGATE wire numbers and JSON bounds no
-# numeric literal: `1e999` round-trips through `json` as `float("inf")`, and
-# `int(inf)` raises `OverflowError`. `BridgeError` is deliberately absent --
-# code that raises one already says exactly what it means.
+# numeric literal: `1e999` round-trips through `json` as `float("inf")`, whose
+# `int()` raises `OverflowError` and whose differences can be `nan`. The
+# disclosure choke point now REFUSES such a counter rather than raising
+# (`formatters._count_field`), so this set covers the arithmetic that happens
+# outside it -- derived counts, sums, offsets. `BridgeError` is deliberately
+# absent -- code that raises one already says exactly what it means.
 # `RecursionError` is here for the same reason `ArithmeticError` is: a deeply
 # nested payload blows the stack in a recursive walk (json.dumps, a renderer),
 # which is a property of the RESPONSE, not a bug in this process.
