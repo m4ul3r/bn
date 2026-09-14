@@ -62,13 +62,18 @@ The bridge runs as a GUI plugin or as a headless process; both speak the same pr
 bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
 bn session start /path/to/binary [--instance-id <id>]   # synchronous preload
 bn session start /path/to/large.bndb --instance-id <id> --detach
-bn -i <id> session status [<job-id>]     # queued/running/complete/failed
+bn session status [<job-id>] [-i <id>]   # queued/running/complete/failed
 bn session list [-i <id>]                # all running instances, or filter one
+bn session restart <id>                  # tear down and respawn that bridge for the same target
+bn instance list                         # registered instances and their sockets
+bn instance find <path-or-subname>       # every instance with a matching OPEN BINARY, not an instance-id lookup
 bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
 bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
+bn refresh                               # promote a --quick view to full analysis (see "Quick load" below)
 bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
 bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities
+bn capabilities --format json             # machine-readable full index, derived from the command registry
 bn instance gc                            # reap dead instance cache residue
 ```
 
@@ -284,6 +289,8 @@ Run `bn doctor` only when something is wrong — commands fail unexpectedly, tar
 
 ```bash
 bn doctor
+bn plugin install                        # install the in-process BN plugin
+bn skill install                         # install the agent skill files
 ```
 
 It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), the Binary Ninja engine each bridge is driving (`binary ninja: <core version> (build <id>)`, so a BN major upgrade is visible rather than inferred), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).

@@ -34,7 +34,7 @@ Per-op statuses:
 - `noop` — already in the requested state.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the op was refused **during apply** (bad field *value*, an ambiguous target, conflicting options); the whole mutation/batch is reverted and this status shows up in a per-op `results[]` row, exit 3. A manifest that instead fails the **up-front shape check** (an unknown op kind, or a missing required field) never reaches apply — nothing is touched, so there is nothing to revert — and surfaces as a bridge/request error with no `results[]` envelope at all, exit 2.
+- `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. Exit 2 still covers everything on this path that is *not* one of those statuses: a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), a transport failure, a bridge error carrying some other status or none, and a response this CLI cannot parse.
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
 
@@ -59,10 +59,33 @@ in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cos
 | the compact status as JSON | `--format json --summary` (alias `--quiet`) |
 | full detail written to a file | `--out detail.json` (stdout keeps a small envelope) |
 
-`--format` picks the medium; `--verbose`/`--summary` pick the detail level. Exit
-codes are unchanged in every combination (0 ok / 2 bridge or request error / 3
-mutation status `verification_failed`, `unsupported`, `invalid_request`,
-`rollback_failed`, or `internal_error`).
+`--format` picks the medium; `--verbose`/`--summary` pick the detail level. No
+combination changes how the outcome is CLASSIFIED (each classifies the same
+full result, before anything is rendered):
+0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a
+response this CLI cannot classify at all) / 3 a mutation status `verification_failed`,
+`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
+unmeasured success (`measured: false` — applied but unverifiable; see
+"Unmeasured mutations").
+
+An output flag cannot reclassify the outcome, but it CAN fail to deliver, and
+that is the divergence. The classification is made before any output is
+produced, so a combination asking for output this CLI cannot deliver
+reports the documented `2` instead — an `--out` destination it cannot write, or
+a reply too deeply nested for `--format json`/`ndjson` to serialize. The
+default status line prints named fields and never walks such a reply, so a
+verified reply exits `0` there. The divergence moves in a single direction: an
+undeliverable output replaces the code with 2 and can never turn a failed or an
+unmeasured mutation into a clean zero. But do NOT read that backwards: on this
+path a 2 is also the code for a bridge this CLI could not reach, a reply it
+could not classify at all, and a flag value rejected before anything was sent.
+Two things are NOT in that list. A refusal: on a mutation a refusal is exit 3,
+as the status table above says. And a reply carrying ONE field this CLI cannot
+read: that field is refused and disclosed by name, a verdict is still derived
+from the rest, and the run exits 3 or 4 accordingly.
+So a 2 alone does not tell you whether the write landed; the stderr line names
+which of them it was, and when it names the delivery step, re-read the view
+rather than re-issuing the mutation.
 
 ### Compact status keys
 
@@ -77,7 +100,7 @@ true:
 | `ok` / `success` | mirrors the read-command envelope (`ok` is always present, unlike the full result) |
 | `committed` | true for any non-preview mutation that reached apply — including an all-noop |
 | `preview` | true when `--preview` was requested |
-| `measured` | **false** when the op reported no `results[]` rows to derive the fields below from; see "Unmeasured mutations" |
+| `measured` | **false** when the counts below could not be derived — the op reported no `results[]` rows to derive them from, or a field they are derived from arrived in a shape no value reads out of and was refused rather than read as a zero; see "Unmeasured mutations" |
 | `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]`; `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true |
 | `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
 | `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
@@ -86,7 +109,24 @@ true:
 
 #### Unmeasured mutations
 
-A small number of bespoke ops (identified statically by `test_mutation_summary_wiring.py`) report success through their own counters instead of populating `results[]`. When that happens the compact summary cannot derive real counts, and says so:
+Every shipped mutation is measurable one of two ways: it populates `results[]`,
+or — like `go rename`, the one op that reports through its own counters — it
+registers a compact summary that counts those counters instead.
+`test_mutation_summary_wiring.py` statically enforces that pairing for every
+`_mutate`-routed op, so a mutation with nothing to count means a bridge older
+or newer than this CLI, or a wiring regression that slipped the sweep.
+
+There is a second way to arrive here, and it does not need a missing
+measurement source: one that arrived UNREADABLE. A count is only read through a
+choke point that refuses a field it cannot use and discloses it by name, rather
+than answering `0` — a fabricated zero is indistinguishable from a real one, and
+on a bulk rename a zero is the "nothing changed, don't save" verdict that
+discards the batch. So a counter or a row status in a shape no value reads out
+of leaves the derived counts exactly as unknown as an empty `results[]` does,
+and is reported the same way. That applies to `go rename` too: registering its
+own summary makes it count from a different SOURCE, not measured by guarantee.
+
+Either way, the compact summary cannot derive real counts, and says so:
 
 ```
 mutation: committed  changed=None  verified=None  noop=None  failed=None  dirty_after=True
@@ -97,15 +137,27 @@ assume nothing changed: read the view back (e.g. `bn target info` or a targeted 
 first_error: unmeasured: this op reported no results[] rows, ...
 ```
 
+...with the cause named: `this op reported no results[] rows` when there was
+nothing to count, `this op's own counters could not be read` when a counter was
+refused, and a `! malformed <field> field` line naming each field that was.
+
 `dirty_after` is deliberately reported `true` here rather than `null`: `null` is
 falsy under every truthiness check a control loop actually writes (`jq 'if
 .dirty_after then'`, `if summary["dirty_after"]:`, `if (!s.dirty_after)
 close()`), so it would read identically to a confirmed clean no-op and a naive
 consumer would discard real work. Check `measured` (or just read `dirty_after`,
 which fails safe on its own) before trusting a `0`-looking status line as a
-confirmed no-op. The exit code does **not** change for an unmeasured result —
-it is still `0` on success — so a script that only checks `$?` will not notice;
-read the summary object.
+confirmed no-op.
+
+An unmeasured **live** success also changes the exit code: it is **`4`**
+("applied but unverifiable"), so a script that only checks `$?` sees that the
+write could not be confirmed instead of reading it as a clean success. `4` is
+distinct from `3` (a failure — a status in `FAILED_MUTATION_STATUSES`, which
+still wins if both apply) and from `0` (a verified or measured all-`noop` run).
+It is not a new failure mode: the mutation did apply, so read the view back and
+`bn save` before closing. The rule is keyed on `measured: false`, not on the
+kind of call, so an unmeasured `--preview` is `4` as well — there the write was
+reverted, and what could not be confirmed is what *would* have landed.
 
 **A mutation result never spills.** A read that spills is recoverable (re-read the
 artifact); an atomic write whose result is unparseable is not — the agent's model of
@@ -147,6 +199,47 @@ bn comment delete --function player_update
 ```
 
 `comment set/get/delete` take the address either positionally (`bn comment set 0x401000 "..."`) or via `--address`; `--function` attaches a function-level comment instead. Exactly one of address / `--function` is required. The **comment text is a positional argument** — `bn comment set --address 0x.. "text"`; there is **no `--comment` flag** (the natural `--comment "text"` fails with an argparse error).
+
+### Tags
+
+```bash
+bn tag add 0x401000 --type Important --data "len unchecked" [--preview]
+bn tag add --function player_update --type Bookmarks --data "entry point"
+bn tag remove --id <tag-id>                        # ids come from `bn tag list --format json`
+bn tag remove 0x401000 --type Important
+bn tag type create my_sink --icon <glyph>
+bn tag type remove my_sink
+```
+
+Tags are the "remember this spot" annotation path — a **bookmark is just
+`--type Bookmarks`** — and they run the standard preview→verify loop. A custom
+type must exist (`tag type create`, a mutation) before `tag add` can use it, and
+each call takes exactly one location: an address (positional or `--address`) or
+`--function`, never both. Reads (`bn tag list/get/types`) are in `reading.md`.
+
+### Go names — apply what `.gopclntab` recovered
+
+```bash
+bn go functions --summary                          # read side: what would be renamed
+bn go rename [--preview]                           # apply; no positional args
+```
+
+`bn go rename` is the bulk mutation that writes the names `bn go functions`
+recovered from `.gopclntab` into the database. It renames **auto-named
+`sub_*`/`nullsub_*` functions only** — an already-named function is left alone
+and counted as a `noop` — so it is idempotent and safe to re-run. It takes the
+standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`,
+`--out`) and nothing else.
+
+It is the one mutation whose bridge result reports the work through its **own
+counters** rather than a `results[]` row per rename (that array carries only the
+failure rows), so it registers its own compact summary to count them. The status
+line and exit codes are therefore the same as every other mutation: it reports
+`measured: true` when those six counters read and agree with the failure rows,
+so a clean run whose counters read is exit `0` — and a counter that arrives
+unreadable is disclosed by name and the run is the unmeasured `4`, exactly as an
+empty `results[]` would be on any other op. Its own summary is a different
+measurement SOURCE, not an exemption from measurement.
 
 ### Data variables — bind a recovered type to an address
 
@@ -235,8 +328,9 @@ for `struct_name`) on the `struct_field_*` ops, `source_path` on `types_declare`
 Rules:
 
 - The manifest must be a dict with an `"ops"` key (not a bare list).
-- **Every op is validated before ANY is applied.** A guessed op name or field name is
-  a clean `invalid_request` naming the op *index* — with a "did you mean" hint — so a
+- **Every op is validated before ANY is applied.** A missing required field or a bad
+  field *value* is a clean `invalid_request` naming the op *index* — with a "did you
+  mean" hint — and an unrecognized op kind is `unsupported`; either way exit 3, and a
   typo in op 13 no longer rolls back 12 good ops.
 - **One write per key.** Every op is verified against the batch's END state, so a
   manifest that writes the same key twice (two `set_comment`s on one address, a

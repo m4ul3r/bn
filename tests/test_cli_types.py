@@ -32,7 +32,7 @@ def test_types_show_uses_type_info_and_text_renderer(fake_transport, capsys):
 def test_types_declare_uses_implicit_target_when_single_target_is_open(fake_transport):
     calls = fake_transport({
         "list_targets": {"ok": True, "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}]},
-        "types_declare": {"ok": True, "result": {"preview": True}},
+        "types_declare": {"ok": True, "result": {"preview": True, "results": [{"status": "verified"}]}},
     })
 
     rc = bn.cli.main(["types", "declare", "typedef struct Player { int hp; } Player;"])
@@ -46,7 +46,7 @@ def test_types_declare_uses_implicit_target_when_single_target_is_open(fake_tran
 def test_types_declare_passes_source_path_for_file_input(fake_transport, tmp_path):
     declaration_file = tmp_path / "win32_min.h"
     declaration_file.write_text("typedef struct Player { int hp; } Player;", encoding="utf-8")
-    calls = fake_transport({"types_declare": {"ok": True, "result": {"preview": False, "success": True, "results": []}}})
+    calls = fake_transport({"types_declare": {"ok": True, "result": {"preview": False, "success": True, "results": [{"status": "verified"}]}}})
 
     rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(declaration_file)])
 

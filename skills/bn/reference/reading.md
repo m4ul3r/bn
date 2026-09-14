@@ -5,6 +5,7 @@ Read-command catalog for the `bn` skill. Open when surveying/decompiling. See `.
 
 ```bash
 bn target info
+bn target list [--format json]                       # open targets + their selectors; `selector` is what -t takes
 bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
 bn function list [--sort {address|size|name}] [--reverse] [--min-size 64] [--demangle]
 bn function list [--named | --unnamed]               # meaningful names vs BN's auto sub_* (import thunks in neither)
@@ -28,10 +29,22 @@ bn evidence table <addr> --record-size N --field cmd:u32@0 --field name:char[16]
 bn evidence calls <reg-fn> --arg-struct N --field type:u8@2 --field cb:ptr@16  # stack-descriptor fields per callsite
 bn evidence message <type-string> [--limit N]        # protobuf/RTTI type-name -> xrefs -> nearby metadata table windows
 bn evidence init [--limit N]                         # .init_array/.ctors constructor-pointer summary
+bn evidence orient                                   # one-shot triage digest under a single read lock: target + analysis state, imports, strings sample, sections
 bn evidence surface                                  # hidden code surface: init/ctor + vtable/dispatch tables + data-referenced code BN missed
+bn evidence virtual-call --at <addr> [--providers <selector>]   # resolve an imported abstract/interface virtual call to the provider's vtable method
 bn trace <fn> <addr> [--arg N] [--interprocedural]   # backward SSA slice: trace where a call argument originates
+bn dataflow defuse <fn> --var <name|local_id|name#version>   # SSA def site + use sites of one variable
+bn dataflow callgraph <fn> [--direction {callees|callers|both}]   # resolved edges; indirect targets via value-set
+bn dataflow values <fn> --at 0x401234                # value-set (possible values) at an instruction
+bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present]   # known sources/sinks; --present needs a target
+bn taint forward -f <fn> --source param:0 [--sink-class recv_overflow]   # untrusted data source→sink across calls (methodology → the `bn-vr` skill)
+bn taint backward -f <fn> --sink arg:memcpy:2         # slice a sink's args back to their origin (`bounded: true` = provably bounded)
+bn function cfg <fn> [--view {asm|mlil|hlil}]        # basic-block graph: blocks, their instructions, and the typed edges between them
+bn function structured-il <fn>                       # flat per-instruction list: op plus vars_read/vars_written, no block partitioning
 bn proto get <fn>
 bn local list <fn>
+bn data vars --start <addr> --end <addr>             # typed data variables in an address window (the window is mandatory)
+bn data symbols [--limit N]                          # every named DataSymbol, including internals `bn exports` omits
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
 bn function create <address> [--preview]
 bn types [--query <q>]
@@ -41,7 +54,12 @@ bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangl
 bn class show <Name>                                  # one class: methods, vtable, size, bases, instances
 bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
+bn exports [--count]                                 # public exported symbols (contrast `imports`)
+bn go functions [--summary | --count]                # recover Go names from .gopclntab (then `bn go rename`, a mutation)
 bn sections [--query <q>]
+bn tag list [--type Bookmarks --query <substr>]      # tags at all scopes; `--type Bookmarks` is the bookmarks tag
+bn tag get 0x401000 | --function <fn>                # tags at one address, or the whole-function tags
+bn tag types                                         # tag types (built-in + custom)
 bn comment list [--query <q>] [--scope {all|address|function}]   # `all` (default) includes function docs
 bn comment get   --address 0x... | --function <fn>
 ```
