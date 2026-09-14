@@ -36,8 +36,11 @@ def validate_instance_id(instance_id: str) -> str:
     Accepts letters, digits, '_', '-', '.'; rejects empty strings, '.'/'..',
     and anything containing a path separator or other character (which also
     rules out absolute paths and traversal). Raises ValueError before the id is
-    joined into a filesystem path. Returns the id unchanged when valid. Mirrors
-    the CLI's transport.validate_instance_id rules so both sides agree.
+    joined into a filesystem path. Returns the id unchanged when valid.
+
+    This is the single owner of the instance-id grammar (#608): the CLI's
+    transport.validate_instance_id delegates here and only translates the
+    exception type, so the two sides cannot drift apart.
     """
     if not isinstance(instance_id, str) or not instance_id:
         raise ValueError("Instance id must be a non-empty string")

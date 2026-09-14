@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -210,6 +211,13 @@ def test_send_request_rejects_foreign_socket_pid_before_dispatch(tmp_path, monke
 
 
 def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, monkeypatch):
+    # A payload claiming an identity its filename disagrees with is never
+    # adopted, and its socket is never unlinked. DELETING the record is a
+    # separate decision that now needs positive evidence the record is litter --
+    # the disagreement itself can be an artifact of the caller's spelling on a
+    # case-insensitive filesystem, where it cost a live bridge its record. The
+    # destructive half, and that live-record case, are pinned by
+    # test_a_filename_mismatch_does_not_delete_a_live_bridges_record.
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     socket_path = tmp_path / "foreign.sock"
     server = _Server(str(socket_path), _Handler)
@@ -230,11 +238,12 @@ def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, mo
 
     try:
         assert list_instances() == []
-        assert not registry.exists()
+        assert list_instances(include_unreachable=True) == []
         assert socket_path.exists()
     finally:
         server.shutdown()
         server.server_close()
+
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -1741,6 +1750,50 @@ def test_validate_instance_id_rejects_traversal_and_separators(bad):
         validate_instance_id(bad)
 
 
+# --- #608: one owner for the instance-id grammar ----------------------------
+# The grammar lives only in bn.paths; transport.validate_instance_id is a
+# ValueError -> BridgeError wrapper that also keeps the socket-length budget
+# check. These guards fail if the wrapper drifts in what it accepts, in the
+# exception type it raises, or in the message it reports.
+
+_INSTANCE_ID_GRAMMAR = [
+    ("abc123", True),
+    ("goal-v1", True),
+    ("my_inst.2", True),
+    ("A.B-C_9", True),
+    ("default", True),
+    ("../evil", False),
+    ("../../tmp/evil", False),
+    ("/abs/path", False),
+    ("a/b", False),
+    ("a\\b", False),
+    (".", False),
+    ("..", False),
+    ("", False),
+    ("has space", False),
+    ("weird;id", False),
+]
+
+
+@pytest.mark.parametrize("instance_id, accepted", _INSTANCE_ID_GRAMMAR)
+def test_instance_id_grammar_agrees_between_paths_and_transport(instance_id, accepted, tmp_path, monkeypatch):
+    from bn.paths import validate_instance_id as paths_validate
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    if accepted:
+        assert paths_validate(instance_id) == instance_id
+        assert validate_instance_id(instance_id) == instance_id
+        return
+    # Value side: ValueError. CLI side: BridgeError (a RuntimeError, so these
+    # two `pytest.raises` cannot both be satisfied by one type).
+    with pytest.raises(ValueError, match="Invalid instance id|non-empty") as paths_exc:
+        paths_validate(instance_id)
+    with pytest.raises(BridgeError) as transport_exc:
+        validate_instance_id(instance_id)
+    # Wrapper fidelity: the CLI-facing message is the canonical one, verbatim.
+    assert str(transport_exc.value) == str(paths_exc.value)
+
+
 def test_spawn_instance_rejects_traversal_id_before_any_fs(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     # Must raise before spawning anything; no files outside instances_dir().
@@ -2556,12 +2609,26 @@ def test_socketless_registry_is_never_listed(tmp_path, monkeypatch, identity):
 
 
 @pytest.mark.parametrize(
-    "identity",
-    [lambda: _identity(ticks_delta=5), lambda: _identity(omit_boot=True), dict],
-    ids=["reused-pid", "no-boot-id", "no-identity"],
+    "identity,owner_alive",
+    [
+        (lambda: _identity(ticks_delta=5), True),
+        (lambda: _identity(omit_boot=True), False),
+        (dict, False),
+    ],
+    ids=["reused-pid", "dead-owner-no-boot-id", "dead-owner-no-identity"],
 )
-def test_socketless_registry_without_proof_self_heals(tmp_path, monkeypatch, identity):
+def test_socketless_registry_self_heals_on_positive_evidence(
+    tmp_path, monkeypatch, identity, owner_alive
+):
+    # A socket-less record is swept when something PROVES it is litter: the
+    # owner is gone, or its recorded identity mismatches (the pid was reused).
+    # The two unprovable-but-ALIVE cases this used to sweep are now kept -- that
+    # record is the only handle on a live process, and "unrecorded" is what
+    # every bridge reports on a platform without /proc -- and they are pinned by
+    # test_a_socketless_registry_is_kept_when_its_owner_proves_nothing.
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    if not owner_alive:
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(
@@ -2847,3 +2914,2928 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
     assert exc_info.value.status is None
     assert exc_info.value.requested is None
     assert exc_info.value.observed is None
+
+# ---------------------------------------------------------------------------
+# #618 — registry socket confinement + spawn log-fd hygiene
+# ---------------------------------------------------------------------------
+#
+# INVENTORY — what in this section's subject is NOT held by anything here.
+#
+# Everything below pins a rule. This block names what does NOT, so the two
+# can be told apart without re-deriving it, and so a guard that can regress
+# silently is at least written down somewhere a maintainer will look. Both
+# lists were produced by mutating the guard and running the three fenced test
+# files (tests/test_transport.py, tests/test_paths.py, tests/test_cli_misc.py);
+# GREEN below means nothing in them would notice that guard breaking.
+#
+# UNPINNED GUARDS — four, and they do NOT carry the same risk:
+#
+#  1. `_load_instance`'s `expected_record=record_document` at all FOUR
+#     `_purge_stale_registry` callsites (the foreign-id, unconfined,
+#     missing-socket and dead-socket arms), which makes each arm destroy the
+#     document it JUDGED. Mutation: a callsite `path.read_bytes()`, green at
+#     each of the four individually and at all four together. DESTRUCTIVE
+#     direction: a legitimate re-spawn inside the loader's decision window
+#     loses its brand-new registry while its socket keeps serving. Detail
+#     block above
+#     `test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket`.
+#
+#  2. `_process_state`'s `rfind(b")")` comm-skip. Mutation: `find`, green.
+#     DESTRUCTIVE direction, and the constructible class is narrower than
+#     "any `)` in the name": the token after the FIRST `)` must be exactly
+#     `Z`, `X` or `x`, so a basename like `x) Z (y` reads as a zombie while
+#     `a)b` parses to `b)` and still reads ALIVE. Where it does fire, a
+#     running bridge's record and log become litter on the strength of what
+#     an unrelated neighbour happens to be called. Detail block above
+#     `test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage`.
+#
+#  3. `owner_alive`'s zombie half, `process_state not in {"Z", "X", "x"}`.
+#     Mutation: drop it (`owner_alive = _process_alive(pid)`) -- the three
+#     fenced files stay GREEN. This one fails SAFE, and that is the whole
+#     reason it is listed third rather than first: an unreaped zombie's owner
+#     then reads as ALIVE, so its record is RETAINED, not destroyed -- litter
+#     rather than data loss. Same category as 1 and 2, opposite risk; a
+#     reader who lumps the four together will misjudge which to pin first.
+#     The OTHER half of that same predicate -- reading an unknowable state as
+#     dead -- is pinned, and destructively, by
+#     `test_a_live_owner_whose_state_cannot_be_read_is_not_litter`.
+#
+#  4. `_socket_path_is_confined`'s failure-direction answer, the
+#     `except (OSError, TypeError, ValueError): return False`. Mutation:
+#     `return True` -- a resolution failure read as CONFINED -- the three
+#     fenced files stay GREEN. INERT here rather than safe by design: the only
+#     two inputs that reach the arm on this platform are an embedded NUL
+#     (`ValueError`) and an UNPAIRED HIGH surrogate, `\ud800`-`\udbff`
+#     (`UnicodeEncodeError`). A LOW surrogate is NOT one of them -- `\udc80`-
+#     `\udcff` is how `surrogateescape` carries a raw byte of a name that
+#     really exists on disk, it encodes fine, and `9d40491` in this branch
+#     turns on exactly that distinction. Such a record is routed to the same
+#     fate by the missing-socket arm downstream, so no destruction is
+#     constructible from the mutation. It is listed because an inventory that
+#     omits a green guard is worth less than no inventory: if some future
+#     input makes that arm reachable with a real path, nothing here notices.
+#
+# For 1 and 2 a pin was written, did not discriminate, and was deleted rather
+# than shipped with a docstring claiming a guard it does not hold; both are
+# ruled disclosed coverage gaps on the condition that they are named here. 3
+# and 4 were each measured by a review lens and are recorded on the same
+# terms.
+#
+# There was a FIFTH, and it is now PINNED rather than listed: `_load_instance`'s
+# `TypeError` in `except (OSError, TypeError, ValueError, KeyError,
+# json.JSONDecodeError)`. Dropping it left the whole suite green, and unlike 3
+# and 4 its direction is DESTRUCTIVE and trivially reachable -- a registry
+# document that parses but is not an object (`[1, 2]`, `"hello"`, `123`,
+# `true`) raises out of `payload["socket_path"]`, so one such file hid every
+# healthy sibling instance behind a raw traceback. A round-32 lens found it in
+# this very block's omission; the pin it needed was available and
+# discriminating, so it was written instead of disclosed:
+# `test_a_registry_that_is_not_a_json_object_does_not_hide_its_siblings`. That
+# is the order of preference this block exists to serve -- pin what can be
+# pinned, disclose only what cannot.
+#
+# SAFE OR INERT GREEN GUARDS, named because completeness is the point: a
+# mutation of each leaves the fenced files green, and each fails in a
+# direction that keeps rather than destroys, so none is a coverage risk in the
+# sense 1 and 2 are -- `_path_has_bound_socket`'s exact-byte fast path (can
+# only weaken a `True` to a `None`, and only `False` authorises an unlink),
+# `_socket_probe`'s `nothing_bound=True` on `ENOENT` (there is nothing left to
+# unlink), `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
+# already answers `None` for a `.json`, so the condition is redundant rather
+# than load-bearing), and `src/bn/commands/misc.py::_resolved_out_format`'s
+# `if out is None` short circuit.
+#
+# UNREACHABLE DEFENSIVE CODE — one category, rather than notes scattered
+# across two files. No mutation can redden these because no input on this
+# platform reaches them; they stay as statements of the contract, and a green
+# mutation here is NOT evidence that the line is dead weight:
+#   - `_unlink_if_unchanged`'s `if expected is None: return False` -- the byte
+#     comparison below it also answers `False` for `None`.
+#   - `_unlink_if_unchanged`'s `ValueError` in `except (OSError, ValueError)`
+#     -- unreachable, but NOT for the reason an earlier form of this note
+#     gave: it is not true that every `registry_path` reaching it comes from
+#     a directory scan, because the legacy fixed registry is CONSTRUCTED by
+#     `bridge_registry_path()` and does reach this unlink. It is unreachable
+#     because neither source can carry an embedded NUL -- a scanned name
+#     cannot, and a constructed one derives from the environment, which
+#     cannot either. A true conclusion does not get to keep a false reason.
+#   - `_socket_path_is_confined`'s `TypeError` in
+#     `except (OSError, TypeError, ValueError)`, documented there as "an empty
+#     final component" -- on this Python `Path("/").parent.resolve() / ""`
+#     answers `/` instead of raising (measured on 3.14.2).
+#   - `_process_state`'s `if close < 0: return None`, `if not fields: return
+#     None` and `except UnicodeDecodeError: return None` -- each green under
+#     mutation and each genuinely unreachable, because everything after the
+#     last `)` in `/proc/<pid>/stat` is kernel-written ASCII: the `)` is
+#     always there, the fields are always there, and the state character
+#     always decodes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("socket_is_live", [True, False])
+def test_load_instance_rejects_socket_outside_cache(tmp_path, monkeypatch, socket_is_live):
+    """A registry is DATA: its socket_path must stay under this user's cache.
+
+    Ids are basename-validated when paths are constructed; the payload is not.
+    Whatever an out-of-tree registry claims, we must never adopt its socket and
+    never let the stale sweep unlink it -- only the registry file under the
+    cache is dropped. Both facets matter: a live foreign socket must not be
+    connected to, and a dead foreign file must survive our cleanup.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    foreign_socket = tmp_path.parent / f"{tmp_path.name}-outside.sock"
+    server = None
+    if socket_is_live:
+        server = _Server(str(foreign_socket), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    else:
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(foreign_socket))
+        stale.listen(1)
+        stale.close()
+
+    registry_path = inst_dir / "outsider.json"
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                foreign_socket,
+                pid=os.getpid(),
+                identity=_identity(ticks_delta=1),
+                instance_id="outsider",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        assert not any(inst.instance_id == "outsider" for inst in list_instances())
+        assert foreign_socket.exists()      # never unlinked
+        assert not registry_path.exists()   # the cache-side record is dropped
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        else:
+            foreign_socket.unlink(missing_ok=True)
+
+
+def test_registry_socket_under_cache_still_loads_and_purges(tmp_path, monkeypatch):
+    """#618 control: in-cache sockets are untouched by the confinement check.
+
+    The legacy fixed pair (cache_home()/bn_agent_bridge.json ->
+    cache_home()/bn-fixed.sock) must keep resolving, and a dead in-cache socket
+    must still be swept together with its registry.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    fixed_socket = tmp_path / "bn-fixed.sock"
+    server = _Server(str(fixed_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    fixed_registry = bridge_registry_path()
+    fixed_registry.write_text(
+        json.dumps(
+            _registry_payload(
+                fixed_socket, pid=os.getpid(), identity=_identity(), instance_id=None
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    stale_socket = inst_dir / "stale1.sock"
+    stale_binder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_binder.bind(str(stale_socket))
+    stale_binder.listen(1)
+    stale_binder.close()
+    stale_registry = inst_dir / "stale1.json"
+    stale_registry.write_text(
+        json.dumps(
+            _registry_payload(
+                stale_socket,
+                pid=os.getpid(),
+                identity=_identity(ticks_delta=1),
+                instance_id="stale1",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+        assert any(inst.registry_path == fixed_registry for inst in instances)
+        assert not any(inst.instance_id == "stale1" for inst in instances)
+        assert not stale_registry.exists()
+        assert not stale_socket.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        stale_socket.unlink(missing_ok=True)
+
+
+def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    """An unresolvable socket_path is corruption to skip, never a CLI abort.
+
+    ``Path.resolve()`` raises ValueError -- not OSError -- on an embedded NUL, so
+    the confinement check must treat it as unconfined instead of letting it
+    escape ``_load_instance``/``list_instances``. The owner here is live and its
+    identity PROVEN: that is the payload the tolerant loader used to ignore, so
+    discovery must still return without raising and must not adopt the record.
+    Its FILE stays, because a proven live owner's record is the only handle its
+    process has and this arm cannot tell a bogus payload from a layout it read
+    wrongly; the dead-owner half is swept, and is pinned separately.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    bystander = outside / "x.sock"
+    bystander.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    registry_path = instances_dir() / "nulpath.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                Path(f"{outside}/x\x00y.sock"),
+                pid=os.getpid(),
+                identity=_identity(),
+                instance_id="nulpath",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert not any(inst.instance_id == "nulpath" for inst in list_instances())
+    assert registry_path.exists()            # refused, not destroyed
+    # The other half of the contract: rejecting the payload must not sweep
+    # anything the cache does not own.
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["x.sock"]
+
+
+def _fds_open_on(path: Path) -> list[str]:
+    """Every fd in THIS process that names *path*, read from the fd table."""
+    target = str(path)
+    found = []
+    for entry in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{entry}") == target:
+                found.append(entry)
+        except OSError:                    # the listing's own fd, already gone
+            continue
+    return found
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(),
+                    reason="reads this process's fd table")
+def test_spawn_closes_log_on_popen_failure(tmp_path, monkeypatch):
+    """A failed Popen must not leak the parent's spawn-log write handle.
+
+    Measured where a leak actually shows -- this process's fd table, inside
+    the ``except`` block, while the traceback still holds the frame that owns
+    the handle, which is exactly how long an unclosed handle survives.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+
+    def raising_popen(*args, **kwargs):
+        raise FileNotFoundError("bn-agent: not found")
+
+    monkeypatch.setattr(transport.subprocess, "Popen", raising_popen)
+
+    log_path = instances_dir() / "leaky1.log"
+    try:
+        transport._spawn_instance_unlocked("leaky1", timeout=5.0)
+    except FileNotFoundError:
+        leaked = _fds_open_on(log_path)
+    else:                                   # pragma: no cover - guard
+        pytest.fail("the spawn was supposed to fail")
+
+    assert log_path.exists()                # the log was really opened
+    assert leaked == []
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_load_instance_never_unlinks_a_foreign_symlink_resolving_into_the_cache(
+    tmp_path, monkeypatch, target_exists
+):
+    """Confinement must bound what we UNLINK, not only what we connect to.
+
+    ``unlink`` never follows the final symlink: it deletes the directory entry
+    at ``<resolved parent>/<name>``. A registry naming an out-of-cache symlink
+    whose TARGET is in-cache therefore resolves "inside" while the stale sweep
+    deletes a path outside the cache -- exactly what #618 forbids ("never cause
+    unlink of the foreign path"). Both variants matter: a link to a dead
+    in-cache socket, and a dangling link.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    in_cache_target = inst_dir / "linked.sock"
+    if target_exists:
+        binder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        binder.bind(str(in_cache_target))
+        binder.listen(1)
+        binder.close()
+    foreign_link = outside / "keep-me.sock"
+    foreign_link.symlink_to(in_cache_target)
+
+    registry_path = inst_dir / "linked.json"
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                foreign_link,
+                pid=os.getpid(),
+                # A mismatched identity is what drives discovery into the
+                # destructive stale sweep; without it nothing would unlink.
+                identity=_identity(ticks_delta=1),
+                instance_id="linked",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert not any(inst.instance_id == "linked" for inst in list_instances())
+    # The whole point: the out-of-cache entry survives the sweep.
+    assert foreign_link.is_symlink()
+    assert not registry_path.exists()
+
+
+@pytest.mark.parametrize("bad_socket_path", [
+    pytest.param(123, id="int"),
+    pytest.param(None, id="null"),
+    pytest.param(["/tmp/x.sock"], id="list"),
+    pytest.param({"path": "/tmp/x.sock"}, id="object"),
+])
+def test_load_instance_drops_a_registry_whose_socket_path_is_not_a_string(
+    tmp_path, monkeypatch, bad_socket_path
+):
+    """A wrong-typed payload field is corruption to skip, never a CLI abort.
+
+    ``Path(123)`` raises ``TypeError``, which is not a ``ValueError``, so a
+    single hand-edited or truncated registry under the cache used to take down
+    every discovery-backed command with a raw traceback. Discovery tolerates a
+    malformed registry everywhere else; the TYPE of the malformation must not
+    decide whether the CLI survives it.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "badtype.json").write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": bad_socket_path,
+            "instance_id": "badtype",
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+
+    # A second, well-formed instance proves the bad record is SKIPPED rather
+    # than aborting the sweep before the rest of the directory is read.
+    good_socket = inst_dir / "good.sock"
+    server = _Server(str(good_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(
+                good_socket, pid=os.getpid(), identity=_identity(), instance_id="good"
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_instance_id_grammar_change_moves_both_sides(tmp_path, monkeypatch):
+    """#608: one owner means widening the grammar widens BOTH entry points.
+
+    Narrowing cannot tell the copies apart -- the CLI wrapper reaches the paths
+    grammar again through ``bridge_socket_path`` and rejects either way.
+    Widening can: a second, private regex in the CLI wrapper would keep
+    rejecting an id the single owner now accepts.
+    """
+    import re as _re
+
+    import bn.paths as paths
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(paths, "_INSTANCE_ID_RE", _re.compile(r"^[A-Za-z0-9_.+-]+$"))
+
+    assert paths.validate_instance_id("plus+id") == "plus+id"
+    assert validate_instance_id("plus+id") == "plus+id"
+
+
+@pytest.mark.parametrize("hostile", [
+    pytest.param("overlong", id="longer-than-PATH_MAX"),
+    pytest.param("escaping-symlink", id="symlink-escaping-the-registry-dir"),
+    pytest.param("surrogate", id="non-utf8-byte-sequence"),
+    pytest.param("empty", id="empty-string"),
+    pytest.param("relative", id="relative-path"),
+])
+def test_hostile_registry_socket_paths_reject_rather_than_crash(
+    tmp_path, monkeypatch, hostile
+):
+    """Confinement must REJECT a hostile socket_path, never abort discovery.
+
+    The property is "rejects cleanly", not "does not adopt": the tolerant
+    loader ignored these payloads before the confinement check existed, so
+    anything that now raises out of ``list_instances`` has converted a skipped
+    record into a dead CLI. Every input the check newly sees is exercised here,
+    and each must leave everything outside the cache alone.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    if hostile == "overlong":
+        socket_path = f"{inst_dir}/{'L' * 9000}.sock"
+    elif hostile == "escaping-symlink":
+        link = inst_dir / "escape.sock"
+        link.symlink_to(bystander)
+        socket_path = str(link)
+    elif hostile == "surrogate":
+        # A lone surrogate is what a non-UTF-8 byte sequence becomes once JSON
+        # has decoded it; it survives into a Path and only fails at the syscall.
+        socket_path = f"{outside}/\udce9bad.sock"
+    elif hostile == "empty":
+        socket_path = ""
+    else:
+        socket_path = "relative.sock"
+
+    registry_path = inst_dir / "hostile.json"
+    registry_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": socket_path,
+            "instance_id": "hostile",
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+
+    instances = list_instances()      # must not raise
+
+    assert not any(inst.instance_id == "hostile" for inst in instances)
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+@pytest.mark.parametrize("raw_pid", [
+    pytest.param("10000000000000000000000000000000000000000", id="wider-than-a-C-int"),
+    pytest.param("Infinity", id="infinity"),
+    pytest.param("-Infinity", id="negative-infinity"),
+    pytest.param("0", id="zero-is-our-own-process-group"),
+    pytest.param("-1", id="negative-is-a-process-group"),
+    pytest.param("true", id="a-json-boolean-is-not-pid-1"),
+])
+def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
+    tmp_path, monkeypatch, raw_pid
+):
+    """An untrusted pid must never reach a syscall unchecked.
+
+    ``os.kill`` takes a C ``int``: anything wider raises ``OverflowError``,
+    which is neither an ``OSError`` nor a ``ValueError``, so one corrupt
+    registry took every discovery-backed command down with a traceback.
+
+    The values that do NOT crash are the more dangerous half, because they make
+    a record that should have been discarded look ALIVE. Zero and negatives
+    address a process GROUP, so ``os.kill(0, 0)`` reports our own group as the
+    bridge's owner; and a JSON ``true`` is an ``int`` in Python, so it becomes
+    pid 1, which always exists and answers ``EPERM``. All are rejected before
+    the probe.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    hostile_socket = inst_dir / "badpid.sock"
+    hostile_socket.write_text("", encoding="utf-8")
+    (inst_dir / "badpid.json").write_text(
+        '{"pid": ' + raw_pid + ', "socket_path": "' + str(hostile_socket) + '",'
+        ' "instance_id": "badpid", "plugin_name": "bn_agent_bridge"}',
+        encoding="utf-8",
+    )
+
+    # A well-formed sibling proves the bad record is SKIPPED, not fatal.
+    good_socket = inst_dir / "good.sock"
+    server = _Server(str(good_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(
+                good_socket, pid=os.getpid(), identity=_identity(), instance_id="good"
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def _plant_registry(inst_dir, name, **fields):
+    """Write a raw registry document, bypassing the well-formed helper."""
+    (inst_dir / f"{name}.json").write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _healthy_sibling(inst_dir):
+    """A genuinely live instance, so a dropped record is distinguishable from
+    a discovery sweep that died before it got to the rest of the directory."""
+    sock = inst_dir / "good.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="good")
+        ),
+        encoding="utf-8",
+    )
+    return server
+
+
+@pytest.mark.parametrize("raw_socket_path", [
+    pytest.param("", id="empty-string"),
+    pytest.param(".", id="dot"),
+    pytest.param("plain.sock", id="bare-relative-name"),
+    pytest.param("./nested/plain.sock", id="explicitly-relative"),
+])
+def test_a_relative_socket_path_never_resolves_against_the_callers_cwd(
+    tmp_path, monkeypatch, raw_socket_path
+):
+    """The answer must not depend on the directory the CLI was run from.
+
+    Confinement asks whether the path is under the cache, and ``Path("")`` is
+    ``Path(".")`` -- so a relative value used to inherit whatever directory
+    the CLI happened to be in. Run from inside the cache it passed confinement
+    and the record was ADOPTED as a live bridge pointing at a directory. Each
+    of these values exists relative to the CWD here, so only the CWD could
+    make them resolve; the record's own socket (``relpath.sock``) does not
+    exist, and that is the only thing a relative value can now mean.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "nested").mkdir()
+    # Every row must fail for the RIGHT reason, so each relative value names
+    # something that actually exists once resolved against the CWD; otherwise
+    # the record would drop on the missing-socket arm and prove nothing.
+    (inst_dir / "plain.sock").write_text("", encoding="utf-8")
+    (inst_dir / "nested" / "plain.sock").write_text("", encoding="utf-8")
+    monkeypatch.chdir(inst_dir)
+
+    _plant_registry(inst_dir, "relpath", pid=os.getpid(),
+                    socket_path=raw_socket_path, instance_id="relpath",
+                    plugin_name="bn_agent_bridge")
+    server = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+@pytest.mark.parametrize("raw_pid", [
+    pytest.param("1", id="numeric-string"),
+    pytest.param(" 1 ", id="padded-numeric-string"),
+    pytest.param("1_0", id="underscored-numeric-string"),
+    pytest.param("\u0661", id="unicode-digit-string"),
+    pytest.param(1.9, id="float-truncating-to-a-live-pid"),
+])
+def test_load_instance_does_not_coerce_a_registry_pid(tmp_path, monkeypatch, raw_pid):
+    """The pid is read, never converted.
+
+    ``int()`` is lossy in exactly the direction that hurts: every one of these
+    becomes a small pid that exists, so the record is ADOPTED as a live bridge.
+    Guarding the known-bad VALUES is a list; requiring the declared TYPE is the
+    property. The bridge writes ``os.getpid()``, so an int is the only shape a
+    real registry ever carries.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    hostile_socket = inst_dir / "coerced.sock"
+    hostile_socket.write_text("", encoding="utf-8")
+
+    _plant_registry(inst_dir, "coerced", pid=raw_pid,
+                    socket_path=str(hostile_socket), instance_id="coerced",
+                    plugin_name="bn_agent_bridge")
+    server = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+@pytest.mark.parametrize("hostile_id", [
+    pytest.param("../evil", id="traversal"),
+    pytest.param("/abs/evil", id="absolute"),
+    pytest.param(17, id="not-a-string"),
+])
+def test_legacy_fixed_registry_validates_its_instance_id(
+    tmp_path, monkeypatch, hostile_id
+):
+    """The legacy fixed registry is the one path with no filename to check against.
+
+    ``instance_id != path.stem`` only runs for registries under the instances
+    directory, so the fixed pair in the cache root let any value through into
+    ``BridgeInstance.instance_id`` and out of ``instance_selector`` -- a
+    selector the caller then passes back to path helpers.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    instances_dir().mkdir(parents=True, exist_ok=True)
+    fixed_socket = tmp_path / "bn_agent_bridge.sock"
+    server = _Server(str(fixed_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path().write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": str(fixed_socket),
+            "instance_id": hostile_id,
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+    sibling = _healthy_sibling(instances_dir())
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_relative_cache_root_still_discovers_its_own_bridge(tmp_path, monkeypatch):
+    """The over-rejection half: a relative cache root is a supported setup.
+
+    ``cache_home()`` does not force its env override absolute, so a relative
+    BN_CACHE_DIR is an input the CLI accepts and the AF_UNIX 107-byte limit
+    gives users a reason to shorten the root. The authoritative writer then
+    emits a relative ``str(bridge_socket_path(id))`` -- so requiring an
+    absolute socket_path silently drops a LIVE bridge, leaving `session list`
+    empty and `session stop` with no handle on a running process.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert not inst_dir.is_absolute()          # the configuration under test
+
+    from bn.paths import bridge_socket_path
+
+    sock = bridge_socket_path("rel1")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("rel1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="rel1")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["rel1"]
+
+
+def test_a_cwd_local_socket_is_not_honoured_under_an_absolute_cache_root(
+    tmp_path, monkeypatch
+):
+    """The under-rejection half: the same value must NOT be honoured when the
+    cache root is absolute, because then it could only mean "resolve against
+    whatever directory the caller happens to be in".
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert inst_dir.is_absolute()
+    # The value is relative, and made to exist relative to the CWD so the
+    # record would be adopted rather than dropped on the missing-socket arm.
+    monkeypatch.chdir(inst_dir)
+    (inst_dir / "cwd.sock").write_text("", encoding="utf-8")
+    _plant_registry(inst_dir, "cwdrel", pid=os.getpid(), socket_path="cwd.sock",
+                    instance_id="cwdrel", plugin_name="bn_agent_bridge")
+    sibling = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_one_cache_root_spelled_two_ways_still_finds_its_bridge(tmp_path, monkeypatch):
+    """Two spellings of ONE cache root must not disagree about a live bridge.
+
+    The writer ran with a relative cache root and emitted the relative
+    ``str(bridge_socket_path(id))`` it always emits there; a later CLI names
+    the SAME directory absolutely. Nothing about the instance changed -- only
+    how the reader spells its own root -- yet asking whether the VALUE is
+    absolute dropped the record ahead of the ``include_unreachable`` arm, so
+    `session list` was empty, `session stop` had no handle, and nothing swept
+    the record either: a running bridge orphaned by a spelling. Base kept the
+    lifecycle handle here, so this is a regression against base, and the
+    reader's CWD must not enter into it.
+    """
+    from bn.paths import bridge_socket_path
+    from bn.transport import find_lifecycle_instance
+
+    writer_cwd = tmp_path / "w"
+    (writer_cwd / "other").mkdir(parents=True)
+    monkeypatch.chdir(writer_cwd)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")          # the WRITER's spelling
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    sock = bridge_socket_path("mix1")
+    assert not sock.is_absolute()                    # what the writer emits here
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("mix1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="mix1")
+        ),
+        encoding="utf-8",
+    )
+
+    # The reader: same directory, absolute spelling, and a DIFFERENT CWD, so
+    # nothing it concludes may depend on where it happens to be run from.
+    monkeypatch.setenv("BN_CACHE_DIR", str(writer_cwd / "c"))
+    monkeypatch.chdir(writer_cwd / "other")
+    assert instances_dir().is_absolute()
+    try:
+        instances = list_instances()
+        lifecycle = find_lifecycle_instance("mix1")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["mix1"]
+    assert lifecycle is not None and lifecycle.instance_id == "mix1"
+    assert bridge_registry_path("mix1").exists()     # and it was not swept
+
+
+def test_a_relative_socket_path_cannot_name_a_siblings_socket(tmp_path, monkeypatch):
+    """Under a relative root, confinement was the only thing left standing.
+
+    Every relative value passed straight through to confinement there, so a
+    record could name a SIBLING's live socket and be adopted as a live bridge
+    of its own -- the same false-affirmative class this validator exists to
+    close, reached through the arm that admits the writer's own relative
+    output. A relative value now names one thing only: the socket this record
+    owns by construction.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sibling = _healthy_sibling(inst_dir)             # a real listening good.sock
+    stolen = str(inst_dir / "good.sock")
+    assert not Path(stolen).is_absolute()            # relative, in-cache, live
+    _plant_registry(inst_dir, "thief", pid=os.getpid(), socket_path=stolen,
+                    instance_id="thief", plugin_name="bn_agent_bridge")
+    try:
+        instances = list_instances()
+    finally:
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_a_misdescribing_relative_path_does_not_cost_a_live_bridge(tmp_path, monkeypatch):
+    """An uninterpretable value must not be allowed to condemn the record.
+
+    Anchoring already makes a relative ``socket_path`` inert -- the record's
+    own socket is used instead -- so the only thing a further rule about that
+    value could still decide is the fate of a record whose own socket IS
+    listening. Refusing it there is the over-rejection shape this field has
+    now produced twice: a running bridge invisible to `session list` and to
+    `session stop` because of how its own registry spells a path nobody can
+    interpret anyway.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sibling = _healthy_sibling(inst_dir)
+    sock = inst_dir / "live1.sock"                   # the bridge really is up
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _plant_registry(inst_dir, "live1", pid=os.getpid(),
+                    socket_path="somewhere/else.sock", instance_id="live1",
+                    plugin_name="bn_agent_bridge")
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert sorted(inst.instance_id for inst in instances) == ["good", "live1"]
+    live = next(inst for inst in instances if inst.instance_id == "live1")
+    assert Path(live.socket_path) == sock            # its own socket, not the claim
+
+
+def test_a_dead_record_is_swept_whatever_its_relative_path_claims(tmp_path, monkeypatch):
+    """Refusing a record ahead of the liveness sweep leaves it on disk forever.
+
+    ``_load_instance`` returns before the purge, so every rule that rejects a
+    record outright also exempts it from cleanup: a dead instance whose
+    registry happens to name an odd relative path would survive every
+    `session list` and every `instance gc`, where base swept it.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    _plant_registry(inst_dir, "gone", pid=os.getpid(),
+                    socket_path="somewhere/else.sock", instance_id="gone",
+                    plugin_name="bn_agent_bridge")
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not (inst_dir / "gone.json").exists()
+
+
+def test_a_symlinked_instances_dir_does_not_cost_a_live_bridge(tmp_path, monkeypatch):
+    """Confinement must measure the cache the user actually laid out.
+
+    ``resolve()`` follows symlinks, so a cache whose ``instances/`` is a link
+    -- a tmpfs, a bigger disk, a per-project directory -- put every socket the
+    bridge writes "outside the cache". That arm does not merely skip the
+    record, it PURGES the registry: the bridge keeps listening while
+    `session list` shows nothing and `session stop` has lost its only handle
+    on the process. Base listed it and kept the record.
+
+    The widened boundary must not become a hole, so the same cache also holds
+    a record naming a socket outside BOTH roots: that one is still refused,
+    and the file it names is still not touched.
+    """
+    from bn.paths import bridge_socket_path
+
+    cache = tmp_path / "cache"
+    linked = tmp_path / "elsewhere"
+    outside = tmp_path / "outside"
+    linked.mkdir(parents=True)
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    (cache / "instances").symlink_to(linked)     # the user's own layout
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+
+    sock = bridge_socket_path("sym1")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("sym1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="sym1")
+        ),
+        encoding="utf-8",
+    )
+    _plant_registry(instances_dir(), "foreign", pid=os.getpid(),
+                    socket_path=str(bystander), instance_id="foreign",
+                    plugin_name="bn_agent_bridge")
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["sym1"]
+    assert bridge_registry_path("sym1").exists()          # and not purged
+    assert bystander.exists()                             # nothing outside touched
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_an_all_dot_instance_id_keeps_its_live_registry(tmp_path, monkeypatch):
+    """``Path.stem`` does not round-trip every id the grammar accepts.
+
+    ``validate_instance_id`` accepts ``...``; its registry is ``....json``,
+    and ``Path("....json").stem`` is the WHOLE name, because pathlib reads a
+    leading dot run as part of the name rather than as a suffix separator. The
+    filename check therefore derived a different identity than the writer
+    wrote and deleted a LIVE bridge's record as foreign -- the destructive
+    form of the same wrong-reason check this PR keeps finding. Both sides now
+    derive the id the one way that round-trips: strip the exact ``.json``.
+    """
+    from bn.paths import bridge_socket_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert Path(str(bridge_registry_path("..."))).stem != "..."   # the trap
+
+    sock = bridge_socket_path("...")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("...").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="...")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["..."]
+    assert bridge_registry_path("...").exists()
+
+
+def test_the_cache_root_pair_reaches_a_symlinked_instances_dir(tmp_path, monkeypatch):
+    """The trusted region is the cache's own layout, not one record's parent.
+
+    A record that lives in the cache ROOT -- the legacy fixed pair -- gets no
+    help from a boundary built out of the directory the record was found in:
+    that directory IS the cache root, so a socket inside a symlinked
+    ``instances/`` still measured as outside, and the purge arm deleted the
+    record of a bridge that was listening. Both of this user's cache
+    directories are the boundary.
+    """
+    cache = tmp_path / "cache"
+    linked = tmp_path / "elsewhere"
+    linked.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    (cache / "instances").symlink_to(linked)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    sock = instances_dir() / "legacy.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    legacy = bridge_registry_path()                  # cache root, no instance id
+    legacy.write_text(
+        json.dumps(_registry_payload(sock, pid=os.getpid(), identity=_identity())),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(instances) == 1
+    assert legacy.exists()                           # and it was not purged
+
+
+def _unconfined_record(inst_dir, name, target):
+    """A record naming a socket outside the cache, with a proven identity."""
+    path = inst_dir / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            _registry_payload(target, pid=os.getpid(), identity=_identity(),
+                              instance_id=name)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_an_unconfined_socket_keeps_a_proven_live_records_handle(tmp_path, monkeypatch):
+    """Refusing a payload is a judgement; destroying the record is destruction.
+
+    This arm cannot tell "the payload is bogus" from "our reading of the
+    layout is wrong" -- the symlinked-cache purge proved the second happens --
+    so when the owner is alive and its identity PROVEN the record stays. File
+    existence is not the property, though: a kept file no consumer can resolve
+    is a handle for nothing. What #694 actually promises is pinned here -- the
+    lifecycle lookup resolves it as unreachable, spawn collision detection
+    sees the id, and the live bridge's own log survives the re-spawn attempt
+    that the collision now refuses. Normal discovery still hides it, the
+    payload is still refused, and nothing outside the cache is touched.
+    """
+    import bn.transport as transport
+
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["/bin/true"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = _unconfined_record(inst_dir, "alive", bystander)
+    log = inst_dir / "alive.log"
+    breadcrumb = "BN Agent Bridge listening on alive.sock\n" * 6
+    log.write_text(breadcrumb, encoding="utf-8")
+
+    assert list_instances() == []            # never advertised, never connected to
+
+    admin = list_instances(include_unreachable=True)
+    assert [inst.instance_id for inst in admin] == ["alive"]
+    assert admin[0].unreachable is True
+    found = transport.find_lifecycle_instance("alive")
+    assert found is not None and found.unreachable is True
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("alive", timeout=1.0, poll_interval=0.01)
+    assert "already exists with id: alive" in str(excinfo.value)
+
+    assert record.exists()                   # proven-live owner: never deleted
+    assert log.read_text(encoding="utf-8") == breadcrumb   # and never truncated
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_an_unreachable_instance_is_a_handle_not_a_connection(tmp_path, monkeypatch):
+    """``unreachable`` promises nothing can be dispatched to it -- enforce it.
+
+    The lifecycle lookup hands `session stop`/`session restart` a handle on a
+    bridge normal discovery hides, and `session restart` dispatches
+    `list_targets` to whatever handle it resolves before tearing it down. For
+    the confinement arm that handle names a socket OUTSIDE this user's cache --
+    the file the loader refused to trust -- and something may well be listening
+    on it, so the refusal cannot rest on connect() failing the way it does for
+    a socket-less bridge. It lives at the one chokepoint every dispatch takes.
+    """
+    import bn.transport as transport
+    from bn.transport import BridgeInstance
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    foreign = tmp_path / "foreign.sock"
+    server = _Server(str(foreign), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    instance = BridgeInstance(
+        pid=os.getpid(),
+        socket_path=foreign,
+        registry_path=instances_dir() / "unreach.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={"instance_token": "identity-token"},
+        instance_id="unreach",
+        instance_token="identity-token",
+        unreachable=True,
+    )
+    try:
+        with pytest.raises(BridgeError, match="bridge_unreachable"):
+            transport._send_request_to_instance(instance, "list_targets", timeout=1.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert server.requests == []         # never connected, let alone dispatched
+
+
+def test_a_record_discovery_cannot_read_keeps_its_bridges_spawn_log(tmp_path, monkeypatch):
+    """Truncating ``<id>.log`` is destruction; "no resolvable record" is no evidence.
+
+    A record whose document is unparseable, or whose fields are the wrong
+    type, is deliberately NOT purged -- which also makes it invisible to spawn
+    collision detection, while the bridge that wrote it may be listening right
+    now (its socket then refuses to be displaced and the child exits). So the
+    one destructive step left in that path -- opening ``<id>.log`` with ``w``
+    and wiping the only recorded output of that process -- is taken on
+    evidence that says nothing about whether the id is free. The log is kept,
+    and the spawn error still quotes only what THIS child wrote.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "corrupt.json").write_text("{not json", encoding="utf-8")
+    log = inst_dir / "corrupt.log"
+    breadcrumb = "BN Agent Bridge listening on corrupt.sock\n" * 6
+    log.write_text(breadcrumb, encoding="utf-8")
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("ImportError: no module named binaryninja\n")
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("corrupt", timeout=1.0, poll_interval=0.01)
+
+    assert (inst_dir / "corrupt.json").exists()          # still not purged
+    text = log.read_text(encoding="utf-8")
+    assert text.startswith(breadcrumb)                   # kept, not truncated
+    assert "no module named binaryninja" in text
+    message = str(excinfo.value)
+    assert "no module named binaryninja" in message
+    assert "listening on" not in message   # the tail is this child's output only
+    # What is known, named where the operator sees it -- and no instruction to
+    # delete a record that may be a live bridge's.
+    assert str(inst_dir / "corrupt.json") in message
+    assert "did not resolve it to a running bridge" in message
+    assert "before removing it" in message
+    assert "could not interpret" not in message
+
+
+@pytest.mark.parametrize("document", ["[1, 2]", '"hello"', "123", "true"])
+def test_a_registry_that_is_not_a_json_object_does_not_hide_its_siblings(
+    tmp_path, monkeypatch, document
+):
+    """One record's SHAPE must not take every discovery-backed command down.
+
+    ``json.loads`` answers whatever the document says, so a registry holding
+    an array, a string, a number or a bare ``true`` parses perfectly and then
+    raises ``TypeError`` out of ``payload["socket_path"]`` -- list indices
+    must be integers, string indices must be integers, and the scalars are
+    not subscriptable at all. That is not a parse failure, so it escapes
+    everything ``json.JSONDecodeError`` covers: ONE such file makes every
+    healthy sibling invisible and turns ``session list`` into a raw traceback
+    for an instance that has nothing to do with it. ``TypeError`` sits in the
+    loader's except tuple for exactly this, and NOTHING pinned it -- dropping
+    it from the tuple left the whole suite green, which is how an availability
+    guard regresses silently (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    healthy_sock = inst_dir / "healthy.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(healthy_sock))
+    server.listen(1)
+    (inst_dir / "healthy.json").write_text(
+        json.dumps(_registry_payload(healthy_sock, pid=os.getpid(),
+                                     identity=_identity(),
+                                     instance_id="healthy")),
+        encoding="utf-8",
+    )
+    # Sorted before "healthy.json", so the bad shape is read FIRST: a raised
+    # TypeError takes the sibling down with it rather than merely trailing it.
+    bad = inst_dir / "aaa-bad-shape.json"
+    bad.write_text(document, encoding="utf-8")
+
+    try:
+        assert [inst.instance_id for inst in list_instances()] == ["healthy"]
+        summary = gc_instances()
+        assert summary["live_instances"] == 1
+        assert bad.exists()          # uninterpretable is refused, not destroyed
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        healthy_sock.unlink(missing_ok=True)
+
+
+def test_a_spawn_with_no_leftover_record_still_starts_a_fresh_log(tmp_path, monkeypatch):
+    """The other half of the append rule: with no record to protect, truncate.
+
+    Keeping a log that may belong to a live bridge must not turn into never
+    replacing one. When no registry file survived the collision pass there is
+    nothing under that id to protect, and `<id>.log` is a spawn's own output:
+    an unbounded concatenation of every previous run's log would make the
+    breadcrumb useless for the case it exists for.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    log = inst_dir / "fresh.log"
+    log.write_text("output from a run that is long gone\n" * 6, encoding="utf-8")
+    assert not (inst_dir / "fresh.json").exists()
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("ImportError: no module named binaryninja\n")
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("fresh", timeout=1.0, poll_interval=0.01)
+
+    text = log.read_text(encoding="utf-8")
+    assert "long gone" not in text          # truncated: nothing was at risk
+    assert text.startswith("ImportError: no module named binaryninja")
+    assert "already on disk" not in str(excinfo.value)
+
+
+def test_the_leftover_note_does_not_call_a_refused_record_corrupt(tmp_path, monkeypatch):
+    """The note fires for every kept record, so it must not guess WHY.
+
+    ``keep_log`` asks only whether a registry file survived discovery, and the
+    set that survives is wider than "uninterpretable": an unconfined socket
+    with a live owner that proves no identity parses perfectly, validates every
+    field, and is kept on purpose. Telling the operator that record is corrupt
+    is false, and telling them to remove it is worse -- in this state it is
+    hidden from `session list`, so they cannot check it through the CLI, and
+    removing a live bridge's record leaves `instance gc` free to unlink that
+    bridge's socket.
+    """
+    import bn.transport as transport
+
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = inst_dir / "refused.json"
+    record.write_text(
+        json.dumps(_registry_payload(bystander, pid=os.getpid(), instance_id="refused")),
+        encoding="utf-8",
+    )
+    assert json.loads(record.read_text(encoding="utf-8"))["pid"] == os.getpid()
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write("RuntimeError: Another bridge is already serving\n")
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._spawn_instance_unlocked("refused", timeout=1.0, poll_interval=0.01)
+
+    message = str(excinfo.value)
+    assert "could not interpret" not in message          # it parsed; it was refused
+    assert "may belong to a bridge that is still running" in message
+    assert "before removing it" in message
+    assert record.exists()
+
+
+def test_a_socketless_registry_is_kept_when_its_owner_proves_nothing(tmp_path, monkeypatch):
+    """The missing-socket arm destroys on evidence too, or not at all.
+
+    An absent socket is evidence about SERVICE -- `start()` binds before it
+    writes the registry -- and says nothing about whether the record is the
+    only handle on a live process. Purging it on ``"unrecorded"`` therefore
+    took that handle away from every pre-#694 bridge, and, because
+    ``identity_verdict`` needs ``/proc`` for both halves of its proof, from
+    every bridge on a platform that has none. Positive evidence still sweeps:
+    a dead owner, or a MISMATCH proving the pid was reused.
+    """
+    import bn.transport as transport
+    from bn.proc_identity import identity_verdict
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    unprovable = inst_dir / "noproof.json"
+    unprovable.write_text(
+        json.dumps(
+            _registry_payload(inst_dir / "noproof.sock", pid=os.getpid(),
+                              identity=_identity(omit_boot=True), instance_id="noproof")
+        ),
+        encoding="utf-8",
+    )
+    reused = inst_dir / "reused.json"
+    reused.write_text(
+        json.dumps(
+            _registry_payload(inst_dir / "reused.sock", pid=os.getpid(),
+                              identity=_identity(ticks_delta=5), instance_id="reused")
+        ),
+        encoding="utf-8",
+    )
+    assert identity_verdict(json.loads(unprovable.read_text()), os.getpid()) == "unrecorded"
+    assert identity_verdict(json.loads(reused.read_text()), os.getpid()) == "mismatch"
+
+    assert list_instances() == []                       # neither is ever advertised
+    assert list_instances(include_unreachable=True) == []   # and neither is proven
+    assert transport.find_lifecycle_instance("noproof") is None
+    assert unprovable.exists()      # no evidence: refused, not destroyed
+    assert not reused.exists()      # pid reuse proven: swept
+
+
+def test_a_filename_mismatch_does_not_delete_a_live_bridges_record(tmp_path, monkeypatch):
+    """The DISAGREEMENT can be an artifact of our reading, not of the record.
+
+    On a case-insensitive filesystem ``Foo.json`` and ``foo.json`` are one
+    file, so the caller's spelling alone made a live bridge's own record read
+    as foreign -- and this arm deleted it, after which `instance gc` reaped the
+    live socket. The record is still refused (a payload claiming another
+    identity is never adopted, and its socket is never unlinked), but deleting
+    it needs the same positive evidence as every other arm.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock = inst_dir / "live.sock"
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    record = inst_dir / "Live.json"          # the caller's spelling
+    record.write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="live")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        assert list_instances() == []        # still refused: identities disagree
+        assert record.exists()               # and no longer deleted
+        assert sock.exists()                 # its socket was never ours to unlink
+
+        # Positive evidence still sweeps the same record.
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+        assert list_instances() == []
+        assert not record.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_unconfined_socket_keeps_an_unprovable_live_owners_record(tmp_path, monkeypatch):
+    """Destruction needs positive evidence, and "unrecorded" is not evidence.
+
+    ``identity_verdict`` returns ``"unrecorded"`` for a bridge that recorded no
+    identity AND for every bridge on a platform with no ``/proc`` -- including
+    one that is serving right now. Deleting this record on that verdict would
+    make the whole proven-live protection unreachable exactly where it is
+    needed most, so the purge demands what the not-live-socket arm demands: a
+    dead owner, or a MISMATCH that proves the pid was reused. An owner that
+    proves nothing gets neither the purge nor the lifecycle handle -- the
+    payload is refused, and the file is left alone.
+    """
+    import bn.transport as transport
+
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = inst_dir / "noproof.json"
+    record.write_text(
+        json.dumps(_registry_payload(bystander, pid=os.getpid(), instance_id="noproof")),
+        encoding="utf-8",
+    )
+    from bn.proc_identity import identity_verdict
+
+    assert identity_verdict(json.loads(record.read_text()), os.getpid()) == "unrecorded"
+
+    assert list_instances() == []
+    assert list_instances(include_unreachable=True) == []      # no handle either
+    assert transport.find_lifecycle_instance("noproof") is None
+    assert record.exists()                   # refused, never destroyed
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_a_backlogged_live_socket_is_never_unlinked(tmp_path, monkeypatch):
+    """The weakest evidence in the file guarded the most destructive act.
+
+    This is the only arm that can unlink a socket something may still be BOUND
+    to, and the probe that reaches it fails on a bridge that is serving as soon
+    as its accept backlog is full -- which is exactly why the arm refuses to
+    purge on the probe alone. Both halves of the shared litter predicate are
+    inferences, though, and they can be wrong AT ONCE: a busy socket plus a pid
+    this process cannot address (another pid namespace, or a recycled number)
+    unlinked a live, listening socket and orphaned its bridge on an unlinked
+    inode. The record is still refused; the unlink now needs the probe to be
+    conclusive -- a refused connection, or a path already gone.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "busy.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    # Fill the accept backlog so a probe of this LISTENING socket fails.
+    held = []
+    for _ in range(8):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.2)
+        try:
+            client.connect(str(sock_path))
+            held.append(client)
+        except OSError:
+            client.close()
+            break
+    record = inst_dir / "busy.json"
+    record.write_text(
+        json.dumps(
+            _registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                              instance_id="busy")
+        ),
+        encoding="utf-8",
+    )
+    # The pid reads as gone -- the inference this arm cannot verify.
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    try:
+        from bn.transport import _socket_is_live
+
+        assert not _socket_is_live(sock_path, timeout=0.2)   # the probe DOES fail
+
+        assert list_instances() == []            # refused, as before
+        assert sock_path.exists()                # but the live socket survives
+        assert record.exists()
+
+        # Conclusive evidence still sweeps both: nothing bound to the path.
+        for client in held:
+            client.close()
+        listener.close()
+        sock_path.unlink()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(sock_path))
+        stale.listen(1)
+        stale.close()
+        assert list_instances() == []
+        assert not record.exists()
+        assert not sock_path.exists()
+    finally:
+        for client in held:
+            with contextlib.suppress(OSError):
+                client.close()
+        with contextlib.suppress(OSError):
+            listener.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_an_unconfined_socket_still_sweeps_a_dead_owners_record(tmp_path, monkeypatch):
+    """The other half: an unusable record whose owner is gone is litter.
+
+    Keeping a proven-live bridge's handle must not turn into keeping every
+    hostile payload forever, and the sweep must still stop at the cache: the
+    file the payload names is not ours to remove.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    record = _unconfined_record(inst_dir, "dead", bystander)
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not record.exists()               # dead owner: still swept
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, monkeypatch):
+    """``instance gc`` reverse-maps sockets to registries, so it needs the id.
+
+    Reading it with ``Path.stem``/``Path.suffix`` misses the same all-dot ids
+    the loader used to miss, and the two halves of that mistake point opposite
+    ways: leftovers that can never be reaped, and -- if the mapping were fixed
+    on only one side -- a LIVE instance's socket unlinked out from under it,
+    which is the failure ``bridge_socket_path`` refuses to risk. Both
+    directions are pinned here.
+    """
+    from bn.paths import bridge_socket_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    live_sock = bridge_socket_path("...")
+    server = _Server(str(live_sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("...").write_text(
+        json.dumps(
+            _registry_payload(live_sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="...")
+        ),
+        encoding="utf-8",
+    )
+    live_log = inst_dir / "....log"               # the live instance's OWN log
+    live_log.write_text("bridge output\n", encoding="utf-8")
+    orphan_sock = inst_dir / ".....sock"          # id '....', no registry
+    orphan_log = inst_dir / ".....log"
+    orphan_sock.write_text("", encoding="utf-8")
+    orphan_log.write_text("", encoding="utf-8")
+
+    try:
+        summary = gc_instances()
+        # `_Server.server_close()` unlinks the pathname, so the live socket has
+        # to be measured before the harness tears it down.
+        live_socket_survived = live_sock.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert summary["live_instances"] == 1
+    assert live_socket_survived                   # never reaped out from under
+    assert str(live_sock) not in summary["removed"]
+    assert bridge_registry_path("...").exists()
+    # The live instance's LOG is the half of the reverse map with no second
+    # guard behind it: the socket is additionally spared by the kernel-proof
+    # check in the sweep, so a wrong id derivation costs the log first and
+    # silently. Reverting `_registry_own_id` to `Path.stem` leaves every other
+    # assertion here green while this one goes red (#618).
+    assert live_log.exists()
+    assert live_log.read_text(encoding="utf-8") == "bridge output\n"
+    assert str(live_log) not in summary["removed"]
+    assert not orphan_sock.exists()
+    assert not orphan_log.exists()
+
+
+# ---------------------------------------------------------------------------
+# UNPINNED GUARD, DISCLOSED — the `expected_record=record_document` WIRING.
+#
+# Read this before editing the two tests below, and before touching
+# `_load_instance`'s FOUR `_purge_stale_registry(..., expected_record=...)`
+# callsites in src/bn/transport.py. It is a coverage gap, not coverage.
+#
+# What IS pinned: the SWEEP's own rule. `_purge_stale_registry` refuses to
+# unlink a record whose bytes are no longer the document it was handed
+# (`test_the_stale_sweep_removes_only_what_it_can_still_see_itself`), and the
+# inner boundary of the window is exercised below.
+#
+# What is NOT pinned: that the LOADER hands down the document it JUDGED.
+# Replacing `expected_record=record_document` with a callsite
+# `path.read_bytes()` -- a plausible refactor, since the comment at that read
+# says the record is re-read as late as possible -- leaves all three fenced
+# test files GREEN at every one of the four: the foreign-id arm, the
+# unconfined arm, the missing-socket arm and the dead-socket arm, each
+# measured individually as well as together. The test below survives that
+# mutation because it stages its respawn INSIDE a monkeypatched
+# `_purge_stale_registry`, i.e. after the mutated read has already happened,
+# so only the innermost boundary is held -- not the loader's whole decision
+# window, which opens at the `path.read_bytes()` on entry.
+#
+# What a regression looks like in BEHAVIOUR: a legitimate `bn session start`
+# replaces the registry under an id between the loader gathering its evidence
+# and the sweep acting on it; the sweep then compares fresh bytes against
+# themselves and deletes them. Measured with the mutation applied and the
+# respawn injected one step earlier (after the conclusive `_socket_probe`
+# answers, before the sweep is called -- still inside the window HEAD
+# closes): `respawned_registry_survived false` under the mutation vs `true`
+# at HEAD. The socket survives, so the symptom is a bridge that is up and
+# serving but has no registry: `bn session list` reports nothing while the
+# process answers requests.
+#
+# Why no pin ships: one was written for exactly that outer window and it did
+# not discriminate -- it stayed green with the mutation in place -- so it was
+# deleted rather than shipped with a docstring claiming a guard it does not
+# hold. Reaching the loader's real window means interposing between two
+# private calls without monkeypatching the function under test. Operator
+# ruling waives the gap on the condition that it is named here: an
+# overclaiming test is worse than an acknowledged gap. The wiring is correct
+# at HEAD and measured so; it can regress silently, and nothing in this
+# module will say so (#618).
+# ---------------------------------------------------------------------------
+
+
+def test_a_respawn_inside_the_decision_window_keeps_its_registry_and_socket(
+    tmp_path, monkeypatch
+):
+    """Destruction must remove the FILE that was judged, not the NAME it had.
+
+    Every arm decides before it destroys: the registry's bytes, a pid's
+    liveness, an errno from a ``connect()`` that may take the whole probe
+    timeout. ``unlink`` acts on a name, and discovery holds no spawn lock --
+    ``gc_instances`` takes one for this exact hazard, while a discovery-backed
+    command cannot without blocking the spawns that call it. So a legitimate
+    re-spawn under that id can bind a new socket and replace the registry
+    inside the window, and the sweep then destroys a LIVE bridge's only handle
+    and the endpoint it is serving on, on evidence about a file already gone.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "respawn.sock"
+    record = inst_dir / "respawn.json"
+    # The state discovery judges: a crashed bridge's leftover socket file
+    # (a plain file answers the probe conclusively) and a dead owner.
+    sock_path.write_text("", encoding="utf-8")
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="respawn")),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    real_purge = transport._purge_stale_registry
+    # What a new bridge writes: its own token, so the document differs from the
+    # one discovery judged.
+    fresh_payload = _registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                      instance_id="respawn")
+    fresh_payload["instance_token"] = "respawned-token"
+    fresh_document = json.dumps(fresh_payload).encode("utf-8")
+
+    def respawn_then_purge(*args, **kwargs):
+        # The window: every piece of the caller's evidence is already gathered,
+        # and a bridge now starts under this id -- binding its own socket over
+        # the leftover name and replacing the registry through `os.replace`,
+        # exactly as `bn session start` does while holding the spawn lock that
+        # discovery cannot take.
+        sock_path.unlink()
+        listener.bind(str(sock_path))
+        listener.listen(1)
+        staged = inst_dir / ".tmp-respawn.json"
+        staged.write_bytes(fresh_document)
+        os.replace(staged, record)
+        return real_purge(*args, **kwargs)
+
+    monkeypatch.setattr("bn.transport._purge_stale_registry", respawn_then_purge)
+
+    try:
+        assert list_instances() == []              # the record it read is refused
+        assert record.read_bytes() == fresh_document   # the NEW record survives
+        assert sock_path.exists()                  # and so does the live endpoint
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))         # still reachable by name
+        finally:
+            client.close()
+        # The new bridge is a usable handle on the next scan, not a survivor
+        # of a race that left it unlisted.
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: True)
+        monkeypatch.setattr("bn.transport._purge_stale_registry", real_purge)
+        assert [inst.instance_id for inst in list_instances()] == ["respawn"]
+    finally:
+        with contextlib.suppress(OSError):
+            listener.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_the_stale_sweep_removes_only_what_it_can_still_see_itself(tmp_path):
+    """The chokepoint's evidence is the document, and a probe taken HERE.
+
+    Both callers gather their evidence upstream of the unlink, so the sweep
+    re-establishes it: the record must still hold the document that was
+    judged, and the socket must answer a conclusive probe at this moment. A
+    name that now holds a different document, or has something listening on
+    it, is kept -- deleting it would be destruction on evidence about
+    something else.
+    """
+    import bn.transport as transport
+
+    registry = tmp_path / "judged.json"
+    sock = tmp_path / "judged.sock"
+    judged_document = b'{"pid": 1}'
+    registry.write_bytes(judged_document)
+    sock.write_text("", encoding="utf-8")
+
+    # A re-spawn in the window: the same names, a new record and a live socket.
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b'{"pid": 2}')
+    os.replace(replacement, registry)
+    sock.unlink()
+    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    live.bind(str(sock))
+    live.listen(1)
+    try:
+        transport._purge_stale_registry(registry, sock, expected_record=judged_document)
+        assert registry.exists()          # a different document: not ours to delete
+        assert sock.exists()              # something is listening: not litter
+
+        # No document to compare is not a licence to destroy either.
+        transport._purge_stale_registry(registry, sock)
+        assert registry.exists()
+        assert sock.exists()
+
+        # What the sweep can still see for itself is still swept.
+        live.close()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(tmp_path / "other.sock"))    # nothing bound to `sock` now
+        stale.close()
+        transport._purge_stale_registry(
+            registry, sock, expected_record=registry.read_bytes()
+        )
+        assert not registry.exists()
+        assert not sock.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            live.close()
+        sock.unlink(missing_ok=True)
+
+
+def test_the_leftover_note_never_enters_the_log_it_protects(tmp_path, monkeypatch):
+    """The note is ABOUT the log, so writing it there grows what it preserves.
+
+    This arm exists because truncating ``<id>.log`` would destroy the only
+    recorded output of a bridge that may still be running, so it appends
+    instead -- and the note explaining that has to reach the operator, not the
+    file. Sent to the log it was paid once per failed attempt, which is the
+    largest single contributor to the growth this arm is criticised for.
+    """
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "kept.json").write_text("{not json", encoding="utf-8")
+    log = inst_dir / "kept.log"
+    log.write_text("BN Agent Bridge listening on kept.sock\n", encoding="utf-8")
+    child_line = "ImportError: no module named binaryninja\n"
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            kwargs["stdout"].write(child_line)
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr(transport.subprocess, "Popen", _FakePopen)
+
+    sizes = [log.stat().st_size]
+    notes = []
+    for _ in range(3):
+        with pytest.raises(BridgeError) as excinfo:
+            transport._spawn_instance_unlocked("kept", timeout=1.0, poll_interval=0.01)
+        message = str(excinfo.value)
+        # The operator is still told, on every attempt.
+        notes.append(message[message.index(" A registry file for"):])
+        assert "before removing it" in notes[-1]
+        sizes.append(log.stat().st_size)
+
+    growth = [sizes[i + 1] - sizes[i] for i in range(3)]
+    text = log.read_text(encoding="utf-8")
+    assert "already on disk at" not in text     # never in the file it is about
+    assert text.count("[bn-cli]") == 3          # one diagnostic line per attempt
+    assert len(set(growth)) == 1                # a constant cost per attempt
+    assert growth[0] < len(notes[0])            # and it is not the note's cost
+
+
+def test_a_bound_but_not_yet_listening_socket_is_never_unlinked(tmp_path, monkeypatch):
+    """`ECONNREFUSED` covers a bridge coming up, not just a bridge long gone.
+
+    A socket that is bound but has not reached ``listen`` refuses connections
+    exactly like a crashed bridge's leftover file, and every bridge passes
+    through that state on its way up. So the errno alone cannot authorise
+    unlinking the SOCKET: taken as proof that nothing is bound, it destroys a
+    STARTING bridge's own endpoint and leaves it serving on an unlinked inode
+    -- the failure this arm exists to prevent. The kernel's own account of
+    which paths hold a socket is what makes that answer conclusive.
+
+    The record is a different object with a different question. A refused
+    connection does prove nothing is ACCEPTING here, and a record whose owner
+    is also gone can never serve again, so it goes -- the bridge coming up
+    writes its own. What must survive is the endpoint, because that is the
+    part nothing can recreate.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "starting.sock"
+    starting = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    starting.bind(str(sock_path))          # bound, and deliberately NOT listening
+    record = inst_dir / "starting.json"
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="starting")),
+        encoding="utf-8",
+    )
+    # The owner reads as gone, so the shared predicate says litter: the only
+    # thing standing between this socket and the unlink is the probe.
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    try:
+        from bn.transport import _socket_is_live
+
+        assert not _socket_is_live(sock_path, timeout=0.2)    # refuses, as a leftover does
+
+        assert list_instances() == []          # refused, exactly as before
+        assert sock_path.exists()              # and the ENDPOINT survives
+        assert not record.exists()             # the dead owner's record does not
+        starting.listen(1)                     # the bridge finishes coming up
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))     # and it is reachable by name
+        finally:
+            client.close()
+
+        # A leftover nothing is bound to loses its socket too: same errno, the
+        # other fact. The record is re-written because the arm above already
+        # reclaimed it.
+        starting.close()
+        sock_path.unlink()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(sock_path))
+        stale.close()
+        record.write_text(
+            json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                         instance_id="starting")),
+            encoding="utf-8",
+        )
+        assert list_instances() == []
+        assert not record.exists()
+        assert not sock_path.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            starting.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_gc_never_unlinks_an_orphan_socket_the_kernel_says_is_bound(tmp_path, monkeypatch):
+    """A registry-less socket is not evidence of a dead instance.
+
+    A bridge binds its socket BEFORE it writes the registry, and a bridge the
+    GUI plugin starts takes no spawn lock, so "no registry for this ``.sock``"
+    is also what an in-flight registration looks like from here. Unlinking it
+    leaves that bridge serving on an unlinked inode, unreachable by name. The
+    leftover file of an instance that really is gone has nothing bound to it,
+    and that is the difference the kernel can state.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    coming_up = inst_dir / "coming-up.sock"
+    bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound.bind(str(coming_up))
+    leftover = inst_dir / "crashed.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(leftover))
+    stale.close()                              # a socket FILE nothing is bound to
+    try:
+        summary = gc_instances()
+
+        assert coming_up.exists()              # the endpoint of a bridge coming up
+        assert not leftover.exists()           # the leftover of one long gone
+        assert summary["sockets_removed"] == 1
+    finally:
+        with contextlib.suppress(OSError):
+            bound.close()
+        coming_up.unlink(missing_ok=True)
+
+
+def test_gc_keeps_the_unreachable_handle_a_lifecycle_lookup_resolves(tmp_path, monkeypatch):
+    """The residual's visibility, and the handle gc must never take.
+
+    A record whose socket is gone but whose owner is PROVEN is the one thing
+    ``bn session stop`` must still be able to name -- that unreachable process
+    is exactly the one a user needs to kill (#694). From the outside it is
+    also indistinguishable from litter: nothing is bound to its socket and
+    nothing ever will be. So ``gc_instances`` retains it, and it stays
+    nameable afterwards, which is what makes this corner of the disclosed
+    retention recoverable rather than invisible.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    record = inst_dir / "orphaned.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "orphaned.sock", pid=os.getpid(),
+                                     identity=_identity(), instance_id="orphaned")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "orphaned.log"
+    log.write_text("bridge started\n", encoding="utf-8")
+
+    assert list_instances() == []                       # hidden from normal discovery
+    assert [i.instance_id for i in list_instances(include_unreachable=True)] == ["orphaned"]
+
+    summary = gc_instances()
+
+    assert record.exists()
+    assert log.exists()
+    assert summary["registries_purged"] == 0 and summary["logs_removed"] == 0
+    # And it is still nameable afterwards, which is the capability being kept.
+    from bn.transport import find_lifecycle_instance
+
+    assert find_lifecycle_instance("orphaned") is not None
+
+
+def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp_path, monkeypatch):
+    """One probe was answering two questions, and the record paid for it.
+
+    A refused connection proves nothing is ACCEPTING at that name -- a serving
+    bridge answers ``EAGAIN`` when its backlog fills, never ``ECONNREFUSED`` --
+    and a record whose owner is also gone can therefore never serve again.
+    Whether the SOCKET may be unlinked is a different question about a
+    different object, and it needs the kernel. Gating both on the stronger fact
+    meant that on a platform with no ``/proc/net/unix`` a crashed bridge's
+    record, socket and log were retained permanently and invisibly, where base
+    reclaimed all three (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "crashed.sock"
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    leftover.bind(str(sock_path))
+    leftover.close()                       # a SIGKILLed bridge's leftover socket file
+    record = inst_dir / "crashed.json"
+    record.write_text(
+        json.dumps(_registry_payload(sock_path, pid=os.getpid(), identity=_identity(),
+                                     instance_id="crashed")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "crashed.log"
+    log.write_text("bridge died\n", encoding="utf-8")
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    # No /proc/net/unix to read: the platform this PR has already shipped two
+    # defects to. The kernel cannot be asked, so the answer is UNKNOWABLE.
+    monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
+
+    assert list_instances() == []
+    assert not record.exists()             # the record goes on its own evidence
+    assert sock_path.exists()              # the socket keeps the benefit of the doubt
+
+    summary = gc_instances()               # explicit, lock-holding, operator-invoked
+
+    assert summary["logs_removed"] == 1
+    # The SOCKET stays, and that is the disclosed residual rather than an
+    # oversight: every unlink in this module needs positive proof, and where
+    # the kernel cannot be asked there is none. Reaping it here would unlink
+    # the endpoint of any bridge that has bound this name and not yet
+    # registered -- a live file, for a leftover inode.
+    assert summary["sockets_removed"] == 0
+    assert sock_path.exists()
+    assert [p.name for p in sorted(inst_dir.iterdir())] == [".spawn.lock", "crashed.sock"]
+
+
+def test_gc_retains_the_record_discovery_cannot_judge(tmp_path, monkeypatch):
+    """The disclosed residual, pinned as retention rather than as a deletion.
+
+    A record whose owner pid is alive but cannot be proven to BE this bridge
+    -- a pre-#694 bridge, any bridge on a platform with no ``/proc``, or a
+    recycled pid -- is refused by every discovery path and judged litter by
+    none. ``gc_instances`` is no exception to that rule: the evidence it would
+    need to delete such a record is exactly the evidence nobody here has, and
+    every version that manufactured some destroyed a live bridge's handle in
+    one narrowing or another. The record stays, and the ``.log`` its surviving
+    registry shields stays with it -- a measured, disclosed residual instead
+    of a deletion taken on an inference (#618).
+
+    Both shapes that reach this state are pinned: a ``socket_path`` outside
+    the cache, which this code never connects to and must never unlink, and a
+    confined socket that is simply gone.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    foreign = outside / "foreign.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(foreign))
+    stale.close()                          # a socket FILE nothing is bound to
+    expected = {".spawn.lock"}
+    for index in range(3):
+        sid = f"unconfined{index}"
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps(_registry_payload(foreign, pid=os.getpid(), instance_id=sid)),
+            encoding="utf-8",
+        )
+        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+        expected |= {f"{sid}.json", f"{sid}.log"}
+    # The other shape: confined, and the socket file is gone.
+    (inst_dir / "nosocket.json").write_text(
+        json.dumps(_registry_payload(inst_dir / "nosocket.sock", pid=os.getpid(),
+                                     instance_id="nosocket")),
+        encoding="utf-8",
+    )
+    (inst_dir / "nosocket.log").write_text("x\n", encoding="utf-8")
+    expected |= {"nosocket.json", "nosocket.log"}
+
+    # Unresolvable on every path: normal discovery and the lifecycle lookup
+    # both refuse a record whose owner proves nothing.
+    assert list_instances() == []
+    assert list_instances(include_unreachable=True) == []
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 0
+    assert summary["logs_removed"] == 0
+    assert summary["sockets_removed"] == 0
+    assert summary["removed"] == []
+    assert {p.name for p in inst_dir.iterdir()} == expected
+    assert foreign.exists()                # the foreign path is never unlinked
+
+
+def test_gc_names_every_path_it_removed_including_the_registries(tmp_path, monkeypatch):
+    """A destructive action has to be visible in its own report.
+
+    ``removed`` is documented as the list of removed paths and is the only
+    per-path account the operator gets, so a registry the liveness sweep took
+    during this very call has to be named there rather than merely counted in
+    ``registries_purged``.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()                            # a pid that is provably not alive
+    record = inst_dir / "gone.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "gone.sock", pid=gone.pid,
+                                     instance_id="gone")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "gone.log"
+    log.write_text("x\n", encoding="utf-8")
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 1
+    assert str(record) in summary["removed"]
+    assert str(log) in summary["removed"]
+    assert len(summary["removed"]) == summary["registries_purged"] + summary["logs_removed"] \
+        + summary["sockets_removed"]
+
+
+def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path, monkeypatch):
+    """A wrong ``False`` here unlinks a serving bridge's own endpoint.
+
+    ``/proc/net/unix`` is the sole corroboration behind every socket unlink in
+    this module, and it is a LINE-oriented text file holding raw path bytes. A
+    cache path containing a newline cannot appear in it at all, and one holding
+    a non-UTF-8 byte survived decoding only as U+FFFD, so the comparison failed
+    and the answer came back as the positive fact "nothing is bound" -- about a
+    socket that was bound AND listening. The answer for a path the listing
+    cannot represent is ``None``, and for a path it can represent only as bytes
+    the comparison is done on bytes (#618).
+    """
+    from bn.transport import _path_has_bound_socket
+
+    for label, raw in ((b"newline", b"root\nwith-newline"), (b"non-utf8", b"root-\xff-byte")):
+        root = tmp_path / os.fsdecode(raw)
+        root.mkdir()
+        monkeypatch.setenv("BN_CACHE_DIR", str(root))
+        inst_dir = instances_dir()
+        inst_dir.mkdir(parents=True, exist_ok=True)
+        sock_path = inst_dir / "serving.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)                   # bound AND listening: a serving bridge
+        try:
+            # Never the positive "nothing is bound" about a socket that is bound:
+            # a newline is unrepresentable (None), a raw byte is answered exactly.
+            answer = _path_has_bound_socket(sock_path)
+            assert answer is not False, label
+
+            summary = gc_instances()       # the registry-less sweep, with no record
+
+            assert summary["sockets_removed"] == 0, label
+            assert sock_path.exists(), label
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(0.5)
+            try:
+                client.connect(str(sock_path))     # still reachable by name
+            finally:
+                client.close()
+        finally:
+            with contextlib.suppress(OSError):
+                server.close()
+            sock_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# UNPINNED GUARD, DISCLOSED — `_process_state`'s `rfind(b")")` comm-skip.
+#
+# Read this before editing the test below or the parse in
+# `src/bn/transport.py::_process_state`. It is a coverage gap, not coverage.
+#
+# What IS pinned: that a non-UTF-8 `comm` does not raise (below). What is NOT
+# pinned: WHERE the parse starts looking for the state character.
+# `stat.rfind(b")")` -> `stat.find(b")")` leaves all three fenced test files
+# GREEN.
+#
+# What a regression looks like in BEHAVIOUR: `comm` is the raw basename of
+# the exec'd file and may itself contain `)`. Measured -- an executable named
+# `x) Z (y` run on this host gives `/proc/<pid>/stat` = `<pid> (x) Z (y) S
+# ...`; the HEAD parse answers `S`, the `find` parse answers `Z`. `Z` is in
+# `_load_instance`'s dead-owner set, so `owner_alive` goes false for a LIVE
+# process and every arm downstream treats that record as litter: a running
+# bridge loses its registry and its log, at the whim of what some unrelated
+# neighbour happens to be called.
+#
+# Why no pin ships: the attempted pin did not discriminate -- it stayed green
+# with `find` in place -- and was deleted rather than shipped overclaiming.
+# Operator ruling waives the gap on the condition that it is named here
+# (#618).
+# ---------------------------------------------------------------------------
+
+
+def test_a_neighbour_the_kernel_names_in_non_utf8_bytes_is_not_an_outage(tmp_path, monkeypatch):
+    """One unrelated process must not take every discovery-backed command down.
+
+    ``/proc/<pid>/stat`` embeds the process's ``comm`` verbatim, and ``comm``
+    is BYTES -- a neighbour whose executable basename holds a byte that is not
+    UTF-8 puts that byte in the file. ``_process_state`` read it with
+    ``read_text(encoding="utf-8")`` and caught only ``OSError``, so a
+    ``UnicodeDecodeError`` escaped and ``list_instances()`` AND
+    ``gc_instances()`` both died with a raw traceback because of a process
+    that has nothing to do with this cache. Its sibling reader,
+    ``proc_identity.process_start_ticks``, already catches ``ValueError``.
+
+    Same root cause as the socket blocker of the previous round: a failing or
+    lossy DECODE of bytes the kernel wrote. The state character lives AFTER
+    the comm field, so the parse is done on bytes and the comm is never
+    decoded at all; anything unparseable answers ``None`` -- unknowable, which
+    no arm treats as evidence (#618).
+    """
+    if not Path("/proc/self/stat").exists():
+        pytest.skip("Linux /proc only")
+    from bn.transport import _process_state
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    # comm is the basename of the file that was exec'd, copied in raw.
+    odd_name = tmp_path / os.fsdecode(b"py\xffx")
+    os.symlink(sys.executable, odd_name)
+    proc = subprocess.Popen([str(odd_name), "-c", "import time; time.sleep(30)"])
+    sock_path = inst_dir / "oddcomm.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # a live, serving neighbour
+    record = inst_dir / "oddcomm.json"
+    record.write_text(
+        json.dumps({"pid": proc.pid, "socket_path": str(sock_path),
+                    "instance_id": "oddcomm"}),
+        encoding="utf-8",
+    )
+    log = inst_dir / "oddcomm.log"
+    log.write_text("crash breadcrumb\n", encoding="utf-8")
+    try:
+        stat_path = Path(f"/proc/{proc.pid}/stat")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and b"\xff" not in stat_path.read_bytes():
+            time.sleep(0.05)
+        assert b"\xff" in stat_path.read_bytes(), "kernel did not keep the raw comm byte"
+
+        assert _process_state(proc.pid) in {"R", "S", "D", "t", "T"}   # answered, not raised
+
+        assert [inst.instance_id for inst in list_instances()] == ["oddcomm"]
+
+        summary = gc_instances()
+
+        assert summary["registries_purged"] == 0
+        assert summary["logs_removed"] == 0
+        assert summary["sockets_removed"] == 0
+        assert record.exists() and log.exists() and sock_path.exists()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+        proc.kill()
+        proc.wait()
+
+
+def test_a_bound_socket_whose_path_contains_a_space_is_still_found(tmp_path):
+    """The space-preserving split, pinned in BOTH directions.
+
+    ``/proc/net/unix`` is whitespace-separated and the bound path is its LAST
+    field, so it is split on the first seven runs. A plain ``split()`` would
+    truncate a cache path at its first space, no line would match, and the
+    answer would come back as the positive fact "nothing is bound" about a
+    socket that is bound and listening -- the sole corroboration behind every
+    socket unlink in this module (#618). Nothing pinned that, and a guard
+    proven only to EXIST says nothing about what it does when it fires.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache dir"          # a space, exactly where the listing puts it
+    root.mkdir()
+    sock_path = root / "serving.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is True
+        # The other direction: a space is not licence to match by prefix either.
+        assert _path_has_bound_socket(root / "never bound.sock") is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
+    """The basename+realpath fallback, pinned in BOTH directions.
+
+    The kernel lists the string ``bind`` was given. A record may spell the same
+    endpoint differently -- a symlinked ``instances/`` -- and a literal byte
+    comparison then fails on a socket that is bound and listening, which reads
+    as the positive "nothing is bound" and unlinks a serving bridge's own
+    endpoint. The fallback resolves both names; the basename filter is only a
+    cheap pre-filter, so a DIFFERENT socket that happens to share a basename
+    must still answer ``False``. A RELATIVE row is NOT covered here and is not
+    resolvable at all -- see the relative-bound-path test, which is the case
+    this fallback used to get wrong (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    real = tmp_path / "real"
+    real.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    sock_path = real / "serving.sock"      # the kernel records THIS spelling
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(link / "serving.sock") is True
+        assert _path_has_bound_socket(other / "serving.sock") is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_symlink_target_holding_a_newline_is_unknowable_not_unbound(tmp_path):
+    """The SECOND newline guard, which only a symlink target can reach.
+
+    The first guard rejects a newline in the name the caller asked about. A
+    name with no newline can still RESOLVE through one -- a symlinked cache
+    root whose target holds a newline -- and the resolved form is what the
+    fallback compares, so the line-oriented listing can never represent it.
+    Without this guard the answer is ``False``, the fabricated positive that
+    unlinks a bound and LISTENING socket. A source that cannot REPRESENT the
+    question must answer ``None`` (#618).
+
+    Both directions: a target WITHOUT a newline is resolved and answered
+    truthfully, so the guard is not blanket over-refusal.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    for label, target_name in (("newline", "target\nnewline"), ("plain", "target-plain")):
+        target = tmp_path / target_name
+        target.mkdir()
+        link = tmp_path / f"link-{label}"      # the LINK's own name is newline-free
+        os.symlink(target, link)
+        sock_path = target / "serving.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(1)                       # bound AND listening
+        try:
+            answer = _path_has_bound_socket(link / "serving.sock")
+            assert answer is (None if label == "newline" else True), label
+        finally:
+            with contextlib.suppress(OSError):
+                server.close()
+            sock_path.unlink(missing_ok=True)
+
+
+def test_unlink_if_unchanged_destroys_nothing_for_a_caller_with_no_document(tmp_path):
+    """"No document to compare" means no file was judged -- pinned both ways.
+
+    Every destructive decision in this module is taken on evidence read before
+    the unlink, and this is the re-check that makes the unlink act on the
+    document that was judged rather than on the NAME. A caller that judged no
+    document has nothing to re-check, so the answer is "keep": treating
+    ``None`` as "matches whatever is there" would make the re-check a no-op
+    and hand the name back to the unconditional unlink this exists to replace
+    (#618). The live direction is pinned beside it so the guard cannot be
+    widened into blanket retention.
+    """
+    from bn.transport import _unlink_if_unchanged
+
+    path = tmp_path / "record.json"
+    document = b'{"pid": 4321}'
+    path.write_bytes(document)
+
+    assert _unlink_if_unchanged(path, None) is False
+    assert path.exists()
+    assert _unlink_if_unchanged(path, b'{"pid": 1}') is False    # a different document
+    assert path.exists()
+    assert _unlink_if_unchanged(path, document) is True          # the one that was judged
+    assert not path.exists()
+
+
+def test_a_relative_bound_path_is_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The listing cannot represent the BINDER's cwd, so it cannot be resolved.
+
+    ``/proc/net/unix`` holds the string ``bind()`` was given, verbatim. A
+    relative cache root is a supported configuration -- the documented answer
+    to the AF_UNIX path-length limit -- and the bridge then binds a RELATIVE
+    string, which the kernel records as-is. ``os.path.realpath`` on that row
+    resolves it against the READER's cwd, which is not the binder's and is
+    nowhere in the file, so no row matched and the loop fell through to the
+    positive claim "nothing is bound" about a socket that was bound AND
+    listening: ``gc`` then unlinked a serving bridge's own endpoint and left
+    it serving on an inode reachable by nobody.
+
+    Same shape as the newline and the U+FFFD: a comparison through a
+    transformation that LOSES information, answering ``False`` where the
+    source cannot represent the question. It answers ``None`` instead.
+
+    The other direction is pinned beside it, because "unknowable" that is too
+    broad is its own defect: an unrelated relative row must not make every
+    other path unknowable, so one with a different basename is skipped and
+    that path still answers ``False`` (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache"
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    # The bridge binds the relative string a relative cache root produces.
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time, sys\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('instances/rel.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(root), stdout=subprocess.PIPE, text=True,
+    )
+    sock_path = inst_dir / "rel.sock"
+    try:
+        assert binder.stdout.readline().strip() == "bound"
+        monkeypatch.chdir(tmp_path)        # a CLI run from anywhere but the binder's cwd
+        monkeypatch.setenv("BN_CACHE_DIR", str(root))
+
+        assert _path_has_bound_socket(sock_path) is None
+        # Narrow: the unresolvable row speaks only for its own basename.
+        assert _path_has_bound_socket(inst_dir / "unrelated.sock") is False
+
+        summary = gc_instances()           # the registry-less orphan sweep
+
+        assert summary["sockets_removed"] == 0
+        assert sock_path.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))         # still reachable by name
+        finally:
+            client.close()
+    finally:
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The listing holds the name ``bind`` was given, not the name it has now.
+
+    Rename the directory of a socket that is still bound and LISTENING -- an
+    ordinary operator action, no attacker and no unsupported configuration --
+    and the kernel goes on listing the path the bridge bound. ``realpath`` then
+    compares against a name that no longer resolves to anything, the row is
+    passed over, and the loop falls through to the positive "nothing is bound"
+    about a socket that is serving: ``gc`` reclaims the now registry-less file
+    and leaves the bridge on an unlinked inode reachable by nobody.
+
+    The fourth shape this listing cannot represent, after the newline, the
+    non-UTF-8 byte and the relative row -- and the same rule answers all four:
+    a name that cannot be compared is not evidence that nothing is bound, so
+    the answer is ``None``.
+
+    Narrow, in the other direction: only a row whose basename could be this
+    path is unanswerable. A different basename is still ``False``, so one
+    unlinked-but-bound socket elsewhere on the host cannot stop the sweep
+    reaping anything (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    root = tmp_path / "cache"
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    sock_path = inst_dir / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # bound AND listening, and stays that way
+    moved = tmp_path / "cache-moved"
+    try:
+        os.rename(root, moved)             # the operator moves the cache
+        moved_sock = moved / "instances" / "live.sock"
+        monkeypatch.setenv("BN_CACHE_DIR", str(moved))
+
+        assert _path_has_bound_socket(moved_sock) is None
+        # Only same-basename rows are unanswerable.
+        assert _path_has_bound_socket(moved / "instances" / "other.sock") is False
+
+        summary = gc_instances()           # the registry-less orphan sweep
+
+        assert summary["sockets_removed"] == 0
+        assert moved_sock.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(moved_sock))        # still serving, still reachable
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        (moved / "instances" / "live.sock").unlink(missing_ok=True)
+
+
+def test_an_at_prefixed_row_is_unknowable_because_the_listing_conflates_two_things(tmp_path):
+    """The listing prints an abstract socket and a path the same way.
+
+    The kernel renders an abstract-namespace socket as ``@`` followed by its
+    name, and that name may contain slashes -- so such a row can present a real
+    cache socket's basename while naming no file at all. The tempting reading
+    is that ``@`` therefore means "no file, answer ``False``". It does not: a
+    PATHNAME socket's path is printed verbatim too, so a relative cache root
+    whose first component begins with ``@`` produces a byte-identical row for a
+    file that very much exists. Skipping every ``@`` row destroyed exactly that
+    bridge's endpoint -- measured, one round after the relative-row fix that
+    was supposed to close this shape.
+
+    The listing cannot tell the two apart, so this reader cannot either, and
+    the rule is the same as for the other four shapes: answer ``None``. The
+    cost is retention -- an abstract socket whose name ends in an orphan's
+    name keeps that orphan file from being reaped -- and that cost is real but
+    it is not destruction, it is bounded by basename, and the same retention is
+    reachable anyway by binding an absolute path and unlinking it (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    orphan = tmp_path / "orphan.sock"
+    orphan.touch()                         # a leftover file, nothing bound to it
+    pinner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pinner.bind("\0" + str(orphan))        # abstract, and ends in the same name
+    pinner.listen(1)
+
+    root = tmp_path / "@cache"             # a relative root starting with `@`
+    inst_dir = root / "instances"
+    inst_dir.mkdir(parents=True)
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('@cache/instances/live.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(tmp_path), stdout=subprocess.PIPE, text=True,
+    )
+    live = inst_dir / "live.sock"
+    try:
+        assert binder.stdout.readline().strip() == "bound"
+        # Indistinguishable rows, so neither may produce the destructive False.
+        assert _path_has_bound_socket(live) is not False
+        assert _path_has_bound_socket(orphan) is None
+    finally:
+        with contextlib.suppress(OSError):
+            pinner.close()
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        live.unlink(missing_ok=True)
+
+
+def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, monkeypatch):
+    """The same conflation, one screen away, in the loader's own arm.
+
+    ``_load_instance`` routes on "registry with no socket", which it read with
+    ``Path.exists()`` -- so an unreadable directory sent a record down the arm
+    reserved for a bridge that died hard, and with its owner gone that arm
+    purges without probing the socket at all. The probe the record would
+    otherwise have faced is INCONCLUSIVE for that errno (``connect`` gives
+    ``EACCES``, which establishes neither fact), so the file survived a real
+    probe and was destroyed by an unreadable one. Absence has to be
+    ESTABLISHED before it can route a destruction (#618).
+
+    Both directions: a socket path that is genuinely gone still routes to that
+    arm and a dead owner's record is still swept, which is the behaviour
+    `#694` put there.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    from bn.transport import _process_alive
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    assert not _process_alive(gone.pid)          # an owner that is provably gone
+
+    unreadable = inst_dir / "unreadable"
+    unreadable.mkdir()
+    blocked = unreadable / "blocked.sock"
+    blocked.touch()
+    # An ancestor that is a regular file: ENOTDIR, and no file can live there.
+    wall = inst_dir / "wall"
+    wall.write_text("not a directory\n", encoding="utf-8")
+    for sid, sock_path in (("blocked", blocked),
+                           ("absent", inst_dir / "absent.sock"),
+                           ("notdir", wall / "notdir.sock")):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": gone.pid, "socket_path": str(sock_path),
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+    unreadable.chmod(0o000)
+    try:
+        assert list_instances(include_unreachable=True) == []
+
+        # Unreadable is not absent: the record stays.
+        assert (inst_dir / "blocked.json").exists()
+        # Genuinely absent, owner gone: swept exactly as before.
+        assert not (inst_dir / "absent.json").exists()
+        # ENOTDIR is as conclusive as ENOENT: no file can carry that name.
+        assert not (inst_dir / "notdir.json").exists()
+    finally:
+        unreadable.chmod(0o700)
+
+
+def test_an_unprobeable_record_is_hidden_rather_than_offered_as_a_bridge(tmp_path, monkeypatch):
+    """Routing and destroying need different readings of the same absence.
+
+    Narrowing what counts as "no socket" was right for the PURGE and wrong for
+    the ROUTE: a record whose socket cannot even be stat'ed stopped being
+    hidden and became a fully reachable instance, so a host with one healthy
+    bridge suddenly had two and ``choose_instance`` failed with ambiguity --
+    every discovery-backed command down, on a record nothing can reach. A
+    socket this process cannot stat is one it certainly cannot serve through,
+    which is what base did with it; the narrow reading belongs only on the arm
+    that DELETES (#618).
+
+    Both directions in one measurement: the healthy bridge beside it is still
+    listed and still selected, and the unprobeable record is still on disk.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this test relies on")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    good_sock = inst_dir / "good.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(good_sock))
+    server.listen(1)
+    unreadable = inst_dir / "unreadable"
+    unreadable.mkdir()
+    for sid, sock_path in (("good", good_sock), ("blocked", unreadable / "blocked.sock")):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": owner.pid, "socket_path": str(sock_path),
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+    unreadable.chmod(0o000)
+    try:
+        assert [inst.instance_id for inst in list_instances()] == ["good"]
+        assert choose_instance(auto_start=False).instance_id == "good"
+        assert (inst_dir / "blocked.json").exists()      # hidden, never destroyed
+    finally:
+        unreadable.chmod(0o700)
+        with contextlib.suppress(OSError):
+            server.close()
+        good_sock.unlink(missing_ok=True)
+        owner.kill()
+        owner.wait()
+
+
+def test_a_relative_row_is_unknowable_even_where_the_readers_cwd_resolves_it(tmp_path, monkeypatch):
+    """The cwd-relative refusal, pinned on the input that isolates it.
+
+    A relative row is normally rescued by the later "this name no longer
+    resolves" arm, which is why deleting the relative refusal alone left the
+    whole suite green. The input that separates them is a reader whose OWN cwd
+    makes the row resolve -- to a different file with the same basename -- and
+    there the fallback returns the destructive ``False`` about a socket that is
+    bound and listening somewhere else entirely. The listing cannot carry the
+    binder's cwd, so the row is unanswerable however well it resolves here
+    (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    binder_root = tmp_path / "binder"
+    (binder_root / "instances").mkdir(parents=True)
+    reader_root = tmp_path / "reader"
+    (reader_root / "instances").mkdir(parents=True)
+    decoy = reader_root / "instances" / "rel.sock"
+    decoy.touch()                          # the reader's cwd DOES resolve the row
+    binder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+         "s.bind('instances/rel.sock')\n"
+         "s.listen(1)\n"
+         "print('bound', flush=True)\n"
+         "time.sleep(30)\n"],
+        cwd=str(binder_root), stdout=subprocess.PIPE, text=True,
+    )
+    live = binder_root / "instances" / "rel.sock"
+    try:
+        assert binder.stdout.readline().strip() == "bound"
+        monkeypatch.chdir(reader_root)
+
+        assert _path_has_bound_socket(live) is None
+    finally:
+        binder.kill()
+        binder.wait()
+        binder.stdout.close()
+        live.unlink(missing_ok=True)
+
+
+def test_a_bound_socket_whose_basename_holds_a_raw_byte_is_found(tmp_path):
+    """The bytes comparison, pinned where only bytes can answer.
+
+    Decoding the listing with ``errors="replace"`` was the round-18 blocker,
+    and until this test the guard against it was pinned only where the odd byte
+    sat in the cache ROOT -- there the mangled row stops resolving and the
+    "name no longer exists" arm answers ``None`` anyway, so restoring the lossy
+    decode left the suite green. With the byte in the BASENAME the mangled row
+    still resolves to an existing directory and the basename filter simply
+    fails, which falls through to the destructive ``False`` about a socket that
+    is bound AND listening (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    sock_path = tmp_path / os.fsdecode(b"od\xffd.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is True
+        assert _path_has_bound_socket(tmp_path / os.fsdecode(b"ot\xffr.sock")) is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_socket_path_the_syscall_layer_cannot_express_does_not_crash_gc(tmp_path, monkeypatch):
+    """An unnameable path is a refusal, never a traceback.
+
+    A registry may carry a ``socket_path`` no syscall can take -- an embedded
+    NUL survives JSON, a Path and every comparison in this module, and only
+    ``stat`` rejects it, with ``ValueError`` rather than ``OSError``. Uncaught,
+    that took ``gc_instances()`` down for every other instance on the host,
+    which is the availability class this PR exists to close. Such a name
+    resolves to nothing, and it is conclusively absent rather than merely
+    unanswered. What each record's OWNER is doing then decides its fate, by
+    the two routes this module keeps apart: a DEAD owner's record is litter
+    and the next discovery sweeps it, while a LIVE owner's record is refused
+    by every caller and destroyed by nobody -- the disclosed retention, whose
+    log gc leaves alone with it. Both routes are asserted here, because an
+    earlier version of this docstring claimed an outcome neither pinned (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    for sid, pid in (("alive", owner.pid), ("gone", gone.pid)):
+        (inst_dir / f"{sid}.json").write_text(
+            json.dumps({"pid": pid, "socket_path": f"{inst_dir}/n\x00ul.sock",
+                        "instance_id": sid}),
+            encoding="utf-8",
+        )
+        (inst_dir / f"{sid}.log").write_text("x\n", encoding="utf-8")
+    try:
+        assert list_instances(include_unreachable=True) == []   # must not raise
+
+        # The dead owner's record is litter: that discovery already swept it.
+        assert not (inst_dir / "gone.json").exists()
+        # The live owner's is kept by discovery, and gc keeps it too.
+        assert (inst_dir / "alive.json").exists()
+
+        summary = gc_instances()                                # must not raise
+
+        assert summary["live_instances"] == 0
+        assert summary["registries_purged"] == 0
+        # ``gone.log`` outlived its registry and goes; the retained record's
+        # log is shielded by the registry gc refuses to delete.
+        assert summary["logs_removed"] == 1
+        assert sorted(p.name for p in inst_dir.iterdir()
+                      if p.name != ".spawn.lock") == ["alive.json", "alive.log"]
+    finally:
+        owner.kill()
+        owner.wait()
+
+
+def test_a_socket_bound_under_a_newline_name_is_unknowable_not_unbound(tmp_path):
+    """The FIRST newline refusal, pinned on the only input that isolates it.
+
+    Two guards refuse a newline: one on the name as asked, one on what it
+    resolves to. Where both hold the newline either one covers the case, which
+    is why deleting the first alone left the suite green. Separate them with a
+    SYMLINK whose own name carries the newline and whose target does not: the
+    bridge binds through the link, so the kernel's row holds the newline and is
+    torn across two lines -- neither of which parses as a row -- while the
+    resolved name is newline-free and the second guard never fires. The reader
+    then sees no match and would answer the destructive ``False`` about a
+    socket that is bound AND listening (#618).
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    link = tmp_path / "link\nnewline"      # the NAME holds it; the target does not
+    os.symlink(plain, link)
+    sock_path = link / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))            # the kernel records the newline spelling
+    server.listen(1)
+    try:
+        assert _path_has_bound_socket(sock_path) is None
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        (plain / "live.sock").unlink(missing_ok=True)
+
+
+def test_an_unreadable_kernel_listing_is_unknowable_not_unbound(tmp_path, monkeypatch):
+    """The source being ABSENT is the off-Linux case, and it was unpinned.
+
+    Every socket unlink in this module rests on this reader's ``False``, and
+    the one input that makes the source unavailable -- the listing cannot be
+    read at all, which is every platform without ``/proc`` -- had no test that
+    exercised the real arm: the two "no /proc" tests monkeypatch
+    ``_path_has_bound_socket`` itself, so they ASSUME the answer under test.
+    Mutating that arm to ``False`` left the whole file green while ``gc``
+    unlinked a bound-and-listening socket. The failure of a SOURCE is not
+    evidence about the question it was asked (#618).
+
+    The other direction is pinned beside it: with the listing readable again,
+    the same sweep still reaps a genuine leftover, so "unknowable" has not
+    become blanket retention.
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import _path_has_bound_socket
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = inst_dir / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)                       # bound AND listening, no registry
+    leftover = inst_dir / "leftover.sock"
+    leftover.touch()                       # a real orphan, nothing bound to it
+    real_read_bytes = Path.read_bytes
+    source_unreadable = [True]
+
+    def maybe_unreadable(self, *args, **kwargs):
+        if source_unreadable[0] and str(self) == "/proc/net/unix":
+            raise OSError(errno.ENOENT, "no such file")
+        return real_read_bytes(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(Path, "read_bytes", maybe_unreadable)
+
+        assert _path_has_bound_socket(sock_path) is None
+        assert gc_instances()["sockets_removed"] == 0
+        assert sock_path.exists() and leftover.exists()
+
+        source_unreadable[0] = False       # the source is readable again
+
+        summary = gc_instances()
+
+        assert summary["sockets_removed"] == 1          # the orphan, and only it
+        assert not leftover.exists()
+        assert sock_path.exists()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        try:
+            client.connect(str(sock_path))
+        finally:
+            client.close()
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_a_name_no_file_can_carry_is_conclusively_absent(tmp_path):
+    """``_path_is_absent``'s conclusive set, asserted rather than described.
+
+    The docstring names four conclusive failures and one that is not. Only
+    ``ENOENT`` and ``ENOTDIR`` were pinned, so the ``ENAMETOOLONG`` arm this
+    round's text newly asserts could be flipped with the file green. A wrong
+    answer here only retains a record, which is the safe direction -- but an
+    unasserted claim in a docstring about destruction evidence is exactly what
+    the last five rounds kept finding (#618).
+    """
+    from bn.transport import _path_is_absent
+
+    present = tmp_path / "present.sock"
+    present.touch()
+
+    assert _path_is_absent(present) is False
+    assert _path_is_absent(tmp_path / "missing.sock") is True
+    assert _path_is_absent(tmp_path / ("L" * 9000)) is True      # ENAMETOOLONG
+    assert _path_is_absent(Path(f"{tmp_path}/n\x00ul.sock")) is True
+    # A raw byte is NOT unnameable: it is how a real name survives a decode.
+    raw = tmp_path / os.fsdecode(b"ra\xffw.sock")
+    raw.touch()
+    assert _path_is_absent(raw) is False
+
+
+def test_a_live_owner_whose_state_cannot_be_read_is_not_litter(tmp_path, monkeypatch):
+    """An unreadable process STATE is not a dead owner -- pinned destructively.
+
+    ``owner_alive`` is ``_process_alive(pid) and process_state not in
+    {"Z","X","x"}``, and the second half is a BLACKLIST on purpose:
+    ``_process_state`` answers ``None`` wherever ``/proc`` is absent, which is
+    every record on a platform this PR names repeatedly. Two plausible wrong
+    forms -- requiring the state to be readable, or whitelisting the states
+    that count as running -- turn ``None`` into "the owner is gone", and the
+    shared predicate then makes every record on that host litter. Nothing
+    pinned that direction: both mutations left all three fenced test files
+    green while a live bridge lost its registry AND its log, with the socket
+    spared only by the unrelated kernel-proof gate in the sweep (#618).
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    # The platform with no /proc: the state is unknowable, not dead.
+    monkeypatch.setattr("bn.transport._process_state", lambda pid: None)
+    record = inst_dir / "socketless.json"
+    record.write_text(
+        json.dumps(_registry_payload(inst_dir / "socketless.sock", pid=os.getpid(),
+                                     instance_id="socketless")),
+        encoding="utf-8",
+    )
+    log = inst_dir / "socketless.log"
+    log.write_text("bridge output\n", encoding="utf-8")
+
+    assert list_instances() == []                 # hidden, as it is at base
+    assert record.exists() and log.exists()       # and not destroyed
+
+    summary = gc_instances()
+
+    assert summary["registries_purged"] == 0
+    assert summary["logs_removed"] == 0
+    assert record.exists()
+    assert log.read_text(encoding="utf-8") == "bridge output\n"

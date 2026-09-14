@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code,
-                   _non_negative_int, _out_path_is_process_local, _pick,
+from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
+                   _mutation_exit_code, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
@@ -366,6 +366,28 @@ def _go_rename(args: argparse.Namespace) -> int:
     )
 
 
+def _resolved_out_format(args: argparse.Namespace) -> str:
+    """``cli._resolve_output_format``'s decision without its stderr side effects.
+
+    The real resolver PRINTS the inference note (or the disagreement warning),
+    and ``_call`` invokes it again a few lines below, so calling it here would
+    emit the note twice. Its precedence -- an explicit ``--format`` wins,
+    otherwise a recognised ``--out`` suffix is inferred -- is mirrored instead,
+    and the two are pinned together over every ``--format`` x ``--out`` suffix
+    combination by
+    ``tests/test_cli_misc.py::test_bundle_delegation_format_tracks_the_cli_resolver``
+    so the copies cannot drift (#670).
+    """
+    out = getattr(args, "out", None)
+    fmt = getattr(args, "format", "text")
+    if out is None:
+        return fmt
+    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
+    if inferred is None or getattr(args, "_format_explicit", False):
+        return fmt
+    return inferred
+
+
 @command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
          args=[arg("identifier")])
 def _bundle_function(args: argparse.Namespace) -> int:
@@ -377,7 +399,25 @@ def _bundle_function(args: argparse.Namespace) -> int:
     # into its own fd <n> and the caller would read zero bytes behind an
     # ok/bytes/sha256 envelope. Write those in THIS process instead: with
     # `out_path=None` the bridge returns the bundle itself.
-    bridge_writes = bool(args.out) and not _out_path_is_process_local(args.out)
+    #
+    # #670: the bridge-side writer sees only the `--out` SUFFIX, so it cannot
+    # honor an explicit --format that disagrees with it -- it would write NDJSON
+    # for `--format json --out x.ndjson` while this CLI prints "writing json".
+    # Delegate only when the format resolved here is the one the bridge would
+    # actually emit for that path.
+    #
+    # `bridge_format` asks the question the BRIDGE asks (`_write_json_artifact`
+    # keys off the literal `.ndjson` suffix), not the one the CLI's suffix MAP
+    # answers. Reading it off the map instead would claim ndjson for any future
+    # ndjson-mapped suffix the bridge still writes as JSON, which is exactly the
+    # note/bytes contradiction #670 reported.
+    out_suffix = Path(str(args.out)).suffix.lower() if args.out else ""
+    bridge_format = "ndjson" if out_suffix == ".ndjson" else "json"
+    bridge_writes = (
+        bool(args.out)
+        and not _out_path_is_process_local(args.out)
+        and _resolved_out_format(args) == bridge_format
+    )
     return _call(
         args,
         "bundle_function",

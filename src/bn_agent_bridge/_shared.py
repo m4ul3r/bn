@@ -417,18 +417,78 @@ def _artifact_summary(value: Any) -> dict[str, Any]:
     return {"kind": type(value).__name__}
 
 
+def _json_default(value: Any) -> Any:
+    """Mirror of ``bn.output._json_default``, the CLI-side writer's fallback.
+
+    ``_shared`` may import stdlib + binaryninja only (see the module docstring),
+    so the CLI renderer cannot be reused here. Keeping the fallback identical is
+    what stops the same payload coming back as an artifact from one ``--out``
+    writer and as ``internal error: TypeError`` from the other (#670).
+    """
+    if isinstance(value, Path):
+        return str(value)
+    return repr(value)
+
+
 def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] | None:
     if not path_text:
         return None
 
     path = Path(path_text).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-    path.write_bytes(data)
+    # #670: the CLI infers --format from the --out suffix (cli.py's
+    # _OUT_FORMAT_BY_SUFFIX) and prints a note saying so, but a bridge-owned
+    # write never sees that format -- the suffix is the only signal available
+    # here. Anything but .ndjson keeps the existing pretty single-document JSON.
+    ndjson = path.suffix.lower() == ".ndjson"
+    if ndjson:
+        # Emit exactly what the CLI-side writer would (output.py's render_value):
+        # one record per element for a list; for a paged dict (a list under
+        # `items`/`functions`) one record per element plus a trailing `_meta`
+        # record carrying the rest of the mapping; a single record otherwise. The
+        # two --out writers must stay interchangeable, so the same dict that
+        # `--format ndjson` fans out on stdout cannot collapse to one line here.
+        records = [payload]
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict) and "_meta" not in payload:
+            # `_meta` is a SENTINEL this fan-out invents, so a payload that
+            # already carries that key cannot be represented: copying the
+            # non-page keys into the trailing record would silently overwrite
+            # the caller's own value. An artifact is the caller's data -- write
+            # it whole as one record rather than a stream that lost a field.
+            for page_key in ("items", "functions"):
+                page = payload.get(page_key)
+                if isinstance(page, list):
+                    meta = {
+                        k: v for k, v in payload.items()
+                        if k not in ("items", "functions")
+                    }
+                    meta["_meta"] = True
+                    records = [*page, meta]
+                    break
+        lines = [json.dumps(item, sort_keys=True, default=_json_default) for item in records]
+        text = "\n".join(lines) + ("\n" if lines else "")
+    else:
+        text = json.dumps(payload, indent=2, sort_keys=True, default=_json_default)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = text.encode("utf-8")
+        path.write_bytes(data)
+    except OSError as exc:
+        # #719: a destination the caller chose but cannot write is a user error,
+        # not a bridge defect. Match the CLI-side writer's message (output.py's
+        # OutputWriteError) so the two --out writers are indistinguishable, and
+        # raise it as user-facing so `_serialize_error` does not add the
+        # `internal error:` prefix. Non-OSError failures (a payload `default=`
+        # cannot rescue, such as a non-str mapping key) deliberately keep
+        # reporting as internal errors.
+        raise OperationFailure(
+            "output_write_failed", f"Failed to write --out file {path}: {exc}"
+        ) from exc
     return {
         "ok": True,
         "artifact_path": str(path),
-        "format": "json",
+        "format": "ndjson" if ndjson else "json",
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "summary": _artifact_summary(payload),
