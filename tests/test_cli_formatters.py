@@ -995,15 +995,14 @@ _GREEN_ON_BASE_BY_DESIGN = {
         "computed name either. It is the executable form of a docstring caveat "
         "two rounds left as prose; red the moment a `getattr(formatters, name)` "
         "with a non-literal name enters the package",
-    "test_no_shape_guard_hides_behind_a_module_level_alias":
-        "the module carried no alias-spelled shape test at base either, so it "
-        "holds at both commits -- it is not a claim about this PR's change but "
-        "the executable form of the ROUTED limitation's one live claim, which "
-        "was prose ('the population's size pins catch it') that turned out to "
-        "be false. Red the moment an `isinstance(x, <name>)` whose class is "
-        "not a builtin shape enters the module, wherever it sits, including in "
-        "a helper no runtime probe reaches; its own anti-vacuity half runs the "
-        "same walk over a synthetic module that DOES carry the spelling",
+    "test_the_string_shape_population_harvests_a_guard_named_through_an_alias":
+        "its subject is the CLASSIFIER in this file, run over a SYNTHETIC "
+        "module that carries an alias-spelled guard, so it holds at either "
+        "commit. It replaces the earlier `no_shape_guard_hides_behind_a_module"
+        "_level_alias`, which asserted the module does not CONTAIN the "
+        "spelling -- bookkeeping for a blindness that the classifier now "
+        "resolves. Red if the harvest goes back to requiring a literal `str`, "
+        "or if the classifier stops calling an alias-spelled drop a drop",
 }
 
 # The PR's base commit: what "green on base" is measured AGAINST. A parameter of
@@ -3788,6 +3787,230 @@ def test_every_count_the_go_rename_summary_decides_on_is_covered_by_measured():
         "add it to _GO_RENAME_NON_COUNT_READS and say why in the commit.")
 
 
+def _count_helper_sites():
+    """Every `(function, literal key)` the module reads through a COUNT helper.
+
+    Harvested from the module's own AST, like the other guards here, and keyed
+    on the enclosing function so the differential below can look the renderer up
+    in the discovered population. A dynamic key is not harvested: there is no
+    payload this file could build for it.
+    """
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    funcs = [node for node in ast.walk(tree)
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    def owner(node):
+        enclosing = [f for f in funcs if f.lineno <= node.lineno <= f.end_lineno]
+        return (min(enclosing, key=lambda f: f.end_lineno - f.lineno).name
+                if enclosing else None)
+
+    sites = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("_count_field", "_stated_count")):
+            continue
+        if len(node.args) != 2:
+            continue
+        key = node.args[1]
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            continue
+        name = owner(node)
+        if name is not None:
+            sites.add((name, key.value))
+    return sites
+
+
+def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
+    """THE differential for #619's count half, stated as a runtime DIFFERENCE
+    rather than as a spelling rule.
+
+    A count read through the choke point answers 0 for a counter it could not
+    use, and the `@_discloses` note lands on a LATER line -- so an unreadable
+    `go_verified_count` rendered "go rename: 0 renamed, 0 failed, 0 skipped",
+    byte-identically to a genuine all-noop run, on the line a caller acts on.
+    That is the #683 fabricated-zero harm with a footnote attached.
+
+    Three renders per (renderer, key), and the third is what makes the property
+    non-vacuous: the BODY (everything before the disclosure note the boundary
+    appends) is taken with the key at 0, at 7, and at a shape no count reads.
+
+      * body(0) == body(7) means this renderer does not STATE that count in the
+        context the population recorded -- nothing to impersonate, so the pair
+        is skipped, and the skipped set is asserted by name below so a renderer
+        that stops stating a count cannot silently leave the differential.
+      * otherwise the unreadable body must match NEITHER, because either match
+        is an unreadable counter wearing a real number's rendering. A trailing
+        note cannot satisfy this, which is the point: the note arrives after the
+        line a caller acts on.
+
+    Sibling count keys are set readable in the context, because a renderer's
+    whole-line refusal for one unreadable counter (`go rename: cannot say what
+    this run did`) otherwise hides every other counter's rendering behind it.
+    """
+    sites = _count_helper_sites()
+    assert len(sites) == 15, (
+        f"the module reads {len(sites)} (renderer, literal key) pairs through a "
+        "count helper, not 15. The number is the size of the covered set: a "
+        "read that vanishes is a read this differential stops running, so move "
+        "it only with the read you deliberately added or removed.")
+
+    keys_by_renderer = collections.defaultdict(set)
+    for name, key in sites:
+        keys_by_renderer[name].add(key)
+    merged = collections.defaultdict(dict)
+    for label, _render, key, _kind, ctx in _runtime_population():
+        merged[label.split("(")[0]].update(copy.deepcopy(ctx))
+    renderers = {}
+    for label, render in _probe_renderers():
+        renderers.setdefault(label.split("(")[0], render)
+
+    def body(out):
+        # Everything the renderer said BEFORE the boundary's disclosure note.
+        return out.split("\n! malformed")[0]
+
+    fabricated, not_stated, checked = [], [], 0
+    for name, key in sorted(sites):
+        render = renderers.get(name)
+        if render is None:
+            # Not a payload renderer: a fragment helper (`_paging_footer`,
+            # `_blast_radius_line`, `_operation_row_text`) whose count refusal
+            # is pinned by its own named test.
+            not_stated.append(f"{name}({key}) [not a payload renderer]")
+            continue
+        ctx = {**merged.get(name, {}), **{k: 3 for k in keys_by_renderer[name]}}
+        rendered = {}
+        for probe in (0, 7, "many"):
+            out = _render_or_exception(render, {**copy.deepcopy(ctx), key: probe})
+            rendered[probe] = None if isinstance(out, Exception) else body(out)
+        if any(out is None for out in rendered.values()):
+            not_stated.append(f"{name}({key}) [the renderer's own shape refusal]")
+            continue
+        if rendered[0] == rendered[7]:
+            not_stated.append(f"{name}({key}) [count not stated in this context]")
+            continue
+        checked += 1
+        impersonated = [str(probe) for probe in (0, 7)
+                        if rendered["many"] == rendered[probe]]
+        if impersonated:
+            fabricated.append(
+                f"{name}({key}) renders an unreadable counter exactly like "
+                f"{'/'.join(impersonated)}: {rendered['many']!r}")
+    assert checked, "no harvested pair states a count, so this proves nothing"
+    assert not fabricated, (
+        "these render an unreadable counter byte-identically to a real number, "
+        f"so the disclosure arrives after the decision: {fabricated}")
+    # The skipped set, by name: a pair leaves the differential only for a reason
+    # stated here, so a renderer that quietly stops stating a count fails.
+    assert sorted(not_stated) == [
+        "_blast_radius_line(referenced) [not a payload renderer]",
+        "_blast_radius_line(reflowed) [not a payload renderer]",
+        "_operation_row_text(count) [not a payload renderer]",
+        "_paging_footer(offset) [not a payload renderer]",
+        "_paging_footer(returned) [not a payload renderer]",
+        "_paging_footer(total) [not a payload renderer]",
+        "_render_function_evidence_text(offset) [count not stated in this context]",
+        "_render_go_rename_text(defined_count) [count not stated in this context]",
+    ], sorted(not_stated)
+
+
+def test_the_call_window_never_states_a_resume_offset_it_could_not_derive():
+    """The evidence card's own resume hint, which the differential above skips
+    because the `has_more` branch is not open in the recorded context.
+
+    Same harm as the paging footer's invented offset: `--offset 3` derived from
+    an unreadable page position sends an agent paging from a window the payload
+    never stated -- it re-reads what it has, or loops on the first page. The
+    refusal states the position as unreadable instead."""
+    from bn import formatters
+
+    def card(offset):
+        return formatters._render_function_evidence_text({
+            "function": {"name": "log_printf", "address": "0x401000"},
+            "calls": [{"address": "0x401010", "operation": "LLIL_CALL",
+                       "direct": True}],
+            "total_calls": 9, "matched_calls": 9, "offset": offset,
+            "has_more": True,
+        })
+
+    readable = card(4)
+    assert "rerun with --offset 5" in readable, readable
+
+    refused = card("bad")
+    assert "page position unreadable" in refused, refused
+    assert "--offset" not in refused.split("\n! malformed")[0], refused
+
+
+
+# The raw numeric spellings this module still carries, MEASURED rather than
+# described. Each is a count read that does not go through `_count_field` --
+# `<payload lookup> or 0`, `.get(<literal>, 0)`, `int(<payload lookup>)` -- so
+# an unreadable value there is a fabricated number with nothing disclosed. The
+# routed audit converted the surfaces that state an ACTIONABLE number (the go
+# rename headline, the evidence card's resume offset); the rest are descriptive
+# counts on rows and summaries, and they are inventoried here so a NEW raw count
+# read arrives red instead of joining a prose claim.
+#
+# `_render_mutation_summary_text`'s `value.get('changed_count', 0)` is
+# deliberately in the residue: it reads a value the ALREADY-guarded summary
+# transform put there (`None` for a refused counter, which is why `changed=None`
+# prints), so a blanket zero-assertion would be wrong where an inventory is
+# right.
+_RAW_COUNT_SPELLINGS = 49
+
+
+def test_the_raw_count_residue_is_exactly_this_big():
+    """The inventory, so the routed item above stops being a prose claim."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    def is_lookup(node):
+        if isinstance(node, ast.Subscript):
+            return True
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "pop"))
+
+    tree = ast.parse(inspect.getsource(formatters))
+    get_zero, or_zero, int_lookup = [], [], []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == 0):
+            get_zero.append(f"{ast.unparse(node)} at line {node.lineno}")
+        if (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                and len(node.values) == 2
+                and isinstance(node.values[1], ast.Constant)
+                and node.values[1].value == 0
+                and is_lookup(node.values[0])):
+            or_zero.append(f"{ast.unparse(node)} at line {node.lineno}")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "int" and node.args
+                and is_lookup(node.args[0])):
+            int_lookup.append(f"{ast.unparse(node)} at line {node.lineno}")
+    residue = get_zero + or_zero + int_lookup
+    assert len(residue) == _RAW_COUNT_SPELLINGS, (
+        f"the module carries {len(residue)} raw count spellings "
+        f"({len(get_zero)} `get(k, 0)`, {len(or_zero)} `or 0`, "
+        f"{len(int_lookup)} `int(lookup)`), not {_RAW_COUNT_SPELLINGS}. A NEW "
+        "one is a fabricated number with nothing disclosed -- route it through "
+        "`_count_field`/`_stated_count`; one you deliberately REMOVED moves "
+        f"this constant in the same commit. Current: {sorted(residue)}")
+    # `int(<payload lookup>)` is the spelling that RAISES rather than
+    # fabricating, and the module carries none: an arriving one costs a whole
+    # render, which is the harm `_count_field` exists to end.
+    assert not int_lookup, (
+        f"a payload lookup reaches bare `int()`, which raises: {int_lookup}")
+
+
 # The declared choke-point reads neither differential reaches, each with a
 # payload that DOES reach it. These are helpers behind a branch gated on a value
 # no probe filler supplies at the position that needs it: a specific op name
@@ -5774,10 +5997,13 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
 # source and an exhaustive answer for arbitrary payload shapes is not attainable
 # statically. Three things it does not do, named rather than implied:
 #
-#   * it sees a shape test spelled `isinstance(x, str)` with a literal class. A
-#     test spelled `type(x) is str`, through a class held in a variable, or as a
-#     duck-typed `try: x.strip()` is outside it. The first two are asserted
-#     absent from the module below; the third is not detectable;
+#   * it sees a shape test spelled `isinstance(x, str)`, including one whose
+#     class is a module-level ALIAS of `str` (`_TEXT_TYPES = (str,)`, and an
+#     alias of an alias), which the classifier resolves the way
+#     `_coercion_sites` resolves a module-level `_EMPTY = []`. A test spelled
+#     `type(x) is str` or as a duck-typed `try: x.strip()` is outside it: the
+#     first is asserted absent from the module below, the second is not
+#     detectable;
 #   * the drop region is an APPROXIMATION of control flow, not a CFG: a render
 #     that follows the conditional counts as reachable from the refusing path
 #     even when some unrelated earlier branch would have returned first. That
@@ -5869,6 +6095,35 @@ def _classify_string_shape_guards(source):
 
     shows = {"repr", "str", "json.dumps", "_render_fallback_text"}
     tree = ast.parse(source)
+    # A class held in a MODULE-LEVEL name is the same guard spelled once
+    # removed (`_TEXT_TYPES = (str,)`, then `isinstance(x, _TEXT_TYPES)`), and
+    # requiring the literal `str` put it outside the population AND outside the
+    # anti-drift assertion -- it would drop a text field with nothing in this
+    # file able to see it. Resolved the way `_coercion_sites` resolves a
+    # module-level `_EMPTY = []`: collect the names bound at module scope to
+    # `str`, or to a tuple/list containing it, and treat them as naming `str`.
+    str_aliases: set[str] = set()
+    for _ in range(4):                       # an alias of an alias
+        before = set(str_aliases)
+        for stmt in tree.body:
+            targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                       else [stmt.target] if isinstance(stmt, ast.AnnAssign)
+                       else [])
+            if not (targets and getattr(stmt, "value", None) is not None):
+                continue
+            bound = (list(stmt.value.elts)
+                     if isinstance(stmt.value, (ast.Tuple, ast.List))
+                     else [stmt.value])
+            if not any(isinstance(c, ast.Name)
+                       and (c.id == "str" or c.id in str_aliases) for c in bound):
+                continue
+            str_aliases |= {t.id for t in targets if isinstance(t, ast.Name)}
+        if before == str_aliases:
+            break
+
+    def _names_str(cls, aliases):
+        return isinstance(cls, ast.Name) and (cls.id == "str" or cls.id in aliases)
+
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     calls: dict[str, list] = {}
@@ -6042,7 +6297,7 @@ def _classify_string_shape_guards(source):
         classes = node.args[1]
         elements = (list(classes.elts)
                     if isinstance(classes, (ast.Tuple, ast.List)) else [classes])
-        if not any(isinstance(c, ast.Name) and c.id == "str" for c in elements):
+        if not any(_names_str(c, str_aliases) for c in elements):
             continue
         guards.append((node.lineno, node.col_offset, node))
     found: dict[tuple[str, str, int], str] = {}
@@ -6972,82 +7227,65 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 
 # --- ROUTED OUT OF #619/#685, NAMED RATHER THAN LEFT IMPLIED ------------------
 #
-# Four findings on this module survive this PR by RULING, not by oversight.
-# The first THREE are pre-existing at base, an exhaustive module-wide
-# count-and-shape answer is a separate audit -- routed to a follow-up PR rather
-# than half-done here, because the honest version of it changes every count
-# surface in the file at once and would land unreviewed on the back of this
-# one. Item 1's own named instance IS on the go-rename path, and is routed
-# anyway: fixing it means the same one-contract sweep over every count surface
-# in the file that the rest of its family needs -- which is the audit routed
-# above -- so it lands there or nowhere. (Earlier wording here called it "a
-# renderer this PR does not otherwise change". That was false: this PR rewrites
-# every count read in `_render_go_rename_text`. The routing never rested on it.)
-# The FOURTH is this PR's own new mechanism and is routed
-# for a different reason again, stated in its entry:
+# TWO findings on this module survive by RULING, not by oversight. Both are
+# pre-existing at base, and both are what the follow-up audit deliberately left
+# after landing the exhaustive count-and-shape answer #619/#685 routed to it.
 #
-#   1. COUNT SURFACES still state a number read out of a counter they could
-#      not read, disclosing beside it rather than refusing it.
-#      `_render_go_rename_text` is the named instance -- the op's `--verbose`
-#      DETAIL view, not its default, which has been the compact status since
-#      #645. An unreadable `go_verified_count` renders its first line ("go
-#      rename: 0 renamed, 0 failed, 0 skipped") byte-identically to a genuine
-#      all-noop run, with the note on a following line -- and the same renderer
-#      never reads `go_failed_count`, `go_committed_count` or
-#      `skipped_changed_during_apply` at all (it counts `results[]` rows and
-#      takes `verified` from `go_verified_count`, so it reads three of the six
-#      counters `_go_rename_summary` reads), so a skew on any of those three
-#      renders byte-identically to a healthy run with NOTHING disclosed, while
-#      `_go_rename_summary` reads all six and refuses. Making that view read
-#      what the compact status reads is the same one-contract change as the
-#      rest of this item. `_render_class_list_text` is the
-#      named family: seven count reads there bypass `_count_field` entirely --
-#      five spelled `value.get(k) or 0` and two spelled `get(k, 0)` -- and
-#      `_render_data_symbols_text` plus the call-window header still build a
-#      resume hint as `_count_field(value, "offset") + len(rows)`, which is
-#      Fix A's harm class at renderers Fix A does not touch. The CLASS is
-#      "every surface in this module that prints a numeral", and the fix is one
-#      contract applied to all of them plus a population test that discovers
-#      them, not seven more hand-written refusals. What IS fixed here is every
-#      count surface the two issues name: the go-rename summary's decision keys
-#      (`test_an_unreadable_go_rename_counter_can_never_read_as_a_finished_run`),
-#      the op row, the type row, the blast-radius line and -- below -- the
-#      paging footer's counts and resume offset.
-#   2. THE STRING-SHAPE GUARD POPULATION is blind to a shape test spelled
-#      through a class held in a VARIABLE (`_TEXT_TYPES = (str,)` at module
-#      level, then `isinstance(x, _TEXT_TYPES)`). The STATED LIMITATION above
-#      `_STRING_SHAPE_GUARDS` says that spelling is "asserted absent from the
-#      module below". That sentence is TRUE of the module and FALSE of the
-#      classifier, which is the distinction worth keeping straight: the
-#      spelling really is absent, and the assertion that keeps it absent is
-#      the AST walk in `test_no_shape_guard_hides_behind_a_module_level_alias`
-#      below -- not the guard population, whose harvest skips a non-`str` Name
-#      and whose anti-drift assertion only flags a class argument that is
-#      neither a Name, a Tuple nor a List. So the population is blind to the
-#      spelling while the module is clean of it; teaching the classifier to
-#      resolve module-level aliases is the routed audit's job, and until then
-#      the absence is asserted rather than asserted-about, because a claim
-#      nobody re-runs is exactly what this file keeps correcting. The earlier
-#      parenthetical here credited the population's size pins with catching
-#      one; they do not -- an alias guard inside a function no probe reaches
-#      moves no size at all.
-#   3. FLAG AND ARITHMETIC SURFACES have the shape contract only where this
-#      PR's harm reached them. `_flag_field` exists because `has_more` decides
+# What that follow-up landed, so the routing above is a record and not an open
+# claim:
+#
+#   * THE STATED-COUNT CONTRACT. `_stated_count` is `_count_field` for a line
+#     that PRINTS the number: the count when it read, `?` when the key arrived
+#     in a shape no count reads out of. Applied to every surface that states an
+#     ACTIONABLE number -- `_render_go_rename_text`'s three interpolated
+#     counters, `_render_instance_gc_text`'s three, and the two resume hints
+#     (`_render_data_symbols_text` and the evidence card's call window) that
+#     were building `--offset N` out of an unreadable page position.
+#   * ITS DIFFERENTIAL, which is the part that cannot go stale:
+#     `test_no_renderer_states_a_count_it_could_not_read_as_a_real_number`
+#     harvests every `(renderer, literal key)` the module reads through a count
+#     helper, asserts that population's EXACT size, and requires the rendered
+#     BODY of an unreadable counter to match neither a real 0 nor a real 7.
+#     A trailing disclosure note cannot satisfy it, and every pair that leaves
+#     the differential is named with the reason it left.
+#   * THE RESIDUE INVENTORY. `test_the_raw_count_residue_is_exactly_this_big`
+#     counts the raw numeric spellings that remain -- `<lookup> or 0`,
+#     `.get(<literal>, 0)`, `int(<lookup>)` -- so a NEW raw count read arrives
+#     red instead of joining a prose claim. `_render_class_list_text` (seven)
+#     and `_render_data_symbols_text` are its largest members; these are
+#     DESCRIPTIVE row/summary counts, not numbers a caller acts on, which is
+#     why the contract above reaches the actionable ones and the inventory
+#     bounds the rest.
+#   * THE STRING-SHAPE POPULATION'S ALIAS BLINDNESS, which was the second
+#     routed item: `_classify_string_shape_guards` now resolves a module-level
+#     name bound to `str` (or to a tuple containing it), so a guard spelled
+#     `isinstance(x, _TEXT_TYPES)` is harvested and classified like any other.
+#     `test_the_string_shape_population_harvests_a_guard_named_through_an_alias`
+#     proves it on a synthetic module carrying that spelling; the old
+#     "the module may not CONTAIN this spelling" assertion is retired BY the
+#     fix. `type(x) is str` is still outside the classifier and still asserted
+#     absent; a duck-typed `try: x.strip()` remains undetectable.
+#
+# What it deliberately left, and why -- these are the two live items:
+#
+#   1. FLAG AND ARITHMETIC SURFACES have the shape contract only where #619's
+#      harm reached them. `_flag_field` exists because `has_more` decides
 #      whether the paging footer states a resume instruction, and a raw
 #      truthiness test on a flag reads `"false"` as True; every OTHER flag read
 #      in this module (`preview`, `committed`, `truncated`, `changed`,
 #      `direct`, `has_more` on the renderers that do their own paging) is still
 #      `bool(value.get(k))` or a bare `value.get(k)`, which is the same class
-#      one field over. Likewise the arithmetic: the footer now refuses counts
+#      one field over. Likewise the arithmetic: the footer refuses counts
 #      that contradict each other, while `_go_rename_summary`'s
 #      `op_count = candidates + skipped - skipped_changed_during_apply` can
-#      still go negative on an inconsistent envelope. Both belong to the same
-#      routed audit, for the same reason: the fix is one contract over every
-#      flag read and every derived count, discovered by a population rather
-#      than listed by hand.
-#   4. THE PAGING FOOTER'S IMPOSSIBILITY REFUSAL IS PINNED ON THE COUNTS'
+#      still go negative on an inconsistent envelope. Both were left by the
+#      count-and-shape follow-up on purpose: its subject was the numbers a
+#      caller ACTS on, and the honest version of these two is one contract over
+#      every flag read and every derived count, discovered by a population
+#      rather than listed by hand.
+#   2. THE PAGING FOOTER'S IMPOSSIBILITY REFUSAL IS PINNED ON THE COUNTS'
 #      VALUES, NOT ON WHICH KEYS CARRY THEM. This one is not pre-existing at
-#      base -- it is this PR's own new mechanism -- and it is routed for the
+#      base -- it is #619's own mechanism -- and it is routed for the
 #      other reason: three consecutive rounds widened this pin, each closing
 #      the axis the last lens named and leaving the next, with HEAD
 #      behaviourally CORRECT on every one of them. What is routed is the PIN,
@@ -7084,55 +7322,53 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 #      is worth more than a fourth pin that closes one more corner of it.
 
 
-def test_no_shape_guard_hides_behind_a_module_level_alias():
-    """The routed limitation's one live claim, executed instead of asserted.
+def test_the_string_shape_population_harvests_a_guard_named_through_an_alias():
+    """The classifier used to require a LITERAL `str` in the class argument, so
+    a guard spelled through a module-level alias (`_TEXT_TYPES = (str,)`;
+    `isinstance(x, _TEXT_TYPES)`) was outside the population AND outside its
+    anti-drift assertion -- it could drop a text field with nothing in this file
+    able to see it. The limitation was papered over by asserting the module does
+    not CONTAIN the spelling, which is bookkeeping for a blindness rather than a
+    fix.
 
-    `_STRING_SHAPE_GUARDS`' classifier harvests `isinstance(x, str)` with a
-    LITERAL class, so a guard spelled through an alias (`_TEXT_TYPES = (str,)`;
-    `isinstance(x, _TEXT_TYPES)`) is outside the population AND outside the
-    anti-drift assertion -- it would drop a text field silently with nothing in
-    this file able to see it. Resolving aliases inside the classifier is the
-    routed audit's job. Until then the module may not CONTAIN that spelling,
-    and this is the assertion that keeps the disclosure above honest: it fails
-    on arrival, wherever in the module the guard sits, including in a function
-    no runtime probe reaches (which is why the population's size pins are not
-    the answer -- they measure discovered renderers, and an undiscovered helper
-    moves none of them)."""
-    import ast
-    import inspect
+    Now the classifier resolves the alias, so the claim is about the RULE and is
+    put to a synthetic module that carries the spelling on purpose: the guard
+    must appear in the population, and a dropping one must classify as `DROPS`.
+    A classifier that skipped it would report that module clean.
 
-    from bn import formatters
+    `type(x) is str` keeps its own absence assertion below; it is still outside
+    the classifier, and a duck-typed `try: x.strip()` is not detectable at all.
+    """
+    source = (
+        "_TEXT_TYPES = (str,)\n"
+        "_ALSO_TEXT = _TEXT_TYPES\n"
+        "\n"
+        "def _render_probe(value):\n"
+        "    note = value.get('note')\n"
+        "    if isinstance(note, _TEXT_TYPES):\n"
+        "        return note\n"
+        "    return ''\n"
+        "\n"
+        "def _render_probe_alias_of_alias(value):\n"
+        "    label = value.get('label')\n"
+        "    if isinstance(label, _ALSO_TEXT):\n"
+        "        return label\n"
+        "    return ''\n"
+    )
+    guards = _classify_string_shape_guards(source)
 
-    tree = ast.parse(inspect.getsource(formatters))
-    builtin_shapes = {"str", "int", "float", "bool", "dict", "list", "tuple",
-                      "set", "frozenset", "bytes", "bytearray", "type",
-                      "BaseException", "Exception"}
-    aliased = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "isinstance" and len(node.args) == 2):
-            classes = node.args[1]
-            names = ([classes] if isinstance(classes, ast.Name)
-                     else list(getattr(classes, "elts", [])))
-            for cls in names:
-                if isinstance(cls, ast.Name) and cls.id not in builtin_shapes:
-                    aliased.append((node.lineno, ast.unparse(node)))
-    assert not aliased, (
-        "a shape test names its class through a variable, which the "
-        "string-shape guard population cannot harvest and its anti-drift "
-        f"assertion cannot flag -- a drop behind it is invisible here: {aliased}")
-    # Anti-vacuity: the same walk over a module that DOES carry the spelling
-    # must find it, or the assertion above is green because the walk is blind.
-    probe = ast.parse("_TEXT_TYPES = (str,)\n"
-                      "def _render_probe(value):\n"
-                      "    note = value.get('note')\n"
-                      "    return note if isinstance(note, _TEXT_TYPES) else ''\n")
-    found = [ast.unparse(n) for n in ast.walk(probe)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-             and n.func.id == "isinstance" and len(n.args) == 2
-             and isinstance(n.args[1], ast.Name)
-             and n.args[1].id not in builtin_shapes]
-    assert found == ["isinstance(note, _TEXT_TYPES)"], found
+    assert ("_render_probe", "note", 0) in guards, (
+        "a guard whose class is a module-level alias of `str` is outside the "
+        f"population, so a drop behind it is invisible: {sorted(guards)}")
+    assert guards[("_render_probe", "note", 0)] == "DROPS", guards
+    assert guards[("_render_probe_alias_of_alias", "label", 0)] == "DROPS", (
+        "an alias of an alias is the same guard one hop further out")
+
+    # The literal spelling still classifies identically, so resolving aliases
+    # did not move the rule for the module's own guards.
+    literal = _classify_string_shape_guards(
+        source.replace("_TEXT_TYPES)", "str)").replace("_ALSO_TEXT)", "str)"))
+    assert literal == guards
 
 
 def test_the_paging_footer_never_states_a_resume_offset_it_could_not_derive():

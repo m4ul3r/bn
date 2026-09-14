@@ -225,6 +225,21 @@ def _count_field(source: Any, key: str) -> int:
         return 0
 
 
+def _stated_count(source: Any, key: str) -> str:
+    """``_count_field`` for a line that STATES the number: the count when it
+    read, and ``?`` when the key was present in a shape no count reads out of.
+
+    The trailing ``@_discloses`` note is not enough on its own for a HEADLINE a
+    caller acts on: "go rename: 0 renamed, 0 failed, 0 skipped" from an
+    unreadable counter reads byte-identically to a genuine all-noop run, which
+    is the #683 fabricated-zero harm with a footnote attached. The compact
+    status already states an unreadable count as unknown (``changed=None``);
+    this is that rule for the text views (#619/#685).
+    """
+    count = _count_field(source, key)
+    return "?" if _field_skewed(key) else str(count)
+
+
 def _text_value(source: Any, key: str) -> str | None:
     """``source[key]`` as TEXT, recording the skew when the key is PRESENT but
     holds something no text can be read out of.
@@ -1472,17 +1487,30 @@ def _render_instance_gc_text(value: Any) -> str:
     # Through the count choke point: silently defaulting these to 0 stopped the
     # TypeError but made an unreadable count render as a confident "0 reaped",
     # which is the other half of the same bug (#619).
-    logs = _count_field(value, "logs_removed")
-    socks = _count_field(value, "sockets_removed")
-    regs = _count_field(value, "registries_purged")
+    # `_stated_count`, because every one of these numbers is STATED: "reaped 0
+    # logs" from an unreadable counter reads byte-identically to a real zero,
+    # and the caller's reading of it ("nothing was reaped") is a decision the
+    # trailing disclosure note arrives too late for.
+    logs = _stated_count(value, "logs_removed")
+    socks = _stated_count(value, "sockets_removed")
+    regs = _stated_count(value, "registries_purged")
     live = value.get("live_instances", 0)
-    reaped = logs + socks + regs
-    if reaped == 0:
+    # The same rule twice on purpose: `_stated_count` for what is PRINTED, the
+    # int for the "anything at all?" test. A refused counter must not be summed
+    # into a confident "nothing to reap" either -- that is the same claim as a
+    # fabricated zero, one branch up. (`_count_field` re-reads are idempotent;
+    # `_record_skew` dedupes.)
+    reaped = (_count_field(value, "logs_removed")
+              + _count_field(value, "sockets_removed")
+              + _count_field(value, "registries_purged"))
+    if reaped == 0 and not any(_field_skewed(key) for key in
+                               ("logs_removed", "sockets_removed",
+                                "registries_purged")):
         return f"gc: nothing to reap ({live} live instance{'' if live == 1 else 's'})"
     return (
-        f"gc: reaped {logs} log{'' if logs == 1 else 's'}, "
-        f"{socks} orphan socket{'' if socks == 1 else 's'}, "
-        f"{regs} dead registr{'y' if regs == 1 else 'ies'} "
+        f"gc: reaped {logs} log{'' if logs == '1' else 's'}, "
+        f"{socks} orphan socket{'' if socks == '1' else 's'}, "
+        f"{regs} dead registr{'y' if regs == '1' else 'ies'} "
         f"({live} live instance{'' if live == 1 else 's'} kept)"
     )
 
@@ -1570,7 +1598,13 @@ def _render_go_rename_text(value: Any) -> str:
     # `skipped_changed_during_apply` -- this view never reads at all, which is
     # its own disclosure gap and is routed by name (see the ROUTED block in
     # `tests/test_cli_formatters.py`, item 1).
-    skipped = _count_field(value, "skipped_user_named")
+    # `_stated_count` for the three counters this view INTERPOLATES: an
+    # unreadable one renders `?`, because "go rename: 0 renamed, 0 failed, 0
+    # skipped" is byte-identical to a genuine all-noop run and the headline is
+    # the line a caller acts on -- the trailing disclosure note arrives after
+    # the decision. `targeted` stays an int: it GATES control flow below and
+    # already has the stronger whole-line refusal.
+    skipped = _stated_count(value, "skipped_user_named")
     targeted = _count_field(value, "go_renamed_candidates")
     if not targeted:
         if _field_skewed("go_renamed_candidates"):
@@ -1582,15 +1616,15 @@ def _render_go_rename_text(value: Any) -> str:
                     "count was unreadable, so neither the renames nor the "
                     "skips can be reported; re-read with --format json")
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
-                f"({_count_field(value, 'defined_count')} defined at pcln addresses, "
+                f"({_stated_count(value, 'defined_count')} defined at pcln addresses, "
                 f"{skipped} already user-named)")
     failed = _row_list(value, "results")
     # The default is a MEASUREMENT (targeted minus the failures), so it is used
     # only when the envelope claimed no verified count at all -- asking
     # `_count_field` for an absent key would fabricate a 0 over it.
-    verified = (_count_field(value, "go_verified_count")
+    verified = (_stated_count(value, "go_verified_count")
                 if _field_present(value, "go_verified_count")
-                else targeted - len(failed))
+                else str(targeted - len(failed)))
     preview = bool(value.get("preview"))
     committed = bool(value.get("committed", True))
     lines: list[str] = []
@@ -2303,7 +2337,14 @@ def _render_function_evidence_text(value: Any) -> str:
             # evidence card where the same payload with `offset` absent rendered
             # cleanly (#619). The choke point answers 0 and discloses instead.
             nxt = _count_field(value, "offset") + len(calls)
-            call_hdr += f" -- more: rerun with --offset {nxt}"
+            if _field_skewed("offset"):
+                # An ACTIONABLE number, not a descriptive one: a fabricated
+                # resume offset sends an agent paging from a window the payload
+                # never stated, which is the invented-offset harm the paging
+                # footer was fixed for (#722). Refuse the hint instead.
+                call_hdr += " -- more: page position unreadable, re-read with --format json"
+            else:
+                call_hdr += f" -- more: rerun with --offset {nxt}"
     lines.append(call_hdr)
     if not calls:
         return "\n".join(lines)
@@ -3925,8 +3966,15 @@ def _render_data_symbols_text(value: Any) -> str:
         # Reaches arithmetic, so it goes through the count choke point rather
         # than a silent default: one count contract, not two (#619).
         shown = _count_field(value, "offset") + len(syms)
-        body += (f"\n// showing {shown} of {value.get('total', '?')}"
-                 f"; resume with --offset {shown}")
+        if _field_skewed("offset"):
+            # An ACTIONABLE number: a resume offset fabricated from an
+            # unreadable page position sends a pager back over a window it
+            # already read, or loops it on page one (#722's harm class).
+            body += (f"\n// showing {len(syms)} of {value.get('total', '?')}"
+                     f"; page position unreadable -- re-read with --format json")
+        else:
+            body += (f"\n// showing {shown} of {value.get('total', '?')}"
+                     f"; resume with --offset {shown}")
     return body
 
 
