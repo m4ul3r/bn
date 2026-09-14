@@ -27,14 +27,27 @@ EXPECTED_READ = {
     "associate_project_roots",
 }
 EXPECTED_WRITE = {
-    "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
-    "set_prototype", "local_rename", "local_retype", "data_retype", "struct_field_set",
-    "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
-    "close_binary", "save_database", "tag_add", "tag_remove",
+    # True short writers: gate + exclusive target lock for the whole op.
+    "py_exec", "close_binary", "save_database",
+    # NB: the mutation ops and "function_create" are intentionally NOT here --
+    # #628 made them lock="none" so they self-manage locking (the write gate
+    # serializes writers for the whole op, while the exclusive target lock covers
+    # only the BN-mutating/snapshotting phases, leaving the post-apply reanalysis
+    # readable), exactly like "refresh"/"load_binary" below.
+}
+# Ops that are registered lock="none" and therefore belong to NEITHER derived
+# set. This is the test-side pin for them; the registry stays the single source
+# of truth (`REGISTRY.read_locked_ops()`/`write_locked_ops()`).
+EXPECTED_SELF_MANAGED = {
+    "cancel_request", "load_binary", "load_binary_async", "load_status",
+    "go_rename", "shutdown", "refresh",
+    # #628: every binder that routes through bridge._mutation() -- all of them
+    # reanalyze inside their own body -- plus the standalone function_create.
+    "function_create", "rename_symbol", "set_comment", "delete_comment",
+    "set_prototype", "local_rename", "local_retype", "data_retype",
+    "struct_field_set", "struct_field_rename", "struct_field_delete",
+    "types_declare", "batch_apply", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",
-    # NB: "refresh" is intentionally NOT here -- #321 made it lock="none" so it
-    # self-manages locking (analysis runs under the write GATE only, leaving reads
-    # responsive), mirroring load_binary. See the self-managed set below.
 }
 
 
@@ -64,19 +77,21 @@ def test_no_op_is_both_read_and_write(bridge):
     assert set(bridge.READ_LOCKED_OPS).isdisjoint(bridge.WRITE_LOCKED_OPS)
 
 
-def test_self_managed_ops_are_unlocked(bridge):
-    assert "cancel_request" not in bridge.READ_LOCKED_OPS
-    assert "cancel_request" not in bridge.WRITE_LOCKED_OPS
-    assert "load_binary" not in bridge.READ_LOCKED_OPS
-    assert "load_binary" not in bridge.WRITE_LOCKED_OPS
-    assert "go_rename" not in bridge.READ_LOCKED_OPS
-    assert "go_rename" not in bridge.WRITE_LOCKED_OPS
-    assert "shutdown" not in bridge.READ_LOCKED_OPS
-    assert "shutdown" not in bridge.WRITE_LOCKED_OPS
-    # #321: refresh self-manages locking (write gate around analysis, not the
-    # exclusive target lock) so reads stay responsive during a long analysis.
-    assert "refresh" not in bridge.READ_LOCKED_OPS
-    assert "refresh" not in bridge.WRITE_LOCKED_OPS
+def test_self_managed_ops_are_unlocked(bridge, op_registry):
+    """Every lock="none" op self-manages locking, so it belongs to NEITHER derived
+    set. Being outside both is what keeps concurrent readers live while the op runs
+    its own analysis/gate dance (#99 load, #321 refresh, #365 go_rename, #628
+    mutation + function_create)."""
+    assert EXPECTED_SELF_MANAGED.isdisjoint(EXPECTED_READ)
+    assert EXPECTED_SELF_MANAGED.isdisjoint(EXPECTED_WRITE)
+    # Every pinned name must be a name the registry actually registers. Without
+    # this the loop below is vacuously true for a name that does not exist (an
+    # unregistered op is trivially in neither derived set), so the pin could
+    # drift to naming anything at all and still pass on its own.
+    assert EXPECTED_SELF_MANAGED <= op_registry.REGISTRY.names()
+    for op_name in sorted(EXPECTED_SELF_MANAGED):
+        assert op_name not in bridge.READ_LOCKED_OPS, op_name
+        assert op_name not in bridge.WRITE_LOCKED_OPS, op_name
 
 
 def test_op_decorator_registers_and_derives_locks(op_registry):
@@ -124,10 +139,7 @@ def test_escalation_is_stored(op_registry):
 
 def test_registry_covers_every_dispatch_op(op_registry):
     REGISTRY = op_registry.REGISTRY
-    expected = EXPECTED_READ | EXPECTED_WRITE | {
-        "cancel_request", "load_binary", "load_binary_async", "load_status",
-        "go_rename", "shutdown", "refresh",
-    }
+    expected = EXPECTED_READ | EXPECTED_WRITE | EXPECTED_SELF_MANAGED
     assert REGISTRY.names() == expected
 
 

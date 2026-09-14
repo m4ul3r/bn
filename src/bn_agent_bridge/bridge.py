@@ -405,14 +405,15 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
             for tab in tabs:
                 collect_from_tab(context, tab)
 
-        unique: list[Any] = []
-        seen: set[int] = set()
-        for bv in found:
-            marker = id(bv)
-            if marker not in seen:
-                seen.add(marker)
-                unique.append(bv)
-        return unique, incomplete
+        # Dedup by BN's handle-based equality, not id(bv) (#714). BN interns a
+        # wrapper only for the scripting console's current view, so one core
+        # view reaches this walk as several DISTINCT wrapper objects -- one per
+        # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab) --
+        # and an id()-keyed dedup lets every duplicate through. Every consumer
+        # then pays for it: refresh() builds a full TargetRecord (session_id,
+        # filename, view name -- three core reads) per duplicate before
+        # discarding the extras.
+        return list(dict.fromkeys(found)), incomplete
 
     views, incomplete = _run_on_main_thread(collect)
     if incomplete and strict:
@@ -430,10 +431,13 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
     # load (#86 Problem A). Merge in any tracked headless views the UI walk
     # missed so every loaded target is visible and resolvable.
     with _headless_views_lock:
-        seen_ids = {id(bv) for bv in views}
+        # Handle equality again (#714): a `bn load`-tracked wrapper for a view
+        # the UI walk already reported IS the same core view, however many
+        # Python objects stand in for it.
+        seen = set(views)
         for bv in _headless_views:
-            if id(bv) not in seen_ids:
-                seen_ids.add(id(bv))
+            if bv not in seen:
+                seen.add(bv)
                 views.append(bv)
     return views
 
@@ -518,14 +522,13 @@ class TargetManager:
 
         Release timing, stated exactly: this is wired ONLY into the `bn close`
         path (`_close_binary`). A tab the USER closes in the GUI never reaches
-        it, and the two structures then age out differently -- `_records` and
-        `_ids_by_object` (and with them the strong view ref) are reclaimed by
-        the next `refresh()`, which prunes to the current open-view set, but
-        `_dirty_view_ids` is NOT pruned by `refresh()` at all, so that view's
-        stable view_id leaks for the process lifetime. `_dirty_view_ids` holds
-        only short id strings, so the leak is bounded in size, not in count
-        (#659). `refresh()` still bounds every structure that pins a
-        BinaryView (#586, #613 review).
+        it, but it does not have to: the next `refresh()` prunes every
+        structure here back to the current open-view set -- `_records` and
+        `_ids_by_object` (and with them the strong view ref), and
+        `_dirty_view_ids` against those same live record ids (#713), so a
+        closed view's stable view_id does not leak for the process lifetime
+        (#659). `refresh()` bounds every structure that pins a BinaryView
+        (#586, #613 review) or a stable view_id (#713).
         """
         with self._lock:
             vid = self._stable_view_id(bv)
@@ -668,6 +671,14 @@ class TargetManager:
                 )
 
             self._records = alive
+            # Prune dirty markers for views that left the open set WITHOUT
+            # going through forget() -- a GUI tab the user closed never reaches
+            # the `bn close` path, so without this its stable view_id (and its
+            # "unsaved" answer) would leak for the process lifetime (#713).
+            # `alive` is the current open set, rebuilt from handle-keyed strong
+            # refs (#586), so a view that is STILL open and still unsaved keeps
+            # its marker across any number of refreshes (#606).
+            self._dirty_view_ids &= set(alive)
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -1986,14 +1997,13 @@ class BinaryNinjaBridge:
             if not to_close:
                 raise RuntimeError(f"No loaded binary matches path: {path}")
 
-        # Dedup by BN's handle-based equality, not id(): _collect_open_views()
-        # only dedups its own walk on `id(bv)`, and BN
-        # interns no wrapper for a non-console view, so the same core view can
-        # arrive here under several distinct wrapper objects -- one per
-        # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab).
-        # Closing/reporting it once per wrapper would run N blocking
-        # main-thread round trips for one tab (the exact contention #658 was
-        # about) and return N identical `closed` rows to the caller.
+        # Dedup by BN's handle-based equality, not id(). _collect_open_views()
+        # already collapses wrappers per core view (#714), but this is the
+        # destructive path: it stays defensive about the list it is handed
+        # rather than trusting the walk. Closing/reporting one core view once
+        # per wrapper would run N blocking main-thread round trips for one tab
+        # (the exact contention #658 was about) and return N identical `closed`
+        # rows to the caller.
         to_close = list(dict.fromkeys(to_close))
 
         # Close on the main thread OUTSIDE any lock (#658): a blocking
@@ -3037,7 +3047,15 @@ class BinaryNinjaBridge:
         return read_misc._is_executable_address(self.ctx, *a, **k)
 
     def _function_create(self, *a, **k):
-        return create_comments._function_create(self.ctx, *a, **k)
+        # #628: same self-managed lock split as _mutation -- the op is
+        # @op lock="none", so the write gate here serializes writers for the whole
+        # call while create_comments._function_create holds the exclusive target
+        # lock only around the create/readback/revert phases, NOT around the
+        # post-create update_analysis_and_wait(). See _mutation.
+        with self._write_gate:
+            return create_comments._function_create(
+                self.ctx, *a, exclusive=self._target_lock.write, **k
+            )
 
     def _get_comment(self, *a, **k):
         return create_comments._get_comment(self.ctx, *a, **k)
@@ -3334,58 +3352,76 @@ class BinaryNinjaBridge:
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
     def _mutation(self, *a, **k):
-        try:
-            result = mutation_engine._mutation(self.ctx, *a, **k)
-        except Exception as exc:
-            # #630 round 2: a post-apply exception path restores the prototype
-            # VALUE but cannot clear the has_user_type override an applied
-            # set_prototype pinned. That residue leaves the view modified even
-            # though _mutation raised (returns no result), so mark the view dirty
-            # here -- otherwise `close` reads bv.file.modified == false and reports
-            # no unsaved state. The original exception still propagates intact.
-            if getattr(exc, "prototype_user_type_residue", False):
+        # #628: mutation ops are @op lock="none" -- they reanalyze inside their
+        # own body, so holding the exclusive target lock for the whole op starved
+        # every concurrent read for the length of update_analysis_and_wait(). Lock
+        # split instead (mirroring load_binary #99 / refresh #321 / go_rename
+        # #365):
+        #   * this write GATE serializes writers for the WHOLE call, so no second
+        #     writer (mutation, py_exec, close, save, refresh, go_rename) can
+        #     interleave with this one;
+        #   * the exclusive TARGET lock is threaded into the engine, which holds it
+        #     only around the phases that mutate or snapshot BN state (resolve,
+        #     gates, snapshots, apply, and the post-analysis verify/commit) and
+        #     NOT around the post-apply reanalysis, which runs under the gate
+        #     alone so concurrent reads stay live.
+        # Revert/settle stays exclusive on purpose: a reader must never observe a
+        # half-reverted view. The #479 quick-load refusal is unchanged.
+        with self._write_gate:
+            try:
+                result = mutation_engine._mutation(
+                    self.ctx, *a, exclusive=self._target_lock.write, **k
+                )
+            except Exception as exc:
+                # #630 round 2: a post-apply exception path restores the prototype
+                # VALUE but cannot clear the has_user_type override an applied
+                # set_prototype pinned. That residue leaves the view modified even
+                # though _mutation raised (returns no result), so mark the view dirty
+                # here -- otherwise `close` reads bv.file.modified == false and reports
+                # no unsaved state. The original exception still propagates intact.
+                if getattr(exc, "prototype_user_type_residue", False):
+                    try:
+                        selector = a[0] if a else k.get("selector")
+                        self.targets.mark_dirty(self.targets.resolve(selector))
+                    except Exception:
+                        pass
+                raise
+            # A committed (non-preview) write that actually changed state leaves the
+            # view dirty until saved -- mark it so `close` can warn. A pure no-op
+            # (every op already in the requested state) changes nothing, so it does
+            # not dirty the view. (L15)
+            committed_change = (
+                isinstance(result, dict)
+                and result.get("committed")
+                and not result.get("preview")
+                and any(
+                    isinstance(r, dict) and r.get("status") == "verified"
+                    for r in (result.get("results") or [])
+                )
+            )
+            # A FAILED rollback (preview or live) can leave partial state live in the
+            # view while committed is False, so the committed check above never fires.
+            # bv.file.modified does not flip for these writes, so mark dirty here or
+            # `bn close` computes unsaved=false and silently discards the leftover
+            # renames/types/locals (#606). Identity check, not falsy: a clean result
+            # with no rolled_back key (rolled_back is None) must be unchanged, and a
+            # clean rollback (rolled_back True) leaves the view as before.
+            rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
+            # An unclearable has_user_type override (a proto set on an AUTO function
+            # that had to be reverted) leaves the view modified even though the
+            # prototype value round-tripped. It now also flips rolled_back to False,
+            # but key on the residue field explicitly too so `bn close` never silently
+            # discards it (#630).
+            residue_left_state = isinstance(result, dict) and bool(
+                result.get("prototype_user_type_residue")
+            )
+            if committed_change or rollback_left_state or residue_left_state:
                 try:
                     selector = a[0] if a else k.get("selector")
                     self.targets.mark_dirty(self.targets.resolve(selector))
                 except Exception:
                     pass
-            raise
-        # A committed (non-preview) write that actually changed state leaves the
-        # view dirty until saved -- mark it so `close` can warn. A pure no-op
-        # (every op already in the requested state) changes nothing, so it does
-        # not dirty the view. (L15)
-        committed_change = (
-            isinstance(result, dict)
-            and result.get("committed")
-            and not result.get("preview")
-            and any(
-                isinstance(r, dict) and r.get("status") == "verified"
-                for r in (result.get("results") or [])
-            )
-        )
-        # A FAILED rollback (preview or live) can leave partial state live in the
-        # view while committed is False, so the committed check above never fires.
-        # bv.file.modified does not flip for these writes, so mark dirty here or
-        # `bn close` computes unsaved=false and silently discards the leftover
-        # renames/types/locals (#606). Identity check, not falsy: a clean result
-        # with no rolled_back key (rolled_back is None) must be unchanged, and a
-        # clean rollback (rolled_back True) leaves the view as before.
-        rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
-        # An unclearable has_user_type override (a proto set on an AUTO function
-        # that had to be reverted) leaves the view modified even though the
-        # prototype value round-tripped. It now also flips rolled_back to False,
-        # but key on the residue field explicitly too so `bn close` never silently
-        # discards it (#630).
-        residue_left_state = isinstance(result, dict) and bool(
-            result.get("prototype_user_type_residue")
-        )
-        if committed_change or rollback_left_state or residue_left_state:
-            try:
-                selector = a[0] if a else k.get("selector")
-                self.targets.mark_dirty(self.targets.resolve(selector))
-            except Exception:
-                pass
-        return result
+            return result
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
@@ -3971,7 +4007,18 @@ def _bind_read(bridge, params, target):
     return bridge._read(target, params["address"], int(params["length"]))
 
 
-@op("function_create", lock="write")
+# #628: function_create and every single-mutation binder below (rename/proto/
+# comment/local/struct/type/tag, plus batch_apply) reanalyze inside their own
+# body -- bridge._function_create / bridge._mutation call
+# bv.update_analysis_and_wait() -- so they are lock="none" and self-manage
+# locking (see BinaryNinjaBridge._mutation): the write gate serializes writers
+# for the WHOLE op, while the exclusive target lock covers only the
+# BN-mutating/snapshotting phases. Holding the exclusive lock through that
+# reanalysis starved every concurrent read (doctor / target info / function
+# list) for minutes on a large target -- the same residual pattern #99 (load),
+# #321 (refresh) and #365 (go_rename) already fixed. The true short writers
+# (py_exec, close_binary, save_database) stay lock="write".
+@op("function_create", lock="none")
 def _bind_function_create(bridge, params, target):
     return bridge._function_create(target, params["address"], _validate_bool(params.get("preview"), label="preview", default=False))
 
@@ -4000,7 +4047,7 @@ def _bind_py_exec(bridge, params, target):
 # operation (e.g. a `set_comment` request with `params={"op":"delete_comment"}`
 # must still run set_comment). Only `batch_apply` legitimately trusts
 # manifest-supplied ops; these fixed-op endpoints must not.
-@op("rename_symbol", lock="write")
+@op("rename_symbol", lock="none")
 def _bind_rename_symbol(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "rename_symbol"}])
 
@@ -4050,79 +4097,79 @@ def _bind_list_tags(bridge, params, target):
     )
 
 
-@op("tag_add", lock="write")
+@op("tag_add", lock="none")
 def _bind_tag_add(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_add"}])
 
 
-@op("tag_remove", lock="write")
+@op("tag_remove", lock="none")
 def _bind_tag_remove(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_remove"}])
 
 
-@op("tag_type_create", lock="write")
+@op("tag_type_create", lock="none")
 def _bind_tag_type_create(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_create"}])
 
 
-@op("tag_type_remove", lock="write")
+@op("tag_type_remove", lock="none")
 def _bind_tag_type_remove(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_remove"}])
 
 
-@op("set_comment", lock="write")
+@op("set_comment", lock="none")
 def _bind_set_comment(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_comment"}])
 
 
-@op("delete_comment", lock="write")
+@op("delete_comment", lock="none")
 def _bind_delete_comment(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "delete_comment"}])
 
 
-@op("set_prototype", lock="write")
+@op("set_prototype", lock="none")
 def _bind_set_prototype(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_prototype"}])
 
 
-@op("local_rename", lock="write")
+@op("local_rename", lock="none")
 def _bind_local_rename(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_rename"}])
 
 
-@op("local_retype", lock="write")
+@op("local_retype", lock="none")
 def _bind_local_retype(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_retype"}])
 
 
-@op("data_retype", lock="write")
+@op("data_retype", lock="none")
 def _bind_data_retype(bridge, params, target):
     # #649: typing a recovered data variable had no verified mutation path at all
     # (py exec only -- no --preview, no readback, no batch atomicity).
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "data_retype"}])
 
 
-@op("struct_field_set", lock="write")
+@op("struct_field_set", lock="none")
 def _bind_struct_field_set(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_set"}])
 
 
-@op("struct_field_rename", lock="write")
+@op("struct_field_rename", lock="none")
 def _bind_struct_field_rename(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_rename"}])
 
 
-@op("struct_field_delete", lock="write")
+@op("struct_field_delete", lock="none")
 def _bind_struct_field_delete(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_delete"}])
 
 
-@op("types_declare", lock="write")
+@op("types_declare", lock="none")
 def _bind_types_declare(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
-@op("batch_apply", lock="write")
+@op("batch_apply", lock="none")
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
@@ -4160,6 +4207,9 @@ def _bind_batch_apply(bridge, params, target):
 # does its OWN fine-grained locking (exclusive only around the BN open and the
 # publish, NOT around the multi-minute update_analysis_and_wait), so doctor/
 # target reads stay responsive during a large load (#99). See _load_binary.
+# The #628 mutation ops are unlocked for the same reason: they hold the write
+# gate for the whole op but the exclusive lock only around the BN-mutating and
+# snapshotting phases, never around the post-apply reanalysis.
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 

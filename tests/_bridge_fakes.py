@@ -802,6 +802,16 @@ class _FakeBV:
     def get_comment_at(self, address: int):
         return self._comments.get(int(address), "")
 
+    def set_comment_at(self, address: int, comment):
+        # Real BN's GLOBAL address-comment store -- the one `address_comments`
+        # reflects: an empty/None comment REMOVES the entry (BNSetGlobalComment
+        # ForAddress with "" clears it), it does not store an empty string. All
+        # three accessors must share `self._comments` (#624).
+        if comment is None or comment == "":
+            self._comments.pop(int(address), None)
+        else:
+            self._comments[int(address)] = comment
+
     @property
     def address_comments(self):
         return dict(self._comments)
@@ -932,12 +942,18 @@ class _FakeMutationBV(_FakeBV):
     its AUTO/USER provenance, but does NOT clear `Function.has_user_type` --
     that flag survives the undo (#582). The journal only tracks functions
     registered on the view.
+
+    The undo buffer also carries the GLOBAL address-comment store (verified
+    live), so a reverted transaction drops comments written through
+    `set_comment_at`; a commit keeps them (#624).
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.events: list[tuple[str, str] | str] = []
-        self._undo_journal: list[tuple[str, list]] = []
+        # (state, function provenance snapshots, address-comment snapshot) per
+        # open transaction, newest last.
+        self._undo_journal: list[tuple[str, list, dict]] = []
         self._undo_states = 0
 
     def begin_undo_actions(self):
@@ -948,8 +964,11 @@ class _FakeMutationBV(_FakeBV):
         state = f"undo-{self._undo_states}"
         self.events.append(("begin", state))
         self._undo_journal.append(
-            (state, [(fn, fn.provenance_snapshot()) for fn in self.functions
-                     if hasattr(fn, "provenance_snapshot")])
+            (state,
+             [(fn, fn.provenance_snapshot()) for fn in self.functions
+              if hasattr(fn, "provenance_snapshot")],
+             # Shallow is enough: the values are comment strings.
+             dict(self._comments))
         )
         return state
 
@@ -960,20 +979,26 @@ class _FakeMutationBV(_FakeBV):
     def _pop_journal(self, state):
         for i in range(len(self._undo_journal) - 1, -1, -1):
             if self._undo_journal[i][0] == state:
-                snapshot = self._undo_journal[i][1]
+                entry = self._undo_journal[i]
                 # Transactions opened after *state* are nested inside it, so
                 # closing the outer one closes them too -- they must not leak.
                 del self._undo_journal[i:]
-                return snapshot
-        return []
+                return entry
+        return None
 
     def revert_undo_actions(self, state):
         self.events.append(("revert", state))
-        for fn, snapshot in self._pop_journal(state):
+        entry = self._pop_journal(state)
+        if entry is None:
+            return
+        _, fn_snapshots, comments = entry
+        self._comments = dict(comments)
+        for fn, snapshot in fn_snapshots:
             fn.provenance_restore(snapshot)
 
     def commit_undo_actions(self, state):
         self.events.append(("commit", state))
+        # Dropped, not restored: the changes survive the transaction.
         self._pop_journal(state)
 
 
@@ -1082,21 +1107,13 @@ def _minimal_valid_op(kind):
 
 
 class _FakeCommentMutationBV(_FakeMutationBV):
-    """Records begin/revert/commit (via _FakeMutationBV) and stores comments so a
-    batch can apply one then have the whole batch reverted."""
+    """A view that accepts comment mutations so a batch can apply one and have
+    the whole batch reverted.
 
-    def __init__(self):
-        super().__init__()
-        self.comments: dict[int, str] = {}
-
-    def get_comment_at(self, address):
-        return self.comments.get(int(address), "")
-
-    def set_comment_at(self, address, comment):
-        if comment is None:
-            self.comments.pop(int(address), None)
-        else:
-            self.comments[int(address)] = comment
+    It carries NO store of its own: `_FakeBV` backs `get_comment_at`,
+    `set_comment_at` and `address_comments` with the one `_comments` dict, and
+    `_FakeMutationBV` journals it, so a revert really clears the comment (#624).
+    Kept as a named type because tests construct it directly."""
 
 
 class _FakeTagMutationBV(_FakeMutationBV):

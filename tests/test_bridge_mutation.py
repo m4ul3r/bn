@@ -267,6 +267,67 @@ def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     assert result["rolled_back"] is False
 
 
+def test_apply_failure_and_exception_revert_settle_before_var_drift_restore(monkeypatch):
+    """#657: the apply-failure and generic-exception revert paths must settle the
+    view before reading var drift, exactly like the preview path (#581). A stale
+    read sees phantom drift and re-pins an AUTO local as USER. Observed
+    behaviourally: the settle must run BEFORE _restore_local_var_drift on both
+    paths, and be skipped when the snapshot is empty (nothing to drift-check =
+    no pointless reanalysis)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def drive(*, apply_exc=None, verify_exc=None, snapshots):
+        instance = bridge.BinaryNinjaBridge()
+        bv = _FakeMutationBV()
+        order: list[str] = []
+
+        def apply(bv_, op, restores=None):
+            if apply_exc is not None:
+                raise apply_exc
+            return {"op": "local_rename", "requested": {}}
+
+        def verify(bv_, result):
+            if verify_exc is not None:
+                raise verify_exc
+            return {**result, "status": "verified"}
+
+        # Record the two operations whose relative order is the contract.
+        monkeypatch.setattr(bv, "update_analysis_and_wait", lambda: order.append("settle"))
+        monkeypatch.setattr(me, "_capture_local_var_snapshots", lambda ctx, bv_, fns: snapshots)
+        monkeypatch.setattr(me, "_run_local_restores", lambda ctx, bv_, restores: True)
+        monkeypatch.setattr(
+            me, "_restore_local_var_drift", lambda ctx, bv_, snap: order.append("drift") or True
+        )
+        _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply, verify=verify)
+        return instance, order
+
+    snapshot = {0x1: {1: ("a", "int32_t")}}
+
+    # Apply-failure path: settle, then read drift.
+    instance, order = drive(
+        apply_exc=me.OperationFailure("unsupported", "nope", requested={}), snapshots=snapshot
+    )
+    result = instance._mutation("active", False, [{"op": "local_rename"}])
+    assert result["rolled_back"] is True
+    assert order == ["settle", "drift"]
+
+    # Generic-exception path (here: post-apply verification raises): the settle
+    # must immediately precede the drift read, and the error still propagates.
+    instance, order = drive(verify_exc=ValueError("boom"), snapshots=snapshot)
+    with pytest.raises(ValueError, match="boom"):
+        instance._mutation("active", False, [{"op": "local_rename"}])
+    assert order[-2:] == ["settle", "drift"]
+
+    # Empty snapshot -> no drift to read, so the revert path skips the
+    # reanalysis entirely (same guard as the preview path's settle).
+    instance, order = drive(
+        apply_exc=me.OperationFailure("unsupported", "nope", requested={}), snapshots={}
+    )
+    instance._mutation("active", False, [{"op": "local_rename"}])
+    assert order == ["drift"]
+
+
 def test_preview_with_successful_restore_still_succeeds(monkeypatch):
     """The restored-success coupling must not regress the normal preview path."""
     bridge = _load_bridge(monkeypatch)
@@ -4284,3 +4345,107 @@ def test_batch_validation_covers_every_op_before_the_first_apply_650(monkeypatch
         instance._mutation("active", False, ops)
     assert "operation 12" in exc.value.message
     assert all(bv.get_comment_at(0x1000 + i * 4) == "" for i in range(12))
+
+
+# ===========================================================================
+# #624 -- the comment fake must be undo-honest. `_FakeCommentMutationBV` used
+# to keep a SECOND dict for `get_comment_at`/`set_comment_at` while the
+# inherited `address_comments` read `_comments`, and the undo journal snapshotted
+# only function provenance -- so a "reverted" comment survived in the store the
+# snapshot/list paths read, and a rollback test could stay green with the view
+# state wrong.
+# ===========================================================================
+
+def test_fake_comment_store_is_unified_624():
+    """Real BN exposes ONE global address-comment store: what `set_comment_at`
+    writes is what `get_comment_at` reads and what `address_comments` hands back.
+    A second dict on the subclass broke that, so an apply landed in a store the
+    snapshot/list paths never saw."""
+    bv = _FakeCommentMutationBV()
+
+    bv.set_comment_at(0x1000, "x")
+    assert bv.get_comment_at(0x1000) == "x"
+    assert bv.address_comments[0x1000] == "x"
+
+    # An empty/None comment REMOVES the key (real BN semantics), in both views.
+    bv.set_comment_at(0x1000, "")
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments
+
+
+def test_fake_mutation_undo_restores_address_comments_624():
+    """Real BN journals global address comments, so a reverted transaction drops
+    the comment it applied; a commit keeps it. The fake journal used to carry
+    only function provenance, so a revert left the comment behind."""
+    bv = _FakeCommentMutationBV()
+    state = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "x")
+    bv.revert_undo_actions(state)
+    assert bv.get_comment_at(0x1000) == ""
+    assert bv.address_comments == {}
+
+    bv = _FakeCommentMutationBV()
+    state = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "x")
+    bv.commit_undo_actions(state)
+    assert bv.get_comment_at(0x1000) == "x"
+
+    # Nested transactions keep the existing stack semantics: reverting the inner
+    # transaction restores the comment state at ITS begin, the outer one at its
+    # own, and closing the outer drops any snapshot left nested inside it.
+    bv = _FakeCommentMutationBV()
+    outer = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "outer")
+    inner = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "inner")
+    bv.revert_undo_actions(inner)
+    assert bv.get_comment_at(0x1000) == "outer"
+    bv.revert_undo_actions(outer)
+    assert bv.get_comment_at(0x1000) == ""
+
+
+def test_preview_set_comment_revert_clears_the_view_624(monkeypatch):
+    """A preview's promise is that the view is left unmodified. For a comment op
+    the revert must really clear the address comment it applied -- the rollback
+    tests only asserted undo events and status strings, so a revert that skipped
+    the comment store shipped green (#173's rollback contract, #624)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", True, [
+        {"op": "set_comment", "address": "0x1000", "comment": "reverted note"}])
+
+    assert result["preview"] is True and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"   # it DID land, then reverted
+    # readback, not a claim: the view really carries no comment now
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments
+
+
+def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
+    """#624 AC3, on the LIVE (non-preview) batch path: when a later op fails, the
+    comment an earlier op already applied must be gone from the VIEW, not merely
+    reported as 'reverted'. The old test of this name asserted only undo events
+    and status strings, so a revert that skipped the comment store shipped green;
+    #624's dual-store/undo fixes are what make the readback below meaningful."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "set_comment", "address": "0x1000", "comment": "doomed note"},
+        {"op": "local_rename", "function": "0x2000", "variable": "v", "new_name": "w"},
+    ])
+
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    statuses = [r["status"] for r in result["results"]]
+    assert statuses[0] == "reverted"          # applied, then undone by the sibling
+    assert statuses[1] != "verified"          # the op that actually failed
+    # readback, not a claim: the view really carries no comment now
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments

@@ -25,6 +25,7 @@ imports it), and ``read_types`` no longer reaches into it -- the cycle-breakers
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import re
 import uuid
@@ -1837,6 +1838,26 @@ def _capture_local_var_snapshots(ctx, bv, functions) -> dict[int, dict[int, tupl
 
 
 
+def _settle_before_drift_restore(bv, var_before) -> None:
+    """Settle analysis before reading var drift (#581/#657).
+
+    ``revert_undo_actions`` restores provenance, but BN only re-derives an AUTO
+    variable's name/type on the next analysis pass, and the restores that ran
+    before this may have skipped their own reanalysis (they do when the failing
+    op registered none -- the blast-radius case). A stale read here would see
+    phantom drift and re-pin an AUTO local as USER, so every revert path must
+    call this immediately before ``_restore_local_var_drift``. Nothing to
+    compare (empty snapshot) means no reanalysis is needed; a failing settle is
+    logged and absorbed, never raised -- the drift read after it stays
+    best-effort."""
+    if not var_before:
+        return
+    try:
+        bv.update_analysis_and_wait()
+    except Exception as exc:
+        bn.log_error(f"BN Agent Bridge: reanalysis before var-drift check failed: {exc!r}")
+
+
 def _restore_local_var_drift(ctx, bv, snapshots) -> bool:
     """Put any local whose (name, type) drifted from *snapshots* back, then
     reanalyze. Covers BN's name/type propagation onto aliased siblings that
@@ -2053,7 +2074,26 @@ def _reject_duplicate_write_keys(ctx, operations: list[dict[str, Any]]) -> None:
         )
 
 
-def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
+def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
+              exclusive=None):
+    """Apply, verify, and (on failure or --preview) revert a batch of mutations.
+
+    #628 lock split: ``exclusive`` is the caller's EXCLUSIVE target-lock scope -- a
+    context-manager FACTORY (``bridge._mutation`` passes ``self._target_lock.write``).
+    The caller holds the bridge write GATE for the whole call, which is what
+    serializes writers (no mutation / py_exec / close / save / refresh / go_rename
+    can interleave); the exclusive lock is taken here only around the phases that
+    mutate or snapshot BN state. The post-apply ``update_analysis_and_wait()``
+    deliberately runs OUTSIDE it, under the gate alone, so concurrent reads
+    (doctor, target info, function list, ...) stay live instead of starving for a
+    multi-minute reanalysis -- parity with load_binary (#99), refresh (#321) and
+    go_rename (#365). The revert/settle paths stay exclusive on purpose: a reader
+    must never observe a half-reverted view. The #479 quick-load refusal is
+    unchanged. ``exclusive=None`` means "no exclusive scope" (a no-op), so direct
+    engine calls and tests keep working. Every return path produces exactly the
+    same result dict as before -- no schema, status, message or ordering change.
+    """
+    exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     if not operations:
         raise ValueError("Batch operation list is empty")
 
@@ -2065,355 +2105,356 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     # #652: reject a same-key-twice manifest BEFORE touching the view.
     _reject_duplicate_write_keys(ctx, operations)
 
-    bv = ctx._resolve_view(selector)
-    # #479: every write op except the standalone function_create routes through
-    # here, and both the success path (bv.update_analysis_and_wait() below) and the
-    # revert paths reanalyze. On a --quick view that runs the full deferred analysis
-    # under the exclusive write lock and wedges the instance -- even a later
-    # `target info` blocks -- so refuse the whole batch fast (including --preview,
-    # whose promise is a bounded probe) and point at `bn refresh`. Subsumes and
-    # generalizes the per-op function_create guard to bn type/comment/rename/proto/
-    # struct-field/batch-apply on a quick view.
-    if bv in _quick_loaded_views:
-        raise OperationFailure(
-            "invalid_request",
-            "Cannot apply mutations: this target was loaded with --quick (no "
-            "analysis). Mutations reanalyze under the write lock, which would wedge "
-            "the instance. Run `bn refresh` first.",
-            requested={"op": "mutation", "operations": len(operations)},
-        )
-    # #630: a --preview of a prototype set on a function with no user type would
-    # pin has_user_type, which BN cannot clear -- so the preview could not honor
-    # its non-destructive contract. Refuse BEFORE touching the view (pristine, no
-    # residue) rather than apply and report a false clean rollback. Non-preview
-    # applies are unaffected: committing a prototype SHOULD leave it a user type.
-    if preview:
-        proto_ops = [
-            op for op in operations
-            if isinstance(op, dict) and op.get("op") == "set_prototype"
-        ]
-        # Round-5 conservative rule: if the same --preview batch also carries any
-        # op that could move function/symbol name-or-address resolution (a rename,
-        # a symbol/function create, or an unknown op), the target a set_prototype
-        # will hit at apply time cannot be PROVEN from the pre-mutation view, so
-        # reversibility of an AUTO-prototype pin can't be guaranteed. Refuse the
-        # whole preview up front rather than simulate BN's resolver (which four
-        # review rounds proved unsound). Over-refusal is acceptable here.
-        offending = _resolution_affecting_op(operations) if proto_ops else None
-        if offending is not None:
-            offending_op, is_known = offending
-            if is_known:
-                # A recognized rename / symbol-or-function create.
-                cause = (
-                    f"a rename or a symbol/function create ({offending_op})"
-                )
-            else:
-                # An unknown/future (or malformed) op: NOT a rename/create, but not
-                # on the resolution-safe whitelist either, so we cannot prove it
-                # leaves resolution untouched. Name it as such rather than falsely
-                # blaming a rename (#630 follow-up).
-                cause = (
-                    f"the operation {offending_op!r}, which is not on the "
-                    "resolution-safe whitelist and so may change how a symbol "
-                    "resolves"
-                )
+    with exclusive_scope():
+        bv = ctx._resolve_view(selector)
+        # #479: every write op except the standalone function_create routes through
+        # here, and both the success path (bv.update_analysis_and_wait() below) and the
+        # revert paths reanalyze. On a --quick view that runs the full deferred analysis
+        # as a side effect of a mutation -- a multi-minute stall the caller never asked
+        # for -- so refuse the whole batch fast (including --preview, whose promise is a
+        # bounded probe) and point at `bn refresh`. #628 shortened the exclusive window
+        # the reanalysis runs in; it does NOT change this refusal. Subsumes and
+        # generalizes the per-op function_create guard to bn type/comment/rename/proto/
+        # struct-field/batch-apply on a quick view.
+        if bv in _quick_loaded_views:
             raise OperationFailure(
-                "unsupported",
-                f"Cannot --preview a prototype change together with {cause} in "
-                "the same batch: it can change how the prototype target resolves "
-                "at apply time, so a clean, reversible preview cannot be proven "
-                "from the pre-mutation view (setting a prototype pins the "
-                "function's has_user_type flag, which Binary Ninja exposes no API "
-                "to clear). Apply the other change(s) and the prototype change in "
-                "separate previews, or re-run without --preview to commit.",
-                requested={
-                    "op": "set_prototype",
-                    "reason": "batch_changes_symbol_resolution",
-                    "offending_op": offending_op,
-                },
+                "invalid_request",
+                "Cannot apply mutations: this target was loaded with --quick (no "
+                "analysis). Mutations reanalyze under the write lock, which would wedge "
+                "the instance. Run `bn refresh` first.",
+                requested={"op": "mutation", "operations": len(operations)},
             )
-        # No resolution-affecting op: current-view resolution == apply-time
-        # resolution, so resolve each proto target with BN's REAL lookup and
-        # refuse the ones that would irreversibly pin has_user_type.
-        unrevertible = _unrevertible_preview_prototypes(ctx, bv, operations)
-        if unrevertible:
-            names = ", ".join(unrevertible)
-            raise OperationFailure(
-                "unsupported",
-                f"Cannot --preview a prototype change on {names}: setting a "
-                "prototype pins the function's has_user_type flag and Binary "
-                "Ninja exposes no API to clear it, so the preview could not be "
-                "cleanly reverted (it would leave the view modified). Re-run "
-                "without --preview to apply the change, or preview a function "
-                "that already has a user-defined prototype.",
-                requested={"op": "set_prototype", "functions": unrevertible},
-            )
-    # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
-    # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
-    # no argparse layer on this path, guessing is the norm, not the exception. Placed
-    # last among the pre-apply gates so the --quick refusal (target state) and the
-    # #630 preview refusals keep owning their more specific messages; still strictly
-    # before the first mutation, which is the property that matters.
-    for index, op in enumerate(operations):
-        if isinstance(op, dict):
-            _validate_operation_request(ctx, op, index=index)
-    affected = _guess_affected_functions(ctx, bv, operations)
-    # Partition for blast-radius attribution: a type op's reach is "functions
-    # referencing the type"; a direct op targets one function. direct_starts are
-    # the direct ops' targets, so they can be excluded from a type's blast radius.
-    type_ops = [op for op in operations if _is_type_op(op)]
-    direct_starts = _operation_function_starts(
-        ctx, bv, [op for op in operations if isinstance(op, dict) and not _is_type_op(op)]
-    )
-    before = _capture_function_snapshots(ctx, bv, affected)
-    type_before = _capture_type_snapshots(ctx, bv, operations)
-    # Snapshot affected-function locals up front when the batch mutates any
-    # (rename/retype/prototype), so the revert paths can undo BN's name/type
-    # propagation onto aliased siblings (see _capture_local_var_snapshots).
-    var_before = (
-        _capture_local_var_snapshots(ctx, bv, affected)
-        if any(
-            isinstance(op, dict)
-            and (op.get("op") or "rename_symbol") in _VAR_DRIFT_OPS
-            for op in operations
-        )
-        else {}
-    )
-    state = bv.begin_undo_actions()
-    results = []
-    # Explicit restores for local var ops, which BN's undo buffer can't
-    # revert (see _run_local_restores). Replayed on every revert path.
-    restores: list = []
-    try:
-        for op in operations:
-            results.append(_apply_operation(ctx, bv, op, restores))
-    except OperationFailure as exc:
-        # Run BOTH revert steps unconditionally: an `and` would short-circuit
-        # past the explicit restores when the undo revert fails, leaving
-        # non-journaled local/prototype changes applied.
-        undo_ok = _revert_undo_safely(ctx, bv, state)
-        restore_ok = _run_local_restores(ctx, bv, restores)
-        drift_ok = _restore_local_var_drift(ctx, bv, var_before)
-        # #630: an already-applied set_prototype on an AUTO function leaves an
-        # unclearable has_user_type override after revert. That is real residue,
-        # not a clean revert, so it must fail and be disclosed here too -- the
-        # apply-failure path previously reported status "reverted"/rolled_back
-        # True with no disclosure at all.
-        proto_residue = _prototype_user_type_residue(ctx, bv, results)
-        values_reverted = undo_ok and restore_ok and drift_ok
-        reverted = values_reverted and not proto_residue
-        if values_reverted and not proto_residue:
-            message = "Rolled back before post-state verification because an operation failed to apply."
-            result_note = "Rolled back before post-state verification."
-            result_status = "reverted"
-        elif values_reverted and proto_residue:
-            message = (
-                "An operation failed to apply; the applied operations were rolled "
-                "back but BN cannot clear the has_user_type override an applied "
-                "prototype set, so the view is left modified."
-            )
-            result_note = "Rolled back, but an unclearable has_user_type override remains."
-            result_status = "rollback_failed"
-        else:
-            message = (
-                "An operation failed to apply AND the rollback itself failed; "
-                "the view may be left partially modified."
-            )
-            result_note = "Rollback failed; this operation may still be applied."
-            result_status = "rollback_failed"
-        result = {
-            "preview": preview,
-            "success": False,
-            "committed": False,
-            "rolled_back": reverted,
-            "message": message,
-            "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
-            + [_operation_failure_result(ctx, operations[len(results)], exc)],
-            "affected_functions": [],
-            "affected_types": [],
-            "affected_summary": {
-                "referenced": _count_referenced_functions(ctx, bv, type_ops, fallback=0),
-                "reflowed": 0,
-            },
-        }
-        if proto_residue:
-            result["prototype_user_type_residue"] = True
-        return result
-
-    try:
-        bv.update_analysis_and_wait()
-        after = _capture_function_snapshots(ctx, bv, affected)
-        type_after = _capture_type_snapshots(ctx, bv, operations)
-        diffs = _diff_snapshots(ctx, before, after)
-        type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
-        verified_results = [_verify_operation(ctx, bv, result) for result in results]
-        annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
-        failed = _has_failed_results(ctx, annotated_results)
-        # Origin tag: a direct op (rename/prototype/comment) targets a specific
-        # function; mark its affected-function diffs `direct` so a mixed batch
-        # never attributes that function to a type's "referenced by" set.
-        for d in diffs:
-            d["direct"] = _diff_function_start(d) in direct_starts
-        # Blast radius is a TYPE concept, so scope it to the type ops only:
-        # reflowed = type-referencing functions whose body text actually moved;
-        # referenced = uncapped distinct functions referencing the type(s) (so a
-        # struct used by 200 functions reads as 200, not the 10-fn snapshot cap).
-        # A batch with no type op reports referenced=0 (no blast line).
-        reflowed = sum(1 for d in diffs if d.get("changed") and not d.get("direct"))
-        referenced = (
-            _count_referenced_functions(ctx, bv, type_ops,
-                                        fallback=sum(1 for d in diffs if not d.get("direct")))
-            if type_ops else 0
-        )
-        restored = True
-        proto_residue = False
-        if preview or failed:
-            # Use the safe helper, not a bare bv.revert_undo_actions: a raise
-            # from the undo revert must be absorbed into a structured result
-            # (rolled_back=False), not escape as a generic bridge error, and
-            # journaled-undo failure alone must flip `restored` even when the
-            # local/drift restores succeed -- fold all three like the
-            # apply-failure path does (#598).
-            undo_ok = _revert_undo_safely(ctx, bv, state)
-            # Targeted/prototype restores first, then mop up BN's propagation
-            # onto aliased siblings; all must succeed for a clean revert.
-            restore_ok = _run_local_restores(ctx, bv, restores)
-            # Settle analysis before reading var drift (#581). revert_undo_actions
-            # restores provenance, but BN only re-derives an AUTO variable's
-            # name/type on the next pass; _run_local_restores skips reanalysis
-            # when it had no restores (the blast-radius case), so a stale read
-            # here would see phantom drift and re-pin an AUTO local as USER.
-            if var_before:
-                try:
-                    bv.update_analysis_and_wait()
-                except Exception as exc:
-                    bn.log_error(
-                        f"BN Agent Bridge: reanalysis before var-drift check failed: {exc!r}"
+        # #630: a --preview of a prototype set on a function with no user type would
+        # pin has_user_type, which BN cannot clear -- so the preview could not honor
+        # its non-destructive contract. Refuse BEFORE touching the view (pristine, no
+        # residue) rather than apply and report a false clean rollback. Non-preview
+        # applies are unaffected: committing a prototype SHOULD leave it a user type.
+        if preview:
+            proto_ops = [
+                op for op in operations
+                if isinstance(op, dict) and op.get("op") == "set_prototype"
+            ]
+            # Round-5 conservative rule: if the same --preview batch also carries any
+            # op that could move function/symbol name-or-address resolution (a rename,
+            # a symbol/function create, or an unknown op), the target a set_prototype
+            # will hit at apply time cannot be PROVEN from the pre-mutation view, so
+            # reversibility of an AUTO-prototype pin can't be guaranteed. Refuse the
+            # whole preview up front rather than simulate BN's resolver (which four
+            # review rounds proved unsound). Over-refusal is acceptable here.
+            offending = _resolution_affecting_op(operations) if proto_ops else None
+            if offending is not None:
+                offending_op, is_known = offending
+                if is_known:
+                    # A recognized rename / symbol-or-function create.
+                    cause = (
+                        f"a rename or a symbol/function create ({offending_op})"
                     )
+                else:
+                    # An unknown/future (or malformed) op: NOT a rename/create, but not
+                    # on the resolution-safe whitelist either, so we cannot prove it
+                    # leaves resolution untouched. Name it as such rather than falsely
+                    # blaming a rename (#630 follow-up).
+                    cause = (
+                        f"the operation {offending_op!r}, which is not on the "
+                        "resolution-safe whitelist and so may change how a symbol "
+                        "resolves"
+                    )
+                raise OperationFailure(
+                    "unsupported",
+                    f"Cannot --preview a prototype change together with {cause} in "
+                    "the same batch: it can change how the prototype target resolves "
+                    "at apply time, so a clean, reversible preview cannot be proven "
+                    "from the pre-mutation view (setting a prototype pins the "
+                    "function's has_user_type flag, which Binary Ninja exposes no API "
+                    "to clear). Apply the other change(s) and the prototype change in "
+                    "separate previews, or re-run without --preview to commit.",
+                    requested={
+                        "op": "set_prototype",
+                        "reason": "batch_changes_symbol_resolution",
+                        "offending_op": offending_op,
+                    },
+                )
+            # No resolution-affecting op: current-view resolution == apply-time
+            # resolution, so resolve each proto target with BN's REAL lookup and
+            # refuse the ones that would irreversibly pin has_user_type.
+            unrevertible = _unrevertible_preview_prototypes(ctx, bv, operations)
+            if unrevertible:
+                names = ", ".join(unrevertible)
+                raise OperationFailure(
+                    "unsupported",
+                    f"Cannot --preview a prototype change on {names}: setting a "
+                    "prototype pins the function's has_user_type flag and Binary "
+                    "Ninja exposes no API to clear it, so the preview could not be "
+                    "cleanly reverted (it would leave the view modified). Re-run "
+                    "without --preview to apply the change, or preview a function "
+                    "that already has a user-defined prototype.",
+                    requested={"op": "set_prototype", "functions": unrevertible},
+                )
+        # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
+        # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
+        # no argparse layer on this path, guessing is the norm, not the exception. Placed
+        # last among the pre-apply gates so the --quick refusal (target state) and the
+        # #630 preview refusals keep owning their more specific messages; still strictly
+        # before the first mutation, which is the property that matters.
+        for index, op in enumerate(operations):
+            if isinstance(op, dict):
+                _validate_operation_request(ctx, op, index=index)
+        affected = _guess_affected_functions(ctx, bv, operations)
+        # Partition for blast-radius attribution: a type op's reach is "functions
+        # referencing the type"; a direct op targets one function. direct_starts are
+        # the direct ops' targets, so they can be excluded from a type's blast radius.
+        type_ops = [op for op in operations if _is_type_op(op)]
+        direct_starts = _operation_function_starts(
+            ctx, bv, [op for op in operations if isinstance(op, dict) and not _is_type_op(op)]
+        )
+        before = _capture_function_snapshots(ctx, bv, affected)
+        type_before = _capture_type_snapshots(ctx, bv, operations)
+        # Snapshot affected-function locals up front when the batch mutates any
+        # (rename/retype/prototype), so the revert paths can undo BN's name/type
+        # propagation onto aliased siblings (see _capture_local_var_snapshots).
+        var_before = (
+            _capture_local_var_snapshots(ctx, bv, affected)
+            if any(
+                isinstance(op, dict)
+                and (op.get("op") or "rename_symbol") in _VAR_DRIFT_OPS
+                for op in operations
+            )
+            else {}
+        )
+        state = bv.begin_undo_actions()
+        results = []
+        # Explicit restores for local var ops, which BN's undo buffer can't
+        # revert (see _run_local_restores). Replayed on every revert path.
+        restores: list = []
+        try:
+            for op in operations:
+                results.append(_apply_operation(ctx, bv, op, restores))
+        except OperationFailure as exc:
+            # Run BOTH revert steps unconditionally: an `and` would short-circuit
+            # past the explicit restores when the undo revert fails, leaving
+            # non-journaled local/prototype changes applied.
+            undo_ok = _revert_undo_safely(ctx, bv, state)
+            restore_ok = _run_local_restores(ctx, bv, restores)
+            _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
-            # #630: a proto set on a function that had NO prior user type pins
-            # has_user_type, and neither BN's undo nor set_auto_type clears the
-            # flag (verified live on BN 5.4) -- there is no BN API to clear it.
-            # has_user_type is behaviorally meaningful (once set, analysis will
-            # not re-derive the signature), NOT value-neutral metadata, so residue
-            # means the rollback is INCOMPLETE -- fold it into `restored` so the
-            # batch reports success:false / rolled_back:false and is marked dirty,
-            # never a false clean rollback. A --preview never reaches here for the
-            # AUTO-prototype case (it is refused before any mutation); this covers
-            # the INVOLUNTARY rollback of a live batch (a sibling op failed
-            # verification) that included a proto-set-on-AUTO op.
-            #
-            # `values_reverted` (the reversible ops) is tracked separately so the
-            # per-op restamp still reports a rename/local that DID revert as
-            # "reverted", not "rollback_failed".
+            # #630: an already-applied set_prototype on an AUTO function leaves an
+            # unclearable has_user_type override after revert. That is real residue,
+            # not a clean revert, so it must fail and be disclosed here too -- the
+            # apply-failure path previously reported status "reverted"/rolled_back
+            # True with no disclosure at all.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
             values_reverted = undo_ok and restore_ok and drift_ok
-            restored = values_reverted and not proto_residue
-        else:
-            values_reverted = True
-            bv.commit_undo_actions(state)
-
-        # Build the per-op output only once the revert outcome is known. On
-        # success the canonical type layout lives in affected_types, so slim the
-        # redundant copies out. On a rolled-back LIVE batch, re-stamp the ops that
-        # verified cleanly -- the whole batch was undone, so they are no longer
-        # "verified"/"noop" (#602). A preview keeps its verified evidence (its
-        # non-commit is already advertised).
-        if not failed:
-            output_results = [_slim_type_result_for_output(item) for item in annotated_results]
-        elif preview:
-            output_results = annotated_results
-        else:
-            output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
-        message = None
-        if preview:
-            if not values_reverted:
+            reverted = values_reverted and not proto_residue
+            if values_reverted and not proto_residue:
+                message = "Rolled back before post-state verification because an operation failed to apply."
+                result_note = "Rolled back before post-state verification."
+                result_status = "reverted"
+            elif values_reverted and proto_residue:
                 message = (
-                    "Preview verified, but reverting a non-journaled change "
-                    "(local variable or prototype) failed; the view may be left modified."
-                )
-            elif proto_residue:
-                # Value reverted, but has_user_type stuck (BN has no API to clear
-                # it), so the revert is INCOMPLETE and the view is left modified.
-                message = (
-                    "Preview verified and the prototype value was reverted, but the "
-                    "function's has_user_type override could NOT be cleared (Binary "
-                    "Ninja exposes no API to clear it); the view is left modified and "
-                    "BN will no longer re-derive that signature."
-                )
-            else:
-                message = "Preview verified and reverted."
-        elif failed:
-            if not values_reverted:
-                message = (
-                    "Live-session verification failed AND reverting a non-journaled change "
-                    "(local variable or prototype) failed; the view may be left modified."
-                )
-            elif proto_residue:
-                message = (
-                    "Live-session verification failed; the prototype value was rolled "
-                    "back but BN cannot clear the has_user_type override the applied "
+                    "An operation failed to apply; the applied operations were rolled "
+                    "back but BN cannot clear the has_user_type override an applied "
                     "prototype set, so the view is left modified."
                 )
+                result_note = "Rolled back, but an unclearable has_user_type override remains."
+                result_status = "rollback_failed"
             else:
-                message = "Rolled back because live-session verification failed."
-        else:
-            message = "Applied and verified in the live Binary Ninja session."
-        # A preview/rollback whose non-journaled restore failed OR that left an
-        # unclearable has_user_type override behind did NOT cleanly revert -- that
-        # is not a success, even if every operation verified. Automation keys off
-        # `success`; `restored` is only False on the preview/failed paths.
-        result = {
-            "preview": preview,
-            "success": (not failed) and restored,
-            "committed": bool((not preview) and (not failed)),
-            "message": message,
-            "results": output_results,
-            "affected_functions": diffs,
-            "affected_types": type_diffs,
-            "affected_summary": {"referenced": referenced, "reflowed": reflowed},
-            # #652: `rolled_back` used to be present in every case EXCEPT success, so
-            # a parser written against a preview or a failure -- the cases you develop
-            # against -- raised KeyError on the happy path. Always emit it (False when
-            # committed), matching the read-command contract where paging keys are
-            # present regardless of outcome.
-            "rolled_back": restored if (preview or failed) else False,
-        }
-        if proto_residue:
-            # Structured disclosure of the unclearable has_user_type override, in
-            # addition to success:false / rolled_back:false (#630).
-            result["prototype_user_type_residue"] = True
-        return result
-    except Exception as exc:
-        undo_ok = _revert_undo_safely(ctx, bv, state)
-        restore_ok = _run_local_restores(ctx, bv, restores)
-        drift_ok = _restore_local_var_drift(ctx, bv, var_before)
-        # #630 round 2: even when the value revert succeeds, an already-applied
-        # set_prototype on an AUTO function leaves an unclearable has_user_type
-        # override -- BN's undo and set_auto_type both restore the value but leave
-        # the flag pinned, and there is no API to clear it. That residue leaves the
-        # view MODIFIED, so disclose it on the raised error; the bridge shim keys
-        # off the attribute to mark the view dirty, or `close` would read
-        # bv.file.modified == false and wrongly report no unsaved state.
-        proto_residue = _prototype_user_type_residue(ctx, bv, results)
-        if not (undo_ok and restore_ok and drift_ok):
-            err = RuntimeError(
-                f"{exc} (additionally, rollback failed; the view may be left partially modified)"
-            )
+                message = (
+                    "An operation failed to apply AND the rollback itself failed; "
+                    "the view may be left partially modified."
+                )
+                result_note = "Rollback failed; this operation may still be applied."
+                result_status = "rollback_failed"
+            result = {
+                "preview": preview,
+                "success": False,
+                "committed": False,
+                "rolled_back": reverted,
+                "message": message,
+                "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
+                + [_operation_failure_result(ctx, operations[len(results)], exc)],
+                "affected_functions": [],
+                "affected_types": [],
+                "affected_summary": {
+                    "referenced": _count_referenced_functions(ctx, bv, type_ops, fallback=0),
+                    "reflowed": 0,
+                },
+            }
             if proto_residue:
-                err.prototype_user_type_residue = True
-            raise err from exc
-        if proto_residue:
-            # Keep the original exception's information; annotate it so the bridge
-            # marks the view dirty. Isolate the attribute write from the re-raise so
-            # an exception whose type rejects attribute assignment (rare builtins)
-            # falls back to a wrapper rather than being mistaken for a set failure.
-            try:
-                exc.prototype_user_type_residue = True
-            except (AttributeError, TypeError):
-                err = RuntimeError(str(exc))
-                err.prototype_user_type_residue = True
+                result["prototype_user_type_residue"] = True
+            return result
+
+    # #628: the reanalysis after a successful apply is the long pole on a large
+    # target and changes nothing we snapshot here -- it runs under the write gate
+    # alone (still held by the caller, so no second writer can start), leaving
+    # concurrent reads live. The post-analysis snapshot/verify/commit phase below
+    # re-takes the exclusive lock: a reader must never observe half-verified or
+    # half-reverted state.
+    try:
+        bv.update_analysis_and_wait()
+        with exclusive_scope():
+            after = _capture_function_snapshots(ctx, bv, affected)
+            type_after = _capture_type_snapshots(ctx, bv, operations)
+            diffs = _diff_snapshots(ctx, before, after)
+            type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
+            verified_results = [_verify_operation(ctx, bv, result) for result in results]
+            annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
+            failed = _has_failed_results(ctx, annotated_results)
+            # Origin tag: a direct op (rename/prototype/comment) targets a specific
+            # function; mark its affected-function diffs `direct` so a mixed batch
+            # never attributes that function to a type's "referenced by" set.
+            for d in diffs:
+                d["direct"] = _diff_function_start(d) in direct_starts
+            # Blast radius is a TYPE concept, so scope it to the type ops only:
+            # reflowed = type-referencing functions whose body text actually moved;
+            # referenced = uncapped distinct functions referencing the type(s) (so a
+            # struct used by 200 functions reads as 200, not the 10-fn snapshot cap).
+            # A batch with no type op reports referenced=0 (no blast line).
+            reflowed = sum(1 for d in diffs if d.get("changed") and not d.get("direct"))
+            referenced = (
+                _count_referenced_functions(ctx, bv, type_ops,
+                                            fallback=sum(1 for d in diffs if not d.get("direct")))
+                if type_ops else 0
+            )
+            restored = True
+            proto_residue = False
+            if preview or failed:
+                # Use the safe helper, not a bare bv.revert_undo_actions: a raise
+                # from the undo revert must be absorbed into a structured result
+                # (rolled_back=False), not escape as a generic bridge error, and
+                # journaled-undo failure alone must flip `restored` even when the
+                # local/drift restores succeed -- fold all three like the
+                # apply-failure path does (#598).
+                undo_ok = _revert_undo_safely(ctx, bv, state)
+                # Targeted/prototype restores first, then mop up BN's propagation
+                # onto aliased siblings; all must succeed for a clean revert.
+                restore_ok = _run_local_restores(ctx, bv, restores)
+                _settle_before_drift_restore(bv, var_before)
+                drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+                # #630: a proto set on a function that had NO prior user type pins
+                # has_user_type, and neither BN's undo nor set_auto_type clears the
+                # flag (verified live on BN 5.4) -- there is no BN API to clear it.
+                # has_user_type is behaviorally meaningful (once set, analysis will
+                # not re-derive the signature), NOT value-neutral metadata, so residue
+                # means the rollback is INCOMPLETE -- fold it into `restored` so the
+                # batch reports success:false / rolled_back:false and is marked dirty,
+                # never a false clean rollback. A --preview never reaches here for the
+                # AUTO-prototype case (it is refused before any mutation); this covers
+                # the INVOLUNTARY rollback of a live batch (a sibling op failed
+                # verification) that included a proto-set-on-AUTO op.
+                #
+                # `values_reverted` (the reversible ops) is tracked separately so the
+                # per-op restamp still reports a rename/local that DID revert as
+                # "reverted", not "rollback_failed".
+                proto_residue = _prototype_user_type_residue(ctx, bv, results)
+                values_reverted = undo_ok and restore_ok and drift_ok
+                restored = values_reverted and not proto_residue
+            else:
+                values_reverted = True
+                bv.commit_undo_actions(state)
+
+            # Build the per-op output only once the revert outcome is known. On
+            # success the canonical type layout lives in affected_types, so slim the
+            # redundant copies out. On a rolled-back LIVE batch, re-stamp the ops that
+            # verified cleanly -- the whole batch was undone, so they are no longer
+            # "verified"/"noop" (#602). A preview keeps its verified evidence (its
+            # non-commit is already advertised).
+            if not failed:
+                output_results = [_slim_type_result_for_output(item) for item in annotated_results]
+            elif preview:
+                output_results = annotated_results
+            else:
+                output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
+            message = None
+            if preview:
+                if not values_reverted:
+                    message = (
+                        "Preview verified, but reverting a non-journaled change "
+                        "(local variable or prototype) failed; the view may be left modified."
+                    )
+                elif proto_residue:
+                    # Value reverted, but has_user_type stuck (BN has no API to clear
+                    # it), so the revert is INCOMPLETE and the view is left modified.
+                    message = (
+                        "Preview verified and the prototype value was reverted, but the "
+                        "function's has_user_type override could NOT be cleared (Binary "
+                        "Ninja exposes no API to clear it); the view is left modified and "
+                        "BN will no longer re-derive that signature."
+                    )
+                else:
+                    message = "Preview verified and reverted."
+            elif failed:
+                if not values_reverted:
+                    message = (
+                        "Live-session verification failed AND reverting a non-journaled change "
+                        "(local variable or prototype) failed; the view may be left modified."
+                    )
+                elif proto_residue:
+                    message = (
+                        "Live-session verification failed; the prototype value was rolled "
+                        "back but BN cannot clear the has_user_type override the applied "
+                        "prototype set, so the view is left modified."
+                    )
+                else:
+                    message = "Rolled back because live-session verification failed."
+            else:
+                message = "Applied and verified in the live Binary Ninja session."
+            # A preview/rollback whose non-journaled restore failed OR that left an
+            # unclearable has_user_type override behind did NOT cleanly revert -- that
+            # is not a success, even if every operation verified. Automation keys off
+            # `success`; `restored` is only False on the preview/failed paths.
+            result = {
+                "preview": preview,
+                "success": (not failed) and restored,
+                "committed": bool((not preview) and (not failed)),
+                "message": message,
+                "results": output_results,
+                "affected_functions": diffs,
+                "affected_types": type_diffs,
+                "affected_summary": {"referenced": referenced, "reflowed": reflowed},
+                # #652: `rolled_back` used to be present in every case EXCEPT success, so
+                # a parser written against a preview or a failure -- the cases you develop
+                # against -- raised KeyError on the happy path. Always emit it (False when
+                # committed), matching the read-command contract where paging keys are
+                # present regardless of outcome.
+                "rolled_back": restored if (preview or failed) else False,
+            }
+            if proto_residue:
+                # Structured disclosure of the unclearable has_user_type override, in
+                # addition to success:false / rolled_back:false (#630).
+                result["prototype_user_type_residue"] = True
+            return result
+    except Exception as exc:
+        with exclusive_scope():
+            undo_ok = _revert_undo_safely(ctx, bv, state)
+            restore_ok = _run_local_restores(ctx, bv, restores)
+            _settle_before_drift_restore(bv, var_before)
+            drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+            # #630 round 2: even when the value revert succeeds, an already-applied
+            # set_prototype on an AUTO function leaves an unclearable has_user_type
+            # override -- BN's undo and set_auto_type both restore the value but leave
+            # the flag pinned, and there is no API to clear it. That residue leaves the
+            # view MODIFIED, so disclose it on the raised error; the bridge shim keys
+            # off the attribute to mark the view dirty, or `close` would read
+            # bv.file.modified == false and wrongly report no unsaved state.
+            proto_residue = _prototype_user_type_residue(ctx, bv, results)
+            if not (undo_ok and restore_ok and drift_ok):
+                err = RuntimeError(
+                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
+                )
+                if proto_residue:
+                    err.prototype_user_type_residue = True
                 raise err from exc
+            if proto_residue:
+                # Keep the original exception's information; annotate it so the bridge
+                # marks the view dirty. Isolate the attribute write from the re-raise so
+                # an exception whose type rejects attribute assignment (rare builtins)
+                # falls back to a wrapper rather than being mistaken for a set failure.
+                try:
+                    exc.prototype_user_type_residue = True
+                except (AttributeError, TypeError):
+                    err = RuntimeError(str(exc))
+                    err.prototype_user_type_residue = True
+                    raise err from exc
         raise
 
 
