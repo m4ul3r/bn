@@ -1128,10 +1128,10 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "b15c995b",  # - **Nested tables are canonical too:** a pointer table embedded 
         "b3400709",  # - **Project-internal wrappers — model them so taint follows them
         "c5e2eebe",  # - `bn function create <address> [--preview]` forces Binary Ninja
+        "c9c89baf",  # - **Nothing-found vs incomplete (don't confuse them):** `items: 
         "ceb51492",  # --field ... --field ... --field ...
         "d3e7db45",  # - Two more signals from the same demotion logic: ... true` when 
         "dd81c5c0",  # - **Width-sensitive reads — trust `bn disasm`, not the ... Pseud
-        "dfa3a380",  # - **Nothing-found vs incomplete (don't confuse them):** `items: 
         "e190b0f0",  # bn evidence orient # one-shot triage digest under a single read 
         "e2f2e169",  # bn trace main ... --arg ... # intra: stops at call boundary
         "ec1c6720",  # bn taint forward -f <fn> --source ... [--sink-class ... # untrus
