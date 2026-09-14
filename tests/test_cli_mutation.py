@@ -2705,7 +2705,7 @@ def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
 
 
 def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
-    """Every occurrence of the reply's result key in `cli.py`, and the names
+    """Every occurrence of the reply's result key in *tree*, and the names
     bound to it.
 
     An occurrence is a `"result"` constant OR a load of a name bound to one:
@@ -2735,8 +2735,33 @@ def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
     return occurrences, aliases
 
 
-def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
-    """The same lesson one level up: `_unwrap_result` was applied to the reads
+@functools.lru_cache(maxsize=8)
+def _module_tree(path: Path) -> ast.Module:
+    """One module under `src/bn`, parsed ONCE.
+
+    Same single-parse discipline as `_cli_tree`: guardedness is keyed on node
+    identity, so two parses produce two sets of nodes and an exemption computed
+    over one of them matches nothing in the other.
+    """
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+# Every module that reads a `result` off a bridge reply. The guard below used to
+# sweep `cli.py` alone, which is why TEN shipped sites in three sibling modules
+# sat outside it -- `target list` raising the documented-as-2 condition as a
+# bare `KeyError` for exit 1 plus a traceback, and `target use` diagnosing a
+# valid selector as unknown off a missing envelope.
+_RESULT_READING_MODULES = (
+    "src/bn/cli.py",
+    "src/bn/commands/admin.py",
+    "src/bn/commands/misc.py",
+    "src/bn/client.py",
+)
+
+
+@pytest.mark.parametrize("module", _RESULT_READING_MODULES)
+def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper(module):
+    """The same lesson one level up: `unwrap_result` was applied to the reads
     its author was looking at, and the fan-out planner's fourth read still
     indexed the reply raw, so `{"ok": true}` with no `result` left `main()` as a
     bare `KeyError`.
@@ -2752,22 +2777,38 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
     unpacking. Everything else that mentions the key -- a subscript, a `.get`, a
     `.pop`, an `in` test, a starred dict, an alias of an alias -- is a read, and
     reads go through the helper.
+
+    A FOURTH cut was the population: one module. The rule now lives in
+    `transport.py`, which all four reading modules already import, and each is
+    swept -- `cli.py` keeps the `_RESULT_ROW_KEY` exemption because it is the
+    module that declares that constant and the only one that WRITES the key.
     """
-    tree = _cli_tree()
-    unwrap = _named("_unwrap_result")
-    assert unwrap is not None, "_unwrap_result is gone; nothing checks the envelope"
+    path = _CLI.parents[2] / module
+    tree = _module_tree(path)
+    is_cli = path == _CLI
+    transport = _module_tree(_CLI.parent / "transport.py")
+    unwrap = next((node for node in ast.walk(transport)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == "unwrap_result"), None)
+    assert unwrap is not None, (
+        "transport.unwrap_result is gone; nothing checks the envelope")
     declared = [node for node in tree.body
                 if isinstance(node, ast.Assign)
                 if any(isinstance(target, ast.Name) and target.id == _RESULT_ROW_KEY_NAME
                        for target in node.targets)]
-    assert (len(declared) == 1 and isinstance(declared[0].value, ast.Constant)
-            and declared[0].value.value == "result"), (
-        f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, at module "
-        "scope, as the literal 'result'; it names the one write this property exempts"
-    )
+    if is_cli:
+        assert (len(declared) == 1 and isinstance(declared[0].value, ast.Constant)
+                and declared[0].value.value == "result"), (
+            f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, at module "
+            "scope, as the literal 'result'; it names the one write this property exempts"
+        )
+    else:
+        assert not declared, (
+            f"{module} declares {_RESULT_ROW_KEY_NAME}; the fan-out row key is "
+            "cli.py's, and a second declaration is a second exemption")
     occurrences, aliases = _result_key_reads(tree)
-    assert aliases == {_RESULT_ROW_KEY_NAME}, (
-        "cli.py binds the reply's result key to more names than the one this "
+    assert aliases <= ({_RESULT_ROW_KEY_NAME} if is_cli else set()), (
+        f"{module} binds the reply's result key to more names than this "
         f"property knows about, and each is a read it cannot see: {sorted(aliases)}"
     )
     starred = {id(inner) for node in ast.walk(tree) if isinstance(node, ast.Starred)
@@ -2780,25 +2821,24 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
         # The write is exempt because its VALUE came from the helper: code that
         # claims this exemption has already put the reply through the envelope
         # check, which is the whole invariant.
-        if isinstance(value, ast.Call) and _callee_names(value) & {"_unwrap_result"}
+        if isinstance(value, ast.Call) and _callee_names(value) & {"unwrap_result"}
         if id(key) in {id(occurrence) for occurrence in occurrences}
     }
     raw = sorted(
-        f"{ast.unparse(node)} at cli.py:{node.lineno}"
+        f"{ast.unparse(node)} at {module}:{node.lineno}"
         for node in occurrences
         if id(node) not in exempt
-        if node is not declared[0].value
-        if not unwrap.lineno <= node.lineno <= (unwrap.end_lineno or unwrap.lineno)
+        if not (declared and node is declared[0].value)
     )
     assert not raw, (
         "these decide what a bridge reply's `result` is without the envelope "
         "helper, so a reply that carries none is read as a raw KeyError or as a "
         f"silent None: {raw}"
     )
-    assert len(exempt) == 1, (
-        "the one exempt write -- the fan-out row keyed to `_unwrap_result`'s "
-        f"return value -- is claimed by {len(exempt)} sites; an exemption no "
-        "site uses is stale, and two sites is two contracts"
+    assert len(exempt) == (1 if is_cli else 0), (
+        "the one exempt write -- the fan-out row keyed to `unwrap_result`'s "
+        f"return value -- is claimed by {len(exempt)} sites in {module}; an "
+        "exemption no site uses is stale, and two sites is two contracts"
     )
 
 

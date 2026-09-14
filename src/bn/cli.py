@@ -50,6 +50,7 @@ from .transport import (  # noqa: F401
     list_instances,
     send_request,
     spawn_instance,
+    unwrap_result,
     validate_instance_id,
     wait_for_teardown,
 )
@@ -837,38 +838,11 @@ def _guarded_transform(transform: Callable[[Any], Any] | None, what: str,
 
 
 # The key this CLI WRITES into a fan-out row -- the one legitimate use of the
-# string outside `_unwrap_result`. Named so the guard in
+# string outside `transport.unwrap_result`. Named so the guard in
 # tests/test_cli_mutation.py can exempt exactly this one site instead of
 # exempting a syntactic class: "any dict-literal key" was claimable by a raw
 # read dressed as `response.get(*{"result": None})`.
 _RESULT_ROW_KEY = "result"
-
-
-def _unwrap_result(response: Any, op: str) -> Any:
-    """The `result` an ok reply must carry.
-
-    A reply of `{"ok": true}` with no `result` key is the same version-skew class
-    as a malformed result, and `response["result"]` raised a bare `KeyError` out
-    of `main()`, which catches only :class:`BridgeError`, for exit 1 and a
-    traceback on every output format. The documented code for a response this
-    CLI cannot read is 2.
-
-    Stated precisely, because the earlier wording implied more than it should:
-    the production transport already refuses this shape (`send_request` raises
-    :class:`BridgeError` for an ok reply with no `result`), so through that path
-    the `KeyError` was unreachable. This is the CLI-side half of the same
-    guarantee, and it is not redundant -- it is what makes the guarantee a
-    property of this module rather than of one caller's transport, and every
-    place that reads a `result` off a reply goes through here (pinned by
-    `test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper`).
-    """
-    if not isinstance(response, dict) or "result" not in response:
-        raise BridgeError(
-            f"the bridge reply to {op!r} carries no `result` -- the response was "
-            f"malformed or newer than this CLI, so the outcome could not be "
-            f"determined. Compare the bridge and CLI builds with `bn doctor`."
-        )
-    return response["result"]
 
 
 def _emit_result(
@@ -1091,7 +1065,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    result = _unwrap_result(response, "list_targets")
+    result = unwrap_result(response, "list_targets")
     if not isinstance(result, list):
         raise BridgeError(
             "malformed bridge reply to list_targets (no target list); the "
@@ -1432,7 +1406,7 @@ def _call(
         spawn_missing_named=spawn_missing_named,
         **timeout_kwargs,
     )
-    result = _unwrap_result(response, op)
+    result = unwrap_result(response, op)
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and
     # disclose the switch, instead of returning a confident literal `none`. Only
@@ -1459,7 +1433,7 @@ def _call(
             timeout=retry_timeout,
             resolved=True,
         )
-        result = _unwrap_result(response, op)
+        result = unwrap_result(response, op)
         # An in-band marker so a --format json consumer (which reads stdout, not
         # the stderr note below) can tell the result set came from a regex
         # fallback rather than a literal match (#291.3 review).
@@ -1588,7 +1562,7 @@ def _fanout_call(
 
     def _instance_target_ids(iid: Any) -> list[Any]:
         tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
-        titems = _unwrap_result(tresp, "list_targets")
+        titems = unwrap_result(tresp, "list_targets")
         # Production list_targets always replies with a bare list (see
         # _implicit_target's identical guard) -- a wrong-typed result (an int,
         # a string, ...) must not reach `for t in titems` below as a raw
@@ -1679,7 +1653,7 @@ def _fanout_call(
                 op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
             )
             row.update({"target": target, "ok": True,
-                        _RESULT_ROW_KEY: _unwrap_result(response, op)})
+                        _RESULT_ROW_KEY: unwrap_result(response, op)})
         except BridgeError as exc:
             row.update({"target": tsel, "ok": False, "error": str(exc)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its

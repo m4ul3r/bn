@@ -1506,6 +1506,40 @@ def _send_request_to_instance(
     )
 
 
+def unwrap_result(response: Any, op: str) -> Any:
+    """The `result` an ok reply must carry.
+
+    A reply of `{"ok": true}` with no `result` key is the same version-skew class
+    as a malformed result, and `response["result"]` raised a bare `KeyError` out
+    of `main()`, which catches only :class:`BridgeError`, for exit 1 and a
+    traceback on every output format. The documented code for a response this
+    CLI cannot read is 2.
+
+    Stated precisely, because the earlier wording implied more than it should:
+    the production transport already refuses this shape (`_send_request_to_instance`
+    above raises :class:`BridgeError` for an ok reply with no `result`), so
+    through that path the `KeyError` was unreachable. This is the caller-side
+    half of the same guarantee, and it is not redundant -- it is what makes the
+    guarantee a property of this package rather than of one caller's transport,
+    which is why it lives HERE, beside that check, rather than in `cli.py`: the
+    `Client` surface cannot import `cli` (`bn/__init__` imports `client`, so
+    that edge closes a cycle) and ten shipped sites in `client.py`,
+    `commands/admin.py` and `commands/misc.py` sat outside the rule while it
+    was CLI-private -- one of them, `target list`, raising the documented
+    `KeyError` and another diagnosing a valid selector as unknown off a missing
+    envelope. Every place that reads a `result` off a reply goes through here:
+    `cli.py`, `client.py`, `commands/admin.py` and `commands/misc.py` are swept
+    by `test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper`.
+    """
+    if not isinstance(response, dict) or "result" not in response:
+        raise BridgeError(
+            f"the bridge reply to {op!r} carries no `result` -- the response was "
+            f"malformed or newer than this CLI, so the outcome could not be "
+            f"determined. Compare the bridge and CLI builds with `bn doctor`."
+        )
+    return response["result"]
+
+
 def _find_bn_agent() -> list[str]:
     """Return the command to invoke bn-agent."""
     # Prefer the bn-agent script in the same directory as sys.executable
