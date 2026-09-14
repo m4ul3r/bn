@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
 import json
 import re
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .transport import BridgeError
 
@@ -397,6 +398,27 @@ def _discloses(fn: Callable[..., str] | None = None, *,
             return out + ("\n" if out else "") + note
         return rendered
     return decorate if fn is None else decorate(fn)
+
+
+@contextlib.contextmanager
+def disclosure_boundary() -> Iterator[list[str]]:
+    """``@_discloses``, opened explicitly for a consumer that is NOT a renderer.
+
+    The decorator is the boundary for everything that RETURNS text. The xrefs
+    pipe note is the other shape: ``cli._call`` hands the SAME raw payload to a
+    second consumer that answers a note-or-``None`` on stderr, and
+    ``_record_skew`` is a no-op with no boundary on the stack -- so a skewed ref
+    bucket coerced to ``[]``, counted zero caller groups, and the note reported
+    "nothing was truncated" while the body renderer was disclosing that same
+    payload as malformed. Yields the list the skew is recorded into, so the
+    caller can state the third answer (unreadable) instead of the confident one.
+    """
+    skewed: list[str] = []
+    token = _SKEWED_FIELDS.set(skewed)
+    try:
+        yield skewed
+    finally:
+        _SKEWED_FIELDS.reset(token)
 
 
 def _discloses_in_summary(fn: Callable[..., Any]) -> Callable[..., Any]:

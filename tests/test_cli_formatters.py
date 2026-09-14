@@ -1032,39 +1032,49 @@ def _tests_added_by_this_branch():
 
 
 def _green_against_the_base_module(deselect):
-    """Which tests in this file PASS against the BASE formatters module.
+    """Which tests in this file PASS against the BASE COMMIT's `bn` package.
 
-    Measured by RUNNING them: the base module is checked out of git into a
-    shadow package that the child's `pythonpath` points at INSTEAD of `src`,
-    and this same file is re-run against it in a child process. Nothing here
+    Measured by RUNNING them: the base package is checked out of git into a
+    shadow tree that the child's `pythonpath` points at INSTEAD of `src`, and
+    this same file is re-run against it in a child process. Nothing here
     consults the declaration it is used to check.
 
     The shadow is installed through pytest's own `pythonpath` ini rather than
     through the environment, because this project SETS that ini to `src`: the
     plugin inserts it at `sys.path[0]` on every run, ahead of anything
     `PYTHONPATH` can reach, so an env-var shadow silently measured the HEAD
-    module and reported every test green on base."""
+    module and reported every test green on base.
+
+    The WHOLE package comes from base, not just `formatters.py`. A shadow that
+    mixed base's `formatters.py` into this branch's package was a chimera that
+    cannot exist: a formatters symbol this branch adds and a command module
+    imports at module scope (`_xrefs`'s `disclosure_boundary`) made
+    `bn.commands.*` unimportable there, so every test that builds the
+    installed-renderer population errored on the import before its subject was
+    reached -- reading as "red on base" for a harness reason, which is the
+    absence-of-evidence mistake this file's own subject is about. "Green at the
+    base commit" is also the claim the declaration below actually makes.
+    """
+    import io
     import os
     import pathlib
-    import shutil
     import subprocess
     import sys
+    import tarfile
     import tempfile
     import xml.etree.ElementTree as ET
 
-    from bn import formatters
-
     here = pathlib.Path(__file__).resolve()
     root = here.parents[1]
-    base_source = subprocess.run(
-        ["git", "-C", str(root), "show", f"{_BASE_SHA}:src/bn/formatters.py"],
-        capture_output=True, text=True, check=True).stdout
-    package = pathlib.Path(formatters.__file__).resolve().parent
+    archive = subprocess.run(
+        ["git", "-C", str(root), "archive", _BASE_SHA, "src/bn"],
+        capture_output=True, check=True).stdout
     with tempfile.TemporaryDirectory() as tmp:
-        shadow = pathlib.Path(tmp) / package.name
-        shutil.copytree(package, shadow,
-                        ignore=shutil.ignore_patterns("__pycache__"))
-        (shadow / "formatters.py").write_text(base_source)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            tar.extractall(tmp)
+        shadow = pathlib.Path(tmp) / "src"
+        assert (shadow / "bn" / "formatters.py").exists(), (
+            "the base package did not extract, so nothing would be measured")
         report = pathlib.Path(tmp) / "base.xml"
         # The node id is spelled RELATIVE to the run's cwd, because that is what
         # pytest collects and therefore the only spelling `--deselect` matches.
@@ -1075,7 +1085,7 @@ def _green_against_the_base_module(deselect):
         node = f"{here.relative_to(root)}::{deselect}"
         subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-             "--no-header", "--tb=no", "-o", f"pythonpath={tmp}",
+             "--no-header", "--tb=no", "-o", f"pythonpath={shadow}",
              f"--junitxml={report}",
              str(here.relative_to(root)), "--deselect", node],
             cwd=root, env=os.environ.copy(), capture_output=True, text=True,
@@ -1097,9 +1107,9 @@ def test_the_green_on_base_declaration_is_not_stale():
     outside its own list for thirteen rounds with the guard green. A
     declaration whose guard cannot fail is this PR's own recurring defect one
     level up, so the set is MEASURED: every test this branch adds is re-run
-    against the base module, and the table must equal exactly what passes
-    there. Add a green-on-base test without declaring it and this fails; keep a
-    name that has gone red on base and this fails too.
+    against the BASE COMMIT's package, and the table must equal exactly what
+    passes there. Add a green-on-base test without declaring it and this fails;
+    keep a name that has gone red on base and this fails too.
 
     ONE exemption, unique by construction: this test is deselected in the child
     run, because measuring it would re-enter the measurement. Its name comes
@@ -1791,7 +1801,8 @@ _ELEMENT_JUNK = (None, 0, 1, True, "s", [], {}, [{"a": 1}], {"a": 1})
 # is false for EVERY transform, because a transform runs before any renderer
 # exists -- and prose cannot go stale loudly. An exemption whose justification
 # is only prose is an exemption nobody re-checks.
-_EXCLUSION_CATEGORIES = ("not-callable", "takes-more-than-a-payload",
+_EXCLUSION_CATEGORIES = ("not-callable", "takes-no-payload",
+                         "takes-more-than-a-payload",
                          "is-a-renderer-factory", "returns-data-not-text")
 _PROBE_EXCLUSIONS = {
     "_render_paged_list_text": (
@@ -1813,19 +1824,33 @@ _PROBE_EXCLUSIONS = {
         "returns-data-not-text",
         "returns DATA (the split ref buckets), not text, so there is no rendering "
         "to absorb; the CLI counts groups with it for a pipe note and hands the "
-        "SAME RAW payload to the body renderer, which discloses the skew. That "
-        "last clause is what makes this legitimate where a transform's is not"),
+        "SAME RAW payload to the body renderer, which discloses the skew. The "
+        "pipe-note consumer additionally opens its own boundary via "
+        "`formatters.disclosure_boundary` and states the unreadable case itself, "
+        "so neither consumer of this payload answers a confident count off a "
+        "bucket it could not read. That is what makes this legitimate where a "
+        "transform's is not"),
     "_group_refs_by_caller": (
         "returns-data-not-text",
         "returns DATA (grouped rows), not text -- same pipe-note path as the "
-        "bucket splitter, and the body renderer likewise still sees the raw "
-        "payload"),
+        "bucket splitter: the body renderer likewise still sees the raw payload, "
+        "and the pipe note opens `formatters.disclosure_boundary` so a skewed "
+        "bucket reports as unreadable rather than as zero hidden groups"),
     "FAILED_MUTATION_STATUSES": (
         "not-callable",
         "a set of status STRINGS the CLI compares an op row against, not a "
         "payload consumer -- there is no render to absorb. Named because "
         "`_probe_renderers` skipping every non-callable SILENTLY is the defect "
         "this list exists to stop"),
+    "disclosure_boundary": (
+        "takes-no-payload",
+        "takes NO argument at all: it is `@_discloses` opened as a context "
+        "manager for a consumer that is not a renderer (the xrefs pipe note, "
+        "which answers a note-or-None on stderr rather than returning a body). "
+        "It reads no payload key, so there is nothing for a payload differential "
+        "to probe -- what it does is make the skew its caller's choke-point "
+        "reads record reach a boundary, which is the property the pipe-note test "
+        "asserts behaviourally"),
 }
 
 
@@ -1848,6 +1873,8 @@ def _exclusion_category_holds(name, category):
     required = [p for p in positional if p.default is p.empty]
     if category == "takes-more-than-a-payload":
         return len(required) > 1
+    if category == "takes-no-payload":
+        return not required
     if len(required) != 1:
         return False           # the two categories below are about the RETURN
     if category == "is-a-renderer-factory":

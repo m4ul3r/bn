@@ -678,6 +678,31 @@ def test_xrefs_text_no_truncation_note_when_under_cap(fake_transport, monkeypatc
     assert "truncat" not in stderr.lower()
 
 
+def test_xrefs_text_pipe_note_states_an_unreadable_bucket_instead_of_zero_hidden(
+        fake_transport, monkeypatch, capsys):
+    """The pipe note and the body renderer consume the SAME raw payload, and the
+    note had no disclosure boundary on the stack: `_record_skew` is a documented
+    no-op without one, so a skewed ref bucket coerced to `[]`, counted zero
+    caller groups, and the note reported "nothing was truncated" at the same
+    moment stdout carried `! malformed code_refs, data_refs fields`. One output,
+    two answers -- and the silent half is the one a piped grep/wc/jq reads."""
+    fake_transport({"xrefs": {"ok": True, "result": {
+        "address": "0x401000", "code_ref_count": 150, "data_ref_count": 3,
+        "code_refs": "bad", "data_refs": "bad",
+    }}})
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True)
+
+    rc = bn.cli.main(["xrefs", "--format", "text", "--target", "active", "log_printf"])
+
+    assert rc == 0
+    stdout, stderr = capsys.readouterr()
+    # The body half already disclosed it ...
+    assert "malformed code_refs, data_refs fields" in stdout, stdout
+    # ... and the stderr half now states the same third answer.
+    assert "unreadable" in stderr, stderr
+    assert "code_refs" in stderr and "data_refs" in stderr, stderr
+
+
 def test_xrefs_text_format_renders_summary(fake_transport, capsys):
     fake_transport({"xrefs": {
         "ok": True,

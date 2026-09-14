@@ -6,6 +6,7 @@ from typing import Any
 
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
 from ..formatters import (
+    disclosure_boundary,
     _render_call_descriptors_text,
     _render_cfg_text,
     _render_surface_text,
@@ -580,9 +581,21 @@ def _xrefs(args: argparse.Namespace) -> int:
         # renders the full body, so nothing is hidden.
         if limit is None or not isinstance(result, dict):
             return None
-        code_refs, data_refs, total_code, total_data = _xref_buckets(result)
-        code_groups = len(_group_refs_by_caller(code_refs))
-        data_groups = len(_group_refs_by_caller(data_refs))
+        # The same payload the body renderer discloses as malformed must not be
+        # reported here as "nothing was truncated": `_record_skew` is a no-op
+        # with no boundary on the stack, so a skewed ref bucket coerced to `[]`,
+        # counted zero caller groups, and this note fell silent -- one output,
+        # two answers, and the silent half is the one the piped consumer reads.
+        with disclosure_boundary() as skewed:
+            code_refs, data_refs, total_code, total_data = _xref_buckets(result)
+            code_groups = len(_group_refs_by_caller(code_refs))
+            data_groups = len(_group_refs_by_caller(data_refs))
+        if skewed:
+            return (
+                f"note: stdout is a pipe -- this xrefs page's {', '.join(sorted(skewed))} "
+                f"arrived unreadable, so whether the display cap hid caller groups "
+                f"could not be determined. Re-run with --format json."
+            )
         hidden = max(0, code_groups - limit) + max(0, data_groups - limit)
         if hidden <= 0:
             return None
