@@ -25,6 +25,7 @@ __all__ = [
     "CliError",
     "BridgeError",
     "VerificationFailed",
+    "Unmeasured",
     "Result",
     "Session",
     "session",
@@ -739,10 +740,23 @@ class VerificationFailed(BnError):
     """bn exit 3: a mutation could not be verified or is unsupported."""
 
 
+class Unmeasured(BnError):
+    """bn exit 4: the mutation applied but its outcome could not be measured."""
+
+
 _EXIT_ERRORS: dict[int, type[BnError]] = {
     1: CliError,
     2: BridgeError,
     3: VerificationFailed,
+    4: Unmeasured,
+}
+
+# The message when bn wrote nothing to either stream. "bn failed" is false for
+# an exit 4: the mutation applied and only its verification is missing, so the
+# default has to carry the read-back instruction rather than a failure claim.
+_EXIT_DEFAULT_MESSAGES: dict[int, str] = {
+    4: ("bn applied the mutation but could not measure the outcome; read the view "
+        "back and `bn save` before closing"),
 }
 
 
@@ -1017,7 +1031,9 @@ class Session:
             if process.returncode:
                 error_type = _EXIT_ERRORS.get(process.returncode, BnError)
                 raise error_type(
-                    stderr_text or stdout_text or "bn failed",
+                    stderr_text
+                    or stdout_text
+                    or _EXIT_DEFAULT_MESSAGES.get(process.returncode, "bn failed"),
                     returncode=process.returncode,
                     argv=argv,
                 )
@@ -1110,7 +1126,8 @@ class Session:
             message = (
                 error_lines[-1]
                 if error_lines
-                else stderr_text or stdout_text.strip() or "bn failed"
+                else stderr_text or stdout_text.strip()
+                or _EXIT_DEFAULT_MESSAGES.get(process.returncode, "bn failed")
             )
             error_type = _EXIT_ERRORS.get(process.returncode, BnError)
             raise error_type(

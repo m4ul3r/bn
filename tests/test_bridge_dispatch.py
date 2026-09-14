@@ -3048,8 +3048,12 @@ def test_start_refuses_to_displace_live_socket(monkeypatch, tmp_path):
     server.listen(1)
     instance.socket_path = sock_path
     try:
-        with pytest.raises(RuntimeError, match="refusing to displace"):
+        with pytest.raises(RuntimeError, match="Refusing to displace") as raised:
             instance.start()
+        # The refusal names WHICH evidence refused: this one is bound AND
+        # accepting, which is distinct from bound-but-not-yet-listening and from
+        # an unprovable answer, and each keeps the file for a different reason.
+        assert "already serving" in str(raised.value), raised.value
         # The live socket file must still be there for its owner.
         assert sock_path.exists()
     finally:

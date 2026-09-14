@@ -57,10 +57,11 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 - `session_state.py` — sticky per-project pins (`instance_id`, `target`) read by `bn instance use` / `bn target use`.
 - `paths.py` — all on-disk locations (cache, instances, sessions, spills, plugin/skills install dirs).
 - `proc_identity.py` — durable process identity (boot id + pid + start ticks) and pidfd-pinned signalling, so the instance registry only ever signals a bridge it actually proved.
+- `socket_evidence.py` — `path_has_bound_socket`: the kernel's own answer (from `/proc/net/unix`) to "is anything BOUND to this path", with `None` for every shape that listing cannot represent. Both processes destroy socket files — the CLI's `gc` sweep and the bridge's own `start()` — and a failed `connect()` cannot answer the question (a socket bound but not yet past `listen` refuses exactly like a leftover file), so a wrong negative unlinks a live bridge's endpoint. Symlinked into `src/bn_agent_bridge/` like `paths.py`, so the unlinking process and the process being unlinked share one rule.
 - `version.py` — the single canonical `VERSION` (derived from `pyproject.toml`, else installed metadata) and the `build_id_*` fingerprints `doctor` compares; symlinked into `src/bn_agent_bridge/` like `paths.py`.
 - `headless.py` — `bn-agent` entry point.
 
-`src/bn_agent_bridge/paths.py` and `version.py` are symlinks to `src/bn/`, so the bridge and CLI agree on filesystem layout and version without duplication.
+`src/bn_agent_bridge/paths.py`, `version.py`, `proc_identity.py` and `socket_evidence.py` are symlinks to `src/bn/`, so the bridge and CLI agree on filesystem layout, version, process identity and socket evidence without duplication.
 
 ### Adding a New Command
 

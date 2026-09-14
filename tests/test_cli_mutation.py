@@ -1344,12 +1344,20 @@ def test_invariant_guard_op_with_its_own_summary_is_measured_and_exits_zero(monk
     assert "warning: unmeasured" not in capsys.readouterr().out
 
 
-def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypatch, capsys):
-    """The transform this guard wraps AGGREGATES wire numbers, so its failure
-    surface includes arithmetic, not just parsing. JSON has no bound on a numeric
-    literal: `1e999` decodes to `float("inf")`, and `int(inf)` raises
-    `OverflowError` -- an `ArithmeticError`, outside the exception set a text
-    renderer can throw. It must still be the documented exit 2, not a traceback.
+def test_a_non_finite_wire_counter_is_refused_like_any_other_unreadable_counter(
+        monkeypatch, capsys):
+    """JSON puts no bound on a numeric literal: `1e999` decodes to
+    `float("inf")` (and `json.dumps` round-trips it as `Infinity`), and
+    `int(inf)` is an `ArithmeticError` rather than the `TypeError`/`ValueError`
+    a string-shaped counter raises.
+
+    The read refuses it instead of raising, so the two unreadable shapes no
+    longer diverge: a verdict exists (this mutation committed, reported no
+    failure, and could not be measured), the field is disclosed by name, and the
+    run is the documented exit 4 -- exactly as for the string-shaped counter in
+    `test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error`.
+    Raising cost the whole render for one field's arithmetic, which is the
+    fabricated-verdict harm inverted.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
@@ -1360,34 +1368,34 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["go", "rename", "--target", "active"])
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose"])
 
-    assert rc == 2
-    assert "malformed or newer than this CLI" in capsys.readouterr().err
+    assert rc == 4
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err, captured.err
+    assert "malformed or newer than this CLI" not in captured.err, captured.err
+    # The unreadable field is named rather than swallowed.
+    assert "go_renamed_candidates" in captured.out, captured.out
 
 
-# The two shapes a counter can arrive in that no count reads out of -- and they
-# take DIFFERENT documented exits, which is precisely why the contract is keyed
-# on "did a classification survive" rather than on "was some field unreadable":
-#
-#   * `"many"` is REFUSED by the read: the count is left unknown and the field
-#     is disclosed by name, so the summary, the status line and the spill status
-#     are all built. The classification stands, and it is a FAILURE -- read from
-#     `success: false` and from a `results[]` row whose status parsed cleanly,
-#     neither of which is the skewed field. Exit 3.
-#   * `float("inf")` -- what `1e999` decodes to -- makes the read RAISE
-#     (`int(inf)` is an `OverflowError`), so no status could be built on any
-#     format. That is the documented one-directional output override: an
-#     undeliverable status replaces the code with 2 and can never turn a failed
-#     or an unmeasured mutation into a clean zero.
-@pytest.mark.parametrize("counter,expected", [("many", 3), (float("inf"), 2)],
+# The two shapes a counter can arrive in that no count reads out of -- `"many"`,
+# which no parse reads, and `float("inf")` (what `1e999` decodes to), whose
+# `int()` is an `ArithmeticError`. BOTH are refused by the read: the count is
+# left unknown and the field is disclosed by name, so the summary, the status
+# line and the spill status are all still built. The classification therefore
+# stands on both, and on this FAILING result that classification is a failure --
+# read from `success: false` and from a `results[]` row whose status parsed
+# cleanly, neither of which is the skewed field. Exit 3 for both, which is also
+# the precedence this contract documents: a failure wins over an unmeasured run,
+# 3 before 4.
+@pytest.mark.parametrize("counter", ["many", float("inf")],
                          ids=["unparseable", "non-finite"])
 @pytest.mark.parametrize("extra", [[], ["--verbose"], ["--summary"],
                                    ["--format", "json"], ["--format", "ndjson"],
                                    ["--out"]],
                          ids=["default", "verbose", "summary", "json", "ndjson", "out"])
 def test_a_failing_mutation_with_an_unreadable_counter_is_still_a_clean_exit(
-        monkeypatch, capsys, tmp_path, extra, counter, expected):
+        monkeypatch, capsys, tmp_path, extra, counter):
     """A FAILING result short-circuits before the summary transform is ever run,
     so the exit-code guard never sees it -- and `_call` then feeds that same
     transform to the renderer AND to the spill-status builder. Every one of
@@ -1422,15 +1430,12 @@ def test_a_failing_mutation_with_an_unreadable_counter_is_still_a_clean_exit(
 
     rc = bn.cli.main(["go", "rename", "--target", "active", *argv])
 
-    assert rc == expected, rc
+    assert rc == 3, rc
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err, captured.err
-    if expected == 2:
-        assert "malformed or newer than this CLI" in captured.err, captured.err
-    else:
-        # The classification survived the delivery step, so the code the
-        # classifier chose is the code the process leaves with.
-        assert "malformed or newer than this CLI" not in captured.err, captured.err
+    # The classification survived the delivery step, so the code the
+    # classifier chose is the code the process leaves with.
+    assert "malformed or newer than this CLI" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize("rows", [5, True, "verified", {"a": 1},
@@ -2700,7 +2705,7 @@ def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
 
 
 def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
-    """Every occurrence of the reply's result key in `cli.py`, and the names
+    """Every occurrence of the reply's result key in *tree*, and the names
     bound to it.
 
     An occurrence is a `"result"` constant OR a load of a name bound to one:
@@ -2730,8 +2735,56 @@ def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
     return occurrences, aliases
 
 
-def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
-    """The same lesson one level up: `_unwrap_result` was applied to the reads
+@functools.lru_cache(maxsize=8)
+def _module_tree(path: Path) -> ast.Module:
+    """One module under `src/bn`, parsed ONCE.
+
+    Same single-parse discipline as `_cli_tree`: guardedness is keyed on node
+    identity, so two parses produce two sets of nodes and an exemption computed
+    over one of them matches nothing in the other.
+    """
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+# Every module under `src/bn` that MENTIONS the reply's result key, DISCOVERED
+# rather than listed. The guard used to sweep `cli.py` alone, which is why TEN
+# shipped sites in three sibling modules sat outside it -- `target list` raising
+# the documented-as-2 condition as a bare `KeyError` for exit 1 plus a
+# traceback, and `target use` diagnosing a valid selector as unknown off a
+# missing envelope. A hand-list would repeat exactly that mistake one scope out:
+# the next module to read an envelope joins the population by EXISTING.
+#
+# `formatters.py` is excluded by NAME and by reason: it never sees a reply. Its
+# two mentions of the key are a fan-out ROW's own field and a `py exec` result
+# payload, both of which this CLI wrote. `transport.py` is excluded because it
+# DEFINES the rule: `unwrap_result`'s own body, and the transport-side
+# `if "result" not in response` check it is the caller-side half of.
+#
+# A module leaves this population by no longer spelling the key -- which is
+# what the ten converted sites did -- and REJOINS it the moment a raw read is
+# added back, which is the failure this is here to catch.
+_RESULT_KEY_EXEMPT_MODULES = {"formatters.py", "transport.py"}
+
+
+def _result_reading_modules():
+    package = _CLI.parent
+    found = []
+    for path in sorted(package.rglob("*.py")):
+        if path.name in _RESULT_KEY_EXEMPT_MODULES:
+            continue
+        occurrences, _aliases = _result_key_reads(_module_tree(path))
+        if occurrences:
+            found.append(str(path.relative_to(package.parents[1])))
+    assert found, "no module under src/bn mentions a reply's result key"
+    return found
+
+
+_RESULT_READING_MODULES = _result_reading_modules()
+
+
+@pytest.mark.parametrize("module", _RESULT_READING_MODULES)
+def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper(module):
+    """The same lesson one level up: `unwrap_result` was applied to the reads
     its author was looking at, and the fan-out planner's fourth read still
     indexed the reply raw, so `{"ok": true}` with no `result` left `main()` as a
     bare `KeyError`.
@@ -2747,22 +2800,38 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
     unpacking. Everything else that mentions the key -- a subscript, a `.get`, a
     `.pop`, an `in` test, a starred dict, an alias of an alias -- is a read, and
     reads go through the helper.
+
+    A FOURTH cut was the population: one module. The rule now lives in
+    `transport.py`, which all four reading modules already import, and each is
+    swept -- `cli.py` keeps the `_RESULT_ROW_KEY` exemption because it is the
+    module that declares that constant and the only one that WRITES the key.
     """
-    tree = _cli_tree()
-    unwrap = _named("_unwrap_result")
-    assert unwrap is not None, "_unwrap_result is gone; nothing checks the envelope"
+    path = _CLI.parents[2] / module
+    tree = _module_tree(path)
+    is_cli = path == _CLI
+    transport = _module_tree(_CLI.parent / "transport.py")
+    unwrap = next((node for node in ast.walk(transport)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == "unwrap_result"), None)
+    assert unwrap is not None, (
+        "transport.unwrap_result is gone; nothing checks the envelope")
     declared = [node for node in tree.body
                 if isinstance(node, ast.Assign)
                 if any(isinstance(target, ast.Name) and target.id == _RESULT_ROW_KEY_NAME
                        for target in node.targets)]
-    assert (len(declared) == 1 and isinstance(declared[0].value, ast.Constant)
-            and declared[0].value.value == "result"), (
-        f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, at module "
-        "scope, as the literal 'result'; it names the one write this property exempts"
-    )
+    if is_cli:
+        assert (len(declared) == 1 and isinstance(declared[0].value, ast.Constant)
+                and declared[0].value.value == "result"), (
+            f"cli.py must declare {_RESULT_ROW_KEY_NAME} exactly once, at module "
+            "scope, as the literal 'result'; it names the one write this property exempts"
+        )
+    else:
+        assert not declared, (
+            f"{module} declares {_RESULT_ROW_KEY_NAME}; the fan-out row key is "
+            "cli.py's, and a second declaration is a second exemption")
     occurrences, aliases = _result_key_reads(tree)
-    assert aliases == {_RESULT_ROW_KEY_NAME}, (
-        "cli.py binds the reply's result key to more names than the one this "
+    assert aliases <= ({_RESULT_ROW_KEY_NAME} if is_cli else set()), (
+        f"{module} binds the reply's result key to more names than this "
         f"property knows about, and each is a read it cannot see: {sorted(aliases)}"
     )
     starred = {id(inner) for node in ast.walk(tree) if isinstance(node, ast.Starred)
@@ -2775,25 +2844,24 @@ def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
         # The write is exempt because its VALUE came from the helper: code that
         # claims this exemption has already put the reply through the envelope
         # check, which is the whole invariant.
-        if isinstance(value, ast.Call) and _callee_names(value) & {"_unwrap_result"}
+        if isinstance(value, ast.Call) and _callee_names(value) & {"unwrap_result"}
         if id(key) in {id(occurrence) for occurrence in occurrences}
     }
     raw = sorted(
-        f"{ast.unparse(node)} at cli.py:{node.lineno}"
+        f"{ast.unparse(node)} at {module}:{node.lineno}"
         for node in occurrences
         if id(node) not in exempt
-        if node is not declared[0].value
-        if not unwrap.lineno <= node.lineno <= (unwrap.end_lineno or unwrap.lineno)
+        if not (declared and node is declared[0].value)
     )
     assert not raw, (
         "these decide what a bridge reply's `result` is without the envelope "
         "helper, so a reply that carries none is read as a raw KeyError or as a "
         f"silent None: {raw}"
     )
-    assert len(exempt) == 1, (
-        "the one exempt write -- the fan-out row keyed to `_unwrap_result`'s "
-        f"return value -- is claimed by {len(exempt)} sites; an exemption no "
-        "site uses is stale, and two sites is two contracts"
+    assert len(exempt) == (1 if is_cli else 0), (
+        "the one exempt write -- the fan-out row keyed to `unwrap_result`'s "
+        f"return value -- is claimed by {len(exempt)} sites in {module}; an "
+        "exemption no site uses is stale, and two sites is two contracts"
     )
 
 
@@ -2982,18 +3050,19 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     returns the identical error is how a version-skew report turns into a
     "the CLI is broken" bug.
 
-    The arrangement is a counter whose read RAISES (`float("inf")`, what `1e999`
-    decodes to: `int(inf)` is an `OverflowError`). That is what "unclassifiable"
-    now means -- no verdict could be derived at all -- and it is the only input
-    class that still reaches this message. A counter the read can REFUSE is
-    disclosed and classified instead, and is exit 4; see
+    The arrangement is a malformed ENVELOPE -- a `results[]` row whose `status`
+    is unhashable, so the classifier's set membership test cannot even be
+    asked. That is what "unclassifiable" now means: no verdict could be derived
+    at all, and after the non-finite fix the malformed-envelope shapes are the
+    classes that still reach this message. EVERY counter shape a read cannot
+    use -- parsing and arithmetic alike -- is refused, disclosed and classified
+    instead; see
     `test_a_refused_counter_is_a_disclosed_unmeasured_run_not_a_bridge_error`.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": True, "committed": True,
-                                       "go_renamed_candidates": float("inf"),
-                                       "results": []}}
+                                       "results": [{"status": ["verification_failed"]}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -3003,7 +3072,7 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     # The advertised escape hatch really is closed on this path ...
     assert rc == 2
     assert json.loads(captured.out).get("ok") is False
-    assert "go_renamed_candidates" not in captured.out
+    assert "verification_failed" not in captured.out
     # ... so the message must not advertise it.
     assert "--format json" not in captured.err, captured.err
     assert "bn doctor" in captured.err, captured.err
@@ -3094,9 +3163,10 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
     status's membership in `FAILED_MUTATION_STATUSES`, the top-level `success`
     flag (which is the OTHER half of the failure verdict, and the half a
     round-21 lens neutralised while this cell stayed green), a row status's
-    readability, a counter's readability (refused and raising, since those
-    diverge), the summary's return type, and the summary's `measured` verdict.
-    A shape that reaches none of those reaches no new code.
+    readability, a counter's readability (every unreadable shape, parsing and
+    arithmetic alike, is refused -- both spellings stay in the population for
+    that reason), the summary's return type, and the summary's `measured`
+    verdict. A shape that reaches none of those reaches no new code.
 
     One shape deliberately outside both lists: a row status the CLI does not
     know (a bridge NEWER than this CLI) classifies as 0, because
@@ -3129,6 +3199,9 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         "row-status-refused": ({**ok, "results": [{"status": 5}]}, _mutation_summary, 4),
         "counter-refused": ({**go, "go_renamed_candidates": "many", "results": []},
                             _go_rename_summary, 4),
+        "counter-refused-non-finite":
+            ({**go, "go_renamed_candidates": float("inf"), "results": []},
+             _go_rename_summary, 4),
         "counter-refused-while-failing":
             ({**go, "success": False, "committed": False,
               "go_renamed_candidates": "many",
@@ -3148,9 +3221,6 @@ def test_exit_2_is_reserved_for_a_mutation_result_that_yields_no_verdict(
         "a-row-is-not-an-object": ({**ok, "results": [5]}, _mutation_summary),
         "a-row-status-is-unhashable":
             ({**ok, "results": [{"status": ["verification_failed"]}]}, _mutation_summary),
-        "counter-read-raises":
-            ({**go, "go_renamed_candidates": float("inf"), "results": []},
-             _go_rename_summary),
         "summary-is-not-an-object": ({**ok, "results": []}, lambda result: "nope"),
         "summary-states-no-verdict": ({**ok, "results": []}, lambda result: {"ok": True}),
     }

@@ -70,7 +70,13 @@ def render_value(value: Any, fmt: str) -> str:
         # trailing {"_meta": true, ...paging...} line -- actual newline-delimited
         # streaming, not the whole envelope collapsed onto a single line (which
         # was identical to compact --format json and defeated the point). (J5)
-        if isinstance(value, dict):
+        # `_meta` is a SENTINEL this fan-out invents, so a payload that already
+        # carries that key cannot be represented: copying the non-page keys into
+        # the trailing record would silently overwrite the caller's own value. An
+        # artifact is the caller's data -- write it whole as one record rather
+        # than a stream that lost a field. Mirrors the bridge-side --out writer,
+        # `_shared.py::_write_json_artifact`; the two must stay interchangeable.
+        if isinstance(value, dict) and "_meta" not in value:
             for page_key in ("items", "functions"):
                 page = value.get(page_key)
                 if isinstance(page, list):

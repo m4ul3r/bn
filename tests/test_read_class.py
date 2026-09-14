@@ -3,8 +3,38 @@ from __future__ import annotations
 import importlib
 import types
 
+import pytest
+
 read_class = importlib.import_module("bn_agent_bridge.read_class")
+seam = importlib.import_module("bn_agent_bridge.seam")
 split = read_class._split_qualified_method
+
+
+@pytest.fixture
+def view_memo_live(monkeypatch):
+    """The precondition the per-view memo tests below actually depend on.
+
+    `seam._view_state` returns None -- caching OFF, every build re-enumerates --
+    whenever `seam.bn` is None, and this module imports `bn_agent_bridge.*`
+    DIRECTLY, so unlike its siblings it never pulls `_bridge_fakes`, which is
+    what installs `sys.modules["binaryninja"]`. The memo assertions therefore
+    used to depend on whether the interpreter happened to find a real
+    `binaryninja`: in a checkout whose venv carries a stray `binaryninja.pth`
+    they measured the memo, and in one built from the lockfile they failed with
+    "a repeat build must not enumerate the view" -- a message that reads like a
+    registry-caching regression and is actually an absent import (#729).
+
+    A stand-in module is enough: `_view_state` only tests `bn` for None; it
+    calls nothing on it. Stated as a fixture, and asserted, so the day the gate
+    grows a second condition these tests say which precondition failed instead
+    of blaming the cache.
+    """
+    if seam.bn is None:
+        monkeypatch.setattr(seam, "bn", types.ModuleType("binaryninja"))
+    assert seam.bn is not None, (
+        "the per-view memo is gated on `seam.bn`; with it None every build "
+        "re-enumerates and the assertions below cannot hold for the reason "
+        "they claim")
 
 
 def test_split_plain_method():
@@ -225,7 +255,7 @@ def _counting_registry_fns():
     ]
 
 
-def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
+def test_class_registry_is_reused_per_view_and_invalidated_by_a_change(view_memo_live):
     """#622 criterion (d): the registry is built ONCE per view and reused -- a
     repeat build, and a filtered one, enumerate nothing -- while BN's own change
     notification forces a rebuild that reflects the rename. Records are handed out
@@ -285,13 +315,19 @@ def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
     assert bv.functions.enumerations == 2, "the change must force exactly one rebuild"
 
 
-def test_class_registry_is_never_cached_without_notification_support():
+def test_class_registry_is_never_cached_without_notification_support(view_memo_live):
     """NEGATIVE CONTROL for the safe-fallback rule -- this passes at the base by
     construction, so it is NOT regression evidence for the cache itself: a view
     with no notification surface has no sound invalidation signal, so it is never
     cached and two builds each enumerate the view. The cache -- reuse while BN
     reports no change, invalidation by BN's own notification -- is pinned by
-    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`."""
+    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`.
+
+    It takes `view_memo_live` for the reason a negative control must: without
+    it this cell passed whenever the memo was OFF ENTIRELY (no `seam.bn`), i.e.
+    it certified the fallback while measuring an environment in which nothing
+    could have been cached anyway. With the gate open, the missing notification
+    surface is the only thing left that can produce the second enumeration."""
     fns = _counting_registry_fns()
     bv = _RegistryBV(fns, [])
     bv.functions = _CountingFunctions(fns)

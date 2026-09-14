@@ -25,7 +25,7 @@ from ..formatters import (
     _render_sections_text,
     _render_strings_text,
 )
-from ..transport import BridgeError
+from ..transport import BridgeError, unwrap_result
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
@@ -465,7 +465,7 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         target=target,
         instance_id=getattr(args, "instance", None),
     )
-    result = response["result"]
+    result = unwrap_result(response, "read")
     hex_payload = result.get("hex") if isinstance(result, dict) else None
     if not isinstance(hex_payload, str):
         raise BridgeError("bridge returned malformed read response (missing 'hex' payload)")

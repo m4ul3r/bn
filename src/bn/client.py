@@ -4,7 +4,7 @@ from collections.abc import Mapping
 import time
 from typing import Any
 
-from .transport import BridgeError, _resolve_timeout, send_request
+from .transport import BridgeError, _resolve_timeout, send_request, unwrap_result
 
 # Distinguishes "no page has reported a total yet" from "a page reported None",
 # which `.get("total")` on an aggregate cannot.
@@ -171,7 +171,7 @@ class Client:
             timeout=timeout,
             **extra,
         )
-        return response["result"]
+        return unwrap_result(response, op)
 
     def request(
         self, op: str, params: Mapping[str, Any] | None = None

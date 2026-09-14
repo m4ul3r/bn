@@ -62,6 +62,7 @@ from .paths import (
 )
 from .proc_identity import identity_payload
 from .seam import BridgeContext
+from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -1070,10 +1071,50 @@ class BinaryNinjaBridge:
             # A stale socket file from a crashed bridge is safe to clear, but a
             # live one belongs to another bridge instance; unlinking it would
             # silently orphan that bridge on an unlinked inode.
-            if self._socket_is_live():
+            #
+            # The two evidences are ASYMMETRIC, and each covers the other's
+            # wrong answer:
+            #
+            # * A FAILED connect() is not proof of absence -- a socket bound
+            #   but not yet past `listen` refuses exactly like a leftover file,
+            #   and every bridge passes through that state coming up -- so the
+            #   kernel's own list of bound paths decides that direction
+            #   (#618/#726).
+            # * A SUCCESSFUL connect() IS proof of presence, and it outranks a
+            #   negative listing answer, because the listing records the name
+            #   `bind` was GIVEN: a listener renamed onto this path is
+            #   reachable here and appears in the listing under its original
+            #   basename, where the lookup filters it out and answers False.
+            #   Base refused that case on the connect alone; dropping the
+            #   connect would have unlinked a reachable endpoint and left its
+            #   owner serving with no pathname.
+            #
+            # So: refuse on either positive, and unlink only when BOTH say
+            # nothing is there.
+            bound = path_has_bound_socket(self.socket_path)
+            live = self._socket_is_live()
+            # `None` means unknowable. Where the listing EXISTS that is a fact
+            # about this path and the file is kept. Where it does not exist at
+            # all (Darwin/BSD) every path answers None, and the strong rule
+            # would make this bridge permanently unstartable on its OWN fixed
+            # socket path after one unclean shutdown, with no in-tool recovery
+            # (`instance gc` retains on an unprovable answer too). A sweep can
+            # skip a file forever at no cost; the process that must BIND that
+            # exact path cannot -- so there the connect() above is the whole
+            # answer, exactly as it was at base.
+            unprovable = bound is None and bound_socket_listing_available()
+            if live or bound or unprovable:
+                if live:
+                    detail = "another bridge is already serving there"
+                elif bound:
+                    detail = ("something is bound there but is not accepting yet "
+                              "(a bridge starting up, or one whose backlog is full)")
+                else:
+                    detail = ("nothing could be proved about it: the kernel's bound-socket "
+                              "listing could not represent this path")
                 raise RuntimeError(
-                    f"Another bridge is already serving on {self.socket_path}; "
-                    "refusing to displace it"
+                    f"Refusing to displace the socket at {self.socket_path}: {detail}. "
+                    "Remove the file by hand only after verifying no bridge owns it."
                 )
             self.socket_path.unlink()
 

@@ -33,7 +33,7 @@ from ..formatters import (
     _render_target_list_text,
     _render_target_use_text,
 )
-from ..transport import BridgeError, _resolve_timeout
+from ..transport import BridgeError, _resolve_timeout, unwrap_result
 
 
 @command("capabilities",
@@ -150,7 +150,7 @@ def _doctor(args: argparse.Namespace) -> int:
                 params={},
                 target=None,
             )
-            ping = response["result"]
+            ping = unwrap_result(response, "doctor")
         except Exception as exc:
             ping = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -397,7 +397,8 @@ def _session_start(args: argparse.Namespace) -> int:
                 },
                 instance_id=instance.instance_id,
             )
-            item = resp.get("result") if isinstance(resp, dict) else None
+            item = unwrap_result(
+                resp, "load_binary_async" if detached else "load_binary")
             valid = (
                 isinstance(item, dict)
                 and (
@@ -499,11 +500,12 @@ def _session_status(args: argparse.Namespace) -> int:
         params={"job_id": getattr(args, "job_id", None)},
         instance_id=instance_id,
     )
-    if not isinstance(response, dict) or not isinstance(response.get("result"), dict):
+    result = unwrap_result(response, "load_status")
+    if not isinstance(result, dict):
         raise BridgeError("malformed load_status response")
     cli._emit_result(
         args,
-        response["result"],
+        result,
         text_renderer=_render_session_status_text,
         stem="session-status",
     )
@@ -649,7 +651,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     try:
         resp = cli._send_request_to_instance(inst, "list_targets", params={}, target=None)
         captured: list[dict[str, Any]] = []
-        for t in (resp.get("result") or []):
+        for t in (unwrap_result(resp, "list_targets") or []):
             path = t.get("filename")
             if path:
                 captured.append({"path": path, "quick": t.get("analysis_state") == "quick"})
@@ -708,7 +710,7 @@ def _session_restart(args: argparse.Namespace) -> int:
                 params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
                 instance_id=instance.instance_id,
             )
-            reloaded.append(r["result"])
+            reloaded.append(unwrap_result(r, "load_binary"))
         except BridgeError as exc:
             reloaded.append({"path": t["path"], "error": str(exc)})
 
@@ -775,11 +777,11 @@ def _associate_project_roots(
             params={"roots": roots},
             instance_id=instance_id,
         )
+        result = unwrap_result(response, "associate_project_roots")
     except BridgeError as exc:
         error = str(exc)
         print(f"warning: project association failed: {error}", file=sys.stderr)
         return [], error
-    result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict):
         error = "bridge returned a malformed project association reply"
         print(f"warning: {error}", file=sys.stderr)
@@ -988,7 +990,7 @@ def _target_list(args: argparse.Namespace) -> int:
         params={},
         instance_id=getattr(args, "instance", None),
     )
-    result = response["result"]
+    result = unwrap_result(response, "list_targets")
     sticky = cli.session_state.read().get("target")
     if sticky and isinstance(result, list):
         for item in result:
@@ -1028,7 +1030,7 @@ def _target_use(args: argparse.Namespace) -> int:
     response = cli.send_request(
         "list_targets", params={}, instance_id=getattr(args, "instance", None)
     )
-    targets = response.get("result") or []
+    targets = unwrap_result(response, "list_targets") or []
     matched = isinstance(targets, list) and any(
         isinstance(item, dict) and _target_matches(item, args.selector) for item in targets
     )

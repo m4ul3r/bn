@@ -2997,7 +2997,7 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # SAFE OR INERT GREEN GUARDS, named because completeness is the point: a
 # mutation of each leaves the fenced files green, and each fails in a
 # direction that keeps rather than destroys, so none is a coverage risk in the
-# sense 1 and 2 are -- `_path_has_bound_socket`'s exact-byte fast path (can
+# sense 1 and 2 are -- `path_has_bound_socket`'s exact-byte fast path (can
 # only weaken a `True` to a `None`, and only `False` authorises an unlink),
 # `_socket_probe`'s `nothing_bound=True` on `ENOENT` (there is nothing left to
 # unlink), `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
@@ -4892,7 +4892,7 @@ def test_a_dead_owners_record_goes_where_no_kernel_can_prove_its_socket_dead(tmp
     monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     # No /proc/net/unix to read: the platform this PR has already shipped two
     # defects to. The kernel cannot be asked, so the answer is UNKNOWABLE.
-    monkeypatch.setattr("bn.transport._path_has_bound_socket", lambda path: None)
+    monkeypatch.setattr("bn.transport.path_has_bound_socket", lambda path: None)
 
     assert list_instances() == []
     assert not record.exists()             # the record goes on its own evidence
@@ -5013,7 +5013,7 @@ def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path
     cannot represent is ``None``, and for a path it can represent only as bytes
     the comparison is done on bytes (#618).
     """
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     for label, raw in ((b"newline", b"root\nwith-newline"), (b"non-utf8", b"root-\xff-byte")):
         root = tmp_path / os.fsdecode(raw)
@@ -5028,7 +5028,7 @@ def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path
         try:
             # Never the positive "nothing is bound" about a socket that is bound:
             # a newline is unrepresentable (None), a raw byte is answered exactly.
-            answer = _path_has_bound_socket(sock_path)
+            answer = path_has_bound_socket(sock_path)
             assert answer is not False, label
 
             summary = gc_instances()       # the registry-less sweep, with no record
@@ -5154,7 +5154,7 @@ def test_a_bound_socket_whose_path_contains_a_space_is_still_found(tmp_path):
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     root = tmp_path / "cache dir"          # a space, exactly where the listing puts it
     root.mkdir()
@@ -5163,9 +5163,9 @@ def test_a_bound_socket_whose_path_contains_a_space_is_still_found(tmp_path):
     server.bind(str(sock_path))
     server.listen(1)
     try:
-        assert _path_has_bound_socket(sock_path) is True
+        assert path_has_bound_socket(sock_path) is True
         # The other direction: a space is not licence to match by prefix either.
-        assert _path_has_bound_socket(root / "never bound.sock") is False
+        assert path_has_bound_socket(root / "never bound.sock") is False
     finally:
         with contextlib.suppress(OSError):
             server.close()
@@ -5187,7 +5187,7 @@ def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     real = tmp_path / "real"
     real.mkdir()
@@ -5200,8 +5200,8 @@ def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
     server.bind(str(sock_path))
     server.listen(1)
     try:
-        assert _path_has_bound_socket(link / "serving.sock") is True
-        assert _path_has_bound_socket(other / "serving.sock") is False
+        assert path_has_bound_socket(link / "serving.sock") is True
+        assert path_has_bound_socket(other / "serving.sock") is False
     finally:
         with contextlib.suppress(OSError):
             server.close()
@@ -5224,7 +5224,7 @@ def test_a_symlink_target_holding_a_newline_is_unknowable_not_unbound(tmp_path):
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     for label, target_name in (("newline", "target\nnewline"), ("plain", "target-plain")):
         target = tmp_path / target_name
@@ -5236,7 +5236,7 @@ def test_a_symlink_target_holding_a_newline_is_unknowable_not_unbound(tmp_path):
         server.bind(str(sock_path))
         server.listen(1)                       # bound AND listening
         try:
-            answer = _path_has_bound_socket(link / "serving.sock")
+            answer = path_has_bound_socket(link / "serving.sock")
             assert answer is (None if label == "newline" else True), label
         finally:
             with contextlib.suppress(OSError):
@@ -5294,7 +5294,7 @@ def test_a_relative_bound_path_is_unknowable_not_unbound(tmp_path, monkeypatch):
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     root = tmp_path / "cache"
     inst_dir = root / "instances"
@@ -5316,9 +5316,9 @@ def test_a_relative_bound_path_is_unknowable_not_unbound(tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)        # a CLI run from anywhere but the binder's cwd
         monkeypatch.setenv("BN_CACHE_DIR", str(root))
 
-        assert _path_has_bound_socket(sock_path) is None
+        assert path_has_bound_socket(sock_path) is None
         # Narrow: the unresolvable row speaks only for its own basename.
-        assert _path_has_bound_socket(inst_dir / "unrelated.sock") is False
+        assert path_has_bound_socket(inst_dir / "unrelated.sock") is False
 
         summary = gc_instances()           # the registry-less orphan sweep
 
@@ -5360,7 +5360,7 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     root = tmp_path / "cache"
     inst_dir = root / "instances"
@@ -5375,9 +5375,9 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
         moved_sock = moved / "instances" / "live.sock"
         monkeypatch.setenv("BN_CACHE_DIR", str(moved))
 
-        assert _path_has_bound_socket(moved_sock) is None
+        assert path_has_bound_socket(moved_sock) is None
         # Only same-basename rows are unanswerable.
-        assert _path_has_bound_socket(moved / "instances" / "other.sock") is False
+        assert path_has_bound_socket(moved / "instances" / "other.sock") is False
 
         summary = gc_instances()           # the registry-less orphan sweep
 
@@ -5417,7 +5417,7 @@ def test_an_at_prefixed_row_is_unknowable_because_the_listing_conflates_two_thin
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     orphan = tmp_path / "orphan.sock"
     orphan.touch()                         # a leftover file, nothing bound to it
@@ -5442,8 +5442,8 @@ def test_an_at_prefixed_row_is_unknowable_because_the_listing_conflates_two_thin
     try:
         assert binder.stdout.readline().strip() == "bound"
         # Indistinguishable rows, so neither may produce the destructive False.
-        assert _path_has_bound_socket(live) is not False
-        assert _path_has_bound_socket(orphan) is None
+        assert path_has_bound_socket(live) is not False
+        assert path_has_bound_socket(orphan) is None
     finally:
         with contextlib.suppress(OSError):
             pinner.close()
@@ -5570,7 +5570,7 @@ def test_a_relative_row_is_unknowable_even_where_the_readers_cwd_resolves_it(tmp
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     binder_root = tmp_path / "binder"
     (binder_root / "instances").mkdir(parents=True)
@@ -5593,7 +5593,7 @@ def test_a_relative_row_is_unknowable_even_where_the_readers_cwd_resolves_it(tmp
         assert binder.stdout.readline().strip() == "bound"
         monkeypatch.chdir(reader_root)
 
-        assert _path_has_bound_socket(live) is None
+        assert path_has_bound_socket(live) is None
     finally:
         binder.kill()
         binder.wait()
@@ -5615,15 +5615,15 @@ def test_a_bound_socket_whose_basename_holds_a_raw_byte_is_found(tmp_path):
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     sock_path = tmp_path / os.fsdecode(b"od\xffd.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(1)
     try:
-        assert _path_has_bound_socket(sock_path) is True
-        assert _path_has_bound_socket(tmp_path / os.fsdecode(b"ot\xffr.sock")) is False
+        assert path_has_bound_socket(sock_path) is True
+        assert path_has_bound_socket(tmp_path / os.fsdecode(b"ot\xffr.sock")) is False
     finally:
         with contextlib.suppress(OSError):
             server.close()
@@ -5696,7 +5696,7 @@ def test_a_socket_bound_under_a_newline_name_is_unknowable_not_unbound(tmp_path)
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     plain = tmp_path / "plain"
     plain.mkdir()
@@ -5707,7 +5707,7 @@ def test_a_socket_bound_under_a_newline_name_is_unknowable_not_unbound(tmp_path)
     server.bind(str(sock_path))            # the kernel records the newline spelling
     server.listen(1)
     try:
-        assert _path_has_bound_socket(sock_path) is None
+        assert path_has_bound_socket(sock_path) is None
     finally:
         with contextlib.suppress(OSError):
             server.close()
@@ -5721,7 +5721,7 @@ def test_an_unreadable_kernel_listing_is_unknowable_not_unbound(tmp_path, monkey
     the one input that makes the source unavailable -- the listing cannot be
     read at all, which is every platform without ``/proc`` -- had no test that
     exercised the real arm: the two "no /proc" tests monkeypatch
-    ``_path_has_bound_socket`` itself, so they ASSUME the answer under test.
+    ``path_has_bound_socket`` itself, so they ASSUME the answer under test.
     Mutating that arm to ``False`` left the whole file green while ``gc``
     unlinked a bound-and-listening socket. The failure of a SOURCE is not
     evidence about the question it was asked (#618).
@@ -5732,7 +5732,7 @@ def test_an_unreadable_kernel_listing_is_unknowable_not_unbound(tmp_path, monkey
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
-    from bn.transport import _path_has_bound_socket
+    from bn.transport import path_has_bound_socket
 
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -5754,7 +5754,7 @@ def test_an_unreadable_kernel_listing_is_unknowable_not_unbound(tmp_path, monkey
     try:
         monkeypatch.setattr(Path, "read_bytes", maybe_unreadable)
 
-        assert _path_has_bound_socket(sock_path) is None
+        assert path_has_bound_socket(sock_path) is None
         assert gc_instances()["sockets_removed"] == 0
         assert sock_path.exists() and leftover.exists()
 

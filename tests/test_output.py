@@ -173,6 +173,24 @@ def test_ndjson_streams_paged_envelope_records():
     assert len(render_value({"text": "x", "name": "f"}, "ndjson").strip().split("\n")) == 1
 
 
+def test_ndjson_does_not_clobber_a_payload_that_carries_its_own_meta():
+    """`_meta` is a sentinel the paging fan-out INVENTS, so a payload already
+    carrying that key cannot be represented as a stream: the trailing record
+    would overwrite the caller's own value. Such a payload falls through to the
+    single-record form, matching the bridge-side `--out` writer
+    (`_shared.py::_write_json_artifact`) so the two stay interchangeable."""
+    from bn.output import render_value
+
+    rendered = render_value(
+        {"items": [{"a": 1}], "total": 1, "_meta": "caller's own"}, "ndjson"
+    )
+    lines = rendered.strip().split("\n")
+    assert len(lines) == 1, lines
+    record = json.loads(lines[0])
+    assert record["_meta"] == "caller's own"
+    assert record["items"] == [{"a": 1}]
+
+
 def test_ndjson_spill_envelope_is_one_json_line(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     payload = [{"i": index} for index in range(1000)]

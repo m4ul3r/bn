@@ -1186,6 +1186,35 @@ def test_reading_reference_documents_hex_string_addresses():
     assert "hex STRING" in text or "hex strings" in text.lower()
 
 
+def test_reading_reference_binds_the_absence_claim_to_the_cap_flag_the_cli_prints():
+    """The reference taught absence from a CAPPED page: "`items: []` + `total: 0`
+    means clean -- nothing found", qualified only for the taint shapes. An
+    `xrefs` page on an import can be empty AND `truncated: true` with a
+    `scan_note` (the budgeted LLIL caller scan), so the flat rule teaches the
+    exact error the CLI's own text output refuses.
+
+    Pinned from both ends: the sentence must bind absence to the cap flags, and
+    the note it QUOTES must be the line the renderer really prints -- delete
+    either half and the doc is quoting text the CLI does not emit."""
+    from bn.formatters import _render_xrefs_text
+
+    quoted = "note: the caller scan was TRUNCATED"
+    text = READING.read_text(encoding="utf-8")
+    assert quoted in text, (
+        "the reading reference no longer quotes the truncation note, so nothing "
+        "tells a reader an empty capped page is unknown rather than absent")
+    assert "truncated: true" in text and "scan_note" in text, (
+        "the absence rule must name the cap flags it is conditional on")
+
+    rendered = _render_xrefs_text({
+        "address": "0x401000", "code_refs": [], "data_refs": [],
+        "code_ref_count": 0, "data_ref_count": 0,
+        "truncated": True, "scan_note": "scan stopped at its budget",
+    })
+    assert quoted in rendered, (
+        f"the reference quotes {quoted!r} but the renderer prints: {rendered}")
+
+
 # ---------------------------------------------------------------------------
 # The mirror of this module's founding defect. Its header records that an
 # OMITTED flag makes agents conclude a shipped feature does not exist -- three

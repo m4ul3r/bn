@@ -778,9 +778,10 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
                 # not be read -- must be flagged: without this an agent reads the
                 # short (or empty) caller list as "no callers found" (#622).
                 # `scan_note` names which of the two actually happened.
-                # Both fields ride the JSON envelope only: the default TEXT
-                # renderers (src/bn/formatters.py) are outside this cluster's fence
-                # and do not surface them yet.
+                # TEXT mode surfaces them too: `formatters._render_xrefs_text`
+                # appends a `note: the caller scan was TRUNCATED` line carrying
+                # `scan_note`, so an empty list cannot read as proof of absence
+                # on either format.
                 extra["truncated"] = True
                 extra["scan_note"] = scan_note
             result = _xref_envelope(
