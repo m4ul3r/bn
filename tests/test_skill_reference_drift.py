@@ -1230,9 +1230,67 @@ _ABSENCE_CLAIM = re.compile(
     re.I)
 
 
-def _absence_claims(text: str) -> set[str]:
-    return {group for match in _ABSENCE_CLAIM.finditer(text)
-            for group in match.groups() if group}
+# One rule, one implementation: a denial binds to the NAME it denies.
+#
+# Rounds 20-22 each closed one instance of the same class -- a guard scoped to a
+# population someone had listed -- and round 23 found the class again one
+# granularity in: the negation was still bound to a text WINDOW rather than to
+# the name it negates. Subtracted DOCUMENT-wide, one denial sentence excused an
+# invented flag inside a runnable fenced example elsewhere in the same file; in
+# `tests/test_agent_docs.py` the same defect read per SENTENCE, so one sentence
+# carrying both a retirement and a positive citation was skipped whole.
+#
+# So a denial is bound by ADJACENCY: the names it covers are the ones its own
+# pattern captures, plus the run of name tokens immediately before it joined by
+# nothing but whitespace, list punctuation, markdown emphasis and a coordinator.
+# A verb or a subordinator ("because") ends the run, so a name on the far side
+# of one is a POSITIVE claim about that name -- and a phrasing the recogniser
+# does not know denies nothing at all, which fails CLOSED for every guard that
+# asks what a document may be excused from naming.
+_SENTENCE = re.compile(r"(?<=[.;:])\s+|\n")
+_COORDINATED = re.compile(r"^[\s,;*_`]*(?:and|or|nor)?[\s,;*_`]*$", re.I)
+
+
+def bound_absence_claims(sentence: str, token: re.Pattern[str],
+                         absence: re.Pattern[str]) -> set[str]:
+    """The names `sentence` denies, bound to the phrase that denies them.
+
+    Shared with `tests/test_agent_docs.py`, which binds retirement claims about
+    test modules through this same function: round 23 found the identical defect
+    in both because the earlier repair had been applied to one and not to its
+    sibling.
+    """
+    names = [(match.start(), match.end(), match[match.lastindex or 0])
+             for match in token.finditer(sentence)]
+    denied: set[str] = set()
+    for claim in absence.finditer(sentence):
+        denied.update(group for group in claim.groups() if group)
+        edge = claim.start()
+        for start, end, name in reversed(names):
+            if end > edge:
+                continue
+            if not _COORDINATED.fullmatch(sentence[end:edge]):
+                break
+            denied.add(name)
+            edge = start
+    return denied
+
+
+def _prose_and_fenced(text: str) -> tuple[str, str]:
+    """A document split into its prose and its fenced examples.
+
+    A fenced example is a runnable instruction, never a denial, so a flag named
+    inside one is a positive claim whatever the prose around it says.
+    """
+    prose: list[str] = []
+    fenced: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        (fenced if inside else prose).append(line)
+    return "\n".join(prose), "\n".join(fenced)
 
 
 def _parser_long_flags() -> set[str]:
@@ -1264,29 +1322,89 @@ def test_every_flag_the_reference_names_exists(doc: Path):
     by nothing: a document that ADVERTISES a flag the parser has never heard of
     sends an agent to write `--dry-run` and read the argparse refusal as a
     broken CLI.
+
+    The absence exemption is bound to the OCCURRENCE, not to the document. Read
+    document-wide it let a round-23 lens ship a runnable `bn go rename
+    --dry-run` example and have it excused by an unrelated denial sentence
+    further down the same file -- certifying the exact false instruction this
+    cell exists to catch.
     """
-    text = doc.read_text(encoding="utf-8")
     known = _parser_long_flags()
     assert known, "the parser exposes no long flags, so this cell proves nothing"
-    named = {match.group(0) for match in _DOC_FLAG.finditer(text)}
-    invented = sorted(named - _absence_claims(text) - known)
+    prose, fenced = _prose_and_fenced(doc.read_text(encoding="utf-8"))
+    invented = {match[0] for match in _DOC_FLAG.finditer(fenced)} - known
+    for sentence in _SENTENCE.split(prose):
+        named = {match[0] for match in _DOC_FLAG.finditer(sentence)}
+        invented |= (named - known
+                     - bound_absence_claims(sentence, _DOC_FLAG, _ABSENCE_CLAIM))
     assert not invented, (
         f"{doc.name} names flags the parser does not accept, so an agent copying "
-        f"them gets an argparse refusal and reads it as a broken CLI: {invented}"
+        f"them gets an argparse refusal and reads it as a broken CLI: "
+        f"{sorted(invented)}"
     )
 
 
+# The opposite direction is the one claim in this accounting that is NOT
+# closable, and saying so is the point of this block rather than a sixth
+# phrasing in `_ABSENCE_CLAIM`.
+#
+# Recognising that a document DENIES a shipped flag means recognising negation
+# in arbitrary English. Round 23 walked five unlisted forms straight past the
+# recogniser ("doesn't exist", "There's no X here", "is unsupported", "was
+# removed", "This CLI accepts no X"), and widening the alternation only moves
+# the boundary rather than closing it: `skills/bn-kernel/SKILL.md` already says
+# "It takes no `--all`" -- a true statement about ONE command, in the same shape
+# as a false global denial -- so a recogniser complete enough to catch "accepts
+# no `--preview`" also reds that line, and the two differ only in which subject
+# the sentence is about. An exhaustive natural-language absence recogniser is
+# not attainable here.
+#
+# What IS closed, and why the residual is bounded:
+#   * an INVENTED flag can never be laundered: the cell above fails CLOSED, so a
+#     phrasing the recogniser does not parse denies nothing and the flag stays a
+#     positive claim. No document can advertise a flag the CLI lacks.
+#   * a command whose reference carries an EXHAUSTIVE flag list is compared
+#     against the parser as a SET (`test_go_rename_reference_lists_exactly_the_
+#     flags_it_takes`), which catches a denial by omission completely.
+#   * what survives is a doc denying a SHIPPED flag in a form this pattern does
+#     not parse. The cost is an agent avoiding a flag that works, not writing a
+#     command that fails; no document in the tree does it; and the cell below
+#     catches every form the tree's own denials actually use.
 @pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
 def test_every_flag_the_reference_denies_really_does_not_exist(doc: Path):
-    """...and the other direction: a flag a document tells an agent does NOT
-    exist must stay unreachable, or the doc is steering them away from something
-    that now works."""
-    text = doc.read_text(encoding="utf-8")
-    shipped = sorted(_absence_claims(text) & _parser_long_flags())
+    """...and the other direction, as far as it is attainable: a flag a document
+    denies in a form this module can PARSE must stay unreachable, or the doc is
+    steering an agent away from something that now works.
+
+    Deliberately NOT a universal claim -- the block above records which shapes
+    survive and why completeness is unattainable.
+    """
+    denied: set[str] = set()
+    for sentence in _SENTENCE.split(doc.read_text(encoding="utf-8")):
+        denied |= bound_absence_claims(sentence, _DOC_FLAG, _ABSENCE_CLAIM)
+    shipped = sorted(denied & _parser_long_flags())
     assert not shipped, (
         f"{doc.name} says these flags do not exist, but the parser accepts them: "
         f"{shipped}"
     )
+
+
+def test_an_absence_claim_binds_to_the_name_it_denies():
+    """The binding rule itself, which both flag cells above and the
+    module-citation guard in `tests/test_agent_docs.py` rest on.
+
+    A run of names joined by a coordinator is denied together; a name on the far
+    side of a clause is a positive claim, which is the round-23 bypass that put
+    an invented module and a retirement in one sentence; and an unrecognised
+    phrasing denies nothing, so the name it names stays asserted.
+    """
+    assert bound_absence_claims("`--alpha` and `--beta` do not exist.",
+                                _DOC_FLAG, _ABSENCE_CLAIM) == {"--alpha", "--beta"}
+    assert bound_absence_claims(
+        "The rule is enforced by `--alpha` because `--beta` does not exist.",
+        _DOC_FLAG, _ABSENCE_CLAIM) == {"--beta"}
+    assert bound_absence_claims("`--alpha` was retired years ago.",
+                                _DOC_FLAG, _ABSENCE_CLAIM) == set()
 
 
 def test_go_rename_reference_states_the_scope_the_bridge_enforces():
@@ -1339,7 +1457,9 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
         "the reference no longer states `go rename`'s flag list, so it can grow "
         "a flag the CLI does not have"
     )
-    claimed = set(re.findall(r"--[a-z][a-z0-9-]+", listed.group(1)))
+    # The same token the doc-wide sweep uses, so a `--Force` invented inside
+    # this EXHAUSTIVE list is not invisible to the cell that owns the list.
+    claimed = {match[0] for match in _DOC_FLAG.finditer(listed.group(1))}
 
     def subparser(path: list[str]) -> argparse.ArgumentParser:
         current = parser
@@ -1374,8 +1494,6 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
     by_option = {opt: action
                  for action in subparser(["go", "rename"])._actions
                  for opt in action.option_strings}
-    all_flags = {opt for action in parser._actions
-                 for opt in action.option_strings} | set(by_option)
     # The canonical side may be a PHRASE naming several flags
     # (`--format json --summary` (alias `--quiet`)), so the alias must share its
     # action with at LEAST one of them -- that is what makes it an alias -- and
@@ -1393,7 +1511,6 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
             "should name"
         )
         real_aliases[alias] = partners
-    del all_flags
     own = {opt for opt in real - shared
            if not (real_aliases.get(opt, set()) & claimed)}
     assert claimed == own, (

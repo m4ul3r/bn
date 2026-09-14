@@ -42,6 +42,15 @@ AGENT_FACING_DOCS = (CLAUDE_MD, REPO / "README.md", *sorted(REPO.glob("skills/**
 # body allows `/` and `*` so a subdirectory or glob form cannot pass vacuously.
 _PYTEST_PATH = re.compile(r"tests/[\w*/-]*test_[\w*-]+\.py(?:::(\w+))?")
 
+# A test module cited in PROSE as the thing that enforces a claim, and the
+# retirement phrasing that is the opposite claim about one. The phrasing is the
+# only one the tree uses, and it does not need to be exhaustive: a retirement a
+# reader states some other way is not recognised as a denial, so the module it
+# names stays a positive citation and must resolve. The unknown case fails
+# CLOSED.
+_MODULE_CITATION = re.compile(r"`((?:tests/)?test_\w+\.py)`")
+_MODULE_RETIRED = re.compile(r"do(?:es)? not exist", re.I)
+
 
 def _doc_text(path: Path = CLAUDE_MD) -> str:
     """Never let a missing doc abort collection -- `test_claude_md_exists` owns that."""
@@ -537,30 +546,34 @@ def test_every_test_module_an_agent_doc_names_exists():
     a claim -- which a round-21 lens falsified by replacing the cited filename
     with one that does not exist, with every guard green.
     """
-    module = re.compile(r"`((?:tests/)?test_\w+\.py)`")
     # A doc may also cite a module to say it is GONE ("`tests/test_cli.py` and
     # `tests/test_bridge.py` do not exist"), which is the opposite claim and is
     # asserted by test_test_layout_bullet_retired_modules_stay_gone. Read the
-    # negation off the same sentence rather than hardcoding the two names, so a
-    # third retirement needs no edit here and a POSITIVE citation of a missing
-    # module still fails.
-    # The negation is read PER SENTENCE, not per document. Read document-wide,
-    # one "`x` does not exist" sentence excused every other citation of `x` in
-    # the same file -- so a doc could name a nonexistent module as the guard
-    # that enforces a claim and stay green, which is the opposite of what this
-    # cell is for.
+    # negation off the document rather than hardcoding the two names, so a third
+    # retirement needs no edit here.
+    #
+    # The negation binds to the NAME it denies, through the one implementation
+    # of that rule (shared with the flag guards in
+    # tests/test_skill_reference_drift.py -- round 23 found this same defect in
+    # both, because the repair had been applied to one file and not its
+    # sibling). Read per DOCUMENT one retirement sentence excused every citation
+    # in the file; read per SENTENCE, a single sentence carrying both a
+    # retirement and a POSITIVE citation of an invented module was skipped
+    # whole -- "enforced by `tests/test_invented_guard.py` because
+    # `tests/test_cli.py` does not exist" stayed green. Bound to the name, the
+    # subordinator ends the denied run and the invented module is still a claim.
+    from test_skill_reference_drift import bound_absence_claims
+
     cited = set()
     for doc in AGENT_FACING_DOCS:
         where = str(doc.relative_to(REPO))
         for sentence in re.split(r"(?<=[.;:])\s+|\n", _doc_text(doc)):
-            names = module.findall(sentence)
+            names = {match[1] for match in _MODULE_CITATION.finditer(sentence)}
             if not names:
                 continue
-            if re.search(r"do(?:es)? not exist", sentence):
-                # A retirement claim: asserted in the OTHER direction by
-                # test_test_layout_bullet_retired_modules_stay_gone.
-                continue
-            cited.update((where, name) for name in names)
+            retired = bound_absence_claims(sentence, _MODULE_CITATION,
+                                           _MODULE_RETIRED)
+            cited.update((where, name) for name in names - retired)
     assert cited, "no agent-facing doc cites a test module, so this cell proves nothing"
     missing = sorted(f"{where}: {name}" for where, name in cited
                      if not (REPO / name).is_file()
