@@ -681,11 +681,16 @@ def test_a_non_utf8_cache_path_is_still_recognised_as_this_worker_s(tmp_path):
     comparison excluded a bridge that WAS inside this worker's root -- the
     sweep answered "no leak" about one it owned (#733 F5 review). `os.fsdecode`
     is the round trip that holds.
+
+    The odd-named directory is deliberately NEVER created: the sweep compares
+    the recorded spelling against the basetemp STRING and never touches either
+    path, while a UTF-8-only filesystem (APFS) refuses a name carrying byte
+    0xff outright -- so creating it would fail this test on macOS for a reason
+    it is not about (#733 F5 review round 2).
     """
     import conftest
 
     odd = tmp_path / os.fsdecode(b"basetemp-\xff")
-    odd.mkdir()
     proc = tmp_path / "proc"
     _fake_proc_entry(
         proc, "4246",
@@ -752,6 +757,54 @@ def test_bn_agent_leak_sweep_reaps_and_names_a_real_leak(tmp_path):
         assert "exited=True" in lines[0]
         assert proc.wait(timeout=5) is not None
         assert conftest.bn_agent_leaks(tmp_path) == []
+    finally:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_an_operational_pin_failure_refuses_rather_than_signalling_unpinned(
+    tmp_path, monkeypatch
+):
+    """The unpinned path is for a platform with NO pidfd, nothing else.
+
+    `pin_process` also raises `PinUnavailable` operationally -- EMFILE, EPERM,
+    a process that has already gone -- and catching every one of them dropped a
+    pidfd-CAPABLE host to a bare `os.kill` while reporting "no pidfd on this
+    platform": the protection was lost AND the reason misstated (#733 F5 review
+    round 2). Such a failure now refuses and carries the real reason.
+    """
+    conftest = _require_process_discovery()
+
+    cache = tmp_path / "bn-cache22"
+    stand_in = tmp_path / "bn-agent"
+    stand_in.write_text("import time; time.sleep(120)\n", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(stand_in), "--instance-id", "e5f6a7b8"],
+        env={**os.environ, "BN_CACHE_DIR": str(cache)},
+    )
+    try:
+        leaks = conftest.bn_agent_leaks(tmp_path)
+        assert [row["instance_id"] for row in leaks] == ["e5f6a7b8"]
+
+        # A pidfd-capable host whose pin fails for a reason that is not
+        # "this platform has no pidfd".
+        def out_of_descriptors(pid):
+            raise conftest.PinUnavailable(
+                f"pid {pid} could not be pinned ([Errno 24] Too many open files)")
+
+        monkeypatch.setattr(conftest, "PIDFD_AVAILABLE", True)
+        monkeypatch.setattr(conftest, "pin_process", out_of_descriptors)
+
+        lines = conftest.reap_bn_agent_leaks(leaks)
+
+        assert len(lines) == 1
+        assert "NOT signalled" in lines[0]
+        assert "Too many open files" in lines[0]          # the real reason
+        assert "no pidfd" not in lines[0]                 # not the tradeoff
+        assert "e5f6a7b8" in lines[0]                     # still reported
+        # And strictly unsignalled: the leak is still running.
+        assert proc.poll() is None
     finally:
         with contextlib.suppress(OSError):
             proc.kill()

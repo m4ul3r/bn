@@ -46,7 +46,7 @@ from typing import NoReturn
 import bn.cli
 import pytest
 from bn.headless import _find_bn_python
-from bn.proc_identity import PinUnavailable, pin_process
+from bn.proc_identity import PIDFD_AVAILABLE, PinUnavailable, pin_process
 
 sys.dont_write_bytecode = True
 
@@ -771,18 +771,28 @@ def _terminate_scanned_leak(
 
     Two defences, in order. `bn.proc_identity.pin_process` holds the pid to ONE
     process for as long as the pin is open, which closes the race outright.
-    Where the platform has no pidfd -- including the interpreter that already
-    skips this repo's pidfd tests -- the row is RE-DERIVED from `/proc`
-    immediately before the signal, which narrows the window from the whole
-    sweep to that instruction pair; that is as close as a pidfd-less platform
-    gets, and it beats the alternative of never signalling, which leaves a
-    ~450 MB process running on exactly the host where the reap is most useful.
-    Which path was taken is stated in the line, so the residual is visible.
+    Only where the platform provides no pidfd primitives at all -- including
+    the interpreter that already skips this repo's pidfd tests -- is the signal
+    sent unpinned, and then the row is RE-DERIVED from `/proc` immediately
+    before it, which narrows the window from the whole sweep to that
+    instruction pair; that is as close as a pidfd-less platform gets, and it
+    beats never signalling, which leaves a ~450 MB process running on exactly
+    the host where the reap is most useful. Which path was taken is stated in
+    the line, so the residual is visible.
+
+    Every OTHER pin failure REFUSES. `pin_process` raises `PinUnavailable` for
+    operational reasons too -- EMFILE, EPERM, a process that has already gone
+    -- and treating those as the no-pidfd tradeoff dropped a pidfd-CAPABLE host
+    to an unpinned kill while reporting "no pidfd on this platform", i.e. it
+    lost the protection and misstated why (#733 F5 review round 2). The real
+    reason is carried into the line instead.
     """
     pid = int(row["pid"])
     try:
         pin = pin_process(pid)
-    except PinUnavailable:
+    except PinUnavailable as exc:
+        if PIDFD_AVAILABLE:
+            return f"NOT signalled: the pid could not be pinned ({exc})"
         pin = None
     with contextlib.ExitStack() as closing:
         if pin is not None:
