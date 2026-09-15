@@ -348,8 +348,21 @@ def _callsites(
     return result
 
 
+#: Every collection of named entries `bv.debug_info` exposes that can surface as
+#: a non-auto SYMBOL, with the name attributes each of them carries. Functions
+#: were not enough: a `cc -g` program holding one `static volatile int` reported
+#: that variable as inherited analyst work, because the exclusion walked
+#: `functions` while the counting walks every non-auto symbol (#733 F2 review).
+#: `DebugFunctionInfo` carries `short_name`/`full_name`/`raw_name` (on a C++
+#: target they legitimately disagree -- qualified vs mangled -- so a symbol may
+#: match any one of them); `DataVariableAndName` carries only `name`. Asking
+#: every attribute of both is cheaper than remembering which shape has which.
+_DEBUG_INFO_COLLECTIONS = ("functions", "data_variables")
+_DEBUG_INFO_NAME_FIELDS = ("short_name", "full_name", "raw_name", "name")
+
+
 def _debug_info_symbols(bv) -> frozenset[tuple[str, str]]:
-    """``(name, address)`` for every function the view's IMPORTED DEBUG INFO named.
+    """``(name, address)`` for everything the view's IMPORTED DEBUG INFO named.
 
     Provenance, not a name shape. BN marks a plain ELF symtab/dynsym name
     ``auto=True`` -- the summary never sees those -- but a name its DWARF
@@ -363,43 +376,47 @@ def _debug_info_symbols(bv) -> frozenset[tuple[str, str]]:
     ``parse_header`` -- a name the debug info supplied for a DIFFERENT function
     -- was credited to the loader and the gate certified the view clean, which
     is the fail-OPEN direction. Measured on a real `-g` build, BN's symbol
-    address and ``DebugFunctionInfo.address`` agree exactly for every recovered
-    function (an imported entry such as ``printf`` reports address 0 and simply
-    matches no symbol), so the pair costs nothing in recall.
-
-    All three name fields are taken: ``short_name``, ``full_name`` and
-    ``raw_name`` are what `DebugFunctionInfo` exposes, and on a C++ target they
-    legitimately disagree (qualified vs mangled), so a symbol may carry any one
-    of them.
+    address and the importer's address agree exactly for every recovered
+    function and data variable (an imported entry such as ``printf`` reports
+    address 0 and simply matches no symbol), so the pair costs nothing in
+    recall.
 
     Empty for a view with no imported debug info, and for one that cannot be
     asked: an unreadable source must not reclassify analyst work as a
     placeholder, so failure here counts symbols as analyst work, the fail-closed
-    direction for the contamination gate.
+    direction for the contamination gate. Each collection is read
+    independently, so one that raises cannot cost the other.
 
-    Cost, measured: ``DebugInfo.functions`` is a generator that materializes a
-    type, a platform and local variables per entry, so a 4000-function `-g`
-    build spends ~0.3s cold / ~0.1s warm building this set -- the bulk of this
-    otherwise-fast triage read, and roughly linear beyond that. A stripped or
-    non-`-g` target reports no debug functions and pays nothing.
+    Cost, measured: these are generators that materialize a type (and, for a
+    function, a platform and its local variables) per entry, so a 4000-function
+    `-g` build spends ~0.3s cold / ~0.1s warm building this set -- the bulk of
+    this otherwise-fast triage read, and roughly linear beyond that. A stripped
+    or non-`-g` target reports nothing here and pays nothing.
     """
+    debug_info = None
     try:
         debug_info = getattr(bv, "debug_info", None)
-        functions = list(getattr(debug_info, "functions", []) or [])
     except Exception:
         return frozenset()
+    if debug_info is None:
+        return frozenset()
     named: set[tuple[str, str]] = set()
-    for function in functions:
-        address = _symbol_address_text(function)
-        if address is None:
+    for collection in _DEBUG_INFO_COLLECTIONS:
+        try:
+            entries = list(getattr(debug_info, collection, []) or [])
+        except Exception:
             continue
-        for attribute in ("short_name", "full_name", "raw_name"):
-            try:
-                value = getattr(function, attribute, None)
-            except Exception:
+        for entry in entries:
+            address = _symbol_address_text(entry)
+            if address is None:
                 continue
-            if isinstance(value, str) and value:
-                named.add((value, address))
+            for attribute in _DEBUG_INFO_NAME_FIELDS:
+                try:
+                    value = getattr(entry, attribute, None)
+                except Exception:
+                    continue
+                if isinstance(value, str) and value:
+                    named.add((value, address))
     return frozenset(named)
 
 

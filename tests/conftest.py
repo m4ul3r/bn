@@ -46,6 +46,7 @@ from typing import NoReturn
 import bn.cli
 import pytest
 from bn.headless import _find_bn_python
+from bn.proc_identity import PinUnavailable, pin_process
 
 sys.dont_write_bytecode = True
 
@@ -642,12 +643,66 @@ def fake_transport(monkeypatch):
     return install
 
 
+def process_discovery_available(proc: Path = Path("/proc")) -> bool:
+    """Whether this host can be ASKED which processes are running.
+
+    The sweep answers an unreadable `/proc` with an empty list -- unknowable,
+    never guessed -- so a test that requires discovery must gate on this rather
+    than assert an empty answer is a pass (#733 F5 review).
+    """
+    try:
+        return proc.joinpath(str(os.getpid()), "cmdline").exists()
+    except OSError:
+        return False
+
+
+def _bn_agent_row(entry: Path) -> dict[str, str] | None:
+    """The leak row for one `/proc/<pid>` entry, or None if it is not a bridge.
+
+    Shared by the scan and the reap, so the reap can re-verify that the pid it
+    is about to signal still describes the SAME bridge it scanned.
+    """
+    try:
+        argv = entry.joinpath("cmdline").read_bytes().split(b"\0")
+        environ = entry.joinpath("environ").read_bytes().split(b"\0")
+    except OSError:
+        return None                       # a pid may vanish mid-walk
+    # `os.fsdecode`, not `decode("utf-8", "replace")`: a filesystem path is
+    # bytes, and replacement turned a non-UTF-8 byte in a cache path into
+    # U+FFFD while `Path`/`str(under)` keeps it through surrogateescape, so the
+    # ownership comparison below excluded a bridge that WAS in this worker's
+    # root (#733 F5 review).
+    decoded = [os.fsdecode(part) for part in argv if part]
+    # All three spellings a bridge can be launched under: the console script,
+    # `transport._find_bn_agent`'s fallback when no `bn-agent` sits beside
+    # `sys.executable` (`python -m bn.headless`, what a `pip install --user`
+    # layout gets), and the package's own module form.
+    if not any(
+        os.path.basename(part) == "bn-agent"
+        or part in ("bn.headless", "bn_agent_bridge")
+        for part in decoded
+    ):
+        return None
+    cache_dir = ""
+    for var in environ:
+        if var.startswith(b"BN_CACHE_DIR="):
+            cache_dir = os.fsdecode(var[len(b"BN_CACHE_DIR="):])
+            break
+    instance_id = "<unknown>"
+    for index, part in enumerate(decoded):
+        if part == "--instance-id" and index + 1 < len(decoded):
+            instance_id = decoded[index + 1]
+            break
+    return {"pid": entry.name, "instance_id": instance_id, "cache_dir": cache_dir}
+
+
 def bn_agent_leaks(under: Path, *, proc: Path = Path("/proc")) -> list[dict[str, str]]:
     """Every live `bn-agent` whose `BN_CACHE_DIR` lies under *under*.
 
     Walks /proc directly, like `bn.proc_identity` and `bn.socket_evidence` do
     (there is no psutil dependency). A host without /proc answers an empty
-    list: unknowable, never guessed.
+    list: unknowable, never guessed -- so a caller that needs a real answer
+    asks `process_discovery_available()` first.
 
     Scoped by cache root rather than by process tree, because a bridge is
     spawned detached from the test that asked for it -- and scoped to THIS
@@ -666,40 +721,17 @@ def bn_agent_leaks(under: Path, *, proc: Path = Path("/proc")) -> list[dict[str,
         entries = list(proc.iterdir())
     except OSError:
         return leaks
+    root = str(under)
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        try:
-            argv = entry.joinpath("cmdline").read_bytes().split(b"\0")
-            environ = entry.joinpath("environ").read_bytes().split(b"\0")
-        except OSError:
-            continue                      # a pid may vanish mid-walk
-        decoded = [part.decode("utf-8", "replace") for part in argv if part]
-        # All three spellings a bridge can be launched under: the console
-        # script, `transport._find_bn_agent`'s fallback when no `bn-agent` sits
-        # beside `sys.executable` (`python -m bn.headless`, what a
-        # `pip install --user` layout gets), and the package's own module form.
-        if not any(
-            os.path.basename(part) == "bn-agent"
-            or part in ("bn.headless", "bn_agent_bridge")
-            for part in decoded
-        ):
+        row = _bn_agent_row(entry)
+        if row is None:
             continue
-        cache_dir = ""
-        for var in environ:
-            if var.startswith(b"BN_CACHE_DIR="):
-                cache_dir = var[len(b"BN_CACHE_DIR="):].decode("utf-8", "replace")
-                break
-        if cache_dir != str(under) and not cache_dir.startswith(f"{under}{os.sep}"):
+        cache_dir = row["cache_dir"]
+        if cache_dir != root and not cache_dir.startswith(f"{root}{os.sep}"):
             continue
-        instance_id = "<unknown>"
-        for index, part in enumerate(decoded):
-            if part == "--instance-id" and index + 1 < len(decoded):
-                instance_id = decoded[index + 1]
-                break
-        leaks.append(
-            {"pid": entry.name, "instance_id": instance_id, "cache_dir": cache_dir}
-        )
+        leaks.append(row)
     # Pid order, so a multi-leak failure message reads the same twice and the
     # sweep's own tests can assert the rows rather than a set.
     return sorted(leaks, key=lambda row: int(row["pid"]))
@@ -727,25 +759,69 @@ def _pid_is_gone(pid: int, *, proc: Path = Path("/proc")) -> bool:
     return bool(tail) and tail[0] == b"Z"
 
 
-def reap_bn_agent_leaks(leaks: list[dict[str, str]]) -> list[str]:
-    """SIGTERM each leak and return one human line per leak, exit confirmed or not."""
-    lines: list[str] = []
-    for row in leaks:
-        pid = int(row["pid"])
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGTERM)
+def _terminate_scanned_leak(
+    row: dict[str, str], *, proc: Path = Path("/proc")
+) -> str:
+    """SIGTERM the process *row* describes, or refuse; returns the detail line.
+
+    The scan records a pid and the signal comes later -- after the rest of the
+    walk and up to `_LEAK_SWEEP_GRACE` per preceding leak -- so a bare
+    `os.kill` on that stale number can terminate an unrelated process if the
+    bridge exited and the kernel recycled the pid in between (#733 F5 review).
+
+    Two defences, in order. `bn.proc_identity.pin_process` holds the pid to ONE
+    process for as long as the pin is open, which closes the race outright.
+    Where the platform has no pidfd -- including the interpreter that already
+    skips this repo's pidfd tests -- the row is RE-DERIVED from `/proc`
+    immediately before the signal, which narrows the window from the whole
+    sweep to that instruction pair; that is as close as a pidfd-less platform
+    gets, and it beats the alternative of never signalling, which leaves a
+    ~450 MB process running on exactly the host where the reap is most useful.
+    Which path was taken is stated in the line, so the residual is visible.
+    """
+    pid = int(row["pid"])
+    try:
+        pin = pin_process(pid)
+    except PinUnavailable:
+        pin = None
+    with contextlib.ExitStack() as closing:
+        if pin is not None:
+            closing.enter_context(pin)
+        if _bn_agent_row(proc.joinpath(str(pid))) != row:
+            # The pid no longer describes what was scanned, so whatever it
+            # names now is not this suite's to kill.
+            return ("gone before it could be signalled (the pid no longer "
+                    "names this bridge)")
+        how = "pinned" if pin is not None else "unpinned (no pidfd on this platform)"
+        try:
+            if pin is not None:
+                pin.send(signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "already exited, nothing to signal"
+        except OSError as exc:
+            return f"SIGTERM refused ({exc})"
         exited = False
         deadline = time.monotonic() + _LEAK_SWEEP_GRACE
         while time.monotonic() < deadline:
-            if _pid_is_gone(pid):
+            if _pid_is_gone(pid, proc=proc):
                 exited = True
                 break
             time.sleep(0.1)
-        lines.append(
-            f"instance {row['instance_id']} (pid {row['pid']}) "
-            f"BN_CACHE_DIR={row['cache_dir']} — SIGTERM sent, exited={exited}"
-        )
-    return lines
+    return f"SIGTERM sent {how}, exited={exited}"
+
+
+def reap_bn_agent_leaks(
+    leaks: list[dict[str, str]], *, proc: Path = Path("/proc")
+) -> list[str]:
+    """SIGTERM each leak and return one human line per leak, with its outcome."""
+    return [
+        f"instance {row['instance_id']} (pid {row['pid']}) "
+        f"BN_CACHE_DIR={row['cache_dir']} — "
+        f"{_terminate_scanned_leak(row, proc=proc)}"
+        for row in leaks
+    ]
 
 
 @pytest.fixture(scope="session", autouse=True)

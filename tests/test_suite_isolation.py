@@ -612,11 +612,13 @@ def test_the_test_environment_arms_the_idle_reaper(monkeypatch):
 def _fake_proc_entry(proc: Path, pid: str, argv: list[str], environ: dict[str, str]):
     entry = proc / pid
     entry.mkdir(parents=True)
+    # `os.fsencode`, so a name carrying a surrogate-escaped non-UTF-8 byte is
+    # written as the kernel would write it rather than raising here.
     entry.joinpath("cmdline").write_bytes(
-        b"\0".join(part.encode() for part in argv) + b"\0"
+        b"\0".join(os.fsencode(part) for part in argv) + b"\0"
     )
     entry.joinpath("environ").write_bytes(
-        b"\0".join(f"{k}={v}".encode() for k, v in environ.items()) + b"\0"
+        b"\0".join(os.fsencode(f"{k}={v}") for k, v in environ.items()) + b"\0"
     )
 
 
@@ -670,10 +672,63 @@ def test_bn_agent_leak_sweep_finds_a_bridge_under_the_pytest_tmp_root(tmp_path):
     ]
 
 
+def test_a_non_utf8_cache_path_is_still_recognised_as_this_worker_s(tmp_path):
+    """A filesystem path is BYTES, and the ownership test compares it to
+    `str(under)`.
+
+    Decoding the child's environment with `errors="replace"` turned a non-UTF-8
+    byte into U+FFFD while `Path` keeps it through surrogateescape, so the
+    comparison excluded a bridge that WAS inside this worker's root -- the
+    sweep answered "no leak" about one it owned (#733 F5 review). `os.fsdecode`
+    is the round trip that holds.
+    """
+    import conftest
+
+    odd = tmp_path / os.fsdecode(b"basetemp-\xff")
+    odd.mkdir()
+    proc = tmp_path / "proc"
+    _fake_proc_entry(
+        proc, "4246",
+        ["/venv/bin/python3", "/venv/bin/bn-agent", "--instance-id", "b2c3d4e5"],
+        {"BN_CACHE_DIR": str(odd / "bn-cache21")},
+    )
+
+    leaks = conftest.bn_agent_leaks(odd, proc=proc)
+
+    assert leaks == [
+        {
+            "pid": "4246",
+            "instance_id": "b2c3d4e5",
+            "cache_dir": str(odd / "bn-cache21"),
+        }
+    ]
+
+
+def _require_process_discovery():
+    """Both end-to-end sweep cells need a readable /proc.
+
+    `bn_agent_leaks` answers an unreadable /proc with an empty list BY DESIGN
+    -- unknowable, never guessed -- so a test that asserts discovery would fail
+    rather than skip where the answer cannot be had. That is exactly the
+    environmental, un-installable precondition `refuse_silent_skip` exists for:
+    strict mode turns it into a failure instead of a silent pass (#733 F5
+    review). A pidfd is NOT required: the reap pins when the platform can and
+    re-verifies the row immediately before signalling when it cannot, so both
+    paths terminate the leak and the line says which was used.
+    """
+    import conftest
+
+    if not conftest.process_discovery_available():
+        conftest.refuse_silent_skip(
+            "this host exposes no readable /proc, so process discovery cannot "
+            "answer at all; run the suite on Linux to exercise the leak sweep")
+    return conftest
+
+
 def test_bn_agent_leak_sweep_reaps_and_names_a_real_leak(tmp_path):
     """Belt 2, end to end against a real process: the sweep finds it, names it
     in a line an operator can act on, and it is gone afterwards."""
-    import conftest
+    conftest = _require_process_discovery()
 
     cache = tmp_path / "bn-cache19"
     cache.mkdir()
@@ -703,6 +758,35 @@ def test_bn_agent_leak_sweep_reaps_and_names_a_real_leak(tmp_path):
         proc.wait(timeout=5)
 
 
+def test_the_reap_refuses_a_pid_that_no_longer_names_the_scanned_bridge(tmp_path):
+    """The scan records a pid; the signal comes later. A stale row must not be
+    signalled, because the kernel may have recycled that pid onto an unrelated
+    process -- the check-then-signal race `bn.proc_identity` exists to close
+    (#733 F5 review). The row is re-derived UNDER the pin, so a pid that no
+    longer describes the scanned bridge is reported and left alone."""
+    conftest = _require_process_discovery()
+
+    # A live process that is NOT a bridge, standing in for the recycled pid.
+    stand_in = tmp_path / "not-a-bridge"
+    stand_in.write_text("import time; time.sleep(120)\n", encoding="utf-8")
+    victim = subprocess.Popen([sys.executable, str(stand_in)])
+    try:
+        stale = {"pid": str(victim.pid), "instance_id": "a1b2c3d4",
+                 "cache_dir": str(tmp_path / "bn-cache20")}
+
+        lines = conftest.reap_bn_agent_leaks([stale])
+
+        assert len(lines) == 1
+        assert "gone before it could be signalled" in lines[0]
+        assert "a1b2c3d4" in lines[0]
+        # Left strictly alone: no signal reached it.
+        assert victim.poll() is None
+    finally:
+        with contextlib.suppress(OSError):
+            victim.kill()
+        victim.wait(timeout=5)
+
+
 def test_a_leaked_bridge_fails_the_run(tmp_path):
     """F5's second criterion, on the WIRING and not just the helpers.
 
@@ -713,6 +797,7 @@ def test_a_leaked_bridge_fails_the_run(tmp_path):
     a basetemp a stand-in bridge is already living under, so its session-final
     sweep must red a run whose one test passes.
     """
+    _require_process_discovery()
     basetemp = tmp_path / "child-basetemp"
     basetemp.mkdir()
     # Under the CHILD's basetemp, which is all the sweep compares against -- it

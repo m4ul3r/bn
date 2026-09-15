@@ -883,12 +883,19 @@ _PROBE_FAN = 8
 def _probe_one_instance(entry: dict[str, Any], deadline: float) -> None:
     """Annotate ONE session row with its unsaved-target count, or with why not.
 
-    `list_targets` is the same read `target list` issues, so it runs that
-    bridge's `TargetManager.refresh()`: id minting plus the #713 prune of dirty
-    markers for views that are no longer open. Idempotent bookkeeping over the
-    current open set -- it cannot drop a marker for a view that is still open,
-    which is the only thing this probe reports on -- but it IS a write to that
-    bookkeeping, newly reached by a triage command, so it is stated here.
+    `strict=True`, because this is a SAFETY count. `list_targets` runs the
+    bridge's `TargetManager.refresh()`, whose non-strict view walk silently
+    omits a tab when a UI query raises -- and a count read off that snapshot is
+    a definitive "nothing would be discarded" about work the reader cannot see.
+    Strict makes the bridge refuse the lossy snapshot instead, which arrives
+    here as a transport error and is disclosed as unknown (#733 F1 review). The
+    bridge no longer prunes its unsaved ledger off an incomplete walk either,
+    so the state survives the failure rather than being erased by this read.
+
+    The refresh itself is id minting plus the #713 prune of markers for views
+    that are no longer open -- idempotent bookkeeping over the current open
+    set, but a WRITE to it, newly reached by a triage command, so it is stated
+    here.
     """
     # The legacy GUI pair registers no instance id, and its selector
     # (`default`) is what `choose_instance` matches on
@@ -910,7 +917,7 @@ def _probe_one_instance(entry: dict[str, Any], deadline: float) -> None:
         rows = unwrap_result(
             cli.send_request(
                 "list_targets",
-                params={},
+                params={"strict": True},
                 instance_id=selector,
                 timeout=remaining,
                 resolved=True,

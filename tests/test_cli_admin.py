@@ -2011,6 +2011,40 @@ def test_session_list_survives_an_exception_with_no_message(monkeypatch, capsys)
     assert "unsaved_targets" not in items[0]
 
 
+def test_session_list_asks_strictly_and_reports_a_lossy_snapshot_as_unknown(
+    monkeypatch, capsys
+):
+    """The probe is a SAFETY count, so it must not read one off a lossy walk.
+
+    `list_targets` is non-strict by default -- a listing has no business
+    failing because one UI query hiccuped -- but a count of unsaved targets
+    derived from a snapshot that silently omits tabs is a definitive "nothing
+    would be discarded" about work the reader cannot see. The probe therefore
+    sends `strict: true` and discloses the bridge's refusal as unknown
+    (#733 F1 review).
+    """
+    _one_instance(monkeypatch)
+    sent = []
+
+    def enumeration_failed(op, *, params=None, instance_id=None, **kwargs):
+        sent.append((op, params))
+        raise bn.cli.BridgeError(
+            "Unable to enumerate every open BinaryView tab: a UI query raised "
+            "mid-walk, so the open-view count cannot be trusted")
+
+    monkeypatch.setattr(bn.cli, "send_request", enumeration_failed)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+
+    assert rc == 0
+    assert sent == [("list_targets", {"strict": True})]
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert "unsaved_targets" not in items[0]
+    assert items[0]["unsaved_targets_unavailable"].startswith(
+        "Unable to enumerate every open BinaryView tab")
+
+
+
 def test_session_list_counts_unsaved_targets_per_instance(
     monkeypatch, fake_transport, capsys
 ):
