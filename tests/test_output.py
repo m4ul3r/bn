@@ -29,6 +29,13 @@ def test_default_spill_token_limit_is_10k():
     assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
 
 
+def test_default_spill_retention_is_14_days_591():
+    """runtime.md states this window to agents; the two must not drift."""
+    from bn.output import DEFAULT_SPILL_RETENTION_DAYS
+
+    assert DEFAULT_SPILL_RETENTION_DAYS == 14
+
+
 def test_summary_reports_array_count_for_paged_envelope():
     # A paged-list envelope must summarize the array's element count + logical
     # total, not the count of envelope KEYS (which read as count=6 on any spill).
@@ -417,3 +424,195 @@ def test_provenance_omits_unknown_values_653():
     res = write_output_result({"kind": "x"}, fmt="json", out_path=None, stem="x",
                               provenance={"target": None, "instance": None})
     assert res.artifact is None      # small output: no artifact envelope at all
+
+
+# --- #591: spill retention -------------------------------------------------
+
+def _make_day(root, day):
+    d = root / day.strftime("%Y%m%d")
+    d.mkdir(parents=True)
+    (d / "decompile-120000-1-ab.txt").write_text("artifact")
+    return d
+
+
+def test_prune_removes_only_days_past_the_retention_window_591(tmp_path, monkeypatch):
+    """The measured failure was 1.0 GB / 4187 files with no prune path at all.
+    Retention is by whole day-directory, and the window boundary is inclusive:
+    a day exactly `retention` days old is still inside the window."""
+    from datetime import date, timedelta
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=15))
+    boundary = _make_day(tmp_path, today - timedelta(days=14))
+    fresh = _make_day(tmp_path, today - timedelta(days=1))
+    current = _make_day(tmp_path, today)
+
+    removed = _prune_old_spill_days(tmp_path, today)
+
+    assert removed == [stale]
+    assert not stale.exists()
+    assert boundary.exists() and fresh.exists() and current.exists()
+
+
+def test_prune_leaves_anything_it_did_not_create_591(tmp_path, monkeypatch):
+    """Only a name that parses exactly as %Y%m%d is eligible. Everything else
+    in the spill root belongs to someone else and survives regardless of age --
+    a prune that guessed from name shape would delete a user's notes."""
+    from datetime import date, timedelta
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=90))
+    keep_dirs = [tmp_path / "notes", tmp_path / "2026-06-09", tmp_path / "20260609-old"]
+    for d in keep_dirs:
+        d.mkdir()
+    loose_file = tmp_path / "20260609"          # right name, but NOT a directory
+    loose_file.write_text("someone else's file")
+
+    removed = _prune_old_spill_days(tmp_path, today)
+
+    assert removed == [stale]
+    assert all(d.exists() for d in keep_dirs)
+    assert loose_file.read_text() == "someone else's file"
+
+
+def test_retention_zero_disables_pruning_591(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "0")
+    today = date(2026, 9, 15)
+    ancient = _make_day(tmp_path, today - timedelta(days=365))
+
+    assert _prune_old_spill_days(tmp_path, today) == []
+    assert ancient.exists()
+
+
+def test_a_typo_in_the_retention_env_falls_back_to_the_default_591(monkeypatch):
+    """A bad value must not mean 'keep forever' -- that is the bug, and a typo
+    silently restoring it is how the 1 GB directory happened."""
+    from bn.output import DEFAULT_SPILL_RETENTION_DAYS, resolve_spill_retention_days
+
+    for bad in ("", "  ", "forever", "-5"):
+        monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", bad)
+        assert resolve_spill_retention_days() == DEFAULT_SPILL_RETENTION_DAYS
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "3")
+    assert resolve_spill_retention_days() == 3
+
+
+def test_spilling_prunes_the_stale_days_it_finds_591(tmp_path, monkeypatch):
+    """End-to-end: the prune is wired into the write path, so an agent that
+    never runs a cleanup command still gets a bounded spill root."""
+    from datetime import datetime, timedelta, timezone
+
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    monkeypatch.setattr(output, "_spill_pruned", False)
+
+    stale = _make_day(output.spill_root(), datetime.now(timezone.utc).date() - timedelta(days=30))
+
+    res = output.write_output_result({"items": ["x" * 400]}, fmt="json",
+                                     out_path=None, stem="functions")
+
+    assert res.spilled is True
+    assert not stale.exists()
+
+
+def test_the_spill_sweep_runs_once_per_process_591(tmp_path, monkeypatch):
+    """A command that spills fifty pages must not re-scan the spill root fifty
+    times; the sweep is a process-lifetime hygiene pass, not per-artifact."""
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setattr(output, "_spill_pruned", False)
+    calls = []
+    monkeypatch.setattr(output, "_prune_old_spill_days",
+                        lambda root, today: calls.append(root) or [])
+
+    for _ in range(3):
+        output.write_output_result({"items": ["x" * 400]}, fmt="json",
+                                   out_path=None, stem="functions")
+
+    assert len(calls) == 1
+
+
+def test_prune_requires_a_canonical_date_name_591(tmp_path, monkeypatch):
+    """`strptime`'s numeric fields accept UNPADDED input, so `202611` parses as
+    2026-01-01 and a directory by that name -- which the writer, which always
+    renders via `strftime`, could never have produced -- was recursively
+    deleted along with its contents. The round-trip is the check."""
+    from datetime import date
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    # Each parses under %Y%m%d, is NOT what strftime emits, and resolves to a
+    # date old enough to be inside the prune window -- so only the round-trip
+    # guard saves them. (A future-dated name would survive on age alone and
+    # prove nothing.)
+    for name in ("202611", "2026011", "202612", "2026061"):
+        d = tmp_path / name
+        d.mkdir(exist_ok=True)
+        (d / "keep.txt").write_text("someone else's data")
+
+    removed = _prune_old_spill_days(tmp_path, date(2026, 9, 15))
+
+    assert removed == []
+    for entry in tmp_path.iterdir():
+        assert (entry / "keep.txt").read_text() == "someone else's data"
+
+
+def test_prune_still_removes_the_canonical_stale_day_591(tmp_path, monkeypatch):
+    """Negative control for the round-trip guard: tightening the name check
+    must not stop the prune doing its job on a name the writer did emit."""
+    from datetime import date
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    stale = _make_day(tmp_path, date(2026, 1, 1))
+    assert stale.name == "20260101"
+
+    assert _prune_old_spill_days(tmp_path, date(2026, 9, 15)) == [stale]
+    assert not stale.exists()
+
+
+def test_an_enormous_retention_window_keeps_everything_591(tmp_path, monkeypatch):
+    """A window wider than the calendar overflowed `date` arithmetic. The spill
+    fallback catches only OSError, so the OverflowError denied the caller both
+    its result AND its artifact -- a config value silently discarding output."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "9999999")
+    ancient = _make_day(tmp_path, date(2026, 9, 15) - timedelta(days=365))
+
+    assert output._prune_old_spill_days(tmp_path, date(2026, 9, 15)) == []
+    assert ancient.exists()
+
+
+def test_an_enormous_retention_window_still_returns_the_output_591(tmp_path, monkeypatch):
+    """End-to-end: the overflow was raised from inside the spill write path."""
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "9999999")
+    monkeypatch.setattr(output, "_spill_pruned", False)
+
+    res = output.write_output_result({"items": ["x" * 400]}, fmt="json",
+                                     out_path=None, stem="functions")
+
+    assert res.spilled is True
+    assert res.artifact["bytes"] > 0

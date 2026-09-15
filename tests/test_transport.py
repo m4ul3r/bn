@@ -1166,20 +1166,135 @@ def test_send_request_non_utf8_reply_raises_bridge_error(tmp_path, monkeypatch):
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
 
 
-def test_send_request_invalid_json_valid_utf8_raises_invalid_json_message(tmp_path, monkeypatch):
-    # #601: invalid JSON that IS valid UTF-8 must raise the invalid-JSON
-    # message, not the non-UTF-8 message -- proves the split except clauses
-    # (transport.py) attribute the failure to the right cause.
+def test_send_request_unparseable_reply_is_attributed_to_json_not_encoding(tmp_path, monkeypatch):
+    # #601: invalid JSON that IS valid UTF-8 must be attributed to the JSON
+    # decoder, not the encoding -- proves the split except clauses attribute
+    # the failure to the right cause.
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: True)
     fake_socket = _fake_socket_returning(b"{not valid json")
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
 
-    with pytest.raises(BridgeError, match="invalid JSON") as excinfo:
+    with pytest.raises(BridgeError, match="could not be parsed") as excinfo:
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     assert "non-UTF-8" not in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+def test_send_request_truncated_reply_from_a_dead_bridge_blames_the_crash(tmp_path, monkeypatch):
+    # #595: a bridge that dies mid-write closes cleanly -- recv() returns b""
+    # and raises nothing -- so the mid-response OSError guard cannot fire and
+    # the truncated bytes reach json.loads. The old message said "returned
+    # invalid JSON", sending the reader after a protocol bug. It must name the
+    # dead process instead.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: False)
+    truncated = b'{"ok": true, "result": {"functions": ['
+    fake_socket = _fake_socket_returning(truncated)
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "no longer running" in message
+    assert "truncated by a crash" in message
+    assert "not a protocol error" in message
+    assert f"after {len(truncated)} bytes" in message
+    # Discriminating: the diagnosis must not still read as a malformed-protocol
+    # claim, which is the whole defect.
+    assert "invalid JSON" not in message
+    assert "still running" not in message
+
+
+def test_send_request_unparseable_reply_from_a_live_bridge_blames_version_skew(tmp_path, monkeypatch):
+    # #595 negative control: the same parse failure from a process that IS
+    # alive is a genuinely malformed reply, and must not be misreported as a
+    # crash. Liveness is the only discriminator, so both arms need coverage.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: True)
+    fake_socket = _fake_socket_returning(b'{"ok": true, "result": <object>}')
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "still running" in message
+    assert "malformed" in message
+    assert "bn doctor" in message
+    assert "crash" not in message
+
+
+def _state_transitions_to_zombie(monkeypatch, transport):
+    """`_process_state` answering "S" once, then "Z" forever after.
+
+    The pre-request guard at the top of `_send_request_to_instance` already
+    refuses a bridge that is ALREADY a zombie, so a fake that answers "Z" from
+    the start never reaches the diagnosis under test. The reachable case is a
+    bridge that is running when the request is dispatched and has exited by the
+    time the reply is diagnosed -- which is exactly why the pre-request check
+    cannot cover this.
+    """
+    states = iter(["S"])
+    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_state",
+                        lambda pid: next(states, "Z"))
+
+
+def test_a_bridge_that_crashed_mid_reply_is_not_called_still_running_595(tmp_path, monkeypatch):
+    """An auto-spawned bridge is our own child, so a mid-request crash leaves it
+    exited-but-unreaped. `kill(pid, 0)` still succeeds for that state, so a
+    pid-existence check inverts the verdict and blames version skew for a
+    crash."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    _state_transitions_to_zombie(monkeypatch, transport)
+    fake_socket = _fake_socket_returning(b'{"ok": true, "result": {"items": [')
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "no longer running" in message
+    assert "truncated by a crash" in message
+    assert "still running" not in message
+    assert "bn doctor" not in message
+
+
+def test_an_empty_reply_from_a_crashed_child_is_not_called_still_running_595(tmp_path, monkeypatch):
+    """The sibling arm carried the same misdiagnosis: a crashed child bridge
+    that wrote nothing at all was reported as a live process whose worker
+    thread faulted."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    _state_transitions_to_zombie(monkeypatch, transport)
+    monkeypatch.setattr(transport.socket, "socket",
+                        lambda *a, **k: _fake_socket_returning(b"")())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "no longer running" in message
+    assert "still running" not in message
+
+
+def test_an_unreportable_process_state_is_not_evidence_of_death_595(tmp_path, monkeypatch):
+    """#618: a host that cannot report a state answers None, which is
+    unknowable. It must fall through to pid existence, not be read as a crash."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: None)
+
+    assert transport._process_running(instance.pid) is True
 
 
 def test_send_request_multi_chunk_utf8_reply_reassembles(tmp_path, monkeypatch):
