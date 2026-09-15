@@ -44,6 +44,74 @@ def test_bn_taint_models_env_does_not_leak_into_test_environment():
     assert "BN_TAINT_MODELS" not in os.environ
 
 
+#: Set by the polluted child run below to the path of a receipt the child must
+#: write. Deliberately NOT a scrubbed name: it is how the parent proves the
+#: child inherited an environment at all.
+_POLLUTION_RECEIPT = "BN_HERMETICITY_RECEIPT"
+
+
+def test_a_session_scoped_fixture_sees_a_scrubbed_environment(session_scope_environment):
+    """The scrub must be in force at SESSION scope, not only per test.
+
+    Pytest builds session-scoped fixtures first, so anything that spawns a
+    process there -- the shared bridge, the fixture build -- used to capture
+    `os.environ` before a single variable had been scrubbed. A bridge outlives
+    the test that started it, so an overlay inherited there can never be taken
+    back by a later `delenv`, and the taint lane then ran against whatever the
+    developer's shell exported (#730 review).
+
+    On a clean shell this passes for free, so
+    `test_the_session_scope_scrub_survives_a_polluted_shell` below runs it
+    again in a child whose shell is deliberately dirty. In that child the
+    receipt branch records what actually arrived, which is what keeps the
+    parent's green from being a green about nothing.
+    """
+    from conftest import SCRUBBED_ENV_VARS
+
+    leaked = [var for var in SCRUBBED_ENV_VARS if var in session_scope_environment]
+    assert not leaked, f"{leaked} reached a session-scoped fixture"
+    assert session_scope_environment.get("NO_COLOR") == "1"
+
+    receipt = os.environ.get(_POLLUTION_RECEIPT)
+    if receipt:
+        # Inside the polluted child: the unscrubbed probe name survived, so an
+        # environment WAS inherited, and the scrubbed names did not survive it.
+        still_set = [var for var in SCRUBBED_ENV_VARS if var in os.environ]
+        Path(receipt).write_text("probe arrived", encoding="utf-8")
+        assert not still_set, f"{still_set} survived into the child's test environment"
+
+
+def test_the_session_scope_scrub_survives_a_polluted_shell(tmp_path):
+    """...and the assertion above is not vacuous: run it in a child pytest whose
+    environment carries every variable the suite refuses to inherit.
+
+    `BN_TAINT_MODELS` is the one with teeth -- an unparseable overlay is what
+    failed the taint lane against the shared bridge -- so it points at one
+    here. The receipt is the differential: a child that silently inherited
+    nothing would report the same green without writing it.
+    """
+    from conftest import SCRUBBED_ENV_VARS
+
+    bogus_models = tmp_path / "models.json"
+    bogus_models.write_text("{ not json", encoding="utf-8")
+    receipt = tmp_path / "receipt.txt"
+    env = dict(os.environ)
+    env.update({var: "1" for var in SCRUBBED_ENV_VARS})
+    env["BN_TAINT_MODELS"] = str(bogus_models)
+    env[_POLLUTION_RECEIPT] = str(receipt)
+
+    repo = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        ["uv", "run", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests/test_suite_isolation.py::test_a_session_scoped_fixture_sees_a_scrubbed_environment"],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert receipt.is_file(), (
+        "the child never took the receipt branch, so it did not inherit the "
+        f"pollution this test exists to defeat: {proc.stdout}")
+
+
 def test_argparse_usage_text_is_never_colorized():
     """Positive control: the bug (#589) was ANSI codes in usage/help text."""
     help_text = bn.cli.build_parser().format_help()

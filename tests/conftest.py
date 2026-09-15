@@ -7,9 +7,12 @@ recorded-calls list so a test can assert on the request the CLI built (the
 CLI's contract is argv -> bridge request, so this is a real assertion, not a
 tautology). Bridge-side tests keep using the `_bridge_fakes._load_bridge` seam.
 
-`_hermetic_env` is autouse: it pins the process environment every test (and
-every subprocess a test spawns) runs under, so `uv run pytest` green means the
-same thing on every machine. See `tests/test_suite_isolation.py`.
+`_hermetic_env` and `_hermetic_session_env` are both autouse: they apply ONE
+rule (`SCRUBBED_ENV_VARS`) at two scopes, so the environment every test -- and
+every subprocess a test or a SESSION-scoped fixture spawns -- runs under is
+the same on every machine. The session half exists because pytest builds
+session-scoped fixtures first, and a process started there (the shared bridge)
+outlives the test that started it. See `tests/test_suite_isolation.py`.
 
 `integration_fixtures` + `require_real_bn` own the real-BN lane's gate (#590):
 the generated `tests/fixtures/*_x86_64` binaries stay untracked, so the suite
@@ -440,12 +443,14 @@ def sessions_dir_for(cache_dir: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
-def _shared_bridge(tmp_path_factory) -> Iterator[SharedBridge]:
+def _shared_bridge(_hermetic_session_env, tmp_path_factory) -> Iterator[SharedBridge]:
+    # The scrub is requested BY NAME, not relied on for being autouse: this
+    # process outlives the test that starts it, so an ambient variable that
+    # reaches it here can never be taken back (#730 review).
     require_real_bn()
     cache_dir = tmp_path_factory.mktemp("bn-shared-bridge")
     env = dict(os.environ)
     env["BN_CACHE_DIR"] = str(cache_dir)
-    env["NO_COLOR"] = "1"
     started = subprocess.run(
         [*_BN_CLI, "session", "start", "--format", "json"],
         capture_output=True, text=True, timeout=_SHARED_BRIDGE_START_TIMEOUT, env=env,
@@ -496,12 +501,71 @@ def pytest_runtest_setup(item):
 # which are testing the right thing.
 _COLOR_FORCING_VARS = ("FORCE_COLOR", "CLICOLOR_FORCE", "PYTHON_COLORS")
 
+#: Every variable the suite refuses to inherit from the caller, in ONE place so
+#: the per-test and per-session gates cannot scrub different sets:
+#:
+#: - the color-forcing trio above;
+#: - `BN_TAINT_MODELS`, which the CLI reads directly (dataflow.py, #615 review
+#:   F6): an ambient overlay silently changes taint semantics, and a malformed
+#:   one fails the run outright;
+#: - `BN_INSTANCE`, which is "the same effect as always passing -i"
+#:   (runtime.md) and silently redirects instance resolution for any test that
+#:   does not pin one -- most visibly `session stop`'s no-sticky-fallback
+#:   guard (#588), which an ambient value bypasses exactly like an explicit -i.
+#:
+#: A test that WANTS one of these sets it itself with `monkeypatch.setenv`,
+#: which runs after both gates.
+SCRUBBED_ENV_VARS = (*_COLOR_FORCING_VARS, "BN_TAINT_MODELS", "BN_INSTANCE")
+
+
+def _apply_hermetic_env(patch: pytest.MonkeyPatch) -> None:
+    """The scrub-and-pin rules, applied through *patch* at whatever scope owns it."""
+    for var in SCRUBBED_ENV_VARS:
+        patch.delenv(var, raising=False)
+    patch.setenv("NO_COLOR", "1")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _hermetic_session_env() -> Iterator[None]:
+    """Scrub the ambient environment for the WHOLE session, not only per test.
+
+    `_hermetic_env` below is function-scoped, and pytest builds session-scoped
+    fixtures FIRST -- so anything that spawns a process at session scope
+    captured `os.environ` before a single variable had been scrubbed. The
+    shared bridge is exactly that: it inherited an ambient `BN_TAINT_MODELS`
+    into a process that OUTLIVES the test which started it, where no later
+    `monkeypatch.delenv` can reach it, and the taint lane then ran against the
+    developer's model overlay (a malformed one failing the run outright).
+    Before the shared bridge existed every bridge was spawned inside a test,
+    after the per-test scrub, which is why the hole only opened now.
+
+    Scrubbing at session scope closes it for every session-scoped spawner
+    rather than for one of them; the per-test fixture then re-applies the same
+    rules over whatever a test did in between.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        _apply_hermetic_env(patch)
+        yield
+
+
+@pytest.fixture(scope="session")
+def session_scope_environment(_hermetic_session_env) -> dict[str, str]:
+    """`os.environ` as a SESSION-scoped fixture sees it.
+
+    A peer of the session-scoped spawners, so it observes what they observe.
+    Its assertion lives in `tests/test_suite_isolation.py`, which also owns the
+    polluted child run that keeps that assertion from passing vacuously on a
+    developer machine with a clean shell.
+    """
+    return dict(os.environ)
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_env(request, monkeypatch, tmp_path_factory):
     """Make every test's environment deterministic and free of real user state.
 
     - plain argparse output regardless of the developer's shell;
+    - none of `SCRUBBED_ENV_VARS` inherited from the caller;
     - `BN_CACHE_DIR` pointed at a fresh per-test directory, so nothing can read
       or write the developer's real `~/.cache/bn` (instance registries, sticky
       `bn target use` / `bn instance use` pins) and no two tests can observe
@@ -513,24 +577,7 @@ def _hermetic_env(request, monkeypatch, tmp_path_factory):
     pin with `@pytest.mark.no_cache_isolation` -- narrow, and never for tests
     that merely touch the cache.
     """
-    for var in _COLOR_FORCING_VARS:
-        monkeypatch.delenv(var, raising=False)
-    # #615 review F6: the CLI now reads BN_TAINT_MODELS directly (dataflow.py),
-    # so an ambient value in the developer/CI shell must not leak into tests --
-    # same precedent as the color vars above. A test that wants it set uses
-    # monkeypatch.setenv itself (runs after this fixture, so it still overrides).
-    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
-    monkeypatch.setenv("NO_COLOR", "1")
-
-    # An ambient BN_INSTANCE in the developer's/CI's shell is "same effect as
-    # always passing -i" (runtime.md) and silently changes instance
-    # resolution for any test that doesn't itself pin one -- most visibly
-    # `session stop`'s no-sticky-fallback guard (#588), which an ambient
-    # BN_INSTANCE bypasses exactly like an explicit -i would. Scrub it so
-    # suite results don't depend on the caller's environment; a test that
-    # wants BN_INSTANCE sets it itself via monkeypatch.setenv.
-    monkeypatch.delenv("BN_INSTANCE", raising=False)
-
+    _apply_hermetic_env(monkeypatch)
     if request.node.get_closest_marker("no_cache_isolation") is None:
         cache_root = tmp_path_factory.mktemp("bn-cache")
         monkeypatch.setenv("BN_CACHE_DIR", str(cache_root))
