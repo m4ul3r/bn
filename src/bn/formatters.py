@@ -1265,6 +1265,16 @@ def _render_session_list_text(value: Any) -> str:
         binaries = _field_list(item, "binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
+        # #733 F1: read directly, NOT through `_stated_count` -- that helper
+        # reads an explicit null as a real 0, which is exactly the fabricated
+        # "nothing would be discarded" this field exists to avoid.
+        unsaved = item.get("unsaved_targets")
+        if isinstance(unsaved, int) and not isinstance(unsaved, bool):
+            lines.append(f"  unsaved targets: {unsaved}")
+        elif item.get("unsaved_targets_unavailable"):
+            lines.append(
+                f"  unsaved targets: unknown — {item['unsaved_targets_unavailable']}"
+            )
         project_roots = _field_list(item, "project_roots")
         if project_roots:
             lines.append(
@@ -1307,6 +1317,12 @@ def _pointer_size_label(size: Any) -> str:
     return f"{size} byte{'s' if size != 1 else ''}"
 
 
+def _yes_no(flag: Any) -> str:
+    """``True``/``False`` -> ``yes``/``no``; anything else renders as nothing, so
+    an older bridge that does not report the field simply omits the row."""
+    return "yes" if flag is True else "no" if flag is False else ""
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
@@ -1320,6 +1336,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     # doesn't trust an empty/partial result from a view whose analysis is pending.
     if value.get("analyzed") is False:
         lines[0] += " [not analyzed]"
+    # #733 F1: the destructive question ("will closing this discard work?")
+    # answered where a reader is already looking.
+    if value.get("unsaved") is True:
+        lines[0] += " [unsaved]"
 
     details = [
         ("target", value.get("target_id")),
@@ -1329,6 +1349,11 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         # tells agents to gate their survey on it, and on a quick-loaded view it
         # explains an apparently-empty result rather than "empty binary" (#378).
         ("analysis", value.get("analysis_state")),
+        # The committed-but-unsaved ledger and BN's generic modified bit, both
+        # rendered as text so an absent key drops out of the detail rows while a
+        # real `False` still prints (#733 F1).
+        ("unsaved", _yes_no(value.get("unsaved"))),
+        ("engine modified", _yes_no(value.get("engine_modified"))),
         ("file", value.get("filename")),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
@@ -1493,6 +1518,7 @@ def _render_instance_gc_text(value: Any) -> str:
     # trailing disclosure note arrives too late for.
     logs = _stated_count(value, "logs_removed")
     socks = _stated_count(value, "sockets_removed")
+    last = _stated_count(value, "last_used_removed")
     regs = _stated_count(value, "registries_purged")
     live = value.get("live_instances", 0)
     # The same rule twice on purpose: `_stated_count` for what is PRINTED, the
@@ -1502,14 +1528,16 @@ def _render_instance_gc_text(value: Any) -> str:
     # `_record_skew` dedupes.)
     reaped = (_count_field(value, "logs_removed")
               + _count_field(value, "sockets_removed")
+              + _count_field(value, "last_used_removed")
               + _count_field(value, "registries_purged"))
     if reaped == 0 and not any(_field_skewed(key) for key in
                                ("logs_removed", "sockets_removed",
-                                "registries_purged")):
+                                "last_used_removed", "registries_purged")):
         return f"gc: nothing to reap ({live} live instance{'' if live == 1 else 's'})"
     return (
         f"gc: reaped {logs} log{'' if logs == '1' else 's'}, "
         f"{socks} orphan socket{'' if socks == '1' else 's'}, "
+        f"{last} last-used sidecar{'' if last == '1' else 's'}, "
         f"{regs} dead registr{'y' if regs == '1' else 'ies'} "
         f"({live} live instance{'' if live == 1 else 's'} kept)"
     )
@@ -2896,12 +2924,30 @@ def _render_orient_text(value: Any) -> str:
         if ea.get("unavailable"):
             lines.append(f"  existing annotations: unavailable — {ea['unavailable']}")
         else:
-            lines.append(
+            # #733 F2: the analyst/placeholder split is rendered only when the
+            # bridge actually reports it, so an older bridge's digest prints
+            # exactly the line it printed before rather than two fabricated
+            # zeroes.
+            row = (
                 f"  existing annotations: comments={ea.get('comments', 0)}, "
                 f"function-docs={ea.get('function_comments', 0)}, "
-                f"user-symbols={ea.get('user_symbols', 0)}, "
-                f"cache-restored={ea.get('analysis_cache_restored', False)}"
+                f"user-symbols={ea.get('user_symbols', 0)}"
             )
+            if _field_present(ea, "analyst_symbols"):
+                # Each fragment gated on its OWN key and stated through
+                # `_stated_count`: a bridge that reports `analyst_symbols`
+                # without `placeholder_symbols` printed a bare
+                # `placeholders=None`, and `_stated_count` alone would have
+                # printed `0` for an absent key -- the fabricated zero this
+                # module refuses everywhere else. Absent -> the fragment is
+                # omitted; present but unreadable -> `?` (#733 F2 review).
+                row += f", analyst-symbols={_stated_count(ea, 'analyst_symbols')}"
+                if _field_present(ea, "placeholder_symbols"):
+                    row += (
+                        f", placeholders={_stated_count(ea, 'placeholder_symbols')}"
+                    )
+            row += f", cache-restored={ea.get('analysis_cache_restored', False)}"
+            lines.append(row)
             if ea.get("provenance_hint"):
                 lines.append(f"  ! {ea['provenance_hint']}")
     ss = _field_dict(value, "strings_sample")

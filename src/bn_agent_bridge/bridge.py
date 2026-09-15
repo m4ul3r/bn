@@ -331,10 +331,23 @@ class _OpenViewEnumerationError(RuntimeError):
     carried from #691)."""
 
 
-def _collect_open_views(*, strict: bool = False) -> list[Any]:
+def _collect_open_views_state(*, strict: bool = False) -> tuple[list[Any], bool]:
+    """``(views, complete)`` -- the open-view snapshot and whether it is WHOLE.
+
+    The walk already knew when a UI query cost it a tab, but only
+    ``strict=True`` used that, to refuse a destructive close; every other
+    caller threw the fact away. One of them prunes state keyed on the
+    snapshot: `refresh()` dropped the unsaved-ledger marker of a view that was
+    merely INVISIBLE, so a UI hiccup during a `session list` erased the record
+    of unsaved work on a still-open tab and the probe then reported a confident
+    zero (#733 F1 review). Completeness is therefore RETURNED, not only
+    enforced, so a non-strict reader can decline to act on a lossy snapshot.
+
+    A headless bridge has no UI to fail: its snapshot is always complete.
+    """
     if ui is None:
         with _headless_views_lock:
-            return list(_headless_views)
+            return list(_headless_views), True
 
     def collect():
         found: list[Any] = []
@@ -440,7 +453,12 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
             if bv not in seen:
                 seen.add(bv)
                 views.append(bv)
-    return views
+    return views, not incomplete
+
+
+def _collect_open_views(*, strict: bool = False) -> list[Any]:
+    """The open-view snapshot alone, for the callers that do not judge on it."""
+    return _collect_open_views_state(strict=strict)[0]
 
 
 def _path_components(path: str) -> tuple[str, ...]:
@@ -633,7 +651,7 @@ class TargetManager:
         return None
 
     def refresh(self, *, strict: bool = False) -> list[dict[str, Any]]:
-        views = _collect_open_views(strict=strict)
+        views, complete = _collect_open_views_state(strict=strict)
         focused = _active_binary_view()
 
         with self._lock:
@@ -641,10 +659,21 @@ class TargetManager:
             # handle-based equality, not id() -- so a closed/stale handle
             # cannot pin a stable view_id (or the wrapper object it is keyed
             # on) forever across many load/close cycles (#586).
+            #
+            # Guarded on a COMPLETE snapshot for the same reason the dirty
+            # prune below is: dropping the stable id of a view that is merely
+            # invisible makes it reborn under a NEW id when the UI recovers,
+            # and the ledger marker keyed on the old id then answers about
+            # nothing -- which erased the unsaved state just as surely as
+            # pruning the marker itself did (#733 F1 review). Retention lasts
+            # until the next complete refresh, so a view that really closed
+            # during a lossy walk is still released promptly.
             current = set(views)
-            self._ids_by_object = {
-                key: vid for key, vid in self._ids_by_object.items() if key in current
-            }
+            if complete:
+                self._ids_by_object = {
+                    key: vid for key, vid in self._ids_by_object.items()
+                    if key in current
+                }
             alive: dict[str, TargetRecord] = {}
             for bv in views:
                 view_id = self._ids_by_object.get(bv)
@@ -679,7 +708,18 @@ class TargetManager:
             # `alive` is the current open set, rebuilt from handle-keyed strong
             # refs (#586), so a view that is STILL open and still unsaved keeps
             # its marker across any number of refreshes (#606).
-            self._dirty_view_ids &= set(alive)
+            #
+            # ONLY on a complete snapshot. A UI query that raises mid-walk
+            # makes a still-open tab invisible, and pruning off that snapshot
+            # DESTROYED the record of unsaved work on a view nobody closed --
+            # permanently, since nothing re-marks it, so the answer stayed a
+            # confident `unsaved: false` after the UI recovered (#733 F1
+            # review). Retaining a marker for a tab that really did close costs
+            # one stale `unsaved: true` until the next complete refresh, which
+            # is the recoverable direction: the same rule the socket sweep
+            # follows (#618).
+            if complete:
+                self._dirty_view_ids &= set(alive)
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -711,6 +751,15 @@ class TargetManager:
                             else "unanalyzed" if view in _unanalyzed_views
                             else "full"
                         ),
+                        # #733 F1: the committed-but-unsaved ledger, published on
+                        # the READ path. It was reachable only by `close` (the
+                        # destructive op) or `py exec`, so "is it safe to close
+                        # this bridge?" had no read-only answer. `unsaved` is this
+                        # bridge's ledger; `engine_modified` is BN's generic bit,
+                        # which does NOT flip for our verified writes and also
+                        # covers analysis churn, so the two stay separate.
+                        "unsaved": view_id in self._dirty_view_ids,
+                        "engine_modified": _view_engine_modified(view),
                     }
                 )
             return result
@@ -1900,7 +1949,7 @@ class BinaryNinjaBridge:
             return {
                 "path": str(getattr(bv.file, "filename", "")),
                 "unsaved": self.targets.is_dirty(bv),
-                "engine_modified": bool(getattr(bv.file, "modified", False)),
+                "engine_modified": _view_engine_modified(bv),
             }
 
         # The three ways to name what to close -- a target selector, a path,
@@ -2363,6 +2412,13 @@ class BinaryNinjaBridge:
             "analysis_state": (
                 "quick" if quick else "unanalyzed" if unanalyzed else "full"
             ),
+            # #733 F1: set explicitly rather than inherited from the row above,
+            # because `record` can be absent (no matching row) and the whole
+            # point of the field is that it is never silently missing on the
+            # read path. `TargetManager._lock` is an RLock, so asking the
+            # ledger here is safe.
+            "unsaved": self.targets.is_dirty(bv),
+            "engine_modified": _view_engine_modified(bv),
             # Pollable analysis phase/progress (#321): while a `bn refresh` runs on
             # another connection, this advances (refresh no longer holds the
             # read-blocking lock) so an agent can watch a large-target analysis
@@ -3222,9 +3278,12 @@ class BinaryNinjaBridge:
         try:
             bv = self._resolve_view(selector)
             annotations = read_listing._annotation_summary(self.ctx, bv)
+            # #733 F2: keyed on ANALYST work, not the raw non-auto count -- the
+            # loader's own placeholders made a pristine view hint that its
+            # entirely-current-run analysis may predate the run.
             total_annotations = (
                 annotations["comments"] + annotations["function_comments"]
-                + annotations["user_symbols"]
+                + annotations["analyst_symbols"]
             )
             hint = None
             if analysis_cache_restored or total_annotations:
@@ -3232,7 +3291,8 @@ class BinaryNinjaBridge:
                     f"existing BNDB annotations may predate this run: "
                     f"{annotations['comments']} comment(s), "
                     f"{annotations['function_comments']} function doc(s), "
-                    f"{annotations['user_symbols']} user symbol(s) already present"
+                    f"{annotations['analyst_symbols']} analyst symbol(s) already present "
+                    f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
                     + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
                     + " -- do not over-credit current-run analysis"
                 )
@@ -3550,7 +3610,12 @@ def _bind_doctor(bridge, params, target):
 
 @op("list_targets", lock="read")
 def _bind_list_targets(bridge, params, target):
-    return bridge.targets.refresh()
+    # `strict` is opt-in. `target list` wants whatever the UI can still report
+    # -- a listing has no business failing because one UI query hiccuped -- but
+    # a SAFETY count read off that listing must refuse a lossy snapshot instead
+    # of answering a definitive zero from it, which is what `session list`'s
+    # unsaved probe asks for (#733 F1 review).
+    return bridge.targets.refresh(strict=bool(params.get("strict", False)))
 
 
 @op("target_info", lock="read")
@@ -4299,6 +4364,20 @@ def _view_function_count(bv) -> int:
         return len(bv.functions)
     except Exception:  # noqa: BLE001 - a raw/uninitialised view may not expose functions
         return 0
+
+
+def _view_engine_modified(bv) -> bool:
+    """BN's generic modified bit, or False when the view cannot be asked.
+
+    The ONE accessor behind `target info`, `target list` and `close`, so the
+    three surfaces cannot disagree about the same view (#733 F1). Guarded
+    because ``bv.file`` itself can raise on a stale/odd view, which is exactly
+    where the inline form propagated while the read paths reported False.
+    """
+    try:
+        return bool(getattr(getattr(bv, "file", None), "modified", False))
+    except Exception:  # noqa: BLE001 - a stale view's `.file` access may raise
+        return False
 
 
 def _analysis_progress(bv):

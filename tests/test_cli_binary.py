@@ -174,6 +174,40 @@ def test_target_summary_text_marks_quick_view():
     assert "[not analyzed]" not in full
 
 
+def test_target_summary_flags_and_states_unsaved():
+    """#733 F1: text says what the JSON says, in both directions.
+
+    The headline flag answers "will closing this discard work?" where a reader
+    is already looking; the detail rows print a real `False` (so "no" is an
+    answer, not an omission) and drop out entirely for a bridge that does not
+    report the fields.
+    """
+    from bn.formatters import _render_target_summary
+
+    dirty = _render_target_summary({
+        "selector": "netsvcd", "view_id": 1, "analyzed": True,
+        "analysis_state": "full", "unsaved": True, "engine_modified": False,
+    })
+    assert "[unsaved]" in dirty
+    assert "unsaved: yes" in dirty
+    assert "engine modified: no" in dirty
+
+    clean = _render_target_summary({
+        "selector": "netsvcd", "view_id": 1, "analyzed": True,
+        "analysis_state": "full", "unsaved": False, "engine_modified": True,
+    })
+    assert "[unsaved]" not in clean
+    assert "unsaved: no" in clean
+    assert "engine modified: yes" in clean
+
+    silent = _render_target_summary({
+        "selector": "netsvcd", "view_id": 1, "analyzed": True,
+        "analysis_state": "full",
+    })
+    assert "unsaved" not in silent
+    assert "engine modified" not in silent
+
+
 def test_target_summary_text_shows_analysis_state():
     """target info text surfaces analysis_state (full/quick) -- the field the
     bn-re methodology tells agents to gate their survey on, previously visible

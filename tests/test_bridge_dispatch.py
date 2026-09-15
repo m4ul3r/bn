@@ -404,6 +404,32 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
     assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
 
 
+def test_target_info_reports_the_same_unsaved_state_as_close(monkeypatch, tmp_path):
+    """#733 F1 criterion 1: the read path agrees with what `close` reports.
+
+    An agent deciding whether to stop a bridge must be able to ask without
+    running the destructive op, and the two answers must be the same answer --
+    which is why both surfaces read one ledger through one accessor.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/netsvcd.bndb", session_id="11")
+    _register_views(bridge, bv)
+    instance.targets.refresh()          # mint the stable view_id mark_dirty keys on
+
+    assert instance._target_info(None)["unsaved"] is False
+    assert instance._target_info(None)["engine_modified"] is False
+
+    instance.targets.mark_dirty(bv)
+    info = instance._target_info(None)
+    assert info["unsaved"] is True
+
+    closed = _close_on_watchdog(instance, target="netsvcd.bndb")["closed"]
+    assert closed[0]["unsaved"] == info["unsaved"]
+    bridge._headless_views.clear()
+
+
 def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1725,6 +1751,42 @@ def test_refresh_rows_carry_analysis_state(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_refresh_rows_carry_the_unsaved_ledger(monkeypatch):
+    """#733 F1: `target list` rows publish the committed-but-unsaved ledger.
+
+    It used to be reachable only through `close` (the destructive op) or
+    `py exec`, so "will stopping this bridge discard work?" had no read-only
+    answer. Both directions plus the unaskable view are pinned, because a row
+    that always says `False` is the dangerous failure.
+    """
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeFileBV("/proj/netsvcd.bndb", session_id="1")
+    _register_views(bridge, bv)
+    manager = bridge.TargetManager()
+
+    rows = {t["filename"]: t for t in manager.refresh()}
+    assert rows["/proj/netsvcd.bndb"]["unsaved"] is False
+    assert rows["/proj/netsvcd.bndb"]["engine_modified"] is False
+
+    manager.mark_dirty(bv)
+    assert manager.refresh()[0]["unsaved"] is True
+
+    manager.clear_dirty(bv)
+    assert manager.refresh()[0]["unsaved"] is False
+
+    # A view whose `.file` raises must report False, not blow up the listing.
+    class _Exploding:
+        @property
+        def file(self):
+            raise RuntimeError("stale handle")
+
+    bv.file.modified = True
+    assert manager.refresh()[0]["engine_modified"] is True
+    assert bridge._view_engine_modified(_Exploding()) is False
+
+    bridge._headless_views.clear()
+
+
 def test_resolve_accepts_path_suffix_selector(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")
@@ -2893,9 +2955,12 @@ def test_target_manager_resolves_view_across_fresh_wrapper_instances(monkeypatch
     handle = object()  # stand-in for the shared core view handle
 
     def fresh_collect(*, strict: bool = False):
-        return [_NonInterningBV(handle, "/proj/b.bin", session_id="22")]
+        # The stub answers the COMPLETENESS seam too (#733 F1 review): the
+        # dirty-marker prune now runs only on a whole snapshot, so a stub that
+        # claimed nothing would leave the prune untested.
+        return [_NonInterningBV(handle, "/proj/b.bin", session_id="22")], True
 
-    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
 
     first_targets = manager.refresh()
     assert len(first_targets) == 1
@@ -2933,9 +2998,9 @@ def test_target_manager_refresh_prunes_dirty_id_of_a_view_the_user_closed(monkey
         return [
             _NonInterningBV(handle, filename, session_id="11")
             for filename in open_files
-        ]
+        ], True
 
-    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
 
     view_id = manager.refresh()[0]["view_id"]
     manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
@@ -2959,9 +3024,9 @@ def test_target_manager_refresh_keeps_dirty_marker_for_a_still_open_view(monkeyp
     handle = object()
 
     def fresh_collect(*, strict: bool = False):
-        return [_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11")]
+        return [_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11")], True
 
-    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
 
     view_id = manager.refresh()[0]["view_id"]
     manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
@@ -2974,6 +3039,51 @@ def test_target_manager_refresh_keeps_dirty_marker_for_a_still_open_view(monkeyp
             manager.is_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
             is True
         )
+
+
+def test_a_lossy_enumeration_does_not_erase_the_unsaved_ledger(monkeypatch):
+    """A READ must not destroy the state it reports on (#733 F1 review).
+
+    The view walk swallows a per-tab UI failure and reports whatever it could
+    see, and the #713 prune intersected the dirty ledger with THAT snapshot --
+    so a UI hiccup during a `session list` dropped the marker of a tab nobody
+    closed, permanently: nothing re-marks it, so the answer stayed a confident
+    `unsaved: false` after the UI recovered. Pruning now requires a complete
+    snapshot; retaining a marker one refresh too long is the recoverable
+    direction.
+    """
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    handle = object()
+    state = {"visible": True, "complete": True}
+
+    def fresh_collect(*, strict: bool = False):
+        views = ([_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11")]
+                 if state["visible"] else [])
+        return views, state["complete"]
+
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
+
+    view_id = manager.refresh()[0]["view_id"]
+    manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
+    assert manager.refresh()[0]["unsaved"] is True
+
+    # The UI query raises: the still-open tab is invisible and the snapshot
+    # says so. No rows to report -- and no prune.
+    state.update(visible=False, complete=False)
+    assert manager.refresh() == []
+    assert manager._dirty_view_ids == {view_id}
+
+    # Recovered: the same view is visible again and still reports unsaved.
+    state.update(visible=True, complete=True)
+    recovered = manager.refresh()
+    assert recovered[0]["view_id"] == view_id
+    assert recovered[0]["unsaved"] is True
+
+    # And the prune still works on a COMPLETE snapshot: the tab really closes.
+    state.update(visible=False, complete=True)
+    assert manager.refresh() == []
+    assert manager._dirty_view_ids == set()
 
 
 def test_target_manager_refresh_does_not_let_a_stale_dirty_id_mark_a_later_view(monkeypatch):
@@ -2991,9 +3101,9 @@ def test_target_manager_refresh_does_not_let_a_stale_dirty_id_mark_a_later_view(
         return [
             _NonInterningBV(handle, filename, session_id="11")
             for filename in open_files
-        ]
+        ], True
 
-    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
 
     leaked = manager.refresh()[0]["view_id"]
     manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
@@ -4219,7 +4329,8 @@ def test_close_binary_all_dedups_multiple_wrappers_of_same_core_view(monkeypatch
         w.file.close = _close
         wrappers.append(w)
 
-    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: list(wrappers))
+    monkeypatch.setattr(bridge, "_collect_open_views_state",
+                        lambda strict=False: (list(wrappers), True))
     bridge._headless_views.clear()
 
     result = _close_on_watchdog(instance, all_=True)
@@ -4525,7 +4636,8 @@ def test_target_manager_forget_releases_record_without_waiting_for_refresh(monke
     manager = bridge.TargetManager()
     bv = _ClosableBV("/proj/parse_header.elf", session_id="11")
 
-    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: [bv])
+    monkeypatch.setattr(bridge, "_collect_open_views_state",
+                        lambda strict=False: ([bv], True))
     targets = manager.refresh()
     assert len(targets) == 1
     vid = targets[0]["view_id"]

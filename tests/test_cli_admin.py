@@ -1696,7 +1696,8 @@ def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
 def test_instance_gc_json_carries_counts(monkeypatch, capsys):
     summary = {
         "live_instances": 0, "registries_purged": 0,
-        "logs_removed": 0, "sockets_removed": 0, "removed": [],
+        "logs_removed": 0, "sockets_removed": 0, "last_used_removed": 0,
+        "removed": [],
     }
     monkeypatch.setattr(bn.cli, "gc_instances", lambda: summary)
 
@@ -1707,19 +1708,25 @@ def test_instance_gc_json_carries_counts(monkeypatch, capsys):
     assert data["logs_removed"] == 0
     assert data["live_instances"] == 0
 
+
 def test_instance_gc_reports_summary_text(monkeypatch, capsys):
     # #80: `bn instance gc` reaps dead-instance cache litter and reports counts.
     monkeypatch.setattr(bn.cli, "gc_instances", lambda: {
         "live_instances": 2, "registries_purged": 1,
-        "logs_removed": 147, "sockets_removed": 3, "removed": ["x"],
+        "logs_removed": 147, "sockets_removed": 3, "last_used_removed": 2,
+        "removed": ["x"],
     })
 
     rc = bn.cli.main(["instance", "gc"])
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "147" in out          # logs reaped (the headline pain)
-    assert "2" in out            # live instances kept
+    # The WHOLE line, so a malformed fragment (a missing comma between the new
+    # sidecar count and the registry count) cannot pass on a substring (#733 F6).
+    assert out.strip() == (
+        "gc: reaped 147 logs, 3 orphan sockets, 2 last-used sidecars, "
+        "1 dead registry (2 live instances kept)"
+    )
     assert "Traceback" not in out
 
 
@@ -1819,6 +1826,313 @@ def test_instance_list_json_includes_binaries(monkeypatch, capsys):
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
     assert data["items"][0]["binaries"] == ["/fw/lib64/libfoo.so"]
+
+
+def _one_instance(monkeypatch):
+    """One registry row, stubbed like every other `session list` cell: the
+    `fake_transport` fixture patches only `cli.send_request`, so without this
+    the listing is empty and an `items[0]` assertion raises IndexError."""
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    inst = BridgeInstance(
+        pid=111, socket_path=_P("/tmp/x.sock"), registry_path=_P("/tmp/x.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="aaaa1111")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+
+def test_session_list_probes_a_gui_bridge_by_its_selector(monkeypatch, capsys):
+    """The legacy GUI pair registers no instance id, and `default` is the
+    selector `choose_instance` matches on -- so keying the probe on
+    `instance_id` alone reported every GUI bridge as unknown without asking it
+    (#733 F1)."""
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    gui = BridgeInstance(
+        pid=222, socket_path=_P("/tmp/g.sock"), registry_path=_P("/tmp/g.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id=None)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [gui])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    asked = []
+
+    def fake_send_request(op, *, params=None, instance_id=None, **kwargs):
+        asked.append(instance_id)
+        return {"ok": True, "result": [{"selector": "netsvcd", "unsaved": True}]}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    assert asked == ["default"]
+    assert json.loads(capsys.readouterr().out)["items"][0]["unsaved_targets"] == 1
+
+
+def test_session_list_probes_instances_concurrently(monkeypatch, capsys):
+    """A fleet triage must not pay one probe budget per bridge: a serial sweep
+    of a wedged fleet is exactly the "one wedged bridge blocks the survey" the
+    budget exists to prevent (#733 F1).
+
+    Proven with a BARRIER rather than a stopwatch: every probe must be inside
+    the stub at the same moment, which a serial sweep can never satisfy. A
+    wall-clock threshold would answer the same question less exactly and could
+    flake on a loaded box running this suite under `-n 8`.
+    """
+    import threading
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    insts = [
+        BridgeInstance(
+            pid=300 + n, socket_path=_P(f"/tmp/{n}.sock"),
+            registry_path=_P(f"/tmp/{n}.json"), plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0", started_at="2026-01-01T00:00:00Z",
+            meta={}, instance_id=f"bbbb{n}{n}{n}{n}")
+        for n in range(4)
+    ]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    all_inside = threading.Barrier(len(insts))
+    observed = {"concurrent": False}
+
+    def wedged(op, *, params=None, instance_id=None, **kwargs):
+        try:
+            all_inside.wait(timeout=10)
+            observed["concurrent"] = True
+        except threading.BrokenBarrierError:
+            pass          # serial: the others never arrived
+        raise bn.cli.BridgeError("bridge did not answer")
+
+    monkeypatch.setattr(bn.cli, "send_request", wedged)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+
+    assert rc == 0
+    assert observed["concurrent"], "the probes never ran at the same time"
+    items = json.loads(capsys.readouterr().out)["items"]
+    # Order is the registry's, not completion order.
+    assert [item["instance_id"] for item in items] == [i.instance_id for i in insts]
+    assert all(item["unsaved_targets_unavailable"] == "bridge did not answer"
+               for item in items)
+
+
+def _wedged_fleet(monkeypatch, count):
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    insts = [
+        BridgeInstance(
+            pid=400 + n, socket_path=_P(f"/tmp/w{n}.sock"),
+            registry_path=_P(f"/tmp/w{n}.json"), plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0", started_at="2026-01-01T00:00:00Z",
+            meta={}, instance_id=f"cccc{n:04d}")
+        for n in range(count)
+    ]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    return insts
+
+
+def test_session_list_bounds_the_whole_probe_not_each_wave(monkeypatch, capsys):
+    """The budget is ONE deadline for the command, not one per wave.
+
+    The probes fan out `_PROBE_FAN` at a time, so a per-probe budget made a
+    fleet larger than the fan cost `ceil(n / _PROBE_FAN)` budgets -- 10s for
+    the fourteen-bridge fleet in #733, 125s for 200 -- and a Ctrl-C waited out
+    all of it. A bridge the deadline never reached is disclosed by name, never
+    counted as zero unsaved work (#733 F1 review).
+
+    The distinguishing signal is the DISCLOSURE, not the stopwatch: under a
+    per-probe budget the second wave gets a fresh one and reports "bridge did
+    not answer"; under one shared deadline it reports that the budget expired
+    before it was reached. That is exact and cannot flake under `-n 8`.
+    """
+    import threading
+    import time
+    import bn.commands.admin as admin
+
+    fan = admin._PROBE_FAN
+    insts = _wedged_fleet(monkeypatch, fan * 2)
+    monkeypatch.setattr(admin, "_UNSAVED_PROBE_TIMEOUT", 0.3)
+
+    first_wave = threading.Barrier(fan)
+
+    def wedged(op, *, params=None, instance_id=None, **kwargs):
+        try:
+            # Only the first `fan` probes meet here; they then burn the whole
+            # shared budget between them.
+            first_wave.wait(timeout=10)
+            time.sleep(0.4)
+        except threading.BrokenBarrierError:
+            pass
+        raise bn.cli.BridgeError("bridge did not answer")
+
+    monkeypatch.setattr(bn.cli, "send_request", wedged)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert [item["instance_id"] for item in items] == [i.instance_id for i in insts]
+    expired = [item for item in items if item.get("unsaved_targets_unavailable")
+               == "the probe budget expired before this bridge was reached"]
+    assert len(expired) == fan, (
+        "the second wave was given its own budget instead of the remainder: "
+        f"{[item.get('unsaved_targets_unavailable') for item in items]}")
+    # And no row is ever left claiming zero unsaved work.
+    assert all("unsaved_targets" not in item for item in items)
+
+
+def test_session_list_survives_an_exception_with_no_message(monkeypatch, capsys):
+    """A listing degrades to `unknown`; it never becomes a traceback.
+
+    A bare `TimeoutError()` has an empty `str()`, so the first-line slice was
+    an `IndexError` -- not in the caught set, re-raised out of the thread pool,
+    and the whole command died where the belt was supposed to absorb it. An
+    empty reason is also useless, so the exception TYPE is named instead
+    (#733 F1 review).
+    """
+    _one_instance(monkeypatch)
+
+    def silent(*args, **kwargs):
+        raise TimeoutError()
+
+    monkeypatch.setattr(bn.cli, "send_request", silent)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert items[0]["unsaved_targets_unavailable"] == "TimeoutError"
+    assert "unsaved_targets" not in items[0]
+
+
+def test_session_list_asks_strictly_and_reports_a_lossy_snapshot_as_unknown(
+    monkeypatch, capsys
+):
+    """The probe is a SAFETY count, so it must not read one off a lossy walk.
+
+    `list_targets` is non-strict by default -- a listing has no business
+    failing because one UI query hiccuped -- but a count of unsaved targets
+    derived from a snapshot that silently omits tabs is a definitive "nothing
+    would be discarded" about work the reader cannot see. The probe therefore
+    sends `strict: true` and discloses the bridge's refusal as unknown
+    (#733 F1 review).
+    """
+    _one_instance(monkeypatch)
+    sent = []
+
+    def enumeration_failed(op, *, params=None, instance_id=None, **kwargs):
+        sent.append((op, params))
+        raise bn.cli.BridgeError(
+            "Unable to enumerate every open BinaryView tab: a UI query raised "
+            "mid-walk, so the open-view count cannot be trusted")
+
+    monkeypatch.setattr(bn.cli, "send_request", enumeration_failed)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+
+    assert rc == 0
+    assert sent == [("list_targets", {"strict": True})]
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert "unsaved_targets" not in items[0]
+    assert items[0]["unsaved_targets_unavailable"].startswith(
+        "Unable to enumerate every open BinaryView tab")
+
+
+
+def test_session_list_counts_unsaved_targets_per_instance(
+    monkeypatch, fake_transport, capsys
+):
+    """#733 F1: "is it safe to stop these bridges?" answered without closing.
+
+    The count is LIVE, not registry meta: the registry's `binaries` list is
+    written on load/close only, so a registry-sourced count would report zero
+    unsaved work for a bridge holding unsaved renames.
+    """
+    _one_instance(monkeypatch)
+    fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [
+                {"selector": "netsvcd", "unsaved": True},
+                {"selector": "dnsproxy", "unsaved": False},
+            ],
+        }
+    })
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert items[0]["unsaved_targets"] == 1
+
+    rc = bn.cli.main(["session", "list"])
+    assert rc == 0
+    assert "unsaved targets: 1" in capsys.readouterr().out
+
+
+def test_session_list_reports_an_unreachable_bridge_as_unknown(
+    monkeypatch, capsys
+):
+    """A bridge that cannot answer is UNKNOWN, never zero: a fabricated 0 reads
+    as "nothing would be discarded", the one wrong answer here (#733 F1)."""
+    _one_instance(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise bn.cli.BridgeError("boom")
+
+    monkeypatch.setattr(bn.cli, "send_request", boom)
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert "unsaved_targets" not in items[0]
+    assert items[0]["unsaved_targets_unavailable"] == "boom"
+
+    rc = bn.cli.main(["session", "list"])
+    assert rc == 0
+    assert "unsaved targets: unknown — boom" in capsys.readouterr().out
+
+
+def test_session_list_reports_a_bridge_without_the_field_as_unknown(
+    monkeypatch, fake_transport, capsys
+):
+    """An older bridge whose rows carry no `unsaved` key is disclosed by name,
+    not counted as zero (#733 F1)."""
+    _one_instance(monkeypatch)
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"selector": "netsvcd"}]}
+    })
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert "unsaved_targets" not in items[0]
+    assert items[0]["unsaved_targets_unavailable"] == (
+        "this bridge does not report per-target unsaved state"
+    )
+
+
+def test_instance_list_stays_round_trip_free(monkeypatch, capsys):
+    """#80 made `instance list` answerable from the registry alone; #733 F1's
+    probe is deliberately `session list`-only. A `send_request` that explodes
+    proves no round trip happens here."""
+    _one_instance(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("instance list must not contact a bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", boom)
+
+    rc = bn.cli.main(["instance", "list", "--format", "json"])
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert "unsaved_targets" not in items[0]
+    assert "unsaved_targets_unavailable" not in items[0]
 
 
 def test_instance_list_no_binaries_key_when_empty(monkeypatch, capsys):

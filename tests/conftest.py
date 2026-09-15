@@ -29,13 +29,16 @@ per-test. Tests whose subject IS the process keep starting their own.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NoReturn
@@ -43,6 +46,7 @@ from typing import NoReturn
 import bn.cli
 import pytest
 from bn.headless import _find_bn_python
+from bn.proc_identity import PIDFD_AVAILABLE, PinUnavailable, pin_process
 
 sys.dont_write_bytecode = True
 
@@ -299,6 +303,21 @@ _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 _SHARED_BRIDGE_START_TIMEOUT = 120.0
 _SHARED_BRIDGE_STOP_TIMEOUT = 30.0
 
+#: `BN_IDLE_TIMEOUT` for every bridge a TEST spawns. A test that spawns a
+#: bridge and does not stop it leaves a ~450 MB BN process nothing can reach --
+#: pytest rotates the per-test cache away, so its registry (and with it
+#: `session list` / `gc`) goes with it. The reaper only has to outlive a test.
+_TEST_BRIDGE_IDLE_TIMEOUT = 120.0
+
+#: `BN_IDLE_TIMEOUT` for the SESSION-scoped shared bridge, which is
+#: legitimately idle between real-BN tests: long enough that no test gap can
+#: reach it, short enough that it still dies on its own if its `session stop`
+#: below ever fails.
+_SHARED_BRIDGE_IDLE_TIMEOUT = 3600.0
+
+#: Grace period for a SIGTERM'd leaked bridge to exit before the sweep reports it.
+_LEAK_SWEEP_GRACE = 3.0
+
 #: One `bn load` into the LIVE bridge: ~0.2s for a fixture binary. A lane that
 #: analyses something big (a cross-built `-static` probe) passes its own.
 SHARED_LOAD_TIMEOUT = 120.0
@@ -451,6 +470,7 @@ def _shared_bridge(_hermetic_session_env, tmp_path_factory) -> Iterator[SharedBr
     cache_dir = tmp_path_factory.mktemp("bn-shared-bridge")
     env = dict(os.environ)
     env["BN_CACHE_DIR"] = str(cache_dir)
+    env["BN_IDLE_TIMEOUT"] = str(_SHARED_BRIDGE_IDLE_TIMEOUT)
     started = subprocess.run(
         [*_BN_CLI, "session", "start", "--format", "json"],
         capture_output=True, text=True, timeout=_SHARED_BRIDGE_START_TIMEOUT, env=env,
@@ -523,6 +543,22 @@ def _apply_hermetic_env(patch: pytest.MonkeyPatch) -> None:
     for var in SCRUBBED_ENV_VARS:
         patch.delenv(var, raising=False)
     patch.setenv("NO_COLOR", "1")
+    # #733 F5: a test that spawns a bridge and does not stop it leaves a
+    # ~450 MB BN process that nothing can reach -- pytest rotates the per-test
+    # cache away, so its registry (and with it `session list` / `gc`) goes too.
+    # `transport._spawn_instance_unlocked` forwards the whole `os.environ` to
+    # the child, so a pin here reaches every auto-spawned and `session
+    # start`-spawned bridge. The reaper is headless-only, arms after preload,
+    # and never fires while a request or load job is in flight, so it cannot
+    # destabilise a test; it just means a leak dies on its own.
+    #
+    # HERE rather than in `_hermetic_env`, for the reason this function exists:
+    # a rule that lives only at function scope misses every session-scoped
+    # spawner, which is exactly how an ambient `BN_TAINT_MODELS` reached the
+    # shared bridge (#730). Pinned, not scrubbed: a name that is both would
+    # make `tests/test_suite_isolation.py`'s polluted child contradict the
+    # scrub it asserts.
+    patch.setenv("BN_IDLE_TIMEOUT", str(_TEST_BRIDGE_IDLE_TIMEOUT))
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -570,6 +606,8 @@ def _hermetic_env(request, monkeypatch, tmp_path_factory):
       or write the developer's real `~/.cache/bn` (instance registries, sticky
       `bn target use` / `bn instance use` pins) and no two tests can observe
       each other's cache state.
+    - `BN_IDLE_TIMEOUT` pinned, so a bridge a test leaks self-terminates
+      instead of surviving the whole run unreachable (#733 F5).
 
     A test may still override any of these with `monkeypatch` (many do); the
     override is restored to this isolated state at teardown. Tests that
@@ -603,3 +641,220 @@ def fake_transport(monkeypatch):
         return calls
 
     return install
+
+
+def process_discovery_available(proc: Path = Path("/proc")) -> bool:
+    """Whether this host can be ASKED which processes are running.
+
+    The sweep answers an unreadable `/proc` with an empty list -- unknowable,
+    never guessed -- so a test that requires discovery must gate on this rather
+    than assert an empty answer is a pass (#733 F5 review).
+    """
+    try:
+        return proc.joinpath(str(os.getpid()), "cmdline").exists()
+    except OSError:
+        return False
+
+
+def _bn_agent_row(entry: Path) -> dict[str, str] | None:
+    """The leak row for one `/proc/<pid>` entry, or None if it is not a bridge.
+
+    Shared by the scan and the reap, so the reap can re-verify that the pid it
+    is about to signal still describes the SAME bridge it scanned.
+    """
+    try:
+        argv = entry.joinpath("cmdline").read_bytes().split(b"\0")
+        environ = entry.joinpath("environ").read_bytes().split(b"\0")
+    except OSError:
+        return None                       # a pid may vanish mid-walk
+    # `os.fsdecode`, not `decode("utf-8", "replace")`: a filesystem path is
+    # bytes, and replacement turned a non-UTF-8 byte in a cache path into
+    # U+FFFD while `Path`/`str(under)` keeps it through surrogateescape, so the
+    # ownership comparison below excluded a bridge that WAS in this worker's
+    # root (#733 F5 review).
+    decoded = [os.fsdecode(part) for part in argv if part]
+    # All three spellings a bridge can be launched under: the console script,
+    # `transport._find_bn_agent`'s fallback when no `bn-agent` sits beside
+    # `sys.executable` (`python -m bn.headless`, what a `pip install --user`
+    # layout gets), and the package's own module form.
+    if not any(
+        os.path.basename(part) == "bn-agent"
+        or part in ("bn.headless", "bn_agent_bridge")
+        for part in decoded
+    ):
+        return None
+    cache_dir = ""
+    for var in environ:
+        if var.startswith(b"BN_CACHE_DIR="):
+            cache_dir = os.fsdecode(var[len(b"BN_CACHE_DIR="):])
+            break
+    instance_id = "<unknown>"
+    for index, part in enumerate(decoded):
+        if part == "--instance-id" and index + 1 < len(decoded):
+            instance_id = decoded[index + 1]
+            break
+    return {"pid": entry.name, "instance_id": instance_id, "cache_dir": cache_dir}
+
+
+def bn_agent_leaks(under: Path, *, proc: Path = Path("/proc")) -> list[dict[str, str]]:
+    """Every live `bn-agent` whose `BN_CACHE_DIR` lies under *under*.
+
+    Walks /proc directly, like `bn.proc_identity` and `bn.socket_evidence` do
+    (there is no psutil dependency). A host without /proc answers an empty
+    list: unknowable, never guessed -- so a caller that needs a real answer
+    asks `process_discovery_available()` first.
+
+    Scoped by cache root rather than by process tree, because a bridge is
+    spawned detached from the test that asked for it -- and scoped to THIS
+    worker's basetemp by the caller, so one xdist worker's sweep cannot see
+    another's bridge.
+
+    The scoping has one disclosed blind spot: a bridge whose `BN_CACHE_DIR` is
+    NOT under *under* is invisible here -- an `@pytest.mark.no_cache_isolation`
+    test's bridge, or one spawned with the variable unset. Deliberate: the
+    alternative is failing this run for another repo's (or another developer's)
+    live bridge on the same host. Belt 1's `BN_IDLE_TIMEOUT` pin still reaps
+    such a leak, on a timer rather than loudly.
+    """
+    leaks: list[dict[str, str]] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return leaks
+    root = str(under)
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        row = _bn_agent_row(entry)
+        if row is None:
+            continue
+        cache_dir = row["cache_dir"]
+        if cache_dir != root and not cache_dir.startswith(f"{root}{os.sep}"):
+            continue
+        leaks.append(row)
+    # Pid order, so a multi-leak failure message reads the same twice and the
+    # sweep's own tests can assert the rows rather than a set.
+    return sorted(leaks, key=lambda row: int(row["pid"]))
+
+
+def _pid_is_gone(pid: int, *, proc: Path = Path("/proc")) -> bool:
+    """Whether *pid* has stopped running -- a zombie counts.
+
+    `os.kill(pid, 0)` succeeds for a process that has EXITED but not been
+    reaped, and a leak the suite itself spawned is a child nobody waits on, so
+    signal 0 alone reports a terminated bridge as still alive. The kernel's own
+    state letter is read instead, exactly like `bn.proc_identity` does.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    try:
+        stat = proc.joinpath(str(pid), "stat").read_bytes()
+    except OSError:
+        return True
+    # `pid (comm) state ...`, and comm may itself contain spaces/parens, so
+    # the state letter is the first field after the LAST `)`.
+    tail = stat.rpartition(b")")[2].split()
+    return bool(tail) and tail[0] == b"Z"
+
+
+def _terminate_scanned_leak(
+    row: dict[str, str], *, proc: Path = Path("/proc")
+) -> str:
+    """SIGTERM the process *row* describes, or refuse; returns the detail line.
+
+    The scan records a pid and the signal comes later -- after the rest of the
+    walk and up to `_LEAK_SWEEP_GRACE` per preceding leak -- so a bare
+    `os.kill` on that stale number can terminate an unrelated process if the
+    bridge exited and the kernel recycled the pid in between (#733 F5 review).
+
+    Two defences, in order. `bn.proc_identity.pin_process` holds the pid to ONE
+    process for as long as the pin is open, which closes the race outright.
+    Only where the platform provides no pidfd primitives at all -- including
+    the interpreter that already skips this repo's pidfd tests -- is the signal
+    sent unpinned, and then the row is RE-DERIVED from `/proc` immediately
+    before it, which narrows the window from the whole sweep to that
+    instruction pair; that is as close as a pidfd-less platform gets, and it
+    beats never signalling, which leaves a ~450 MB process running on exactly
+    the host where the reap is most useful. Which path was taken is stated in
+    the line, so the residual is visible.
+
+    Every OTHER pin failure REFUSES. `pin_process` raises `PinUnavailable` for
+    operational reasons too -- EMFILE, EPERM, a process that has already gone
+    -- and treating those as the no-pidfd tradeoff dropped a pidfd-CAPABLE host
+    to an unpinned kill while reporting "no pidfd on this platform", i.e. it
+    lost the protection and misstated why (#733 F5 review round 2). The real
+    reason is carried into the line instead.
+    """
+    pid = int(row["pid"])
+    try:
+        pin = pin_process(pid)
+    except PinUnavailable as exc:
+        if PIDFD_AVAILABLE:
+            return f"NOT signalled: the pid could not be pinned ({exc})"
+        pin = None
+    with contextlib.ExitStack() as closing:
+        if pin is not None:
+            closing.enter_context(pin)
+        if _bn_agent_row(proc.joinpath(str(pid))) != row:
+            # The pid no longer describes what was scanned, so whatever it
+            # names now is not this suite's to kill.
+            return ("gone before it could be signalled (the pid no longer "
+                    "names this bridge)")
+        how = "pinned" if pin is not None else "unpinned (no pidfd on this platform)"
+        try:
+            if pin is not None:
+                pin.send(signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "already exited, nothing to signal"
+        except OSError as exc:
+            return f"SIGTERM refused ({exc})"
+        exited = False
+        deadline = time.monotonic() + _LEAK_SWEEP_GRACE
+        while time.monotonic() < deadline:
+            if _pid_is_gone(pid, proc=proc):
+                exited = True
+                break
+            time.sleep(0.1)
+    return f"SIGTERM sent {how}, exited={exited}"
+
+
+def reap_bn_agent_leaks(
+    leaks: list[dict[str, str]], *, proc: Path = Path("/proc")
+) -> list[str]:
+    """SIGTERM each leak and return one human line per leak, with its outcome."""
+    return [
+        f"instance {row['instance_id']} (pid {row['pid']}) "
+        f"BN_CACHE_DIR={row['cache_dir']} — "
+        f"{_terminate_scanned_leak(row, proc=proc)}"
+        for row in leaks
+    ]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _refuse_leaked_bridges(tmp_path_factory) -> Iterator[None]:
+    """A leaked bridge is a failure, not something to clean up quietly (#733 F5).
+
+    Ordering, stated because the whole fixture depends on it: this is autouse
+    at session scope, so it is SET UP before the non-autouse `_shared_bridge`
+    (autouse names lead the fixture closure) and therefore finalized AFTER it.
+    The shared bridge is untouched while the session runs, and one that
+    survived its own `session stop` is correctly reported as a leak. If the
+    ordering ever inverts, the symptom is a false leak report naming the shared
+    bridge's instance id -- fix that by passing its id into the sweep as an
+    exclusion, not by dropping this fixture.
+
+    The basetemp is THIS worker's (`getbasetemp()` returns the per-xdist-worker
+    directory), so one worker cannot fail another's run.
+    """
+    yield
+    leaks = bn_agent_leaks(tmp_path_factory.getbasetemp())
+    if leaks:
+        pytest.fail(
+            "the suite leaked a headless bridge; it was reaped, but a leak is a "
+            "defect:\n" + "\n".join(reap_bn_agent_leaks(leaks)),
+            pytrace=False,
+        )
