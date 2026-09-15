@@ -1178,6 +1178,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "6bcea80f",  # "count": ...
         "7ae58359",  # Identity is `(boot id, pid, process start ... Start times count 
         "7f52ba89",  # verdict, because one verdict over many jobs would be a lie, and 
+        "88987e65",  # **Spill retention ... Spill artifacts are a cache, not a record:
         "8c11c1cb",  # ... (Optional) Pin sticky defaults — useful for a **single** ...
         "9308d393",  # **Unreachable bridges are hidden, not ... The bridge binds its s
         "959dac82",  # - ... and ... work **before or after** the subcommand, and for t

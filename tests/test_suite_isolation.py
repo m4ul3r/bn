@@ -14,6 +14,7 @@ cannot observe each other's cache state.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import os
 import platform
@@ -180,18 +181,49 @@ def test_session_state_cannot_read_real_sticky_pins(monkeypatch):
     assert after is None or b"isolation-probe" not in after
 
 
-_SEEN_ROOTS: list[Path] = []
+def _run_scoped_dir(request, tmp_path_factory) -> Path:
+    """A directory shared by every worker of THIS pytest run and no other.
+
+    A module-global list cannot carry this control: under `-n` the two
+    parametrized cases can land on different workers, each a fresh process
+    with an empty list, so the duplicate check passes vacuously while
+    reporting green -- the #589 shape #680 exists to not repeat. `xdist_group`
+    does not fix it either: that marker is inert unless the run also passes
+    `--dist loadgroup`, which `-n 8` does not, so it would re-hide the same
+    vacuity behind an annotation that looks load-bearing.
+
+    Under xdist a worker's basetemp is `<run>/popen-gw<N>`, so the parent is
+    the run; serially basetemp IS the run and its parent is the retained
+    `pytest-of-<user>` root, which would carry stale claims from the previous
+    three runs. Keyed off `workerinput`, not the directory name.
+    """
+    basetemp = tmp_path_factory.getbasetemp()
+    is_worker = hasattr(request.config, "workerinput")
+    claims = (basetemp.parent if is_worker else basetemp) / "cache-root-claims"
+    claims.mkdir(exist_ok=True)
+    return claims
 
 
 @pytest.mark.parametrize("name", ["first", "second"])
-def test_two_tests_cannot_observe_each_others_cache_state(monkeypatch, name):
+def test_two_tests_cannot_observe_each_others_cache_state(
+    monkeypatch, request, tmp_path_factory, name
+):
     root = paths.cache_home()
     # Assert isolation BEFORE mutating: if the fixture regresses, `root` is the
     # developer's real ~/.cache/bn and this test would otherwise write into it.
     assert root != _real_cache_home(monkeypatch)
     assert Path.home() not in root.parents
-    assert root not in _SEEN_ROOTS, "cache root shared between tests"
-    _SEEN_ROOTS.append(root)
+
+    # Claim the root by creating a file named for it. `touch(exist_ok=False)`
+    # is O_CREAT|O_EXCL, so the claim is atomic between concurrent workers --
+    # a second test handed the same root loses the race and fails.
+    claim = _run_scoped_dir(request, tmp_path_factory) / hashlib.sha256(
+        str(root).encode()).hexdigest()
+    try:
+        claim.touch(exist_ok=False)
+    except FileExistsError:
+        pytest.fail(f"cache root shared between tests: {root}")
+
     leaked = list(root.rglob("leaked-*"))
     assert leaked == [], f"state leaked from a previous test: {leaked}"
     (root / f"leaked-{name}").write_text(name)

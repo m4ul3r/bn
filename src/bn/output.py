@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import secrets
+import shutil
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -125,8 +127,80 @@ def _summary(value: Any) -> dict[str, Any]:
     return {"kind": type(value).__name__}
 
 
+DEFAULT_SPILL_RETENTION_DAYS = 14
+# Set once a process has swept, so a command that spills fifty pages pays for
+# the `iterdir()` once rather than fifty times.
+_spill_pruned = False
+
+
+def resolve_spill_retention_days(default: int = DEFAULT_SPILL_RETENTION_DAYS) -> int:
+    """How many days of spill artifacts to keep (#591).
+
+    ``BN_SPILL_RETENTION_DAYS=0`` disables pruning for an engagement that must
+    keep every artifact. A negative or non-numeric value falls back to the
+    default: the failure mode of a typo must not be silently unbounded growth,
+    which is the bug being fixed.
+    """
+    raw = os.environ.get("BN_SPILL_RETENTION_DAYS")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip(), 0)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
+    """Remove whole spill day-directories older than the retention window.
+
+    Spills already live in ``spills/<YYYYMMDD>/``, so retention costs one
+    ``iterdir()`` over a few dozen names and zero per-file stats -- the
+    measured 1.0 GB / 4187-file spill root is reclaimed a day at a time.
+
+    Only an entry that is a directory AND whose name parses EXACTLY as
+    ``%Y%m%d`` is eligible. Anything else in the spill root -- a user's notes,
+    another tool's file, a partially-named dir -- is evidence of something this
+    function did not create, so it is left alone (#618: act on evidence, never
+    on its absence). ``strptime`` is the check; no name is trusted by shape.
+    """
+    retention = resolve_spill_retention_days()
+    if retention == 0:
+        return []
+    cutoff = today - timedelta(days=retention)
+    removed: list[Path] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            day = datetime.strptime(entry.name, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if day >= cutoff or not entry.is_dir():
+            continue
+        # A racing peer may remove the same stale day; that is the outcome we
+        # wanted either way, so a failure here is never the command's problem.
+        with contextlib.suppress(OSError):
+            shutil.rmtree(entry)
+            removed.append(entry)
+    return removed
+
+
 def _spill_path(stem: str, suffix: str) -> Path:
+    global _spill_pruned
     now = datetime.now(timezone.utc)
+    if not _spill_pruned:
+        _spill_pruned = True
+        removed = _prune_old_spill_days(spill_root(), now.date())
+        if removed:
+            print(
+                f"note: pruned {len(removed)} spill day(s) older than "
+                f"{resolve_spill_retention_days()} days from {spill_root()} "
+                "(set BN_SPILL_RETENTION_DAYS=0 to keep everything)",
+                file=sys.stderr,
+            )
     # spill_root() is already private (0o700); tighten the per-day subdir too so a
     # permissive umask can't leave decompiled artifacts group/world-readable (#612).
     directory = ensure_private_dir(spill_root() / now.strftime("%Y%m%d"))

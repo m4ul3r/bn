@@ -317,7 +317,6 @@ def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeErr
     Surface the pid, liveness, and log path instead of a bare one-liner.
     """
     op_label = f"op '{op}'" if op else "the request"
-    log_path = instance.registry_path.with_suffix(".log")
     parts = [
         f"Binary Ninja bridge returned an empty response for {op_label} "
         f"(instance {instance_selector(instance)}, pid {instance.pid})."
@@ -333,9 +332,56 @@ def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeErr
             "OOM-killed (large or complex binaries can exhaust memory during "
             "update_analysis_and_wait)."
         )
+    parts.extend(_bridge_recovery_advice(instance))
+    return BridgeError(" ".join(parts))
+
+
+def _bridge_recovery_advice(instance: BridgeInstance) -> list[str]:
+    """The log pointer and restart line shared by every dead-bridge diagnosis."""
+    log_path = instance.registry_path.with_suffix(".log")
+    parts = []
     if log_path.exists():
         parts.append(f"Check {log_path} for any crash output.")
     parts.append("Reload the target with `bn load`, or start a fresh bridge with `bn session start`.")
+    return parts
+
+
+def _unparseable_response_error(
+    instance: BridgeInstance, op: str | None, received: int, exc: Exception
+) -> BridgeError:
+    """Explain a reply the JSON decoder could not read.
+
+    A bridge that dies while writing yields a CLEAN EOF: ``recv`` returns b""
+    and raises nothing, so the loop exits by its ordinary path and
+    ``last_error`` stays None -- the mid-response guard above cannot fire.
+    ``json.loads`` then fails on the truncated bytes, and reporting that as
+    "returned invalid JSON" sends the reader hunting a protocol bug when the
+    bridge simply died mid-write (#595).
+
+    The decoder cannot tell the two apart: a truncated document reports
+    `pos < len` as readily as a corrupt one (an unterminated string points at
+    where the string began), so the parse error is not evidence. Liveness is
+    the discriminator, and it is best-effort -- a recycled pid reads alive --
+    so it is REPORTED as the reason, never asserted as fact.
+    """
+    op_label = f"op '{op}'" if op else "the request"
+    parts = [
+        f"Binary Ninja bridge sent a reply for {op_label} that could not be parsed "
+        f"(instance {instance_selector(instance)}, pid {instance.pid}): "
+        f"the connection closed after {received} bytes ({type(exc).__name__}: {exc})."
+    ]
+    if _process_alive(instance.pid):
+        parts.append(
+            "The process is still running, so the reply is malformed rather than "
+            "cut short -- a bridge older or newer than this CLI is the usual cause; "
+            "compare the build ids with `bn doctor`."
+        )
+    else:
+        parts.append(
+            "The process is no longer running, so the reply was truncated by a crash "
+            "or OOM kill -- this is a dead bridge, not a protocol error."
+        )
+    parts.extend(_bridge_recovery_advice(instance))
     return BridgeError(" ".join(parts))
 
 
@@ -1369,18 +1415,16 @@ def _send_request_to_instance(
 
     if not chunks:
         raise _empty_response_error(instance, op)
+    raw = b"".join(chunks)
     try:
-        response = json.loads(b"".join(chunks).decode("utf-8"))
+        response = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise BridgeError(
             f"Binary Ninja bridge returned a non-UTF-8 response for op '{op}' "
             f"(instance {instance_selector(instance)}, pid {instance.pid})"
         ) from exc
     except json.JSONDecodeError as exc:
-        raise BridgeError(
-            f"Binary Ninja bridge returned invalid JSON for op '{op}' "
-            f"(instance {instance_selector(instance)}, pid {instance.pid})"
-        ) from exc
+        raise _unparseable_response_error(instance, op, len(raw), exc) from exc
 
     if not isinstance(response, dict):
         raise BridgeError(
