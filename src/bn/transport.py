@@ -168,6 +168,30 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
+# A process that has exited but not yet been reaped keeps its pid, so
+# `kill(pid, 0)` still succeeds -- `_process_alive` answers True for a zombie by
+# design (the pid is not yet reusable, which is what its callers ask about).
+# A *diagnosis* asks a different question: did this bridge die during my
+# request? An auto-spawned bridge is our own child, so a mid-request crash lands
+# in exactly that state and the pid-existence answer inverts the verdict --
+# reporting a crashed bridge as a live one sending malformed replies. The
+# pre-request zombie check cannot cover it; the transition happens after.
+_EXITED_STATES = frozenset({"Z", "X", "x"})
+
+
+def _process_running(pid: int) -> bool:
+    """Whether *pid* names a process that has not yet exited.
+
+    Stricter than ``_process_alive``: an exited-but-unreaped child answers
+    False. A state this host cannot report answers None from
+    ``_process_state``, which is unknowable and therefore NOT evidence of
+    death (#618) -- it falls through to the pid-existence answer.
+    """
+    if not _process_alive(pid):
+        return False
+    return _process_state(pid) not in _EXITED_STATES
+
+
 def _process_state(pid: int) -> str | None:
     """Return Linux /proc state, or None when unavailable.
 
@@ -321,7 +345,7 @@ def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeErr
         f"Binary Ninja bridge returned an empty response for {op_label} "
         f"(instance {instance_selector(instance)}, pid {instance.pid})."
     ]
-    if _process_alive(instance.pid):
+    if _process_running(instance.pid):
         parts.append(
             "The process is still running but closed the connection without "
             "replying -- a worker thread likely hit a native fault."
@@ -370,7 +394,7 @@ def _unparseable_response_error(
         f"(instance {instance_selector(instance)}, pid {instance.pid}): "
         f"the connection closed after {received} bytes ({type(exc).__name__}: {exc})."
     ]
-    if _process_alive(instance.pid):
+    if _process_running(instance.pid):
         parts.append(
             "The process is still running, so the reply is malformed rather than "
             "cut short -- a bridge older or newer than this CLI is the usual cause; "
@@ -679,8 +703,7 @@ def _load_instance(
     socket_path = _record_socket_path(path, raw_socket_path)
     pid = raw_pid
 
-    process_state = _process_state(pid)
-    owner_alive = _process_alive(pid) and process_state not in {"Z", "X", "x"}
+    owner_alive = _process_running(pid)
     # Liveness alone cannot tell a running bridge from an unrelated process that
     # recycled its pid, so discovery consults the durable identity too (#694).
     verdict = identity_verdict(payload, pid)

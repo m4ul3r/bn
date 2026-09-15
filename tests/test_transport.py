@@ -1173,7 +1173,7 @@ def test_send_request_unparseable_reply_is_attributed_to_json_not_encoding(tmp_p
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
-    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: True)
     fake_socket = _fake_socket_returning(b"{not valid json")
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
 
@@ -1192,7 +1192,7 @@ def test_send_request_truncated_reply_from_a_dead_bridge_blames_the_crash(tmp_pa
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
-    monkeypatch.setattr(transport, "_process_alive", lambda pid: False)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: False)
     truncated = b'{"ok": true, "result": {"functions": ['
     fake_socket = _fake_socket_returning(truncated)
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
@@ -1217,7 +1217,7 @@ def test_send_request_unparseable_reply_from_a_live_bridge_blames_version_skew(t
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
-    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_running", lambda pid: True)
     fake_socket = _fake_socket_returning(b'{"ok": true, "result": <object>}')
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
 
@@ -1228,6 +1228,73 @@ def test_send_request_unparseable_reply_from_a_live_bridge_blames_version_skew(t
     assert "malformed" in message
     assert "bn doctor" in message
     assert "crash" not in message
+
+
+def _state_transitions_to_zombie(monkeypatch, transport):
+    """`_process_state` answering "S" once, then "Z" forever after.
+
+    The pre-request guard at the top of `_send_request_to_instance` already
+    refuses a bridge that is ALREADY a zombie, so a fake that answers "Z" from
+    the start never reaches the diagnosis under test. The reachable case is a
+    bridge that is running when the request is dispatched and has exited by the
+    time the reply is diagnosed -- which is exactly why the pre-request check
+    cannot cover this.
+    """
+    states = iter(["S"])
+    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_state",
+                        lambda pid: next(states, "Z"))
+
+
+def test_a_bridge_that_crashed_mid_reply_is_not_called_still_running_595(tmp_path, monkeypatch):
+    """An auto-spawned bridge is our own child, so a mid-request crash leaves it
+    exited-but-unreaped. `kill(pid, 0)` still succeeds for that state, so a
+    pid-existence check inverts the verdict and blames version skew for a
+    crash."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    _state_transitions_to_zombie(monkeypatch, transport)
+    fake_socket = _fake_socket_returning(b'{"ok": true, "result": {"items": [')
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "no longer running" in message
+    assert "truncated by a crash" in message
+    assert "still running" not in message
+    assert "bn doctor" not in message
+
+
+def test_an_empty_reply_from_a_crashed_child_is_not_called_still_running_595(tmp_path, monkeypatch):
+    """The sibling arm carried the same misdiagnosis: a crashed child bridge
+    that wrote nothing at all was reported as a live process whose worker
+    thread faulted."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    _state_transitions_to_zombie(monkeypatch, transport)
+    monkeypatch.setattr(transport.socket, "socket",
+                        lambda *a, **k: _fake_socket_returning(b"")())
+
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    message = str(excinfo.value)
+    assert "no longer running" in message
+    assert "still running" not in message
+
+
+def test_an_unreportable_process_state_is_not_evidence_of_death_595(tmp_path, monkeypatch):
+    """#618: a host that cannot report a state answers None, which is
+    unknowable. It must fall through to pid existence, not be read as a crash."""
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: None)
+
+    assert transport._process_running(instance.pid) is True
 
 
 def test_send_request_multi_chunk_utf8_reply_reassembles(tmp_path, monkeypatch):

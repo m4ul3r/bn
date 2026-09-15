@@ -544,3 +544,75 @@ def test_the_spill_sweep_runs_once_per_process_591(tmp_path, monkeypatch):
                                    out_path=None, stem="functions")
 
     assert len(calls) == 1
+
+
+def test_prune_requires_a_canonical_date_name_591(tmp_path, monkeypatch):
+    """`strptime`'s numeric fields accept UNPADDED input, so `202611` parses as
+    2026-01-01 and a directory by that name -- which the writer, which always
+    renders via `strftime`, could never have produced -- was recursively
+    deleted along with its contents. The round-trip is the check."""
+    from datetime import date
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    # Each parses under %Y%m%d, is NOT what strftime emits, and resolves to a
+    # date old enough to be inside the prune window -- so only the round-trip
+    # guard saves them. (A future-dated name would survive on age alone and
+    # prove nothing.)
+    for name in ("202611", "2026011", "202612", "2026061"):
+        d = tmp_path / name
+        d.mkdir(exist_ok=True)
+        (d / "keep.txt").write_text("someone else's data")
+
+    removed = _prune_old_spill_days(tmp_path, date(2026, 9, 15))
+
+    assert removed == []
+    for entry in tmp_path.iterdir():
+        assert (entry / "keep.txt").read_text() == "someone else's data"
+
+
+def test_prune_still_removes_the_canonical_stale_day_591(tmp_path, monkeypatch):
+    """Negative control for the round-trip guard: tightening the name check
+    must not stop the prune doing its job on a name the writer did emit."""
+    from datetime import date
+
+    from bn.output import _prune_old_spill_days
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    stale = _make_day(tmp_path, date(2026, 1, 1))
+    assert stale.name == "20260101"
+
+    assert _prune_old_spill_days(tmp_path, date(2026, 9, 15)) == [stale]
+    assert not stale.exists()
+
+
+def test_an_enormous_retention_window_keeps_everything_591(tmp_path, monkeypatch):
+    """A window wider than the calendar overflowed `date` arithmetic. The spill
+    fallback catches only OSError, so the OverflowError denied the caller both
+    its result AND its artifact -- a config value silently discarding output."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "9999999")
+    ancient = _make_day(tmp_path, date(2026, 9, 15) - timedelta(days=365))
+
+    assert output._prune_old_spill_days(tmp_path, date(2026, 9, 15)) == []
+    assert ancient.exists()
+
+
+def test_an_enormous_retention_window_still_returns_the_output_591(tmp_path, monkeypatch):
+    """End-to-end: the overflow was raised from inside the spill write path."""
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "9999999")
+    monkeypatch.setattr(output, "_spill_pruned", False)
+
+    res = output.write_output_result({"items": ["x" * 400]}, fmt="json",
+                                     out_path=None, stem="functions")
+
+    assert res.spilled is True
+    assert res.artifact["bytes"] > 0

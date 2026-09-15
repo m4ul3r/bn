@@ -158,16 +158,30 @@ def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
     ``iterdir()`` over a few dozen names and zero per-file stats -- the
     measured 1.0 GB / 4187-file spill root is reclaimed a day at a time.
 
-    Only an entry that is a directory AND whose name parses EXACTLY as
-    ``%Y%m%d`` is eligible. Anything else in the spill root -- a user's notes,
-    another tool's file, a partially-named dir -- is evidence of something this
-    function did not create, so it is left alone (#618: act on evidence, never
-    on its absence). ``strptime`` is the check; no name is trusted by shape.
+    Only an entry that is a directory AND whose name is the CANONICAL
+    ``%Y%m%d`` rendering of a date is eligible. Anything else in the spill root
+    -- a user's notes, another tool's file, a partially-named dir -- is
+    evidence of something this function did not create, so it is left alone
+    (#618: act on evidence, never on its absence).
+
+    ``strptime`` alone is NOT that check: its numeric fields accept unpadded
+    input, so ``202611`` parses happily as 2026-01-01 and a directory by that
+    name -- which this writer, which always calls ``strftime``, could not have
+    produced -- was recursively deleted. The round-trip is the check: a name is
+    eligible only if formatting the parsed date reproduces the name byte for
+    byte.
     """
     retention = resolve_spill_retention_days()
     if retention == 0:
         return []
-    cutoff = today - timedelta(days=retention)
+    try:
+        cutoff = today - timedelta(days=retention)
+    except OverflowError:
+        # A window wider than the calendar is a request to keep everything, and
+        # it must not become an exception on the output path: the spill write's
+        # fallback catches OSError, so an OverflowError here would deny the
+        # caller its result AND its artifact over a config value.
+        return []
     removed: list[Path] = []
     try:
         entries = list(root.iterdir())
@@ -177,6 +191,8 @@ def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
         try:
             day = datetime.strptime(entry.name, "%Y%m%d").date()
         except ValueError:
+            continue
+        if day.strftime("%Y%m%d") != entry.name:
             continue
         if day >= cutoff or not entry.is_dir():
             continue
