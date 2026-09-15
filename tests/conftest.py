@@ -14,6 +14,9 @@ same thing on every machine. See `tests/test_suite_isolation.py`.
 `integration_fixtures` + `require_real_bn` own the real-BN lane's gate (#590):
 the generated `tests/fixtures/*_x86_64` binaries stay untracked, so the suite
 builds them itself rather than skipping the only real-BN net silently.
+`BN_REQUIRE_REAL_TESTS` is the strict flag over both halves of that gate: it
+refuses ANY skip the machine cannot un-skip, an absent BN via `require_real_bn`
+and an environment-bound skip via `refuse_silent_skip`.
 
 `shared_bn` is one headless bridge for the whole pytest session, because that
 lane's cost was process lifecycle rather than the work under test. Each test
@@ -32,6 +35,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NoReturn
 
 import bn.cli
 import pytest
@@ -116,6 +120,28 @@ def require_real_bn() -> None:
         pytest.fail(f"{message} {STRICT_ENV_VAR} is set, so this is a failure.",
                     pytrace=False)
     pytest.skip(message)
+
+
+def refuse_silent_skip(reason: str) -> NoReturn:
+    """Skip on a condition the machine cannot change -- loudly under strict mode.
+
+    `require_real_bn` covers an absent BN, which a machine CAN fix by
+    installing one. A skip nothing can un-skip (running as root, so the DAC
+    checks a permission test asserts are bypassed) is worse: it is a test
+    nobody ever runs, and on a root CI container it disappears permanently
+    with no signal. Strict mode is the flag that says "this lane is supposed
+    to be complete", so under it such a skip is a failure, not a pass.
+
+    *reason* carries its own remedy, because only the caller knows one: this
+    helper is not root-specific and must not advise as though it were.
+    """
+    if _strict_mode():
+        pytest.fail(
+            f"{reason} -- {STRICT_ENV_VAR} is set, so this skip is a failure "
+            "rather than a silent pass.",
+            pytrace=False,
+        )
+    pytest.skip(reason)
 
 
 #: Wall-clock ceiling for the six-binary build. Generous: six -O0 compiles are

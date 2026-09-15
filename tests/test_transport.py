@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import refuse_silent_skip
 
 from bn.paths import bridge_registry_path, instances_dir
 from bn.transport import (
@@ -5502,7 +5503,8 @@ def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, mon
     `#694` put there.
     """
     if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
+        refuse_silent_skip("root ignores the directory mode this test relies on; "
+                           "run the suite as a non-root user")
     from bn.transport import _process_alive
 
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -5557,7 +5559,8 @@ def test_an_unprobeable_record_is_hidden_rather_than_offered_as_a_bridge(tmp_pat
     listed and still selected, and the unprobeable record is still on disk.
     """
     if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
+        refuse_silent_skip("root ignores the directory mode this test relies on; "
+                           "run the suite as a non-root user")
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)

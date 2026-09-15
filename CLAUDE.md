@@ -39,7 +39,7 @@ The `tests/fixtures/*_x86_64` binaries those tests run against are compiler outp
 BN_REQUIRE_REAL_TESTS=1 uv run pytest tests/test_integration.py tests/test_taint_integration.py   # strict: fail (not skip) if BN is missing
 ```
 
-Without BN the `real_bn`-marked tests skip visibly. Use the strict invocation on any lane that is *supposed* to have BN, so an absent install can't report green. Both real-BN modules carry `pytest.mark.real_bn` — never a bare module-level `skipif`, which bypasses the strict gate entirely.
+Without BN the `real_bn`-marked tests skip visibly. Use the strict invocation on any lane that is *supposed* to have BN, so an absent install can't report green. Both real-BN modules carry `pytest.mark.real_bn` — never a bare module-level `skipif`, which bypasses the strict gate entirely. The same flag refuses any skip the machine cannot un-skip, not just an absent BN: a test whose precondition is environmental rather than installable — running as root, where the DAC denial a permission test asserts is bypassed — calls `refuse_silent_skip` (in `tests/conftest.py`), which fails under strict mode instead of disappearing.
 
 ### The real-BN lane's shared bridge
 

@@ -6872,7 +6872,10 @@ def test_descend_downstream_finding_not_attributed_when_handoff_is_unconditional
     # taint never traced back to the declared --source, so the finding must
     # still render the "?" sentinel, not param:0.
     assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
-    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    # The LENGTH argument (index 2 of `memcpy(dst, src, rax)`), not merely
+    # "some argument": a finding that names the wrong argument is the wrong
+    # answer under the right sink, which `is not None` accepts.
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] == 2
     assert memcpy_sinks[0]["signature"]["source"] == "?"
     assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
     assert result["stats"]["functions_visited"] == 2
@@ -6940,7 +6943,10 @@ def test_descend_downstream_finding_composes_across_two_levels(models):
     # in relay()) but never traces back to the declared --source, so it must
     # still render the "?" sentinel, not param:0, even after two merges.
     assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
-    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    # The LENGTH argument (index 2 of `memcpy(dst, src, rax)`), not merely
+    # "some argument": a finding that names the wrong argument is the wrong
+    # answer under the right sink, which `is not None` accepts.
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] == 2
     assert memcpy_sinks[0]["signature"]["source"] == "?"
     assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
     assert result["stats"]["functions_visited"] == 3

@@ -3507,3 +3507,175 @@ def test_class_list_zero_result_reports_its_inputs_653(monkeypatch):
     text = _render_class_list_text(out)
     assert "demangled C++ symbols: 0" in text
     assert "no C++ type evidence" in text
+
+
+# --- #469 call-descriptor evidence (`evidence calls`) ------------------------
+#
+# The op reads a stack descriptor built by each caller and reports it FIELD BY
+# FIELD, so the whole answer is a mapping from a write's offset to a declared
+# field's name. A mapping that slips by one slot reports the wrong value under
+# the right name -- an undetectable wrong answer, not a crash -- which is what
+# these three tests exist to make loud. The op had no functional test at all
+# before this: the only mentions of it were a name in the op-registry
+# membership pin and a fake-CLI page loop that never reaches the handler.
+
+def _desc_caller(name, start, end, instructions):
+    caller = _FakeFunction(start, name)
+    caller.basic_blocks = [_FakeBasicBlock(start, end)]
+    caller.mlil = types.SimpleNamespace(instructions=instructions)
+    return caller
+
+
+def _desc_stack_var(name, storage, identifier):
+    return _FakeVariable(name=name, storage=storage, var_type="void*",
+                         identifier=identifier)
+
+
+def _desc_call(address, *params):
+    return _vc_expr("MLIL_CALL", address=address, params=list(params), output=[])
+
+
+def test_call_descriptors_maps_each_write_to_the_field_at_its_own_offset(monkeypatch):
+    """Each declared field reports the constant written AT ITS OWN OFFSET, and a
+    `ptr` field resolves the callback it points at.
+
+    The two scalars are deliberately distinguishable (7 vs 0x11) and adjacent:
+    a mapping that walks the declared fields against the writes in order, or
+    slips a slot, swaps them and this fails. The pointer field proves the other
+    half of the contract -- a descriptor slot is only useful once the callback
+    it holds is named -- and it is reached through a register copy of `&desc`,
+    which is how a real caller passes it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    desc = _desc_stack_var("desc", -0x30, 1)
+    argreg = _FakeVariable(name="rsi", storage=0, var_type="void*", identifier=2,
+                           source_type="RegisterVariableSourceType")
+    callback = _FakeFunction(0x401500, "on_event_cb")
+    callee = _FakeFunction(0x401200, "register_handler")
+    caller = _desc_caller("install_handlers", 0x401000, 0x401030, [
+        _vc_expr("MLIL_SET_VAR_FIELD", dest=desc, offset=0, size=4,
+                 src=_vc_expr("MLIL_CONST", constant=7), address=0x401010),
+        _vc_expr("MLIL_SET_VAR_FIELD", dest=desc, offset=4, size=4,
+                 src=_vc_expr("MLIL_CONST", constant=0x11), address=0x401014),
+        _vc_expr("MLIL_SET_VAR_FIELD", dest=desc, offset=8, size=8,
+                 src=_vc_expr("MLIL_CONST_PTR", constant=0x401500), address=0x401018),
+        _vc_expr("MLIL_SET_VAR", dest=argreg, size=8,
+                 src=_vc_expr("MLIL_ADDRESS_OF", src=desc), address=0x40101C),
+        _desc_call(0x401020, _vc_expr("MLIL_CONST", constant=0),
+                   _vc_expr("MLIL_VAR", src=argreg)),
+    ])
+    bv = _FakeBV(functions=[callee, caller, callback],
+                 arch=_FakeArch(name="x86_64", address_size=8),
+                 code_refs={0x401200: [_FakeCodeRef(0x401020)]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._call_descriptor_evidence(
+        None, "register_handler", arg_index=1,
+        field_specs=["version:u32@0", "flags:u32@4", "on_event:ptr@0x8"])
+
+    assert result["kind"] == "call_descriptors"
+    assert result["total"] == 1 and not result["warnings"]
+    row = result["items"][0]
+    assert row["status"] == "ok"
+    assert row["caller"] == "install_handlers" and row["call_address"] == "0x401020"
+    fields = {f["name"]: f for f in row["fields"]}
+    assert fields["version"]["value"] == "0x7", row["fields"]
+    assert fields["flags"]["value"] == "0x11", row["fields"]
+    assert fields["on_event"]["value"] == "0x401500"
+    assert fields["on_event"]["symbol"] == "on_event_cb"
+    # Each value is attributed to the instruction that wrote it, so the claim can
+    # be checked in the listing rather than taken on trust.
+    assert fields["version"]["source_address"] == "0x401010"
+    assert fields["flags"]["source_address"] == "0x401014"
+    assert all(f["status"] == "resolved" for f in row["fields"])
+
+
+def test_call_descriptors_slices_a_write_combined_store_per_field(monkeypatch):
+    """A single wide store covering two fields is SLICED to each field's bytes.
+
+    An optimizer merges `version = 7; flags = 0x11` into one 8-byte store of
+    0x11_00000007. Reporting the whole store under both names -- or shifting by
+    the wrong end -- is the same wrong-value-under-the-right-name failure as a
+    slot slip, so both halves are asserted, little-endian: the low word is
+    `version`, the high word is `flags`.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    desc = _desc_stack_var("desc", -0x20, 1)
+    callee = _FakeFunction(0x402200, "register_handler")
+    caller = _desc_caller("install_one", 0x402000, 0x402030, [
+        _vc_expr("MLIL_SET_VAR_FIELD", dest=desc, offset=0, size=8,
+                 src=_vc_expr("MLIL_CONST", constant=(0x11 << 32) | 7),
+                 address=0x402010),
+        _desc_call(0x402020, _vc_expr("MLIL_ADDRESS_OF", src=desc)),
+    ])
+    bv = _FakeBV(functions=[callee, caller],
+                 arch=_FakeArch(name="x86_64", address_size=8),
+                 code_refs={0x402200: [_FakeCodeRef(0x402020)]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._call_descriptor_evidence(
+        None, "register_handler", arg_index=0,
+        field_specs=["version:u32@0", "flags:u32@4"])
+
+    fields = {f["name"]: f for f in result["items"][0]["fields"]}
+    assert fields["version"]["value"] == "0x7", fields
+    assert fields["flags"]["value"] == "0x11", fields
+
+
+def test_call_descriptors_reports_a_callsite_it_could_not_resolve(monkeypatch):
+    """A callsite whose argument is not a local descriptor is REPORTED as such.
+
+    Dropping it would turn "I could not read this one" into "this one has no
+    fields", which is the shape #469 was filed against: the row keeps its
+    caller and address, carries the reason, and the count reaches the warning
+    so a reader knows the sweep was incomplete.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    desc = _desc_stack_var("desc", -0x30, 1)
+    callee = _FakeFunction(0x403300, "register_handler")
+    resolved = _desc_caller("install_local", 0x403000, 0x403030, [
+        _vc_expr("MLIL_SET_VAR_FIELD", dest=desc, offset=0, size=4,
+                 src=_vc_expr("MLIL_CONST", constant=3), address=0x403010),
+        _desc_call(0x403020, _vc_expr("MLIL_ADDRESS_OF", src=desc)),
+    ])
+    # A static descriptor in .data: the argument is a constant pointer, not the
+    # address of a stack local, so nothing can be recovered from the caller.
+    static = _desc_caller("install_static", 0x403100, 0x403130, [
+        _desc_call(0x403120, _vc_expr("MLIL_CONST_PTR", constant=0x500000)),
+    ])
+    bv = _FakeBV(functions=[callee, resolved, static],
+                 arch=_FakeArch(name="x86_64", address_size=8),
+                 code_refs={0x403300: [_FakeCodeRef(0x403020), _FakeCodeRef(0x403120)]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._call_descriptor_evidence(
+        None, "register_handler", arg_index=0, field_specs=["version:u32@0"])
+
+    rows = {row["caller"]: row for row in result["items"]}
+    assert rows["install_local"]["status"] == "ok"
+    assert rows["install_static"]["status"] == "not_a_local_descriptor"
+    assert rows["install_static"]["call_address"] == "0x403120"
+    assert rows["install_static"]["fields"] == []
+    assert result["total"] == 2
+    assert any("1 callsite(s) did not resolve arg 0" in w for w in result["warnings"])
+
+
+def test_call_descriptors_refuses_a_run_with_no_declared_field(monkeypatch):
+    """No `--field` means no question was asked. Returning an empty-field row per
+    callsite would read as "this descriptor has nothing in it", so the op refuses
+    up front instead."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view",
+                        lambda selector: pytest.fail("refusal must precede view resolution"))
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._call_descriptor_evidence(None, "register_handler", arg_index=0,
+                                           field_specs=[])
+    assert excinfo.value.status == "invalid_request"

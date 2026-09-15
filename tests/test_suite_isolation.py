@@ -492,3 +492,23 @@ def test_strict_mode_does_not_fail_when_bn_is_present(monkeypatch):
     monkeypatch.setattr(conftest, "real_bn_available", lambda: True)
     monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
     conftest.require_real_bn()
+
+
+def test_an_unfixable_skip_is_a_failure_in_strict_mode(monkeypatch):
+    """The strict gate covers skips no machine can un-skip, not just an absent
+    BN: `test_transport.py`'s two directory-mode permission tests cannot run as
+    root, so on a root CI container they vanish for good unless strict mode
+    turns them red."""
+    reason = "root ignores the directory mode this test relies on"
+
+    monkeypatch.delenv("BN_REQUIRE_REAL_TESTS", raising=False)
+    with pytest.raises(Skipped):
+        conftest.refuse_silent_skip(reason)
+
+    monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
+    with pytest.raises(Failed) as excinfo:
+        conftest.refuse_silent_skip(reason)
+    assert reason in str(excinfo.value)
+    # The message names the knob that produced the failure, so a reader who did
+    # not set it knows where it came from; the remedy rides in the reason.
+    assert conftest.STRICT_ENV_VAR in str(excinfo.value)
