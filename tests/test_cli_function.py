@@ -1007,6 +1007,69 @@ def test_evidence_table_renders_interior_function_targets(fake_transport, capsys
     assert "[thumb-adjusted]" not in output
 
 
+def test_evidence_calls_routes_and_renders_descriptor_rows(fake_transport, capsys):
+    """#469 end to end through the CLI: the declared fields reach the bridge and
+    every callsite reaches the reader.
+
+    `--field` is repeatable and arrives under a different key than its flag, so
+    the request shape is asserted; and the rendered listing must show the row
+    the bridge could NOT resolve, because a reader who sees only the resolved
+    rows would read an incomplete sweep as a complete one.
+    """
+    calls = fake_transport({"call_descriptors": {
+        "ok": True,
+        "result": {
+            "kind": "call_descriptors",
+            "callee": "register_handler",
+            "arg_index": 1,
+            "fields": [{"name": "version", "type": "u32", "offset": "0x0"},
+                       {"name": "on_event", "type": "ptr", "offset": "0x8"}],
+            "total": 2,
+            "count": 2,
+            "warnings": ["1 callsite(s) did not resolve arg 1 to a local descriptor "
+                         "(indirect/aliased pointer, or the descriptor is not stack-local)"],
+            "items": [
+                {
+                    "caller": "install_handlers",
+                    "caller_address": "0x401000",
+                    "call_address": "0x401020",
+                    "status": "ok",
+                    "fields": [
+                        {"name": "version", "offset": 0, "type": "u32",
+                         "status": "resolved", "value": "0x7",
+                         "source_address": "0x401010"},
+                        {"name": "on_event", "offset": 8, "type": "ptr",
+                         "status": "resolved", "value": "0x401500",
+                         "symbol": "on_event_cb", "source_address": "0x401018"},
+                    ],
+                },
+                {
+                    "caller": "install_static",
+                    "caller_address": "0x401100",
+                    "call_address": "0x401120",
+                    "status": "not_a_local_descriptor",
+                    "fields": [],
+                },
+            ],
+        }}})
+
+    rc = bn.cli.main(["evidence", "calls", "--target", "active", "register_handler",
+                      "--arg-struct", "1",
+                      "--field", "version:u32@0", "--field", "on_event:ptr@0x8"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "call_descriptors"
+    assert calls[-1]["params"]["identifier"] == "register_handler"
+    assert calls[-1]["params"]["arg_index"] == 1
+    assert calls[-1]["params"]["fields"] == ["version:u32@0", "on_event:ptr@0x8"]
+    output = capsys.readouterr().out
+    assert "descriptors passed to register_handler (arg 1): 2 callsite(s)" in output
+    assert "warning: 1 callsite(s) did not resolve arg 1" in output
+    assert "caller=install_handlers call=0x401020 version=0x7 on_event=0x401500 (on_event_cb)" \
+        in output
+    assert "caller=install_static call=0x401120 [not_a_local_descriptor]" in output
+
+
 def test_evidence_message_routes_and_renders_lens(fake_transport, capsys):
     calls = fake_transport({"message_lens": {
         "ok": True,

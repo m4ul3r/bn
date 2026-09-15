@@ -28,6 +28,11 @@ bn-agent = "bn.headless:main"
 [dependency-groups]
 dev = [
     "pytest>=8.4.0",
+    # The suite is xdist-clean, and parallel is where the wall time is: the
+    # full run drops from ~7.5min to ~2.5min on a 6-core laptop with `-n 8`.
+    # Not in `addopts`, because a serial run is the one that gives a readable
+    # failure and a usable `-x`; see CLAUDE.md's Testing section.
+    "pytest-xdist>=3.6.0",
 ]
 
 [build-system]

@@ -54,19 +54,21 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     )
 
 
-# `session start` is a superprocess: bridge spawn + BN import + FULL analysis of
-# every fixture passed in, not just the socket round trip. These budgets are
-# ceilings on that whole pipeline, sized from the SLOWEST fixture rather than
+# Bringing a binary into a bridge is a superprocess: for `session start` it is
+# bridge spawn + BN import + FULL analysis of every binary passed in; for a
+# `load` into the shared bridge it is the analysis alone. These budgets are
+# ceilings on that whole pipeline, sized from the SLOWEST binary rather than
 # tuned to one machine.
 #
-# Measured on a 6-core laptop, warm: ~5s of bridge startup plus ~25s of analysis
-# for the -static aarch64 probe (~1.1k functions). #718 was filed while this
-# default was 30s -- a 5s margin over the measurement itself -- so a cold BN
-# cache or a loaded host manufactured `subprocess.TimeoutExpired` failures that
-# were indistinguishable from a genuine hang. The cross-arch lane is the one
-# that analyses that probe, so it gets the larger, explicitly named budget.
+# Measured on a 6-core laptop, warm: ~3s of bridge startup, and ~20s of
+# analysis for the -static aarch64 probe (~1.1k functions). #718 was filed
+# while this default was 30s -- a margin thinner than the measurement's own
+# noise -- so a cold BN cache or a loaded host manufactured
+# `subprocess.TimeoutExpired` failures indistinguishable from a genuine hang.
+# The cross-arch lane is the one that analyses that probe, so it gets the
+# larger, explicitly named budget -- on whichever call does the analysing.
 _SESSION_START_TIMEOUT = 120.0
-_CROSS_ARCH_SESSION_START_TIMEOUT = 300.0
+_CROSS_ARCH_ANALYSIS_TIMEOUT = 300.0
 
 # How much of a bridge log to attach to a timeout: the crash output that matters
 # is at the end, and the tail cannot be allowed to swamp the failure report.
@@ -234,75 +236,66 @@ class TestSavePathIdentity:
     live target, so the original selector keeps resolving afterward. Needs real BN
     -- only `bv.create_database` actually rebinds the view's filename."""
 
-    def test_save_path_keeps_original_selector(self, tmp_path):
+    def test_save_path_keeps_original_selector(self, shared_bn, tmp_path):
         # Two targets in one instance so the selector is REQUIRED and name-based.
-        info = _session_start(str(HELLO_BINARY), str(ADD_BINARY))
-        inst = info["instance_id"]
-        try:
-            listing = json.loads(
-                _bn("--instance", inst, "target", "list", "--format", "json").stdout)["items"]
-            hello = next(t for t in listing
-                         if "hello" in (t.get("filename", "") + t.get("basename", "")))
-            sel = hello.get("selector") or hello.get("basename")
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.load(ADD_BINARY)
+        listing = json.loads(
+            shared_bn.run("target", "list", "--format", "json").stdout)["items"]
+        hello = next(t for t in listing
+                     if "hello" in (t.get("filename", "") + t.get("basename", "")))
+        sel = hello.get("selector") or hello.get("basename")
 
-            copy = str(tmp_path / "copy.bndb")
-            saved = _bn("--instance", inst, "save", "--target", sel, "--path", copy,
-                        "--format", "json")
-            assert saved.returncode == 0, saved.stderr
-            assert json.loads(saved.stdout).get("saved") is True
-            assert Path(copy).exists()
+        copy = str(tmp_path / "copy.bndb")
+        saved = shared_bn.run("save", "--target", sel, "--path", copy,
+                              "--format", "json")
+        assert saved.returncode == 0, saved.stderr
+        assert json.loads(saved.stdout).get("saved") is True
+        assert Path(copy).exists()
 
-            # The original selector must STILL resolve -- before the fix the live
-            # target was rebound to copy.bndb and `sel` raised "not found".
-            after = _bn("--instance", inst, "target", "info", "--target", sel,
-                        "--format", "json")
-            assert after.returncode == 0, (
-                f"original selector {sel!r} stopped resolving after save --path: "
-                f"{after.stdout} {after.stderr}")
-        finally:
-            _session_stop(inst)
+        # The original selector must STILL resolve -- before the fix the live
+        # target was rebound to copy.bndb and `sel` raised "not found".
+        after = shared_bn.run("target", "info", "--target", sel,
+                              "--format", "json")
+        assert after.returncode == 0, (
+            f"original selector {sel!r} stopped resolving after save --path: "
+            f"{after.stdout} {after.stderr}")
 
-    def test_bare_save_multi_target_gets_target_hint(self):
+    def test_bare_save_multi_target_gets_target_hint(self, shared_bn):
         # #663 end-to-end: bare `bn save` with two targets open in one headless
         # instance (no active view) must exit 2 with the bridge's -t hint +
         # open-target list -- the live behavior the mocked lanes structurally
         # cannot see (their fakes hard-code the very message under test).
-        info = _session_start(str(HELLO_BINARY), str(ADD_BINARY))
-        inst = info["instance_id"]
-        try:
-            result = _bn("--instance", inst, "save")
-            assert result.returncode == 2, (result.stdout, result.stderr)
-            err = result.stderr
-            assert "No active BinaryView is selected and multiple targets are open" in err
-            assert "Pass -t <selector> (--target) to choose one." in err
-            assert "Open targets:" in err
-            # Prefix-matches both the raw and the .bndb-restored selector spelling.
-            assert "-t hello_x86_64" in err
-            assert "-t add_x86_64" in err
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.load(ADD_BINARY)
+        result = shared_bn.run("save")
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        err = result.stderr
+        assert "No active BinaryView is selected and multiple targets are open" in err
+        assert "Pass -t <selector> (--target) to choose one." in err
+        assert "Open targets:" in err
+        # Prefix-matches both the raw and the .bndb-restored selector spelling.
+        assert "-t hello_x86_64" in err
+        assert "-t add_x86_64" in err
 
-            # `-t active` (the documented copy-paste footgun, #366) collapses
-            # bridge-side to the same hint. Assert the discriminating first
-            # line, not just "Open targets:", which the unknown-selector error
-            # also prints: if the bridge collapse regressed, `-t active` would
-            # fall through to "Unknown target selector" and a looser assert
-            # would stay green.
-            result = _bn("--instance", inst, "save", "--target", "active")
-            assert result.returncode == 2, (result.stdout, result.stderr)
-            assert "No active BinaryView is selected and multiple targets are open" \
-                in result.stderr
+        # `-t active` (the documented copy-paste footgun, #366) collapses
+        # bridge-side to the same hint. Assert the discriminating first
+        # line, not just "Open targets:", which the unknown-selector error
+        # also prints: if the bridge collapse regressed, `-t active` would
+        # fall through to "Unknown target selector" and a looser assert
+        # would stay green.
+        result = shared_bn.run("save", "--target", "active")
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        assert "No active BinaryView is selected and multiple targets are open" \
+            in result.stderr
 
-            # `-t ""` is an explicit-but-empty selector (an unset shell
-            # variable): #690 r3 rejects it CLI-side for every command -- it is
-            # never pin-filled and never forwarded (the bridge would collapse
-            # it to the focused view with no count check).
-            result = _bn("--instance", inst, "save", "--target", "")
-            assert result.returncode == 2, (result.stdout, result.stderr)
-            assert "--target is empty" in result.stderr
-
-            # Explicit-selector save on this same session shape is pinned by
-            # test_save_path_keeps_original_selector above.
-        finally:
-            _session_stop(inst)
+        # `-t ""` is an explicit-but-empty selector (an unset shell
+        # variable): #690 r3 rejects it CLI-side for every command -- it is
+        # never pin-filled and never forwarded (the bridge would collapse
+        # it to the focused view with no count check).
+        result = shared_bn.run("save", "--target", "")
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        assert "--target is empty" in result.stderr
 
 
 class TestProtoSetUnnamedParams:
@@ -317,77 +310,65 @@ class TestProtoSetUnnamedParams:
     AUTO function is refused (see test_auto_prototype_preview_is_refused, #630) --
     committing is the correct way to prove the unnamed/named acceptance."""
 
-    def _first_fn(self, inst_id):
-        out = _bn("--instance", inst_id, "function", "list", "--format", "json")
+    def _first_fn(self, shared_bn):
+        out = shared_bn.run("function", "list", "--format", "json")
         return json.loads(out.stdout)["items"][0]["name"]
 
-    def test_unnamed_params_verify(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            fn = self._first_fn(inst_id)
-            res = _bn("--instance", inst_id, "proto", "set", fn,
-                      f"void {fn}(int32_t, char**, char**)", "--format", "json")
-            parsed = json.loads(res.stdout)
-            statuses = [r.get("status") for r in parsed["results"]]
-            assert statuses == ["verified"], parsed
-            assert res.returncode == 0, res.stdout
-        finally:
-            _session_stop(inst_id)
+    def test_unnamed_params_verify(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        fn = self._first_fn(shared_bn)
+        res = shared_bn.run("proto", "set", fn,
+                            f"void {fn}(int32_t, char**, char**)", "--format", "json")
+        parsed = json.loads(res.stdout)
+        statuses = [r.get("status") for r in parsed["results"]]
+        assert statuses == ["verified"], parsed
+        assert res.returncode == 0, res.stdout
 
-    def test_named_params_also_verify(self):
+    def test_named_params_also_verify(self, shared_bn):
         """Contrast case: a fully NAMED prototype still verifies through the same
         path -- the name-insensitive acceptance must not perturb the normal,
         string-matching case. (The rejection of a genuine type/arity/return
         mismatch can't be forced through real BN, which applies valid prototypes
         verbatim, so that is covered by the mocked unit test
         test_prototype_matches_ignoring_param_names.)"""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            fn = self._first_fn(inst_id)
-            res = _bn("--instance", inst_id, "proto", "set", fn,
-                      f"int32_t {fn}(int64_t argc, char** argv)", "--format", "json")
-            parsed = json.loads(res.stdout)
-            assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        fn = self._first_fn(shared_bn)
+        res = shared_bn.run("proto", "set", fn,
+                            f"int32_t {fn}(int64_t argc, char** argv)", "--format", "json")
+        parsed = json.loads(res.stdout)
+        assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
 
-    def test_auto_prototype_preview_is_refused(self):
+    def test_auto_prototype_preview_is_refused(self, shared_bn):
         """#630: a --preview of a proto set on an AUTO function (no user type) is
         REFUSED before any mutation, because BN cannot clear the has_user_type it
         would pin, so the preview could not be cleanly reverted. Proves the honest
         contract on live BN: refuse rather than apply and claim a clean rollback.
         The view is left pristine -- the function stays AUTO."""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            fn = self._first_fn(inst_id)  # a fresh-analysis function is AUTO
-            res = _bn("--instance", inst_id, "proto", "set", fn,
-                      f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
-            # A refusal is a structured OperationFailure(status="unsupported")
-            # escaping a `_mutate`-marked call, so it lands at exit 3 (#625/#701:
-            # a FAILED_MUTATION_STATUSES status on a genuine mutation call). It is
-            # NOT exit 2 -- that is reserved for a read/resolver op sharing the
-            # status string. `status` is surfaced in the --format json envelope.
-            assert res.returncode == 3, (res.returncode, res.stdout, res.stderr)
-            payload = json.loads(res.stdout)
-            assert payload["status"] == "unsupported", payload
-            assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
-            # Pristine, checked against a source that ACTUALLY reflects has_user_type:
-            # `function info` never emits the flag, so asserting on its output is
-            # vacuous. Instead commit a real prototype set now and read the op's
-            # before_has_user_type -- it reports the function's provenance at the
-            # moment before this commit. If the refused preview had wrongly pinned
-            # has_user_type, before_has_user_type would be true and this fails.
-            commit = _bn("--instance", inst_id, "proto", "set", fn,
-                         f"void {fn}(int32_t, char**, char**)", "--format", "json")
-            commit_parsed = json.loads(commit.stdout)
-            proto_result = next(r for r in commit_parsed["results"]
-                                if r.get("op") == "set_prototype")
-            assert proto_result["before_has_user_type"] is False, commit_parsed
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        fn = self._first_fn(shared_bn)  # a fresh-analysis function is AUTO
+        res = shared_bn.run("proto", "set", fn,
+                            f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
+        # A refusal is a structured OperationFailure(status="unsupported")
+        # escaping a `_mutate`-marked call, so it lands at exit 3 (#625/#701:
+        # a FAILED_MUTATION_STATUSES status on a genuine mutation call). It is
+        # NOT exit 2 -- that is reserved for a read/resolver op sharing the
+        # status string. `status` is surfaced in the --format json envelope.
+        assert res.returncode == 3, (res.returncode, res.stdout, res.stderr)
+        payload = json.loads(res.stdout)
+        assert payload["status"] == "unsupported", payload
+        assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
+        # Pristine, checked against a source that ACTUALLY reflects has_user_type:
+        # `function info` never emits the flag, so asserting on its output is
+        # vacuous. Instead commit a real prototype set now and read the op's
+        # before_has_user_type -- it reports the function's provenance at the
+        # moment before this commit. If the refused preview had wrongly pinned
+        # has_user_type, before_has_user_type would be true and this fails.
+        commit = shared_bn.run("proto", "set", fn,
+                               f"void {fn}(int32_t, char**, char**)", "--format", "json")
+        commit_parsed = json.loads(commit.stdout)
+        proto_result = next(r for r in commit_parsed["results"]
+                            if r.get("op") == "set_prototype")
+        assert proto_result["before_has_user_type"] is False, commit_parsed
 
 
 class TestStructFieldTypedef:
@@ -397,90 +378,74 @@ class TestStructFieldTypedef:
     returning an NTR builder, so this drives the real BN type system end-to-end.
     """
 
-    def _declare_and_set(self, inst_id, decl, struct_name):
-        declared = _bn("--instance", inst_id, "types", "declare", decl, "--format", "json")
+    def _declare_and_set(self, shared_bn, decl, struct_name):
+        declared = shared_bn.run("types", "declare", decl, "--format", "json")
         assert declared.returncode == 0, declared.stderr
-        return _bn("--instance", inst_id, "struct", "field", "set",
-                   struct_name, "0x4", "newfield", "uint32_t", "--format", "json")
+        return shared_bn.run("struct", "field", "set",
+                             struct_name, "0x4", "newfield", "uint32_t", "--format", "json")
 
-    def test_set_field_on_named_typedef_struct(self):
+    def test_set_field_on_named_typedef_struct(self, shared_bn):
         """typedef of a named struct: `typedef struct InnerRec AliasRec;`. The
         report must key on the underlying TAG, not the alias: affected_types names
         the tag (so it carries members and a real layout diff) and agrees with
         results[].struct_name (#246, incl. the reporting-path follow-up)."""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            res = self._declare_and_set(
-                inst_id,
-                "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
-                "AliasRec")
-            assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
-            parsed = json.loads(res.stdout)
-            affected = parsed["affected_types"]
-            assert affected and affected[0]["name"] == "InnerRec", affected
-            assert affected[0]["changed"] is True, affected
-            # the member-level layout (not just the alias header) is in the diff
-            assert "newfield" in affected[0]["after_layout"], affected[0]["after_layout"]
-            assert parsed["results"][0]["struct_name"] == "InnerRec"
-            # the field landed on the underlying tag, and the typedef sees it
-            shown = _bn("--instance", inst_id, "struct", "show", "InnerRec")
-            assert "newfield" in shown.stdout, shown.stdout
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        res = self._declare_and_set(
+            shared_bn,
+            "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
+            "AliasRec")
+        assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
+        parsed = json.loads(res.stdout)
+        affected = parsed["affected_types"]
+        assert affected and affected[0]["name"] == "InnerRec", affected
+        assert affected[0]["changed"] is True, affected
+        # the member-level layout (not just the alias header) is in the diff
+        assert "newfield" in affected[0]["after_layout"], affected[0]["after_layout"]
+        assert parsed["results"][0]["struct_name"] == "InnerRec"
+        # the field landed on the underlying tag, and the typedef sees it
+        shown = shared_bn.run("struct", "show", "InnerRec")
+        assert "newfield" in shown.stdout, shown.stdout
 
-    def test_rename_field_through_typedef_reports_change(self):
+    def test_rename_field_through_typedef_reports_change(self, shared_bn):
         """Regression for the reporting follow-up: a field rename through a typedef
         must report the real change against the TAG -- before the fix it keyed the
         diff on the members-less alias and falsely said 'No effective change
         detected' even though the op verified (#246)."""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            self._declare_and_set(
-                inst_id,
-                "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
-                "AliasRec")
-            res = _bn("--instance", inst_id, "struct", "field", "rename",
-                      "AliasRec", "newfield", "renamed", "--format", "json")
-            assert res.returncode == 0, f"rename failed: {res.stdout}\n{res.stderr}"
-            parsed = json.loads(res.stdout)
-            assert parsed["results"][0]["status"] == "verified", parsed["results"]
-            affected = parsed["affected_types"]
-            assert affected and affected[0]["name"] == "InnerRec", affected
-            assert affected[0]["changed"] is True, affected
-            assert "No effective change" not in (affected[0].get("message") or "")
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        self._declare_and_set(
+            shared_bn,
+            "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
+            "AliasRec")
+        res = shared_bn.run("struct", "field", "rename",
+                            "AliasRec", "newfield", "renamed", "--format", "json")
+        assert res.returncode == 0, f"rename failed: {res.stdout}\n{res.stderr}"
+        parsed = json.loads(res.stdout)
+        assert parsed["results"][0]["status"] == "verified", parsed["results"]
+        affected = parsed["affected_types"]
+        assert affected and affected[0]["name"] == "InnerRec", affected
+        assert affected[0]["changed"] is True, affected
+        assert "No effective change" not in (affected[0].get("message") or "")
 
-    def test_set_field_on_anonymous_typedef_struct(self):
+    def test_set_field_on_anonymous_typedef_struct(self, shared_bn):
         """The idiomatic `typedef struct { ... } AnonRec;` -- body is registered
         under the auto-named tag `_AnonRec`, alias is an NTR to it."""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            res = self._declare_and_set(
-                inst_id,
-                "typedef struct { uint32_t m; } AnonRec;",
-                "AnonRec")
-            assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
-            shown = _bn("--instance", inst_id, "struct", "show", "_AnonRec")
-            assert "newfield" in shown.stdout, shown.stdout
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        res = self._declare_and_set(
+            shared_bn,
+            "typedef struct { uint32_t m; } AnonRec;",
+            "AnonRec")
+        assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
+        shown = shared_bn.run("struct", "show", "_AnonRec")
+        assert "newfield" in shown.stdout, shown.stdout
 
-    def test_set_field_on_typedef_to_nonstruct_is_clean_error(self):
+    def test_set_field_on_typedef_to_nonstruct_is_clean_error(self, shared_bn):
         """`typedef uint32_t Foo;` resolves to a non-aggregate: a field set must
         fail cleanly (not exit 0, not an internal AttributeError crash)."""
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            res = self._declare_and_set(
-                inst_id, "typedef uint32_t NotAStruct;", "NotAStruct")
-            assert res.returncode != 0, f"expected a clean failure, got: {res.stdout}"
-            assert "AttributeError" not in res.stdout + res.stderr
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        res = self._declare_and_set(
+            shared_bn, "typedef uint32_t NotAStruct;", "NotAStruct")
+        assert res.returncode != 0, f"expected a clean failure, got: {res.stdout}"
+        assert "AttributeError" not in res.stdout + res.stderr
 
 
 class TestTaintIndirectValueSetAnchor:
@@ -502,31 +467,27 @@ class TestTaintIndirectValueSetAnchor:
             f"fixture should have produced it"
         )
 
-    def test_value_set_resolved_indirect_call_anchors_source(self):
+    def test_value_set_resolved_indirect_call_anchors_source(self, shared_bn):
         self._ensure_fixture()
-        info = _session_start(str(DISPATCH_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            # arg:h_copy:1 with NO --resolve-map: the source must anchor at the
-            # indirect `table[cmd](buf, n)` call because value-set resolves it to
-            # {h_copy, h_noop, h_log}, and the attacker length must reach h_copy's
-            # copy sink.
-            res = _bn("--instance", inst_id, "taint", "forward", "-f", "dispatch",
-                      "--source", "arg:h_copy:1", "--format", "json")
-            assert res.returncode == 0, res.stderr
-            out = json.loads(res.stdout)
-            result = out.get("result", out)
-            assumptions = result.get("assumptions", [])
-            # anchored via value-set (not a map), with the multiplicity disclosure
-            anchor = [a for a in assumptions
-                      if "anchored at indirect callsite" in a and "value-set" in a]
-            assert anchor, f"no value-set anchor assumption: {assumptions}"
-            assert any("candidate target" in a for a in anchor), anchor
-            # the seeded length propagated through the resolved callee to a copy sink
-            classes = [s.get("sink", {}).get("class") for s in result.get("reached_sinks", [])]
-            assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(DISPATCH_BINARY)
+        # arg:h_copy:1 with NO --resolve-map: the source must anchor at the
+        # indirect `table[cmd](buf, n)` call because value-set resolves it to
+        # {h_copy, h_noop, h_log}, and the attacker length must reach h_copy's
+        # copy sink.
+        res = shared_bn.run("taint", "forward", "-f", "dispatch",
+                            "--source", "arg:h_copy:1", "--format", "json")
+        assert res.returncode == 0, res.stderr
+        out = json.loads(res.stdout)
+        result = out.get("result", out)
+        assumptions = result.get("assumptions", [])
+        # anchored via value-set (not a map), with the multiplicity disclosure
+        anchor = [a for a in assumptions
+                  if "anchored at indirect callsite" in a and "value-set" in a]
+        assert anchor, f"no value-set anchor assumption: {assumptions}"
+        assert any("candidate target" in a for a in anchor), anchor
+        # the seeded length propagated through the resolved callee to a copy sink
+        classes = [s.get("sink", {}).get("class") for s in result.get("reached_sinks", [])]
+        assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
 
 
 class TestStructFieldDeleteWidth:
@@ -537,50 +498,42 @@ class TestStructFieldDeleteWidth:
     end-to-end.
     """
 
-    def _declare(self, inst_id, decl):
-        res = _bn("--instance", inst_id, "types", "declare", decl, "--format", "json")
+    def _declare(self, shared_bn, decl):
+        res = shared_bn.run("types", "declare", decl, "--format", "json")
         assert res.returncode == 0, res.stderr
         return res
 
-    def test_delete_trailing_field_shrinks_width(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            self._declare(inst_id, "struct WTd320 { unsigned char pad[24]; };")
-            setres = _bn("--instance", inst_id, "struct", "field", "set",
-                         "WTd320", "0x18", "extra", "int32_t", "--format", "json")
-            assert setres.returncode == 0, setres.stderr
-            shown = _bn("--instance", inst_id, "struct", "show", "WTd320")
-            assert "0x1c" in shown.stdout, shown.stdout  # width grew to 0x1c
+    def test_delete_trailing_field_shrinks_width(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        self._declare(shared_bn, "struct WTd320 { unsigned char pad[24]; };")
+        setres = shared_bn.run("struct", "field", "set",
+                               "WTd320", "0x18", "extra", "int32_t", "--format", "json")
+        assert setres.returncode == 0, setres.stderr
+        shown = shared_bn.run("struct", "show", "WTd320")
+        assert "0x1c" in shown.stdout, shown.stdout  # width grew to 0x1c
 
-            res = _bn("--instance", inst_id, "struct", "field", "delete",
-                      "WTd320", "extra", "--format", "json")
-            assert res.returncode == 0, f"delete failed: {res.stdout}\n{res.stderr}"
-            parsed = json.loads(res.stdout)
-            assert parsed["results"][0]["status"] == "verified", parsed["results"]
-            after = _bn("--instance", inst_id, "struct", "show", "WTd320")
-            assert "0x18" in after.stdout, after.stdout   # shrank back to 0x18
-            assert "0x1c" not in after.stdout, after.stdout
-        finally:
-            _session_stop(inst_id)
+        res = shared_bn.run("struct", "field", "delete",
+                            "WTd320", "extra", "--format", "json")
+        assert res.returncode == 0, f"delete failed: {res.stdout}\n{res.stderr}"
+        parsed = json.loads(res.stdout)
+        assert parsed["results"][0]["status"] == "verified", parsed["results"]
+        after = shared_bn.run("struct", "show", "WTd320")
+        assert "0x18" in after.stdout, after.stdout   # shrank back to 0x18
+        assert "0x1c" not in after.stdout, after.stdout
 
-    def test_preview_delete_restores_width(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            self._declare(inst_id, "struct WTp320 { unsigned char pad[24]; };")
-            _bn("--instance", inst_id, "struct", "field", "set",
-                "WTp320", "0x18", "extra", "int32_t", "--format", "json")
-            res = _bn("--instance", inst_id, "struct", "field", "delete",
-                      "WTp320", "extra", "--preview", "--format", "json")
-            assert res.returncode == 0, f"preview failed: {res.stdout}\n{res.stderr}"
-            # after a preview revert, the struct must be unchanged: extra still
-            # present and width still 0x1c (preview restored the shrink too).
-            after = _bn("--instance", inst_id, "struct", "show", "WTp320")
-            assert "extra" in after.stdout, after.stdout
-            assert "0x1c" in after.stdout, after.stdout
-        finally:
-            _session_stop(inst_id)
+    def test_preview_delete_restores_width(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        self._declare(shared_bn, "struct WTp320 { unsigned char pad[24]; };")
+        shared_bn.run("struct", "field", "set",
+                      "WTp320", "0x18", "extra", "int32_t", "--format", "json")
+        res = shared_bn.run("struct", "field", "delete",
+                            "WTp320", "extra", "--preview", "--format", "json")
+        assert res.returncode == 0, f"preview failed: {res.stdout}\n{res.stderr}"
+        # after a preview revert, the struct must be unchanged: extra still
+        # present and width still 0x1c (preview restored the shrink too).
+        after = shared_bn.run("struct", "show", "WTp320")
+        assert "extra" in after.stdout, after.stdout
+        assert "0x1c" in after.stdout, after.stdout
 
 
 class TestTypesDeclareBitfield:
@@ -590,38 +543,30 @@ class TestTypesDeclareBitfield:
     be registered. Drives the real BN parser end-to-end.
     """
 
-    def test_bitfield_declaration_is_rejected(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            res = _bn("--instance", inst_id, "types", "declare",
-                      "struct BF322 { unsigned a:3; unsigned b:5; unsigned c:1; unsigned d:23; };",
-                      "--format", "json")
-            assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
-            parsed = json.loads(res.stdout)
-            results = parsed.get("results") or [parsed]
-            assert results[0].get("status") == "invalid_request", parsed
-            assert "bitfield" in (results[0].get("message") or "").lower(), parsed
-            # the corrupt type must not have been registered
-            shown = _bn("--instance", inst_id, "struct", "show", "BF322")
-            assert "BF322" not in shown.stdout or "size=0x4" not in shown.stdout, shown.stdout
-        finally:
-            _session_stop(inst_id)
+    def test_bitfield_declaration_is_rejected(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run("types", "declare",
+                            "struct BF322 { unsigned a:3; unsigned b:5; unsigned c:1; unsigned d:23; };",
+                            "--format", "json")
+        assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
+        parsed = json.loads(res.stdout)
+        results = parsed.get("results") or [parsed]
+        assert results[0].get("status") == "invalid_request", parsed
+        assert "bitfield" in (results[0].get("message") or "").lower(), parsed
+        # the corrupt type must not have been registered
+        shown = shared_bn.run("struct", "show", "BF322")
+        assert "BF322" not in shown.stdout or "size=0x4" not in shown.stdout, shown.stdout
 
-    def test_plain_struct_still_declares(self):
+    def test_plain_struct_still_declares(self, shared_bn):
         # The contrast: a bitfield-free struct (incl. a comment containing a
         # colon-number) still declares cleanly -- no false rejection.
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            res = _bn("--instance", inst_id, "types", "declare",
-                      "struct OK322 { int a; /* note:32 */ char b; long c; };",
-                      "--format", "json")
-            assert res.returncode == 0, f"unexpected rejection: {res.stdout}\n{res.stderr}"
-            parsed = json.loads(res.stdout)
-            assert parsed["results"][0]["status"] == "verified", parsed["results"]
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run("types", "declare",
+                            "struct OK322 { int a; /* note:32 */ char b; long c; };",
+                            "--format", "json")
+        assert res.returncode == 0, f"unexpected rejection: {res.stdout}\n{res.stderr}"
+        parsed = json.loads(res.stdout)
+        assert parsed["results"][0]["status"] == "verified", parsed["results"]
 
 
 class TestDisasmLinear:
@@ -641,51 +586,82 @@ class TestDisasmLinear:
         d = cls._unwrap(payload)
         return d.get("items", []) if isinstance(d, dict) else (d or [])
 
-    def _a_data_address(self, inst_id) -> str:
+    def _a_data_address(self, shared_bn) -> str:
         """The start of a non-executable data section -- a mapped address BN did
         not make part of a function."""
-        res = _bn("--instance", inst_id, "sections", "--format", "json")
+        res = shared_bn.run("sections", "--format", "json")
         assert res.returncode == 0, res.stderr
         for sec in self._items(json.loads(res.stdout)):
             if not sec.get("executable") and sec.get("start"):
                 return sec["start"]
         raise AssertionError("no non-executable section found")
 
-    def test_linear_disasm_at_non_function_address(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            addr = self._a_data_address(inst_id)
-            # plain disasm refuses it, but points at --linear
-            plain = _bn("--instance", inst_id, "disasm", addr)
-            assert plain.returncode != 0, plain.stdout
-            assert "--linear" in (plain.stdout + plain.stderr)
-            # --linear disassembles N instructions there
-            res = _bn("--instance", inst_id, "disasm", addr, "--linear", "4", "--format", "json")
-            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
-            result = self._unwrap(json.loads(res.stdout))
-            assert result.get("linear") is True, result
-            assert result.get("function") is None, result
-            assert 1 <= result.get("instruction_count", 0) <= 4, result
-            assert result["instructions"], result
-            assert result["instructions"][0]["address"].lower().startswith("0x")
-        finally:
-            _session_stop(inst_id)
+    def test_linear_disasm_at_non_function_address(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        addr = self._a_data_address(shared_bn)
+        # plain disasm refuses it, but points at --linear
+        plain = shared_bn.run("disasm", addr)
+        assert plain.returncode != 0, plain.stdout
+        assert "--linear" in (plain.stdout + plain.stderr)
+        # --linear disassembles N instructions there
+        res = shared_bn.run("disasm", addr, "--linear", "4", "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        result = self._unwrap(json.loads(res.stdout))
+        assert result.get("linear") is True, result
+        assert result.get("function") is None, result
+        assert 1 <= result.get("instruction_count", 0) <= 4, result
+        assert result["instructions"], result
+        assert result["instructions"][0]["address"].lower().startswith("0x")
 
-    def test_linear_disasm_from_function_name(self):
+    def test_linear_disasm_from_function_name(self, shared_bn):
         # --linear also accepts a function name, anchoring at its start.
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
-            name = self._items(json.loads(listing.stdout))[0]["name"]
-            res = _bn("--instance", inst_id, "disasm", name, "--linear", "3", "--format", "json")
-            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
-            result = self._unwrap(json.loads(res.stdout))
-            assert result.get("linear") is True
-            assert result.get("instruction_count", 0) >= 1
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(HELLO_BINARY)
+        listing = shared_bn.run("function", "list", "--format", "json")
+        name = self._items(json.loads(listing.stdout))[0]["name"]
+        res = shared_bn.run("disasm", name, "--linear", "3", "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        result = self._unwrap(json.loads(res.stdout))
+        assert result.get("linear") is True
+        assert result.get("instruction_count", 0) >= 1
+
+
+def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
+    """Cross-build the AArch64 probe and pay for its analysis ONCE.
+
+    Full analysis of the ~1.1k-function `-static` probe measures ~20s; saving
+    its BNDB costs 0.6s and reloading through that sidecar measures 0.5s,
+    because the bridge prefers an adjacent `<binary>.bndb` to the binary
+    (#717). Priming here turns a two-test lane of 2 x 20s into 20s once plus a
+    sub-second load per test -- and `SharedBridge.load()` copies the sidecar
+    along with the binary, so each test still gets its own private view.
+
+    A plain function, not the fixture body, so the budget guard below can call
+    it with a recording stand-in instead of spending the 20s for real.
+    """
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        pytest.skip("aarch64-linux-gnu-gcc not available")
+    workdir = tmp_path_factory.mktemp("aarch64-probe")
+    src = workdir / "probe.c"
+    src.write_text("int add(int a, int b){return a + b;}\nint main(){return add(1, 2);}\n")
+    probe = workdir / "probe_aarch64"
+    build = subprocess.run(
+        [cc, "-O0", "-no-pie", "-static", str(src), "-o", str(probe)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if build.returncode != 0:
+        pytest.skip(f"aarch64 cross-compile failed: {build.stderr}")
+    selector = bridge.load(probe, copy=False, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+    saved = bridge.run("save", "--target", selector, "--format", "json")
+    assert saved.returncode == 0, f"priming save failed: {saved.stderr}\n{saved.stdout}"
+    closed = bridge.run("close", selector)
+    assert closed.returncode == 0, f"priming close failed: {closed.stderr}\n{closed.stdout}"
+    return probe
+
+
+@pytest.fixture(scope="session")
+def aarch64_probe(_shared_bridge, tmp_path_factory) -> Path:
+    return _build_and_prime_aarch64_probe(_shared_bridge, tmp_path_factory)
 
 
 class TestDisasmLinearAArch64:
@@ -710,74 +686,36 @@ class TestDisasmLinearAArch64:
     """
 
     @staticmethod
-    def _build_aarch64(tmp_path) -> Path:
-        cc = shutil.which("aarch64-linux-gnu-gcc")
-        if cc is None:
-            pytest.skip("aarch64-linux-gnu-gcc not available")
-        src = tmp_path / "probe.c"
-        src.write_text("int add(int a, int b){return a + b;}\nint main(){return add(1, 2);}\n")
-        out = tmp_path / "probe_aarch64"
-        proc = subprocess.run(
-            [cc, "-O0", "-no-pie", "-static", str(src), "-o", str(out)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if proc.returncode != 0:
-            pytest.skip(f"aarch64 cross-compile failed: {proc.stderr}")
-        return out
-
-    @staticmethod
-    def _start(binary: Path) -> dict:
-        """The ONE place this lane's `session start` budget lives (#718).
-
-        Every start here analyses the ~1.1k-function `-static` cross-built probe,
-        which measures ~25s warm, so it must run on the larger lane budget rather
-        than the general default. Spread across the individual tests that budget
-        was one forgettable kwarg per callsite; here dropping it is a visible
-        change to a helper whose only job is to apply it.
-        """
-        return _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
-
-    @staticmethod
-    def _func_start(inst_id: str, name: str) -> int:
-        listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
+    def _func_start(shared_bn, name: str) -> int:
+        listing = shared_bn.run("function", "list", "--format", "json")
         assert listing.returncode == 0, listing.stderr
         funcs = TestDisasmLinear._items(json.loads(listing.stdout))
         matches = [f for f in funcs if f["name"] == name]
         assert matches, f"{name} not found among {len(funcs)} functions"
         return int(matches[0]["address"], 16)
 
-    def test_aarch64_odd_linear_start_not_thumb_masked(self, tmp_path):
-        binary = self._build_aarch64(tmp_path)
-        info = self._start(binary)
-        inst_id = info["instance_id"]
-        try:
-            start = self._func_start(inst_id, "add")
-            odd = start | 1  # poke bit 0 so a Thumb-masking gate would strip it
-            res = _bn("--instance", inst_id, "disasm", hex(odd), "--linear", "2", "--format", "json")
-            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
-            result = TestDisasmLinear._unwrap(json.loads(res.stdout))
-            # Premise: the live arch name really is "aarch64", not "arm64".
-            assert result["decode_arch"] == "aarch64", result
-            # bit 0 preserved -- NOT masked back to the even address ...
-            assert int(result["address"], 16) == odd, result
-            # ... and no Thumb function-pointer-tag normalization was applied.
-            assert "Thumb" not in result["note"], result["note"]
-        finally:
-            _session_stop(inst_id)
+    def test_aarch64_odd_linear_start_not_thumb_masked(self, shared_bn, aarch64_probe):
+        shared_bn.load(aarch64_probe, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        start = self._func_start(shared_bn, "add")
+        odd = start | 1  # poke bit 0 so a Thumb-masking gate would strip it
+        res = shared_bn.run("disasm", hex(odd), "--linear", "2", "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        result = TestDisasmLinear._unwrap(json.loads(res.stdout))
+        # Premise: the live arch name really is "aarch64", not "arm64".
+        assert result["decode_arch"] == "aarch64", result
+        # bit 0 preserved -- NOT masked back to the even address ...
+        assert int(result["address"], 16) == odd, result
+        # ... and no Thumb function-pointer-tag normalization was applied.
+        assert "Thumb" not in result["note"], result["note"]
 
-    def test_aarch64_rejects_arm_thumb_mode(self, tmp_path):
+    def test_aarch64_rejects_arm_thumb_mode(self, shared_bn, aarch64_probe):
         # --mode arm|thumb is only meaningful for classic 32-bit ARM/Thumb. On a
         # real aarch64 target it must be rejected with the ACTUAL arch named.
-        binary = self._build_aarch64(tmp_path)
-        info = self._start(binary)
-        inst_id = info["instance_id"]
-        try:
-            res = _bn("--instance", inst_id, "disasm", "add", "--linear", "2",
-                      "--mode", "arm", "--format", "json")
-            assert res.returncode != 0, res.stdout
-            assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
-        finally:
-            _session_stop(inst_id)
+        shared_bn.load(aarch64_probe, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        res = shared_bn.run("disasm", "add", "--linear", "2",
+                            "--mode", "arm", "--format", "json")
+        assert res.returncode != 0, res.stdout
+        assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
 
 
 class TestSessionStartTimeoutDiagnostics:
@@ -813,34 +751,45 @@ class TestSessionStartTimeoutDiagnostics:
     def test_cross_arch_lane_budget_clears_the_warm_cost(self):
         """The cross-arch lane must not run on a budget that IS the measurement.
 
-        One aarch64 `session start` measures ~25s warm (a ~1.1k-function -static
-        probe). #718 was filed against a 30s ceiling -- all the margin was the
-        measurement's own noise -- so the lane's budget must clear that ceiling
-        and be larger than the general default, not equal to it.
+        Analysing the aarch64 probe measures ~20s warm (a ~1.1k-function
+        -static build). #718 was filed against a 30s ceiling -- all the margin
+        was the measurement's own noise -- so the lane's budget must clear that
+        ceiling and be larger than the general default, not equal to it.
         """
         assert _SESSION_START_TIMEOUT > 30.0
-        assert _CROSS_ARCH_SESSION_START_TIMEOUT > _SESSION_START_TIMEOUT
+        assert _CROSS_ARCH_ANALYSIS_TIMEOUT > _SESSION_START_TIMEOUT
 
-    def test_cross_arch_lane_actually_starts_on_its_own_budget(self, monkeypatch):
+    def test_cross_arch_lane_actually_analyses_on_its_own_budget(self, monkeypatch,
+                                                                 tmp_path_factory):
         """...and the lane must USE it. Asserting only the two constants left the
-        delivered behaviour unguarded: dropping the budget from the lane's start
-        silently put the slow cross-built probe back on the general default with
-        every test still green. Observe the budget the lane's start really asks
-        for, so that regression is RED.
+        delivered behaviour unguarded: dropping the budget from the call that
+        analyses the probe silently puts it back on the general default with
+        every test still green. Observe the budget the lane really asks for, so
+        that regression is RED.
+
+        The analysing call is now the `load` into the shared bridge, so the
+        stand-in is a bridge whose `load` records the budget instead of doing
+        20s of real analysis.
         """
         seen: dict[str, float] = {}
 
-        def record(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> dict:
-            seen["timeout"] = timeout
-            return {"instance_id": "stand-in"}
+        class _RecordingBridge:
+            def load(self, binary, *, copy=True, timeout=None):
+                seen["timeout"] = timeout
+                return str(binary)
 
-        monkeypatch.setattr(sys.modules[__name__], "_session_start", record)
+            def run(self, *args, timeout=60.0):
+                return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
 
-        TestDisasmLinearAArch64._start(Path("stand-in-probe"))
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/" + name)
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+            a[0] if a else [], 0, stdout="", stderr=""))
 
-        assert seen["timeout"] == _CROSS_ARCH_SESSION_START_TIMEOUT, seen
+        _build_and_prime_aarch64_probe(_RecordingBridge(), tmp_path_factory)
 
-    def test_every_cross_arch_session_start_asks_for_the_lane_budget(self):
+        assert seen["timeout"] == _CROSS_ARCH_ANALYSIS_TIMEOUT, seen
+
+    def test_every_cross_arch_analysis_asks_for_the_lane_budget(self):
         """...and the lane must be pinned to it, not merely have one.
 
         The test above observes today's helper. Nothing stopped a NEW lane test
@@ -855,11 +804,14 @@ class TestSessionStartTimeoutDiagnostics:
         module-level constant was not a lane at all, and ran on the general
         budget with all five #718 guards green.
 
-        So: the population is every class that CROSS-COMPILES, recognised from
-        any string constant it reaches -- wherever it sits in the expression,
-        and through the module-level constants and helpers the class names --
-        the call shape is any expression naming `_session_start`, and
-        reachability follows module-level helpers the class calls.
+        So: the population is every class OR module-level function (the probe
+        fixture is one) that CROSS-COMPILES, recognised from any string
+        constant it reaches -- wherever it sits in the expression, and through
+        the module-level constants and helpers it names -- the call shape is
+        any expression naming `_session_start` or `load` (the two ways a
+        cross-built probe gets analysed: spawning a bridge around it, or
+        loading it into the shared one), and reachability follows module-level
+        helpers the lane calls.
         """
         import ast
 
@@ -927,9 +879,27 @@ class TestSessionStartTimeoutDiagnostics:
                         return True
             return False
 
+        # A module-level function counts as a lane too: the fixture builder that
+        # cross-compiles and primes the probe is where the 20s of analysis
+        # actually happens, and it is not inside any class.
+        #
+        # ONE exemption, and it is this guard's own host class, named from the
+        # running frame rather than spelled so it cannot drift onto a second
+        # class: the tests here REFERENCE the builder (with a recording
+        # stand-in, exactly to avoid paying for real analysis) and deliberately
+        # start stand-in CLIs on a 2s hang budget. Reachability would therefore
+        # class it as a cross-compiling lane and flag those 2s budgets --
+        # measuring the measurement. Nothing in this class brings a real probe
+        # into a real bridge.
+        host = type(self).__name__
         lanes = [node for node in tree.body
-                 if isinstance(node, ast.ClassDef) and cross_compiles(node)]
-        assert lanes, "no cross-compiling lane class found; update this guard"
+                 if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                 and node.name != host
+                 and cross_compiles(node)]
+        assert lanes, "no cross-compiling lane found; update this guard"
+        assert any(isinstance(node, ast.FunctionDef) for node in lanes), (
+            "the probe builder is a module-level function; a population that "
+            "sees only classes would not check the call that does the analysing")
 
         def unbudgeted(node: ast.AST, seen: frozenset[str]) -> list[str]:
             found: list[str] = []
@@ -937,11 +907,11 @@ class TestSessionStartTimeoutDiagnostics:
                 if not isinstance(call, ast.Call):
                     continue
                 reached = names_of(call)
-                if "_session_start" in reached:
+                if reached & {"_session_start", "load"}:
                     budget = next((keyword.value for keyword in call.keywords
                                    if keyword.arg == "timeout"), None)
                     if not (isinstance(budget, ast.Name)
-                            and budget.id == "_CROSS_ARCH_SESSION_START_TIMEOUT"):
+                            and budget.id == "_CROSS_ARCH_ANALYSIS_TIMEOUT"):
                         found.append(f"tests/test_integration.py:{call.lineno}")
                 for name in (reached & set(helpers)) - seen:
                     found += unbudgeted(helpers[name], seen | {name})
@@ -949,8 +919,8 @@ class TestSessionStartTimeoutDiagnostics:
 
         offenders = sorted({site for lane in lanes for site in unbudgeted(lane, frozenset())})
         assert not offenders, (
-            "these start a session in a cross-compiling lane without asking for "
-            f"_CROSS_ARCH_SESSION_START_TIMEOUT, so the slow probe runs on the "
+            "these analyse a cross-built probe without asking for "
+            f"_CROSS_ARCH_ANALYSIS_TIMEOUT, so the slow probe runs on the "
             f"general budget: {offenders}"
         )
 
@@ -983,10 +953,10 @@ class TestFunctionCreatePreviewHonesty:
     Needs real BN -- only BN's analysis reproduces the suppression behavior.
     """
 
-    def _gap_addresses(self, inst_id):
+    def _gap_addresses(self, shared_bn):
         """Candidate executable addresses that are NOT function starts: the byte
         just past a function when a gap precedes the next function."""
-        listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
+        listing = shared_bn.run("function", "list", "--format", "json")
         items = json.loads(listing.stdout)
         items = items.get("items", items) if isinstance(items, dict) else items
         fns = sorted(
@@ -1000,34 +970,30 @@ class TestFunctionCreatePreviewHonesty:
                 gaps.append(end)
         return gaps
 
-    def test_preview_then_live_agree(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst_id = info["instance_id"]
-        try:
-            chosen = None
-            for addr in self._gap_addresses(inst_id)[:20]:
-                hexaddr = hex(addr)
-                prev = _bn("--instance", inst_id, "function", "create", hexaddr,
-                           "--preview", "--format", "json")
-                if prev.returncode != 0:
-                    continue
-                status = json.loads(prev.stdout)["results"][0]["status"]
-                if status == "verified":
-                    chosen = hexaddr
-                    break
-            if chosen is None:
-                pytest.skip("no creatable gap address found in this fixture")
+    def test_preview_then_live_agree(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        chosen = None
+        for addr in self._gap_addresses(shared_bn)[:20]:
+            hexaddr = hex(addr)
+            prev = shared_bn.run("function", "create", hexaddr,
+                                 "--preview", "--format", "json")
+            if prev.returncode != 0:
+                continue
+            status = json.loads(prev.stdout)["results"][0]["status"]
+            if status == "verified":
+                chosen = hexaddr
+                break
+        if chosen is None:
+            pytest.skip("no creatable gap address found in this fixture")
 
-            # The live create at the SAME address must ALSO verify -- before the
-            # fix the preview's remove_user_function suppressed it and this
-            # returned verification_failed.
-            live = _bn("--instance", inst_id, "function", "create", chosen, "--format", "json")
-            assert live.returncode == 0, f"{chosen}: {live.stdout}\n{live.stderr}"
-            parsed = json.loads(live.stdout)
-            assert parsed["results"][0]["status"] == "verified", parsed
-            assert parsed["committed"] is True, parsed
-        finally:
-            _session_stop(inst_id)
+        # The live create at the SAME address must ALSO verify -- before the
+        # fix the preview's remove_user_function suppressed it and this
+        # returned verification_failed.
+        live = shared_bn.run("function", "create", chosen, "--format", "json")
+        assert live.returncode == 0, f"{chosen}: {live.stdout}\n{live.stderr}"
+        parsed = json.loads(live.stdout)
+        assert parsed["results"][0]["status"] == "verified", parsed
+        assert parsed["committed"] is True, parsed
 
 
 class TestLoadCacheBndbRestore:
@@ -1085,8 +1051,8 @@ class TestBatchFunctionCreate:
     (uses the non-poisoning remove_function). Drives real BN."""
 
     @staticmethod
-    def _gaps(inst):
-        listing = _bn("--instance", inst, "function", "list", "--format", "json")
+    def _gaps(shared_bn):
+        listing = shared_bn.run("function", "list", "--format", "json")
         items = json.loads(listing.stdout)
         items = items.get("items", items) if isinstance(items, dict) else items
         fns = sorted(((int(f["address"], 16), int(f.get("size") or 0)) for f in items),
@@ -1094,45 +1060,41 @@ class TestBatchFunctionCreate:
         return [start + size for (start, size), (nxt, _) in zip(fns, fns[1:])
                 if size > 0 and start + size < nxt]
 
-    def test_batch_function_create_preview_then_live_atomic(self, tmp_path):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            addr = None
-            for cand in self._gaps(inst)[:20]:
-                mf = tmp_path / "probe.json"
-                mf.write_text(json.dumps({"ops": [{"op": "function_create", "address": hex(cand)}]}))
-                prev = _bn("--instance", inst, "batch", "apply", str(mf), "--preview", "--format", "json")
-                if prev.returncode == 0 and json.loads(prev.stdout)["results"][0]["status"] == "verified":
-                    addr = hex(cand)
-                    break
-            if addr is None:
-                pytest.skip("no creatable gap address found in this fixture")
+    def test_batch_function_create_preview_then_live_atomic(self, shared_bn, tmp_path):
+        shared_bn.load(HELLO_BINARY)
+        addr = None
+        for cand in self._gaps(shared_bn)[:20]:
+            mf = tmp_path / "probe.json"
+            mf.write_text(json.dumps({"ops": [{"op": "function_create", "address": hex(cand)}]}))
+            prev = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+            if prev.returncode == 0 and json.loads(prev.stdout)["results"][0]["status"] == "verified":
+                addr = hex(cand)
+                break
+        if addr is None:
+            pytest.skip("no creatable gap address found in this fixture")
 
-            mf = tmp_path / "batch.json"
-            mf.write_text(json.dumps({"ops": [
-                {"op": "function_create", "address": addr},
-                {"op": "set_comment", "address": addr, "comment": "BATCH308"},
-            ]}))
+        mf = tmp_path / "batch.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": addr},
+            {"op": "set_comment", "address": addr, "comment": "BATCH308"},
+        ]}))
 
-            # --preview: both ops verify, nothing commits, and the function is
-            # reverted (not left behind).
-            prev = _bn("--instance", inst, "batch", "apply", str(mf), "--preview", "--format", "json")
-            assert prev.returncode == 0, f"{prev.stdout}\n{prev.stderr}"
-            pj = json.loads(prev.stdout)
-            assert [r["status"] for r in pj["results"]] == ["verified", "verified"], pj
-            assert pj["committed"] is False
-            assert _bn("--instance", inst, "function", "info", addr).returncode != 0  # reverted
+        # --preview: both ops verify, nothing commits, and the function is
+        # reverted (not left behind).
+        prev = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert prev.returncode == 0, f"{prev.stdout}\n{prev.stderr}"
+        pj = json.loads(prev.stdout)
+        assert [r["status"] for r in pj["results"]] == ["verified", "verified"], pj
+        assert pj["committed"] is False
+        assert shared_bn.run("function", "info", addr).returncode != 0  # reverted
 
-            # live: the batch commits atomically -- function AND comment persist.
-            live = _bn("--instance", inst, "batch", "apply", str(mf), "--format", "json")
-            assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
-            lj = json.loads(live.stdout)
-            assert [r["status"] for r in lj["results"]] == ["verified", "verified"], lj
-            assert lj["committed"] is True
-            assert _bn("--instance", inst, "function", "info", addr).returncode == 0  # now a function
-        finally:
-            _session_stop(inst)
+        # live: the batch commits atomically -- function AND comment persist.
+        live = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        lj = json.loads(live.stdout)
+        assert [r["status"] for r in lj["results"]] == ["verified", "verified"], lj
+        assert lj["committed"] is True
+        assert shared_bn.run("function", "info", addr).returncode == 0  # now a function
 
 
 class TestFunctionCreateSkippedAddress:
@@ -1142,52 +1104,48 @@ class TestFunctionCreateSkippedAddress:
     exactly those addresses, so the op used to return verification_failed on its
     own documented use-case. Drives real BN."""
 
-    def test_create_on_auto_skipped_address(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            # Find a caller-less function (reachable only indirectly -- the
-            # data-table-handler shape), undefine it so the address becomes one
-            # auto-analysis declines to recreate, and return its address.
-            code = (
-                "for f in bv.functions:\n"
-                "    if f.start != bv.entry_point and len(list(bv.get_code_refs(f.start))) == 0:\n"
-                "        a = f.start\n"
-                "        bv.remove_user_function(f); bv.update_analysis_and_wait()\n"
-                "        if bv.get_function_at(a) is None:\n"
-                "            print('ADDR=' + hex(a)); break\n"
-            )
-            probe = _bn("--instance", inst, "py", "exec", code)
-            line = next((l for l in probe.stdout.splitlines() if l.startswith("ADDR=")), None)
-            if line is None:
-                pytest.skip("no caller-less auto-skipped function in this fixture")
-            addr = line.split("=", 1)[1].strip()
+    def test_create_on_auto_skipped_address(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        # Find a caller-less function (reachable only indirectly -- the
+        # data-table-handler shape), undefine it so the address becomes one
+        # auto-analysis declines to recreate, and return its address.
+        code = (
+            "for f in bv.functions:\n"
+            "    if f.start != bv.entry_point and len(list(bv.get_code_refs(f.start))) == 0:\n"
+            "        a = f.start\n"
+            "        bv.remove_user_function(f); bv.update_analysis_and_wait()\n"
+            "        if bv.get_function_at(a) is None:\n"
+            "            print('ADDR=' + hex(a)); break\n"
+        )
+        probe = shared_bn.run("py", "exec", code)
+        line = next((l for l in probe.stdout.splitlines() if l.startswith("ADDR=")), None)
+        if line is None:
+            pytest.skip("no caller-less auto-skipped function in this fixture")
+        addr = line.split("=", 1)[1].strip()
 
-            # create on the skipped address: must verify and commit (#360). With
-            # the advisory add_function this returned verification_failed.
-            out = _bn("--instance", inst, "function", "create", addr, "--format", "json")
-            assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
-            res = json.loads(out.stdout)
-            assert res["results"][0]["status"] == "verified", res
-            assert res["committed"] is True, res
-            assert _bn("--instance", inst, "function", "info", addr).returncode == 0
+        # create on the skipped address: must verify and commit (#360). With
+        # the advisory add_function this returned verification_failed.
+        out = shared_bn.run("function", "create", addr, "--format", "json")
+        assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+        res = json.loads(out.stdout)
+        assert res["results"][0]["status"] == "verified", res
+        assert res["committed"] is True, res
+        assert shared_bn.run("function", "info", addr).returncode == 0
 
-            # --preview on another skipped address verifies AND reverts cleanly,
-            # and a subsequent live create still works (the revert must not poison
-            # the address, #304).
-            probe2 = _bn("--instance", inst, "py", "exec", code)
-            line2 = next((l for l in probe2.stdout.splitlines() if l.startswith("ADDR=")), None)
-            if line2 is not None:
-                addr2 = line2.split("=", 1)[1].strip()
-                prev = _bn("--instance", inst, "function", "create", addr2,
-                           "--preview", "--format", "json")
-                assert json.loads(prev.stdout)["results"][0]["status"] == "verified"
-                assert _bn("--instance", inst, "function", "info", addr2).returncode != 0
-                live = _bn("--instance", inst, "function", "create", addr2, "--format", "json")
-                assert json.loads(live.stdout)["results"][0]["status"] == "verified"
-                assert json.loads(live.stdout)["committed"] is True
-        finally:
-            _session_stop(inst)
+        # --preview on another skipped address verifies AND reverts cleanly,
+        # and a subsequent live create still works (the revert must not poison
+        # the address, #304).
+        probe2 = shared_bn.run("py", "exec", code)
+        line2 = next((l for l in probe2.stdout.splitlines() if l.startswith("ADDR=")), None)
+        if line2 is not None:
+            addr2 = line2.split("=", 1)[1].strip()
+            prev = shared_bn.run("function", "create", addr2,
+                                 "--preview", "--format", "json")
+            assert json.loads(prev.stdout)["results"][0]["status"] == "verified"
+            assert shared_bn.run("function", "info", addr2).returncode != 0
+            live = shared_bn.run("function", "create", addr2, "--format", "json")
+            assert json.loads(live.stdout)["results"][0]["status"] == "verified"
+            assert json.loads(live.stdout)["committed"] is True
 
 
 class TestTaintEmptyVerdictHonesty:
@@ -1196,29 +1154,25 @@ class TestTaintEmptyVerdictHonesty:
     partial-coverage paths do -- it's exactly the shape a structurally-invisible
     bug produces, so it must be the most caveated case, not the least."""
 
-    def test_empty_forward_verdict_is_caveated(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            fns = json.loads(_bn("--instance", inst, "function", "list", "--format", "json").stdout)
-            names = [f["name"] for f in (fns.get("items") if isinstance(fns, dict) else fns)]
-            saw_empty = False
-            for name in names[:30]:
-                out = _bn("--instance", inst, "taint", "forward", "-f", name, "--source", "param:0")
-                # Only reason about a clean, non-spilled text result: a spilled
-                # (truncated) render can cut the verdict line mid-string, which is
-                # not a real "bare phrase without caveat". (No break: the caveat
-                # invariant must hold for EVERY empty verdict, not just the first.)
-                if out.returncode != 0 or "__BN_SPILLED__" in out.stdout:
-                    continue
-                if "no taint reached any sink or frontier" in out.stdout:
-                    saw_empty = True
-                    assert "NOT an all-clear" in out.stdout, out.stdout
-                    assert "structurally see" in out.stdout, out.stdout
-            if not saw_empty:
-                pytest.skip("no empty-verdict function found in this fixture")
-        finally:
-            _session_stop(inst)
+    def test_empty_forward_verdict_is_caveated(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        fns = json.loads(shared_bn.run("function", "list", "--format", "json").stdout)
+        names = [f["name"] for f in (fns.get("items") if isinstance(fns, dict) else fns)]
+        saw_empty = False
+        for name in names[:30]:
+            out = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0")
+            # Only reason about a clean, non-spilled text result: a spilled
+            # (truncated) render can cut the verdict line mid-string, which is
+            # not a real "bare phrase without caveat". (No break: the caveat
+            # invariant must hold for EVERY empty verdict, not just the first.)
+            if out.returncode != 0 or "__BN_SPILLED__" in out.stdout:
+                continue
+            if "no taint reached any sink or frontier" in out.stdout:
+                saw_empty = True
+                assert "NOT an all-clear" in out.stdout, out.stdout
+                assert "structurally see" in out.stdout, out.stdout
+        if not saw_empty:
+            pytest.skip("no empty-verdict function found in this fixture")
 
 
 class TestTaintUnderRecoveredArgFrontier:
@@ -1237,7 +1191,7 @@ class TestTaintUnderRecoveredArgFrontier:
         "int main(int argc, char **argv){ if (argc > 1) build_cmd(argv[1]); return 0; }\n"
     )
 
-    def test_under_recovered_callee_arg_emits_frontier(self, tmp_path):
+    def test_under_recovered_callee_arg_emits_frontier(self, shared_bn, tmp_path):
         import shutil
         cc = shutil.which("arm-linux-gnueabihf-gcc")
         if cc is None:
@@ -1251,33 +1205,29 @@ class TestTaintUnderRecoveredArgFrontier:
         if build.returncode != 0:
             pytest.skip(f"arm build failed: {build.stderr}")
 
-        info = _session_start(str(binp))
-        inst = info["instance_id"]
-        try:
-            def _taint_leaves():
-                out_file = tmp_path / "taint.json"
-                _bn("--instance", inst, "taint", "forward", "-f", "main",
-                    "--source", "param:1", "--format", "json", "--out", str(out_file))
-                return json.loads(out_file.read_text()).get("leaves", [])
+        shared_bn.load(binp, copy=False, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        def _taint_leaves():
+            out_file = tmp_path / "taint.json"
+            shared_bn.run("taint", "forward", "-f", "main",
+                          "--source", "param:1", "--format", "json", "--out", str(out_file))
+            return json.loads(out_file.read_text()).get("leaves", [])
 
-            def _frontiers(leaves):
-                return [l for l in leaves if "under-recovered" in str(l.get("note", ""))]
+        def _frontiers(leaves):
+            return [l for l in leaves if "under-recovered" in str(l.get("note", ""))]
 
-            # Baseline: build_cmd recovered with its arg -> no #381 frontier.
-            assert _frontiers(_taint_leaves()) == []
+        # Baseline: build_cmd recovered with its arg -> no #381 frontier.
+        assert _frontiers(_taint_leaves()) == []
 
-            # Force the recovery miss: build_cmd as 0-arity.
-            _bn("--instance", inst, "proto", "set", "build_cmd",
-                "void build_cmd(void)", "--format", "json")
+        # Force the recovery miss: build_cmd as 0-arity.
+        shared_bn.run("proto", "set", "build_cmd",
+                      "void build_cmd(void)", "--format", "json")
 
-            # Now the tainted argv arg into the under-recovered callee must be an
-            # honest frontier, not a silent drop.
-            frontiers = _frontiers(_taint_leaves())
-            assert frontiers, "expected a #381 under-recovered-arg frontier"
-            assert frontiers[0].get("kind") == "unmodeled_callee"
-            assert frontiers[0].get("callee", {}).get("name") == "build_cmd"
-        finally:
-            _session_stop(inst)
+        # Now the tainted argv arg into the under-recovered callee must be an
+        # honest frontier, not a silent drop.
+        frontiers = _frontiers(_taint_leaves())
+        assert frontiers, "expected a #381 under-recovered-arg frontier"
+        assert frontiers[0].get("kind") == "unmodeled_callee"
+        assert frontiers[0].get("callee", {}).get("name") == "build_cmd"
 
 
 class TestTaintArgRegisterFallback:
@@ -1298,7 +1248,7 @@ class TestTaintArgRegisterFallback:
         "  do_copy(d, s, n);\n  return 0;\n}\n"
     )
 
-    def test_arg_register_fallback_backward_and_trace(self, tmp_path):
+    def test_arg_register_fallback_backward_and_trace(self, shared_bn, tmp_path):
         import shutil
         cc = shutil.which("arm-linux-gnueabihf-gcc")
         if cc is None:
@@ -1312,40 +1262,36 @@ class TestTaintArgRegisterFallback:
         if build.returncode != 0:
             pytest.skip(f"arm build failed: {build.stderr}")
 
-        info = _session_start(str(binp))
-        inst = info["instance_id"]
-        try:
-            # Force the recovery miss: memcpy as 1-arity, so arg:memcpy:2 (the length,
-            # in r2) is out of range and only the register fallback can seed it.
-            _bn("--instance", inst, "proto", "set", "memcpy",
-                "void* memcpy(void* dst)", "--format", "json")
+        shared_bn.load(binp, copy=False, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        # Force the recovery miss: memcpy as 1-arity, so arg:memcpy:2 (the length,
+        # in r2) is out of range and only the register fallback can seed it.
+        shared_bn.run("proto", "set", "memcpy",
+                      "void* memcpy(void* dst)", "--format", "json")
 
-            # Backward: the canonical `arg:memcpy:2` length seed resolves to a slice
-            # (register-recovered), not a dead-end, and discloses the #433 caveat.
-            bw = tmp_path / "bw.json"
-            r = _bn("--instance", inst, "taint", "backward", "-f", "do_copy",
-                    "--sink", "arg:memcpy:2", "--format", "json", "--out", str(bw))
-            assert r.returncode == 0, r.stderr
-            res = json.loads(bw.read_text())
-            assert res.get("slices"), "backward: expected a #433 register-recovered slice"
-            assert any("#433" in a for a in res.get("assumptions", [])), \
-                "backward: expected the #433 register-recovery caveat"
-            seeds = " ".join(str(sl.get("sink", {}).get("seed")) for sl in res["slices"])
-            assert "r2" in seeds, f"expected the r2 length register as the seed, got {seeds!r}"
-            call_addr = res["slices"][0]["sink"]["address"]
+        # Backward: the canonical `arg:memcpy:2` length seed resolves to a slice
+        # (register-recovered), not a dead-end, and discloses the #433 caveat.
+        bw = tmp_path / "bw.json"
+        r = shared_bn.run("taint", "backward", "-f", "do_copy",
+                          "--sink", "arg:memcpy:2", "--format", "json", "--out", str(bw))
+        assert r.returncode == 0, r.stderr
+        res = json.loads(bw.read_text())
+        assert res.get("slices"), "backward: expected a #433 register-recovered slice"
+        assert any("#433" in a for a in res.get("assumptions", [])), \
+            "backward: expected the #433 register-recovery caveat"
+        seeds = " ".join(str(sl.get("sink", {}).get("seed")) for sl in res["slices"])
+        assert "r2" in seeds, f"expected the r2 length register as the seed, got {seeds!r}"
+        call_addr = res["slices"][0]["sink"]["address"]
 
-            # trace --arg 2 at the same call recovers arg 2 from r2 and discloses #433.
-            tr = tmp_path / "tr.json"
-            r2 = _bn("--instance", inst, "trace", "do_copy", str(call_addr), "--arg", "2",
-                     "--format", "json", "--out", str(tr))
-            assert r2.returncode == 0, r2.stderr
-            tres = json.loads(tr.read_text())
-            assert tres.get("step_count", 0) > 0, "trace: expected a #433 register-recovered trace"
-            assert tres.get("arg_label", {}).get("register") == "r2"
-            assert any("#433" in h for h in tres.get("hints", [])), \
-                "trace: expected the #433 register-recovery hint"
-        finally:
-            _session_stop(inst)
+        # trace --arg 2 at the same call recovers arg 2 from r2 and discloses #433.
+        tr = tmp_path / "tr.json"
+        r2 = shared_bn.run("trace", "do_copy", str(call_addr), "--arg", "2",
+                           "--format", "json", "--out", str(tr))
+        assert r2.returncode == 0, r2.stderr
+        tres = json.loads(tr.read_text())
+        assert tres.get("step_count", 0) > 0, "trace: expected a #433 register-recovered trace"
+        assert tres.get("arg_label", {}).get("register") == "r2"
+        assert any("#433" in h for h in tres.get("hints", [])), \
+            "trace: expected the #433 register-recovery hint"
 
 
 class TestTagRoundtrip:
@@ -1356,97 +1302,89 @@ class TestTagRoundtrip:
     surface address-scope tags the way the mocked fakes in test_tags.py model
     them -- only a real BN Function object can prove that assumption."""
 
-    def _first_function_address(self, inst) -> str:
-        out = _bn("--instance", inst, "function", "list", "--limit", "1", "--format", "json")
+    def _first_function_address(self, shared_bn) -> str:
+        out = shared_bn.run("function", "list", "--limit", "1", "--format", "json")
         assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
         listing = json.loads(out.stdout)
         items = listing.get("items") if isinstance(listing, dict) else listing
         return items[0]["address"]
 
-    def test_tag_roundtrip_across_scopes(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            created = _bn("--instance", inst, "tag", "type", "create", "AgentNote",
-                          "--icon", "\U0001F916", "--format", "json")
-            assert created.returncode == 0, f"{created.stdout}\n{created.stderr}"
-            assert json.loads(created.stdout)["results"][0]["status"] in ("verified", "noop")
+    def test_tag_roundtrip_across_scopes(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        created = shared_bn.run("tag", "type", "create", "AgentNote",
+                                "--icon", "\U0001F916", "--format", "json")
+        assert created.returncode == 0, f"{created.stdout}\n{created.stderr}"
+        assert json.loads(created.stdout)["results"][0]["status"] in ("verified", "noop")
 
-            fn_addr = self._first_function_address(inst)
+        fn_addr = self._first_function_address(shared_bn)
 
-            # FUNCTION-scope tag.
-            add_fn = _bn("--instance", inst, "tag", "add", "--function", fn_addr,
-                        "--type", "AgentNote", "--data", "reviewed by agent",
-                        "--format", "json")
-            assert add_fn.returncode == 0, f"{add_fn.stdout}\n{add_fn.stderr}"
-            assert json.loads(add_fn.stdout)["results"][0]["status"] == "verified"
+        # FUNCTION-scope tag.
+        add_fn = shared_bn.run("tag", "add", "--function", fn_addr,
+                              "--type", "AgentNote", "--data", "reviewed by agent",
+                              "--format", "json")
+        assert add_fn.returncode == 0, f"{add_fn.stdout}\n{add_fn.stderr}"
+        assert json.loads(add_fn.stdout)["results"][0]["status"] == "verified"
 
-            # ADDRESS-scope tag at the function's entry address (still an
-            # address tag, not a function tag -- distinct scope, distinct id).
-            add_addr = _bn("--instance", inst, "tag", "add", fn_addr,
-                           "--type", "AgentNote", "--data", "flagged address",
-                           "--format", "json")
-            assert add_addr.returncode == 0, f"{add_addr.stdout}\n{add_addr.stderr}"
-            assert json.loads(add_addr.stdout)["results"][0]["status"] == "verified"
+        # ADDRESS-scope tag at the function's entry address (still an
+        # address tag, not a function tag -- distinct scope, distinct id).
+        add_addr = shared_bn.run("tag", "add", fn_addr,
+                                 "--type", "AgentNote", "--data", "flagged address",
+                                 "--format", "json")
+        assert add_addr.returncode == 0, f"{add_addr.stdout}\n{add_addr.stderr}"
+        assert json.loads(add_addr.stdout)["results"][0]["status"] == "verified"
 
-            # `tag list` sweeps Function.get_function_tags() AND Function.tags --
-            # both scopes must be found (the address-scope entry is the key
-            # real-BN dogfood check, see class docstring).
-            listing = json.loads(_bn("--instance", inst, "tag", "list",
-                                     "--type", "AgentNote", "--format", "json").stdout)
-            items = listing["items"]
-            scopes_and_data = {(t["scope"], t["data"]) for t in items}
-            assert ("function", "reviewed by agent") in scopes_and_data, items
-            assert ("address", "flagged address") in scopes_and_data, items
+        # `tag list` sweeps Function.get_function_tags() AND Function.tags --
+        # both scopes must be found (the address-scope entry is the key
+        # real-BN dogfood check, see class docstring).
+        listing = json.loads(shared_bn.run("tag", "list",
+                                           "--type", "AgentNote", "--format", "json").stdout)
+        items = listing["items"]
+        scopes_and_data = {(t["scope"], t["data"]) for t in items}
+        assert ("function", "reviewed by agent") in scopes_and_data, items
+        assert ("address", "flagged address") in scopes_and_data, items
 
-            # `tag get <addr>` independently surfaces the address-scope tag via
-            # Function.get_tags_at -- a second, distinct real-BN code path.
-            got = json.loads(_bn("--instance", inst, "tag", "get", fn_addr,
-                                 "--format", "json").stdout)
-            assert any(t["scope"] == "address" and t["data"] == "flagged address"
-                      for t in got["tags"]), got
+        # `tag get <addr>` independently surfaces the address-scope tag via
+        # Function.get_tags_at -- a second, distinct real-BN code path.
+        got = json.loads(shared_bn.run("tag", "get", fn_addr,
+                                       "--format", "json").stdout)
+        assert any(t["scope"] == "address" and t["data"] == "flagged address"
+                  for t in got["tags"]), got
 
-            # Remove both tags (each `tag remove` targets one scope).
-            rm_addr = _bn("--instance", inst, "tag", "remove", fn_addr,
-                          "--type", "AgentNote", "--format", "json")
-            assert rm_addr.returncode == 0, f"{rm_addr.stdout}\n{rm_addr.stderr}"
-            assert json.loads(rm_addr.stdout)["results"][0]["status"] == "verified"
+        # Remove both tags (each `tag remove` targets one scope).
+        rm_addr = shared_bn.run("tag", "remove", fn_addr,
+                                "--type", "AgentNote", "--format", "json")
+        assert rm_addr.returncode == 0, f"{rm_addr.stdout}\n{rm_addr.stderr}"
+        assert json.loads(rm_addr.stdout)["results"][0]["status"] == "verified"
 
-            rm_fn = _bn("--instance", inst, "tag", "remove", "--function", fn_addr,
-                       "--type", "AgentNote", "--format", "json")
-            assert rm_fn.returncode == 0, f"{rm_fn.stdout}\n{rm_fn.stderr}"
-            assert json.loads(rm_fn.stdout)["results"][0]["status"] == "verified"
+        rm_fn = shared_bn.run("tag", "remove", "--function", fn_addr,
+                             "--type", "AgentNote", "--format", "json")
+        assert rm_fn.returncode == 0, f"{rm_fn.stdout}\n{rm_fn.stderr}"
+        assert json.loads(rm_fn.stdout)["results"][0]["status"] == "verified"
 
-            # Now that no tags of this type remain, the custom tag type itself
-            # can be removed.
-            rm_type = _bn("--instance", inst, "tag", "type", "remove", "AgentNote",
-                          "--format", "json")
-            assert rm_type.returncode == 0, f"{rm_type.stdout}\n{rm_type.stderr}"
-            assert json.loads(rm_type.stdout)["results"][0]["status"] == "verified"
-        finally:
-            _session_stop(inst)
+        # Now that no tags of this type remain, the custom tag type itself
+        # can be removed.
+        rm_type = shared_bn.run("tag", "type", "remove", "AgentNote",
+                                "--format", "json")
+        assert rm_type.returncode == 0, f"{rm_type.stdout}\n{rm_type.stderr}"
+        assert json.loads(rm_type.stdout)["results"][0]["status"] == "verified"
 
-    def test_tag_type_remove_refuses_builtin(self):
+    def test_tag_type_remove_refuses_builtin(self, shared_bn):
         """A built-in tag type (e.g. Bookmarks) must be refused with a clean
         invalid_request, not removed -- mirrors the bitfield-rejection shape in
         TestTypesDeclareBitfield above."""
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            res = _bn("--instance", inst, "tag", "type", "remove", "Bookmarks",
-                      "--format", "json")
-            assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
-            parsed = json.loads(res.stdout)
-            results = parsed.get("results") or [parsed]
-            assert results[0].get("status") == "invalid_request", parsed
-            assert "built-in" in (results[0].get("message") or "").lower(), parsed
-            # Must NOT have been removed -- still present and flagged built-in.
-            types = json.loads(_bn("--instance", inst, "tag", "types",
-                                   "--format", "json").stdout)["tag_types"]
-            bookmarks = next((t for t in types if t["name"] == "Bookmarks"), None)
-            assert bookmarks is not None and bookmarks["is_builtin"] is True, types
-        finally:
-            _session_stop(inst)
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run("tag", "type", "remove", "Bookmarks",
+                            "--format", "json")
+        assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
+        parsed = json.loads(res.stdout)
+        results = parsed.get("results") or [parsed]
+        assert results[0].get("status") == "invalid_request", parsed
+        assert "built-in" in (results[0].get("message") or "").lower(), parsed
+        # Must NOT have been removed -- still present and flagged built-in.
+        types = json.loads(shared_bn.run("tag", "types",
+                                         "--format", "json").stdout)["tag_types"]
+        bookmarks = next((t for t in types if t["name"] == "Bookmarks"), None)
+        assert bookmarks is not None and bookmarks["is_builtin"] is True, types
 
 
 class TestFunctionDocRoundtrip:
@@ -1454,37 +1392,33 @@ class TestFunctionDocRoundtrip:
     now targets `fn.comment` (the function's documentation comment shown atop
     the function), not an address comment."""
 
-    def test_function_doc_set_get_delete(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            listing = json.loads(_bn("--instance", inst, "function", "list",
-                                     "--limit", "1", "--format", "json").stdout)
-            items = listing.get("items") if isinstance(listing, dict) else listing
-            fn_addr = items[0]["address"]
+    def test_function_doc_set_get_delete(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        listing = json.loads(shared_bn.run("function", "list",
+                                           "--limit", "1", "--format", "json").stdout)
+        items = listing.get("items") if isinstance(listing, dict) else listing
+        fn_addr = items[0]["address"]
 
-            doc_text = "AgentNote: reviewed and documented by an integration test"
-            set_res = _bn("--instance", inst, "comment", "set", "--function", fn_addr,
-                          doc_text, "--format", "json")
-            assert set_res.returncode == 0, f"{set_res.stdout}\n{set_res.stderr}"
-            assert json.loads(set_res.stdout)["results"][0]["status"] == "verified"
+        doc_text = "AgentNote: reviewed and documented by an integration test"
+        set_res = shared_bn.run("comment", "set", "--function", fn_addr,
+                                doc_text, "--format", "json")
+        assert set_res.returncode == 0, f"{set_res.stdout}\n{set_res.stderr}"
+        assert json.loads(set_res.stdout)["results"][0]["status"] == "verified"
 
-            got = json.loads(_bn("--instance", inst, "comment", "get", "--function", fn_addr,
-                                 "--format", "json").stdout)
-            assert got["function_doc"] == doc_text, got
-            assert got["has_function_doc"] is True, got
+        got = json.loads(shared_bn.run("comment", "get", "--function", fn_addr,
+                                       "--format", "json").stdout)
+        assert got["function_doc"] == doc_text, got
+        assert got["has_function_doc"] is True, got
 
-            del_res = _bn("--instance", inst, "comment", "delete", "--function", fn_addr,
-                          "--format", "json")
-            assert del_res.returncode == 0, f"{del_res.stdout}\n{del_res.stderr}"
-            assert json.loads(del_res.stdout)["results"][0]["status"] == "verified"
+        del_res = shared_bn.run("comment", "delete", "--function", fn_addr,
+                                "--format", "json")
+        assert del_res.returncode == 0, f"{del_res.stdout}\n{del_res.stderr}"
+        assert json.loads(del_res.stdout)["results"][0]["status"] == "verified"
 
-            after = json.loads(_bn("--instance", inst, "comment", "get", "--function", fn_addr,
-                                   "--format", "json").stdout)
-            assert after["function_doc"] == "", after
-            assert after["has_function_doc"] is False, after
-        finally:
-            _session_stop(inst)
+        after = json.loads(shared_bn.run("comment", "get", "--function", fn_addr,
+                                         "--format", "json").stdout)
+        assert after["function_doc"] == "", after
+        assert after["has_function_doc"] is False, after
 
 
 class TestBareVoidCallHlilStatement:
@@ -1498,45 +1432,37 @@ class TestBareVoidCallHlilStatement:
     `parse_record` reported `hlil_statement: None`, reason `no_local_statement`,
     while `bn il --view hlil` rendered the statement at the identical address."""
 
-    def test_discarded_return_call_resolves_its_statement(self):
-        info = _session_start(str(PARSER_BINARY))
-        inst = info["instance_id"]
-        try:
-            ev = json.loads(_bn("--instance", inst, "evidence", "function", "parse_record",
-                                "--format", "json").stdout)
-            calls = ev["calls"]
-            memcpy_calls = [
-                c for c in calls
-                if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
-            ]
-            assert memcpy_calls, f"no memcpy callsite found: {calls}"
-            for c in memcpy_calls:
-                # `memcpy(dst, src, n)` discards its return, so its HLIL parent is
-                # the enclosing Block -- the shape that used to null out.
-                assert c["hlil_statement"], (
-                    f"bare void call statement still unresolved: "
-                    f"reason={c['hlil_statement_reason']!r}")
-                assert "memcpy" in c["hlil_statement"]
-                assert c["hlil_statement_reason"] is None
-        finally:
-            _session_stop(inst)
+    def test_discarded_return_call_resolves_its_statement(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        ev = json.loads(shared_bn.run("evidence", "function", "parse_record",
+                                      "--format", "json").stdout)
+        calls = ev["calls"]
+        memcpy_calls = [
+            c for c in calls
+            if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+        ]
+        assert memcpy_calls, f"no memcpy callsite found: {calls}"
+        for c in memcpy_calls:
+            # `memcpy(dst, src, n)` discards its return, so its HLIL parent is
+            # the enclosing Block -- the shape that used to null out.
+            assert c["hlil_statement"], (
+                f"bare void call statement still unresolved: "
+                f"reason={c['hlil_statement_reason']!r}")
+            assert "memcpy" in c["hlil_statement"]
+            assert c["hlil_statement_reason"] is None
 
-    def test_return_used_call_still_resolves(self):
+    def test_return_used_call_still_resolves(self, shared_bn):
         """The #475/#490 shapes must keep working: `int k = parse_record(...)` has a
         real assignment parent, and the ancestor walk (not the new root fallback)
         must still be what answers it."""
-        info = _session_start(str(PARSER_BINARY))
-        inst = info["instance_id"]
-        try:
-            ev = json.loads(_bn("--instance", inst, "evidence", "function", "main",
-                                "--format", "json").stdout)
-            resolved = [c for c in ev["calls"]
-                        if "parse_record" in str(((c.get("target") or {}).get("function") or {})
-                                                 .get("name", ""))]
-            assert resolved, f"no parse_record callsite in main: {ev['calls']}"
-            assert all(c["hlil_statement"] for c in resolved)
-        finally:
-            _session_stop(inst)
+        shared_bn.load(PARSER_BINARY)
+        ev = json.loads(shared_bn.run("evidence", "function", "main",
+                                      "--format", "json").stdout)
+        resolved = [c for c in ev["calls"]
+                    if "parse_record" in str(((c.get("target") or {}).get("function") or {})
+                                             .get("name", ""))]
+        assert resolved, f"no parse_record callsite in main: {ev['calls']}"
+        assert all(c["hlil_statement"] for c in resolved)
 
 
 class TestArgumentArityConfidence:
@@ -1547,23 +1473,19 @@ class TestArgumentArityConfidence:
     control that keeps the fix from blanket-demoting everything: `memcpy` has a
     bundled 3-parameter prototype, so its arguments really ARE authoritative."""
 
-    def test_known_prototype_callee_stays_authoritative(self):
-        info = _session_start(str(PARSER_BINARY))
-        inst = info["instance_id"]
-        try:
-            ev = json.loads(_bn("--instance", inst, "evidence", "function", "parse_record",
-                                "--format", "json").stdout)
-            memcpy_calls = [
-                c for c in ev["calls"]
-                if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
-            ]
-            assert memcpy_calls
-            for c in memcpy_calls:
-                assert c["argument_confidence"] == "authoritative", c
-                assert c["arity_unknown"] is False, c
-                assert "abi_register_saturated" not in c, c
-        finally:
-            _session_stop(inst)
+    def test_known_prototype_callee_stays_authoritative(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        ev = json.loads(shared_bn.run("evidence", "function", "parse_record",
+                                      "--format", "json").stdout)
+        memcpy_calls = [
+            c for c in ev["calls"]
+            if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+        ]
+        assert memcpy_calls
+        for c in memcpy_calls:
+            assert c["argument_confidence"] == "authoritative", c
+            assert c["arity_unknown"] is False, c
+            assert "abi_register_saturated" not in c, c
 
     _VENDOR_SRC = (
         "int vendor_get_status(int code, int flags, int retries,\n"
@@ -1580,7 +1502,7 @@ class TestArgumentArityConfidence:
         "int main(void) { return probe_device(); }\n"
     )
 
-    def test_demotion_fires(self, tmp_path):
+    def test_demotion_fires(self, shared_bn, tmp_path):
         """#648 positive control: the demotion must actually FIRE, not just
         decline to fire on a known prototype. A call to a DYNAMICALLY-linked
         "vendor" import BN's bundled type library has no signature for (unlike
@@ -1614,21 +1536,17 @@ class TestArgumentArityConfidence:
         if build_bin.returncode != 0:
             pytest.skip(f"vendor-import caller build failed: {build_bin.stderr}")
 
-        info = _session_start(str(binp))
-        inst = info["instance_id"]
-        try:
-            ev = json.loads(_bn("--instance", inst, "evidence", "function", "probe_device",
-                                "--format", "json").stdout)
-            vendor_calls = [
-                c for c in ev["calls"]
-                if "vendor_get_status" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
-            ]
-            assert vendor_calls, "expected a call to the unprototyped vendor import"
-            for c in vendor_calls:
-                assert c["arity_unknown"] is True, c
-                assert c["argument_confidence"] != "authoritative", c
-        finally:
-            _session_stop(inst)
+        shared_bn.load(binp, copy=False)
+        ev = json.loads(shared_bn.run("evidence", "function", "probe_device",
+                                      "--format", "json").stdout)
+        vendor_calls = [
+            c for c in ev["calls"]
+            if "vendor_get_status" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+        ]
+        assert vendor_calls, "expected a call to the unprototyped vendor import"
+        for c in vendor_calls:
+            assert c["arity_unknown"] is True, c
+            assert c["argument_confidence"] != "authoritative", c
 
 
 class TestDataRetypeRoundtrip:
@@ -1639,8 +1557,12 @@ class TestDataRetypeRoundtrip:
     `bn py exec`: no --preview, no readback verification, no batch atomicity, no
     audit trail. Only real BN exercises define_user_data_var + BNDB persistence."""
 
-    def _writable_data_address(self, inst: str) -> str:
-        secs = json.loads(_bn("--instance", inst, "sections", "--format", "json").stdout)
+    @staticmethod
+    def _writable_data_address(run) -> str:
+        """*run* takes CLI args and returns a CompletedProcess: `shared_bn.run`
+        on the shared bridge, or a private-session wrapper for the persistence
+        test below, which needs a bridge it can stop and restart."""
+        secs = json.loads(run("sections", "--format", "json").stdout)
         items = secs.get("items") if isinstance(secs, dict) else secs
         by_name = {s.get("name"): s for s in items if isinstance(s, dict)}
         for name in (".data", ".bss", ".rodata"):
@@ -1649,13 +1571,16 @@ class TestDataRetypeRoundtrip:
         raise AssertionError(f"no data section found: {list(by_name)}")
 
     def test_declare_then_retype_verifies_and_persists(self, tmp_path):
+        # Its own bridge, not the shared one: the BNDB round trip this proves IS
+        # a stop and a restart, which is exactly what the shared bridge removes.
         prog = tmp_path / "prog"
         prog.write_bytes(Path(DISPATCH_BINARY).read_bytes())
         prog.chmod(0o755)
         inst = None
         try:
             inst = _session_start(str(prog))["instance_id"]
-            addr = self._writable_data_address(inst)
+            addr = self._writable_data_address(
+                lambda *args: _bn("--instance", inst, *args))
 
             declared = _bn("--instance", inst, "types", "declare",
                            "struct bn649_entry { char* desc; char* usage; };",
@@ -1691,30 +1616,22 @@ class TestDataRetypeRoundtrip:
             if inst:
                 _session_stop(inst)
 
-    def test_preview_reverts_the_data_var_type(self, tmp_path):
-        prog = tmp_path / "prog"
-        prog.write_bytes(Path(DISPATCH_BINARY).read_bytes())
-        prog.chmod(0o755)
-        inst = None
-        try:
-            inst = _session_start(str(prog))["instance_id"]
-            addr = self._writable_data_address(inst)
+    def test_preview_reverts_the_data_var_type(self, shared_bn):
+        shared_bn.load(DISPATCH_BINARY)
+        addr = self._writable_data_address(shared_bn.run)
 
-            previewed = _bn("--instance", inst, "data", "retype", "--preview", addr,
-                            "uint64_t[4]", "--format", "json")
-            assert previewed.returncode == 0, f"{previewed.stdout}\n{previewed.stderr}"
-            payload = json.loads(previewed.stdout)
-            assert payload["results"][0]["status"] == "verified", payload
-            assert payload["committed"] is False and payload["rolled_back"] is True
+        previewed = shared_bn.run("data", "retype", "--preview", addr,
+                                  "uint64_t[4]", "--format", "json")
+        assert previewed.returncode == 0, f"{previewed.stdout}\n{previewed.stderr}"
+        payload = json.loads(previewed.stdout)
+        assert payload["results"][0]["status"] == "verified", payload
+        assert payload["committed"] is False and payload["rolled_back"] is True
 
-            # The preview reverted, so applying it live now must CHANGE the view
-            # (`verified`, not `noop`) -- proof the preview left nothing behind.
-            live = json.loads(_bn("--instance", inst, "data", "retype", addr,
-                                  "uint64_t[4]", "--format", "json").stdout)
-            assert live["results"][0]["status"] == "verified", live
-        finally:
-            if inst:
-                _session_stop(inst)
+        # The preview reverted, so applying it live now must CHANGE the view
+        # (`verified`, not `noop`) -- proof the preview left nothing behind.
+        live = json.loads(shared_bn.run("data", "retype", addr,
+                                        "uint64_t[4]", "--format", "json").stdout)
+        assert live["results"][0]["status"] == "verified", live
 
 
 class TestCommentListFunctionDocs:
@@ -1724,27 +1641,23 @@ class TestCommentListFunctionDocs:
     TODO` reported nothing existed, silently breaking the resume/handoff workflow
     the bn-re skill prescribes."""
 
-    def test_function_doc_is_discoverable_by_query(self):
-        info = _session_start(str(HELLO_BINARY))
-        inst = info["instance_id"]
-        try:
-            listing = json.loads(_bn("--instance", inst, "function", "list",
-                                     "--limit", "1", "--format", "json").stdout)
-            fn_addr = (listing.get("items") or listing)[0]["address"]
-            doc = "Dispatcher; TODO643: confirm shm bounds"
-            assert _bn("--instance", inst, "comment", "set", "--function", fn_addr, doc,
-                       "--format", "json").returncode == 0
+    def test_function_doc_is_discoverable_by_query(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        listing = json.loads(shared_bn.run("function", "list",
+                                           "--limit", "1", "--format", "json").stdout)
+        fn_addr = (listing.get("items") or listing)[0]["address"]
+        doc = "Dispatcher; TODO643: confirm shm bounds"
+        assert shared_bn.run("comment", "set", "--function", fn_addr, doc,
+                             "--format", "json").returncode == 0
 
-            found = json.loads(_bn("--instance", inst, "comment", "list",
-                                   "--query", "TODO643", "--format", "json").stdout)
-            assert found["total"] == 1, found
-            assert found["items"][0]["scope"] == "function_doc", found
-            assert found["items"][0]["comment"] == doc, found
+        found = json.loads(shared_bn.run("comment", "list",
+                                         "--query", "TODO643", "--format", "json").stdout)
+        assert found["total"] == 1, found
+        assert found["items"][0]["scope"] == "function_doc", found
+        assert found["items"][0]["comment"] == doc, found
 
-            # --scope address is the old behaviour, still expressible.
-            narrowed = json.loads(_bn("--instance", inst, "comment", "list",
-                                      "--query", "TODO643", "--scope", "address",
-                                      "--format", "json").stdout)
-            assert narrowed["total"] == 0, narrowed
-        finally:
-            _session_stop(inst)
+        # --scope address is the old behaviour, still expressible.
+        narrowed = json.loads(shared_bn.run("comment", "list",
+                                            "--query", "TODO643", "--scope", "address",
+                                            "--format", "json").stdout)
+        assert narrowed["total"] == 0, narrowed

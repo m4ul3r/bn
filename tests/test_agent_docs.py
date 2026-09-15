@@ -968,12 +968,16 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "06935f28",  # `bn` is an agent-friendly CLI for Binary ... It has two parts: a
         "08df77ee",  # ... is the single source of truth: `@op(name, lock="read"|"write
         "0b9e7173",  # When only one target is open, target-required commands can omit 
+        "317b8cb0",  # The suite is xdist-clean, and parallel is where the wall time is
+        "31a415da",  # What the fixture keeps is the isolation that mattered: ... copie
         "3f1d7f43",  # ... Add a handler in the appropriate ... module, decorated with 
+        "476c789d",  # uv run pytest -n ... # All tests, in parallel (pytest-xdist)
         "49146e24",  # This file provides guidance to Claude Code ... when working with
         "5369b91c",  # ... Add tests in ... (mirror the source ...
         "5c14e27a",  # `observed` are `{}` when the failure supplied no ... All three k
         "9a7f2e2c",  # ### Two-Process Model
         "9bcf19ed",  # - Test files mirror source, split by concern rather than one mod
+        "aae32d66",  # ... (in ... is one headless bridge per pytest session, and every
         "ad00bd37",  # uv run pytest ... # one module
         "b65d6dff",  # **Line count is not a split criterion ... Split a module only on
         "c25f3873",  # Tests mock the `binaryninja` module — no BN license needed excep

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import refuse_silent_skip
 
 from bn.paths import bridge_registry_path, instances_dir
 from bn.transport import (
@@ -78,6 +79,27 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         Path(self.server_address).unlink(missing_ok=True)
 
 
+# `BaseServer.serve_forever` sleeps in a `selectors` poll of this length, and
+# `shutdown()` blocks until the loop next wakes. The stdlib default of 0.5s put
+# a hard 0.5s floor under each of the 26 server-backed tests in this module
+# (measured: 14.2s module wall time at the default). 10ms is far below the work
+# each test does, so it costs nothing measurable and shutdown is prompt.
+_SERVE_POLL_SECONDS = 0.01
+
+# `path_has_bound_socket` answers None when ANOTHER row in `/proc/net/unix`
+# shares the basename it was asked about and that row's own recorded path has
+# since vanished -- its documented "that row might BE the one you asked about"
+# rule. Parallel pytest workers binding one literal name are exactly that
+# shape, so the evidence probes below bind under a name unique to this process.
+# What they pin is the DIRECTORY component (a space, a symlink, a newline);
+# the basename is incidental to every one of them.
+#
+# Kept SHORTER than the literal it replaced: these paths carry a deliberately
+# awkward directory (a space, an embedded newline) under an xdist worker's
+# already-long tmp root, and `sockaddr_un` has 108 bytes for the lot.
+_PROBE_SOCK = f"s{os.getpid():x}.sock"
+
+
 def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -92,7 +114,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
         "pid": pid,
         "token": token,
     }
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True)
     thread.start()
 
     registry_path.write_text(
@@ -133,7 +155,7 @@ def test_send_request_rejects_foreign_response_identity(tmp_path, monkeypatch):
         "pid": os.getpid(),
         "token": "foreign-token",
     }
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     instance = transport.BridgeInstance(
         pid=os.getpid(),
         socket_path=socket_path,
@@ -159,7 +181,7 @@ def test_send_request_rejects_tokenless_registry_before_dispatch(tmp_path, monke
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     socket_path = tmp_path / "legacy.sock"
     server = _Server(str(socket_path), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     registry = bridge_registry_path("legacy")
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text(
@@ -187,7 +209,7 @@ def test_send_request_rejects_foreign_socket_pid_before_dispatch(tmp_path, monke
 
     socket_path = tmp_path / "foreign-pid.sock"
     server = _Server(str(socket_path), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     instance = transport.BridgeInstance(
         pid=os.getpid() + 100000,
         socket_path=socket_path,
@@ -221,7 +243,7 @@ def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, mo
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     socket_path = tmp_path / "foreign.sock"
     server = _Server(str(socket_path), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     registry = instances_dir() / "expected.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text(
@@ -1346,7 +1368,7 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
 
     socket_path = tmp_path / "bn-live.sock"
     server = _Server(str(socket_path), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True)
     thread.start()
 
     registry_path.write_text(
@@ -1377,7 +1399,7 @@ def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     pid = os.getpid()
     socket_path = tmp_path / "bn-fixed.sock"
     server = _Server(str(socket_path), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True)
     thread.start()
 
     registry_path = bridge_registry_path()
@@ -1415,7 +1437,7 @@ def _create_live_instance(tmp_path, instance_id, *, subdir="instances"):
     inst_dir.mkdir(parents=True, exist_ok=True)
     socket_path = tmp_path / f"bn-inst-{instance_id}.sock"
     server = _Server(str(socket_path), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True)
     thread.start()
     registry_path = inst_dir / f"{instance_id}.json"
     registry_path.write_text(
@@ -1470,7 +1492,7 @@ def test_choose_instance_by_default_selects_fixed_registry(tmp_path, monkeypatch
     pid = os.getpid()
     socket_path = tmp_path / "bn-default.sock"
     server = _Server(str(socket_path), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True)
     thread.start()
 
     registry_path = bridge_registry_path()
@@ -1885,7 +1907,7 @@ def test_spawn_rejects_registry_owned_by_other_pid(tmp_path, monkeypatch):
     inst_dir.mkdir(parents=True, exist_ok=True)
     socket_path = tmp_path / "bn-pidtest.sock"
     server = _Server(str(socket_path), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
 
     other_pid = os.getpid()  # a live pid that is NOT our spawned child's pid
     our_child_pid = 2_000_000_000  # implausible, definitely != other_pid
@@ -1943,7 +1965,7 @@ def test_wait_for_teardown_times_out_while_live(tmp_path, monkeypatch):
 
     socket_path = tmp_path / "bn-live.sock"
     server = _Server(str(socket_path), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     reg = tmp_path / "live.json"
     reg.write_text(
         json.dumps({"pid": os.getpid(), "socket_path": str(socket_path), "instance_id": "live"}),
@@ -3049,7 +3071,7 @@ def test_load_instance_rejects_socket_outside_cache(tmp_path, monkeypatch, socke
     server = None
     if socket_is_live:
         server = _Server(str(foreign_socket), _Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     else:
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(foreign_socket))
@@ -3094,7 +3116,7 @@ def test_registry_socket_under_cache_still_loads_and_purges(tmp_path, monkeypatc
 
     fixed_socket = tmp_path / "bn-fixed.sock"
     server = _Server(str(fixed_socket), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     fixed_registry = bridge_registry_path()
     fixed_registry.write_text(
         json.dumps(
@@ -3306,7 +3328,7 @@ def test_load_instance_drops_a_registry_whose_socket_path_is_not_a_string(
     # than aborting the sweep before the rest of the directory is read.
     good_socket = inst_dir / "good.sock"
     server = _Server(str(good_socket), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     (inst_dir / "good.json").write_text(
         json.dumps(
             _registry_payload(
@@ -3442,7 +3464,7 @@ def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
     # A well-formed sibling proves the bad record is SKIPPED, not fatal.
     good_socket = inst_dir / "good.sock"
     server = _Server(str(good_socket), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     (inst_dir / "good.json").write_text(
         json.dumps(
             _registry_payload(
@@ -3471,7 +3493,7 @@ def _healthy_sibling(inst_dir):
     a discovery sweep that died before it got to the rest of the directory."""
     sock = inst_dir / "good.sock"
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     (inst_dir / "good.json").write_text(
         json.dumps(
             _registry_payload(sock, pid=os.getpid(), identity=_identity(),
@@ -3579,7 +3601,7 @@ def test_legacy_fixed_registry_validates_its_instance_id(
     instances_dir().mkdir(parents=True, exist_ok=True)
     fixed_socket = tmp_path / "bn_agent_bridge.sock"
     server = _Server(str(fixed_socket), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path().write_text(
         json.dumps({
             "pid": os.getpid(),
@@ -3621,7 +3643,7 @@ def test_relative_cache_root_still_discovers_its_own_bridge(tmp_path, monkeypatc
 
     sock = bridge_socket_path("rel1")
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path("rel1").write_text(
         json.dumps(
             _registry_payload(sock, pid=os.getpid(), identity=_identity(),
@@ -3691,7 +3713,7 @@ def test_one_cache_root_spelled_two_ways_still_finds_its_bridge(tmp_path, monkey
     sock = bridge_socket_path("mix1")
     assert not sock.is_absolute()                    # what the writer emits here
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path("mix1").write_text(
         json.dumps(
             _registry_payload(sock, pid=os.getpid(), identity=_identity(),
@@ -3763,7 +3785,7 @@ def test_a_misdescribing_relative_path_does_not_cost_a_live_bridge(tmp_path, mon
     sibling = _healthy_sibling(inst_dir)
     sock = inst_dir / "live1.sock"                   # the bridge really is up
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     _plant_registry(inst_dir, "live1", pid=os.getpid(),
                     socket_path="somewhere/else.sock", instance_id="live1",
                     plugin_name="bn_agent_bridge")
@@ -3832,7 +3854,7 @@ def test_a_symlinked_instances_dir_does_not_cost_a_live_bridge(tmp_path, monkeyp
 
     sock = bridge_socket_path("sym1")
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path("sym1").write_text(
         json.dumps(
             _registry_payload(sock, pid=os.getpid(), identity=_identity(),
@@ -3875,7 +3897,7 @@ def test_an_all_dot_instance_id_keeps_its_live_registry(tmp_path, monkeypatch):
 
     sock = bridge_socket_path("...")
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path("...").write_text(
         json.dumps(
             _registry_payload(sock, pid=os.getpid(), identity=_identity(),
@@ -3911,7 +3933,7 @@ def test_the_cache_root_pair_reaches_a_symlinked_instances_dir(tmp_path, monkeyp
     monkeypatch.setenv("BN_CACHE_DIR", str(cache))
     sock = instances_dir() / "legacy.sock"
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     legacy = bridge_registry_path()                  # cache root, no instance id
     legacy.write_text(
         json.dumps(_registry_payload(sock, pid=os.getpid(), identity=_identity())),
@@ -4005,7 +4027,7 @@ def test_an_unreachable_instance_is_a_handle_not_a_connection(tmp_path, monkeypa
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     foreign = tmp_path / "foreign.sock"
     server = _Server(str(foreign), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     instance = BridgeInstance(
         pid=os.getpid(),
         socket_path=foreign,
@@ -4278,7 +4300,7 @@ def test_a_filename_mismatch_does_not_delete_a_live_bridges_record(tmp_path, mon
     inst_dir.mkdir(parents=True, exist_ok=True)
     sock = inst_dir / "live.sock"
     server = _Server(str(sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     record = inst_dir / "Live.json"          # the caller's spelling
     record.write_text(
         json.dumps(
@@ -4457,7 +4479,7 @@ def test_gc_reaps_an_all_dot_instances_leftovers_but_not_a_live_one(tmp_path, mo
 
     live_sock = bridge_socket_path("...")
     server = _Server(str(live_sock), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True).start()
     bridge_registry_path("...").write_text(
         json.dumps(
             _registry_payload(live_sock, pid=os.getpid(), identity=_identity(),
@@ -5013,9 +5035,20 @@ def test_a_cache_path_the_kernel_listing_cannot_represent_is_unknowable(tmp_path
     cannot represent is ``None``, and for a path it can represent only as bytes
     the comparison is done on bytes (#618).
     """
+    from bn.paths import socket_path_budget
     from bn.transport import path_has_bound_socket
 
-    for label, raw in ((b"newline", b"root\nwith-newline"), (b"non-utf8", b"root-\xff-byte")):
+    cases = ((b"newline", b"root\nwith-newline"), (b"non-utf8", b"root-\xff-byte"))
+    # `sun_path` is a fixed array, so an oversized probe makes `bind()` raise
+    # instead of testing anything. `tmp_path` already spends ~60 bytes and
+    # pytest-xdist adds a `popen-gwN/` segment per worker, which is what pushed
+    # this over the limit under `-n 8` (OSError: AF_UNIX path too long).
+    fixed = len(os.fsencode(tmp_path)) + 1 + len(b"/instances/serving.sock")
+    longest = fixed + max(len(raw) for _, raw in cases)
+    if longest > socket_path_budget():
+        pytest.skip(f"tmp_path {tmp_path} too long to build a {longest}-byte probe")
+
+    for label, raw in cases:
         root = tmp_path / os.fsdecode(raw)
         root.mkdir()
         monkeypatch.setenv("BN_CACHE_DIR", str(root))
@@ -5158,7 +5191,7 @@ def test_a_bound_socket_whose_path_contains_a_space_is_still_found(tmp_path):
 
     root = tmp_path / "cache dir"          # a space, exactly where the listing puts it
     root.mkdir()
-    sock_path = root / "serving.sock"
+    sock_path = root / _PROBE_SOCK
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(1)
@@ -5195,13 +5228,13 @@ def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
     other.mkdir()
     link = tmp_path / "link"
     os.symlink(real, link)
-    sock_path = real / "serving.sock"      # the kernel records THIS spelling
+    sock_path = real / _PROBE_SOCK         # the kernel records THIS spelling
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(1)
     try:
-        assert path_has_bound_socket(link / "serving.sock") is True
-        assert path_has_bound_socket(other / "serving.sock") is False
+        assert path_has_bound_socket(link / _PROBE_SOCK) is True
+        assert path_has_bound_socket(other / _PROBE_SOCK) is False
     finally:
         with contextlib.suppress(OSError):
             server.close()
@@ -5231,12 +5264,12 @@ def test_a_symlink_target_holding_a_newline_is_unknowable_not_unbound(tmp_path):
         target.mkdir()
         link = tmp_path / f"link-{label}"      # the LINK's own name is newline-free
         os.symlink(target, link)
-        sock_path = target / "serving.sock"
+        sock_path = target / _PROBE_SOCK
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(sock_path))
         server.listen(1)                       # bound AND listening
         try:
-            answer = path_has_bound_socket(link / "serving.sock")
+            answer = path_has_bound_socket(link / _PROBE_SOCK)
             assert answer is (None if label == "newline" else True), label
         finally:
             with contextlib.suppress(OSError):
@@ -5470,7 +5503,8 @@ def test_discovery_keeps_a_record_whose_socket_could_not_be_probed(tmp_path, mon
     `#694` put there.
     """
     if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
+        refuse_silent_skip("root ignores the directory mode this test relies on; "
+                           "run the suite as a non-root user")
     from bn.transport import _process_alive
 
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -5525,7 +5559,8 @@ def test_an_unprobeable_record_is_hidden_rather_than_offered_as_a_bridge(tmp_pat
     listed and still selected, and the unprobeable record is still on disk.
     """
     if os.geteuid() == 0:
-        pytest.skip("root ignores the directory mode this test relies on")
+        refuse_silent_skip("root ignores the directory mode this test relies on; "
+                           "run the suite as a non-root user")
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
