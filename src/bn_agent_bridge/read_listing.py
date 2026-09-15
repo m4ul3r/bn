@@ -41,6 +41,7 @@ from ._shared import (
     _validate_count,
     is_auto_function_name,
     is_imported_function,
+    is_placeholder_symbol_name,
 )
 from .bridge_state import require_analysis, _quick_loaded_views
 
@@ -347,6 +348,76 @@ def _callsites(
     return result
 
 
+def _debug_info_symbols(bv) -> frozenset[tuple[str, str]]:
+    """``(name, address)`` for every function the view's IMPORTED DEBUG INFO named.
+
+    Provenance, not a name shape. BN marks a plain ELF symtab/dynsym name
+    ``auto=True`` -- the summary never sees those -- but a name its DWARF
+    importer recovered arrives ``auto=False``, so a `cc -g` build of a
+    three-function program reported two "analyst symbols" on a view nobody had
+    touched and `bn_kernel.assert_unannotated` refused it (#733 F2 review).
+    Those names are the binary's own, so they are classified as placeholders.
+
+    Keyed on the name AND the address the importer reported, because a bare
+    name is not provenance: an analyst who renames a second parser copy to
+    ``parse_header`` -- a name the debug info supplied for a DIFFERENT function
+    -- was credited to the loader and the gate certified the view clean, which
+    is the fail-OPEN direction. Measured on a real `-g` build, BN's symbol
+    address and ``DebugFunctionInfo.address`` agree exactly for every recovered
+    function (an imported entry such as ``printf`` reports address 0 and simply
+    matches no symbol), so the pair costs nothing in recall.
+
+    All three name fields are taken: ``short_name``, ``full_name`` and
+    ``raw_name`` are what `DebugFunctionInfo` exposes, and on a C++ target they
+    legitimately disagree (qualified vs mangled), so a symbol may carry any one
+    of them.
+
+    Empty for a view with no imported debug info, and for one that cannot be
+    asked: an unreadable source must not reclassify analyst work as a
+    placeholder, so failure here counts symbols as analyst work, the fail-closed
+    direction for the contamination gate.
+
+    Cost, measured: ``DebugInfo.functions`` is a generator that materializes a
+    type, a platform and local variables per entry, so a 4000-function `-g`
+    build spends ~0.3s cold / ~0.1s warm building this set -- the bulk of this
+    otherwise-fast triage read, and roughly linear beyond that. A stripped or
+    non-`-g` target reports no debug functions and pays nothing.
+    """
+    try:
+        debug_info = getattr(bv, "debug_info", None)
+        functions = list(getattr(debug_info, "functions", []) or [])
+    except Exception:
+        return frozenset()
+    named: set[tuple[str, str]] = set()
+    for function in functions:
+        address = _symbol_address_text(function)
+        if address is None:
+            continue
+        for attribute in ("short_name", "full_name", "raw_name"):
+            try:
+                value = getattr(function, attribute, None)
+            except Exception:
+                continue
+            if isinstance(value, str) and value:
+                named.add((value, address))
+    return frozenset(named)
+
+
+def _symbol_address_text(symbol) -> str | None:
+    """A symbol's address as ``0x`` text, or None when it cannot be read.
+
+    Separate and guarded so a sample ROW degrades on an unreadable address
+    while the COUNTS beside it stay exact -- those counts drive the
+    contamination refusal in `bn_kernel.assert_unannotated`, and a count that
+    collapsed to zero because one symbol's `address` raised reads as "this view
+    is pristine" (#733 F2).
+    """
+    try:
+        return hex(int(getattr(symbol, "address", 0)))
+    except Exception:
+        return None
+
+
 def _annotation_summary(ctx, bv) -> dict[str, Any]:
     """Count annotations ALREADY present in the view (#561).
 
@@ -393,25 +464,63 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
 
     user_symbols = 0
     user_symbol_locations: list[dict[str, Any]] = []
-    try:
-        getter = getattr(bv, "get_symbols", None)
-        symbols = getter() if callable(getter) else list(getattr(bv, "symbols", []) or [])
-        for symbol in symbols:
-            if getattr(symbol, "auto", None) is False:
-                user_symbols += 1
-                if len(user_symbol_locations) < 20:
-                    user_symbol_locations.append(
-                        {
-                            "name": str(
-                                getattr(symbol, "raw_name", "")
-                                or getattr(symbol, "name", "")
-                            ),
-                            "address": hex(int(getattr(symbol, "address", 0))),
-                        }
-                    )
-    except Exception:
-        user_symbols = 0
-        user_symbol_locations = []
+    # #733 F2: the raw non-auto count above includes the names BN's LOADERS
+    # synthesize, so it is not a measure of analyst work. Split, losslessly:
+    # `user_symbols` keeps its meaning and sampling order.
+    analyst_symbols = 0
+    placeholder_symbols = 0
+    analyst_symbol_locations: list[dict[str, Any]] = []
+    # The functions the binary's own debug info named. BN marks those
+    # `auto=False`, so without this a `cc -g` build reported its own function
+    # names as inherited analyst work (#733 F2 review).
+    debug_info_symbols = _debug_info_symbols(bv)
+    # A failure to ENUMERATE the symbols propagates: these counts drive
+    # `bn_kernel.assert_unannotated`'s refusal, so a summary nobody could
+    # measure, published as `analyst_symbols: 0`, certifies contaminated
+    # benchmark data clean. `_orient_digest` already degrades an unreadable
+    # view to an `unavailable` marker that the kernel's `_require_orient_digest`
+    # refuses as a contract violation; swallowing here into zeros was what kept
+    # that path from ever being reached (#733 F2 review). A PER-SYMBOL failure
+    # is absorbed below instead, so one odd symbol cannot cost the whole read.
+    getter = getattr(bv, "get_symbols", None)
+    symbols = getter() if callable(getter) else list(getattr(bv, "symbols", []) or [])
+    for symbol in symbols:
+        try:
+            is_auto = getattr(symbol, "auto", None)
+        except Exception:
+            # Unreadable provenance is counted, never skipped: a symbol dropped
+            # here is a fabricated shortfall in the count the gate refuses on.
+            is_auto = False
+        if is_auto is not False:
+            continue
+        user_symbols += 1
+        try:
+            name = str(
+                getattr(symbol, "raw_name", "")
+                or getattr(symbol, "name", "")
+                or ""
+            )
+        except Exception:
+            name = ""     # not a placeholder shape -> counted as analyst work
+        # The address is read for every non-auto symbol -- guarded, so an
+        # unreadable one costs its own sample ROW and nothing else. It is
+        # load-bearing for the classification, not just for the row: the
+        # debug-info exclusion is keyed on `(name, address)` so an analyst
+        # rename that reuses a name the debug info gave a DIFFERENT function
+        # still counts as analyst work.
+        address = _symbol_address_text(symbol)
+        placeholder = (
+            (address is not None and (name, address) in debug_info_symbols)
+            or is_placeholder_symbol_name(name)
+        )
+        if len(user_symbol_locations) < 20 and address is not None:
+            user_symbol_locations.append({"name": name, "address": address})
+        if placeholder:
+            placeholder_symbols += 1
+        else:
+            analyst_symbols += 1
+            if len(analyst_symbol_locations) < 20 and address is not None:
+                analyst_symbol_locations.append({"name": name, "address": address})
 
     return {
         "comments": comments,
@@ -420,6 +529,14 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         "function_comment_locations": function_comment_locations,
         "user_symbols": user_symbols,
         "user_symbol_locations": user_symbol_locations,
+        "analyst_symbols": analyst_symbols,
+        "placeholder_symbols": placeholder_symbols,
+        "analyst_symbol_locations": analyst_symbol_locations,
+        # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
+        # at 20, so whenever the analyst pair could report truncation the user
+        # pair already does (#733 F2). Not because one sample contains the
+        # other -- it does not, once more than 20 placeholders precede an
+        # analyst row.
         "locations_truncated": any(
             count > len(locations)
             for count, locations in (

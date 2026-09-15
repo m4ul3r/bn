@@ -13,6 +13,8 @@ import os
 import shutil
 import signal
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -855,6 +857,120 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
     return {"kind": "instances", "items": entries, "total_rss_mb": round(total_rss, 1)}
 
 
+#: Budget for the `session list` unsaved-target probe, ONE deadline for the
+#: whole command rather than one per instance. Short on purpose: a fleet triage
+#: must not block on a wedged bridge, and an unanswered instance is reported as
+#: unknown rather than as zero unsaved work.
+#:
+#: Applied with `resolved=True` so `BN_REQUEST_TIMEOUT` cannot widen it -- that
+#: variable exists to give a long LOAD more room (and `none`/`off`/`0` disables
+#: the deadline entirely), and a triage read that inherits it is exactly the
+#: command a hung bridge takes hostage.
+#:
+#: Shared, not per instance and not per WAVE: the probes fan out `_PROBE_FAN`
+#: at a time, so a per-probe budget made the listing cost
+#: `ceil(n / _PROBE_FAN)` budgets -- 10s for the fourteen-bridge fleet in #733
+#: and 125s for 200 -- and a Ctrl-C waited out the whole of it, because the
+#: pool joins on exit. Each worker gets the REMAINING slice; a bridge the
+#: deadline never reached is disclosed as unknown by name. Healthy bridges
+#: answer in milliseconds, so this costs a real fleet nothing.
+_UNSAVED_PROBE_TIMEOUT = 5.0
+
+#: Concurrency cap for the probe, matching the survey planner's `min(8, n)`.
+_PROBE_FAN = 8
+
+
+def _probe_one_instance(entry: dict[str, Any], deadline: float) -> None:
+    """Annotate ONE session row with its unsaved-target count, or with why not.
+
+    `list_targets` is the same read `target list` issues, so it runs that
+    bridge's `TargetManager.refresh()`: id minting plus the #713 prune of dirty
+    markers for views that are no longer open. Idempotent bookkeeping over the
+    current open set -- it cannot drop a marker for a view that is still open,
+    which is the only thing this probe reports on -- but it IS a write to that
+    bookkeeping, newly reached by a triage command, so it is stated here.
+    """
+    # The legacy GUI pair registers no instance id, and its selector
+    # (`default`) is what `choose_instance` matches on
+    # (`instance_selector(inst) == instance_id`), so keying on `instance_id`
+    # alone reported every GUI bridge as unknown without even asking it.
+    selector = entry.get("instance_id") or entry.get("selector")
+    if not isinstance(selector, str) or not selector:
+        entry["unsaved_targets_unavailable"] = "the registry names no instance id"
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        # Disclosed by name, never counted as zero: the point of this field is
+        # that "0 unsaved" means "nothing would be discarded".
+        entry["unsaved_targets_unavailable"] = (
+            "the probe budget expired before this bridge was reached"
+        )
+        return
+    try:
+        rows = unwrap_result(
+            cli.send_request(
+                "list_targets",
+                params={},
+                instance_id=selector,
+                timeout=remaining,
+                resolved=True,
+            ),
+            "list_targets",
+        )
+    except (BridgeError, OSError) as exc:
+        # `BridgeError` is the declared surface -- `validate_instance_id`
+        # translates the id-grammar `ValueError` into one and the socket
+        # layer raises it for every transport failure -- and `OSError` is
+        # belt: a listing must degrade to "unknown" rather than turn into a
+        # traceback. First line, capped: a transport error can be a
+        # multi-line "Multiple instances..." listing or a long "Start one
+        # with: ..." hint, and this goes into a one-line-per-instance view.
+        #
+        # `or` twice, because an exception CAN have an empty message: a bare
+        # `TimeoutError()` made `splitlines()[0]` an IndexError that escaped
+        # the caught set and turned the whole listing into a traceback, and an
+        # empty reason string renders as neither a count nor an `unknown`.
+        reason = (str(exc).splitlines() or [""])[0][:120]
+        entry["unsaved_targets_unavailable"] = reason or type(exc).__name__
+        return
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        entry["unsaved_targets_unavailable"] = (
+            "the bridge returned a malformed target listing"
+        )
+        return
+    if any("unsaved" not in row for row in rows):
+        entry["unsaved_targets_unavailable"] = (
+            "this bridge does not report per-target unsaved state"
+        )
+        return
+    entry["unsaved_targets"] = sum(1 for row in rows if row.get("unsaved") is True)
+
+
+def _probe_unsaved_targets(snapshot: dict[str, Any]) -> None:
+    """Annotate each session row with a LIVE count of unsaved targets (#733 F1).
+
+    Registry meta is written on load/close only, so it cannot answer this; the
+    ledger lives in the bridge. Each row gets `unsaved_targets` (an int) or
+    `unsaved_targets_unavailable` (why not) -- never a fabricated 0, which reads
+    as "nothing would be discarded" and is the decision this probe exists for.
+
+    Concurrent, under ONE deadline for the whole sweep (`_UNSAVED_PROBE_TIMEOUT`),
+    so the listing's worst case is that budget rather than one per bridge or one
+    per wave of `_PROBE_FAN`. Each worker writes only into its own row dict, so
+    the snapshot's order is the registry's regardless of completion order.
+    """
+    entries = [entry for entry in (snapshot.get("items") or [])
+               if isinstance(entry, dict)]
+    if not entries:
+        return
+    deadline = time.monotonic() + _UNSAVED_PROBE_TIMEOUT
+    if len(entries) == 1:
+        _probe_one_instance(entries[0], deadline)
+        return
+    with ThreadPoolExecutor(max_workers=min(_PROBE_FAN, len(entries))) as pool:
+        list(pool.map(lambda entry: _probe_one_instance(entry, deadline), entries))
+
+
 @command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
     # An explicit `-i ''` is an empty SELECTOR, not "no selector": the filter in
@@ -870,6 +986,11 @@ def _session_list(args: argparse.Namespace) -> int:
         else None
     )
     result: Any = _running_instances_result(selector_filter)
+    # #733 F1: "is it safe to stop these bridges?" answered on the read path.
+    # A live probe, not registry meta: `_write_registry` runs on load/close
+    # only, so a registry-sourced count would report "0 unsaved" for a bridge
+    # holding unsaved renames -- the one wrong answer this field prevents.
+    _probe_unsaved_targets(result)
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="session-list")
     return 0
 
@@ -879,6 +1000,9 @@ def _instance_list(args: argparse.Namespace) -> int:
     # `instance list` ignores the selector entirely, but an explicit empty one is
     # still a caller mistake and is refused everywhere else in the CLI (#694).
     cli._require_nonempty_instance(args)
+    # No unsaved probe here, unlike its `session list` alias: `instance list`
+    # answers "which instance has libfoo.so?" from the registry alone, and #80
+    # made round-trip-freedom that command's design contract.
     result: Any = _running_instances_result()
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
     return 0

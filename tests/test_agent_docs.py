@@ -1158,6 +1158,7 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "2e17cf8a",  # bn decompile main -i ... -t ... # after the leaf
         "30c54757",  # ## ... Workflow & target selection
         "393df258",  # > bn session start ... --instance-id ... # spawn naming
+        "39b226e4",  # `unsaved` and ... are reported on the READ path too, so "will st
         "3ecb3444",  # bn session list [-i ... # all running instances, or filter one
         "42663a3b",  # bn xrefs <fn-or-addr> --limit ... # cap text output
         "42c9764f",  # Requests time out after ... by default; override with ... ... ..
@@ -1214,21 +1215,24 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "3804218c",  # ... bn session start ... --instance-id ...
         "3a2677e0",  # ... ...
         "3bd6c497",  # spawn budget (for example ... and give the surrounding tool a
+        "3cb975c0",  # children inherit one eval session and can overwrite ... or kill
         "3ff3109a",  # HLIL and decompilation can distort access width, conditional gua
         "4333a9bd",  # Full loads can take many minutes and each bridge can consume hun
         "501a0d7d",  # This is a programmatic-only ... Wire-level `bn <paged command> -
+        "51eaa389",  # results = wait(handles, ... ...
         "5217ba8e",  # ONE real request and returns no ... The bridge enforces `limit >
         "5b90ca26",  # ... may legitimately be **absent** from a ... envelope: the brid
         "615d3c92",  # polling the exact job ... In a ... dogfood
+        "620158d6",  # Measured: three children spawned with bare `agent()` received th
         "62271b7e",  # applied exactly once as one end-to-end deadline: every page of a
         "69aebef4",  # ... Use `int(row["address"], ... for arithmetic; do not call `he
         "6bb82d86",  # return len(rows), ... "name", "address", "size", ...
         "6dd5e055",  # - `await ... ... `await ... ... ... always return row lists; eve
         "71820845",  # Use this skill for high-volume reads that benefit from OMP's ret
+        "73dcdc6d",  # - `await ... reports offending comment locations; ... is the exp
         "742c5bd1",  # more than ... seconds (maximum ... ...
         "74a85e20",  # ... is always normalized to ... A non-zero `offset` means the
         "7e6433f3",  # bn -i ... session status "$JOB" --format json # one job: machine
-        "7ed9f73a",  # - `await ... reports offending comment locations; ... is the exp
         "90230d5e",  # Paged reads also require each page to publish an integer `offset
         "92bdec53",  # - `await ... exposes ... ... (the exact `imports` row count), an
         "9e322829",  # The bootstrap is idempotent: rerun it after an eval-kernel ... E
@@ -1249,13 +1253,14 @@ NON_CLAIM_NUMBER_LINES: dict[str, frozenset[str]] = {
         "dadd509e",  # ... ... ...
         "db9deb20",  # zero-row position, that row alone proves more exists at this ...
         "e22c411b",  # bridge, or treat the command as unavailable — do not synthesize 
+        "e51102db",  # ... hex ... and the stem rule strips that digest exactly
         "e5563d00",  # "Start your unique headless bridge with the exact ... "
         "e6fb072e",  # large = [row for row in rows if ... ... >= ...
+        "e719f47d",  # strip, so a ... binary cached as ... hex ... is
         "e9265826",  # **Bare-decimal addresses, one disclosure ... Every containment-e
         "f23ef97b",  # > **Concurrent sibling task agents:** OMP currently shares one r
         "f9d5322a",  # ... # ...
         "fd3e3a3d",  # the collection already ... The documented ... spelling disables
-        "fede3564",  # inherit one eval session and can overwrite ... or kill sibling
         "ffc45d17",  # Native reads are bounded to ... seconds by ... Every curated exp
     }),
     "skills/bn-re/SKILL.md": frozenset({

@@ -880,9 +880,10 @@ def gc_instances() -> dict[str, Any]:
     but deliberately keeps the ``.log`` breadcrumb (the empty-response
     diagnostic). A host that spawns many short-lived bridges therefore
     accumulates hundreds of zero-byte logs for instances that are long gone
-    (#80). This sweeps the logs -- and any registry-less orphan sockets -- of
-    every instance that no longer has a live registry, leaving live instances
-    and the shared spawn lock untouched.
+    (#80). This sweeps those logs -- plus the ``.last_used`` sidecar written
+    beside them and any registry-less orphan sockets -- for every instance
+    that no longer has a live registry, leaving live instances and the shared
+    spawn lock untouched.
 
     What it deliberately does NOT do is remove a registry discovery chose to
     keep. Every destructive arm in this module demands positive evidence that
@@ -899,9 +900,9 @@ def gc_instances() -> dict[str, Any]:
 
     Returns a summary: ``live_instances``, ``registries_purged`` (dead
     registries the liveness sweep removed), ``logs_removed``,
-    ``sockets_removed``, and ``removed`` (the list of removed paths, the
-    purged registries included -- reporting those as a count alone hid a
-    destructive action behind a number).
+    ``sockets_removed``, ``last_used_removed``, and ``removed`` (the list of
+    removed paths, the purged registries included -- reporting those as a
+    count alone hid a destructive action behind a number).
     """
     inst_dir = instances_dir()
     summary: dict[str, Any] = {
@@ -909,6 +910,7 @@ def gc_instances() -> dict[str, Any]:
         "registries_purged": 0,
         "logs_removed": 0,
         "sockets_removed": 0,
+        "last_used_removed": 0,
         "removed": [],
     }
     # Serialize against spawns. A spawn creates ``<id>.log`` + ``<id>.sock``
@@ -943,7 +945,11 @@ def gc_instances() -> dict[str, Any]:
             # A .log/.sock whose registry is gone belongs to a dead/long-gone
             # instance -- the registry was purged (now or earlier) or never
             # existed (and, under the lock, is not a spawn in flight).
-            suffix = next((s for s in (".log", ".sock")
+            # A ``.last_used`` sidecar is reaped on the same evidence as the
+            # ``.log`` beside it: nothing in this tree writes one, but a host
+            # running a build that does accumulates them and `gc` is their
+            # only reaper (#733 F6).
+            suffix = next((s for s in (".log", ".sock", ".last_used")
                            if entry.name.endswith(s)), None)
             if suffix is None or entry.name.removesuffix(suffix) in live_ids:
                 continue
@@ -963,10 +969,9 @@ def gc_instances() -> dict[str, Any]:
             with contextlib.suppress(OSError):
                 entry.unlink()
                 summary["removed"].append(str(entry))
-                if suffix == ".log":
-                    summary["logs_removed"] += 1
-                else:
-                    summary["sockets_removed"] += 1
+                summary[{".log": "logs_removed",
+                         ".sock": "sockets_removed",
+                         ".last_used": "last_used_removed"}[suffix]] += 1
     return summary
 
 

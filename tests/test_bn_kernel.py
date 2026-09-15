@@ -1988,6 +1988,90 @@ def test_native_assert_target_accepts_basename_and_full_path(tmp_path):
     assert _run(session.assert_target(filename))["basename"] == filename.name
 
 
+def _digest_client(**info):
+    """A native client answering `target_info` with one canonical identity."""
+
+    class IdentityClient:
+        def request(self, op, params=None):
+            assert op == "target_info"
+            return _canonical_target_info(**info)
+
+    return IdentityClient()
+
+
+def test_assert_target_accepts_a_cache_restored_digest_name():
+    """#733 F3: this guard must not be stricter than the resolver it guards.
+
+    A target saved on a read-only mount restores from the global cache DB,
+    which the bridge names `<basename>.<16 hex path digest>.bndb` and resolves
+    by stem. `Path(...).stem` keeps the digest, so the documented
+    `assert_target("netsvcd")` refused a target `-t netsvcd` resolves fine.
+    """
+    session = bn_kernel.Session(instance="worker", backend="native")
+    filename = "/home/dev/.cache/bn/bndb/netsvcd.3f9c1d0a77bb4e20.bndb"
+    session._client = _digest_client(
+        basename="netsvcd.3f9c1d0a77bb4e20.bndb", filename=filename
+    )
+
+    assert _run(session.assert_target("netsvcd"))["filename"] == filename
+    assert _run(
+        session.assert_target("netsvcd.3f9c1d0a77bb4e20.bndb")
+    )["filename"] == filename
+    assert _run(session.assert_target(filename))["filename"] == filename
+
+
+def test_assert_target_does_not_compound_the_digest_strip_with_an_extension_strip():
+    """The boundary: the strip goes exactly as far as the bridge's, no further.
+
+    `_cache_bndb_path` keeps the FULL basename, so a `sample.bin` binary caches
+    as `sample.bin.<digest>.bndb` and `-t sample.bin` resolves it while
+    `-t sample` misses every branch of `_matches_record`. Accepting `"sample"`
+    here would certify a name the tool cannot resolve -- #733 F3 inverted.
+    """
+    session = bn_kernel.Session(instance="worker", backend="native")
+    session._client = _digest_client(
+        basename="sample.bin.4e20a1b2c3d4e5f6.bndb",
+        filename="/home/dev/.cache/bn/bndb/sample.bin.4e20a1b2c3d4e5f6.bndb",
+    )
+
+    assert _run(session.assert_target("sample.bin"))["basename"] == (
+        "sample.bin.4e20a1b2c3d4e5f6.bndb"
+    )
+    with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
+        _run(session.assert_target("sample"))
+
+
+def test_assert_target_still_refuses_a_foreign_cache_restored_target():
+    session = bn_kernel.Session(instance="worker", backend="native")
+    session._client = _digest_client(
+        basename="netsvcd.3f9c1d0a77bb4e20.bndb",
+        filename="/home/dev/.cache/bn/bndb/netsvcd.3f9c1d0a77bb4e20.bndb",
+    )
+
+    with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
+        _run(session.assert_target("dnsproxy"))
+
+
+def test_assert_target_strips_a_cache_digest_only_once():
+    """One peel, exactly like the bridge: a binary whose own name ends in a
+    dot-separated 16-hex segment must not be peeled twice. This is the cell that
+    reds if a second strip is ever added (#733 F3)."""
+    session = bn_kernel.Session(instance="worker", backend="native")
+    session._client = _digest_client(
+        basename="netsvcd.3f9c1d0a77bb4e20.4e20a1b2c3d4e5f6.bndb",
+        filename=(
+            "/home/dev/.cache/bn/bndb/"
+            "netsvcd.3f9c1d0a77bb4e20.4e20a1b2c3d4e5f6.bndb"
+        ),
+    )
+
+    assert _run(session.assert_target("netsvcd.3f9c1d0a77bb4e20"))["basename"] == (
+        "netsvcd.3f9c1d0a77bb4e20.4e20a1b2c3d4e5f6.bndb"
+    )
+    with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
+        _run(session.assert_target("netsvcd"))
+
+
 def test_assert_target_accepts_shorter_caller_timeout(monkeypatch):
     session = bn_kernel.Session(instance="worker", timeout=1, backend="native")
     requested_timeouts = []
@@ -2806,6 +2890,135 @@ def test_assert_unannotated_accepts_a_well_formed_clean_digest():
 
     assert digest["existing_annotations"]["user_symbols"] == 7
     assert session.last is not None
+
+
+def test_assert_unannotated_accepts_a_placeholder_only_view():
+    """#733 F2: a freshly loaded binary is not contaminated benchmark data.
+
+    Hundreds of loader-synthesized names arrive marked non-auto, so keying the
+    refusal on the raw count would refuse every pristine target.
+    """
+    session = _shape_session(
+        {
+            "kind": "orient",
+            "existing_annotations": {
+                "comments": 0,
+                "function_comments": 0,
+                "user_symbols": 612,
+                "analyst_symbols": 0,
+                "placeholder_symbols": 612,
+            },
+        }
+    )
+
+    digest = _run(session.assert_unannotated())
+
+    assert digest["existing_annotations"]["placeholder_symbols"] == 612
+    assert session.last is not None
+
+
+def test_assert_unannotated_refuses_analyst_symbols():
+    """#733 F2: one analyst rename IS inherited work, and must refuse."""
+    payload = {
+        "kind": "orient",
+        "existing_annotations": {
+            "comments": 0,
+            "function_comments": 0,
+            "user_symbols": 612,
+            "analyst_symbols": 1,
+            "placeholder_symbols": 611,
+        },
+    }
+
+    with pytest.raises(
+        bn_kernel.BridgeError, match="inherited analyst symbols detected"
+    ) as caught:
+        _run(_shape_session(payload).assert_unannotated())
+    assert "analyst_symbols=1" in str(caught.value)
+
+    assert _run(
+        _shape_session(payload).assert_unannotated(allow_contaminated=True)
+    ) == payload
+
+
+def test_the_analyst_refusal_names_the_offending_symbols():
+    """A refusal that states only a count needs a second command to act on.
+
+    This branch is reached with zero comments, so the comment-location note is
+    empty by construction; the bridge publishes `analyst_symbol_locations`
+    precisely so the operator can see WHICH names they are (#733 F2 review).
+    Malformed location metadata must still refuse, and say it was omitted.
+    """
+    payload = {
+        "kind": "orient",
+        "existing_annotations": {
+            "comments": 0,
+            "function_comments": 0,
+            "user_symbols": 4,
+            "analyst_symbols": 2,
+            "placeholder_symbols": 2,
+            "analyst_symbol_locations": [
+                {"name": "parse_request", "address": "0x401a40"},
+                {"name": "emit_record", "address": "0x401b10"},
+            ],
+        },
+    }
+
+    with pytest.raises(bn_kernel.BridgeError) as caught:
+        _run(_shape_session(payload).assert_unannotated())
+    message = str(caught.value)
+    assert "parse_request" in message and "0x401a40" in message
+    assert "emit_record" in message
+
+    hostile = {**payload, "existing_annotations": {
+        **payload["existing_annotations"], "analyst_symbol_locations": 7}}
+    with pytest.raises(
+        bn_kernel.BridgeError, match="inherited analyst symbols detected"
+    ) as caught:
+        _run(_shape_session(hostile).assert_unannotated())
+    assert "location metadata was malformed and omitted" in str(caught.value)
+
+
+def test_assert_unannotated_ignores_symbols_on_a_bridge_without_the_split():
+    """The presence gate: a bridge that predates the split passes unchanged."""
+    session = _shape_session(
+        {
+            "kind": "orient",
+            "existing_annotations": {
+                "comments": 0,
+                "function_comments": 0,
+                "user_symbols": 540,
+            },
+        }
+    )
+
+    digest = _run(session.assert_unannotated())
+
+    assert digest["existing_annotations"]["user_symbols"] == 540
+
+
+@pytest.mark.parametrize("bad", [-1, "3", True], ids=["negative", "string", "bool"])
+def test_assert_unannotated_fails_closed_on_a_malformed_analyst_counter(bad):
+    """Present-but-unreadable is not absent: an optional counter this gate
+    cannot read must refuse rather than degrade to "no analyst work" (#733 F2)."""
+    session = _shape_session(
+        {
+            "kind": "orient",
+            "existing_annotations": {
+                "comments": 0,
+                "function_comments": 0,
+                "user_symbols": 7,
+                "analyst_symbols": bad,
+                "placeholder_symbols": 7,
+            },
+        }
+    )
+
+    with pytest.raises(
+        bn_kernel.BnError, match="must be a non-negative integer"
+    ):
+        _run(session.assert_unannotated())
+    assert session.last is None
 
 
 PREFLIGHT_CASES = [

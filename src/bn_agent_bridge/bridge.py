@@ -711,6 +711,15 @@ class TargetManager:
                             else "unanalyzed" if view in _unanalyzed_views
                             else "full"
                         ),
+                        # #733 F1: the committed-but-unsaved ledger, published on
+                        # the READ path. It was reachable only by `close` (the
+                        # destructive op) or `py exec`, so "is it safe to close
+                        # this bridge?" had no read-only answer. `unsaved` is this
+                        # bridge's ledger; `engine_modified` is BN's generic bit,
+                        # which does NOT flip for our verified writes and also
+                        # covers analysis churn, so the two stay separate.
+                        "unsaved": view_id in self._dirty_view_ids,
+                        "engine_modified": _view_engine_modified(view),
                     }
                 )
             return result
@@ -1900,7 +1909,7 @@ class BinaryNinjaBridge:
             return {
                 "path": str(getattr(bv.file, "filename", "")),
                 "unsaved": self.targets.is_dirty(bv),
-                "engine_modified": bool(getattr(bv.file, "modified", False)),
+                "engine_modified": _view_engine_modified(bv),
             }
 
         # The three ways to name what to close -- a target selector, a path,
@@ -2363,6 +2372,13 @@ class BinaryNinjaBridge:
             "analysis_state": (
                 "quick" if quick else "unanalyzed" if unanalyzed else "full"
             ),
+            # #733 F1: set explicitly rather than inherited from the row above,
+            # because `record` can be absent (no matching row) and the whole
+            # point of the field is that it is never silently missing on the
+            # read path. `TargetManager._lock` is an RLock, so asking the
+            # ledger here is safe.
+            "unsaved": self.targets.is_dirty(bv),
+            "engine_modified": _view_engine_modified(bv),
             # Pollable analysis phase/progress (#321): while a `bn refresh` runs on
             # another connection, this advances (refresh no longer holds the
             # read-blocking lock) so an agent can watch a large-target analysis
@@ -3222,9 +3238,12 @@ class BinaryNinjaBridge:
         try:
             bv = self._resolve_view(selector)
             annotations = read_listing._annotation_summary(self.ctx, bv)
+            # #733 F2: keyed on ANALYST work, not the raw non-auto count -- the
+            # loader's own placeholders made a pristine view hint that its
+            # entirely-current-run analysis may predate the run.
             total_annotations = (
                 annotations["comments"] + annotations["function_comments"]
-                + annotations["user_symbols"]
+                + annotations["analyst_symbols"]
             )
             hint = None
             if analysis_cache_restored or total_annotations:
@@ -3232,7 +3251,8 @@ class BinaryNinjaBridge:
                     f"existing BNDB annotations may predate this run: "
                     f"{annotations['comments']} comment(s), "
                     f"{annotations['function_comments']} function doc(s), "
-                    f"{annotations['user_symbols']} user symbol(s) already present"
+                    f"{annotations['analyst_symbols']} analyst symbol(s) already present "
+                    f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
                     + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
                     + " -- do not over-credit current-run analysis"
                 )
@@ -4299,6 +4319,20 @@ def _view_function_count(bv) -> int:
         return len(bv.functions)
     except Exception:  # noqa: BLE001 - a raw/uninitialised view may not expose functions
         return 0
+
+
+def _view_engine_modified(bv) -> bool:
+    """BN's generic modified bit, or False when the view cannot be asked.
+
+    The ONE accessor behind `target info`, `target list` and `close`, so the
+    three surfaces cannot disagree about the same view (#733 F1). Guarded
+    because ``bv.file`` itself can raise on a stale/odd view, which is exactly
+    where the inline form propagated while the read paths reported False.
+    """
+    try:
+        return bool(getattr(getattr(bv, "file", None), "modified", False))
+    except Exception:  # noqa: BLE001 - a stale view's `.file` access may raise
+        return False
 
 
 def _analysis_progress(bv):

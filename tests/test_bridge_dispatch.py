@@ -404,6 +404,32 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
     assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
 
 
+def test_target_info_reports_the_same_unsaved_state_as_close(monkeypatch, tmp_path):
+    """#733 F1 criterion 1: the read path agrees with what `close` reports.
+
+    An agent deciding whether to stop a bridge must be able to ask without
+    running the destructive op, and the two answers must be the same answer --
+    which is why both surfaces read one ledger through one accessor.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/netsvcd.bndb", session_id="11")
+    _register_views(bridge, bv)
+    instance.targets.refresh()          # mint the stable view_id mark_dirty keys on
+
+    assert instance._target_info(None)["unsaved"] is False
+    assert instance._target_info(None)["engine_modified"] is False
+
+    instance.targets.mark_dirty(bv)
+    info = instance._target_info(None)
+    assert info["unsaved"] is True
+
+    closed = _close_on_watchdog(instance, target="netsvcd.bndb")["closed"]
+    assert closed[0]["unsaved"] == info["unsaved"]
+    bridge._headless_views.clear()
+
+
 def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1722,6 +1748,42 @@ def test_refresh_rows_carry_analysis_state(monkeypatch):
     assert rows["/proj/f.bndb"]["analyzed"] is True
 
     bridge._quick_loaded_views.discard(bv_quick)
+    bridge._headless_views.clear()
+
+
+def test_refresh_rows_carry_the_unsaved_ledger(monkeypatch):
+    """#733 F1: `target list` rows publish the committed-but-unsaved ledger.
+
+    It used to be reachable only through `close` (the destructive op) or
+    `py exec`, so "will stopping this bridge discard work?" had no read-only
+    answer. Both directions plus the unaskable view are pinned, because a row
+    that always says `False` is the dangerous failure.
+    """
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeFileBV("/proj/netsvcd.bndb", session_id="1")
+    _register_views(bridge, bv)
+    manager = bridge.TargetManager()
+
+    rows = {t["filename"]: t for t in manager.refresh()}
+    assert rows["/proj/netsvcd.bndb"]["unsaved"] is False
+    assert rows["/proj/netsvcd.bndb"]["engine_modified"] is False
+
+    manager.mark_dirty(bv)
+    assert manager.refresh()[0]["unsaved"] is True
+
+    manager.clear_dirty(bv)
+    assert manager.refresh()[0]["unsaved"] is False
+
+    # A view whose `.file` raises must report False, not blow up the listing.
+    class _Exploding:
+        @property
+        def file(self):
+            raise RuntimeError("stale handle")
+
+    bv.file.modified = True
+    assert manager.refresh()[0]["engine_modified"] is True
+    assert bridge._view_engine_modified(_Exploding()) is False
+
     bridge._headless_views.clear()
 
 

@@ -46,6 +46,16 @@ A stem-only check such as `assert_target("sample")` accepts either
 is strict and must name the actual loaded file: if sibling-BNDB preference
 loaded `/x/sample.bndb` for `/x/sample.bin`, assert the `.bndb` path.
 
+A target restored from the read-only-mount cache is open as
+`<basename>.<16 hex digest>.bndb`, and the stem rule strips that digest exactly
+once, so `assert_target("netsvcd")` accepts `netsvcd.3f9c1d0a77bb4e20.bndb`;
+the full basename and the absolute cache path accept it too. Within a
+cache-restored name the digest strip is not compounded with an extension
+strip, so a `sample.bin` binary cached as `sample.bin.<16 hex digest>.bndb` is
+asserted by `sample.bin` and not by `sample` -- the same rule `bn -t` applies
+to that name. The plain stem rule in the paragraph above is unchanged and is
+deliberately laxer than `bn -t` for an ordinary (non-cache) basename.
+
 > **Concurrent sibling task agents:** OMP currently shares one retained eval
 > namespace across those siblings. Module globals can be rebound between cells.
 > Ordinary inactive `Session` objects may be retained for inspecting `.last` and
@@ -122,10 +132,12 @@ GUI tabs bn never loaded), sticky pins, or another agent's instance.
 ## Parallel bn-kernel subagents
 
 When two or more concurrent children will use bn-kernel, launch them from an
-Eval cell with `agent()` inside `parallel()`. Eval-agent children receive
-independent retained kernels on current OMP releases; ordinary `task` children
-inherit one eval session and can overwrite globals/modules or kill sibling
-cells. A direct-CLI-only fleet may still use an ordinary task batch.
+Eval cell with bare `agent()` calls collected by `wait()`. Eval-agent children
+receive independent retained kernels on current OMP releases; ordinary `task`
+children inherit one eval session and can overwrite globals/modules or kill
+sibling cells. A direct-CLI-only fleet may still use an ordinary task batch.
+Measured: three children spawned with bare `agent()` received three distinct
+kernel processes and each reported an empty foreign-globals probe.
 
 Give every child a self-contained assignment, a unique bridge instance and
 target, and require a bounded summary rather than returning its Session or bulk
@@ -139,27 +151,27 @@ lifecycle = (
     "if opened, then always stop its exact instance even if start, load, analysis, "
     "or target close fails; every other failed or timed-out start is ambiguous. "
 )
-results = await parallel([
-    lambda: agent(
-        "Use bn-kernel. Analyze target A via instance bnk-a and its exact "
-        "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary. " + lifecycle,
-        label="A",
-    ),
-    lambda: agent(
-        "Use bn-kernel. Analyze target B via instance bnk-b and its exact "
-        "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary. " + lifecycle,
-        label="B",
-    ),
-    lambda: agent(
-        "Use bn-kernel. Analyze target C via instance bnk-c and its exact "
-        "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary. " + lifecycle,
-        label="C",
-    ),
-])
+
+def assignment(label, instance):
+    return (
+        f"Use bn-kernel. Analyze target {label} via instance {instance} and its "
+        "exact selector. Use direct bn only for lifecycle, keep state "
+        "function-local with scoped(), and return a bounded summary. "
+    )
+
+handles = [
+    agent(assignment("A", "bnk-a") + lifecycle, label="A"),
+    agent(assignment("B", "bnk-b") + lifecycle, label="B"),
+    agent(assignment("C", "bnk-c") + lifecycle, label="C"),
+]
+results = wait(handles, timeout=1320, raise_errors=False)
 ```
+
+`wait()` is a **synchronous** barrier: `await wait(...)` raises
+`TypeError: 'list' object can't be awaited`. `raise_errors=False` keeps a
+failed child's error in its slot instead of losing the whole wave. When the
+number of children is not fixed, use `workpool()` and push items into it
+instead of building a handle list.
 
 Each child retains cleanup responsibility for its exact target and instance and
 returns only after attempting that exact teardown on every reachable exit. This
@@ -202,7 +214,7 @@ Prefer these curated helpers for list-shaped and common reads:
 - `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
 - `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero. `total` is monotone across a collection's pages: a `None` page can be followed by a page with the exact integer once the caller scan completes, so a long `callsites` collection can legitimately end with a determined total after starting with null ones -- but an already-determined total never reverts to null or changes to a different int.
 - `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
+- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own, because a loader synthesizes those names on a binary with zero analyst work. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
 
 Every collection and text helper validates **after** the backend branch, so `cli`
 and `native` enforce the same shape: malformed, nested, or silently truncated

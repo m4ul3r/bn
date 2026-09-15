@@ -416,6 +416,8 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dead.bind(str(dead_sock)); dead.listen(1); dead.close()
     dead_log.write_text("crash output\n", encoding="utf-8")
+    dead_last_used = inst_dir / "dead.last_used"
+    dead_last_used.write_text("1700000000.0", encoding="utf-8")
     dead_reg.write_text(json.dumps({
         "pid": os.getpid(), "socket_path": str(dead_sock), "instance_id": "dead",
         "plugin_name": "bn_agent_bridge", "plugin_version": "0",
@@ -434,6 +436,8 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     live_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     live_server.bind(str(live_sock)); live_server.listen(1)
     live_log.write_text("serving\n", encoding="utf-8")
+    live_last_used = inst_dir / "live.last_used"
+    live_last_used.write_text("1700000001.0", encoding="utf-8")
     live_reg.write_text(json.dumps({
         "pid": os.getpid(), "socket_path": str(live_sock), "instance_id": "live",
         "plugin_name": "bn_agent_bridge", "plugin_version": "0",
@@ -451,8 +455,11 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     # Live instance fully preserved.
     assert live_reg.exists() and live_sock.exists() and live_log.exists()
     assert live_log.read_text(encoding="utf-8") == "serving\n"
+    # #733 F6: a live instance's `.last_used` sidecar is retained like its log.
+    assert live_last_used.exists()
     # Dead instance fully reaped (registry+socket by the liveness sweep, log by gc).
     assert not dead_reg.exists() and not dead_sock.exists() and not dead_log.exists()
+    assert not dead_last_used.exists()
     # Registry-less orphans reaped.
     assert not orphan_log.exists() and not orphan_sock.exists()
     # Spawn lock preserved.
@@ -462,6 +469,7 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     assert result["registries_purged"] == 1          # dead.json
     assert result["logs_removed"] == 2               # dead.log + longgone.log
     assert result["sockets_removed"] == 1            # longgone.sock (dead.sock swept by liveness)
+    assert result["last_used_removed"] == 1           # dead.last_used
 
 
 def test_gc_instances_on_empty_or_missing_dir_is_noop(tmp_path, monkeypatch):
@@ -469,7 +477,7 @@ def test_gc_instances_on_empty_or_missing_dir_is_noop(tmp_path, monkeypatch):
     result = gc_instances()
     assert result == {
         "live_instances": 0, "registries_purged": 0, "logs_removed": 0,
-        "sockets_removed": 0, "removed": [],
+        "sockets_removed": 0, "last_used_removed": 0, "removed": [],
     }
 
 
@@ -486,11 +494,15 @@ def test_gc_instances_keeps_siblings_of_unparseable_registry(tmp_path, monkeypat
     bad_log.write_text("x", encoding="utf-8")
     bad_sock = inst_dir / "weird.sock"
     bad_sock.write_text("", encoding="utf-8")
+    bad_last_used = inst_dir / "weird.last_used"
+    bad_last_used.write_text("1700000000.0", encoding="utf-8")
 
     result = gc_instances()
 
     assert bad_reg.exists() and bad_log.exists() and bad_sock.exists()
+    assert bad_last_used.exists()
     assert result["logs_removed"] == 0 and result["sockets_removed"] == 0
+    assert result["last_used_removed"] == 0
 
 
 def test_gc_holds_spawn_lock_so_it_cannot_reap_an_in_flight_spawn(tmp_path, monkeypatch):
@@ -5235,6 +5247,41 @@ def test_a_bound_socket_named_through_a_symlinked_dir_is_still_found(tmp_path):
     try:
         assert path_has_bound_socket(link / _PROBE_SOCK) is True
         assert path_has_bound_socket(other / _PROBE_SOCK) is False
+    finally:
+        with contextlib.suppress(OSError):
+            server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_path_has_bound_socket_answers_the_same_for_str_and_path(tmp_path):
+    """The argument is accepted as either spelling, and both agree.
+
+    #733 F4: the function was str-tolerant on its first line and Path-only on
+    its next, so a caller reading a registry path out of JSON got an
+    AttributeError that read as a bridge defect. Both directions are pinned --
+    a bound socket answers ``True`` for either spelling, and an unbound
+    sibling answers ``False`` for either -- so the fix cannot be a blanket
+    "accept anything and return None".
+    """
+    if not Path("/proc/net/unix").exists():
+        pytest.skip("Linux /proc/net/unix only")
+    from bn.transport import path_has_bound_socket
+
+    sock_path = tmp_path / _PROBE_SOCK
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    try:
+        assert path_has_bound_socket(str(sock_path)) is True
+        assert path_has_bound_socket(sock_path) is True
+
+        absent = tmp_path / "never-bound.sock"
+        assert path_has_bound_socket(str(absent)) is False
+        assert path_has_bound_socket(absent) is False
+
+        # A redundant separator is the shape where the two spellings used to
+        # be able to diverge: `Path` normalizes it, a raw string does not.
+        assert path_has_bound_socket(f"{tmp_path}//{_PROBE_SOCK}") is True
     finally:
         with contextlib.suppress(OSError):
             server.close()

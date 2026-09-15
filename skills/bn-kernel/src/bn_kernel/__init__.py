@@ -348,6 +348,11 @@ def _require_callsites(value: Any, payload: Any) -> list[dict[str, Any]]:
 
 _ORIENT_COUNTERS = ("comments", "function_comments", "user_symbols")
 
+# #733 F2: the bridge now splits the raw non-auto count into analyst work and
+# loader placeholders. OPTIONAL, not required: a bridge that predates the
+# split omits them and must still pass this gate unchanged.
+_ORIENT_OPTIONAL_COUNTERS = ("analyst_symbols", "placeholder_symbols")
+
 
 def _require_orient_digest(payload: Any) -> dict[str, Any]:
     """Fail closed on any orientation digest this gate cannot actually read.
@@ -375,6 +380,22 @@ def _require_orient_digest(payload: Any) -> dict[str, Any]:
         )
     counts: dict[str, int] = {}
     for key in _ORIENT_COUNTERS:
+        value = annotations.get(key)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise BnError(
+                "orient digest contract violation: annotation counter "
+                f"{key!r} must be a non-negative integer, got {value!r}",
+                returncode=0,
+                argv=("orient_digest",),
+            )
+        counts[key] = value
+    for key in _ORIENT_OPTIONAL_COUNTERS:
+        if key not in annotations:
+            continue
         value = annotations.get(key)
         if (
             not isinstance(value, int)
@@ -470,6 +491,40 @@ def _require_target_info(payload: Any) -> dict[str, Any]:
             argv=("target_info",),
         )
     return dict(payload)
+
+
+_CACHE_DIGEST_CHARS = frozenset("0123456789abcdef")
+
+
+def _target_name_candidates(observed_basename: str) -> set[str]:
+    """Every spelling of *observed_basename* a stem-only check may name.
+
+    The bridge's own resolver (`TargetManager._matches_record`) strips a
+    trailing `.<16 hex>` from a `.bndb` basename, because a target saved on a
+    read-only mount restores from the global cache DB `_cache_bndb_path` names
+    `<basename>.<16 hex path digest>.bndb`. This guard was stricter than the
+    tool it guards: `Path("netsvcd.3f9c1d0a77bb4e20.bndb").stem` keeps the
+    digest, so the documented `assert_target("netsvcd")` refused a target the
+    bridge resolves fine (#733 F3). The DIGEST strip is bounded in both
+    directions: applied ONCE, exactly like the bridge, so a name whose own tail
+    is 16 hex characters is not peeled twice; and no further than the bridge,
+    so a `netsvcd.backup` binary caches as `netsvcd.backup.<16 hex>.bndb` and
+    is asserted as `netsvcd.backup`, never as `netsvcd`.
+
+    The plain-`Path.stem` candidate on the next line is PRE-EXISTING and is
+    deliberately broader than `_matches_record`: `assert_target("sample")`
+    accepts a `sample.bin` target that `bn -t sample` does not resolve. That
+    laxity is the documented stem-check contract (`SKILL.md`, "Bind
+    explicitly"), it predates this helper, and #733 F3 was the opposite
+    complaint -- so it is left exactly as it was rather than tightened here.
+    """
+    candidates = {observed_basename, Path(observed_basename).stem}
+    if observed_basename.endswith(".bndb"):
+        core = observed_basename[: -len(".bndb")]
+        stem, dot, digest = core.rpartition(".")
+        if dot and len(digest) == 16 and set(digest) <= _CACHE_DIGEST_CHARS:
+            candidates.add(stem)                  # `netsvcd`, or `sample.bin`
+    return {name for name in candidates if name}
 
 
 # Distinguishes "no page has reported a total yet" from "a page reported None",
@@ -1497,10 +1552,7 @@ class Session:
         else:
             expected_value = expected_path.name
             observed_value = observed_basename
-            matches = expected_value in {
-                observed_basename,
-                Path(observed_basename).stem,
-            }
+            matches = expected_value in _target_name_candidates(observed_basename)
 
         if not matches:
             # A foreign target is a failure, not the documented contamination
@@ -1541,55 +1593,103 @@ class Session:
         # the payload contract.
         counts = self._validated(_require_orient_digest, digest)
         annotations = digest["existing_annotations"]
-        if counts["comments"] + counts["function_comments"] and not allow_contaminated:
+        comment_count = counts["comments"] + counts["function_comments"]
+        # Loader placeholders never refuse; only ANALYST work does, and only
+        # when the bridge reports the split (#733 F2). `.get` rather than `in`
+        # + index so an older bridge's digest reads as "no analyst work
+        # claimed" rather than as a refusal or a KeyError.
+        analyst_count = counts.get("analyst_symbols", 0)
+        if (comment_count or analyst_count) and not allow_contaminated:
             argv = self.last.argv if self.last is not None else ("orient_digest",)
             # Only take a field's entries when it IS a list (#694 item 12):
             # malformed OPTIONAL location metadata (e.g. an int or a mapping
             # instead of a list) must never crash the contamination refusal
             # below with a bare TypeError, and must never suppress it either.
-            raw_comment_locations = annotations.get("comment_locations", [])
-            raw_function_comment_locations = annotations.get(
-                "function_comment_locations", []
-            )
-            locations: list[Any] = []
             malformed_locations = False
-            for raw_locations in (
-                raw_comment_locations,
-                raw_function_comment_locations,
-            ):
-                if isinstance(raw_locations, list):
-                    locations.extend(raw_locations)
-                else:
-                    malformed_locations = True
-            rendered_locations = ", ".join(
-                " ".join(
-                    part
-                    for part in (
-                        str(item.get("address", "")),
-                        str(item.get("name", "")),
+
+            def _rows(raw: Any) -> list[Any]:
+                nonlocal malformed_locations
+                if isinstance(raw, list):
+                    return raw
+                malformed_locations = True
+                return []
+
+            def _render(rows: list[Any]) -> str:
+                return ", ".join(
+                    " ".join(
+                        part
+                        for part in (
+                            str(item.get("address", "")),
+                            str(item.get("name", "")),
+                        )
+                        if part
                     )
-                    if part
+                    for item in rows[:5]
+                    if isinstance(item, dict)
                 )
-                for item in locations[:5]
-                if isinstance(item, dict)
+
+            comment_locations = (
+                _rows(annotations.get("comment_locations", []))
+                + _rows(annotations.get("function_comment_locations", []))
             )
+            # The symbol rows get their OWN labelled fragment rather than being
+            # merged into the comment list: the symbol-driven refusal reached
+            # this block naming a count and nothing else -- unactionable without
+            # a second command, while the bridge already publishes exactly which
+            # names they are -- and folding them into `First locations:` made a
+            # COMMENT-driven refusal list three locations under a lead that
+            # accounted for two comments, with nothing saying which was which
+            # (#733 F2 review).
+            symbol_rows = (
+                _rows(annotations.get("analyst_symbol_locations", []))
+                if analyst_count
+                else []
+            )
+            rendered_locations = _render(comment_locations)
+            rendered_symbols = _render(symbol_rows)
             location_note = (
                 f" First locations: {rendered_locations}."
                 if rendered_locations
                 else ""
             )
+            if rendered_symbols:
+                location_note += f" First analyst symbols: {rendered_symbols}."
             if malformed_locations:
                 location_note += (
                     " (location metadata was malformed and omitted)"
                 )
+            # Presence-gated, like the renderer's: a bridge that reports
+            # `analyst_symbols` without `placeholder_symbols` passes the
+            # optional-counter validation, and stating `placeholder_symbols=0`
+            # for it told the reader every non-auto symbol was analyst work --
+            # a count the digest never claimed (#733 F2 review).
+            placeholder_clause = (
+                f", placeholder_symbols={counts['placeholder_symbols']}"
+                if "placeholder_symbols" in counts
+                else ""
+            )
+            symbol_note = (
+                f"Symbol counts: analyst_symbols={analyst_count}"
+                f"{placeholder_clause} (loader placeholders are excluded from "
+                "the analyst count and never refuse on their own)."
+                if "analyst_symbols" in counts else
+                "User symbols are reported but not rejected because raw "
+                "binaries can legitimately carry them."
+            )
+            if comment_count:
+                lead = ("inherited comments detected: "
+                        f"comments={counts['comments']}, "
+                        f"function_comments={counts['function_comments']}; ")
+            else:
+                lead = ("inherited analyst symbols detected: "
+                        f"analyst_symbols={analyst_count}"
+                        f"{placeholder_clause}; ")
             raise BridgeError(
-                "inherited comments detected: "
-                f"comments={counts['comments']}, "
-                f"function_comments={counts['function_comments']}; "
-                "refusing contaminated benchmark data."
-                f"{location_note} Pass allow_contaminated=True to inspect the "
-                "digest and proceed explicitly. User symbols are reported but "
-                "not rejected because raw binaries can legitimately carry them.",
+                lead
+                + "refusing contaminated benchmark data."
+                + f"{location_note} Pass allow_contaminated=True to inspect "
+                "the digest and proceed explicitly. "
+                + symbol_note,
                 returncode=2,
                 argv=argv,
             )

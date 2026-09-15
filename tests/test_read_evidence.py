@@ -3452,6 +3452,316 @@ def test_annotation_summary_counts(monkeypatch):
         }
     ]
     assert summary["locations_truncated"] is False
+    # #733 F2: an `_AutoSym` carries no `name` at all, which resolves to `""`.
+    # An empty name is NOT a placeholder shape (the conservative direction), so
+    # both non-auto symbols here count as analyst work. Pinned, not incidental.
+    assert summary["analyst_symbols"] == 2
+    assert summary["placeholder_symbols"] == 0
+
+
+def test_annotation_summary_splits_loader_placeholders_from_analyst_symbols(monkeypatch):
+    """#733 F2: `auto=False` is not a measure of analyst work.
+
+    BN's loaders synthesize named symbols and mark them non-auto, so a freshly
+    loaded binary with zero analyst effort reported hundreds of "user symbols".
+    The raw count stays (lossless); the split is what orientation and the
+    contamination gate key on.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    placeholders = [
+        _NamedSym("func_10a4c0", 0x10A4C0),
+        _NamedSym("sub_10b220", 0x10B220),
+        _NamedSym("start_routine_10c000", 0x10C000),
+        _NamedSym("init_routine", 0x10C100),
+        _NamedSym("_init", 0x10C200),
+        _NamedSym("_fini", 0x10C300),
+        # Measured, not assumed: a freshly loaded stripped dynamic ELF reports
+        # exactly one non-auto symbol, `main`, synthesized by BN's loader from
+        # the `__libc_start_main` argument. Without this row every fresh ELF
+        # hinted "1 analyst symbol(s)" and the benchmark gate refused it.
+        _NamedSym("main", 0x10C400),
+    ]
+    analyst = _NamedSym("parse_header", 0x10D000)
+    bv = _FakeBV(functions=[], symbols=[*placeholders, analyst])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["user_symbols"] == 8          # raw non-auto count, unchanged
+    assert summary["placeholder_symbols"] == 7
+    assert summary["analyst_symbols"] == 1
+    assert summary["analyst_symbol_locations"] == [
+        {"name": "parse_header", "address": "0x10d000"}
+    ]
+
+
+def test_annotation_summary_counts_survive_an_unreadable_symbol(monkeypatch):
+    """One bad symbol must not fabricate a pristine view.
+
+    `assert_unannotated` now REFUSES on `analyst_symbols`, so the inverse of a
+    fabricated refusal is a fabricated clean certification: a summary that
+    collapses every count to zero because one symbol out of hundreds has an
+    unreadable `address` reports contaminated benchmark data as untouched. The
+    counts are therefore exact and only the sample ROW degrades.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    class _BadAddressSym:
+        auto = False
+        name = "parse_trailer"
+
+        @property
+        def address(self):
+            raise RuntimeError("symbol address unavailable")
+
+    class _BadProvenanceSym:
+        name = "dispatch_entry"
+        address = 0x10E100
+
+        @property
+        def auto(self):
+            raise RuntimeError("symbol provenance unavailable")
+
+    bv = _FakeBV(functions=[], symbols=[
+        _NamedSym("parse_header", 0x10D000),
+        _BadAddressSym(),
+        _NamedSym("_init", 0x10D100),
+        _BadProvenanceSym(),
+    ])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    # Every symbol is counted, including the two that cannot be fully read --
+    # unreadable provenance counts as analyst work, the fail-closed direction.
+    assert summary["user_symbols"] == 4
+    assert summary["placeholder_symbols"] == 1
+    assert summary["analyst_symbols"] == 3
+    # Only the row whose address is unreadable is missing from the samples.
+    assert [row["name"] for row in summary["analyst_symbol_locations"]] == [
+        "parse_header", "dispatch_entry"
+    ]
+    assert summary["locations_truncated"] is True
+
+
+def test_an_unreadable_symbol_enumeration_refuses_instead_of_reporting_zero(monkeypatch):
+    """The other half: a view whose symbols cannot be ENUMERATED must not be
+    published as pristine.
+
+    The summary used to answer an enumeration failure with five zeros, and
+    `assert_unannotated` refuses on `analyst_symbols` -- so a generator that
+    raises after yielding two inherited renames turned contaminated benchmark
+    data into a clean certification. It now propagates, and `_orient_digest`
+    degrades the block to the `unavailable` marker the kernel's digest contract
+    refuses (#733 F2 review).
+    """
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    def _hostile_symbols():
+        yield _NamedSym("parse_header", 0x401000)
+        yield _NamedSym("emit_record", 0x401100)
+        raise RuntimeError("symbol table unavailable")
+
+    class _BV:
+        functions: list = []
+        address_comments: dict = {}
+
+        def get_symbols(self):
+            return _hostile_symbols()
+
+    bv = _BV()
+    with pytest.raises(RuntimeError, match="symbol table unavailable"):
+        bridge.read_listing._annotation_summary(inst.ctx, bv)
+
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "netsvcd", "filename": "/opt/netsvcd",
+                                     "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 0})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+
+    ea = inst._orient_digest(None)["existing_annotations"]
+    assert "annotation counts unavailable" in ea["unavailable"]
+    assert "analyst_symbols" not in ea      # nothing is claimed, so nothing passes
+
+
+def test_annotation_summary_credits_debug_info_names_to_the_binary(monkeypatch):
+    """Names the DWARF importer recovered are the binary's, not an analyst's.
+
+    BN marks a plain symtab/dynsym name `auto=True` (the summary never sees
+    those), but a DWARF-recovered name arrives `auto=False` -- measured: a
+    `cc -g -O0` build of a three-function program reported two "analyst
+    symbols" on a view nobody had touched, and the contamination gate refused
+    it. The match is keyed on the name AND the importer's address, so an
+    analyst rename still counts -- including one that REUSES a name the debug
+    info supplied for a different function, which a bare-name match credited
+    to the loader (#733 F2 review).
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    class _DebugFn:
+        def __init__(self, short_name, address):
+            self.short_name = short_name
+            self.full_name = short_name
+            self.address = address
+
+    bv = _FakeBV(functions=[], symbols=[
+        _NamedSym("parse_header", 0x401149),
+        _NamedSym("emit_record", 0x40115B),
+        _NamedSym("parse_trailer", 0x401179),     # the analyst's own rename
+        # The collision: renamed to a name the debug info gave a DIFFERENT
+        # function, at an address the debug info never named.
+        _NamedSym("parse_header", 0x4020A0),
+    ])
+    bv.debug_info = types.SimpleNamespace(functions=[
+        _DebugFn("parse_header", 0x401149),
+        _DebugFn("emit_record", 0x40115B),
+        _DebugFn("printf", 0),
+    ])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["user_symbols"] == 4
+    assert summary["placeholder_symbols"] == 2
+    assert summary["analyst_symbols"] == 2
+    assert [(row["name"], row["address"]) for row
+            in summary["analyst_symbol_locations"]] == [
+        ("parse_trailer", "0x401179"), ("parse_header", "0x4020a0")
+    ]
+
+
+def test_annotation_summary_fails_closed_on_unreadable_debug_info(monkeypatch):
+    """A debug-info source that cannot be read must not reclassify analyst work
+    as the binary's own: no names means no exclusions, so the symbols count as
+    analyst work and the gate refuses rather than certifying (#733 F2 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    class _Hostile:
+        @property
+        def functions(self):
+            raise RuntimeError("debug info unavailable")
+
+    bv = _FakeBV(functions=[], symbols=[_NamedSym("parse_header", 0x401149)])
+    bv.debug_info = _Hostile()
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["analyst_symbols"] == 1
+    assert summary["placeholder_symbols"] == 0
+    assert bridge.read_listing._debug_info_symbols(bv) == frozenset()
+
+
+def test_a_trailing_newline_name_is_not_a_placeholder(monkeypatch):
+    """The pattern is anchored with `fullmatch`, not a trailing `$`.
+
+    `$` also matches immediately before a trailing newline, and an ELF string
+    table is NUL- not newline-terminated, so `"main\\n"` is a legal symbol name
+    that `$` classified as a loader placeholder -- excluding it from the
+    counter `assert_unannotated` refuses on, which is a fail-OPEN on the gate
+    (#733 F2 review).
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    bv = _FakeBV(functions=[], symbols=[
+        _NamedSym("main", 0x401000),        # the placeholder shape
+        _NamedSym("main\n", 0x401010),      # NOT the placeholder shape
+        _NamedSym("sub_401020\n", 0x401020),
+    ])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["placeholder_symbols"] == 1
+    assert summary["analyst_symbols"] == 2
+
+
+def test_orient_hint_is_null_when_only_loader_placeholders_are_present(monkeypatch):
+    """#733 F2: the provenance hint must not fire on the loader's own names.
+
+    A hint that tells the reader to discount current-run analysis on a view
+    whose annotations are ALL current-run is the defect; one analyst rename is
+    the boundary where it must fire.
+    """
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    # A non-`.bndb` filename, so `analysis_cache_restored` cannot drive the hint.
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "netsvcd", "filename": "/opt/netsvcd",
+                                     "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 0})
+
+    class _NamedSym:
+        def __init__(self, name, address):
+            self.auto = False
+            self.name = name
+            self.address = address
+
+    bv = _FakeBV(functions=[], symbols=[_NamedSym("func_401000", 0x401000),
+                                        _NamedSym("_init", 0x401100)])
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+
+    ea = inst._orient_digest(None)["existing_annotations"]
+    assert ea["user_symbols"] == 2
+    assert ea["analyst_symbols"] == 0
+    assert ea["placeholder_symbols"] == 2
+    assert ea["analysis_cache_restored"] is False
+    assert ea["provenance_hint"] is None
+
+    bv._symbols = [*bv._symbols, _NamedSym("parse_header", 0x401200)]
+    ea = inst._orient_digest(None)["existing_annotations"]
+    assert ea["analyst_symbols"] == 1
+    assert "1 analyst symbol(s)" in ea["provenance_hint"]
+    assert "2 loader placeholder(s) excluded" in ea["provenance_hint"]
+
 
 
 def test_orient_surfaces_existing_annotations(monkeypatch):

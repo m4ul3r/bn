@@ -3671,7 +3671,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 592, 200), (
+    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 597, 200), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -3696,9 +3696,9 @@ def test_the_runtime_population_is_exactly_this_big():
     # evidence card -- and 220 more were swept with their siblings absent, which
     # is the leaf-level form of the same defect.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 401, (
+    assert len(situated) == 406, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 401. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 406. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -3853,9 +3853,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     this run did`) otherwise hides every other counter's rendering behind it.
     """
     sites = _count_helper_sites()
-    assert len(sites) == 15, (
+    assert len(sites) == 18, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 15. The number is the size of the covered set: a "
+        "count helper, not 18. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3915,6 +3915,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(total) [not a payload renderer]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
+        # Both live NESTED under `existing_annotations`, so a top-level probe
+        # cannot open the presence gate that states them. Covered by name in
+        # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
+        # which drives the real nested payload and asserts `placeholders=?` for
+        # a count no value reads out of (#733 F2 review).
+        "_render_orient_text(analyst_symbols) [count not stated in this context]",
+        "_render_orient_text(placeholder_symbols) [count not stated in this "
+        "context]",
     ], sorted(not_stated)
 
 
@@ -4376,13 +4384,13 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 592 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 597 read keys
     rather than the 200 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4736.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4776.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4401,7 +4409,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4736, f"the raise sweep ran {swept} renders, not 4736"
+    assert swept == 4776, f"the raise sweep ran {swept} renders, not 4776"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -4411,12 +4419,12 @@ def test_the_nested_population_is_exactly_this_big():
     nested = _nested_population()
     depths = collections.Counter(len(path) for _, _, path, _, _, _, _ in nested)
     containers = [rec for rec in nested if rec[4] is not None]
-    assert (len(nested), len(containers)) == (1368, 218), (
+    assert (len(nested), len(containers)) == (1377, 218), (
         f"the nested population changed size: {len(nested)} nested keys read, "
         f"{len(containers)} of them as containers. If you added a nested read, "
         "update these numbers; if you did not, a renderer stopped reading a "
         "nested field and the differential below stopped covering it.")
-    assert dict(sorted(depths.items())) == {1: 801, 2: 360, 3: 128, 4: 48, 5: 25, 6: 6}, (
+    assert dict(sorted(depths.items())) == {1: 810, 2: 360, 3: 128, 4: 48, 5: 25, 6: 6}, (
         f"the nested population's shape changed: {dict(sorted(depths.items()))}")
     # THE convergence proof, and the answer to round 10's second blocker: the
     # descent stopped because a level found no further container, not because it
@@ -4527,7 +4535,7 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
     spec, an unhashable `kind` used as a grouping key. Base, swept over its own
     nested population the same way, raises 320 times at 86 nested positions in
-    10096 renders; this commit raises 0 in 10944."""
+    10096 renders; this commit raises 0 in 11016."""
     swept, raised = 0, []
     for fn_name, render, path, key, _kind, ctx, leaf in _nested_population():
         base = {k: v for k, v in leaf.items() if k != key}
@@ -4541,7 +4549,7 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-    assert swept == 10944, f"the nested raise sweep ran {swept} renders, not 10944"
+    assert swept == 11016, f"the nested raise sweep ran {swept} renders, not 11016"
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
@@ -4576,7 +4584,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1384, f"the mirror ran {checked} renders, not 1384"
+    assert checked == 1394, f"the mirror ran {checked} renders, not 1394"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -5050,6 +5058,47 @@ def test_render_orient_shows_existing_annotations():
     assert "existing annotations: comments=8" in out
     assert "user-symbols=12" in out and "cache-restored=True" in out
     assert "predate this run" in out
+
+
+def test_render_orient_states_the_analyst_split_without_fabricating_it():
+    """#733 F2: the split prints when reported, is absent when not, and a
+    half-reported pair prints `?` rather than a bare `None` or a confident 0 --
+    the same rule every other stated count in this module follows."""
+    from bn.formatters import _render_orient_text
+
+    base = {"kind": "orient_digest", "target": {"basename": "netsvcd"},
+            "analyzed": True, "analysis_state": "full", "function_count": 10}
+
+    full = _render_orient_text({**base, "existing_annotations": {
+        "comments": 0, "function_comments": 0, "user_symbols": 612,
+        "analyst_symbols": 0, "placeholder_symbols": 612,
+        "analysis_cache_restored": False}})
+    assert "analyst-symbols=0, placeholders=612" in full
+
+    older = _render_orient_text({**base, "existing_annotations": {
+        "comments": 0, "function_comments": 0, "user_symbols": 540,
+        "analysis_cache_restored": False}})
+    assert "analyst-symbols" not in older
+    assert "user-symbols=540" in older
+
+    half = _render_orient_text({**base, "existing_annotations": {
+        "comments": 0, "function_comments": 0, "user_symbols": 612,
+        "analyst_symbols": 3, "analysis_cache_restored": False}})
+    # The sibling was never claimed, so it is omitted -- not printed as a
+    # confident `placeholders=0`, and not as a bare `None`.
+    assert "analyst-symbols=3," in half and "placeholders" not in half
+
+    unreadable_analyst = _render_orient_text({**base, "existing_annotations": {
+        "comments": 0, "function_comments": 0, "user_symbols": 612,
+        "analyst_symbols": "many", "placeholder_symbols": 612,
+        "analysis_cache_restored": False}})
+    assert "analyst-symbols=?" in unreadable_analyst
+
+    unreadable = _render_orient_text({**base, "existing_annotations": {
+        "comments": 0, "function_comments": 0, "user_symbols": 612,
+        "analyst_symbols": 3, "placeholder_symbols": "many",
+        "analysis_cache_restored": False}})
+    assert "placeholders=?" in unreadable
 
 
 def test_render_session_status_single_job_names_the_poll_command():

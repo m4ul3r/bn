@@ -43,7 +43,7 @@ def bound_socket_listing_available() -> bool:
     return True
 
 
-def path_has_bound_socket(socket_path: Path) -> bool | None:
+def path_has_bound_socket(socket_path: str | Path) -> bool | None:
     """Whether any socket is BOUND to *socket_path*; ``None`` when unknowable.
 
     ``connect`` cannot answer this question. A socket that is bound but has not
@@ -103,8 +103,13 @@ def path_has_bound_socket(socket_path: Path) -> bool | None:
       SERVING socket and the sweep unlinked it. A row whose name has ceased to
       exist cannot be compared to anything, which is not evidence that nothing
       is bound, so it too answers ``None``.
+
+    The argument is accepted as a ``str`` or a ``Path`` and normalized to bytes
+    exactly once, because this module is symlinked into the bridge and both
+    processes call it -- one with a ``Path`` it built, one with a registry path
+    it read out of JSON (#733 F4).
     """
-    wanted = os.fsencode(str(socket_path))
+    wanted = os.fsencode(socket_path)
     if b"\n" in wanted:
         return None
     resolved = os.path.realpath(wanted)
@@ -114,7 +119,19 @@ def path_has_bound_socket(socket_path: Path) -> bool | None:
         listing = _LISTING.read_bytes()
     except OSError:
         return None
-    name = os.fsencode(socket_path.name)
+    # The basename of the bytes above, rather than a second `fsencode` of a
+    # `Path`-only attribute: this function is also handed a plain string (a
+    # registry path read out of JSON), and `socket_path.name` made that an
+    # `AttributeError` that read as a bridge defect (#733 F4). `normpath`
+    # first, because `Path` normalizes a trailing separator and a `/.` tail
+    # while `posixpath.basename` does not -- `basename(b"/p/x.sock/")` is
+    # `b""`, which would make the basename filter below match no row and
+    # answer the one thing this module must never fabricate, a positive
+    # "nothing is bound". A path that names no file at all (`/`) is
+    # unknowable rather than unbound.
+    name = os.path.basename(os.path.normpath(wanted))
+    if not name:
+        return None
     for line in listing.split(b"\n"):
         # `Num RefCount Protocol Flags Type St Inode Path`, whitespace-separated,
         # and the trailing path is present only for a BOUND socket. Splitting on

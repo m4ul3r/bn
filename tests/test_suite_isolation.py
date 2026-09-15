@@ -13,11 +13,13 @@ cannot observe each other's cache state.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -580,3 +582,165 @@ def test_an_unfixable_skip_is_a_failure_in_strict_mode(monkeypatch):
     # The message names the knob that produced the failure, so a reader who did
     # not set it knows where it came from; the remedy rides in the reason.
     assert conftest.STRICT_ENV_VAR in str(excinfo.value)
+
+
+# --- #733 F5: the suite cannot leak a headless bridge ---------------------
+
+def test_the_test_environment_arms_the_idle_reaper(monkeypatch):
+    """Belt 1: a leaked bridge must die on its own.
+
+    `BN_IDLE_TIMEOUT` was unset in the test environment, so
+    `_maybe_start_idle_reaper` was a no-op and a bridge a test spawned without
+    stopping survived the whole run holding ~450 MB -- unreachable, because
+    pytest rotates its cache (and with it the registry `session list` and `gc`
+    read) away. The contract is "the test environment pins a finite, positive
+    timeout that the bridge's own parser accepts", so the constant is imported
+    rather than re-spelled: the design deliberately allows raising it, and a
+    cell that reds on a value change catches nothing while an unparseable or
+    non-positive pin is the bug that matters.
+    """
+    from _bridge_fakes import _load_bridge
+
+    bridge = _load_bridge(monkeypatch)
+    pinned = os.environ["BN_IDLE_TIMEOUT"]
+    assert pinned == str(conftest._TEST_BRIDGE_IDLE_TIMEOUT)
+    parsed = bridge._parse_idle_timeout(pinned)
+    assert parsed == conftest._TEST_BRIDGE_IDLE_TIMEOUT
+    assert isinstance(parsed, float) and parsed > 0
+
+
+def _fake_proc_entry(proc: Path, pid: str, argv: list[str], environ: dict[str, str]):
+    entry = proc / pid
+    entry.mkdir(parents=True)
+    entry.joinpath("cmdline").write_bytes(
+        b"\0".join(part.encode() for part in argv) + b"\0"
+    )
+    entry.joinpath("environ").write_bytes(
+        b"\0".join(f"{k}={v}".encode() for k, v in environ.items()) + b"\0"
+    )
+
+
+def test_bn_agent_leak_sweep_finds_a_bridge_under_the_pytest_tmp_root(tmp_path):
+    """The sweep's scoping, in all three directions: a bridge under this
+    worker's basetemp is reported, one pointed at the developer's real cache is
+    not (it is not the suite's leak to fail on), and a non-bridge process is
+    not."""
+    import conftest
+
+    under = tmp_path / "basetemp"
+    under.mkdir()
+    proc = tmp_path / "proc"
+    _fake_proc_entry(
+        proc, "4242",
+        ["/venv/bin/python3", "/venv/bin/bn-agent", "--instance-id", "a1b2c3d4"],
+        {"BN_CACHE_DIR": str(under / "bn-cache17")},
+    )
+    _fake_proc_entry(
+        proc, "4243",
+        ["/venv/bin/python3", "/venv/bin/bn-agent", "--instance-id", "e5f6a7b8"],
+        {"BN_CACHE_DIR": "/home/dev/.cache/bn"},
+    )
+    _fake_proc_entry(
+        proc, "4244", ["/usr/bin/sleep", "30"],
+        {"BN_CACHE_DIR": str(under / "bn-cache18")},
+    )
+    # `transport._find_bn_agent`'s fallback spelling, which a layout with no
+    # `bn-agent` beside `sys.executable` gets. Missing it made belt 2 blind to
+    # a leak belt 1 could only reap on a timer.
+    _fake_proc_entry(
+        proc, "4245",
+        ["/usr/bin/python3", "-m", "bn.headless", "--instance-id", "c3d4e5f6"],
+        {"BN_CACHE_DIR": str(under / "bn-cache19")},
+    )
+    proc.joinpath("self").mkdir()      # a non-numeric entry must be skipped
+
+    leaks = conftest.bn_agent_leaks(under, proc=proc)
+
+    assert leaks == [
+        {
+            "pid": "4242",
+            "instance_id": "a1b2c3d4",
+            "cache_dir": str(under / "bn-cache17"),
+        },
+        {
+            "pid": "4245",
+            "instance_id": "c3d4e5f6",
+            "cache_dir": str(under / "bn-cache19"),
+        },
+    ]
+
+
+def test_bn_agent_leak_sweep_reaps_and_names_a_real_leak(tmp_path):
+    """Belt 2, end to end against a real process: the sweep finds it, names it
+    in a line an operator can act on, and it is gone afterwards."""
+    import conftest
+
+    cache = tmp_path / "bn-cache19"
+    cache.mkdir()
+    stand_in = tmp_path / "bn-agent"
+    stand_in.write_text("import time; time.sleep(120)\n", encoding="utf-8")
+    stand_in.chmod(0o755)
+    proc = subprocess.Popen(
+        [sys.executable, str(stand_in), "--instance-id", "d4c3b2a1"],
+        env={**os.environ, "BN_CACHE_DIR": str(cache)},
+    )
+    try:
+        leaks = conftest.bn_agent_leaks(tmp_path)
+        assert [row["instance_id"] for row in leaks] == ["d4c3b2a1"]
+        assert leaks[0]["pid"] == str(proc.pid)
+
+        lines = conftest.reap_bn_agent_leaks(leaks)
+
+        assert len(lines) == 1
+        assert "d4c3b2a1" in lines[0]
+        assert str(cache) in lines[0]
+        assert "exited=True" in lines[0]
+        assert proc.wait(timeout=5) is not None
+        assert conftest.bn_agent_leaks(tmp_path) == []
+    finally:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_a_leaked_bridge_fails_the_run(tmp_path):
+    """F5's second criterion, on the WIRING and not just the helpers.
+
+    `bn_agent_leaks`/`reap_bn_agent_leaks` are covered above, but nothing
+    exercised `_refuse_leaked_bridges` itself: gutting its `pytest.fail` left
+    the whole suite green, so "a leak fails the run with the instance id and
+    cache dir named" rested on unexercised wiring. A child pytest is pointed at
+    a basetemp a stand-in bridge is already living under, so its session-final
+    sweep must red a run whose one test passes.
+    """
+    basetemp = tmp_path / "child-basetemp"
+    basetemp.mkdir()
+    # Under the CHILD's basetemp, which is all the sweep compares against -- it
+    # reads the process's `BN_CACHE_DIR` string, so pytest purging the
+    # directory on startup does not hide the leak.
+    cache = basetemp / "bn-cache-leak"
+    stand_in = tmp_path / "bn-agent"
+    stand_in.write_text("import time; time.sleep(120)\n", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(stand_in), "--instance-id", "leakcell1"],
+        env={**os.environ, "BN_CACHE_DIR": str(cache)},
+    )
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        child = subprocess.run(
+            ["uv", "run", "pytest", "-q", "-p", "no:cacheprovider",
+             f"--basetemp={basetemp}",
+             "tests/test_suite_isolation.py::test_argparse_usage_text_is_never_colorized"],
+            cwd=repo, capture_output=True, text=True, timeout=300,
+        )
+        assert child.returncode != 0, (
+            f"the child run stayed green with a leaked bridge:\n{child.stdout}")
+        assert "leaked a headless bridge" in child.stdout
+        assert "leakcell1" in child.stdout, child.stdout
+        assert str(cache) in child.stdout, child.stdout
+        # Reaped as well as reported: the child SIGTERMs what it names.
+        assert proc.wait(timeout=10) is not None
+    finally:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        proc.wait(timeout=5)
