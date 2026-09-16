@@ -81,6 +81,32 @@ def test_truncation_note_fires_when_output_is_not_spilled(monkeypatch, capsys):
     assert "spilled" not in stderr
 
 
+def test_the_slicing_note_and_the_envelope_hint_name_the_same_knob():
+    """Two builders answer "which flag bounds this command?" -- the envelope's
+    `rerun` remedy (`output._rerun_hint`) and the no-spill stderr note
+    (`cli._spill_next_step_hint`). Answering that separately is how
+    `function structured-il` came to be told `--out` while `--lines` worked, and
+    `evidence function` while `--limit`/`--address-window` worked (dogfood C1).
+
+    `paged` is threaded from the command declaration at the real call sites, so
+    the paged case passes it here exactly as the CLI does.
+    """
+    from bn.output import _rerun_hint
+
+    cases = (
+        ("functions", "--limit", {"paged": True}),
+        ("decompile", "--lines", {}),
+        ("il", "--lines", {}),
+        ("disasm", "--lines", {}),
+        ("structured-il", "--lines", {}),
+        ("function-evidence", "--address-window", {}),
+    )
+    for stem, flag, kwargs in cases:
+        assert flag in _rerun_hint(stem, "text"), stem
+        note = bn.cli._spill_next_step_hint(stem, text_format=True, **kwargs)
+        assert flag in note, f"{stem}: note offered {note!r}"
+
+
 def test_unrecognized_argument_routes_to_subcommand_usage(capsys):
     parser = bn.cli.build_parser()
 

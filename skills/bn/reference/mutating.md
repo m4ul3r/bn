@@ -164,9 +164,11 @@ artifact); an atomic write whose result is unparseable is not — the agent's mo
 the BNDB silently desyncs from the BNDB. So even with `BN_SPILL_TOKENS` armed and the
 detail payload over it, stdout keeps the parseable status and the detail goes to an
 artifact named in `detail_artifact_path` (plus a stderr note): `json.loads(stdout)` on
-a `batch apply` always works. Spill is opt-in in the first place, so the default path
-is the compact status above — and a `--verbose`/`--format json` detail big enough for
-your wrapper to truncate is the case to bound with `--out`.
+a `batch apply` always works, because bn never swaps the status for an envelope. That
+is a statement about bn's own output, not about your wrapper: a `--verbose`/
+`--format json` detail big enough for the consuming tool to truncate only parses if
+you captured all of it, so bound that read with `--out`. Spill is opt-in in the first
+place, so the default path is the compact status above.
 
 ### Step 3 — read back
 

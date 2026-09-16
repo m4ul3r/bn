@@ -229,9 +229,9 @@ Defaults:
 
 **Choosing the spill point (#409).** Spill is armed by you, not by a default:
 - **No threshold (default)** — unset, empty, non-numeric, zero and negative all mean **no spill**: the full payload goes to stdout and the *consuming* agent/Harness bounds what is read. A typo can never silently re-arm disk output.
-- **Slicing note (no threshold)** — a payload over **10 000** estimated tokens prints a `note:` on stderr naming this command's own slicing flag (below), instead of writing anything. Nothing lands on disk and no envelope replaces the data.
+- **Slicing note (any mode)** — a read that does NOT spill but is over **10 000** estimated tokens prints a `note:` on stderr naming this command's own slicing flag (below). Nothing lands on disk and no envelope replaces the data. It stays on when a threshold is armed above the payload, so a large-but-fitting read is never silent.
 - **Threshold** — `BN_SPILL_TOKENS=<tokens>` (e.g. `40000`) arms the spill at that size for a bigger/smaller context budget.
-- **Near-spill note (threshold armed)** — a read that *fits* but lands within 20 % of the configured threshold prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively.
+- **Near-spill note (threshold armed)** — a read that *fits* but lands within 20 % of the configured threshold prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively. That warning replaces the slicing note for that read, so one read never draws two notes.
 
 **Reading a large payload back.** With no spill, a command whose stdout you *capture* (rather than pipe) can be truncated by your own tool wrapper mid-payload — a truncated JSON body does not parse. Recover with the wrapper's artifact, or avoid it: pipe into `jq`/`grep` (the stream is complete), or take the data with `--out FILE` / `--limit` / `--lines`.
 

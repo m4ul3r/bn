@@ -643,3 +643,26 @@ def test_opting_in_restores_spill_and_suppresses_the_note(tmp_path, monkeypatch)
                               out_path=None, stem="functions")
     assert res.spilled is True
     assert res.truncation_risk is False            # the configured limit governs
+
+
+def test_an_armed_threshold_above_the_payload_still_draws_the_note(tmp_path, monkeypatch):
+    """Arming a threshold ABOVE the payload used to silence the note entirely, so
+    a read between 10 000 tokens and 80 % of the threshold got no slicing guidance
+    at all -- while the same read with nothing armed printed it (dogfood C3)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1000000")     # far above the payload
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False and res.near_spill is False
+    assert res.truncation_risk is True
+    assert not (tmp_path / "spills").exists()
+
+    # Inside the 20 % band the sharper signal replaces it; two notes for one read
+    # is noise.
+    monkeypatch.setenv("BN_SPILL_TOKENS", "30000")        # the payload is ~29 344
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False
+    assert res.near_spill is True and res.truncation_risk is False

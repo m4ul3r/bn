@@ -52,9 +52,10 @@ class OutputWriteResult:
     # Estimated tokens of the RENDERED payload, always populated. Lets the caller
     # name a size in the slicing note without re-encoding the string.
     token_count: int = 0
-    # No spill threshold configured and the payload exceeds DEFAULT_SLICE_NOTE_TOKENS:
-    # nothing was written to disk, but a consuming agent truncates tool output this
-    # large. Mutually exclusive with `near_spill` (which only exists under opt-in).
+    # The payload did NOT spill and clears DEFAULT_SLICE_NOTE_TOKENS: nothing was
+    # written to disk, but a consuming agent truncates tool output this large.
+    # Mutually exclusive with `near_spill` (the sharper signal whenever a
+    # threshold is armed).
     truncation_risk: bool = False
 
 
@@ -498,7 +499,16 @@ def write_output_result(
         # that a slightly larger next read (next page / bigger function) will spill --
         # a preflight signal without a second run.
         near = token_count >= (spill_token_limit * 4) // 5
-        return OutputWriteResult(rendered=rendered, near_spill=near, token_count=token_count)
+        # A payload that FITS but is still large gets the slicing note: arming a
+        # threshold above it must not silence the guidance the default gives --
+        # 10 000..0.8xN was a note-free band. `near_spill` wins when both apply;
+        # it is the sharper signal, and two lines for one read is noise.
+        return OutputWriteResult(
+            rendered=rendered,
+            near_spill=near,
+            token_count=token_count,
+            truncation_risk=(not near and token_count >= DEFAULT_SLICE_NOTE_TOKENS),
+        )
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     try:

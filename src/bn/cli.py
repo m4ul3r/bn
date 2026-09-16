@@ -706,7 +706,7 @@ def _render_result(
                 lambda payload: render_value(payload, fmt), status_value,
                 f"serialize the {stem} status line as {fmt}"))
         print(
-            f"note: full mutation detail ({result.artifact.get('estimated_tokens')} est. "
+            f"note: full mutation detail ({result.artifact.get('tokens')} est. "
             f"tokens) written to {artifact_path}; stdout carries the parseable status "
             f"summary. Re-run with --out FILE for the detail in a chosen location.",
             file=sys.stderr,
@@ -1029,13 +1029,20 @@ def _spill_next_step_hint(
     clause is dropped rather than naming a path that does not exist.
     """
 
-    if text_format and stem in ("decompile", "il", "disasm"):
+    # MUST agree with output._rerun_hint (the envelope's `rerun` remedy): two
+    # builders answering "what flag bounds this command?" separately is how
+    # `function structured-il` came to be told --out while --lines worked, and
+    # `evidence function` while --limit/--address-window worked (dogfood C1).
+    if text_format and stem in ("decompile", "il", "disasm", "structured-il"):
         return "rerun with --lines START:END to fetch a slice instead"
     # `paged` is only set for commands that actually expose --limit/--offset, so
     # it alone gates the paging hint (function list/search now page bridge-side
     # and return a dict envelope rather than a bare list, #59).
     if paged:
         return "rerun with --limit/--offset to page through the results"
+    if stem == "function-evidence":
+        # Windowing, not paging: `evidence function` caps the read with either.
+        return "rerun with --limit N or --address-window A:B to bound the read"
     hint = "rerun with --out <path> to write it to a file"
     if artifact_path is None:
         return hint
