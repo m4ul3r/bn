@@ -657,6 +657,16 @@ _EXIT_CODE_ECHOES = (
     ("skills/bn/reference/mutating.md", "unmeasured-live-success",
      r"An unmeasured \*\*live\*\* success also changes the exit code: it is \*\*`(?P<code>\d)`\*\*",
      "unmeasured"),
+    # The same rule stated for the other KIND of call, two paragraphs down. Its
+    # digit sits in an inline code span and nothing else on the line carries a
+    # number, so the kind that excuses `--limit 50` excused this `4` too and
+    # flipping it to `0` left every cell in this module green. Measured rather
+    # than excused: the scenario is a previewed run with nothing to count, so
+    # the number comes from the classifier, and the doc's "keyed on `measured:
+    # false`, not on the kind of call" is the thing actually asserted.
+    ("skills/bn/reference/mutating.md", "an-unmeasured-preview-is-4-too",
+     r"an\s+unmeasured\s+`--preview`\s+is\s+`(?P<code>\d)`\s+as\s+well",
+     "unmeasured-preview"),
     # Both `own-summary` echoes use `\s+` between words: these references are
     # hand-wrapped prose, and a claim that reds on a re-wrap is bookkeeping
     # rather than a guard.
@@ -1152,31 +1162,69 @@ def test_no_agent_doc_carries_a_number_nothing_accounts_for(doc: str):
 # and inserting a line above one re-pointed its declaration at a stranger.
 # Keyed by a FINGERPRINT of the line it was unreviewable, and re-deriving the
 # hash after a rewrap was the tax #731 retired. A phrase is content-keyed and
-# readable, and one phrase rules on every line that repeats the same sentence,
+# readable, and one phrase rules on every line that repeats the same SENTENCE,
 # which is what "not a claim" means for a recurring obligation.
+#
+# The phrase must name the SUBJECT of the assertion it excuses, and must not
+# reach past the clause it rules on. Keyed by a bare predicate a declaration
+# excused a sentence it had never read: `does **not** change the exit code`
+# survived replacing its subject with a different one ("The output format does
+# **not** change the exit code" -- false, since the same reply exits 0 through
+# the default status line and 2 when `--format json` cannot serialize it), and
+# a reason that rules on a whole line rules on every OTHER exit word that line
+# grows, which is how one purge clause came to excuse a separate warning about
+# the restart code. So one declaration per assertion, subject included: a
+# rewritten subject stale-fails `test_no_declared_exit_word_entry_is_stale`
+# instead of inheriting the exemption.
 DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
-    ("README.md", "only checks `$?` cannot read an unconfirmed write"):
+    ("README.md", "a script that only checks `$?` cannot read an unconfirmed "
+                  "write as a clean success"):
         '`$?` names the variable a consumer reads; every digit on this line is '
         'pinned or echoed',
-    ("skills/bn-kernel/SKILL.md", "after an eval-kernel exit/reset"):
+    ("skills/bn-kernel/SKILL.md",
+     "The bootstrap is idempotent: rerun it after an eval-kernel exit/reset"):
         'an eval-kernel exit/reset, not an exit code',
-    ("skills/bn-kernel/SKILL.md", "every reachable exit"):
-        "'on every reachable exit' is a teardown obligation, not an exit code",
+    # One obligation per declaration rather than one bare `every reachable
+    # exit`: the prepositional phrase alone also excuses a sentence that states
+    # a CODE on a reachable exit, and it did rule on three different sentences.
+    ("skills/bn-kernel/SKILL.md",
+     "On every reachable exit, close only the exact selector"):
+        "a CLOSE obligation on exit, not an exit code",
+    ("skills/bn-kernel/SKILL.md",
+     "on every reachable exit close its exact target"):
+        "the same close obligation, quoted in the lifecycle prompt",
+    ("skills/bn-kernel/SKILL.md",
+     "attempting that exact teardown on every reachable exit"):
+        "a TEARDOWN obligation on exit, not an exit code",
     ("skills/bn-kernel/SKILL.md", "A sibling exit 130 can still destroy"):
         "a SIGINT-killed sibling process's 130, not a code `bn` itself returns",
-    ("skills/bn/reference/mutating.md", "does **not** change the exit code"):
+    ("skills/bn/reference/mutating.md",
+     "The up-front/apply-time distinction does **not** change the exit code"):
         'the lead-in to the pinned sentence on the same line, which states both '
-        'digits',
-    ("skills/bn/reference/mutating.md", "a script that only checks `$?` sees"):
+        'digits; it is that distinction and no other that leaves the code alone',
+    # Reaches to the wrap, which is as far as the clause goes on this line: cut
+    # at `sees`, the declaration also excused "so a script that only checks
+    # `$?` sees a clean success", which is the opposite of what a `4` does.
+    ("skills/bn/reference/mutating.md",
+     "so a script that only checks `$?` sees that the"):
         '`$?` names the variable a consumer reads; the digit is echoed',
-    ("skills/bn/reference/mutating.md", "exit codes are therefore the same"):
+    ("skills/bn/reference/mutating.md",
+     "exit codes are therefore the same as every other mutation"):
         'the lead-in to the two echoed digits on the following lines',
     ("skills/bn/reference/runtime.md",
      "the verified process can exit and its pid be reused"):
         'a process EXITING and its pid being reused, not an exit code',
-    ("skills/bn/reference/runtime.md", "purged as soon as a proven owner exits"):
-        'a proven owner EXITING, plus a warning not to key on the code at all; '
-        'the restart digits are pinned two paragraphs down',
+    ("skills/bn/reference/runtime.md",
+     "the record is purged outright, and it is purged as soon as a proven "
+     "owner exits"):
+        'a proven owner EXITING, not an exit code',
+    # The second exit word on that same line, which the purge declaration used
+    # to carry for free.
+    ("skills/bn/reference/runtime.md",
+     "A scripted recovery loop that keys on the exit code alone will read that "
+     "success as a failure"):
+        'a warning NOT to key on the code, which states no value for it; the '
+        'restart digits are pinned two paragraphs down',
 }
 
 # The vocabulary that puts a line in the population for naming an EXIT rather
@@ -1320,6 +1368,13 @@ def _exit_code_for(scenario: str) -> int:
                      "results": [{"status": "invalid_request"}]}, _mutation_summary),
         "unmeasured": ({"success": True, "committed": True, "results": []},
                        _mutation_summary),
+        # The same unmeasured shape on the other kind of call: a PREVIEW, so it
+        # reverted and never committed. The claim is that the verdict keys on
+        # `measured: false` and not on the kind of call, so the preview flags
+        # are really set rather than reusing the live scenario's reply.
+        "unmeasured-preview": ({"success": True, "committed": False,
+                                "preview": True, "results": []},
+                               _mutation_summary),
         "own-summary": ({**go, "go_renamed_candidates": 7, "go_committed_count": 7,
                          "go_verified_count": 7, "go_failed_count": 0},
                         _go_rename_summary),

@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 Binder = Callable[[Any, dict[str, Any], "str | None"], Any]
 Escalation = Callable[[dict[str, Any]], bool]
+SelectorFrom = Callable[[dict[str, Any], "str | None"], Any]
 
 _LOCK_CLASSES = ("read", "write", "none")
 
@@ -25,11 +26,15 @@ class OpSpec:
     # #688: an op that destroys or overwrites state may not fall back to the
     # focused GUI tab when several targets are open. Declared here so the
     # policy is hosted once (and visible beside the lock class) instead of
-    # copied into each handler. `destructive_bypass` names the params shape
-    # that makes the request unambiguous anyway -- `close_binary`'s
-    # `all=true`, which addresses every target on purpose.
+    # copied into each handler.
     destructive: bool = False
-    destructive_bypass: Escalation | None = None
+    # The selector the op will ACTUALLY resolve, when that is not simply the
+    # request's top-level target: `batch_apply` prefers a `target` inside its
+    # manifest. The gate and the binder must read one decider, or the gate
+    # judges a selector the handler never uses -- which both refused a legal
+    # manifest-only target and let a request pass the gate on its top-level
+    # selector and then act on the manifest's `active` (#736 review, P1).
+    selector: SelectorFrom | None = None
 
 
 class OpRegistry:
@@ -43,12 +48,12 @@ class OpRegistry:
         lock: str,
         escalation: Escalation | None = None,
         destructive: bool = False,
-        destructive_bypass: Escalation | None = None,
+        selector: SelectorFrom | None = None,
     ) -> Callable[[Binder], Binder]:
         if lock not in _LOCK_CLASSES:
             raise ValueError(f"invalid lock class {lock!r} for op {name!r}; expected one of {_LOCK_CLASSES}")
-        if destructive_bypass is not None and not destructive:
-            raise ValueError(f"op {name!r} declares destructive_bypass without destructive=True")
+        if selector is not None and not destructive:
+            raise ValueError(f"op {name!r} declares a selector reader without destructive=True")
 
         def decorator(binder: Binder) -> Binder:
             if name in self._ops:
@@ -59,7 +64,7 @@ class OpRegistry:
                 binder=binder,
                 lock_escalation=escalation,
                 destructive=destructive,
-                destructive_bypass=destructive_bypass,
+                selector=selector,
             )
             return binder
 

@@ -271,6 +271,29 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
+def _same_view(left: Any, right: Any) -> bool:
+    """Whether two wrappers stand for the same core BinaryView.
+
+    NOT ``is``: BN interns a Python wrapper only for the scripting console's
+    current view, so a non-focused tab hands back a brand new object on every
+    walk for the same handle (#586) -- while BN's own ``__eq__``/``__hash__``
+    are handle-based. An identity test therefore reported the FOCUSED tab as
+    inactive whenever the focused-view lookup and the open-view walk returned
+    two wrappers, which made every snapshot row inactive and refused a bare
+    selector on a GUI bridge that plainly had a focused tab (#736 review, P2).
+    Identity first because it is cheap and total; ``==`` behind a guard
+    because a BN object's comparison can raise on a dead handle.
+    """
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
 def _active_binary_view():
     if ui is not None:
         def resolve():
@@ -726,7 +749,7 @@ class TargetManager:
                         "basename": record.basename,
                         "selector": selectors[view_id],
                         "view_name": record.view_name,
-                        "active": bool(view is active),
+                        "active": _same_view(view, active),
                         # Per-target analysis state so `target list` can flag a
                         # --quick or restore-failed (#458) unanalyzed view without a
                         # per-target lookup.
@@ -783,8 +806,8 @@ class TargetManager:
             )
         return matches[0][1]
 
-    def require_explicit_target(self, op_name: str, selector: Any) -> None:
-        """Refuse a destructive op that named no target while several are open.
+    def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
+        """Gate a destructive op that named no target, and pin what it may act on.
 
         ``resolve()`` keeps a focused-tab convenience for None / "" / "active"
         (a GUI user's `bn save` should not have to spell out the tab they are
@@ -795,15 +818,32 @@ class TargetManager:
         ``""`` meant 'the focused tab' here while meaning 'error' on close
         (#688). Hosted once, driven by ``destructive=True`` in the op registry.
 
+        Returns the stable ``target_id`` the caller must forward instead of the
+        volatile selector, or None to leave the request untouched. Counting is
+        not enough on its own: the handler resolves the selector AGAIN, later,
+        and for a ``lock="none"`` op outside the gate's lock entirely -- so a
+        close/load between the two landed the operation on a different binary
+        with the count check green (#736 review, P1). Pinning the id the count
+        was taken on makes that case a safe unknown-selector error, the same
+        trade the CLI's ``_implicit_target`` makes (#690 R3) and the same
+        snapshot discipline ``_resolve_sole_target_for_close`` follows.
+
         ``strict=True`` for the same reason the close gate uses it: a per-tab
         UI exception makes ``refresh()`` silently lossy, and a count that hid
         the second open tab would wave the request through.
         """
         if selector not in (None, "", "active"):
-            return
+            return None
         targets = self.refresh(strict=True)
-        if len(targets) <= 1:
-            return
+        if not targets:
+            return None                     # the handler raises its own error
+        if len(targets) == 1:
+            # "" is never pinned: an explicit-but-empty selector is each
+            # destructive handler's own error (#690 r4), and substituting a
+            # real id for it would replace that refusal with a silent success.
+            # It is still COUNTED above, because `py_exec` / `go_rename` have
+            # no such check and would otherwise fall through to the focused tab.
+            return None if selector == "" else str(targets[0]["target_id"])
         raise RuntimeError(
             format_multi_target_hint(
                 f"{op_name} needs an explicit target when multiple targets "
@@ -1397,14 +1437,26 @@ class BinaryNinjaBridge:
                 elif lock_class == "read":
                     lock = self._target_lock.read()
             with lock:
-                # #688: hosted here, under the op's own lock, so the count the
-                # refusal is decided on cannot change before the handler
-                # resolves the selector it was allowed to omit.
-                if spec is not None and spec.destructive and not (
-                    spec.destructive_bypass is not None
-                    and spec.destructive_bypass(params)
-                ):
-                    self.targets.require_explicit_target(str(op), target)
+                if spec is not None and spec.destructive:
+                    # The selector the HANDLER will resolve, which is not
+                    # always the request's top-level one (batch_apply prefers
+                    # its manifest's). Judging a different selector both
+                    # refused a legal manifest-only target and let a request
+                    # pass on its top-level selector then act on the
+                    # manifest's "active" (#736 review, P1).
+                    selector = (
+                        spec.selector(params, target) if spec.selector is not None
+                        else target
+                    )
+                    pinned = self.targets.pin_destructive_target(str(op), selector)
+                    if pinned is not None:
+                        # Forward the stable id the count was taken on, in BOTH
+                        # places the handler may read it from, so the later
+                        # (and for lock="none", unlocked) resolve cannot land
+                        # on a view that replaced the one this gate allowed.
+                        target = pinned
+                        if spec.selector is not None:
+                            params = {**params, "target": pinned}
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
@@ -4307,16 +4359,25 @@ def _bind_types_declare(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
-@op("batch_apply", lock="none", destructive=True)
+def _batch_apply_selector(params: dict[str, Any], target: str | None) -> Any:
+    """The selector `batch_apply` resolves: the manifest's, else the request's.
+
+    Keep None as None so the single-open-target default still applies;
+    str(None) would become the bogus selector "None". Presence, not
+    truthiness (#690 r4): an explicit-but-empty manifest target must error,
+    never collapse into the focused-tab convenience. Read by the binder AND
+    by the destructive gate in dispatch(), which is the point -- two readers
+    of this precedence disagreed (#736 review, P1).
+    """
+    manifest_target = params.get("target")
+    return manifest_target if manifest_target is not None else target
+
+
+@op("batch_apply", lock="none", destructive=True, selector=_batch_apply_selector)
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
-    # Keep None as None so the single-open-target default still applies;
-    # str(None) would become the bogus selector "None". Presence, not
-    # truthiness (#690 r4): an explicit-but-empty manifest target must error,
-    # never collapse into the focused-tab convenience.
-    manifest_target = manifest.get("target")
-    chosen = manifest_target if manifest_target is not None else target
+    chosen = _batch_apply_selector(manifest, target)
     if chosen is not None:
         if not isinstance(chosen, str):
             raise ValueError("batch_apply: target must be a string selector")

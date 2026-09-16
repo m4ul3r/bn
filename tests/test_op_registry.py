@@ -163,10 +163,20 @@ def test_the_destructive_ops_are_exactly_these(op_registry):
     assert destructive == EXPECTED_DESTRUCTIVE
 
 
-def test_destructive_bypass_without_the_flag_is_refused(op_registry):
-    """A bypass predicate on a non-destructive op is dead code that reads like
-    a guard, so it is rejected at import time rather than silently ignored."""
+def test_a_selector_reader_without_the_destructive_flag_is_refused(op_registry):
+    """A selector reader exists to feed the destructive gate, so declaring one
+    on a non-destructive op is dead code that reads like a guard: rejected at
+    import time rather than silently ignored."""
     reg = op_registry.OpRegistry()
-    with pytest.raises(ValueError, match="destructive_bypass without destructive"):
-        @reg.op("b", lock="write", destructive_bypass=lambda params: True)
+    with pytest.raises(ValueError, match="selector reader without destructive"):
+        @reg.op("b", lock="write", selector=lambda params, target: target)
         def _b(bridge, params, target): return 1
+
+
+def test_batch_apply_is_the_only_op_declaring_a_selector_reader(op_registry):
+    """The reader exists because batch_apply resolves its manifest's `target`
+    in preference to the request's, so the gate and the binder must read one
+    decider (#736 review). Any other op adding one is a policy change."""
+    REGISTRY = op_registry.REGISTRY
+    with_reader = {n for n in REGISTRY.names() if REGISTRY.spec(n).selector is not None}
+    assert with_reader == {"batch_apply"}
