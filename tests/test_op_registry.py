@@ -147,3 +147,36 @@ def test_decompile_is_the_only_escalating_op(op_registry):
     REGISTRY = op_registry.REGISTRY
     escalating = {n for n in REGISTRY.names() if REGISTRY.spec(n).lock_escalation is not None}
     assert escalating == {"decompile"}
+
+
+# #688: the ops whose bare/empty/"active" target may NOT fall back to the
+# focused GUI tab. Pinned here for the same reason the lock sets are: the flag
+# is a policy declaration, so an op gaining or losing it is a deliberate
+# change. `close_binary` is absent on purpose -- it refuses the ambiguous case
+# in `_resolve_sole_target_for_close`, which also names its `all=true` escape.
+EXPECTED_DESTRUCTIVE = {"save_database", "py_exec", "batch_apply", "go_rename"}
+
+
+def test_the_destructive_ops_are_exactly_these(op_registry):
+    REGISTRY = op_registry.REGISTRY
+    destructive = {n for n in REGISTRY.names() if REGISTRY.spec(n).destructive}
+    assert destructive == EXPECTED_DESTRUCTIVE
+
+
+def test_a_selector_reader_without_the_destructive_flag_is_refused(op_registry):
+    """A selector reader exists to feed the destructive gate, so declaring one
+    on a non-destructive op is dead code that reads like a guard: rejected at
+    import time rather than silently ignored."""
+    reg = op_registry.OpRegistry()
+    with pytest.raises(ValueError, match="selector reader without destructive"):
+        @reg.op("b", lock="write", selector=lambda params, target: target)
+        def _b(bridge, params, target): return 1
+
+
+def test_batch_apply_is_the_only_op_declaring_a_selector_reader(op_registry):
+    """The reader exists because batch_apply resolves its manifest's `target`
+    in preference to the request's, so the gate and the binder must read one
+    decider (#736 review). Any other op adding one is a policy change."""
+    REGISTRY = op_registry.REGISTRY
+    with_reader = {n for n in REGISTRY.names() if REGISTRY.spec(n).selector is not None}
+    assert with_reader == {"batch_apply"}

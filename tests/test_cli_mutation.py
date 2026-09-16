@@ -662,12 +662,17 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_trans
     rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
 
     assert rc == 2
-    assert capsys.readouterr().err == (
+    err = capsys.readouterr().err
+    # The exact block is pinned once, in test_cli_function; what matters here
+    # is that a MUTATION refuses pre-flight with the shared hint (#688) and
+    # sends nothing.
+    assert err.startswith(
         "This command requires --target when multiple targets are open.\n"
+        "Pass -t <selector> (--target) to choose one.\n"
         "Open targets:\n"
-        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
-        "- other.exe.bndb (target_id: 123:2:8)\n"
     )
+    assert "  * -t SnailMail_unwrapped.exe.bndb" in err
+    assert "    -t other.exe.bndb" in err
 
 
 def test_function_create_builds_payload_explicit_json(fake_transport, capsys):

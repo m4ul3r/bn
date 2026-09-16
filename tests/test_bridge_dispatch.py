@@ -1965,22 +1965,251 @@ def test_dispatch_envelope_carries_multiline_target_hint(monkeypatch):
     # dispatch()'s {ok:false, error} serialization. The real-BN lane pins this
     # end-to-end but skips without a BN install (and there is no CI), so pin
     # it in the mocked lane: a real op through dispatch(), no monkeypatched
-    # internals.
+    # internals. A READ op, so what is exercised is the resolver's own
+    # no-active refusal rather than the destructive gate (#688) that answers
+    # first for `save_database`.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
     bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
     _register_views(bridge, bv1, bv2)
 
-    resp = instance.dispatch({"op": "save_database", "params": {}, "target": None})
+    resp = instance.dispatch({"op": "target_info", "params": {}, "target": None})
 
     assert resp["ok"] is False
     error = resp["error"]
     assert "No active BinaryView is selected and multiple targets are open" in error
+    assert "Pass -t <selector> (--target) to choose one." in error
     assert "\nOpen targets:\n" in error
     assert "-t libparse.so.bndb" in error
     assert "-t svcmain.bndb" in error
     bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("selector", [None, "active"])
+def test_destructive_op_refuses_a_bare_target_while_several_are_open(monkeypatch, selector):
+    """#688: `resolve()` keeps a count-free focused-tab convenience for
+    None/""/"active", so a raw bare-target save/batch_apply/py_exec acted on
+    whichever tab had focus. The gate is declared in the op registry and
+    enforced in dispatch, so every destructive op inherits it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    # Focus one tab: the convenience this gate removes would have picked it.
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: bv1)
+
+    for op_name, params in (
+        ("save_database", {}),
+        ("py_exec", {"script": "1"}),
+        ("batch_apply", {"operations": []}),
+        ("go_rename", {}),
+    ):
+        resp = instance.dispatch({"op": op_name, "params": params, "target": selector})
+        assert resp["ok"] is False, (op_name, resp)
+        error = resp["error"]
+        assert f"{op_name} needs an explicit target when multiple targets are open (2)" in error
+        assert "Pass -t <selector> (--target) to choose one." in error
+        assert "-t libparse.so.bndb" in error
+        assert "-t svcmain.bndb" in error
+    # Nothing was written: the refusal happens before the handler runs.
+    assert not getattr(bv1, "saved_paths", [])
+    bridge._headless_views.clear()
+
+
+def test_destructive_op_still_resolves_the_sole_open_target(monkeypatch):
+    # The gate is a multi-target rule only: bare `bn save` on one open target
+    # (the overwhelmingly common shape) must keep working.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+
+    resp = instance.dispatch({"op": "target_info", "params": {}, "target": None})
+    assert resp["ok"] is True
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("op_name,params", [
+    ("save_database", {}),
+    ("py_exec", {"script": "1"}),
+    ("batch_apply", {"ops": []}),
+    ("go_rename", {}),
+])
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_destructive_op_refuses_an_explicitly_empty_selector(monkeypatch, op_name, params, empty):
+    """An unset shell variable must never resolve to the focused view. The
+    refusal is the gate's, not each handler's: `py_exec` and `go_rename` have
+    no empty-selector check of their own, so theirs fell through to the
+    focused-tab convenience (#736 review round 2). One open target, so this
+    cannot pass on the count check."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: bv)
+
+    resp = instance.dispatch({"op": op_name, "params": params, "target": empty})
+    assert resp["ok"] is False, resp
+    assert f"{op_name}: empty target selector" in resp["error"]
+    bridge._headless_views.clear()
+
+
+def test_a_destructive_op_refuses_when_the_snapshot_has_no_targets(monkeypatch):
+    # The gate used to return None here and trust the handler to raise, which
+    # a concurrent load between the count and the handler's resolve made false
+    # (#736 review round 2). Refuse on the snapshot that was actually counted.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(RuntimeError, match="No BinaryView targets are open"):
+        instance.targets.pin_destructive_target("save_database", None)
+
+
+def test_a_bare_destructive_request_is_pinned_to_the_sole_target_id(monkeypatch):
+    """Counting alone left the hole open (#736 review): the handler resolves
+    the volatile selector AGAIN, later, and for a `lock="none"` op outside the
+    gate's lock entirely -- so a close/load in between landed the write on a
+    different binary with the count check green. The gate now forwards the
+    identity it counted, and that identity resolves by exact target_id ONLY --
+    a pin that kept the human-selector fallbacks could still be satisfied by a
+    different view whose filename spelled the id (round 2)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+    target_id = instance.targets.refresh()[0]["target_id"]
+
+    seen = []
+
+    def _capture(target, preview, operations):
+        seen.append(target)
+        return {"results": []}
+
+    monkeypatch.setattr(instance, "_mutation", _capture)
+    resp = instance.dispatch({"op": "batch_apply", "params": {"ops": []}, "target": None})
+    assert resp["ok"] is True, resp
+    # Not None and not "active": the handler can no longer re-decide which
+    # view a bare request meant.
+    pinned = bridge.PinnedTarget(target_id)
+    assert seen == [pinned]
+    assert instance.targets.resolve(pinned) is bv
+
+    # The pin is what makes the race safe: once that view is gone, the
+    # forwarded identity resolves to nothing -- including when the view that
+    # replaced it is NAMED after the pinned id, which every basename/.bndb
+    # fallback in `_matches_record` would otherwise match.
+    bridge._headless_views.clear()
+    _register_views(bridge, _FakeFileBV(f"/corpus/{target_id}.bndb", session_id="2"))
+    with pytest.raises(RuntimeError, match="Unknown target selector"):
+        instance.targets.resolve(pinned)
+    bridge._headless_views.clear()
+
+
+def test_a_pin_is_not_forgeable_and_shadows_no_advertised_selector(monkeypatch):
+    """Round 3 of the review: the pin was a reserved string PREFIX, which is
+    forgeable from both directions. `_compute_selectors` advertises a
+    filename-derived selector, and a target legitimately named
+    `target_id:<other-id>` therefore published a selector that resolved to the
+    OTHER view -- the published, documented way to name B silently addressed
+    A. The pin is now a type `dispatch` constructs in-process, so no wire
+    value can carry pin semantics and no advertised selector can collide with
+    one."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    alpha = _FakeFileBV("/corpus/alpha.bndb", session_id="1")
+    _register_views(bridge, alpha)
+    alpha_id = instance.targets.refresh()[0]["target_id"]
+
+    # A legal POSIX filename that spells alpha's identity, prefix included.
+    beta = _FakeFileBV(f"/corpus/target_id:{alpha_id}", session_id="2")
+    _register_views(bridge, alpha, beta)
+    rows = {row["filename"]: row for row in instance.targets.refresh()}
+    beta_selector = rows[beta.file.filename]["selector"]
+
+    # Beta's own published selector resolves to beta...
+    assert instance.targets.resolve(beta_selector) is beta
+    # ...the pin resolves only to the view it was taken on...
+    assert instance.targets.resolve(bridge.PinnedTarget(alpha_id)) is alpha
+    # ...and those same characters arriving as an ordinary wire selector get
+    # ordinary selector semantics, never identity-only matching.
+    assert isinstance(beta_selector, str)
+    assert not isinstance(beta_selector, bridge.PinnedTarget)
+    bridge._headless_views.clear()
+
+
+def test_the_destructive_gate_judges_the_selector_the_handler_will_use(monkeypatch):
+    """#736 review: the gate read the request's top-level target while
+    `batch_apply` resolves its MANIFEST's in preference. Two readers of one
+    precedence disagreed, which cost both directions -- a legal manifest-only
+    target was refused while several were open, and a top-level selector waved
+    a manifest `"active"` through onto the focused tab."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: bv1)
+
+    seen = []
+
+    def _capture(target, preview, operations):
+        seen.append(target)
+        return {"results": []}
+
+    monkeypatch.setattr(instance, "_mutation", _capture)
+
+    # Legal: the manifest names a concrete target, the request omits one.
+    resp = instance.dispatch({
+        "op": "batch_apply",
+        "params": {"ops": [], "target": "svcmain.bndb"},
+        "target": None,
+    })
+    assert resp["ok"] is True, resp
+    assert seen == ["svcmain.bndb"]
+
+    # Bypass: a concrete top-level selector, an `"active"` manifest. What runs
+    # is the manifest's, so that is what must be judged.
+    resp = instance.dispatch({
+        "op": "batch_apply",
+        "params": {"ops": [], "target": "active"},
+        "target": "libparse.so.bndb",
+    })
+    assert resp["ok"] is False, resp
+    assert "batch_apply needs an explicit target when multiple targets are open (2)" \
+        in resp["error"]
+    assert seen == ["svcmain.bndb"]        # nothing further reached the engine
+    bridge._headless_views.clear()
+
+
+def test_a_focused_tab_stays_active_across_fresh_wrapper_instances(monkeypatch):
+    """#736 review: `refresh()` marked the active row with `view is active`,
+    but BN interns a wrapper only for the console's current view (#586) -- so
+    the focused-view lookup and the open-view walk hand back two objects for
+    one core view, every row read inactive, and a bare/`"active"` selector was
+    refused on a GUI bridge that plainly had a focused tab. BN's own equality
+    is handle-based; the snapshot must use it."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    focused_handle, other_handle = object(), object()
+
+    def fresh_collect(*, strict: bool = False):
+        return [
+            _NonInterningBV(focused_handle, "/proj/alpha.bndb", session_id="11"),
+            _NonInterningBV(other_handle, "/proj/beta.bndb", session_id="22"),
+        ], True
+
+    # A FRESH wrapper per lookup, equal but never identical to the walked one.
+    monkeypatch.setattr(bridge, "_collect_open_views_state", fresh_collect)
+    monkeypatch.setattr(
+        bridge, "_active_binary_view",
+        lambda: _NonInterningBV(focused_handle, "/proj/alpha.bndb", session_id="11"),
+    )
+
+    targets = manager.refresh()
+    assert [row["active"] for row in targets] == [True, False]
+    assert manager.resolve(None).file.filename == "/proj/alpha.bndb"
+    assert manager.resolve("active").file.filename == "/proj/alpha.bndb"
 
 
 def test_resolve_no_selector_single_target_still_returns_view(monkeypatch):
@@ -3934,7 +4163,8 @@ def test_close_binary_bare_request_refuses_under_multiple_gui_tabs_despite_focus
     # Sanity: the GUI walk sees both tabs and the convenience resolver WOULD
     # pick the focused one -- that is the hole this test pins shut for close.
     assert len(bridge._collect_open_views()) == 2
-    assert bridge.TargetManager()._default_view() is focused
+    manager = bridge.TargetManager()
+    assert manager._default_view(manager.refresh()) is focused
 
     with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=target)
@@ -4149,7 +4379,8 @@ def test_close_binary_rejects_empty_target_on_single_gui_tab(monkeypatch, tmp_pa
     _hermetic_registry(instance, tmp_path)
     only = _ClosableBV("/proj/only.so", session_id="11")
     _gui_with_focused_tab(monkeypatch, bridge, only)
-    assert bridge.TargetManager()._default_view() is only
+    manager = bridge.TargetManager()
+    assert manager._default_view(manager.refresh()) is only
 
     with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target="")

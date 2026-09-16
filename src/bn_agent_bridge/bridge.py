@@ -63,6 +63,7 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
+from .target_hint import format_multi_target_hint, open_target_lines
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -207,43 +208,22 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
-def _open_target_lines(targets: list[dict[str, Any]]) -> list[str]:
-    # Shared "Open targets:" listing for the resolver errors. Entries render
-    # the `-t` form, shell-quoted, because they are a copy-paste contract: for
-    # some commands (`bn save`) the positional is an output path, so echoing a
-    # bare selector invites `bn save <selector>` -- a silent wrong-file write
-    # -- and an unquoted selector with a space splits into exactly that shape.
-    lines = ["Open targets:"]
-    for target in targets:
-        marker = "*" if target.get("active") else " "
-        lines.append(
-            f"  {marker} -t {shlex.quote(str(target.get('selector', '')))}"
-            f"  view_id={target.get('view_id', '')}"
-            f"  target_id={target.get('target_id', '')}"
-            f"  {target.get('filename', '')}"
-        )
-    lines.append("note: view_id / target_id are stable across `bn save`")
-    return lines
-
-
 def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
     lines = [f"Unknown target selector: {selector}"]
     if not targets:
         lines.append("No BinaryView targets are open.")
         return "\n".join(lines)
-    lines.extend(_open_target_lines(targets))
+    lines.extend(open_target_lines(targets))
     return "\n".join(lines)
 
 
 def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
     # #663: several targets open, none active (headless has no focused tab),
     # and the request carried no selector.
-    lines = [
+    return format_multi_target_hint(
         "No active BinaryView is selected and multiple targets are open.",
-        "Pass -t <selector> (--target) to choose one.",
-    ]
-    lines.extend(_open_target_lines(targets))
-    return "\n".join(lines)
+        targets,
+    )
 
 
 # REQUIRED_FIELDS / REQUIRED_ONE_OF moved to mutation_engine.py with the
@@ -289,6 +269,47 @@ class _ReadWriteLock:
             with self._condition:
                 self._writer = False
                 self._condition.notify_all()
+
+
+class PinnedTarget(str):
+    """A target identity the BRIDGE pinned, not a selector a client sent.
+
+    `_matches_record` resolves one of these by exact ``target_id`` and by none
+    of the human-selector fallbacks, so a view that replaced the pinned one
+    cannot inherit the request. It is a TYPE rather than a reserved string
+    prefix because a prefix is forgeable from both directions: a request could
+    send it, and `_compute_selectors` could legitimately advertise a filename
+    that starts with it, which made another target's published selector
+    resolve to the pinned one (#736 review round 3). Nothing off the wire can
+    construct this class -- it is created in `dispatch` and consumed by the
+    handler in the same process -- and it still behaves as the `str` every
+    selector path (validation, logging, JSON echo) expects.
+    """
+
+    __slots__ = ()
+
+
+def _same_view(left: Any, right: Any) -> bool:
+    """Whether two wrappers stand for the same core BinaryView.
+
+    NOT ``is``: BN interns a Python wrapper only for the scripting console's
+    current view, so a non-focused tab hands back a brand new object on every
+    walk for the same handle (#586) -- while BN's own ``__eq__``/``__hash__``
+    are handle-based. An identity test therefore reported the FOCUSED tab as
+    inactive whenever the focused-view lookup and the open-view walk returned
+    two wrappers, which made every snapshot row inactive and refused a bare
+    selector on a GUI bridge that plainly had a focused tab (#736 review, P2).
+    Identity first because it is cheap and total; ``==`` behind a guard
+    because a BN object's comparison can raise on a dead handle.
+    """
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
 
 
 def _active_binary_view():
@@ -590,6 +611,15 @@ class TargetManager:
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
         if selector is None:
             return False
+        if isinstance(selector, PinnedTarget):
+            # An identity the BRIDGE pinned (the destructive gate) resolves by
+            # exact target_id and by nothing else. Every fallback below is a
+            # convenience for a HUMAN selector -- basename, a .bndb-stripped
+            # core, a path tail -- and a pin that kept them could match a
+            # DIFFERENT view whose filename happened to spell the pinned id,
+            # which is exactly the wrong-target write the pin prevents (#736
+            # review rounds 2 and 3).
+            return str(selector) == record.target_id()
         candidate = str(selector).strip()
         if candidate in ("", "active"):
             return False
@@ -639,16 +669,24 @@ class TargetManager:
                     return self._matches_record(record, selector)
         return False
 
-    def _default_view(self):
-        active = _active_binary_view()
-        if active is not None:
-            return active
+    def _default_view(self, targets: list[dict[str, Any]]):
+        """The view a bare / empty / ``"active"`` selector means, decided from
+        the SAME ``refresh()`` snapshot the caller's listing came from (#688).
 
+        ``refresh()`` already resolves this: it marks the focused tab active,
+        and falls back to the sole record when nothing is focused (headless has
+        no focused tab). Re-sampling ``_active_binary_view()`` afterwards
+        opened a window where the listing shown to the user and the view the
+        request landed on came from two different samples of GUI state.
+        Returns None when the snapshot names no active target, or when that
+        target went away between the snapshot and the record lookup.
+        """
+        row = next((item for item in targets if item.get("active")), None)
+        if row is None:
+            return None
         with self._lock:
-            live_views = [record.view for record in self._records.values()]
-        if len(live_views) == 1:
-            return live_views[0]
-        return None
+            record = self._records.get(row["view_id"])
+        return record.view if record is not None else None
 
     def refresh(self, *, strict: bool = False) -> list[dict[str, Any]]:
         views, complete = _collect_open_views_state(strict=strict)
@@ -738,7 +776,7 @@ class TargetManager:
                         "basename": record.basename,
                         "selector": selectors[view_id],
                         "view_name": record.view_name,
-                        "active": bool(view is active),
+                        "active": _same_view(view, active),
                         # Per-target analysis state so `target list` can flag a
                         # --quick or restore-failed (#458) unanalyzed view without a
                         # per-target lookup.
@@ -770,7 +808,7 @@ class TargetManager:
             raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):
-            active = self._default_view()
+            active = self._default_view(targets)
             if active is None:
                 raise RuntimeError(_format_no_active_target_error(targets))
             return active
@@ -794,6 +832,64 @@ class TargetManager:
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
             )
         return matches[0][1]
+
+    def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
+        """Gate a destructive op that named no target, and pin what it may act on.
+
+        ``resolve()`` keeps a focused-tab convenience for None / "" / "active"
+        (a GUI user's `bn save` should not have to spell out the tab they are
+        looking at). For an op that overwrites or destroys state that
+        convenience is a footgun for every raw protocol client -- a bare
+        ``save_database`` / ``batch_apply`` / ``py_exec`` on a multi-tab GUI
+        bridge silently acted on whichever tab had focus, and the wire value
+        ``""`` meant 'the focused tab' here while meaning 'error' on close
+        (#688). Hosted once, driven by ``destructive=True`` in the op registry.
+
+        Returns the pinned selector the caller must forward instead of the
+        volatile one, or None when the request already names a concrete
+        target. Counting is not enough on its own: the handler resolves the
+        selector AGAIN, later, and for a ``lock="none"`` op outside the gate's
+        lock entirely -- so a close/load between the two landed the operation
+        on a different binary with the count check green (#736 review, P1).
+        The pin is a ``PinnedTarget``, which ``_matches_record`` resolves by
+        exact ``target_id`` and by nothing else, so a replaced view
+        fails as an unknown selector instead of being substituted -- the same
+        trade the CLI's ``_implicit_target`` makes (#690 R3) and the same
+        snapshot discipline ``_resolve_sole_target_for_close`` follows.
+
+        Nothing implicit is ever forwarded unbound (#736 review round 2): an
+        explicit-but-empty selector is refused here rather than left to each
+        handler (``py_exec`` and ``go_rename`` have no such check, so theirs
+        fell through to the focused tab), and an empty snapshot is refused
+        here rather than trusted to raise later (a concurrent load between the
+        count and the handler's resolve made that assumption false).
+
+        ``strict=True`` for the same reason the close gate uses it: a per-tab
+        UI exception makes ``refresh()`` silently lossy, and a count that hid
+        the second open tab would wave the request through.
+        """
+        if isinstance(selector, str) and not selector.strip():
+            raise RuntimeError(
+                f"{op_name}: empty target selector; pass a selector from "
+                "list_targets or omit the target entirely. An unset shell "
+                "variable must not resolve to whichever view happens to be "
+                "focused."
+            )
+        if selector not in (None, "active"):
+            return None
+        targets = self.refresh(strict=True)
+        if not targets:
+            raise RuntimeError("No BinaryView targets are open")
+        if len(targets) == 1:
+            return PinnedTarget(targets[0]["target_id"])
+        raise RuntimeError(
+            format_multi_target_hint(
+                f"{op_name} needs an explicit target when multiple targets "
+                f"are open ({len(targets)}): it overwrites or destroys state, "
+                "so the focused-tab default is not honored for it.",
+                targets,
+            )
+        )
 
 
 class BridgeHandler(socketserver.StreamRequestHandler):
@@ -1379,6 +1475,26 @@ class BinaryNinjaBridge:
                 elif lock_class == "read":
                     lock = self._target_lock.read()
             with lock:
+                if spec is not None and spec.destructive:
+                    # The selector the HANDLER will resolve, which is not
+                    # always the request's top-level one (batch_apply prefers
+                    # its manifest's). Judging a different selector both
+                    # refused a legal manifest-only target and let a request
+                    # pass on its top-level selector then act on the
+                    # manifest's "active" (#736 review, P1).
+                    selector = (
+                        spec.selector(params, target) if spec.selector is not None
+                        else target
+                    )
+                    pinned = self.targets.pin_destructive_target(str(op), selector)
+                    if pinned is not None:
+                        # Forward the stable id the count was taken on, in BOTH
+                        # places the handler may read it from, so the later
+                        # (and for lock="none", unlocked) resolve cannot land
+                        # on a view that replaced the one this gate allowed.
+                        target = pinned
+                        if spec.selector is not None:
+                            params = {**params, "target": pinned}
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
@@ -2180,15 +2296,16 @@ class BinaryNinjaBridge:
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) > 1:
-            lines = [
-                "close_binary needs a concrete target when multiple targets "
-                f"are open ({len(targets)}): pass a target selector, a path, "
-                "or all=true to close every open target, including GUI tabs "
-                "bn did not load. The volatile \"active\" selector is not "
-                "honored for close.",
-            ]
-            lines.extend(_open_target_lines(targets))
-            raise RuntimeError("\n".join(lines))
+            raise RuntimeError(
+                format_multi_target_hint(
+                    "close_binary needs a concrete target when multiple "
+                    f"targets are open ({len(targets)}): pass a target "
+                    "selector, a path, or all=true to close every open "
+                    "target, including GUI tabs bn did not load. The volatile "
+                    '"active" selector is not honored for close.',
+                    targets,
+                )
+            )
         # Look the view up from the snapshot the ==1 decision was made on --
         # a second resolve() would re-refresh, so the count gate and the
         # actual close could examine different target sets.
@@ -3675,6 +3792,11 @@ def _bind_load_status(bridge, params, target):
     return bridge._load_status(params.get("job_id"))
 
 
+# `close_binary` is deliberately not `destructive=True`: it guards locally in
+# `_resolve_sole_target_for_close`, which refuses the ambiguous case with a
+# message naming its own escape hatch (`all=true`) and resolves the sole
+# target from the same snapshot it counted. The registry gate would answer
+# first and less usefully.
 @op("close_binary", lock="write")
 def _bind_close_binary(bridge, params, target):
     # The selector rides the TOP-LEVEL request key. path/all DO live in
@@ -3692,7 +3814,7 @@ def _bind_close_binary(bridge, params, target):
     )
 
 
-@op("save_database", lock="write")
+@op("save_database", lock="write", destructive=True)
 def _bind_save_database(bridge, params, target):
     return bridge._save_database(target, params.get("path"))
 
@@ -4100,7 +4222,7 @@ def _bind_go_functions(bridge, params, target):
     )
 
 
-@op("go_rename", lock="none")
+@op("go_rename", lock="none", destructive=True)
 def _bind_go_rename(bridge, params, target):
     return bridge._go_rename(
         target,
@@ -4142,7 +4264,7 @@ def _bind_orient_digest(bridge, params, target):
     )
 
 
-@op("py_exec", lock="write")
+@op("py_exec", lock="write", destructive=True)
 def _bind_py_exec(bridge, params, target):
     return bridge._py_exec(target, str(params["script"]))
 
@@ -4275,16 +4397,25 @@ def _bind_types_declare(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
-@op("batch_apply", lock="none")
+def _batch_apply_selector(params: dict[str, Any], target: str | None) -> Any:
+    """The selector `batch_apply` resolves: the manifest's, else the request's.
+
+    Keep None as None so the single-open-target default still applies;
+    str(None) would become the bogus selector "None". Presence, not
+    truthiness (#690 r4): an explicit-but-empty manifest target must error,
+    never collapse into the focused-tab convenience. Read by the binder AND
+    by the destructive gate in dispatch(), which is the point -- two readers
+    of this precedence disagreed (#736 review, P1).
+    """
+    manifest_target = params.get("target")
+    return manifest_target if manifest_target is not None else target
+
+
+@op("batch_apply", lock="none", destructive=True, selector=_batch_apply_selector)
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
-    # Keep None as None so the single-open-target default still applies;
-    # str(None) would become the bogus selector "None". Presence, not
-    # truthiness (#690 r4): an explicit-but-empty manifest target must error,
-    # never collapse into the focused-tab convenience.
-    manifest_target = manifest.get("target")
-    chosen = manifest_target if manifest_target is not None else target
+    chosen = _batch_apply_selector(manifest, target)
     if chosen is not None:
         if not isinstance(chosen, str):
             raise ValueError("batch_apply: target must be a string selector")

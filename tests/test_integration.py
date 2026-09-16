@@ -263,15 +263,18 @@ class TestSavePathIdentity:
 
     def test_bare_save_multi_target_gets_target_hint(self, shared_bn):
         # #663 end-to-end: bare `bn save` with two targets open in one headless
-        # instance (no active view) must exit 2 with the bridge's -t hint +
-        # open-target list -- the live behavior the mocked lanes structurally
-        # cannot see (their fakes hard-code the very message under test).
+        # instance must exit 2 with the -t hint + open-target list -- the live
+        # behavior the mocked lanes structurally cannot see (their fakes
+        # hard-code the very message under test). Since #688 the refusal comes
+        # from the registry's destructive gate rather than the resolver's
+        # no-active branch: save overwrites state, so it is refused on the
+        # COUNT, which also covers a GUI bridge where a focused tab exists.
         shared_bn.load(HELLO_BINARY)
         shared_bn.load(ADD_BINARY)
         result = shared_bn.run("save")
         assert result.returncode == 2, (result.stdout, result.stderr)
         err = result.stderr
-        assert "No active BinaryView is selected and multiple targets are open" in err
+        assert "save_database needs an explicit target when multiple targets are open (2)" in err
         assert "Pass -t <selector> (--target) to choose one." in err
         assert "Open targets:" in err
         # Prefix-matches both the raw and the .bndb-restored selector spelling.
@@ -279,15 +282,26 @@ class TestSavePathIdentity:
         assert "-t add_x86_64" in err
 
         # `-t active` (the documented copy-paste footgun, #366) collapses
-        # bridge-side to the same hint. Assert the discriminating first
+        # bridge-side to the same refusal. Assert the discriminating first
         # line, not just "Open targets:", which the unknown-selector error
         # also prints: if the bridge collapse regressed, `-t active` would
         # fall through to "Unknown target selector" and a looser assert
         # would stay green.
         result = shared_bn.run("save", "--target", "active")
         assert result.returncode == 2, (result.stdout, result.stderr)
-        assert "No active BinaryView is selected and multiple targets are open" \
+        assert "save_database needs an explicit target when multiple targets are open (2)" \
             in result.stderr
+
+        # A `require_target=True` command refuses in the CLI pre-flight
+        # instead, and must print the SAME grammar (#688) -- the two halves
+        # that used to disagree, checked against one live bridge.
+        result = shared_bn.run("target", "info")
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        assert "This command requires --target when multiple targets are open." \
+            in result.stderr
+        assert "Pass -t <selector> (--target) to choose one." in result.stderr
+        assert "-t hello_x86_64" in result.stderr
+        assert "note: view_id / target_id are stable across `bn save`" in result.stderr
 
         # `-t ""` is an explicit-but-empty selector (an unset shell
         # variable): #690 r3 rejects it CLI-side for every command -- it is
