@@ -450,6 +450,7 @@ def write_output_result(
     stem: str,
     spill_token_limit: int | None = None,
     provenance: dict[str, Any] | None = None,
+    rerun_hint: str | None = None,
 ) -> OutputWriteResult:
     # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
     if spill_token_limit is None:
@@ -521,7 +522,15 @@ def write_output_result(
             f"warning: failed to write spill artifact ({exc}); printing full output",
             file=sys.stderr,
         )
-        return OutputWriteResult(rendered=rendered)
+        # Nothing was written, so the FULL payload is on stdout -- exactly the case
+        # the slicing note exists for. Leaving `token_count` at its 0 default
+        # silenced it here, so a read 80x its armed bound arrived with no guidance
+        # at all (dogfood pass 3, reproduced on two targets).
+        return OutputWriteResult(
+            rendered=rendered,
+            token_count=token_count,
+            truncation_risk=token_count >= DEFAULT_SLICE_NOTE_TOKENS,
+        )
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,
@@ -534,12 +543,16 @@ def write_output_result(
     # #409: name the command-specific slicing knob + the threshold that tripped, so
     # the agent bounds the next read instead of re-running blind. BN_SPILL_TOKENS
     # raises/lowers the threshold.
-    artifact["rerun"] = _rerun_hint(stem, fmt)
+    # `rerun_hint` is what the CLI derived from the command's own parser; the
+    # stem-keyed fallback covers callers that did not derive one (direct library
+    # use), and is deliberately the SAME builder the no-spill note uses.
+    artifact["rerun"] = rerun_hint or _rerun_hint(stem, fmt)
     artifact["spill_token_limit"] = spill_token_limit
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),
         artifact=artifact,
         spilled=True,
+        token_count=token_count,
     )
 
 

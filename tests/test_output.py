@@ -275,6 +275,30 @@ def test_write_output_falls_back_to_full_output_when_spill_write_fails(
     assert "printing full output" in err
 
 
+def test_a_failed_spill_write_still_draws_the_slicing_note(tmp_path, monkeypatch, capsys):
+    """The OSError fallback puts the FULL payload on stdout, which is exactly the
+    case the slicing note exists for -- but that return left `token_count` at its
+    0 default, so a read 80x its armed bound arrived with no guidance at all
+    (dogfood pass 3, reproduced on two targets)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    def _boom(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("bn.output._write_private_bytes", _boom)
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions",
+                              spill_token_limit=1000)
+
+    assert res.spilled is False and res.artifact is None
+    assert res.token_count >= 10_000
+    assert res.truncation_risk is True
+    assert "printing full output" in capsys.readouterr().err
+
+
 def test_write_output_raises_clean_error_when_explicit_out_write_fails(
     tmp_path, monkeypatch
 ):
@@ -643,6 +667,7 @@ def test_opting_in_restores_spill_and_suppresses_the_note(tmp_path, monkeypatch)
                               out_path=None, stem="functions")
     assert res.spilled is True
     assert res.truncation_risk is False            # the configured limit governs
+    assert res.token_count > 0                     # documented as always populated
 
 
 def test_an_armed_threshold_above_the_payload_still_draws_the_note(tmp_path, monkeypatch):

@@ -81,30 +81,52 @@ def test_truncation_note_fires_when_output_is_not_spilled(monkeypatch, capsys):
     assert "spilled" not in stderr
 
 
-def test_the_slicing_note_and_the_envelope_hint_name_the_same_knob():
-    """Two builders answer "which flag bounds this command?" -- the envelope's
-    `rerun` remedy (`output._rerun_hint`) and the no-spill stderr note
-    (`cli._spill_next_step_hint`). Answering that separately is how
-    `function structured-il` came to be told `--out` while `--lines` worked, and
-    `evidence function` while `--limit`/`--address-window` worked (dogfood C1).
+def test_every_advised_flag_is_accepted_by_the_command_it_names():
+    """The no-spill note, the envelope's `rerun` and the near-spill warning all
+    print the hint `_call` derives from the command's own parser, so "they agree"
+    is true by construction. The assertion that matters is that the advice RUNS:
+    every flag a hint names must be accepted by the command it names it for.
 
-    `paged` is threaded from the command declaration at the real call sites, so
-    the paged case passes it here exactly as the CLI does.
+    Hand-maintained stem lists failed exactly this. Live: `taint models --limit`
+    and `local list --limit` exit 2, and `disasm --linear N --lines a:b` is
+    refused by the mutex group (dogfood pass 3, 4 structural divergences).
     """
-    from bn.output import _rerun_hint
+    import re
 
-    cases = (
-        ("functions", "--limit", {"paged": True}),
-        ("decompile", "--lines", {}),
-        ("il", "--lines", {}),
-        ("disasm", "--lines", {}),
-        ("structured-il", "--lines", {}),
-        ("function-evidence", "--address-window", {}),
-    )
-    for stem, flag, kwargs in cases:
-        assert flag in _rerun_hint(stem, "text"), stem
-        note = bn.cli._spill_next_step_hint(stem, text_format=True, **kwargs)
-        assert flag in note, f"{stem}: note offered {note!r}"
+    parser = bn.cli.build_parser()
+    checked = 0
+    for spec in bn.cli._COMMANDS:
+        accepted = bn.cli._known_option_strings(
+            bn.cli._selected_parser_for_argv(parser, list(spec["path"]))
+        )
+        for text_format in (True, False):
+            hint = bn.cli._slice_hint_for_command(spec["path"], text_format)
+            if hint is None:
+                continue
+            checked += 1
+            for flag in re.findall(r"--[a-z][a-z-]*", hint):
+                assert flag in accepted, (spec["path"], text_format, hint)
+
+    # Most of the registry derives a hint; a handful of commands have none.
+    assert checked > 100, checked
+
+
+def test_the_derived_hint_drops_the_flags_its_command_rejects():
+    """The three live counterexamples, pinned by command."""
+    taint = bn.cli._slice_hint_for_command(("taint", "models"), True) or ""
+    assert "--limit" not in taint and "--offset" not in taint
+
+    local = bn.cli._slice_hint_for_command(("local", "list"), True) or ""
+    assert "--limit" not in local
+
+    # disasm's window flags are one mutex group: whichever the caller used is the
+    # one that has to shrink, so every accepted spelling is named.
+    disasm = bn.cli._slice_hint_for_command(("disasm",), True) or ""
+    for flag in ("--lines", "--count", "--linear"):
+        assert flag in disasm, disasm
+
+    # A mutation's `--summary` keeps the status parseable; `--out` replaces it.
+    assert "--summary" in (bn.cli._slice_hint_for_command(("batch", "apply"), True) or "")
 
 
 def test_unrecognized_argument_routes_to_subcommand_usage(capsys):
