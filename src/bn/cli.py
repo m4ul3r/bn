@@ -727,7 +727,7 @@ def _render_result(
             sys.stdout.write(f"__BN_SPILLED__ {artifact_path}\n")
         sys.stdout.write(result.rendered)
         hint = _spill_next_step_hint(
-            stem, spill_context, artifact_path, paged=paged, text_format=(fmt == "text")
+            stem, artifact_path, paged=paged, text_format=(fmt == "text")
         )
         print(
             f"warning: {label} output spilled to {artifact_path}; {hint}",
@@ -755,6 +755,16 @@ def _render_result(
             "note: output is within 20% of the spill threshold; a slightly larger next "
             "read (next page / bigger scope) will spill to disk -- bound it with "
             "--limit/--offset/--lines, or raise BN_SPILL_TOKENS.",
+            file=sys.stderr,
+        )
+    elif result.truncation_risk:
+        # Spill is opt-in, so this payload reaches stdout in full and the consuming
+        # agent's harness truncates it. Name this command's own slicing knob -- the
+        # one thing no harness can derive (#409).
+        print(
+            f"note: output is {result.token_count} estimated tokens; a consuming agent "
+            f"truncates long tool output -- "
+            f"{_spill_next_step_hint(stem, paged=paged, text_format=(fmt == 'text'))}.",
             file=sys.stderr,
         )
     return False
@@ -997,8 +1007,7 @@ def _stdout_is_pipe() -> bool:
 
 def _spill_next_step_hint(
     stem: str,
-    spill_context: Any,
-    artifact_path: str,
+    artifact_path: str | None = None,
     *,
     paged: bool = False,
     text_format: bool = True,
@@ -1014,6 +1023,10 @@ def _spill_next_step_hint(
     ``--lines`` only slices the TEXT renderer, so it is only suggested for text
     output -- recommending it to a JSON consumer is a dead end (#120). In JSON
     mode the line-oriented commands fall through to the --out/artifact hint.
+
+    ``artifact_path`` is ``None`` when the caller prints this hint for output
+    that did NOT spill: there is no file to point at then, so the artifact
+    clause is dropped rather than naming a path that does not exist.
     """
 
     if text_format and stem in ("decompile", "il", "disasm"):
@@ -1023,9 +1036,12 @@ def _spill_next_step_hint(
     # and return a dict envelope rather than a bare list, #59).
     if paged:
         return "rerun with --limit/--offset to page through the results"
-    # The warning already names the artifact path ("spilled to <path>"); don't
-    # repeat it a second time in the hint (#49).
-    return "rerun with --out <path> to write it to a file, or read that artifact to inspect the full output"
+    hint = "rerun with --out <path> to write it to a file"
+    if artifact_path is None:
+        return hint
+    # The spill warning already names the artifact path ("spilled to <path>");
+    # don't repeat it a second time in the hint (#49).
+    return hint + ", or read that artifact to inspect the full output"
 
 
 class MultiTargetError(BridgeError):
@@ -1900,8 +1916,9 @@ def build_parser() -> argparse.ArgumentParser:
             "    function list    enumerate, filter, or count functions\n"
             "    function search  match by name or regex\n"
             "\n"
-            "Output over ~10k estimated tokens spills to disk; the command prints an\n"
-            "envelope with the artifact path. Read that file directly -- do not pipe to grep."
+            "Output spills to disk only when BN_SPILL_TOKENS is set; a larger read is\n"
+            "truncated by the consuming agent instead. Bound it with --limit/--lines, or\n"
+            "write it with --out; do not pipe a large read to grep."
         ),
     )
     parser.add_argument("--version", action="version", version=f"bn {VERSION}")

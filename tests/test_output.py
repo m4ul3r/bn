@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bn.output import DEFAULT_SPILL_TOKEN_LIMIT
+from bn.output import DEFAULT_SLICE_NOTE_TOKENS
 from bn.output import OutputWriteError
 from bn.output import estimate_tokens
 from bn.output import write_output
@@ -25,8 +25,8 @@ def _parse_envelope(text: str) -> dict[str, str]:
     return result
 
 
-def test_default_spill_token_limit_is_10k():
-    assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
+def test_default_slice_note_threshold_is_10k():
+    assert DEFAULT_SLICE_NOTE_TOKENS == 10_000
 
 
 def test_default_spill_retention_is_14_days_591():
@@ -317,18 +317,18 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
     assert int(envelope["tokens"]) == _token_count(artifact_text)
 
 
-def test_resolve_spill_limit_env_override_409(monkeypatch):
-    from bn.output import resolve_spill_limit, DEFAULT_SPILL_TOKEN_LIMIT
+def test_resolve_spill_limit_is_opt_in_409(monkeypatch):
+    from bn.output import resolve_spill_limit
     monkeypatch.delenv("BN_SPILL_TOKENS", raising=False)
-    assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+    assert resolve_spill_limit() is None          # unset -> never spill
     monkeypatch.setenv("BN_SPILL_TOKENS", "40000")
     assert resolve_spill_limit() == 40000
     monkeypatch.setenv("BN_SPILL_TOKENS", "0x1000")
     assert resolve_spill_limit() == 0x1000
-    # non-positive / junk -> default (never silently disable spill)
+    # non-positive / junk -> no threshold: a typo must never re-arm disk output
     for bad in ("0", "-5", "notanumber", ""):
         monkeypatch.setenv("BN_SPILL_TOKENS", bad)
-        assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+        assert resolve_spill_limit() is None
 
 
 def test_rerun_hint_names_slicing_knob_409():
@@ -616,3 +616,30 @@ def test_an_enormous_retention_window_still_returns_the_output_591(tmp_path, mon
 
     assert res.spilled is True
     assert res.artifact["bytes"] > 0
+
+
+def test_no_spill_by_default_and_truncation_risk_flagged(tmp_path, monkeypatch):
+    """The default writes nothing to disk and keeps the whole payload on stdout;
+    a payload this large is the consumer's problem, and the caller is told so."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("BN_SPILL_TOKENS", raising=False)
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False and res.artifact is None
+    assert res.truncation_risk is True and res.near_spill is False
+    assert res.token_count >= 10_000
+    assert not (tmp_path / "spills").exists()      # nothing touched the disk
+    assert "sub_003999" in res.rendered            # the payload, not an envelope
+    assert "artifact_path" not in res.rendered
+
+
+def test_opting_in_restores_spill_and_suppresses_the_note(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    res = write_output_result({"kind": "functions", "items": ["x" * 200]}, fmt="json",
+                              out_path=None, stem="functions")
+    assert res.spilled is True
+    assert res.truncation_risk is False            # the configured limit governs

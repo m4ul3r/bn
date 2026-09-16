@@ -25,11 +25,15 @@ class OutputWriteError(BridgeError):
     """
 
 
-DEFAULT_SPILL_TOKEN_LIMIT = 10_000
+# Rendered payload size (in estimated tokens) past which the caller prints its
+# slicing note instead of staying silent. NOT a spill threshold: spilling is
+# opt-in via BN_SPILL_TOKENS (#409), so by default a payload this large goes to
+# stdout whole and the consuming agent's harness bounds what it reads.
+DEFAULT_SLICE_NOTE_TOKENS = 10_000
 # Offline token estimate: ~3 bytes of UTF-8 per token. Deliberately
 # conservative for the decompiled-code/JSON output this tool produces (which
-# tokenizes denser than prose), so oversized output spills to disk a little
-# early rather than flooding the consuming agent's context. This replaces a
+# tokenizes denser than prose), so a large payload is flagged a little early
+# rather than flooding the consuming agent's context. This replaces a
 # tiktoken dependency that downloaded the OpenAI BPE at runtime and crashed
 # every command on offline machines.
 TOKEN_ESTIMATE_BYTES_PER_TOKEN = 3
@@ -40,10 +44,18 @@ class OutputWriteResult:
     rendered: str
     artifact: dict[str, Any] | None = None
     spilled: bool = False
-    # #409: True when output did NOT spill but is within 20% of the threshold -- a
-    # cheap preflight signal that a slightly larger read (next page / bigger fn) will
-    # spill, so an agent can pre-emptively slice. Surfaced by the caller on stderr.
+    # #409: True when output did NOT spill but is within 20% of the CONFIGURED spill
+    # threshold -- a cheap preflight signal that a slightly larger read (next page /
+    # bigger fn) will spill, so an agent can pre-emptively slice. Surfaced by the
+    # caller on stderr, and only ever set when a threshold is configured at all.
     near_spill: bool = False
+    # Estimated tokens of the RENDERED payload, always populated. Lets the caller
+    # name a size in the slicing note without re-encoding the string.
+    token_count: int = 0
+    # No spill threshold configured and the payload exceeds DEFAULT_SLICE_NOTE_TOKENS:
+    # nothing was written to disk, but a consuming agent truncates tool output this
+    # large. Mutually exclusive with `near_spill` (which only exists under opt-in).
+    truncation_risk: bool = False
 
 
 def _json_default(value: Any) -> Any:
@@ -245,20 +257,27 @@ def estimate_tokens(encoded: bytes) -> int:
     return -(-len(encoded) // TOKEN_ESTIMATE_BYTES_PER_TOKEN)
 
 
-def resolve_spill_limit(default: int = DEFAULT_SPILL_TOKEN_LIMIT) -> int:
-    """The spill threshold in estimated tokens (#409). Overridable via the
-    ``BN_SPILL_TOKENS`` env var so an agent with a bigger/smaller context window can
-    raise or lower the on-disk-spill point (e.g. ``BN_SPILL_TOKENS=40000``). A
-    non-positive / non-numeric value falls back to the default rather than disabling
-    spill silently (an unbounded read could flood the context)."""
+def resolve_spill_limit() -> int | None:
+    """The opt-in spill threshold in estimated tokens (#409), or ``None``.
+
+    Spilling is OFF unless ``BN_SPILL_TOKENS`` names a positive integer: the
+    default is to write the full rendered payload to stdout and let the
+    consuming agent's harness bound what it reads. Unset, empty, whitespace,
+    non-numeric, zero and negative all mean "no spill" -- a typo can never
+    silently re-arm disk output.
+
+    A caller that passes ``spill_token_limit=`` explicitly bypasses this
+    resolver entirely and forces the threshold it named (test and programmatic
+    use).
+    """
     raw = os.environ.get("BN_SPILL_TOKENS")
     if raw is None or not raw.strip():
-        return default
+        return None
     try:
         value = int(raw.strip(), 0)
     except ValueError:
-        return default
-    return value if value > 0 else default
+        return None
+    return value if value > 0 else None
 
 
 # Per-command rerun/slicing knob named in a spill envelope so an agent bounds the
@@ -463,14 +482,23 @@ def write_output_result(
             rendered=render_envelope(artifact, fmt),
             artifact=artifact,
             spilled=False,
+            token_count=token_count,
         )
 
-    if token_count <= spill_token_limit:
-        # #409: flag a read that fit but is within 20% of the threshold, so the caller
-        # can warn that a slightly larger next read (next page / bigger function) will
-        # spill -- a preflight signal without a second run.
+    if spill_token_limit is None or token_count <= spill_token_limit:
+        if spill_token_limit is None:
+            # Opt-in spill is off: the full payload is on stdout, so a read this
+            # large is bounded by the consumer's harness, not by us.
+            return OutputWriteResult(
+                rendered=rendered,
+                token_count=token_count,
+                truncation_risk=token_count >= DEFAULT_SLICE_NOTE_TOKENS,
+            )
+        # #409: fit, but within 20% of the CONFIGURED threshold, so the caller can warn
+        # that a slightly larger next read (next page / bigger function) will spill --
+        # a preflight signal without a second run.
         near = token_count >= (spill_token_limit * 4) // 5
-        return OutputWriteResult(rendered=rendered, near_spill=near)
+        return OutputWriteResult(rendered=rendered, near_spill=near, token_count=token_count)
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     try:

@@ -59,6 +59,28 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
     )
 
 
+def test_truncation_note_fires_when_output_is_not_spilled(monkeypatch, capsys):
+    """Spill is opt-in, so the slicing note is the agent's only signal that a large
+    read will be truncated -- it must name this command's real paging flag."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"items": [], "total": 0}}
+
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
+        assert stem == "functions"
+        return _oversized_unspilled_namespace()
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+
+    rc = bn.cli.main(["function", "list", "--target", "active"])
+
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "12345 estimated tokens" in stderr
+    assert "--limit/--offset" in stderr
+    assert "spilled" not in stderr
+
+
 def test_unrecognized_argument_routes_to_subcommand_usage(capsys):
     parser = bn.cli.build_parser()
 
