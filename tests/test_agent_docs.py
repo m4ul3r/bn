@@ -657,6 +657,22 @@ _EXIT_CODE_ECHOES = (
     ("skills/bn/reference/mutating.md", "unmeasured-live-success",
      r"An unmeasured \*\*live\*\* success also changes the exit code: it is \*\*`(?P<code>\d)`\*\*",
      "unmeasured"),
+    # ...and the three digits the REST of that paragraph states, which is where
+    # round 1 of this repair stopped: each sits in an inline code span, and the
+    # kind that excuses `--limit 50` excused them too, so `distinct from \`3\``
+    # could be rewritten to `distinct from \`2\`` -- exit 2 for a mutation
+    # failure, which this same file refutes 120 lines up -- with every cell
+    # green. One cell per digit, each measured against the case the clause
+    # names: the 4 it contrasts, the failure it is not, and the clean run it is
+    # not. The digit NOT captured by a cell is written literally into that
+    # cell's pattern, so flipping either half stops the match and reds.
+    ("skills/bn/reference/mutating.md", "the-unmeasured-4-it-contrasts",
+     r"`(?P<code>\d)`\s+is\s+distinct\s+from\s+`3`\s+\(a\s+failure", "unmeasured"),
+    ("skills/bn/reference/mutating.md", "not-the-failure-3",
+     r"`4`\s+is\s+distinct\s+from\s+`(?P<code>\d)`\s+\(a\s+failure", "failing"),
+    ("skills/bn/reference/mutating.md", "not-the-clean-0",
+     r"and\s+from\s+`(?P<code>\d)`\s+\(a\s+verified\s+or\s+measured\s+all-`noop`\s+run\)",
+     "verified"),
     # The same rule stated for the other KIND of call, two paragraphs down. Its
     # digit sits in an inline code span and nothing else on the line carries a
     # number, so the kind that excuses `--limit 50` excused this `4` too and
@@ -1049,9 +1065,28 @@ def _non_claim_numbers(text: str) -> bytearray:
     return excused
 
 
-def _number_lines(doc: str) -> list[tuple[str, str, list[str]]]:
-    """(where, normalized line, residual tokens) for every line carrying a
-    number that no cell pins and no kind excuses.
+def _normalized_offset(raw: str, index: int) -> int:
+    """Where `raw[index]` lands in the normalized form of *raw*.
+
+    A declaration is keyed by a phrase of the NORMALIZED line, while a token's
+    position is read off the RAW one -- those are the offsets the pin and kind
+    bitmaps are indexed by. Whitespace is the only difference between the two,
+    so collapsing the prefix exactly as `_doc_lines` does states both in one
+    coordinate, which is what scoping an exemption to a phrase's SPAN needs.
+    """
+    prefix = " ".join(raw[:index].split())
+    if not prefix:
+        return 0
+    return len(prefix) + (1 if raw[index - 1].isspace() else 0)
+
+
+def _number_lines(doc: str) -> list[tuple[str, str, list[tuple[str, int]]]]:
+    """(where, normalized line, residual (token, offset)) for every line
+    carrying a number that no cell pins and no kind excuses.
+
+    The offset is the token's position in the NORMALIZED line, which is the
+    coordinate a declaration's phrase span is stated in: an exemption is scoped
+    to that span, so the position has to travel with the token.
 
     The residual is per TOKEN, not per line. Excused per line, one entry covered
     every number on it: `README.md`'s contract paragraph carries eight
@@ -1076,7 +1111,8 @@ def _number_lines(doc: str) -> list[tuple[str, str, list[str]]]:
                 continue
             if excused[offset] and not _EXIT_WORD_TOKEN.match(match.group(0)):
                 continue
-            residual.append(match.group(0).lower())
+            residual.append((match.group(0).lower(),
+                             _normalized_offset(raw, match.start())))
         if residual:
             rows.append((f"line {at}", normalized, residual))
     return rows
@@ -1088,23 +1124,47 @@ def _declared_reasons(doc: str) -> list[str]:
             if declared_doc == doc]
 
 
+def _declared_spans(doc: str, normalized: str) -> list[tuple[int, int]]:
+    """Where each declaration's phrase actually sits in *normalized*."""
+    return [match.span()
+            for phrase in _declared_reasons(doc)
+            for match in re.finditer(re.escape(phrase), normalized)]
+
+
+def _undeclared_tokens(doc: str, normalized: str,
+                       residual: list[tuple[str, int]]) -> list[str]:
+    """*residual* minus the exit words a declaration's own SPAN covers.
+
+    A declaration excuses the exit words inside the phrase it is keyed by, not
+    every exit word the physical line happens to carry. Ruling on the LINE, even
+    a subject-qualified key handed its exemption to whatever was appended beside
+    it: `The up-front/apply-time distinction does **not** change the exit code;
+    the output format does not change the exit code either` kept the declaration
+    matching and parked a false claim next to the true one. No key is long
+    enough to fix that -- a line holds however many assertions someone writes on
+    it -- so the scope is the phrase, and the second claim needs its own
+    declaration or a cell.
+    """
+    spans = _declared_spans(doc, normalized)
+    return [token for token, at in residual
+            if not (_EXIT_WORD_TOKEN.match(token)
+                    and any(start <= at < end for start, end in spans))]
+
+
 def _unaccounted_number_lines(doc: str) -> list[str]:
     """Lines carrying a number that no cell pins, no kind excuses and no
     declaration rules on.
 
-    A declaration rules on the line's EXIT WORDS and nothing else, so a numbered
-    claim appended to a declared line is still unaccounted -- excusing the whole
-    line is how a paragraph carrying eight pinned digits became exempt from this
-    half in the first place.
+    A declaration rules on the exit words in its own span and nothing else, so a
+    numbered claim appended to a declared line is still unaccounted -- excusing
+    the whole line is how a paragraph carrying eight pinned digits became exempt
+    from this half in the first place.
     """
-    declared = _declared_reasons(doc)
     unaccounted = []
     for where, normalized, residual in _number_lines(doc):
-        if any(phrase in normalized for phrase in declared):
-            residual = [token for token in residual
-                        if not _EXIT_WORD_TOKEN.match(token)]
-        if residual:
-            unaccounted.append(f"{where} ({', '.join(residual)}): {normalized[:140]}")
+        tokens = _undeclared_tokens(doc, normalized, residual)
+        if tokens:
+            unaccounted.append(f"{where} ({', '.join(tokens)}): {normalized[:140]}")
     return unaccounted
 
 
@@ -1176,6 +1236,15 @@ def test_no_agent_doc_carries_a_number_nothing_accounts_for(doc: str):
 # the restart code. So one declaration per assertion, subject included: a
 # rewritten subject stale-fails `test_no_declared_exit_word_entry_is_stale`
 # instead of inheriting the exemption.
+#
+# The length of the key is not what holds any of this together, though -- a
+# line holds however many assertions someone writes on it, and appending a
+# second `does not change the exit code` beside the declared one was still
+# absorbed while the key matched. `_undeclared_tokens` scopes each exemption to
+# the SPAN its phrase occupies, so a neighbouring claim is unaccounted for no
+# matter how specific the key beside it is. The subject stays in the key
+# because that is what makes the exemption reviewable, not because it is the
+# mechanism.
 DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
     ("README.md", "a script that only checks `$?` cannot read an unconfirmed "
                   "write as a clean success"):
@@ -1232,20 +1301,29 @@ DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
 _EXIT_WORD_TOKEN = re.compile(rf"^(?:{_EXIT_WORDS})$", re.I)
 
 
-def _parked_exit_word_lines() -> set[tuple[str, str]]:
-    """Every line whose residual NAMES an exit rather than a number, keyed by
-    the document and the line's own normalized text.
+def _declarations_in_use() -> set[tuple[str, str]]:
+    """Every declaration whose own SPAN really covers a residual exit word.
 
     Keyed by LINE NUMBER, a reason followed the position rather than the text:
     swapping the contents of two declared lines left both cells green with each
     reason excusing the other line, and inserting a line above one re-pointed
-    its declaration at a stranger. So this keys on content, and so does the
-    declaration that rules on it.
+    its declaration at a stranger. So this keys on content -- and on the span
+    the content occupies, because "the phrase is still somewhere on a parked
+    line" is not the same as "the phrase is still excusing something": a
+    declaration whose exit word a cell has since pinned is dead weight, and dead
+    weight is where the next claim parks.
     """
-    return {(doc, normalized)
-            for doc in EXIT_CODE_DOCS
-            for _, normalized, residual in _number_lines(doc)
-            if any(_EXIT_WORD_TOKEN.match(token) for token in residual)}
+    in_use = set()
+    for doc in EXIT_CODE_DOCS:
+        for _, normalized, residual in _number_lines(doc):
+            exits = [at for token, at in residual if _EXIT_WORD_TOKEN.match(token)]
+            if not exits:
+                continue
+            for phrase in _declared_reasons(doc):
+                for match in re.finditer(re.escape(phrase), normalized):
+                    if any(match.start() <= at < match.end() for at in exits):
+                        in_use.add((doc, phrase))
+    return in_use
 
 
 def test_no_parked_line_carries_an_undeclared_exit_word():
@@ -1257,8 +1335,10 @@ def test_no_parked_line_carries_an_undeclared_exit_word():
     """
     undeclared = sorted(
         f"{doc}: {normalized[:120]}"
-        for doc, normalized in _parked_exit_word_lines()
-        if not any(phrase in normalized for phrase in _declared_reasons(doc))
+        for doc in EXIT_CODE_DOCS
+        for _, normalized, residual in _number_lines(doc)
+        if any(_EXIT_WORD_TOKEN.match(token)
+               for token in _undeclared_tokens(doc, normalized, residual))
     )
     assert not undeclared, (
         "these parked lines name an exit and no cell pins them, so whether they "
@@ -1271,12 +1351,7 @@ def test_no_parked_line_carries_an_undeclared_exit_word():
 def test_no_declared_exit_word_entry_is_stale():
     """...and the declarations stale-fail too, so the list cannot outlive the
     lines it rules on and become the next place a claim can park."""
-    parked = _parked_exit_word_lines()
-    stale = sorted(
-        (doc, phrase) for doc, phrase in DECLARED_NON_EXIT_CODE_WORDS
-        if not any(parked_doc == doc and phrase in normalized
-                   for parked_doc, normalized in parked)
-    )
+    stale = sorted(set(DECLARED_NON_EXIT_CODE_WORDS) - _declarations_in_use())
     assert not stale, (
         "these declarations rule on a parked exit word that is no longer there "
         f"(the line moved, was pinned, or was rewritten): {stale}"

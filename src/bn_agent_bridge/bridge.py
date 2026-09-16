@@ -271,6 +271,12 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
+# The selector grammar the bridge pins onto an implicit destructive request.
+# Resolvable by exact target_id only (see `_matches_record`), so it can never
+# be satisfied by a view that merely spells the id in its filename.
+PINNED_TARGET_PREFIX = "target_id:"
+
+
 def _same_view(left: Any, right: Any) -> bool:
     """Whether two wrappers stand for the same core BinaryView.
 
@@ -596,6 +602,15 @@ class TargetManager:
         candidate = str(selector).strip()
         if candidate in ("", "active"):
             return False
+        if candidate.startswith(PINNED_TARGET_PREFIX):
+            # An identity the BRIDGE pinned (the destructive gate, #736 review
+            # round 2) resolves by exact target_id and by nothing else. Every
+            # fallback below is a convenience for a HUMAN selector -- basename,
+            # a .bndb-stripped core, a path tail -- and a pin that kept them
+            # could match a *different* view whose filename happened to spell
+            # the pinned id (`/corpus/<pinned-id>.bndb`), which is exactly the
+            # wrong-target write the pin exists to prevent.
+            return candidate[len(PINNED_TARGET_PREFIX):] == record.target_id()
         if candidate in (
             record.target_id(),
             record.view_id,
@@ -818,32 +833,43 @@ class TargetManager:
         ``""`` meant 'the focused tab' here while meaning 'error' on close
         (#688). Hosted once, driven by ``destructive=True`` in the op registry.
 
-        Returns the stable ``target_id`` the caller must forward instead of the
-        volatile selector, or None to leave the request untouched. Counting is
-        not enough on its own: the handler resolves the selector AGAIN, later,
-        and for a ``lock="none"`` op outside the gate's lock entirely -- so a
-        close/load between the two landed the operation on a different binary
-        with the count check green (#736 review, P1). Pinning the id the count
-        was taken on makes that case a safe unknown-selector error, the same
+        Returns the pinned selector the caller must forward instead of the
+        volatile one, or None when the request already names a concrete
+        target. Counting is not enough on its own: the handler resolves the
+        selector AGAIN, later, and for a ``lock="none"`` op outside the gate's
+        lock entirely -- so a close/load between the two landed the operation
+        on a different binary with the count check green (#736 review, P1).
+        The pin carries the ``PINNED_TARGET_PREFIX``, which ``_matches_record``
+        resolves by exact ``target_id`` and by nothing else, so a replaced view
+        fails as an unknown selector instead of being substituted -- the same
         trade the CLI's ``_implicit_target`` makes (#690 R3) and the same
         snapshot discipline ``_resolve_sole_target_for_close`` follows.
+
+        Nothing implicit is ever forwarded unbound (#736 review round 2): an
+        explicit-but-empty selector is refused here rather than left to each
+        handler (``py_exec`` and ``go_rename`` have no such check, so theirs
+        fell through to the focused tab), and an empty snapshot is refused
+        here rather than trusted to raise later (a concurrent load between the
+        count and the handler's resolve made that assumption false).
 
         ``strict=True`` for the same reason the close gate uses it: a per-tab
         UI exception makes ``refresh()`` silently lossy, and a count that hid
         the second open tab would wave the request through.
         """
-        if selector not in (None, "", "active"):
+        if isinstance(selector, str) and not selector.strip():
+            raise RuntimeError(
+                f"{op_name}: empty target selector; pass a selector from "
+                "list_targets or omit the target entirely. An unset shell "
+                "variable must not resolve to whichever view happens to be "
+                "focused."
+            )
+        if selector not in (None, "active"):
             return None
         targets = self.refresh(strict=True)
         if not targets:
-            return None                     # the handler raises its own error
+            raise RuntimeError("No BinaryView targets are open")
         if len(targets) == 1:
-            # "" is never pinned: an explicit-but-empty selector is each
-            # destructive handler's own error (#690 r4), and substituting a
-            # real id for it would replace that refusal with a silent success.
-            # It is still COUNTED above, because `py_exec` / `go_rename` have
-            # no such check and would otherwise fall through to the focused tab.
-            return None if selector == "" else str(targets[0]["target_id"])
+            return f"{PINNED_TARGET_PREFIX}{targets[0]['target_id']}"
         raise RuntimeError(
             format_multi_target_hint(
                 f"{op_name} needs an explicit target when multiple targets "

@@ -1986,14 +1986,12 @@ def test_dispatch_envelope_carries_multiline_target_hint(monkeypatch):
     bridge._headless_views.clear()
 
 
-@pytest.mark.parametrize("selector", [None, "", "active"])
+@pytest.mark.parametrize("selector", [None, "active"])
 def test_destructive_op_refuses_a_bare_target_while_several_are_open(monkeypatch, selector):
     """#688: `resolve()` keeps a count-free focused-tab convenience for
     None/""/"active", so a raw bare-target save/batch_apply/py_exec acted on
     whichever tab had focus. The gate is declared in the op registry and
-    enforced in dispatch, so every destructive op inherits it -- including the
-    wire value "", which meant 'error' on close and 'focused tab' everywhere
-    else."""
+    enforced in dispatch, so every destructive op inherits it."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
@@ -2033,18 +2031,54 @@ def test_destructive_op_still_resolves_the_sole_open_target(monkeypatch):
     bridge._headless_views.clear()
 
 
+@pytest.mark.parametrize("op_name,params", [
+    ("save_database", {}),
+    ("py_exec", {"script": "1"}),
+    ("batch_apply", {"ops": []}),
+    ("go_rename", {}),
+])
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_destructive_op_refuses_an_explicitly_empty_selector(monkeypatch, op_name, params, empty):
+    """An unset shell variable must never resolve to the focused view. The
+    refusal is the gate's, not each handler's: `py_exec` and `go_rename` have
+    no empty-selector check of their own, so theirs fell through to the
+    focused-tab convenience (#736 review round 2). One open target, so this
+    cannot pass on the count check."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: bv)
+
+    resp = instance.dispatch({"op": op_name, "params": params, "target": empty})
+    assert resp["ok"] is False, resp
+    assert f"{op_name}: empty target selector" in resp["error"]
+    bridge._headless_views.clear()
+
+
+def test_a_destructive_op_refuses_when_the_snapshot_has_no_targets(monkeypatch):
+    # The gate used to return None here and trust the handler to raise, which
+    # a concurrent load between the count and the handler's resolve made false
+    # (#736 review round 2). Refuse on the snapshot that was actually counted.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(RuntimeError, match="No BinaryView targets are open"):
+        instance.targets.pin_destructive_target("save_database", None)
+
+
 def test_a_bare_destructive_request_is_pinned_to_the_sole_target_id(monkeypatch):
     """Counting alone left the hole open (#736 review): the handler resolves
     the volatile selector AGAIN, later, and for a `lock="none"` op outside the
     gate's lock entirely -- so a close/load in between landed the write on a
     different binary with the count check green. The gate now forwards the
-    stable target_id the count was taken on, which a replaced view fails as an
-    unknown selector instead of silently accepting."""
+    identity it counted, and that identity resolves by exact target_id ONLY --
+    a pin that kept the human-selector fallbacks could still be satisfied by a
+    different view whose filename spelled the id (round 2)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
     _register_views(bridge, bv)
-    pinned = instance.targets.refresh()[0]["target_id"]
+    target_id = instance.targets.refresh()[0]["target_id"]
 
     seen = []
 
@@ -2057,12 +2091,16 @@ def test_a_bare_destructive_request_is_pinned_to_the_sole_target_id(monkeypatch)
     assert resp["ok"] is True, resp
     # Not None and not "active": the handler can no longer re-decide which
     # view a bare request meant.
+    pinned = f"{bridge.PINNED_TARGET_PREFIX}{target_id}"
     assert seen == [pinned]
+    assert instance.targets.resolve(pinned) is bv
 
-    # And the pin is what makes the race safe: once that view is gone, the
-    # forwarded id resolves to nothing rather than to whatever replaced it.
+    # The pin is what makes the race safe: once that view is gone, the
+    # forwarded identity resolves to nothing -- including when the view that
+    # replaced it is NAMED after the pinned id, which every basename/.bndb
+    # fallback in `_matches_record` would otherwise match.
     bridge._headless_views.clear()
-    _register_views(bridge, _FakeFileBV("/corpus/other.bndb", session_id="2"))
+    _register_views(bridge, _FakeFileBV(f"/corpus/{target_id}.bndb", session_id="2"))
     with pytest.raises(RuntimeError, match="Unknown target selector"):
         instance.targets.resolve(pinned)
     bridge._headless_views.clear()
