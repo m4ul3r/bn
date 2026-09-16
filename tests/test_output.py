@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bn.output import DEFAULT_SPILL_TOKEN_LIMIT
+from bn.output import DEFAULT_SLICE_NOTE_TOKENS
 from bn.output import OutputWriteError
 from bn.output import estimate_tokens
 from bn.output import write_output
@@ -25,8 +25,8 @@ def _parse_envelope(text: str) -> dict[str, str]:
     return result
 
 
-def test_default_spill_token_limit_is_10k():
-    assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
+def test_default_slice_note_threshold_is_10k():
+    assert DEFAULT_SLICE_NOTE_TOKENS == 10_000
 
 
 def test_default_spill_retention_is_14_days_591():
@@ -275,6 +275,48 @@ def test_write_output_falls_back_to_full_output_when_spill_write_fails(
     assert "printing full output" in err
 
 
+def test_a_failed_spill_write_still_draws_the_slicing_note(tmp_path, monkeypatch, capsys):
+    """The OSError fallback puts the FULL payload on stdout, which is exactly the
+    case the slicing note exists for -- but that return left `token_count` at its
+    0 default, so a read 80x its armed bound arrived with no guidance at all
+    (dogfood pass 3, reproduced on two targets)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    def _boom(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("bn.output._write_private_bytes", _boom)
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions",
+                              spill_token_limit=1000)
+
+    assert res.spilled is False and res.artifact is None
+    assert res.token_count >= 10_000
+    assert res.truncation_risk is True
+    assert "printing full output" in capsys.readouterr().err
+
+
+def test_a_failed_spill_below_the_default_still_draws_the_note(tmp_path, monkeypatch, capsys):
+    """An ARMED threshold below 10 000 is a request for a file at that size, so
+    when the write fails the note must fire from the ARMED bound rather than the
+    default: armed 50 with a 2 823-token payload (56x the bound) printed the
+    failure warning and no guidance at all (dogfood pass 4)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.output._write_private_bytes",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError(28, "full")))
+
+    for limit, tokens in ((50, 2823), (1000, 5608)):
+        res = write_output_result("A" * (tokens * 3 - 1), fmt="text", out_path=None,
+                                  stem="functions", spill_token_limit=limit)
+        assert res.spilled is False and res.token_count == tokens
+        assert res.truncation_risk is True, (limit, tokens)
+    assert "failed to write spill artifact" in capsys.readouterr().err
+
+
 def test_write_output_raises_clean_error_when_explicit_out_write_fails(
     tmp_path, monkeypatch
 ):
@@ -317,58 +359,46 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
     assert int(envelope["tokens"]) == _token_count(artifact_text)
 
 
-def test_resolve_spill_limit_env_override_409(monkeypatch):
-    from bn.output import resolve_spill_limit, DEFAULT_SPILL_TOKEN_LIMIT
+def test_resolve_spill_limit_is_opt_in_409(monkeypatch):
+    from bn.output import resolve_spill_limit
     monkeypatch.delenv("BN_SPILL_TOKENS", raising=False)
-    assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+    assert resolve_spill_limit() is None          # unset -> never spill
     monkeypatch.setenv("BN_SPILL_TOKENS", "40000")
     assert resolve_spill_limit() == 40000
     monkeypatch.setenv("BN_SPILL_TOKENS", "0x1000")
     assert resolve_spill_limit() == 0x1000
-    # non-positive / junk -> default (never silently disable spill)
+    # non-positive / junk -> no threshold: a typo must never re-arm disk output
     for bad in ("0", "-5", "notanumber", ""):
         monkeypatch.setenv("BN_SPILL_TOKENS", bad)
-        assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+        assert resolve_spill_limit() is None
 
 
-def test_rerun_hint_names_slicing_knob_409():
-    from bn.output import _rerun_hint
-    assert "--limit" in _rerun_hint("functions")
-    assert "--limit" in _rerun_hint("class-list")
-    assert "--lines" in _rerun_hint("disasm")
-    assert "--address-window" in _rerun_hint("function-evidence")
-    # unknown stem still points at the spilled file + generic knobs
-    assert "spilled file" in _rerun_hint("something-new")
-    # decompile DOES have a text slicing knob (--lines START:END); the hint must
-    # never claim otherwise, and must name the pointer key the consumer's
-    # envelope actually renders (`path` in text, `artifact_path` in json).
-    text_hint = _rerun_hint("decompile", "text")
-    assert "--lines" in text_hint
-    assert "no in-line slicing knob" not in text_hint
-    assert "`path`" in text_hint
-    # --lines is text-only: a json spill must not send the consumer down a flag
-    # that errors (#120); it points at the artifact + --out instead.
-    json_hint = _rerun_hint("decompile", "json")
-    assert "--lines" not in json_hint
-    assert "--out" in json_hint
-    assert "`artifact_path`" in json_hint
-    # disasm/il inherit the same format-awareness
-    assert "--lines" not in _rerun_hint("il", "json")
+def test_the_envelope_carries_a_derived_rerun_hint_and_none_without_one(tmp_path, monkeypatch):
+    """The `rerun` key is the CLI's DERIVED hint, handed in by `_render_result`.
 
-
-def test_spill_envelope_carries_rerun_hint_and_limit_409(tmp_path, monkeypatch):
-    from bn.output import write_output_result
+    The stem-keyed builder that used to live in this module is gone (it named
+    flags its command rejects), so a direct library call with no hint gets no
+    `rerun` key at all -- there is no command to name a flag for -- and a hint
+    passed in is what the envelope (and its text rendering) carries.
+    """
+    from bn.output import render_artifact_envelope, write_output_result
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     value = {"kind": "functions", "items": [{"name": f"f{i}"} for i in range(500)], "total": 500}
+
+    derived = "rerun with --limit/--offset to page through the results"
     res = write_output_result(value, fmt="json", out_path=None, stem="functions",
-                              spill_token_limit=64)
+                              spill_token_limit=64, rerun_hint=derived)
     assert res.spilled is True
-    assert res.artifact["rerun"] and "--limit" in res.artifact["rerun"]
+    assert res.artifact["rerun"] == derived
     assert res.artifact["spill_token_limit"] == 64
     assert "rerun" in res.rendered  # rendered JSON envelope carries the knob key
-    # text-format envelope renders it as a rerun: line
-    from bn.output import render_artifact_envelope
     assert "rerun:" in render_artifact_envelope(res.artifact)
+
+    bare = write_output_result(value, fmt="json", out_path=None, stem="functions",
+                               spill_token_limit=64)
+    assert bare.spilled is True
+    assert "rerun" not in bare.artifact
+    assert "rerun" not in bare.rendered
 
 
 def test_near_spill_flag_409(tmp_path, monkeypatch):
@@ -616,3 +646,54 @@ def test_an_enormous_retention_window_still_returns_the_output_591(tmp_path, mon
 
     assert res.spilled is True
     assert res.artifact["bytes"] > 0
+
+
+def test_no_spill_by_default_and_truncation_risk_flagged(tmp_path, monkeypatch):
+    """The default writes nothing to disk and keeps the whole payload on stdout;
+    a payload this large is the consumer's problem, and the caller is told so."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("BN_SPILL_TOKENS", raising=False)
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False and res.artifact is None
+    assert res.truncation_risk is True and res.near_spill is False
+    assert res.token_count >= 10_000
+    assert not (tmp_path / "spills").exists()      # nothing touched the disk
+    assert "sub_003999" in res.rendered            # the payload, not an envelope
+    assert "artifact_path" not in res.rendered
+
+
+def test_opting_in_restores_spill_and_suppresses_the_note(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    res = write_output_result({"kind": "functions", "items": ["x" * 200]}, fmt="json",
+                              out_path=None, stem="functions")
+    assert res.spilled is True
+    assert res.truncation_risk is False            # the configured limit governs
+    assert res.token_count > 0                     # documented as always populated
+
+
+def test_an_armed_threshold_above_the_payload_still_draws_the_note(tmp_path, monkeypatch):
+    """Arming a threshold ABOVE the payload used to silence the note entirely, so
+    a read between 10 000 tokens and 80 % of the threshold got no slicing guidance
+    at all -- while the same read with nothing armed printed it (dogfood C3)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {"kind": "functions",
+               "items": [f"0x401000 sub_{i:06d}" for i in range(4000)]}
+
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1000000")     # far above the payload
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False and res.near_spill is False
+    assert res.truncation_risk is True
+    assert not (tmp_path / "spills").exists()
+
+    # Inside the 20 % band the sharper signal replaces it; two notes for one read
+    # is noise.
+    monkeypatch.setenv("BN_SPILL_TOKENS", "30000")        # the payload is ~29 344
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
+    assert res.spilled is False
+    assert res.near_spill is True and res.truncation_risk is False

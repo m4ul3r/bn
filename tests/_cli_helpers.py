@@ -24,6 +24,16 @@ def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
     )
 
 
+def _oversized_unspilled_namespace(tokens: int = 12345) -> types.SimpleNamespace:
+    """The default-mode counterpart of `_spill_artifact_namespace`: nothing was
+    written to disk, the payload is on stdout, and the caller must warn that a
+    consumer will truncate it."""
+    return types.SimpleNamespace(
+        rendered="ok: true\n", spilled=False, artifact=None,
+        near_spill=False, truncation_risk=True, token_count=tokens,
+    )
+
+
 def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None,
                           spawn_missing_named=False, resolved=False, **kwargs):
     return {"ok": True, "result": {"functions": [], "total": 0, "offset": 0,
@@ -109,4 +119,4 @@ def _capture_xrefs_call(monkeypatch):
     return captured
 
 
-__all__ = ['_spill_artifact_namespace', '_zero_function_search', '_zero_function_search_count', '_empty_xrefs', 'tmp_session', '_fake_bridge_instance', '_load_capture', '_assert_no_bridge_call', '_capture_xrefs_call']
+__all__ = ['_spill_artifact_namespace', '_oversized_unspilled_namespace', '_zero_function_search', '_zero_function_search_count', '_empty_xrefs', 'tmp_session', '_fake_bridge_instance', '_load_capture', '_assert_no_bridge_call', '_capture_xrefs_call']

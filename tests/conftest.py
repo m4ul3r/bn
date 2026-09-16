@@ -532,10 +532,13 @@ _COLOR_FORCING_VARS = ("FORCE_COLOR", "CLICOLOR_FORCE", "PYTHON_COLORS")
 #:   (runtime.md) and silently redirects instance resolution for any test that
 #:   does not pin one -- most visibly `session stop`'s no-sticky-fallback
 #:   guard (#588), which an ambient value bypasses exactly like an explicit -i.
+#: - `BN_SPILL_TOKENS`, the opt-in spill threshold (#409): an ambient value
+#:   re-arms disk output for every test that assumes the default, which is now
+#:   "print the payload, write nothing".
 #:
 #: A test that WANTS one of these sets it itself with `monkeypatch.setenv`,
 #: which runs after both gates.
-SCRUBBED_ENV_VARS = (*_COLOR_FORCING_VARS, "BN_TAINT_MODELS", "BN_INSTANCE")
+SCRUBBED_ENV_VARS = (*_COLOR_FORCING_VARS, "BN_TAINT_MODELS", "BN_INSTANCE", "BN_SPILL_TOKENS")
 
 
 def _apply_hermetic_env(patch: pytest.MonkeyPatch) -> None:

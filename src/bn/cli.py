@@ -7,8 +7,9 @@ import stat
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import session_state
 from .formatters import (
@@ -641,7 +642,21 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             for flags, kwargs in group_args:
                 group.add_argument(*flags, **kwargs)
 
-        cmd.set_defaults(handler=spec["handler"])
+        # The slice vocabulary this command accepts, recorded HERE, while its
+        # parser is built: the hint derivation then needs no parser walk (one
+        # build per invocation instead of two) and cannot resolve the wrong
+        # subparser. Option strings plus their dest, so a caller's own flag can be
+        # told from an alias pair (`--count`/`--limit` share a dest).
+        cmd.set_defaults(
+            handler=spec["handler"],
+            _command_path=path,
+            _slice_flags=tuple(
+                (option, action.dest)
+                for action in cmd._actions
+                for option in action.option_strings
+                if option in _SLICE_VOCABULARY_SET
+            ),
+        )
 
 
 def _render_result(
@@ -655,6 +670,7 @@ def _render_result(
     paged: bool = False,
     spill_status: tuple[Any, Callable[[Any], str] | None] | None = None,
     provenance: dict[str, Any] | None = None,
+    slice_hint: str | None = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -681,7 +697,8 @@ def _render_result(
 
     result = _apply_result_transform(
         lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
-                                           stem=stem, provenance=provenance),
+                                           stem=stem, provenance=provenance,
+                                           rerun_hint=slice_hint),
         value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
@@ -706,7 +723,7 @@ def _render_result(
                 lambda payload: render_value(payload, fmt), status_value,
                 f"serialize the {stem} status line as {fmt}"))
         print(
-            f"note: full mutation detail ({result.artifact.get('estimated_tokens')} est. "
+            f"note: full mutation detail ({result.artifact.get('tokens')} est. "
             f"tokens) written to {artifact_path}; stdout carries the parseable status "
             f"summary. Re-run with --out FILE for the detail in a chosen location.",
             file=sys.stderr,
@@ -727,7 +744,8 @@ def _render_result(
             sys.stdout.write(f"__BN_SPILLED__ {artifact_path}\n")
         sys.stdout.write(result.rendered)
         hint = _spill_next_step_hint(
-            stem, spill_context, artifact_path, paged=paged, text_format=(fmt == "text")
+            stem, artifact_path, paged=paged, text_format=(fmt == "text"),
+            slice_hint=slice_hint,
         )
         print(
             f"warning: {label} output spilled to {artifact_path}; {hint}",
@@ -750,11 +768,25 @@ def _render_result(
     if result.near_spill:
         # #409: fit this time, but close to the threshold -- warn so the agent slices
         # the next (larger) read pre-emptively instead of discovering the spill after
-        # paying for it. Stderr only, so stdout/pipes stay clean.
+        # paying for it. Stderr only, so stdout/pipes stay clean. The remedy comes
+        # from the SAME derived hint as the other two paths: this branch's hardcoded
+        # "--limit/--offset/--lines" was wrong for every command that lacks them
+        # (`taint models`, `local list`, `batch apply`).
         print(
             "note: output is within 20% of the spill threshold; a slightly larger next "
-            "read (next page / bigger scope) will spill to disk -- bound it with "
-            "--limit/--offset/--lines, or raise BN_SPILL_TOKENS.",
+            "read (next page / bigger scope) will spill to disk -- "
+            f"{_spill_next_step_hint(stem, paged=paged, text_format=(fmt == 'text'), slice_hint=slice_hint)}; "
+            "or raise BN_SPILL_TOKENS.",
+            file=sys.stderr,
+        )
+    elif result.truncation_risk:
+        # Spill is opt-in, so this payload reaches stdout in full and the consuming
+        # agent's harness truncates it. Name this command's own slicing knob -- the
+        # one thing no harness can derive (#409).
+        print(
+            f"note: output is {result.token_count} estimated tokens; a consuming agent "
+            f"truncates long tool output -- "
+            f"{_spill_next_step_hint(stem, paged=paged, text_format=(fmt == 'text'), slice_hint=slice_hint)}.",
             file=sys.stderr,
         )
     return False
@@ -870,7 +902,17 @@ def _emit_result(
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
         result = text_renderer(result)
-    _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
+    _render_result(
+        result,
+        fmt=fmt,
+        out_path=args.out,
+        stem=stem,
+        # These handlers assemble their own result instead of going through
+        # `_call`, so the hint has to be derived here too -- otherwise their
+        # envelope falls back to the stem guesses while their stderr note uses the
+        # derived one, and one run offers two different remedies (dogfood pass 4).
+        slice_hint=_slice_hint_for_args(args, fmt),
+    )
 
 
 # Regex metacharacters that make a literal substring query likely to be a
@@ -995,37 +1037,181 @@ def _stdout_is_pipe() -> bool:
         return False
 
 
+# The vocabulary of BOUNDS this CLI offers, in the order an offer names them.
+# Membership per command is recorded while its parser is BUILT (see
+# `_build_from_commands`), so the derivation reads the same parser that will run
+# the rerun without walking one: it cannot resolve the wrong subparser, and an
+# invocation builds one parser instead of two.
+#
+# Curated rather than pattern-matched: a flag belongs here only if narrowing it
+# shrinks the rendered read -- by slicing (window), paging, or capping/narrowing
+# what gets enumerated. The seven commands this covers were measured in dogfood
+# pass 4 (195x on the raw read's `--length`, down to 1.3x on others); row
+# selectors that do not reduce volume (`--named`, `--min-address`) stay out, so
+# the vocabulary remains small enough that every entry is actionable.
+_SLICE_WINDOW_FLAGS = ("--lines", "--count", "--linear")
+_SLICE_BOUND_FLAGS = (
+    "--length", "--max-length", "--min-length", "--min-size", "--max-depth",
+    "--ip-depth", "--max-candidates", "--max-tables", "--max-scan-bytes",
+    "--strings-limit", "--record-size",
+)
+_SLICE_VOCABULARY = (
+    *_SLICE_WINDOW_FLAGS, "--limit", "--offset", "--address-window",
+    *_SLICE_BOUND_FLAGS, "--summary", "--out",
+)
+_SLICE_VOCABULARY_SET = frozenset(_SLICE_VOCABULARY)
+# `--lines` renders only under --format text (#120); every other window member is
+# format-independent, which is why the window advice is no longer text-gated as a
+# whole (a JSON read using `--linear` was told `--limit`, which its own mutex
+# group refuses).
+_TEXT_ONLY_SLICE_FLAGS = frozenset({"--lines"})
+
+
+def _derive_slice_hint(
+    accepted: Iterable[str], text_format: bool, used: Iterable[str] = ()
+) -> str | None:
+    """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
+
+    The order is the contract, and each step exists because a dogfood pass found
+    the opposite:
+    - a WINDOW family is mutually exclusive, so when the caller already used one
+      of its members the hint must prefer THAT flag (`--linear N --lines a:b` is
+      an argparse error, and naming a sibling gives unusable advice);
+    - PAGING before `--summary`, because on the two commands that accept both,
+      `--summary` is a mode that returns no rows rather than a smaller read;
+    - the command's own size LEVER before `--out`, because seven commands were
+      told to write a file while their own bound shrank the read by up to 195x.
+
+    Returns ``None`` when the command has no bound at all; the caller then prints
+    a flag-free hint rather than inventing one.
+    """
+    accepted = set(accepted)
+    used = set(used)
+
+    def in_order(vocabulary: Iterable[str]) -> list[str]:
+        return [flag for flag in vocabulary if flag in accepted]
+
+    windows = in_order(_SLICE_WINDOW_FLAGS)
+    if not text_format:
+        windows = [flag for flag in windows if flag not in _TEXT_ONLY_SLICE_FLAGS]
+    reused_window = [flag for flag in windows if flag in used]
+
+    # Paging comes FIRST, and `--offset` is what marks it: `--limit` alone is a
+    # CAP (`evidence function`), and `--count` on a paged command is a MODE, not a
+    # window -- `function list --count` narrows the ANSWER, it does not shrink the
+    # output, so a window hint there would be advice that does not bound anything.
+    if "--offset" in accepted:
+        if "--limit" in accepted and "--address-window" in accepted:
+            return "rerun with --limit/--offset or --address-window A:B to bound the read"
+        if "--limit" in accepted:
+            return "rerun with --limit/--offset to page through the results"
+        return "rerun with --offset K to page through the results"
+
+    if windows:
+        if reused_window:
+            # The caller's own flag: any sibling is refused by the mutex group
+            # (`--linear N --lines a:b` is an argparse error), so name THAT one.
+            return f"rerun with a smaller {reused_window[0]}"
+        if windows == ["--lines"]:
+            return "rerun with --lines START:END to fetch a slice instead"
+        spelled = " / ".join(f"{flag} N" for flag in windows)
+        return f"rerun with a smaller window ({spelled}) instead"
+
+    if "--limit" in accepted:
+        if "--address-window" in accepted:
+            return "rerun with --limit N or --address-window A:B to bound the read"
+        return "rerun with --limit N to bound the read"
+    if "--address-window" in accepted:
+        return "rerun with --address-window A:B to bound the read"
+
+    bounds = in_order(_SLICE_BOUND_FLAGS)
+    if bounds:
+        reused = [flag for flag in bounds if flag in used]
+        flag = reused[0] if reused else bounds[0]
+        return f"rerun with a smaller {flag} to bound the read"
+
+    if "--summary" in accepted:
+        # A mutation's `--summary` keeps the parseable status on stdout, while
+        # `--out` REPLACES it with an artifact envelope (#645). Reached only when
+        # the command has no read to bound, i.e. the mutation case.
+        hint = "rerun with --summary for the compact status"
+        if "--out" in accepted:
+            hint += ", or --out FILE for the full detail"
+        return hint
+
+    if "--out" in accepted:
+        return "rerun with --out <path> to write it to a file"
+    return None
+
+
+def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
+    """The derived remedy for the invocation in *args* -- no parser walk."""
+    flags = tuple(getattr(args, "_slice_flags", ()))
+    accepted = {option for option, _ in flags}
+    used = {
+        option for option, dest in flags
+        # A store_true default (False) and an unset value (None) both mean "the
+        # caller did not use this flag". Aliases (-–count/-–limit share a dest)
+        # are grouped by dest, so an alias pair marks both spellings used and the
+        # vocabulary order picks which one to name.
+        if getattr(args, dest, None) not in (None, False)
+    }
+    return _derive_slice_hint(accepted, fmt == "text", used)
+
+
+@lru_cache(maxsize=None)
+def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | None:
+    """The derived remedy for *path*, for callers with no namespace (tests).
+
+    Walks the registry's parser, so it is the same function the CLI reaches via
+    the flags recorded at build time -- `test_every_advised_flag_is_accepted_by_
+    the_command_it_names` runs the whole registry through it.
+    """
+    sub = _selected_parser_for_argv(build_parser(), list(path))
+    return _derive_slice_hint(_known_option_strings(sub), text_format)
+
+
 def _spill_next_step_hint(
     stem: str,
-    spill_context: Any,
-    artifact_path: str,
+    artifact_path: str | None = None,
     *,
     paged: bool = False,
     text_format: bool = True,
+    slice_hint: str | None = None,
 ) -> str:
     """Build a command-keyed next-step slicing hint for spilled output.
 
-    Mirrors the pagination truncation warning: line-oriented output (decompile,
-    il, disasm) is line-sliced, list output from a paged command is paginated,
-    and anything else points at --out or the artifact. ``paged`` is threaded
-    from the command's @command declaration via ``_call``; only commands that
-    actually expose --limit/--offset may suggest them.
+    ``slice_hint`` is what ``_call`` derived from the command's own parser and is
+    the only source that can be right for every command. The stem/``paged``
+    fallback below covers callers with no command path (the fan-out renderer,
+    direct library use); ``--lines`` is TEXT-only, so a JSON consumer is never
+    sent to it (#120).
 
-    ``--lines`` only slices the TEXT renderer, so it is only suggested for text
-    output -- recommending it to a JSON consumer is a dead end (#120). In JSON
-    mode the line-oriented commands fall through to the --out/artifact hint.
+    ``artifact_path`` is ``None`` when the caller prints this hint for output
+    that did NOT spill: there is no file to point at then, so the artifact
+    clause is dropped rather than naming a path that does not exist.
     """
-
-    if text_format and stem in ("decompile", "il", "disasm"):
-        return "rerun with --lines START:END to fetch a slice instead"
-    # `paged` is only set for commands that actually expose --limit/--offset, so
-    # it alone gates the paging hint (function list/search now page bridge-side
-    # and return a dict envelope rather than a bare list, #59).
-    if paged:
-        return "rerun with --limit/--offset to page through the results"
-    # The warning already names the artifact path ("spilled to <path>"); don't
-    # repeat it a second time in the hint (#49).
-    return "rerun with --out <path> to write it to a file, or read that artifact to inspect the full output"
+    core = slice_hint
+    if core is None:
+        if text_format and stem in ("decompile", "il", "disasm", "structured-il"):
+            core = "rerun with --lines START:END to fetch a slice instead"
+        # `paged` is only set for commands that actually expose --limit/--offset,
+        # so it alone gates the paging hint (function list/search now page
+        # bridge-side and return a dict envelope rather than a bare list, #59).
+        elif paged:
+            core = "rerun with --limit/--offset to page through the results"
+        elif stem == "function-evidence":
+            core = "rerun with --limit N or --address-window A:B to bound the read"
+        else:
+            core = "rerun with --out <path> to write it to a file"
+    if artifact_path is None or "--out" not in core:
+        # A hint naming this command's own knob stands alone: the artifact clause
+        # belongs to the branch whose remedy IS "write it to a file" (#49), where
+        # the file already on disk is the alternative to re-running.
+        return core
+    # The spill warning already names the artifact path ("spilled to <path>");
+    # don't repeat it a second time in the hint (#49).
+    return core + ", or read that artifact to inspect the full output"
 
 
 class MultiTargetError(BridgeError):
@@ -1479,6 +1665,11 @@ def _call(
         result = result_transform(result)
     spill_context = result
     fmt = _resolve_output_format(args)
+    # Derived from the flags recorded when this command's parser was built, so
+    # every flag the note and the envelope's `rerun` offer is one THIS command
+    # accepts (dogfood pass 3: the hand-maintained lists disagreed and named
+    # flags that exit 2).
+    slice_hint = _slice_hint_for_args(args, fmt)
     if text_renderer is not None and fmt == "text":
         result = text_renderer(result)
     spilled = _render_result(
@@ -1502,6 +1693,7 @@ def _call(
         # foreign `--out` file is detectable by inspection rather than by
         # recognising unrelated symbol names.
         provenance={"target": target, "instance": getattr(args, "instance", None)},
+        slice_hint=slice_hint,
         # paged_spill keeps the "--limit/--offset to page" spill hint for
         # commands (function list/search) that page bridge-side and so don't set
         # the client-side page_limit (#59).
@@ -1713,6 +1905,7 @@ def _fanout_call(
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
+        slice_hint=_slice_hint_for_args(args, fmt),
     )
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A
@@ -1900,8 +2093,9 @@ def build_parser() -> argparse.ArgumentParser:
             "    function list    enumerate, filter, or count functions\n"
             "    function search  match by name or regex\n"
             "\n"
-            "Output over ~10k estimated tokens spills to disk; the command prints an\n"
-            "envelope with the artifact path. Read that file directly -- do not pipe to grep."
+            "Output spills to disk only when BN_SPILL_TOKENS is set; a larger read is\n"
+            "truncated by the consuming agent instead. Bound it with --limit/--lines, or\n"
+            "write it with --out; do not pipe a large read to grep."
         ),
     )
     parser.add_argument("--version", action="version", version=f"bn {VERSION}")

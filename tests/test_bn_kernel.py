@@ -95,6 +95,10 @@ def _canonical_target_info(**overrides):
 def _clear_bn_bin(monkeypatch):
     monkeypatch.delenv("BN_BIN", raising=False)
     monkeypatch.delenv("BN_BACKEND", raising=False)
+    # The registry root is read from the environment, so an ambient value would
+    # point these tests at a real cache dir -- the hint's record check would then
+    # answer about the developer's machine instead of the tmp_path under test.
+    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
     bn_kernel._ACTIVE_SESSIONS.clear()
     bn_kernel._ACTIVE_SCOPED_CALLBACKS.clear()
     bn_kernel._ACTIVE_SCOPED_BINDINGS.clear()
@@ -694,6 +698,81 @@ sys.exit(1)
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, silent_script)))
     with pytest.raises(bn_kernel.CliError, match="bn failed"):
         _run(bn_kernel.Session(backend="cli").run("bad"))
+
+
+def test_cache_dir_reaches_the_env_before_the_client_is_built(monkeypatch, tmp_path):
+    # A retained kernel's environment was fixed when the kernel started, so a
+    # bridge registered under another cache dir is unreachable from here: the
+    # explicit argument is the only knob, and it must land before the native
+    # client resolves its socket at construction time.
+    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
+
+    bound = bn_kernel.Session(instance="w1", backend="cli", cache_dir=tmp_path)
+
+    assert os.environ["BN_CACHE_DIR"] == str(tmp_path)
+    assert bound.cache_dir == str(tmp_path)
+
+    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
+    assert bn_kernel.Session(instance="w1", backend="cli").cache_dir is None
+    assert "BN_CACHE_DIR" not in os.environ
+
+
+def test_cache_dir_rejects_a_non_path(monkeypatch):
+    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
+
+    with pytest.raises(ValueError, match="cache_dir must be a path"):
+        bn_kernel.Session(backend="cli", cache_dir=7)
+
+
+def test_the_registry_hint_names_the_root_and_is_decided_by_the_record(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bound = bn_kernel.Session(instance="ghost", backend="cli")
+
+    hint = bound._unreachable_instance_hint()
+    assert hint is not None
+    assert str(tmp_path) in hint
+    assert "cache_dir=" in hint
+
+    # A record that IS there means the failure was something else: the hint must
+    # not append a wrong explanation to a real bridge-side error.
+    (tmp_path / "instances").mkdir()
+    (tmp_path / "instances" / "ghost.json").write_text("{}")
+    assert bound._unreachable_instance_hint() is None
+
+
+def test_a_session_without_an_instance_has_no_registry_hint(monkeypatch):
+    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
+
+    assert bn_kernel.Session(backend="cli")._unreachable_instance_hint() is None
+
+
+def test_cli_failure_carries_the_hint_only_when_the_record_is_absent(
+    monkeypatch, tmp_path
+):
+    """The child's own remedy ("start one with bn session start ...") is the
+    command the agent already ran, so the failure it cannot diagnose is the one
+    that needs the registry root named."""
+    not_found = (
+        "No bridge instance found with id: ghost. Start one with: "
+        "bn session start /path/to/binary --instance-id ghost\n"
+    )
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "BN_BIN",
+        str(_fake_bn(tmp_path, _payload_script({}, rc=2, stderr=not_found))),
+    )
+
+    with pytest.raises(bn_kernel.BridgeError, match="cache_dir=") as caught:
+        _run(bn_kernel.Session(instance="ghost", backend="cli").run("list_functions"))
+    assert "No bridge instance found with id: ghost" in str(caught.value)
+
+    (tmp_path / "instances").mkdir()
+    (tmp_path / "instances" / "ghost.json").write_text("{}")
+    with pytest.raises(bn_kernel.BridgeError) as caught:
+        _run(bn_kernel.Session(instance="ghost", backend="cli").run("list_functions"))
+    assert "cache_dir=" not in str(caught.value)
 
 
 def test_an_unmeasured_mutation_does_not_default_to_claiming_failure(monkeypatch, tmp_path):
@@ -2551,6 +2630,51 @@ def test_brief_nested_miss_reports_the_row_keys_too():
     assert "brief key 'callee.address' is missing at row 0" in message
     assert "available keys" in message
     assert "'callee'" in message
+
+
+def test_brief_renders_a_declared_but_sparse_column_as_a_placeholder():
+    # The bridge MUST declare conditionally-set keys so a zero-hit page still
+    # describes its shape (`function_pointer`, `callee_variadic`, `provenance`),
+    # which makes `brief(rows, *last.row_fields)` -- the documented in-band idiom
+    # -- hit a column a given row does not carry. That is normal, not an error.
+    rows = [
+        {"address": "0x1000", "kind": "code", "function_pointer": "0x2000"},
+        {"address": "0x1010", "kind": "code"},
+    ]
+
+    assert bn_kernel.brief(rows, "address", "function_pointer") == (
+        "0x1000  0x2000\n0x1010  -"
+    )
+    # A request that names NO column these rows have at all is still the case the
+    # error is for: a wrong collection or a typo.
+    with pytest.raises(KeyError, match="brief key 'nope' is missing at row 0"):
+        bn_kernel.brief(rows, "nope")
+    with pytest.raises(KeyError, match="brief key 'address' is missing at row 0"):
+        bn_kernel.brief(
+            [{"start": "0x1000", "name": ".text"}], "address", "also_absent"
+        )
+    # Deliberate consequence of the per-CALL guard (see `brief`'s docstring): one
+    # mistyped column beside a real one renders `-`. Judging keys one at a time
+    # would restore the failure this tolerance exists to remove -- a declared but
+    # conditional column (`function_pointer`) is absent from EVERY row of a small
+    # xrefs sample, so `brief(rows, *row_fields)` would raise again.
+    assert bn_kernel.brief(rows, "address", "mistyped") == "0x1000  -\n0x1010  -"
+
+
+def test_brief_resolves_the_wildcard_path_its_own_error_advises():
+    # `_missing_key_message` names `callee.*` as the remedy for a nesting row;
+    # the resolver used to look for a literal "*" key and raise, so following the
+    # advice failed identically -- a loop an agent cannot escape from the error.
+    rows = [{"callee": {"name": "memcpy", "address": "0x1000"}, "call_addr": "0x1010"}]
+
+    assert bn_kernel.brief(rows, "callee.*") == "name=memcpy address=0x1000"
+    assert bn_kernel.brief(rows, "call_addr", "callee.*") == (
+        "0x1010  name=memcpy address=0x1000"
+    )
+
+    with pytest.raises(KeyError) as exc:
+        bn_kernel.brief(rows, "name")
+    assert "callee.*" in str(exc.value)
 
 
 def test_result_exposes_the_row_field_hint_from_the_payload():

@@ -560,6 +560,11 @@ def test_mutation_result_never_spills_to_an_envelope_645(fake_transport, capsys,
     # the detail is still reachable
     assert payload["detail_artifact_path"].endswith((".json", ".ndjson", ".txt"))
     assert "full mutation detail" in captured.err
+    # The note names the payload's size. The artifact key is `tokens`; reading a
+    # key that is never written rendered this as "None est. tokens" (dogfood C2).
+    assert "(None est. tokens)" not in captured.err
+    size = captured.err.split("full mutation detail (")[1].split(" est. tokens)")[0]
+    assert size.isdigit() and int(size) > 0
 
 
 def test_symbol_rename_builds_preview_payload(fake_transport):

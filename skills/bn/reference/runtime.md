@@ -210,12 +210,12 @@ Requests time out after 600s by default; override with `BN_REQUEST_TIMEOUT=<seco
 Defaults:
 
 - Read commands → `--format text`.
-- Mutations → a compact **text status line**; the full audit payload is opt-in via `--verbose`, an explicit `--format json`, or `--out` (see `reference/mutating.md`). A mutation result never spills, so `json.loads(stdout)` on a `batch apply` always works.
+- Mutations → a compact **text status line**; the full audit payload is opt-in via `--verbose` or an explicit `--format json`, and `--out` writes it to a file instead of stdout (envelope on stdout). `--summary` forces the compact `mutation_summary` envelope under any format. A mutation result never spills, so the status is never swapped for a spill envelope — but the default is TEXT, so parse it as JSON only under `--format json`, and bound a large detail with `--out`.
 - Setup and export commands → `--format json`.
 - `--format ndjson` is available where it makes sense.
 - `--out <path>` writes the full body to disk and returns an envelope on stdout.
 
-**Spill envelopes.** When output exceeds **10 000 estimated tokens** (~3 bytes/token heuristic), the body is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
+**Spill envelopes (opt-in).** Nothing is written to disk unless `BN_SPILL_TOKENS` names a positive token count. With it set, output over that threshold (~3 bytes/token heuristic) is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
 
 - `ok` — request status.
 - `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
@@ -227,13 +227,17 @@ Defaults:
 - `spill_token_limit` — the threshold that tripped (so you can see how far over you went).
 - `rerun` — the **command-specific slicing knob** to bound the next read (e.g. `--limit`/`--offset` for lists, `--lines` for `disasm`/`il`, `--address-window` for `evidence function`), so you re-run bounded instead of blind.
 
-**Predicting spill (#409).** Two signals let you avoid a wasted full run:
-- **Threshold override** — set `BN_SPILL_TOKENS` (e.g. `BN_SPILL_TOKENS=40000`) to raise/lower the spill point for a bigger/smaller context budget. Non-positive/garbage values fall back to the 10 000 default (spill is never silently disabled). 
-- **Near-spill note** — when a read *fits* but lands within 20 % of the threshold, `bn` prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively.
+**Choosing the spill point (#409).** Spill is armed by you, not by a default:
+- **No threshold (default)** — unset, empty, non-numeric, zero and negative all mean **no spill**: the full payload goes to stdout and the *consuming* agent/Harness bounds what is read. A typo can never silently re-arm disk output.
+- **Slicing note (any mode)** — a read that does NOT spill but is over **10 000** estimated tokens prints a `note:` on stderr naming this command's own slicing flag (below). The flag is derived from the command's own parser, so it is one that command accepts — and for a mutation it is `--summary`, which keeps the status parseable. Nothing lands on disk and no envelope replaces the data. It stays on when a threshold is armed above the payload, so a large-but-fitting read is never silent.
+- **Threshold** — `BN_SPILL_TOKENS=<tokens>` (e.g. `40000`) arms the spill at that size for a bigger/smaller context budget.
+- **Near-spill note (threshold armed)** — a read that *fits* but lands within 20 % of the configured threshold prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively. That warning replaces the slicing note for that read, so one read never draws two notes.
+
+**Reading a large payload back.** With no spill, a command whose stdout you *capture* (rather than pipe) can be truncated by your own tool wrapper mid-payload — a truncated JSON body does not parse. Recover with the wrapper's artifact, or avoid it: pipe into `jq`/`grep` (the stream is complete), or take the data with `--out FILE` / `--limit` / `--lines`.
 
 **Spill retention (#591).** Spill artifacts are a cache, not a record: `bn` keeps the last **14** day-directories under `<cache>/spills/` and removes older ones on the first spill of a process (a measured dogfood cache had reached 1.0 GB / 4187 files with no prune path). Set `BN_SPILL_RETENTION_DAYS=0` to keep everything for an engagement whose artifacts must survive, or to any day count to shorten the window; a garbage value falls back to 14 rather than to "forever". Anything in the spill root that is not a `YYYYMMDD` directory is never touched. Copy an artifact you need to keep out of the cache with `--out`.
 
-**Pipe trap (correctness).** When output spills, a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` now prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill.
+**Pipe trap (correctness — opt-in only).** When output spills (`BN_SPILL_TOKENS` armed), a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill. **The default inverts the trap**: a pipe receives the real data, but a *captured* large payload is truncated by the consumer wrapper (head + tail), so `jq` over the capture fails mid-object — pipe it, or take it with `--out`/`--limit`/`--lines`.
 
 > **`xrefs` text is display-capped (not just spilled).** For a hot symbol with thousands of callers, `bn xrefs <sym>` text output caps the body at the first 100 caller groups per section (the on-screen page) — the total-count header line (`xrefs to 0x… (N code, M data)`) stays accurate, but the body is truncated, so `bn xrefs <sym> | grep -c` / `| wc -l` undercounts. When stdout is a pipe and the body was capped, `bn` prints a `note:` on stderr naming the true totals. To get the full set, use `--out FILE` (writes every ref), `--format json` (paged, honest `total`), or bump `--limit`.
 

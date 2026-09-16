@@ -161,10 +161,18 @@ reverted, and what could not be confirmed is what *would* have landed.
 
 **A mutation result never spills.** A read that spills is recoverable (re-read the
 artifact); an atomic write whose result is unparseable is not — the agent's model of
-the BNDB silently desyncs from the BNDB. However large the detail payload, stdout
-keeps the parseable status and the detail goes to an artifact named in
-`detail_artifact_path` (plus a stderr note). So `json.loads(stdout)` on a
-`batch apply` always works.
+the BNDB silently desyncs from the BNDB. So even with `BN_SPILL_TOKENS` armed and the
+detail payload over it, stdout keeps the parseable status and the detail goes to an
+artifact named in `detail_artifact_path` (plus a stderr note).
+
+**Read that status in the format that produces it.** The default mutation output is
+TEXT (`mutation: committed changed=200 …`), so `json.loads(stdout)` is only
+meaningful under `--format json`/`--verbose`. `--out` is the one mode that REPLACES
+the status with an artifact envelope (`artifact_path`, `bytes`, `sha256`, `tokens` —
+no `changed_count`), so it is not how you keep a parseable result; `--summary` is —
+it forces the compact `kind: mutation_summary` envelope under any format, and it is
+also what a spilled mutation falls back to (#645). A `--verbose`/`--format json`
+detail large enough for the consuming wrapper to truncate is bounded with `--out`.
 
 ### Step 3 — read back
 

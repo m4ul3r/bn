@@ -43,7 +43,7 @@ Start broad, then narrow:
 
 ## Function Triage
 
-> **Pipe trap:** large `bn` read output (decompile, `function list`, etc.) spills to disk and stdout carries only an envelope. Piping that into `grep`/`jq`/`awk`/`c++filt` makes the filter see the envelope, **not** the data — a no-match then misreads as "absent" (e.g. concluding a name is mangled because `| grep _Z` matched nothing). Write to a file first and process it: `bn function list --out /tmp/fns.json && jq '.items|length' /tmp/fns.json`, or slice with `--limit`/`--lines` so it doesn't spill.
+> **Pipe trap (opt-in only):** spilling happens only when `BN_SPILL_TOKENS` is set. With it set, large `bn` read output (decompile, `function list`, etc.) is written to disk and stdout carries only an envelope. Piping that into `grep`/`jq`/`awk`/`c++filt` makes the filter see the envelope, **not** the data — a no-match then misreads as "absent" (e.g. concluding a name is mangled because `| grep _Z` matched nothing). By default nothing is written to disk and the pipe receives the real data, but a large *captured* payload is truncated by your own wrapper mid-object. Either way, bound a read you intend to parse: `bn function list --out /tmp/fns.json && jq '.items|length' /tmp/fns.json`, or slice with `--limit`/`--lines`.
 
 Not all functions matter equally. Prioritize:
 

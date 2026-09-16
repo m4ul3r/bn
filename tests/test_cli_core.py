@@ -59,6 +59,141 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
     )
 
 
+def test_truncation_note_fires_when_output_is_not_spilled(monkeypatch, capsys):
+    """Spill is opt-in, so the slicing note is the agent's only signal that a large
+    read will be truncated -- it must name this command's real paging flag."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"items": [], "total": 0}}
+
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
+        assert stem == "functions"
+        return _oversized_unspilled_namespace()
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+
+    rc = bn.cli.main(["function", "list", "--target", "active"])
+
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "12345 estimated tokens" in stderr
+    assert "--limit/--offset" in stderr
+    assert "spilled" not in stderr
+
+
+def test_every_advised_flag_is_accepted_by_the_command_it_names():
+    """The no-spill note, the envelope's `rerun` and the near-spill warning all
+    print the hint `_call` derives from the command's own parser, so "they agree"
+    is true by construction. The assertion that matters is that the advice RUNS:
+    every flag a hint names must be accepted by the command it names it for.
+
+    Hand-maintained stem lists failed exactly this. Live: `taint models --limit`
+    and `local list --limit` exit 2, and `disasm --linear N --lines a:b` is
+    refused by the mutex group (dogfood pass 3, 4 structural divergences).
+    """
+    import re
+
+    parser = bn.cli.build_parser()
+    checked = 0
+    for spec in bn.cli._COMMANDS:
+        accepted = bn.cli._known_option_strings(
+            bn.cli._selected_parser_for_argv(parser, list(spec["path"]))
+        )
+        for text_format in (True, False):
+            hint = bn.cli._slice_hint_for_command(spec["path"], text_format)
+            if hint is None:
+                continue
+            checked += 1
+            for flag in re.findall(r"--[a-z][a-z-]*", hint):
+                assert flag in accepted, (spec["path"], text_format, hint)
+
+    # Most of the registry derives a hint; a handful of commands have none.
+    assert checked > 100, checked
+
+
+def test_a_window_family_prefers_the_flag_the_run_already_used():
+    """`--linear N --lines a:b` is an argparse error, so a hint naming a SIBLING
+    of the caller's own window flag is unusable advice (dogfood pass 4: a JSON
+    read using `--linear` was told `--limit`, which its mutex group refuses)."""
+    accepted = {"--lines", "--count", "--linear"}
+
+    assert bn.cli._derive_slice_hint(accepted, True, used={"--linear"}) == (
+        "rerun with a smaller --linear"
+    )
+    assert bn.cli._derive_slice_hint(accepted, False, used={"--count"}) == (
+        "rerun with a smaller --count"
+    )
+    # With nothing used, name the family -- and never the text-only member in JSON.
+    assert "smaller window" in bn.cli._derive_slice_hint(accepted, True)
+    assert "--lines" not in bn.cli._derive_slice_hint(accepted, False)
+
+
+def test_paging_beats_summary_on_a_command_that_has_both():
+    """`imports` and `go functions` accept both, and `--summary` there is a MODE
+    whose answer has no `items` (102 rows -> 0 rows), so the size advice must be
+    the paging pair. The `--summary` branch pre-empted it and turned the note into
+    a regression against the pre-PR text (dogfood pass 4)."""
+    for path in (("imports",), ("go", "functions")):
+        hint = bn.cli._slice_hint_for_command(path, True) or ""
+        assert "--limit" in hint and "--summary" not in hint, (path, hint)
+
+    # A mutation has no read to page, so it still gets the status-preserving flag.
+    assert "--summary" in (bn.cli._slice_hint_for_command(("batch", "apply"), True) or "")
+
+
+def test_every_command_with_a_size_lever_names_it_instead_of_only_out():
+    """Seven commands were told `--out` while owning a bound that shrinks the read
+    (measured up to 195x, and 5.0x/1.8x/1.3x on others -- dogfood pass 4).
+
+    This is the census that fails when a bound flag reaches the registry without
+    being handled: at minimum the hint must offer a *specific* smaller flag, not
+    the write-to-a-file fallback.
+    """
+    for path in (
+        ("read",), ("trace",), ("taint", "forward"), ("taint", "backward"),
+        ("evidence", "orient"), ("evidence", "surface"), ("evidence", "table"),
+    ):
+        hint = bn.cli._slice_hint_for_command(path, True) or ""
+        assert "smaller" in hint, (path, hint)
+        assert hint != "rerun with --out <path> to write it to a file", (path, hint)
+
+
+def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tmp_path):
+    """`_emit_result` assembles its own result instead of going through `_call`,
+    so it derives the hint itself. Before the fix its envelope used the deleted
+    stem guesses while its stderr note used the derived one: one run, two
+    different remedies (dogfood pass 4)."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "64")
+    args = bn.cli.build_parser().parse_args(["instance", "list", "--format", "json"])
+    value = {"kind": "instances",
+             "items": [{"instance_id": f"i{n}", "pid": n} for n in range(400)]}
+
+    bn.cli._emit_result(args, value, stem="instances")
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["spilled"] is True
+    assert envelope["rerun"] == bn.cli._slice_hint_for_args(args, "json")
+
+
+def test_the_derived_hint_drops_the_flags_its_command_rejects():
+    """The three live counterexamples, pinned by command."""
+    taint = bn.cli._slice_hint_for_command(("taint", "models"), True) or ""
+    assert "--limit" not in taint and "--offset" not in taint
+
+    local = bn.cli._slice_hint_for_command(("local", "list"), True) or ""
+    assert "--limit" not in local
+
+    # disasm's window flags are one mutex group: whichever the caller used is the
+    # one that has to shrink, so every accepted spelling is named.
+    disasm = bn.cli._slice_hint_for_command(("disasm",), True) or ""
+    for flag in ("--lines", "--count", "--linear"):
+        assert flag in disasm, disasm
+
+    # A mutation's `--summary` keeps the status parseable; `--out` replaces it.
+    assert "--summary" in (bn.cli._slice_hint_for_command(("batch", "apply"), True) or "")
+
+
 def test_unrecognized_argument_routes_to_subcommand_usage(capsys):
     parser = bn.cli.build_parser()
 
