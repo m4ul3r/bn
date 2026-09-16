@@ -38,10 +38,18 @@ def test_function_list_requires_target_when_multiple_targets_are_open(fake_trans
             "result": [
                 {
                     "target_id": "123:1:7",
+                    "view_id": "1",
                     "selector": "SnailMail_unwrapped.exe.bndb",
+                    "filename": "/corpus/SnailMail_unwrapped.exe.bndb",
                     "active": True,
                 },
-                {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
+                {
+                    "target_id": "123:2:8",
+                    "view_id": "2",
+                    "selector": "other.exe.bndb",
+                    "filename": "/corpus/other.exe.bndb",
+                    "active": False,
+                },
             ],
         },
     })
@@ -49,11 +57,17 @@ def test_function_list_requires_target_when_multiple_targets_are_open(fake_trans
     rc = bn.cli.main(["function", "list"])
 
     assert rc == 2
+    # Byte-identical to the grammar the bridge resolver prints for the same
+    # condition (#688): headline, instruction line, `-t` rows, stable-id note.
     assert capsys.readouterr().err == (
         "This command requires --target when multiple targets are open.\n"
+        "Pass -t <selector> (--target) to choose one.\n"
         "Open targets:\n"
-        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
-        "- other.exe.bndb (target_id: 123:2:8)\n"
+        "  * -t SnailMail_unwrapped.exe.bndb  view_id=1  target_id=123:1:7"
+        "  /corpus/SnailMail_unwrapped.exe.bndb\n"
+        "    -t other.exe.bndb  view_id=2  target_id=123:2:8"
+        "  /corpus/other.exe.bndb\n"
+        "note: view_id / target_id are stable across `bn save`\n"
     )
 
 

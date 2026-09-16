@@ -147,3 +147,26 @@ def test_decompile_is_the_only_escalating_op(op_registry):
     REGISTRY = op_registry.REGISTRY
     escalating = {n for n in REGISTRY.names() if REGISTRY.spec(n).lock_escalation is not None}
     assert escalating == {"decompile"}
+
+
+# #688: the ops whose bare/empty/"active" target may NOT fall back to the
+# focused GUI tab. Pinned here for the same reason the lock sets are: the flag
+# is a policy declaration, so an op gaining or losing it is a deliberate
+# change. `close_binary` is absent on purpose -- it refuses the ambiguous case
+# in `_resolve_sole_target_for_close`, which also names its `all=true` escape.
+EXPECTED_DESTRUCTIVE = {"save_database", "py_exec", "batch_apply", "go_rename"}
+
+
+def test_the_destructive_ops_are_exactly_these(op_registry):
+    REGISTRY = op_registry.REGISTRY
+    destructive = {n for n in REGISTRY.names() if REGISTRY.spec(n).destructive}
+    assert destructive == EXPECTED_DESTRUCTIVE
+
+
+def test_destructive_bypass_without_the_flag_is_refused(op_registry):
+    """A bypass predicate on a non-destructive op is dead code that reads like
+    a guard, so it is rejected at import time rather than silently ignored."""
+    reg = op_registry.OpRegistry()
+    with pytest.raises(ValueError, match="destructive_bypass without destructive"):
+        @reg.op("b", lock="write", destructive_bypass=lambda params: True)
+        def _b(bridge, params, target): return 1

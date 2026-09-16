@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any, Callable, Iterator, Sequence
 
+from .target_hint import open_target_lines, target_row
 from .transport import BridgeError
 
 # "rollback_failed" = an op succeeded but the batch revert that should have
@@ -1458,23 +1459,23 @@ def _render_target_info_text(value: Any) -> str:
 def _render_target_choice(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-
-    label = str(value.get("selector") or value.get("target_id") or "<unknown>")
-    if value.get("active"):
-        label += " [active]"
-
-    target_id = value.get("target_id")
-    if target_id not in (None, "", value.get("selector")):
-        label += f" (target_id: {target_id})"
-    return label
+    return target_row(value)
 
 
 def _render_target_choices(value: Any) -> str:
+    """The multi-target hint block, rendered from a `list_targets` reply.
+
+    Byte-identical to what the bridge resolver prints for the same condition
+    (#688): one grammar, `src/bn/target_hint.py`, so an agent that learned the
+    pre-flight refusal parses the resolver's too. Row rendering stays per-item
+    here because these rows come off the wire and a non-dict one must degrade
+    rather than raise.
+    """
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
         return "none"
-    return "\n".join(f"- {_render_target_choice(item)}" for item in value)
+    return "\n".join(open_target_lines(value, row=_render_target_choice))
 
 
 @_discloses

@@ -3671,7 +3671,7 @@ def test_the_runtime_population_is_exactly_this_big():
     probed = len(_probe_renderers())
     reading = {name for name, _, _, _, _ in population}
     containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 597, 200), (
+    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 599, 200), (
         "the runtime-discovered population changed size: "
         f"{probed} renderers probed / {len(reading)} of them read a named field / "
         f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
@@ -3696,9 +3696,9 @@ def test_the_runtime_population_is_exactly_this_big():
     # evidence card -- and 220 more were swept with their siblings absent, which
     # is the leaf-level form of the same defect.
     situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 406, (
+    assert len(situated) == 408, (
         f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 406. A pair whose context collapses back to the "
+        "NON-EMPTY context, not 408. A pair whose context collapses back to the "
         "bare payload is a pair whose read the sweeps below may never reach: "
         "recording `{}` for every key no container was walked at put 367 of 564 "
         "pairs -- including all six `go rename` counters, behind "
@@ -4384,13 +4384,13 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 597 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 599 read keys
     rather than the 200 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4776.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4792.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4409,7 +4409,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4776, f"the raise sweep ran {swept} renders, not 4776"
+    assert swept == 4792, f"the raise sweep ran {swept} renders, not 4792"
 
 
 def test_the_nested_population_is_exactly_this_big():
@@ -4584,7 +4584,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1394, f"the mirror ran {checked} renders, not 1394"
+    assert checked == 1398, f"the mirror ran {checked} renders, not 1398"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

@@ -22,20 +22,45 @@ class OpSpec:
     lock: str
     binder: Binder
     lock_escalation: Escalation | None = None
+    # #688: an op that destroys or overwrites state may not fall back to the
+    # focused GUI tab when several targets are open. Declared here so the
+    # policy is hosted once (and visible beside the lock class) instead of
+    # copied into each handler. `destructive_bypass` names the params shape
+    # that makes the request unambiguous anyway -- `close_binary`'s
+    # `all=true`, which addresses every target on purpose.
+    destructive: bool = False
+    destructive_bypass: Escalation | None = None
 
 
 class OpRegistry:
     def __init__(self) -> None:
         self._ops: dict[str, OpSpec] = {}
 
-    def op(self, name: str, *, lock: str, escalation: Escalation | None = None) -> Callable[[Binder], Binder]:
+    def op(
+        self,
+        name: str,
+        *,
+        lock: str,
+        escalation: Escalation | None = None,
+        destructive: bool = False,
+        destructive_bypass: Escalation | None = None,
+    ) -> Callable[[Binder], Binder]:
         if lock not in _LOCK_CLASSES:
             raise ValueError(f"invalid lock class {lock!r} for op {name!r}; expected one of {_LOCK_CLASSES}")
+        if destructive_bypass is not None and not destructive:
+            raise ValueError(f"op {name!r} declares destructive_bypass without destructive=True")
 
         def decorator(binder: Binder) -> Binder:
             if name in self._ops:
                 raise ValueError(f"duplicate op registration: {name!r}")
-            self._ops[name] = OpSpec(name=name, lock=lock, binder=binder, lock_escalation=escalation)
+            self._ops[name] = OpSpec(
+                name=name,
+                lock=lock,
+                binder=binder,
+                lock_escalation=escalation,
+                destructive=destructive,
+                destructive_bypass=destructive_bypass,
+            )
             return binder
 
         return decorator

@@ -63,6 +63,7 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
+from .target_hint import format_multi_target_hint, open_target_lines
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -207,43 +208,22 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
-def _open_target_lines(targets: list[dict[str, Any]]) -> list[str]:
-    # Shared "Open targets:" listing for the resolver errors. Entries render
-    # the `-t` form, shell-quoted, because they are a copy-paste contract: for
-    # some commands (`bn save`) the positional is an output path, so echoing a
-    # bare selector invites `bn save <selector>` -- a silent wrong-file write
-    # -- and an unquoted selector with a space splits into exactly that shape.
-    lines = ["Open targets:"]
-    for target in targets:
-        marker = "*" if target.get("active") else " "
-        lines.append(
-            f"  {marker} -t {shlex.quote(str(target.get('selector', '')))}"
-            f"  view_id={target.get('view_id', '')}"
-            f"  target_id={target.get('target_id', '')}"
-            f"  {target.get('filename', '')}"
-        )
-    lines.append("note: view_id / target_id are stable across `bn save`")
-    return lines
-
-
 def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
     lines = [f"Unknown target selector: {selector}"]
     if not targets:
         lines.append("No BinaryView targets are open.")
         return "\n".join(lines)
-    lines.extend(_open_target_lines(targets))
+    lines.extend(open_target_lines(targets))
     return "\n".join(lines)
 
 
 def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
     # #663: several targets open, none active (headless has no focused tab),
     # and the request carried no selector.
-    lines = [
+    return format_multi_target_hint(
         "No active BinaryView is selected and multiple targets are open.",
-        "Pass -t <selector> (--target) to choose one.",
-    ]
-    lines.extend(_open_target_lines(targets))
-    return "\n".join(lines)
+        targets,
+    )
 
 
 # REQUIRED_FIELDS / REQUIRED_ONE_OF moved to mutation_engine.py with the
@@ -639,16 +619,24 @@ class TargetManager:
                     return self._matches_record(record, selector)
         return False
 
-    def _default_view(self):
-        active = _active_binary_view()
-        if active is not None:
-            return active
+    def _default_view(self, targets: list[dict[str, Any]]):
+        """The view a bare / empty / ``"active"`` selector means, decided from
+        the SAME ``refresh()`` snapshot the caller's listing came from (#688).
 
+        ``refresh()`` already resolves this: it marks the focused tab active,
+        and falls back to the sole record when nothing is focused (headless has
+        no focused tab). Re-sampling ``_active_binary_view()`` afterwards
+        opened a window where the listing shown to the user and the view the
+        request landed on came from two different samples of GUI state.
+        Returns None when the snapshot names no active target, or when that
+        target went away between the snapshot and the record lookup.
+        """
+        row = next((item for item in targets if item.get("active")), None)
+        if row is None:
+            return None
         with self._lock:
-            live_views = [record.view for record in self._records.values()]
-        if len(live_views) == 1:
-            return live_views[0]
-        return None
+            record = self._records.get(row["view_id"])
+        return record.view if record is not None else None
 
     def refresh(self, *, strict: bool = False) -> list[dict[str, Any]]:
         views, complete = _collect_open_views_state(strict=strict)
@@ -770,7 +758,7 @@ class TargetManager:
             raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):
-            active = self._default_view()
+            active = self._default_view(targets)
             if active is None:
                 raise RuntimeError(_format_no_active_target_error(targets))
             return active
@@ -794,6 +782,36 @@ class TargetManager:
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
             )
         return matches[0][1]
+
+    def require_explicit_target(self, op_name: str, selector: Any) -> None:
+        """Refuse a destructive op that named no target while several are open.
+
+        ``resolve()`` keeps a focused-tab convenience for None / "" / "active"
+        (a GUI user's `bn save` should not have to spell out the tab they are
+        looking at). For an op that overwrites or destroys state that
+        convenience is a footgun for every raw protocol client -- a bare
+        ``save_database`` / ``batch_apply`` / ``py_exec`` on a multi-tab GUI
+        bridge silently acted on whichever tab had focus, and the wire value
+        ``""`` meant 'the focused tab' here while meaning 'error' on close
+        (#688). Hosted once, driven by ``destructive=True`` in the op registry.
+
+        ``strict=True`` for the same reason the close gate uses it: a per-tab
+        UI exception makes ``refresh()`` silently lossy, and a count that hid
+        the second open tab would wave the request through.
+        """
+        if selector not in (None, "", "active"):
+            return
+        targets = self.refresh(strict=True)
+        if len(targets) <= 1:
+            return
+        raise RuntimeError(
+            format_multi_target_hint(
+                f"{op_name} needs an explicit target when multiple targets "
+                f"are open ({len(targets)}): it overwrites or destroys state, "
+                "so the focused-tab default is not honored for it.",
+                targets,
+            )
+        )
 
 
 class BridgeHandler(socketserver.StreamRequestHandler):
@@ -1379,6 +1397,14 @@ class BinaryNinjaBridge:
                 elif lock_class == "read":
                     lock = self._target_lock.read()
             with lock:
+                # #688: hosted here, under the op's own lock, so the count the
+                # refusal is decided on cannot change before the handler
+                # resolves the selector it was allowed to omit.
+                if spec is not None and spec.destructive and not (
+                    spec.destructive_bypass is not None
+                    and spec.destructive_bypass(params)
+                ):
+                    self.targets.require_explicit_target(str(op), target)
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
@@ -2180,15 +2206,16 @@ class BinaryNinjaBridge:
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) > 1:
-            lines = [
-                "close_binary needs a concrete target when multiple targets "
-                f"are open ({len(targets)}): pass a target selector, a path, "
-                "or all=true to close every open target, including GUI tabs "
-                "bn did not load. The volatile \"active\" selector is not "
-                "honored for close.",
-            ]
-            lines.extend(_open_target_lines(targets))
-            raise RuntimeError("\n".join(lines))
+            raise RuntimeError(
+                format_multi_target_hint(
+                    "close_binary needs a concrete target when multiple "
+                    f"targets are open ({len(targets)}): pass a target "
+                    "selector, a path, or all=true to close every open "
+                    "target, including GUI tabs bn did not load. The volatile "
+                    '"active" selector is not honored for close.',
+                    targets,
+                )
+            )
         # Look the view up from the snapshot the ==1 decision was made on --
         # a second resolve() would re-refresh, so the count gate and the
         # actual close could examine different target sets.
@@ -3675,6 +3702,11 @@ def _bind_load_status(bridge, params, target):
     return bridge._load_status(params.get("job_id"))
 
 
+# `close_binary` is deliberately not `destructive=True`: it guards locally in
+# `_resolve_sole_target_for_close`, which refuses the ambiguous case with a
+# message naming its own escape hatch (`all=true`) and resolves the sole
+# target from the same snapshot it counted. The registry gate would answer
+# first and less usefully.
 @op("close_binary", lock="write")
 def _bind_close_binary(bridge, params, target):
     # The selector rides the TOP-LEVEL request key. path/all DO live in
@@ -3692,7 +3724,7 @@ def _bind_close_binary(bridge, params, target):
     )
 
 
-@op("save_database", lock="write")
+@op("save_database", lock="write", destructive=True)
 def _bind_save_database(bridge, params, target):
     return bridge._save_database(target, params.get("path"))
 
@@ -4100,7 +4132,7 @@ def _bind_go_functions(bridge, params, target):
     )
 
 
-@op("go_rename", lock="none")
+@op("go_rename", lock="none", destructive=True)
 def _bind_go_rename(bridge, params, target):
     return bridge._go_rename(
         target,
@@ -4142,7 +4174,7 @@ def _bind_orient_digest(bridge, params, target):
     )
 
 
-@op("py_exec", lock="write")
+@op("py_exec", lock="write", destructive=True)
 def _bind_py_exec(bridge, params, target):
     return bridge._py_exec(target, str(params["script"]))
 
@@ -4275,7 +4307,7 @@ def _bind_types_declare(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
-@op("batch_apply", lock="none")
+@op("batch_apply", lock="none", destructive=True)
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)

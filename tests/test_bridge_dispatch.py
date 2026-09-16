@@ -1965,21 +1965,72 @@ def test_dispatch_envelope_carries_multiline_target_hint(monkeypatch):
     # dispatch()'s {ok:false, error} serialization. The real-BN lane pins this
     # end-to-end but skips without a BN install (and there is no CI), so pin
     # it in the mocked lane: a real op through dispatch(), no monkeypatched
-    # internals.
+    # internals. A READ op, so what is exercised is the resolver's own
+    # no-active refusal rather than the destructive gate (#688) that answers
+    # first for `save_database`.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
     bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
     _register_views(bridge, bv1, bv2)
 
-    resp = instance.dispatch({"op": "save_database", "params": {}, "target": None})
+    resp = instance.dispatch({"op": "target_info", "params": {}, "target": None})
 
     assert resp["ok"] is False
     error = resp["error"]
     assert "No active BinaryView is selected and multiple targets are open" in error
+    assert "Pass -t <selector> (--target) to choose one." in error
     assert "\nOpen targets:\n" in error
     assert "-t libparse.so.bndb" in error
     assert "-t svcmain.bndb" in error
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("selector", [None, "", "active"])
+def test_destructive_op_refuses_a_bare_target_while_several_are_open(monkeypatch, selector):
+    """#688: `resolve()` keeps a count-free focused-tab convenience for
+    None/""/"active", so a raw bare-target save/batch_apply/py_exec acted on
+    whichever tab had focus. The gate is declared in the op registry and
+    enforced in dispatch, so every destructive op inherits it -- including the
+    wire value "", which meant 'error' on close and 'focused tab' everywhere
+    else."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    # Focus one tab: the convenience this gate removes would have picked it.
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: bv1)
+
+    for op_name, params in (
+        ("save_database", {}),
+        ("py_exec", {"script": "1"}),
+        ("batch_apply", {"operations": []}),
+        ("go_rename", {}),
+    ):
+        resp = instance.dispatch({"op": op_name, "params": params, "target": selector})
+        assert resp["ok"] is False, (op_name, resp)
+        error = resp["error"]
+        assert f"{op_name} needs an explicit target when multiple targets are open (2)" in error
+        assert "Pass -t <selector> (--target) to choose one." in error
+        assert "-t libparse.so.bndb" in error
+        assert "-t svcmain.bndb" in error
+    # Nothing was written: the refusal happens before the handler runs.
+    assert not getattr(bv1, "saved_paths", [])
+    bridge._headless_views.clear()
+
+
+def test_destructive_op_still_resolves_the_sole_open_target(monkeypatch):
+    # The gate is a multi-target rule only: bare `bn save` on one open target
+    # (the overwhelmingly common shape) must keep working.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+
+    resp = instance.dispatch({"op": "target_info", "params": {}, "target": None})
+    assert resp["ok"] is True
+    assert bridge.TargetManager().require_explicit_target("save_database", None) is None
     bridge._headless_views.clear()
 
 
@@ -3934,7 +3985,8 @@ def test_close_binary_bare_request_refuses_under_multiple_gui_tabs_despite_focus
     # Sanity: the GUI walk sees both tabs and the convenience resolver WOULD
     # pick the focused one -- that is the hole this test pins shut for close.
     assert len(bridge._collect_open_views()) == 2
-    assert bridge.TargetManager()._default_view() is focused
+    manager = bridge.TargetManager()
+    assert manager._default_view(manager.refresh()) is focused
 
     with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=target)
@@ -4149,7 +4201,8 @@ def test_close_binary_rejects_empty_target_on_single_gui_tab(monkeypatch, tmp_pa
     _hermetic_registry(instance, tmp_path)
     only = _ClosableBV("/proj/only.so", session_id="11")
     _gui_with_focused_tab(monkeypatch, bridge, only)
-    assert bridge.TargetManager()._default_view() is only
+    manager = bridge.TargetManager()
+    assert manager._default_view(manager.refresh()) is only
 
     with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target="")
