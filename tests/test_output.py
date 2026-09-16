@@ -299,6 +299,24 @@ def test_a_failed_spill_write_still_draws_the_slicing_note(tmp_path, monkeypatch
     assert "printing full output" in capsys.readouterr().err
 
 
+def test_a_failed_spill_below_the_default_still_draws_the_note(tmp_path, monkeypatch, capsys):
+    """An ARMED threshold below 10 000 is a request for a file at that size, so
+    when the write fails the note must fire from the ARMED bound rather than the
+    default: armed 50 with a 2 823-token payload (56x the bound) printed the
+    failure warning and no guidance at all (dogfood pass 4)."""
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.output._write_private_bytes",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError(28, "full")))
+
+    for limit, tokens in ((50, 2823), (1000, 5608)):
+        res = write_output_result("A" * (tokens * 3 - 1), fmt="text", out_path=None,
+                                  stem="functions", spill_token_limit=limit)
+        assert res.spilled is False and res.token_count == tokens
+        assert res.truncation_risk is True, (limit, tokens)
+    assert "failed to write spill artifact" in capsys.readouterr().err
+
+
 def test_write_output_raises_clean_error_when_explicit_out_write_fails(
     tmp_path, monkeypatch
 ):
@@ -355,44 +373,32 @@ def test_resolve_spill_limit_is_opt_in_409(monkeypatch):
         assert resolve_spill_limit() is None
 
 
-def test_rerun_hint_names_slicing_knob_409():
-    from bn.output import _rerun_hint
-    assert "--limit" in _rerun_hint("functions")
-    assert "--limit" in _rerun_hint("class-list")
-    assert "--lines" in _rerun_hint("disasm")
-    assert "--address-window" in _rerun_hint("function-evidence")
-    # unknown stem still points at the spilled file + generic knobs
-    assert "spilled file" in _rerun_hint("something-new")
-    # decompile DOES have a text slicing knob (--lines START:END); the hint must
-    # never claim otherwise, and must name the pointer key the consumer's
-    # envelope actually renders (`path` in text, `artifact_path` in json).
-    text_hint = _rerun_hint("decompile", "text")
-    assert "--lines" in text_hint
-    assert "no in-line slicing knob" not in text_hint
-    assert "`path`" in text_hint
-    # --lines is text-only: a json spill must not send the consumer down a flag
-    # that errors (#120); it points at the artifact + --out instead.
-    json_hint = _rerun_hint("decompile", "json")
-    assert "--lines" not in json_hint
-    assert "--out" in json_hint
-    assert "`artifact_path`" in json_hint
-    # disasm/il inherit the same format-awareness
-    assert "--lines" not in _rerun_hint("il", "json")
+def test_the_envelope_carries_a_derived_rerun_hint_and_none_without_one(tmp_path, monkeypatch):
+    """The `rerun` key is the CLI's DERIVED hint, handed in by `_render_result`.
 
-
-def test_spill_envelope_carries_rerun_hint_and_limit_409(tmp_path, monkeypatch):
-    from bn.output import write_output_result
+    The stem-keyed builder that used to live in this module is gone (it named
+    flags its command rejects), so a direct library call with no hint gets no
+    `rerun` key at all -- there is no command to name a flag for -- and a hint
+    passed in is what the envelope (and its text rendering) carries.
+    """
+    from bn.output import render_artifact_envelope, write_output_result
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     value = {"kind": "functions", "items": [{"name": f"f{i}"} for i in range(500)], "total": 500}
+
+    derived = "rerun with --limit/--offset to page through the results"
     res = write_output_result(value, fmt="json", out_path=None, stem="functions",
-                              spill_token_limit=64)
+                              spill_token_limit=64, rerun_hint=derived)
     assert res.spilled is True
-    assert res.artifact["rerun"] and "--limit" in res.artifact["rerun"]
+    assert res.artifact["rerun"] == derived
     assert res.artifact["spill_token_limit"] == 64
     assert "rerun" in res.rendered  # rendered JSON envelope carries the knob key
-    # text-format envelope renders it as a rerun: line
-    from bn.output import render_artifact_envelope
     assert "rerun:" in render_artifact_envelope(res.artifact)
+
+    bare = write_output_result(value, fmt="json", out_path=None, stem="functions",
+                               spill_token_limit=64)
+    assert bare.spilled is True
+    assert "rerun" not in bare.artifact
+    assert "rerun" not in bare.rendered
 
 
 def test_near_spill_flag_409(tmp_path, monkeypatch):

@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import session_state
 from .formatters import (
@@ -642,7 +642,21 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             for flags, kwargs in group_args:
                 group.add_argument(*flags, **kwargs)
 
-        cmd.set_defaults(handler=spec["handler"], _command_path=path)
+        # The slice vocabulary this command accepts, recorded HERE, while its
+        # parser is built: the hint derivation then needs no parser walk (one
+        # build per invocation instead of two) and cannot resolve the wrong
+        # subparser. Option strings plus their dest, so a caller's own flag can be
+        # told from an alias pair (`--count`/`--limit` share a dest).
+        cmd.set_defaults(
+            handler=spec["handler"],
+            _command_path=path,
+            _slice_flags=tuple(
+                (option, action.dest)
+                for action in cmd._actions
+                for option in action.option_strings
+                if option in _SLICE_VOCABULARY_SET
+            ),
+        )
 
 
 def _render_result(
@@ -888,7 +902,17 @@ def _emit_result(
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
         result = text_renderer(result)
-    _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
+    _render_result(
+        result,
+        fmt=fmt,
+        out_path=args.out,
+        stem=stem,
+        # These handlers assemble their own result instead of going through
+        # `_call`, so the hint has to be derived here too -- otherwise their
+        # envelope falls back to the stem guesses while their stderr note uses the
+        # derived one, and one run offers two different remedies (dogfood pass 4).
+        slice_hint=_slice_hint_for_args(args, fmt),
+    )
 
 
 # Regex metacharacters that make a literal substring query likely to be a
@@ -1013,71 +1037,138 @@ def _stdout_is_pipe() -> bool:
         return False
 
 
-# Flags that bound a re-read, in the order an offer should name them. Membership
-# is decided by the command's OWN parser -- never a hand list: a hint naming a
-# flag the command rejects is worse than no hint, and dogfood pass 3 found three
-# of them live (`taint models --limit`, `local list --limit`, and `disasm
-# --linear N --lines a:b`, which argparse refuses through the mutex group).
+# The vocabulary of BOUNDS this CLI offers, in the order an offer names them.
+# Membership per command is recorded while its parser is BUILT (see
+# `_build_from_commands`), so the derivation reads the same parser that will run
+# the rerun without walking one: it cannot resolve the wrong subparser, and an
+# invocation builds one parser instead of two.
+#
+# Curated rather than pattern-matched: a flag belongs here only if narrowing it
+# shrinks the rendered read -- by slicing (window), paging, or capping/narrowing
+# what gets enumerated. The seven commands this covers were measured in dogfood
+# pass 4 (195x on the raw read's `--length`, down to 1.3x on others); row
+# selectors that do not reduce volume (`--named`, `--min-address`) stay out, so
+# the vocabulary remains small enough that every entry is actionable.
 _SLICE_WINDOW_FLAGS = ("--lines", "--count", "--linear")
+_SLICE_BOUND_FLAGS = (
+    "--length", "--max-length", "--min-length", "--min-size", "--max-depth",
+    "--ip-depth", "--max-candidates", "--max-tables", "--max-scan-bytes",
+    "--strings-limit", "--record-size",
+)
+_SLICE_VOCABULARY = (
+    *_SLICE_WINDOW_FLAGS, "--limit", "--offset", "--address-window",
+    *_SLICE_BOUND_FLAGS, "--summary", "--out",
+)
+_SLICE_VOCABULARY_SET = frozenset(_SLICE_VOCABULARY)
+# `--lines` renders only under --format text (#120); every other window member is
+# format-independent, which is why the window advice is no longer text-gated as a
+# whole (a JSON read using `--linear` was told `--limit`, which its own mutex
+# group refuses).
+_TEXT_ONLY_SLICE_FLAGS = frozenset({"--lines"})
+
+
+def _derive_slice_hint(
+    accepted: Iterable[str], text_format: bool, used: Iterable[str] = ()
+) -> str | None:
+    """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
+
+    The order is the contract, and each step exists because a dogfood pass found
+    the opposite:
+    - a WINDOW family is mutually exclusive, so when the caller already used one
+      of its members the hint must prefer THAT flag (`--linear N --lines a:b` is
+      an argparse error, and naming a sibling gives unusable advice);
+    - PAGING before `--summary`, because on the two commands that accept both,
+      `--summary` is a mode that returns no rows rather than a smaller read;
+    - the command's own size LEVER before `--out`, because seven commands were
+      told to write a file while their own bound shrank the read by up to 195x.
+
+    Returns ``None`` when the command has no bound at all; the caller then prints
+    a flag-free hint rather than inventing one.
+    """
+    accepted = set(accepted)
+    used = set(used)
+
+    def in_order(vocabulary: Iterable[str]) -> list[str]:
+        return [flag for flag in vocabulary if flag in accepted]
+
+    windows = in_order(_SLICE_WINDOW_FLAGS)
+    if not text_format:
+        windows = [flag for flag in windows if flag not in _TEXT_ONLY_SLICE_FLAGS]
+    reused_window = [flag for flag in windows if flag in used]
+
+    # Paging comes FIRST, and `--offset` is what marks it: `--limit` alone is a
+    # CAP (`evidence function`), and `--count` on a paged command is a MODE, not a
+    # window -- `function list --count` narrows the ANSWER, it does not shrink the
+    # output, so a window hint there would be advice that does not bound anything.
+    if "--offset" in accepted:
+        if "--limit" in accepted and "--address-window" in accepted:
+            return "rerun with --limit/--offset or --address-window A:B to bound the read"
+        if "--limit" in accepted:
+            return "rerun with --limit/--offset to page through the results"
+        return "rerun with --offset K to page through the results"
+
+    if windows:
+        if reused_window:
+            # The caller's own flag: any sibling is refused by the mutex group
+            # (`--linear N --lines a:b` is an argparse error), so name THAT one.
+            return f"rerun with a smaller {reused_window[0]}"
+        if windows == ["--lines"]:
+            return "rerun with --lines START:END to fetch a slice instead"
+        spelled = " / ".join(f"{flag} N" for flag in windows)
+        return f"rerun with a smaller window ({spelled}) instead"
+
+    if "--limit" in accepted:
+        if "--address-window" in accepted:
+            return "rerun with --limit N or --address-window A:B to bound the read"
+        return "rerun with --limit N to bound the read"
+    if "--address-window" in accepted:
+        return "rerun with --address-window A:B to bound the read"
+
+    bounds = in_order(_SLICE_BOUND_FLAGS)
+    if bounds:
+        reused = [flag for flag in bounds if flag in used]
+        flag = reused[0] if reused else bounds[0]
+        return f"rerun with a smaller {flag} to bound the read"
+
+    if "--summary" in accepted:
+        # A mutation's `--summary` keeps the parseable status on stdout, while
+        # `--out` REPLACES it with an artifact envelope (#645). Reached only when
+        # the command has no read to bound, i.e. the mutation case.
+        hint = "rerun with --summary for the compact status"
+        if "--out" in accepted:
+            hint += ", or --out FILE for the full detail"
+        return hint
+
+    if "--out" in accepted:
+        return "rerun with --out <path> to write it to a file"
+    return None
+
+
+def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
+    """The derived remedy for the invocation in *args* -- no parser walk."""
+    flags = tuple(getattr(args, "_slice_flags", ()))
+    accepted = {option for option, _ in flags}
+    used = {
+        option for option, dest in flags
+        # A store_true default (False) and an unset value (None) both mean "the
+        # caller did not use this flag". Aliases (-–count/-–limit share a dest)
+        # are grouped by dest, so an alias pair marks both spellings used and the
+        # vocabulary order picks which one to name.
+        if getattr(args, dest, None) not in (None, False)
+    }
+    return _derive_slice_hint(accepted, fmt == "text", used)
 
 
 @lru_cache(maxsize=None)
 def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | None:
-    """The bounding remedy for *path*, derived from the parser that will run it.
+    """The derived remedy for *path*, for callers with no namespace (tests).
 
-    ONE source for the three consumers that used to answer this question
-    separately -- the no-spill note, the envelope's `rerun` key, and the
-    near-spill warning -- so they cannot contradict each other, and every flag
-    named is one this command actually accepts (asserted for the whole registry
-    by `test_every_advised_flag_is_accepted_by_the_command_it_names`).
-
-    Returns ``None`` when the command exposes no bounding flag at all; the caller
-    then prints a flag-free hint rather than inventing one.
+    Walks the registry's parser, so it is the same function the CLI reaches via
+    the flags recorded at build time -- `test_every_advised_flag_is_accepted_by_
+    the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    options = _known_option_strings(sub)
-
-    if "--summary" in options:
-        # A mutation's `--summary` keeps the parseable status on stdout, while
-        # `--out` REPLACES it with an artifact envelope -- the opposite of what
-        # the #645 note promises (#645).
-        hint = "rerun with --summary for the compact status"
-        if "--limit" in options or "--offset" in options:
-            hint += ", or bound the scope"
-        if "--out" in options:
-            hint += ", or --out FILE for the full detail"
-        return hint
-
-    # Paging means the command really pages: `--offset` is what marks that.
-    # `--limit` alone is a CAP, and on disasm it is an alias of `--count`, whose
-    # window family is the honest remedy there (`function list` accepts --count
-    # too, but there it selects a MODE, which is why `--offset` decides).
-    if "--offset" in options:
-        if "--limit" in options and "--address-window" in options:
-            return "rerun with --limit/--offset or --address-window A:B to bound the read"
-        if "--limit" in options:
-            return "rerun with --limit/--offset to page through the results"
-        return "rerun with --offset K to page through the results"
-    if text_format:
-        windows = [flag for flag in _SLICE_WINDOW_FLAGS if flag in options]
-        if windows == ["--lines"]:
-            return "rerun with --lines START:END to fetch a slice instead"
-        if windows:
-            # disasm: --lines/--count(--limit)/--linear are one mutually exclusive
-            # family, so name every accepted spelling -- whichever the caller used
-            # is the one that has to shrink.
-            spelled = " / ".join(f"{flag} N" for flag in windows)
-            return f"rerun with a smaller window ({spelled}) instead"
-
-    if "--limit" in options:
-        if "--address-window" in options:
-            return "rerun with --limit N or --address-window A:B to bound the read"
-        return "rerun with --limit N to bound the read"
-    if "--address-window" in options:
-        return "rerun with --address-window A:B to bound the read"
-    if "--out" in options:
-        return "rerun with --out <path> to write it to a file"
-    return None
+    return _derive_slice_hint(_known_option_strings(sub), text_format)
 
 
 def _spill_next_step_hint(
@@ -1574,12 +1665,11 @@ def _call(
         result = result_transform(result)
     spill_context = result
     fmt = _resolve_output_format(args)
-    # Derived from the parser that will run the rerun, so every flag the note and
-    # the envelope's `rerun` offer is one THIS command accepts (dogfood pass 3:
-    # the hand-maintained lists disagreed and named flags that exit 2).
-    slice_hint = _slice_hint_for_command(
-        tuple(getattr(args, "_command_path", ())), fmt == "text"
-    )
+    # Derived from the flags recorded when this command's parser was built, so
+    # every flag the note and the envelope's `rerun` offer is one THIS command
+    # accepts (dogfood pass 3: the hand-maintained lists disagreed and named
+    # flags that exit 2).
+    slice_hint = _slice_hint_for_args(args, fmt)
     if text_renderer is not None and fmt == "text":
         result = text_renderer(result)
     spilled = _render_result(
@@ -1815,6 +1905,7 @@ def _fanout_call(
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
+        slice_hint=_slice_hint_for_args(args, fmt),
     )
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A

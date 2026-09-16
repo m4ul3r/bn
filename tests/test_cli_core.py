@@ -111,6 +111,71 @@ def test_every_advised_flag_is_accepted_by_the_command_it_names():
     assert checked > 100, checked
 
 
+def test_a_window_family_prefers_the_flag_the_run_already_used():
+    """`--linear N --lines a:b` is an argparse error, so a hint naming a SIBLING
+    of the caller's own window flag is unusable advice (dogfood pass 4: a JSON
+    read using `--linear` was told `--limit`, which its mutex group refuses)."""
+    accepted = {"--lines", "--count", "--linear"}
+
+    assert bn.cli._derive_slice_hint(accepted, True, used={"--linear"}) == (
+        "rerun with a smaller --linear"
+    )
+    assert bn.cli._derive_slice_hint(accepted, False, used={"--count"}) == (
+        "rerun with a smaller --count"
+    )
+    # With nothing used, name the family -- and never the text-only member in JSON.
+    assert "smaller window" in bn.cli._derive_slice_hint(accepted, True)
+    assert "--lines" not in bn.cli._derive_slice_hint(accepted, False)
+
+
+def test_paging_beats_summary_on_a_command_that_has_both():
+    """`imports` and `go functions` accept both, and `--summary` there is a MODE
+    whose answer has no `items` (102 rows -> 0 rows), so the size advice must be
+    the paging pair. The `--summary` branch pre-empted it and turned the note into
+    a regression against the pre-PR text (dogfood pass 4)."""
+    for path in (("imports",), ("go", "functions")):
+        hint = bn.cli._slice_hint_for_command(path, True) or ""
+        assert "--limit" in hint and "--summary" not in hint, (path, hint)
+
+    # A mutation has no read to page, so it still gets the status-preserving flag.
+    assert "--summary" in (bn.cli._slice_hint_for_command(("batch", "apply"), True) or "")
+
+
+def test_every_command_with_a_size_lever_names_it_instead_of_only_out():
+    """Seven commands were told `--out` while owning a bound that shrinks the read
+    (measured up to 195x, and 5.0x/1.8x/1.3x on others -- dogfood pass 4).
+
+    This is the census that fails when a bound flag reaches the registry without
+    being handled: at minimum the hint must offer a *specific* smaller flag, not
+    the write-to-a-file fallback.
+    """
+    for path in (
+        ("read",), ("trace",), ("taint", "forward"), ("taint", "backward"),
+        ("evidence", "orient"), ("evidence", "surface"), ("evidence", "table"),
+    ):
+        hint = bn.cli._slice_hint_for_command(path, True) or ""
+        assert "smaller" in hint, (path, hint)
+        assert hint != "rerun with --out <path> to write it to a file", (path, hint)
+
+
+def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tmp_path):
+    """`_emit_result` assembles its own result instead of going through `_call`,
+    so it derives the hint itself. Before the fix its envelope used the deleted
+    stem guesses while its stderr note used the derived one: one run, two
+    different remedies (dogfood pass 4)."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "64")
+    args = bn.cli.build_parser().parse_args(["instance", "list", "--format", "json"])
+    value = {"kind": "instances",
+             "items": [{"instance_id": f"i{n}", "pid": n} for n in range(400)]}
+
+    bn.cli._emit_result(args, value, stem="instances")
+
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["spilled"] is True
+    assert envelope["rerun"] == bn.cli._slice_hint_for_args(args, "json")
+
+
 def test_the_derived_hint_drops_the_flags_its_command_rejects():
     """The three live counterexamples, pinned by command."""
     taint = bn.cli._slice_hint_for_command(("taint", "models"), True) or ""

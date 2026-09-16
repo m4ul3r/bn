@@ -282,40 +282,11 @@ def resolve_spill_limit() -> int | None:
 
 
 # Per-command rerun/slicing knob named in a spill envelope so an agent bounds the
-# next read instead of guessing (#409). Keyed by the command's output `stem`.
-_LIST_SLICE_STEMS = frozenset({
-    "functions", "function-search", "imports", "exports", "strings", "sections",
-    "class-list", "comments", "callsites", "evidence-xrefs", "go-functions", "xrefs",
-    "types", "taint-models", "field-xrefs",
-})
-
-
-def _rerun_hint(stem: str | None, fmt: str = "text") -> str:
-    s = (stem or "").lower()
-    # The pointer key the consumer actually sees: the text envelope renders
-    # `path:` (render_artifact_envelope maps artifact_path -> path), json/ndjson
-    # carry `artifact_path`. Naming the wrong key sends a model hunting for a
-    # field that is not there.
-    pointer = "path" if fmt == "text" else "artifact_path"
-    if s in _LIST_SLICE_STEMS or s.endswith("-list"):
-        return "bound the next read with --limit N (and --offset K to page), or read the spilled file"
-    if s in ("disasm", "il", "structured-il"):
-        if fmt != "text":
-            # --lines is text-only; suggesting it to a json/ndjson consumer is a
-            # dead end (#120).
-            return f"read the spilled file at `{pointer}`, or re-run with --out FILE"
-        return ("rerun with --lines START:END (function/CFG order) or "
-                f"--linear N at an address, or read the spilled file at `{pointer}`")
-    if s == "function-evidence":
-        return "bound the next read with --limit N / --address-window A:B, or read the spilled file"
-    if s == "decompile":
-        if fmt == "text":
-            return f"rerun with --lines START:END to fetch a slice, or read the spilled file at `{pointer}`"
-        return f"read the spilled file at `{pointer}`, or re-run with --out FILE"
-    if s == "function-bundle":
-        return f"narrow the scope or read the spilled file at `{pointer}`"
-    return (f"read the spilled file at `{pointer}`, or re-run with a slicing flag "
-            "(--limit/--offset/--lines) or --out")
+# next read instead of guessing (#409). It is DERIVED by the CLI from the command's
+# own parser and passed in (`rerun_hint=`), so this module holds no stem-keyed
+# table: the two that used to live here disagreed with each other and named flags
+# their command rejects (dogfood passes 3 and 4). A caller that passes no hint
+# simply gets no `rerun` key -- there is no command to name a flag for.
 
 
 def _artifact_payload(
@@ -523,13 +494,17 @@ def write_output_result(
             file=sys.stderr,
         )
         # Nothing was written, so the FULL payload is on stdout -- exactly the case
-        # the slicing note exists for. Leaving `token_count` at its 0 default
-        # silenced it here, so a read 80x its armed bound arrived with no guidance
-        # at all (dogfood pass 3, reproduced on two targets).
+        # the slicing note exists for. Two fixes from dogfood passes 3/4: leaving
+        # `token_count` at its 0 default silenced the note entirely, and gating on
+        # the 10 000 default ignored an ARMED threshold below it (armed 50, payload
+        # 2 823 tokens = 56x the bound, warning and no guidance). The effective
+        # floor is whichever bound the user asked for, or the default.
         return OutputWriteResult(
             rendered=rendered,
             token_count=token_count,
-            truncation_risk=token_count >= DEFAULT_SLICE_NOTE_TOKENS,
+            truncation_risk=(
+                token_count >= min(DEFAULT_SLICE_NOTE_TOKENS, spill_token_limit)
+            ),
         )
     artifact = _artifact_payload(
         artifact_path=spill_path,
@@ -543,10 +518,10 @@ def write_output_result(
     # #409: name the command-specific slicing knob + the threshold that tripped, so
     # the agent bounds the next read instead of re-running blind. BN_SPILL_TOKENS
     # raises/lowers the threshold.
-    # `rerun_hint` is what the CLI derived from the command's own parser; the
-    # stem-keyed fallback covers callers that did not derive one (direct library
-    # use), and is deliberately the SAME builder the no-spill note uses.
-    artifact["rerun"] = rerun_hint or _rerun_hint(stem, fmt)
+    # `rerun_hint` is what the CLI derived from the command's own parser. With no
+    # hint there is no command to name a flag for, so the key is simply absent.
+    if rerun_hint:
+        artifact["rerun"] = rerun_hint
     artifact["spill_token_limit"] = spill_token_limit
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),
