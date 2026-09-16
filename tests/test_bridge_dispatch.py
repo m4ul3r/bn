@@ -2091,7 +2091,7 @@ def test_a_bare_destructive_request_is_pinned_to_the_sole_target_id(monkeypatch)
     assert resp["ok"] is True, resp
     # Not None and not "active": the handler can no longer re-decide which
     # view a bare request meant.
-    pinned = f"{bridge.PINNED_TARGET_PREFIX}{target_id}"
+    pinned = bridge.PinnedTarget(target_id)
     assert seen == [pinned]
     assert instance.targets.resolve(pinned) is bv
 
@@ -2103,6 +2103,38 @@ def test_a_bare_destructive_request_is_pinned_to_the_sole_target_id(monkeypatch)
     _register_views(bridge, _FakeFileBV(f"/corpus/{target_id}.bndb", session_id="2"))
     with pytest.raises(RuntimeError, match="Unknown target selector"):
         instance.targets.resolve(pinned)
+    bridge._headless_views.clear()
+
+
+def test_a_pin_is_not_forgeable_and_shadows_no_advertised_selector(monkeypatch):
+    """Round 3 of the review: the pin was a reserved string PREFIX, which is
+    forgeable from both directions. `_compute_selectors` advertises a
+    filename-derived selector, and a target legitimately named
+    `target_id:<other-id>` therefore published a selector that resolved to the
+    OTHER view -- the published, documented way to name B silently addressed
+    A. The pin is now a type `dispatch` constructs in-process, so no wire
+    value can carry pin semantics and no advertised selector can collide with
+    one."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    alpha = _FakeFileBV("/corpus/alpha.bndb", session_id="1")
+    _register_views(bridge, alpha)
+    alpha_id = instance.targets.refresh()[0]["target_id"]
+
+    # A legal POSIX filename that spells alpha's identity, prefix included.
+    beta = _FakeFileBV(f"/corpus/target_id:{alpha_id}", session_id="2")
+    _register_views(bridge, alpha, beta)
+    rows = {row["filename"]: row for row in instance.targets.refresh()}
+    beta_selector = rows[beta.file.filename]["selector"]
+
+    # Beta's own published selector resolves to beta...
+    assert instance.targets.resolve(beta_selector) is beta
+    # ...the pin resolves only to the view it was taken on...
+    assert instance.targets.resolve(bridge.PinnedTarget(alpha_id)) is alpha
+    # ...and those same characters arriving as an ordinary wire selector get
+    # ordinary selector semantics, never identity-only matching.
+    assert isinstance(beta_selector, str)
+    assert not isinstance(beta_selector, bridge.PinnedTarget)
     bridge._headless_views.clear()
 
 

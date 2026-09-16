@@ -271,10 +271,22 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
-# The selector grammar the bridge pins onto an implicit destructive request.
-# Resolvable by exact target_id only (see `_matches_record`), so it can never
-# be satisfied by a view that merely spells the id in its filename.
-PINNED_TARGET_PREFIX = "target_id:"
+class PinnedTarget(str):
+    """A target identity the BRIDGE pinned, not a selector a client sent.
+
+    `_matches_record` resolves one of these by exact ``target_id`` and by none
+    of the human-selector fallbacks, so a view that replaced the pinned one
+    cannot inherit the request. It is a TYPE rather than a reserved string
+    prefix because a prefix is forgeable from both directions: a request could
+    send it, and `_compute_selectors` could legitimately advertise a filename
+    that starts with it, which made another target's published selector
+    resolve to the pinned one (#736 review round 3). Nothing off the wire can
+    construct this class -- it is created in `dispatch` and consumed by the
+    handler in the same process -- and it still behaves as the `str` every
+    selector path (validation, logging, JSON echo) expects.
+    """
+
+    __slots__ = ()
 
 
 def _same_view(left: Any, right: Any) -> bool:
@@ -599,18 +611,18 @@ class TargetManager:
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
         if selector is None:
             return False
+        if isinstance(selector, PinnedTarget):
+            # An identity the BRIDGE pinned (the destructive gate) resolves by
+            # exact target_id and by nothing else. Every fallback below is a
+            # convenience for a HUMAN selector -- basename, a .bndb-stripped
+            # core, a path tail -- and a pin that kept them could match a
+            # DIFFERENT view whose filename happened to spell the pinned id,
+            # which is exactly the wrong-target write the pin prevents (#736
+            # review rounds 2 and 3).
+            return str(selector) == record.target_id()
         candidate = str(selector).strip()
         if candidate in ("", "active"):
             return False
-        if candidate.startswith(PINNED_TARGET_PREFIX):
-            # An identity the BRIDGE pinned (the destructive gate, #736 review
-            # round 2) resolves by exact target_id and by nothing else. Every
-            # fallback below is a convenience for a HUMAN selector -- basename,
-            # a .bndb-stripped core, a path tail -- and a pin that kept them
-            # could match a *different* view whose filename happened to spell
-            # the pinned id (`/corpus/<pinned-id>.bndb`), which is exactly the
-            # wrong-target write the pin exists to prevent.
-            return candidate[len(PINNED_TARGET_PREFIX):] == record.target_id()
         if candidate in (
             record.target_id(),
             record.view_id,
@@ -839,8 +851,8 @@ class TargetManager:
         selector AGAIN, later, and for a ``lock="none"`` op outside the gate's
         lock entirely -- so a close/load between the two landed the operation
         on a different binary with the count check green (#736 review, P1).
-        The pin carries the ``PINNED_TARGET_PREFIX``, which ``_matches_record``
-        resolves by exact ``target_id`` and by nothing else, so a replaced view
+        The pin is a ``PinnedTarget``, which ``_matches_record`` resolves by
+        exact ``target_id`` and by nothing else, so a replaced view
         fails as an unknown selector instead of being substituted -- the same
         trade the CLI's ``_implicit_target`` makes (#690 R3) and the same
         snapshot discipline ``_resolve_sole_target_for_close`` follows.
@@ -869,7 +881,7 @@ class TargetManager:
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) == 1:
-            return f"{PINNED_TARGET_PREFIX}{targets[0]['target_id']}"
+            return PinnedTarget(targets[0]["target_id"])
         raise RuntimeError(
             format_multi_target_hint(
                 f"{op_name} needs an explicit target when multiple targets "

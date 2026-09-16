@@ -1124,11 +1124,34 @@ def _declared_reasons(doc: str) -> list[str]:
             if declared_doc == doc]
 
 
-def _declared_spans(doc: str, normalized: str) -> list[tuple[int, int]]:
-    """Where each declaration's phrase actually sits in *normalized*."""
-    return [match.span()
+# What a clause is allowed to end on. A declaration has to cover its clause to
+# the END, because a span that stops inside one excuses whatever is appended
+# after it: `will read that success as a failure` still matched `... as a
+# failure only when the respawn fails`, which REVERSES the warning while adding
+# no number and no exit word for the sweep to catch. A key that stops mid-clause
+# therefore has no span at all -- its line re-parks and the declaration reads as
+# stale -- and that is deliberately not fixable by making the key longer, only
+# by making it land on a boundary.
+#
+# Two limits, stated rather than papered over. The check is TRAILING only: a
+# qualifier prepended INSIDE the clause leaves the key matching, and requiring a
+# boundary on the left as well would only ask every key to start at one. And a
+# clause is only checked as far as the LINE goes, so where a key ends at a hard
+# wrap (`... sees that the`) a qualifier added on the next line is invisible
+# here. Both are drift in prose that carries no number and no exit word, which
+# is the population this whole accounting is defined over; catching them needs a
+# reader, not a regex, and a regex that pretended to would be the fail-open echo
+# the module exists to retire.
+_CLAUSE_END = re.compile(r'\s*(?:[.,;:!?)"\u2014\u2013-]|$)')
+
+
+def _declared_clauses(doc: str, normalized: str) -> list[tuple[str, int, int]]:
+    """(phrase, start, end) for every declaration of *doc* whose phrase covers a
+    COMPLETE clause of *normalized*."""
+    return [(phrase, match.start(), match.end())
             for phrase in _declared_reasons(doc)
-            for match in re.finditer(re.escape(phrase), normalized)]
+            for match in re.finditer(re.escape(phrase), normalized)
+            if _CLAUSE_END.match(normalized, match.end())]
 
 
 def _undeclared_tokens(doc: str, normalized: str,
@@ -1145,10 +1168,10 @@ def _undeclared_tokens(doc: str, normalized: str,
     it -- so the scope is the phrase, and the second claim needs its own
     declaration or a cell.
     """
-    spans = _declared_spans(doc, normalized)
+    clauses = _declared_clauses(doc, normalized)
     return [token for token, at in residual
             if not (_EXIT_WORD_TOKEN.match(token)
-                    and any(start <= at < end for start, end in spans))]
+                    and any(start <= at < end for _, start, end in clauses))]
 
 
 def _unaccounted_number_lines(doc: str) -> list[str]:
@@ -1256,8 +1279,12 @@ DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
     # One obligation per declaration rather than one bare `every reachable
     # exit`: the prepositional phrase alone also excuses a sentence that states
     # a CODE on a reachable exit, and it did rule on three different sentences.
+    # Both of these stopped INSIDE their clause, which `_CLAUSE_END` is what
+    # found: `close only the exact selector` excused whatever followed it, so
+    # `... the exact selector the caller guessed` read as declared.
     ("skills/bn-kernel/SKILL.md",
-     "On every reachable exit, close only the exact selector"):
+     "On every reachable exit, close only the exact selector returned by the "
+     "bridge"):
         "a CLOSE obligation on exit, not an exit code",
     ("skills/bn-kernel/SKILL.md",
      "on every reachable exit close its exact target"):
@@ -1281,7 +1308,7 @@ DECLARED_NON_EXIT_CODE_WORDS: dict[tuple[str, str], str] = {
      "exit codes are therefore the same as every other mutation"):
         'the lead-in to the two echoed digits on the following lines',
     ("skills/bn/reference/runtime.md",
-     "the verified process can exit and its pid be reused"):
+     "the verified process can exit and its pid be reused between the two steps"):
         'a process EXITING and its pid being reused, not an exit code',
     ("skills/bn/reference/runtime.md",
      "the record is purged outright, and it is purged as soon as a proven "
@@ -1302,7 +1329,8 @@ _EXIT_WORD_TOKEN = re.compile(rf"^(?:{_EXIT_WORDS})$", re.I)
 
 
 def _declarations_in_use() -> set[tuple[str, str]]:
-    """Every declaration whose own SPAN really covers a residual exit word.
+    """Every declaration whose own clause-complete SPAN really covers a residual
+    exit word.
 
     Keyed by LINE NUMBER, a reason followed the position rather than the text:
     swapping the contents of two declared lines left both cells green with each
@@ -1319,10 +1347,9 @@ def _declarations_in_use() -> set[tuple[str, str]]:
             exits = [at for token, at in residual if _EXIT_WORD_TOKEN.match(token)]
             if not exits:
                 continue
-            for phrase in _declared_reasons(doc):
-                for match in re.finditer(re.escape(phrase), normalized):
-                    if any(match.start() <= at < match.end() for at in exits):
-                        in_use.add((doc, phrase))
+            for phrase, start, end in _declared_clauses(doc, normalized):
+                if any(start <= at < end for at in exits):
+                    in_use.add((doc, phrase))
     return in_use
 
 
@@ -1479,6 +1506,56 @@ def test_every_doc_that_states_an_exit_code_states_the_one_the_cli_returns(
     assert int(match.group("code")) == _exit_code_for(scenario), (
         f"{doc} tells an agent the {claim!r} case is exit {match.group('code')}, "
         f"but the CLI returns {_exit_code_for(scenario)} for it"
+    )
+
+
+def test_the_readme_failure_predicate_sorts_the_statuses_the_way_the_cli_does():
+    """README classifies by STATUS, and the echo above measures only its digit.
+
+    So widening the predicate -- "any status above other than `verified`" --
+    swept `noop` into the failure set with the `3` untouched and every cell
+    green, while a measured all-`noop` really exits 0. The sentence names a
+    POPULATION ("any status above") and an EXCEPTION set, so both are read out
+    of the document and each member is run through the classifier: the doc's
+    exceptions must be exactly the statuses that come back 0, and its
+    population minus them exactly the statuses that come back the stated code.
+    Dropping a status from the list above fails here too -- the sentence quantifies
+    over that list, so a shorter list is a narrower claim.
+    """
+    from bn.cli import _mutation_exit_code
+
+    text = _doc_text(REPO / "README.md")
+    listed = re.search(r"Mutation results now distinguish:\n\n((?:- `\w+`\n)+)", text)
+    assert listed, "README no longer lists the mutation statuses this sentence quantifies over"
+    statuses = re.findall(r"`(\w+)`", listed.group(1))
+    sentence = re.search(
+        r"Any status above other than (?P<excepted>.+?) puts a mutation at "
+        r"exit code `(?P<code>\d)`\.", text)
+    assert sentence, (
+        "README no longer states which statuses put a mutation at the failure "
+        "exit code, so the predicate can drift from the classifier"
+    )
+    excepted = set(re.findall(r"`(\w+)`", sentence.group("excepted")))
+    assert excepted <= set(statuses), (
+        f"README excepts {sorted(excepted - set(statuses))} from a list that does "
+        f"not contain them: {statuses}"
+    )
+    assert FAILED_MUTATION_STATUSES <= set(statuses), (
+        "the list this sentence quantifies over no longer names every failure "
+        f"status, so the predicate is narrower than it reads: "
+        f"{sorted(FAILED_MUTATION_STATUSES - set(statuses))} missing"
+    )
+    codes = {status: _mutation_exit_code(
+        {"success": True, "committed": True, "results": [{"status": status}]},
+        _mutation_summary) for status in statuses}
+    stated = int(sentence.group("code"))
+    assert {s for s, code in codes.items() if code == 0} == excepted, (
+        f"README says only {sorted(excepted)} escape exit {stated}, but the CLI "
+        f"returns 0 for {sorted(s for s, c in codes.items() if c == 0)}"
+    )
+    assert {s for s, code in codes.items() if code == stated} == set(statuses) - excepted, (
+        f"README puts every status but {sorted(excepted)} at exit {stated}, but the "
+        f"CLI returns {stated} for {sorted(s for s, c in codes.items() if c == stated)}"
     )
 
 
