@@ -40,6 +40,19 @@ await s.assert_target("<stem-or-basename-or-absolute-loaded-path>", timeout=30)
 s.backend
 ```
 
+The registry lives under the bridge's cache dir, read from **this kernel's**
+environment — fixed when the kernel started, so an `export BN_CACHE_DIR=...` in
+the shell that started the bridge is invisible here. `bn session start` looks
+like it worked while `session()` keeps answering "No bridge instance found with
+id: ...", and the remedy that message prints is the command you already ran.
+Pass the dir explicitly; it is applied process-wide (before the native client
+resolves its socket, so the last explicit value wins):
+
+```python
+s = bn_kernel.session(instance="analysis-1", target="<target-selector>",
+                      cache_dir="/path/that/bn/session/start/used")  # default ~/.cache/bn
+```
+
 A stem-only check such as `assert_target("sample")` accepts either
 `sample.bin` or `sample.bndb`. A basename check such as
 `assert_target("sample.bndb")` must match the loaded basename. An absolute path
@@ -275,9 +288,13 @@ print(bn_kernel.brief(rows, *s.last.row_fields[:3]))
 
 `brief()` accepts only a sequence of row mappings; pass
 `s.last.payload['items']` (or the returned row list), never the payload dict or
-plain text. A missing key raises a `KeyError` that **lists the row's actual
-top-level keys**, and adds dotted-path guidance (`brief(rows, "callee.name",
-"call_addr")`) only when that row really does nest mappings.
+plain text. A column this row omits renders `-`: the bridge must declare keys
+only some rows carry (`function_pointer`, `callee_variadic`, `provenance`), so
+`brief(rows, *s.last.row_fields)` is the intended idiom and a sparse column is
+normal. A request naming no column the rows have at all raises a `KeyError` that
+**lists the row's actual top-level keys**, and adds dotted-path guidance
+(`brief(rows, "callee.name", "call_addr")`, or `"callee.*"` for the whole nested
+mapping) only when that row really does nest mappings.
 
 Curated address fields are canonical hexadecimal strings (`"0x401000"`), not
 integers. Use `int(row["address"], 0)` for arithmetic; do not call `hex()` on

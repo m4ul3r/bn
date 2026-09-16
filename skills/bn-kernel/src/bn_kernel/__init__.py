@@ -9,6 +9,7 @@ import math
 import inspect
 import re
 import os
+import platform
 import shutil
 import threading
 import tempfile
@@ -39,6 +40,33 @@ BackendChoice = Literal["auto", "cli", "native"]
 _TEXT_KEYS = ("text", "listing", "body")
 _REGEX_METACHARS = ".|()[]{}*+?^$\\"
 _ENV_REQUEST_TIMEOUT = "BN_REQUEST_TIMEOUT"
+_ENV_CACHE_DIR = "BN_CACHE_DIR"
+# A column the bridge declares but this row omits (see `brief`).
+_ABSENT = object()
+_ABSENT_PLACEHOLDER = "-"
+
+
+def _cache_root() -> Path:
+    """The bridge registry root this kernel will actually read.
+
+    Mirrors ``bn.paths.cache_home`` deliberately instead of importing it (the CLI
+    backend must stay zero-install), so a "no such instance" failure can NAME the
+    root it searched instead of leaving the reader to find bn's resolution rule.
+    """
+    configured = os.environ.get(_ENV_CACHE_DIR)
+    if configured:
+        return Path(configured).expanduser()
+    home = Path.home()
+    if platform.system() == "Darwin":
+        return home / "Library" / "Caches" / "bn"
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "bn"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg) / "bn"
+    return home / ".cache" / "bn"
 
 
 def _env_timeout_override() -> tuple[bool, float | None]:
@@ -944,6 +972,7 @@ class Session:
         *,
         timeout: float = 120.0,
         backend: BackendChoice = "auto",
+        cache_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         configured_backend = os.environ.get("BN_BACKEND")
         if configured_backend is not None:
@@ -962,6 +991,28 @@ class Session:
         self.timeout = timeout
         self.last: Result | None = None
         self._client: Any = None
+
+        # A retained kernel's environment was fixed when the kernel STARTED, so a
+        # bridge whose registry lives under another cache dir is unreachable from
+        # here no matter what the shell that started it exported. `cache_dir=` is
+        # the caller naming that dir, and BN_CACHE_DIR is the one knob both
+        # backends read: bn.Client resolves it per call, and the cli backend passes
+        # this process's environment to the child `bn`. Setting it is therefore
+        # process-wide ON PURPOSE -- two sessions with different cache_dirs in one
+        # kernel conflict, and the last explicit value wins. It is set BEFORE the
+        # native client is constructed, because that client resolves its socket at
+        # construction time.
+        if cache_dir is not None:
+            try:
+                configured_cache = os.fspath(cache_dir)
+            except TypeError as exc:
+                raise ValueError(
+                    f"cache_dir must be a path, got {cache_dir!r}"
+                ) from exc
+            if isinstance(configured_cache, bytes):
+                configured_cache = os.fsdecode(configured_cache)
+            os.environ[_ENV_CACHE_DIR] = configured_cache
+        self.cache_dir = os.environ.get(_ENV_CACHE_DIR)
 
         if backend == "cli":
             self.backend: Backend = "cli"
@@ -989,6 +1040,28 @@ class Session:
         if self.target:
             argv.extend(("-t", self.target))
         return argv
+
+    def _unreachable_instance_hint(self) -> str | None:
+        """Explain a missing instance by its FILE, never by the child's prose.
+
+        "No bridge instance found with id: X" is the failure an agent cannot
+        diagnose: the remedy it prints ("start one with bn session start ...") is
+        the command the agent just ran, and the usual cause is a bridge registered
+        under a different cache dir. The registry record is readable, so the hint
+        is decided by evidence -- a record that IS there means the failure was
+        something else, and stays untouched.
+        """
+        if not self.instance:
+            return None
+        record = _cache_root() / "instances" / f"{self.instance}.json"
+        if record.exists():
+            return None
+        return (
+            f"this kernel reads the bridge registry from {_cache_root()} "
+            f"({_ENV_CACHE_DIR}, else the platform default), which cannot see an "
+            f"`export` in the shell that started the bridge -- bind with "
+            f"cache_dir=<the cache that bridge was started with>"
+        )
 
     async def run(
         self,
@@ -1085,10 +1158,14 @@ class Session:
             stderr_text = stderr_bytes.decode(errors="replace").strip()
             if process.returncode:
                 error_type = _EXIT_ERRORS.get(process.returncode, BnError)
-                raise error_type(
+                message = (
                     stderr_text
                     or stdout_text
-                    or _EXIT_DEFAULT_MESSAGES.get(process.returncode, "bn failed"),
+                    or _EXIT_DEFAULT_MESSAGES.get(process.returncode, "bn failed")
+                )
+                hint = self._unreachable_instance_hint()
+                raise error_type(
+                    f"{message} ({hint})" if hint else message,
                     returncode=process.returncode,
                     argv=argv,
                 )
@@ -1434,8 +1511,9 @@ class Session:
                     returncode=124,
                     argv=(op,),
                 ) from exc
+            hint = self._unreachable_instance_hint()
             raise BridgeError(
-                str(exc), returncode=2, argv=(op,)
+                f"{exc} ({hint})" if hint else str(exc), returncode=2, argv=(op,)
             ) from exc
         value = _unwrap(payload)
         self.last = Result(value, payload, (), (op,), "native")
@@ -1493,8 +1571,9 @@ class Session:
                     returncode=124,
                     argv=(op,),
                 ) from exc
+            hint = self._unreachable_instance_hint()
             raise BridgeError(
-                str(exc), returncode=2, argv=(op,)
+                f"{exc} ({hint})" if hint else str(exc), returncode=2, argv=(op,)
             ) from exc
         value = _require_collection(op, _unwrap(payload), payload)
         self.last = Result(value, payload, (), (op,), "native")
@@ -2148,6 +2227,7 @@ async def scoped(
     target: str | None = None,
     timeout: float = 120.0,
     backend: BackendChoice = "auto",
+    cache_dir: str | os.PathLike[str] | None = None,
 ) -> Any:
     binding = (instance, target)
     callback_binding = getattr(callback, _SCOPED_BINDING_ATTRIBUTE, None)
@@ -2194,7 +2274,9 @@ async def scoped(
             _ACTIVE_SCOPED_CALLBACKS.add(callback_id)
             _ACTIVE_SCOPED_BINDINGS[callback_id] = binding
 
-        bound = Session(instance, target, timeout=timeout, backend=backend)
+        bound = Session(
+            instance, target, timeout=timeout, backend=backend, cache_dir=cache_dir
+        )
         if (bound.instance, bound.target) != binding:
             raise BnError(
                 "scoped Session binding changed before callback execution",
@@ -2224,17 +2306,21 @@ def session(
     *,
     timeout: float = 120.0,
     backend: BackendChoice = "auto",
+    cache_dir: str | os.PathLike[str] | None = None,
 ) -> Session:
-    return Session(instance, target, timeout=timeout, backend=backend)
+    return Session(
+        instance, target, timeout=timeout, backend=backend, cache_dir=cache_dir
+    )
 
 
 async def run(
     *args: str,
     instance: str | None = None,
     target: str | None = None,
+    cache_dir: str | os.PathLike[str] | None = None,
     **kwargs: Any,
 ) -> Any:
-    return await Session(instance, target).run(*args, **kwargs)
+    return await Session(instance, target, cache_dir=cache_dir).run(*args, **kwargs)
 
 
 def _missing_key_message(row: Mapping[str, Any], key: str, index: int) -> str:
@@ -2263,6 +2349,22 @@ def _missing_key_message(row: Mapping[str, Any], key: str, index: int) -> str:
 def brief(
     rows: Sequence[Mapping[str, Any]], *keys: str, n: int = 10
 ) -> str:
+    """One bounded line per row for the named columns (dotted paths allowed).
+
+    A column this row omits renders `-` -- the bridge MUST declare columns that
+    only some rows carry (`function_pointer`, `callee_variadic`, `provenance`), so
+    `brief(rows, *last.row_fields)` is the documented in-band idiom and a sparse
+    column is normal, not an error. A request naming no column the rows have at
+    all still raises, because that is a wrong collection or a typo.
+
+    That guard is per CALL, not per key, and the difference is deliberate: a
+    declared-but-conditional column can be absent from every row of a small
+    sample (an `xrefs` page with no function-pointer hit has no
+    `function_pointer` anywhere), so judging keys one at a time restores exactly
+    the failure this tolerance exists to remove. The cost is that one mistyped
+    column beside valid ones renders as `-` instead of raising -- visible in the
+    output, but not distinguished from an empty column.
+    """
     if n < 0:
         raise ValueError("n must be non-negative")
     if (
@@ -2279,23 +2381,32 @@ def brief(
 
     selected_keys = keys or tuple(rows[0].keys())[:4]
 
-    def value_at(row: Mapping[str, Any], key: str, index: int) -> Any:
+    def value_at(row: Mapping[str, Any], key: str) -> Any:
+        """Resolve *key* in *row*, or `_ABSENT` when this row does not carry it.
+
+        A trailing `*` renders that nested mapping compactly. It is the remedy
+        `_missing_key_message` names for a nesting row, so it has to resolve --
+        looking for a literal `*` key and raising made the advice unfollowable.
+        """
         if key in row:
             return row[key]
         value: Any = row
         for part in key.split("."):
+            if part == "*" and isinstance(value, Mapping) and "*" not in value:
+                return " ".join(f"{name}={item}" for name, item in value.items())
             if not isinstance(value, Mapping) or part not in value:
-                raise KeyError(_missing_key_message(row, key, index))
+                return _ABSENT
             value = value[part]
         return value
 
-    lines = [
-        "  ".join(
-            str(value_at(row, key, index))
-            for key in selected_keys
-        )
-        for index, row in enumerate(rows[:n])
-    ]
+    def cell(row: Mapping[str, Any], key: str) -> str:
+        resolved = value_at(row, key)
+        return _ABSENT_PLACEHOLDER if resolved is _ABSENT else str(resolved)
+
+    if all(value_at(row, key) is _ABSENT for row in rows for key in selected_keys):
+        raise KeyError(_missing_key_message(rows[0], selected_keys[0], 0))
+
+    lines = ["  ".join(cell(row, key) for key in selected_keys) for row in rows[:n]]
     remaining = len(rows) - min(n, len(rows))
     if remaining:
         lines.append(f"... {remaining} more of {len(rows)}")

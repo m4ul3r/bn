@@ -7,7 +7,7 @@
 - Query live Binary Ninja state from the shell: targets, functions, callsites, decompile text, IL, disassembly, xrefs, types, strings, imports, and reusable bundles.
 - Execute Python inside the Binary Ninja process instead of maintaining a separate headless workflow.
 - Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
-- Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
+- Emit structured `json` or `ndjson` output and return token counts so agents can budget context intelligently, with opt-in spilling of oversized results to files (`BN_SPILL_TOKENS`).
 
 ## Install
 
@@ -204,7 +204,7 @@ summary: kind=object count=3
 
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
-`bn function list` and `bn function search` return the full matching set for the selected target or address range. Large results auto-spill to an artifact instead of forcing manual pagination. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout contains the compact artifact envelope and stderr carries a short warning with the artifact path.
+`bn function list` and `bn function search` return the full matching set for the selected target or address range, and by default that full set goes to stdout — `bn` writes nothing to disk unless you ask it to. Spilling is opt-in: set `BN_SPILL_TOKENS=<positive N>` to divert any result over N estimated tokens to an artifact, in which case stdout carries the compact envelope above (with `spilled: true`) and stderr a short warning naming the path. Any other value — unset, empty, `0`, negative, non-numeric — means no spill, so a typo cannot silently re-arm disk output; `--out <path>` writes the body wherever you name regardless. With spilling off, a payload over 10 000 estimated tokens still draws one stderr `note:` naming that command's own slicing flag (`--limit`/`--offset` for lists, `--lines` for `decompile`/`il`/`disasm`), because what truncates a long payload then is the consuming agent's harness rather than `bn`.
 
 ## Extraction Commands
 
