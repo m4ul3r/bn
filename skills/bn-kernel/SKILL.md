@@ -230,7 +230,20 @@ Prefer these curated helpers for list-shaped and common reads:
 - `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
 - `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero. `total` is monotone across a collection's pages: a `None` page can be followed by a page with the exact integer once the caller scan completes, so a long `callsites` collection can legitimately end with a determined total after starting with null ones -- but an already-determined total never reverts to null or changes to a different int.
 - `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own, because a loader synthesizes those names on a binary with zero analyst work. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
+- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed** on malformed payloads: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
+
+The symbol classification is not proof of an untouched database. In
+`existing_annotations`, `symbol_exclusions` lists **every** excluded non-auto
+symbol as `{name, address, reason}` without a cap (`address` is null if unreadable).
+`reason="debug_info"` means an exact imported name-and-address match and takes
+precedence over `reason="name_shape"`, the loader/engine-name heuristic. This
+includes bare `init`/`fini`, `dest`, and `destr`/`compar` with optional hexadecimal
+suffixes, alongside existing placeholder families. Ordinary analyst renames and
+comments still refuse, but an analyst rename matching an excluded name shape
+**may remain undetected**. An internal symbol namespace does not prove loader
+origin: user renames can carry it too. `symbol_exclusion_limitations` discloses
+this fallback in the payload. The older `*_locations` samples remain bounded;
+`locations_truncated` refers to those samples, not to `symbol_exclusions`.
 
 Every collection and text helper validates **after** the backend branch, so `cli`
 and `native` enforce the same shape: malformed, nested, or silently truncated

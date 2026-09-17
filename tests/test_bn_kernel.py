@@ -2343,6 +2343,53 @@ def test_assert_unannotated_returns_digest_and_preserves_last():
     assert session.last.payload == digest
 
 
+def test_assert_unannotated_classifies_loader_helpers_then_refuses_analyst_work():
+    from types import SimpleNamespace
+
+    from bn_agent_bridge.read_listing import _annotation_summary
+
+    session = bn_kernel.Session(instance="worker", backend="native")
+    function = SimpleNamespace(name="sub_1000", start=0x1000, comment="")
+    bv = SimpleNamespace(
+        functions=[function], address_comments={},
+        symbols=[
+            SimpleNamespace(auto=False, name=name, address=0x2000 + index * 0x10)
+            for index, name in enumerate(
+                ["init", "fini", "dest", "destr", "destr_1a2b", "compar", "compar_1a2b"]
+            )
+        ],
+    )
+
+    class OrientClient:
+        def request(self, op, params=None):
+            return {"existing_annotations": _annotation_summary(None, bv)}
+
+    session._client = OrientClient()
+    clean = _run(session.assert_unannotated())
+    assert clean["existing_annotations"]["analyst_symbols"] == 0
+    assert {row["reason"] for row in clean["existing_annotations"]["symbol_exclusions"]} == {
+        "name_shape"
+    }
+
+    # The SDK's internal namespace also occurs on real user renames.
+    bv.symbols.append(SimpleNamespace(
+        auto=False, name="parse_record", address=0x1000,
+        namespace="BNINTERNALNAMESPACE",
+    ))
+    with pytest.raises(bn_kernel.BridgeError, match="inherited analyst symbols"):
+        _run(session.assert_unannotated())
+
+    bv.symbols.pop()
+    function.comment = "inherited function note"
+    with pytest.raises(bn_kernel.BridgeError, match="inherited comments"):
+        _run(session.assert_unannotated())
+
+    function.comment = ""
+    bv.address_comments[0x1000] = "inherited address note"
+    with pytest.raises(bn_kernel.BridgeError, match="inherited comments"):
+        _run(session.assert_unannotated())
+
+
 @pytest.mark.parametrize("within", [[], (), ""])
 def test_callsites_rejects_empty_scope(within):
     session, _ = _native_session()

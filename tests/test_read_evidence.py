@@ -3502,6 +3502,39 @@ def test_annotation_summary_splits_loader_placeholders_from_analyst_symbols(monk
     ]
 
 
+def test_annotation_summary_discloses_every_loader_helper_exclusion(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    names = ["init", "fini", "dest", "destr", "destr_1a2b", "compar", "compar_1A2B"]
+    # Exceed the legacy location sample: every exclusion still needs a reason.
+    symbols = [
+        types.SimpleNamespace(
+            auto=False, name=name, address=0x1000 + index * 0x10,
+            namespace="BNINTERNALNAMESPACE",
+        )
+        for index, name in enumerate(names * 4)
+    ]
+    analyst = types.SimpleNamespace(
+        auto=False, name="parse_record", address=0x2000,
+        namespace="BNINTERNALNAMESPACE",
+    )
+    bv = _FakeBV(functions=[], symbols=[*symbols, analyst])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["user_symbols"] == 29
+    assert summary["placeholder_symbols"] == 28
+    assert summary["analyst_symbols"] == 1
+    assert summary["analyst_symbol_locations"] == [
+        {"name": "parse_record", "address": "0x2000"}
+    ]
+    assert summary["symbol_exclusions"] == [
+        {"name": symbol.name, "address": hex(symbol.address), "reason": "name_shape"}
+        for symbol in symbols
+    ]
+    assert summary["locations_truncated"] is True
+
+
 def test_annotation_summary_counts_survive_an_unreadable_symbol(monkeypatch):
     """One bad symbol must not fabricate a pristine view.
 
@@ -3643,21 +3676,28 @@ def test_annotation_summary_credits_debug_info_names_to_the_binary(monkeypatch):
         # The collision: renamed to a name the debug info gave a DIFFERENT
         # function, at an address the debug info never named.
         _NamedSym("parse_header", 0x4020A0),
+        _NamedSym("init", 0x403000),             # debug provenance beats name shape
     ])
     bv.debug_info = types.SimpleNamespace(functions=[
         _DebugFn("parse_header", 0x401149),
         _DebugFn("emit_record", 0x40115B),
+        _DebugFn("init", 0x403000),
         _DebugFn("printf", 0),
     ])
 
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
 
-    assert summary["user_symbols"] == 4
-    assert summary["placeholder_symbols"] == 2
+    assert summary["user_symbols"] == 5
+    assert summary["placeholder_symbols"] == 3
     assert summary["analyst_symbols"] == 2
     assert [(row["name"], row["address"]) for row
             in summary["analyst_symbol_locations"]] == [
         ("parse_trailer", "0x401179"), ("parse_header", "0x4020a0")
+    ]
+    assert summary["symbol_exclusions"] == [
+        {"name": "parse_header", "address": "0x401149", "reason": "debug_info"},
+        {"name": "emit_record", "address": "0x40115b", "reason": "debug_info"},
+        {"name": "init", "address": "0x403000", "reason": "debug_info"},
     ]
 
 
