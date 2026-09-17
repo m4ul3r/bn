@@ -69,6 +69,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # flow-sensitively (only when taint actually reaches such an instruction),
     # so a function that merely CONTAINS unlifted ops does not block the gate.
     "unlifted_instruction_reached",
+    # #810: a backward ascent followed only the first N caller sites of a
+    # parameter-origin slice; origins reachable only from the dropped callers are
+    # absent from the result. Same class as the other frontier leaves: the walk
+    # stopped with data unexamined, so the slice is NOT a complete answer.
+    "caller_sites_truncated",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a

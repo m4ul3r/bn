@@ -67,6 +67,13 @@ from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
 
 
+# Caller sites the backward ascent follows per function. Module-level (not a
+# local of ``_continue_into_callers``) because the cap is part of the result
+# contract: crossing it sets ``stats.truncated``/``truncation_cause`` and emits a
+# ``caller_sites_truncated`` leaf naming the counts (#810).
+MAX_CALLERS = 16
+
+
 # --------------------------------------------------------------------------
 # engine
 # --------------------------------------------------------------------------
@@ -4842,6 +4849,13 @@ class TaintEngine:
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
         self._bw_assumptions: list[str] = []
+        # #810: backward-run truncation state, mirroring the forward contract
+        # (``_truncated`` + ``_truncation_causes``, #579/#576). The caller-site cap
+        # used to be disclosed as an assumption string ONLY -- prose no consumer can
+        # gate on -- so a capped ascent came back with the same clean envelope as a
+        # full one.
+        self._bw_truncated = False
+        self._bw_truncation_causes: set[str] = set()
         slices: list[dict[str, Any]] = []
 
         # Function-level resolution is sink-independent: a missing MLIL/SSA form
@@ -4913,6 +4927,11 @@ class TaintEngine:
                 self._bw_assume(
                     f"backward slice for {format_locator(sink)} truncated: "
                     "Python recursion limit reached (possible unresolved cycle)")
+                # #810: the envelope carries the same truncation the sink_status row
+                # and the assumption do, so `stats.truncated` is never a false
+                # "complete" claim for a run that lost slices.
+                self._bw_truncated = True
+                self._bw_truncation_causes.add("recursion")
                 sink_status.append({**desc, "seeded": True, "truncated": True,
                                     "slices": len(slices) - n_before,
                                     "note": "recursion limit reached while slicing; results incomplete"})
@@ -4943,7 +4962,12 @@ class TaintEngine:
             "assumptions": self._bw_assumptions,
             # Authoritative leaf count, matching the forward contract so the TEXT
             # header / JSON array / stats all reconcile for backward too (#181).
-            "stats": {"leaves": len(self._bw_leaves), "slices": len(slices)},
+            # #810: `truncated`/`truncation_cause` are the forward stats pair
+            # (#579/#576) -- a backward run whose caller ascent was capped is
+            # INCOMPLETE and must not report from stats as a complete one.
+            "stats": {"leaves": len(self._bw_leaves), "slices": len(slices),
+                      "truncated": self._bw_truncated,
+                      "truncation_cause": sorted(self._bw_truncation_causes)},
             "soundness": SOUNDNESS,
         }
 
@@ -5100,8 +5124,9 @@ class TaintEngine:
         caller_sites = list(getattr(func, "caller_sites", None) or [])
         if not caller_sites:
             return []
-        MAX_CALLERS = 16
         results: list[dict[str, Any]] = []
+        if len(caller_sites) > MAX_CALLERS:
+            self._bw_note_caller_cap(func, len(caller_sites))
         for pidx, pvar in terminal_params.items():
             followed = False
             for site in caller_sites[:MAX_CALLERS]:
@@ -5136,13 +5161,42 @@ class TaintEngine:
                             "crossed": [str(func.name)] + sub["crossed"],
                         })
                         followed = True
-            if len(caller_sites) > MAX_CALLERS:
-                self._bw_assume(f"{func.name} has {len(caller_sites)} callers; followed first {MAX_CALLERS}")
             if not followed:
                 results.append({"steps": base_steps,
                                 "origin": {"kind": "parameter", "index": pidx, "var": var_label(pvar)},
                                 "crossed": []})
         return results
+
+    def _bw_note_caller_cap(self, func: Any, total: int) -> None:
+        """Disclose that the caller ascent dropped sites past ``MAX_CALLERS`` (#810).
+
+        ``_continue_into_callers`` follows only the first ``MAX_CALLERS`` caller
+        sites of a function whose slice bottoms out at a parameter; the rest were
+        dropped with an assumption string only -- prose no consumer can gate on, so
+        a capped ascent returned exactly the envelope of a complete one. Record the
+        truncation on the run (``stats.truncated``/``truncation_cause``, the pair
+        the forward side already carries, #579/#576) AND emit a blocking frontier
+        leaf into the existing ``leaves`` channel, so the dropped callers are
+        machine-readable in ``--format json`` and named in the text frontiers +
+        verdict lines. The assumption is kept: it is the human-readable half."""
+        dropped = int(total) - MAX_CALLERS
+        self._bw_assume(f"{func.name} has {total} callers; followed first {MAX_CALLERS}")
+        self._bw_truncated = True
+        self._bw_truncation_causes.add("caller_cap")
+        leaf = {
+            "kind": "caller_sites_truncated",
+            "address": hex(int(getattr(func, "start", 0))),
+            "function": {"name": str(getattr(func, "name", "?")),
+                         "address": hex(int(getattr(func, "start", 0)))},
+            "callers_total": int(total),
+            "callers_followed": MAX_CALLERS,
+            "callers_dropped": dropped,
+            "note": (f"caller-site cap: only the first {MAX_CALLERS} of {total} callers "
+                     f"were followed ({dropped} dropped) -- an origin reachable only "
+                     "from a dropped caller is missing from this slice"),
+        }
+        if leaf not in self._bw_leaves:
+            self._bw_leaves.append(leaf)
 
     def _seed_backward(self, func, ssaf, instrs, sink) -> list[tuple]:
         kind = sink.get("kind")

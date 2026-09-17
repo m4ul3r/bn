@@ -293,6 +293,51 @@ def test_render_taint_backward_text():
     assert "len#2 = len#1 + 4" in text
 
 
+# The truncated backward envelope the engine now emits when the caller ascent hit
+# the caller-site cap (#810): stats carry the forward `truncated`/`truncation_cause`
+# pair and the dropped callers land in `leaves` as a `caller_sites_truncated`
+# frontier naming the counts.
+_BACKWARD_CAPPED = {
+    "direction": "backward",
+    "function": {"name": "use_len", "address": "0x800"},
+    "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+    "slices": [{"sink": {"callee": "memcpy", "address": "0x804", "seed": "n#0"},
+                "origin": {"kind": "parameter", "index": 2, "var": "n#0"},
+                "slice": []}],
+    "leaves": [{"kind": "caller_sites_truncated", "address": "0x800",
+                "function": {"name": "use_len", "address": "0x800"},
+                "callers_total": 20, "callers_followed": 16, "callers_dropped": 4,
+                "note": "caller-site cap: only the first 16 of 20 callers were followed"}],
+    "assumptions": ["use_len has 20 callers; followed first 16"],
+    "stats": {"leaves": 1, "slices": 1, "truncated": True,
+              "truncation_cause": ["caller_cap"]},
+    "soundness": "x",
+}
+
+
+def test_render_taint_backward_truncated_is_not_a_complete_result():
+    # #810: a capped ascent returned the same text shape as a complete one -- the
+    # slice list read as a finished answer. The truncated run must say INCOMPLETE
+    # and name the cause, and the dropped count must be visible in the frontier.
+    text = _render_taint_text(_BACKWARD_CAPPED)
+    assert "verdict: INCOMPLETE" in text
+    assert "caller-site cap reached" in text
+    assert "caller_sites_truncated @ 0x800" in text
+    assert "16 of 20 caller(s) followed; 4 dropped" in text
+
+
+def test_render_taint_backward_complete_run_keeps_old_text():
+    # #810: the verdict line is added ONLY for a truncated run, so a complete
+    # backward result renders exactly as it did before (no false INCOMPLETE).
+    value = {**_BACKWARD_CAPPED,
+             "leaves": [],
+             "stats": {"leaves": 0, "slices": 1, "truncated": False,
+                       "truncation_cause": []}}
+    text = _render_taint_text(value)
+    assert "INCOMPLETE" not in text
+    assert "caller_sites_truncated" not in text
+
+
 def test_render_taint_backward_bounded_sink_is_success_not_unseeded():
     # #310: a provably-bounded (constant-length) sink renders under "provably
     # bounded", NOT "UNSEEDED SINKS" -- it's a successful conclusion.
