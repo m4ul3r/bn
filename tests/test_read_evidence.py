@@ -2461,6 +2461,67 @@ def test_virtual_call_register_indirect_not_misresolved_544(monkeypatch):
     assert re_mod._vc_slot_and_factory(caller, call, 8) is None
 
 
+def test_virtual_call_slot_offset_in_its_own_instruction_790(monkeypatch):
+    """#790: g++ -O0 does not fold `vptr + off` into the dispatch load. The real
+    shape is three instructions:
+
+        0x401126  rdx = [rax].q        (vptr)
+        0x401129  rdx_1 = rdx + 0x10   (the slot offset, computed SEPARATELY)
+        0x40112d  rdx_2 = [rdx_1].q    (the dispatch load)
+        0x401133  rax_1 = rdx_2(rdi)   (the call)
+
+    so the load's src is an MLIL_VAR and the offset read as 0 -- every -O0
+    dispatch resolved to slot 0 while still reporting `resolved: true`, i.e. a
+    silently WRONG provider method (m0 instead of m2 on the fixture this was
+    found on; the -O2 build of the same source folds the ADD and was correct).
+    The offset must come from the address var's own reaching def, one hop
+    further out than #544's call-dest hop."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    vptr_expr, _ = _vc_var_expr("rdx", 1)
+    add = _vc_expr("MLIL_ADD", left=vptr_expr,
+                   right=_vc_expr("MLIL_CONST", constant=0x10))
+    _, slot_addr_var = _vc_var_expr("rdx_1", 2)
+    set_add = _vc_expr("MLIL_SET_VAR", dest=slot_addr_var, src=add, address=0x401129)
+    slot_load = _vc_expr("MLIL_LOAD", src=_vc_var_expr("rdx_1", 2)[0])
+    _, slot_target_var = _vc_var_expr("rdx_2", 3)
+    set_load = _vc_expr("MLIL_SET_VAR", dest=slot_target_var, src=slot_load,
+                        address=0x40112d)
+    call = _vc_expr("MLIL_CALL", dest=_vc_var_expr("rdx_2", 3)[0], output=[],
+                    address=0x401133)
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[set_add, set_load, call]), view=None)
+
+    off, factory = re_mod._vc_slot_and_factory(caller, call, 8)
+
+    assert off == 0x10, "the slot offset lives in its own ADD instruction"
+    assert factory is None
+
+
+def test_virtual_call_slot_offset_own_instruction_commutative_790(monkeypatch):
+    """#790: the def-walk must keep the folded case's commutativity handling --
+    `vptr + const` and `const + vptr` are the same slot, wherever the ADD lives."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    vptr_expr, _ = _vc_var_expr("rdx", 1)
+    add = _vc_expr("MLIL_ADD", left=_vc_expr("MLIL_CONST", constant=0x18),
+                   right=vptr_expr)
+    _, slot_addr_var = _vc_var_expr("rdx_1", 2)
+    set_add = _vc_expr("MLIL_SET_VAR", dest=slot_addr_var, src=add, address=0x401129)
+    slot_load = _vc_expr("MLIL_LOAD", src=_vc_var_expr("rdx_1", 2)[0])
+    _, slot_target_var = _vc_var_expr("rdx_2", 3)
+    set_load = _vc_expr("MLIL_SET_VAR", dest=slot_target_var, src=slot_load,
+                        address=0x40112d)
+    call = _vc_expr("MLIL_CALL", dest=_vc_var_expr("rdx_2", 3)[0], output=[],
+                    address=0x401133)
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[set_add, set_load, call]), view=None)
+
+    off, _ = re_mod._vc_slot_and_factory(caller, call, 8)
+
+    assert off == 0x18
+
+
 # --- #530 Thumb-pointer miss count normalization -----------------------------
 
 class _ThumbSurfBV:

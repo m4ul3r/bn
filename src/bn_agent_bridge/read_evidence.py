@@ -2373,6 +2373,12 @@ def _section_is_code_like(bv, addr: int) -> bool | None:
 
 # --- #466 cross-target virtual-call resolution -------------------------------
 
+#: How many reaching-def hops `_vc_slot_and_factory` will follow to find the
+#: dispatch slot's constant offset (#790). The offset is one ADD away on the
+#: unfolded shapes seen in practice; the bound only stops a pathological chain.
+_VC_ADDR_DEF_HOPS = 4
+
+
 def _vc_const(expr):
     """Integer constant of a MLIL CONST/CONST_PTR expr, else None."""
     if expr is None or "CONST" not in _op(expr):
@@ -2453,17 +2459,44 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
     if addr_expr is None:
         return None
     off, base = 0, addr_expr
-    if _op(addr_expr) == "MLIL_ADD":
-        rc = _vc_const(getattr(addr_expr, "right", None))
-        if rc is not None:
-            off, base = rc, getattr(addr_expr, "left", None)
-        else:
-            # MLIL_ADD is commutative; BN usually canonicalizes the constant to the
-            # right, but not always -- handle `[const + base]` too so a vtable slot
-            # with the offset on the LEFT is not mis-resolved to the whole ADD expr.
-            lc = _vc_const(getattr(addr_expr, "left", None))
-            if lc is not None:
-                off, base = lc, getattr(addr_expr, "right", None)
+    # #790: the slot offset may live in its OWN instruction rather than in the
+    # load's address. g++ -O0 does not fold `vptr + 0x10` into the dispatch --
+    #   rax_3 = rax_2 + 0x10 ; rdx = [rax_3].q ; rdx(rdi)
+    # so the load's src is an MLIL_VAR and every -O0 dispatch read as slot 0: a
+    # silently WRONG provider method (the -O2 build of the same source folds the
+    # ADD and resolved correctly), while the reported `resolved: true` made it
+    # look authoritative. Walk the address var's reaching-def chain (bounded,
+    # summing constant addends) until an ADD appears -- one hop further out than
+    # #544's call-dest hop, and for the same reason.
+    for _ in range(_VC_ADDR_DEF_HOPS):
+        if _op(base) == "MLIL_ADD":
+            right_const = _vc_const(getattr(base, "right", None))
+            left_const = _vc_const(getattr(base, "left", None))
+            # MLIL_ADD is commutative; BN usually canonicalizes the constant to
+            # the right, but not always -- handle `const + base` too so a vtable
+            # slot with the offset on the LEFT is not mis-resolved to the whole
+            # ADD expr.
+            if right_const is not None:
+                off += right_const
+                base = getattr(base, "left", None)
+            elif left_const is not None:
+                off += left_const
+                base = getattr(base, "right", None)
+            else:
+                break  # ADD of two non-constants: nothing further to read
+            continue
+        var = _vc_var(base)
+        if var is None:
+            break  # a constant/global address: not a computed slot
+        if instrs is None:
+            instrs = list(caller.mlil.instructions)
+        d = _vc_def_ins(instrs, var, call_addr)
+        if d is None or _op(d) != "MLIL_SET_VAR":
+            break
+        src = getattr(d, "src", None)
+        if src is None:
+            break
+        base = src
     # Best-effort factory trace: base (the vtable) is `[obj]`; obj is `factory()`.
     factory = None
     try:
