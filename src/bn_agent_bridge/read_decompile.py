@@ -149,18 +149,19 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
             f"this may be a trampoline/veneer but that is not confirmed.")
 
 
-_COMMENT_LINE_RE = re.compile(
-    r"^(?P<prefix>(?:0x[0-9a-fA-F]+\s+)?\s*//\s*)(?P<body>.*?)(?P<trailing>\s*)$"
+# Consume literals and block comments before looking for a line-comment span,
+# so a quoted URL or a `//` inside `/* ... */` cannot start a redaction.
+_COMMENT_SPAN_RE = re.compile(
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|/\*.*?(?:\*/|\Z)|//(?P<body>[^\r\n]*)""",
+    re.DOTALL,
 )
 
 
 def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str:
-    """Redact *text* by rewriting whole rendered comment LINES whose body
-    exactly matches one of *annotation_bodies* (or one of its own lines, for
-    multiline bodies) to ``<annotation redacted>``, instead of bare
-    ``str.replace()``-ing the annotation body out of the text -- which
-    corrupts code whenever the body is a short token that also occurs inside
-    unrelated code (e.g. a comment body of `1`, `buf`, or `end`).
+    """Redact matching standalone or trailing ``//`` annotation bodies.
+
+    Match complete stored body lines, not substrings in code or literals.
+    Block comments are consumed unchanged; BN renders inherited notes as ``//``.
     """
     bodies = {
         line.strip()
@@ -168,15 +169,18 @@ def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str
         for line in str(body).splitlines()
         if line.strip()
     }
-    out = []
-    for line in text.splitlines(keepends=True):
-        ending = "\n" if line.endswith("\n") else ""
-        content = line[:-1] if ending else line
-        match = _COMMENT_LINE_RE.fullmatch(content)
-        if match and match.group("body").strip() in bodies:
-            content = f"{match.group('prefix')}<annotation redacted>"
-        out.append(content + ending)
-    return "".join(out)
+    if not bodies:
+        return text
+
+    def redact(match: re.Match[str]) -> str:
+        body = match.group("body")
+        if body is None or body.strip() not in bodies:
+            return match.group(0)
+        leading = body[:len(body) - len(body.lstrip())]
+        trailing = body[len(body.rstrip()):]
+        return f"//{leading}<annotation redacted>{trailing}"
+
+    return _COMMENT_SPAN_RE.sub(redact, text)
 
 
 

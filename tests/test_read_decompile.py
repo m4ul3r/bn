@@ -739,15 +739,14 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
         comments={0x401000: "inherited address note"},
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {  // inherited function note\n"
+        "    // inherited address note\n"
+        "    return; // inherited address note\n"
+        "}"
+    )
     monkeypatch.setattr(
-        bridge.il_format,
-        "_decompile_text",
-        lambda *args, **kwargs: (
-            "void parse_record() {\n"
-            "    // inherited function note\n"
-            "    // inherited address note\n"
-            "}"
-        ),
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
     )
 
     redacted = instance._decompile("active", "parse_record")
@@ -755,15 +754,18 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
         "active", "parse_record", include_annotations=True
     )
 
-    assert "inherited function note" not in redacted["text"]
-    assert "inherited address note" not in redacted["text"]
+    assert redacted["text"] == (
+        "void parse_record() {  // <annotation redacted>\n"
+        "    // <annotation redacted>\n"
+        "    return; // <annotation redacted>\n"
+        "}"
+    )
     assert redacted["comments"] == {}
     assert redacted["annotation_summary"] == {
         "comment_count": 2,
         "redacted": True,
     }
-    assert "inherited function note" in included["text"]
-    assert "inherited address note" in included["text"]
+    assert included["text"] == text
     assert included["comments"] == {"0x401000": "inherited address note"}
 
 
@@ -806,8 +808,7 @@ def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
     text = (
         "void parse_record() {\n"
         "    // first line\n"
-        "    // second line\n"
-        "    do_thing();\n"
+        "    do_thing(); // second line\n"
         "}"
     )
     monkeypatch.setattr(
@@ -815,11 +816,13 @@ def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
     )
 
     result = instance._decompile("active", "parse_record")
+    included = instance._decompile("active", "parse_record", include_annotations=True)
 
     assert "first line" not in result["text"]
     assert "second line" not in result["text"]
     assert result["text"].count("// <annotation redacted>") == 2
     assert "do_thing();" in result["text"]
+    assert included["text"] == text
 
 
 def test_redact_rendered_annotations_preserves_address_gutter():
@@ -835,6 +838,31 @@ def test_redact_rendered_annotations_preserves_address_gutter():
         "0x401000        // <annotation redacted>\n"
         "0x401004            value = 1;"
     )
+
+
+def test_redact_rendered_annotations_preserves_literals_and_noncomment_spans():
+    lines = [
+        '0x401000    const char* url = "https://host/buf";',
+        r'0x401004    const char* quoted = "\"// buf"; // buf',
+        r"0x401008    char quote = '\''; char slash = '/';",
+        "0x40100c    buf = end / 1 + count; /* // buf */",
+        "0x401010    /* block comment",
+        "0x401014       // buf",
+        "0x401018    */ buf++;",
+        '0x40101c    puts("buf"); // unrelated note',
+        '0x401020    puts("// buf"); /* // buf */ return; // \tbuf  ',
+        "0x401024    // buf\t",
+    ]
+    text = "\r\n".join(lines)
+    expected = "\r\n".join([
+        lines[0],
+        r'0x401004    const char* quoted = "\"// buf"; // <annotation redacted>',
+        *lines[2:-2],
+        '0x401020    puts("// buf"); /* // buf */ return; // \t<annotation redacted>  ',
+        "0x401024    // <annotation redacted>\t",
+    ])
+
+    assert read_decompile._redact_rendered_annotations(text, ["buf"]) == expected
 
 
 def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
