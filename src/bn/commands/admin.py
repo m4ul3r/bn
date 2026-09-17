@@ -368,15 +368,30 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
     return None
 
 
+def _install_path(dest: Path) -> Path:
+    """The path `dest` actually names, decided without touching the disk.
+
+    `..` and symlinked ancestors are resolved -- so `store/missing/..` is
+    `store`, not a directory that only exists once something has created
+    `missing` -- while a symlink AT `dest` is kept as the link it is, because
+    that is what gets removed (a link is unlinked, never followed). Planning
+    and acting on this one path is what keeps a spelling from naming two
+    different directories either side of a `mkdir`.
+    """
+    return dest if dest.is_symlink() else dest.resolve()
+
+
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
 
-    # The parent exists before the check so it and the removal below decide on
-    # the same path: a `--dest` spelled through a missing intermediate ("a/b/..")
-    # only becomes the directory it resolves to once the parent is there.
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    _check_install_destination(source, dest, force=force)
+    dest = _plan_install(source, dest, force=force)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BridgeError(
+            f"Cannot create the parent directory of {dest}: {exc}"
+        ) from exc
 
     if dest.is_symlink():
         dest.unlink()
@@ -398,27 +413,42 @@ def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
     )
 
 
-def _check_install_destination(source: Path, dest: Path, *, force: bool) -> None:
-    """Raise unless `dest` may be written to right now.
+def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
+    """The path this install will write to, or a refusal raised.
 
-    Without `--force` any existing destination is an error. With it, only a
-    symlink (removed as a link, never recursed into), an empty directory, or a
-    previous install of `source` may be replaced -- a regular file under
-    `--dest` is somebody else's and is refused instead of unlinked (#766).
-    Deciding this before anything is written also makes the refusal
-    all-or-nothing across a multi-destination `skill install`.
+    Both `plugin install` and the `skill install` pre-pass call this, on the
+    same untouching disk, so the pre-pass cannot approve a destination the
+    install then refuses: that disagreement used to leave a refused
+    multi-destination `skill install` with the destinations it reached first
+    already replaced (#766).
+
+    Nothing may be written inside the artifact's own source tree, even when
+    nothing is there yet -- a copy-mode install into it walks the copy it is
+    writing. Without `--force` any existing destination is an error. With it,
+    only a symlink (removed as a link, never recursed into), an empty
+    directory, or a previous install of `source` may be replaced; a regular
+    file under `--dest` is somebody else's and is refused instead of unlinked.
     """
+    dest = _install_path(dest)
+    source_resolved = source.resolve()
+    if dest.resolve().is_relative_to(source_resolved):
+        raise BridgeError(
+            f"Refusing to install into {dest}: it is the install source itself "
+            f"or inside it ({source}). Choose a destination outside the "
+            "artifact's own tree."
+        )
     if not force:
         if dest.exists() or dest.is_symlink():
             raise BridgeError(f"Destination already exists: {dest}")
-        return
+        return dest
     if dest.is_symlink() or not dest.exists():
-        return
+        return dest
     if not dest.is_dir():
         _refuse_replacement(dest, "it is not a directory")
     refusal = _unsafe_replace_reason(dest, source)
     if refusal is not None:
         _refuse_replacement(dest, refusal)
+    return dest
 
 
 @command("skill", "install", help="Install the bundled agent skills", fmt="text",
@@ -456,8 +486,12 @@ def _skill_install(args: argparse.Namespace) -> int:
         if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
             skipped_destinations.append(str(dest))
             continue
-        _check_install_destination(source, dest, force=args.force)
-        pending_installs.append((source, dest))
+        # Planned, not just checked: the path validated here is the path the
+        # install writes to, and every destination is validated before the
+        # first one is written -- a refused skill install installs nothing.
+        pending_installs.append(
+            (source, _plan_install(source, dest, force=args.force))
+        )
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)

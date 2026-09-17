@@ -436,6 +436,80 @@ def test_a_refused_skill_install_replaces_no_other_destination(tmp_path):
     assert not (destination_root / skills[0].name).exists()
 
 
+def test_a_refused_skill_install_writes_nothing_for_a_spelled_destination(tmp_path):
+    # A destination spelled through a missing intermediate names the same
+    # directory the validated one does, and deciding that must not create the
+    # intermediate: the pre-pass used to approve "store/missing/.." (nothing
+    # there yet) and the per-destination install then replaced the skills it
+    # reached before refusing the unsafe one.
+    skills = sorted(
+        entry
+        for entry in bn.cli.skills_source_dir().iterdir()
+        if (entry / "SKILL.md").exists()
+    )
+    unsafe = skills[-1]
+    store = tmp_path / "store"
+    (store / unsafe.name).mkdir(parents=True)
+    (store / unsafe.name / "keepme.txt").write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        [
+            "skill",
+            "install",
+            "--mode",
+            "copy",
+            "--dest",
+            str(store / "missing" / ".."),
+            "--force",
+        ]
+    )
+
+    assert rc == 2
+    assert (store / unsafe.name / "keepme.txt").read_text() == "irreplaceable"
+    assert not (store / skills[0].name).exists()
+    assert not (store / "missing").exists()
+
+
+def test_install_refuses_a_destination_inside_the_install_source(tmp_path, monkeypatch):
+    # Copying the artifact into its own source tree walks the copy being
+    # written, so a destination under the source is refused even though there
+    # is nothing there to remove yet.
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "bridge.py").write_text("PLUGIN = 1\n")
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source)
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(source / "nested"), "--force"]
+    )
+
+    assert rc == 2
+    assert sorted(entry.name for entry in source.iterdir()) == ["bridge.py", "sub"]
+
+
+def test_install_refuses_a_destination_whose_parent_is_a_file(tmp_path, capsys):
+    # A regular file where a parent directory belongs cannot be a destination
+    # path; the refusal is a clean exit 2, not a traceback out of main().
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory\n")
+
+    rc = bn.cli.main(
+        [
+            "plugin",
+            "install",
+            "--mode",
+            "copy",
+            "--dest",
+            str(blocker / "sub"),
+            "--force",
+        ]
+    )
+
+    assert rc == 2
+    assert blocker.read_text() == "not a directory\n"
+    assert "Cannot create the parent directory" in capsys.readouterr().err
+
+
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
     import bn.paths as paths
 
