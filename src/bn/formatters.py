@@ -2401,8 +2401,10 @@ def _render_function_evidence_text(value: Any) -> str:
             lines.append(f"  mlil: {call['mlil']}")
         if call.get("llil"):
             lines.append(f"  llil: {call['llil']}")
-        args = [arg for arg in _field_list(call, "arguments") if isinstance(arg, dict)]
-        if args:
+        argument_rows = _field_list(call, "arguments")
+        args = [arg for arg in argument_rows if isinstance(arg, dict)]
+        # Confidence and arity diagnostics also describe empty argument lists.
+        if args or call.get("argument_confidence") or call.get("arity_mismatch"):
             source = call.get("argument_source")
             # #549: mark whether `arguments` is canonical (authoritative HLIL/ABI) or a
             # heuristic lower-IL fallback, so an agent traces the right field.
@@ -2435,7 +2437,13 @@ def _render_function_evidence_text(value: Any) -> str:
                 # `argument_source` made `.upper()` an AttributeError that cost
                 # the whole evidence card (#619).
                 layer = str(source).upper() if source else "the rendered list"
-                if isinstance(declared, int):
+                # A missing/malformed list or discarded member supplies no exact
+                # count. Validate this row, not render-wide skew from other calls.
+                if (
+                    isinstance(declared, int)
+                    and isinstance(call.get("arguments"), list)
+                    and len(args) == len(argument_rows)
+                ):
                     note = (f"  arity: MISMATCH — {layer} rendered {len(args)} argument(s) but "
                             f"the callee's recovered prototype declares {declared}")
                 else:

@@ -1701,6 +1701,104 @@ class TestArgumentArityConfidence:
             assert c["argument_confidence"] != "authoritative", c
 
 
+class TestUserPrototypeArityConfidence742:
+    """Use real call-type adjustments, not an accidental compiler recovery quirk."""
+
+    _SOURCE = (
+        "__attribute__((noinline)) int arity_sink(int a, int b, int c) {\n"
+        "  return a + b + c;\n"
+        "}\n"
+        "__attribute__((noinline)) int arity_probe(void) {\n"
+        "  return arity_sink(1, 2, 3);\n"
+        "}\n"
+        "__attribute__((noinline)) int arity_dispatch(int (*fn)(int, int, int)) {\n"
+        "  return fn(4, 5, 6);\n"
+        "}\n"
+        "int main(void) { return arity_probe() + arity_dispatch(arity_sink); }\n"
+    )
+
+    def test_real_user_prototype_counts_and_indirect_dispatch(self, shared_bn, tmp_path):
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the issue742 real-BN regression"
+        source = tmp_path / "arity_fixture.c"
+        source.write_text(self._SOURCE)
+        binary = tmp_path / "arity_fixture"
+        build = subprocess.run(
+            [cc, "-O0", "-fno-inline", "-fno-builtin", "-fno-stack-protector", "-no-pie",
+             str(source), "-o", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        assert build.returncode == 0, f"arity fixture build failed:\n{build.stdout}\n{build.stderr}"
+        target = shared_bn.load(binary, copy=False)
+        shared_bn.json(
+            "py", "exec",
+            "sink = bv.get_functions_by_name('arity_sink')[0]\n"
+            "sink.type = 'int arity_sink(int a, int b, int c)'\n"
+            "bv.update_analysis_and_wait()\n",
+            "-t", target)
+
+        # Changing only the call-site type gives genuine short/empty HLIL while
+        # leaving the callee's known three-parameter prototype intact. Clearing
+        # the adjustment is the matching-count negative control.
+        for adjustment, expected_count in (
+            ("int adjusted(int a)", 1),
+            ("int adjusted(void)", 0),
+            (None, 3),
+        ):
+            observed = shared_bn.json(
+                "py", "exec",
+                "caller = bv.get_functions_by_name('arity_probe')[0]\n"
+                "sites = list(caller.call_sites)\n"
+                "assert len(sites) == 1, sites\n"
+                "call_address = sites[0].address\n"
+                f"caller.set_call_type_adjustment(call_address, {adjustment!r})\n"
+                "bv.update_analysis_and_wait()\n"
+                "caller = bv.get_function_at(caller.start)\n"
+                "sink = bv.get_functions_by_name('arity_sink')[0]\n"
+                "result = {\n"
+                "    'call_address': hex(call_address),\n"
+                "    'has_user_type': sink.has_user_type,\n"
+                "    'declared_count': len(sink.type.parameters),\n"
+                "    'hlil_calls': list(caller.hlil.traverse(lambda node: {\n"
+                "        'address': hex(node.address),\n"
+                "        'parameter_count': len(node.params)\n"
+                "    } if node.operation in (bn.HighLevelILOperation.HLIL_CALL,\n"
+                "                             bn.HighLevelILOperation.HLIL_TAILCALL) else None)),\n"
+                "}\n",
+                "-t", target)["result"]
+            # Preconditions come directly from BN's prototype and raw HLIL,
+            # independently of the evidence argument-selection implementation.
+            assert observed["has_user_type"] is True, observed
+            assert observed["declared_count"] == 3, observed
+            assert observed["hlil_calls"] == [{
+                "address": observed["call_address"], "parameter_count": expected_count,
+            }], observed
+
+            evidence = shared_bn.json("evidence", "function", "arity_probe", "-t", target)
+            assert len(evidence["calls"]) == 1, evidence
+            call = evidence["calls"][0]
+            assert call["address"] == observed["call_address"], call
+            assert call["direct"] is True, call
+            assert call["argument_source"] == "hlil", call
+            assert len(call["arguments"]) == expected_count, call
+            assert call["arity_unknown"] is False, call
+            if expected_count < 3:
+                assert call["arity_mismatch"] is True, call
+                assert call["declared_arity"] == 3, call
+                assert call["argument_confidence"] == "inferred", call
+            else:
+                assert "arity_mismatch" not in call, call
+                assert call["argument_confidence"] == "authoritative", call
+
+        indirect = shared_bn.json("evidence", "function", "arity_dispatch", "-t", target)
+        assert len(indirect["calls"]) == 1, indirect
+        call = indirect["calls"][0]
+        assert call["direct"] is False, call
+        assert call["indirect_call"] is True, call
+        assert call["callee_unresolved"] is True, call
+        assert call["argument_confidence"] == "heuristic", call
+        assert "arity_mismatch" not in call, call
+
+
 class TestDataRetypeRoundtrip:
     """Regression for #649: typing a recovered data variable had NO verified
     mutation path -- `types declare` defines a struct but cannot apply it,
