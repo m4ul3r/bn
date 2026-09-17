@@ -116,10 +116,13 @@ Omit the spawn line only for the confirmed non-ownership collision below or when
 the user explicitly selected another positive idle timeout; merely describing an
 idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
 
-A deliberate alternative timeout must be positive; never use `0`, `none`, or
-`off` for an agent-owned bridge. The reaper starts after preload, resets after
-completed requests, and never fires during an in-flight request or active load
-job. It covers hard agent/process death; it does not replace normal cleanup.
+`BN_IDLE_TIMEOUT` is opt-in: unset means no idle reaper. A positive number of
+seconds arms headless idle shutdown; the agent-owned spawn above uses `3600`
+(one hour). A deliberate alternative timeout must be positive; never use `0`,
+`none`, or `off` for an agent-owned bridge. With it enabled, the reaper starts
+after preload, resets after completed requests, and never fires during an
+in-flight request or active load job. Only an enabled reaper provides the
+fallback after the owning agent/process dies; it does not replace normal cleanup.
 
 On every reachable exit, close only the exact selector returned by the bridge
 when a target opened. Never infer it from a path or basename; a basename is valid
@@ -222,12 +225,28 @@ Prefer these curated helpers for list-shaped and common reads:
 - `await s.info(verbose=False)` exposes `function_count`, `import_symbol_count` (the exact `imports` row count), and `imported_function_count` (callable imported targets); do not compare the latter two as if they were the same population. It requires the canonical `target_info` shape rather than "some mapping", so another payload cannot answer every one of those questions with a silent "absent": `filename` and `basename` must be present as strings or null; `function_count`, `named_function_count`, `unnamed_function_count` and `imported_function_count` must be present non-negative integers; `import_symbol_count` must be present and either a non-negative integer or `null` (the bridge uses `null` when the imports count fails).
 - `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope. Address/name/size sorts are ascending; pass `reverse=True` for descending/largest-first. Search matches function names/display names only. Regex-shaped zero hits disclose `regex_fallback=True|False` on both backends; `"."` is treated as the all-names regex even when literal dots exist, invalid regex-like input raises, and `exact=True` forces a literal.
 - `await s.function_info(identifier, blocks=False)` returns flattened `name`, `address`, `size`, `size_known`, and `imported`; `blocks=True` adds `blocks`. Raw identity remains under `s.last.payload['function']`.
-- `await s.decompile(identifier)` returns the non-empty text string with inherited annotation bodies redacted. Use `include_annotations=True` only after an explicit contamination decision. Skipped placeholders raise and direct you to `force_analysis=True`.
+- `await s.decompile(identifier)` returns the non-empty text string with inherited global address, function-local address, and function-doc annotation bodies redacted from standalone and inline/trailing `//` comments when the complete comment body matches a stored annotation line (ignoring surrounding whitespace). Code, quoted/escaped literals, address gutters, and unrelated comments are preserved. This is not arbitrary-text scrubbing: block comments and differently rendered bodies are not redacted. Use `include_annotations=True` only after an explicit contamination decision; it retains all rendered bodies, while the payload's legacy `comments` map contains global address comments only. Skipped placeholders raise and direct you to `force_analysis=True`.
 - `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise.
 - `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
 - `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero. `total` is monotone across a collection's pages: a `None` page can be followed by a page with the exact integer once the caller scan completes, so a long `callsites` collection can legitimately end with a determined total after starting with null ones -- but an already-determined total never reverts to null or changes to a different int.
 - `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own, because a loader synthesizes those names on a binary with zero analyst work. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
+- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed** on malformed payloads: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
+
+The symbol classification is not proof of an untouched database. In
+`existing_annotations`, `symbol_exclusions` lists **every** excluded non-auto
+symbol as `{name, address, reason}` without a cap (`address` is null if unreadable).
+`reason="debug_info"` means an exact imported name-and-address match and takes
+precedence over `reason="name_shape"`, the loader/engine-name heuristic. This
+includes bare `init`/`fini`, `dest`, and `destr`/`compar` with optional hexadecimal
+suffixes, alongside existing placeholder families. Ordinary analyst renames and
+comments still refuse, but an analyst rename matching an excluded name shape
+**may remain undetected**. An internal symbol namespace does not prove loader
+origin: user renames can carry it too. `symbol_exclusion_limitations` discloses
+this fallback in the payload. The older `*_locations` samples remain bounded;
+`locations_truncated` refers to those samples, not to `symbol_exclusions`.
+The `comments` count includes global and function-local address comments, even
+when both stores have entries at the same address; local sample rows also name
+their function. `function_comments` counts function-doc comments separately.
 
 Every collection and text helper validates **after** the backend branch, so `cli`
 and `native` enforce the same shape: malformed, nested, or silently truncated
@@ -403,7 +422,7 @@ GUI tabs `bn` never loaded. Close the target, then stop the instance.
 
 ## Load cost and memory
 
-Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), stop every owned instance deterministically as soon as its work ends, and rely on one-hour idle reaping only as the crash fallback.
+Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop every owned instance deterministically as soon as its work ends. One-hour idle reaping is a crash fallback only for a headless bridge started with `BN_IDLE_TIMEOUT=3600` (another positive value changes the idle interval); unset means no idle reaper.
 
 For high-fanout cold starts, the orchestration tool's command timeout must exceed
 `BN_SPAWN_TIMEOUT`; otherwise the harness can kill `bn session start` while its

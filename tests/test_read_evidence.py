@@ -3432,18 +3432,25 @@ def test_annotation_summary_counts(monkeypatch):
 
     documented = _FakeFunction(0x1000, "documented")
     documented.comment = "prior-run note"
+    documented.comments = {0x1004: "function-local address note"}
     plain = _FakeFunction(0x2000, "plain")
     bv = _FakeBV(functions=[documented, plain],
                  symbols=[_AutoSym(False), _AutoSym(False), _AutoSym(True)],
                  comments={0x1000: "an address comment", 0x1004: "another"})
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
-    assert summary["comments"] == 2
+    assert summary["comments"] == 3
     assert summary["function_comments"] == 1
     assert summary["user_symbols"] == 2
     assert [item["address"] for item in summary["comment_locations"]] == [
         "0x1000",
         "0x1004",
+        "0x1004",
     ]
+    assert summary["comment_locations"][-1] == {
+        "name": "documented",
+        "address": "0x1004",
+        "comment": "function-local address note",
+    }
     assert summary["function_comment_locations"] == [
         {
             "name": "documented",
@@ -3457,6 +3464,20 @@ def test_annotation_summary_counts(monkeypatch):
     # both non-auto symbols here count as analyst work. Pinned, not incidental.
     assert summary["analyst_symbols"] == 2
     assert summary["placeholder_symbols"] == 0
+
+
+def test_annotation_summary_does_not_hide_an_unreadable_local_comment_store(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class UnreadableComments(_FakeFunction):
+        @property
+        def comments(self):
+            raise RuntimeError("function comments unavailable")
+
+    bv = _FakeBV(functions=[UnreadableComments(0x1000, "parse_record")])
+    with pytest.raises(RuntimeError, match="function comments unavailable"):
+        bridge.read_listing._annotation_summary(instance.ctx, bv)
 
 
 def test_annotation_summary_splits_loader_placeholders_from_analyst_symbols(monkeypatch):
@@ -3502,6 +3523,39 @@ def test_annotation_summary_splits_loader_placeholders_from_analyst_symbols(monk
     ]
 
 
+def test_annotation_summary_discloses_every_loader_helper_exclusion(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    names = ["init", "fini", "dest", "destr", "destr_1a2b", "compar", "compar_1A2B"]
+    # Exceed the legacy location sample: every exclusion still needs a reason.
+    symbols = [
+        types.SimpleNamespace(
+            auto=False, name=name, address=0x1000 + index * 0x10,
+            namespace="BNINTERNALNAMESPACE",
+        )
+        for index, name in enumerate(names * 4)
+    ]
+    analyst = types.SimpleNamespace(
+        auto=False, name="parse_record", address=0x2000,
+        namespace="BNINTERNALNAMESPACE",
+    )
+    bv = _FakeBV(functions=[], symbols=[*symbols, analyst])
+
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+
+    assert summary["user_symbols"] == 29
+    assert summary["placeholder_symbols"] == 28
+    assert summary["analyst_symbols"] == 1
+    assert summary["analyst_symbol_locations"] == [
+        {"name": "parse_record", "address": "0x2000"}
+    ]
+    assert summary["symbol_exclusions"] == [
+        {"name": symbol.name, "address": hex(symbol.address), "reason": "name_shape"}
+        for symbol in symbols
+    ]
+    assert summary["locations_truncated"] is True
+
+
 def test_annotation_summary_counts_survive_an_unreadable_symbol(monkeypatch):
     """One bad symbol must not fabricate a pristine view.
 
@@ -3528,6 +3582,9 @@ def test_annotation_summary_counts_survive_an_unreadable_symbol(monkeypatch):
         def address(self):
             raise RuntimeError("symbol address unavailable")
 
+    class _BadAddressPlaceholder(_BadAddressSym):
+        name = "init"
+
     class _BadProvenanceSym:
         name = "dispatch_entry"
         address = 0x10E100
@@ -3541,20 +3598,24 @@ def test_annotation_summary_counts_survive_an_unreadable_symbol(monkeypatch):
         _BadAddressSym(),
         _NamedSym("_init", 0x10D100),
         _BadProvenanceSym(),
+        _BadAddressPlaceholder(),
     ])
 
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
 
-    # Every symbol is counted, including the two that cannot be fully read --
-    # unreadable provenance counts as analyst work, the fail-closed direction.
-    assert summary["user_symbols"] == 4
-    assert summary["placeholder_symbols"] == 1
+    # Every symbol is counted, even if its address or provenance is unreadable.
+    assert summary["user_symbols"] == 5
+    assert summary["placeholder_symbols"] == 2
     assert summary["analyst_symbols"] == 3
     # Only the row whose address is unreadable is missing from the samples.
     assert [row["name"] for row in summary["analyst_symbol_locations"]] == [
         "parse_header", "dispatch_entry"
     ]
     assert summary["locations_truncated"] is True
+    assert summary["symbol_exclusions"] == [
+        {"name": "_init", "address": "0x10d100", "reason": "name_shape"},
+        {"name": "init", "address": None, "reason": "name_shape"},
+    ]
 
 
 def test_an_unreadable_symbol_enumeration_refuses_instead_of_reporting_zero(monkeypatch):
@@ -3643,21 +3704,28 @@ def test_annotation_summary_credits_debug_info_names_to_the_binary(monkeypatch):
         # The collision: renamed to a name the debug info gave a DIFFERENT
         # function, at an address the debug info never named.
         _NamedSym("parse_header", 0x4020A0),
+        _NamedSym("init", 0x403000),             # debug provenance beats name shape
     ])
     bv.debug_info = types.SimpleNamespace(functions=[
         _DebugFn("parse_header", 0x401149),
         _DebugFn("emit_record", 0x40115B),
+        _DebugFn("init", 0x403000),
         _DebugFn("printf", 0),
     ])
 
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
 
-    assert summary["user_symbols"] == 4
-    assert summary["placeholder_symbols"] == 2
+    assert summary["user_symbols"] == 5
+    assert summary["placeholder_symbols"] == 3
     assert summary["analyst_symbols"] == 2
     assert [(row["name"], row["address"]) for row
             in summary["analyst_symbol_locations"]] == [
         ("parse_trailer", "0x401179"), ("parse_header", "0x4020a0")
+    ]
+    assert summary["symbol_exclusions"] == [
+        {"name": "parse_header", "address": "0x401149", "reason": "debug_info"},
+        {"name": "emit_record", "address": "0x40115b", "reason": "debug_info"},
+        {"name": "init", "address": "0x403000", "reason": "debug_info"},
     ]
 
 

@@ -165,38 +165,21 @@ def is_auto_function_name(name: str) -> bool:
     return bool(suffix) and all(c in "0123456789abcdefABCDEF" for c in suffix)
 
 
-# The remaining names Binary Ninja's LOADERS synthesize and mark `auto=False`.
-# "non-auto" alone reported hundreds of "user symbols" on a view with zero
-# analyst work, so `provenance_hint` told the reader to discount current-run
-# analysis that WAS entirely current-run, and a benchmark gate read a pristine
-# binary as contaminated (#733 F2). Deliberately conservative: exactly these
-# shapes are placeholders, and anything else -- including an unreadable or empty
-# name, and an analyst rename that happens to look like one -- counts as analyst
-# work, because over-counting analyst effort is the safe direction here.
-# `main` is in the set on MEASURED evidence, not by analogy: a freshly loaded
-# stripped dynamic ELF (`/usr/bin/ls`, copied aside, never annotated) reports
-# exactly one non-auto symbol, `main`, which BN's loader synthesizes from the
-# `__libc_start_main` argument. Leaving it out made every fresh ELF hint "1
-# analyst symbol(s) already present" and made the benchmark gate refuse it --
-# the same defect as the 612-symbol case, at a smaller count. The disclosed
-# cost is the other direction, and it is one name wide: an analyst who renames
-# a function to `main` on a binary where BN could NOT find it is not counted as
-# contamination.
-# This predicate is the NAME-shape half only. Names a view's imported debug
-# info supplied are excluded by PROVENANCE instead, in
-# `read_listing._debug_info_names` -- an exact match against what BN's DWARF
-# importer reported, which is why `helper`/`parse_header` on a `cc -g` build
-# need no entry here and an analyst rename of one still counts.
+# Name-shape fallback for names BN's loaders/analysis can mark `auto=False`.
+# This is NOT provenance: an analyst rename matching one of these families is
+# indistinguishable and can be missed. BN's internal namespace is not proof
+# either -- user-defined symbols can carry it too. `read_listing` prefers an
+# address-specific imported-debug-info match and discloses every fallback.
 _PLACEHOLDER_SYMBOL_NAME = re.compile(
     r"^(?:func(?:_[0-9a-fA-F]+)?"
     r"|sub"
     r"|(?:init|start)_routine(?:_[0-9a-fA-F]+)?"
-    r"|_init|_fini|main)$"
+    r"|_?init|_?fini|main|dest|(?:destr|compar)(?:_[0-9a-fA-F]+)?)$"
 )
 
 
 def is_placeholder_symbol_name(name: str) -> bool:
-    """True for a machine-generated symbol name, loader placeholders included.
+    """True when a name resembles a machine-generated symbol (a heuristic).
 
     Delegates the ``sub_<hex>``/``j_sub_<hex>`` family to
     ``is_auto_function_name`` rather than re-spelling it, so the two predicates

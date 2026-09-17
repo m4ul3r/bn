@@ -891,22 +891,24 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     function = _FakeFunction(0x401000, "parse_record")
-    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401004)]
     function.comment = "inherited function note"
+    function.comments = {0x401002: "function-local address note"}
     bv = _FakeBV(
         functions=[function],
-        comments={0x401000: "inherited address note"},
+        # A grouped instruction span must not skip a rendered comment within it.
+        instruction_lengths={0x401000: 4},
+        comments={0x401002: "inherited address note", 0x401004: "outside function"},
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {  // inherited function note\n"
+        "    // inherited address note\n"
+        "    return; // function-local address note\n"
+        "}"
+    )
     monkeypatch.setattr(
-        bridge.il_format,
-        "_decompile_text",
-        lambda *args, **kwargs: (
-            "void parse_record() {\n"
-            "    // inherited function note\n"
-            "    // inherited address note\n"
-            "}"
-        ),
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
     )
 
     redacted = instance._decompile("active", "parse_record")
@@ -914,16 +916,45 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
         "active", "parse_record", include_annotations=True
     )
 
-    assert "inherited function note" not in redacted["text"]
-    assert "inherited address note" not in redacted["text"]
+    assert redacted["text"] == (
+        "void parse_record() {  // <annotation redacted>\n"
+        "    // <annotation redacted>\n"
+        "    return; // <annotation redacted>\n"
+        "}"
+    )
     assert redacted["comments"] == {}
     assert redacted["annotation_summary"] == {
-        "comment_count": 2,
+        "comment_count": 3,
         "redacted": True,
     }
-    assert "inherited function note" in included["text"]
-    assert "inherited address note" in included["text"]
-    assert included["comments"] == {"0x401000": "inherited address note"}
+    assert included["text"] == text
+    # The legacy map stays global-only; local bodies are collected independently.
+    assert included["comments"] == {"0x401002": "inherited address note"}
+
+
+@pytest.mark.parametrize("store", ["global", "local"])
+def test_decompile_does_not_hide_an_unreadable_comment_store(monkeypatch, store):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class UnreadableLocalComments(_FakeFunction):
+        @property
+        def comments(self):
+            raise RuntimeError("local comment store unavailable")
+
+    class UnreadableGlobalComments(_FakeBV):
+        @property
+        def address_comments(self):
+            raise RuntimeError("global comment store unavailable")
+
+    function_type = UnreadableLocalComments if store == "local" else _FakeFunction
+    view_type = UnreadableGlobalComments if store == "global" else _FakeBV
+    function = function_type(0x401000, "parse_record")
+    bv = view_type(functions=[function])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match=f"{store} comment store unavailable"):
+        instance._decompile("active", "parse_record")
 
 
 @pytest.mark.parametrize("body,code", [
@@ -965,8 +996,7 @@ def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
     text = (
         "void parse_record() {\n"
         "    // first line\n"
-        "    // second line\n"
-        "    do_thing();\n"
+        "    do_thing(); // second line\n"
         "}"
     )
     monkeypatch.setattr(
@@ -974,11 +1004,13 @@ def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
     )
 
     result = instance._decompile("active", "parse_record")
+    included = instance._decompile("active", "parse_record", include_annotations=True)
 
     assert "first line" not in result["text"]
     assert "second line" not in result["text"]
     assert result["text"].count("// <annotation redacted>") == 2
     assert "do_thing();" in result["text"]
+    assert included["text"] == text
 
 
 def test_redact_rendered_annotations_preserves_address_gutter():
@@ -994,6 +1026,31 @@ def test_redact_rendered_annotations_preserves_address_gutter():
         "0x401000        // <annotation redacted>\n"
         "0x401004            value = 1;"
     )
+
+
+def test_redact_rendered_annotations_preserves_literals_and_noncomment_spans():
+    lines = [
+        '0x401000    const char* url = "https://host/buf";',
+        r'0x401004    const char* quoted = "\"// buf"; // buf',
+        r"0x401008    char quote = '\''; char slash = '/';",
+        "0x40100c    buf = end / 1 + count; /* // buf */",
+        "0x401010    /* block comment",
+        "0x401014       // buf",
+        "0x401018    */ buf++;",
+        '0x40101c    puts("buf"); // unrelated note',
+        '0x401020    puts("// buf"); /* // buf */ return; // \tbuf  ',
+        "0x401024    // buf\t",
+    ]
+    text = "\r\n".join(lines)
+    expected = "\r\n".join([
+        lines[0],
+        r'0x401004    const char* quoted = "\"// buf"; // <annotation redacted>',
+        *lines[2:-2],
+        '0x401020    puts("// buf"); /* // buf */ return; // \t<annotation redacted>  ',
+        "0x401024    // <annotation redacted>\t",
+    ])
+
+    assert read_decompile._redact_rendered_annotations(text, ["buf"]) == expected
 
 
 def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):

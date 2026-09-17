@@ -120,16 +120,16 @@ def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
 
 
 def _comment_map(bv, func) -> dict[str, str]:
-    arch = getattr(func, "arch", None)
-    comments: dict[str, str] = {}
-    for block in list(func.basic_blocks):
-        addr = block.start
-        while addr < block.end:
-            text = bv.get_comment_at(addr)
-            if text:
-                comments[hex(addr)] = text
-            addr += max(1, _instruction_length(bv, int(addr), arch=arch))
-    return comments
+    """Global comments within the function, including grouped instruction spans."""
+    address_comments = bv.address_comments
+    if not address_comments:
+        return {}
+    ranges = [(block.start, block.end) for block in func.basic_blocks]
+    return {
+        hex(address): text
+        for address, text in address_comments.items()
+        if text and any(start <= address < end for start, end in ranges)
+    }
 
 
 def _il_op_name(item) -> str:

@@ -439,11 +439,10 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     """Count annotations ALREADY present in the view (#561).
 
     On a cached/shared BNDB, inherited comments/names can bias analysis and let
-    an agent over-credit itself for state a prior run produced. Surface bounded
-    counts so orientation discloses the inherited baseline. Cheap: global address
-    comments come from the ``address_comments`` map; function-doc comments read one
-    string attribute per function (the per-function address-comment map is NOT
-    materialized, to keep this a fast triage read)."""
+    an agent over-credit itself for state a prior run produced. Surface counts
+    and bounded annotation samples; symbol exclusions are uncapped so each has
+    a reason. Address-comment counts include both the global map and each
+    function's local map; function-doc comments have their own count."""
     comments = 0
     comment_locations: list[dict[str, Any]] = []
     try:
@@ -464,6 +463,18 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     function_comments = 0
     function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
+        local_comments = getattr(fn, "comments", {}) or {}
+        comments += len(local_comments)
+        for address, text in local_comments.items():
+            if len(comment_locations) >= 20:
+                break
+            comment_locations.append(
+                {
+                    "name": str(getattr(fn, "name", "")),
+                    "address": hex(int(address)),
+                    "comment": str(text)[:160],
+                }
+            )
         try:
             text = str(getattr(fn, "comment", "") or "").strip()
             if text:
@@ -487,6 +498,7 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     analyst_symbols = 0
     placeholder_symbols = 0
     analyst_symbol_locations: list[dict[str, Any]] = []
+    symbol_exclusions: list[dict[str, Any]] = []
     # The functions the binary's own debug info named. BN marks those
     # `auto=False`, so without this a `cc -g` build reported its own function
     # names as inherited analyst work (#733 F2 review).
@@ -526,14 +538,18 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         # rename that reuses a name the debug info gave a DIFFERENT function
         # still counts as analyst work.
         address = _symbol_address_text(symbol)
-        placeholder = (
-            (address is not None and (name, address) in debug_info_symbols)
-            or is_placeholder_symbol_name(name)
-        )
+        exclusion_reason = None
+        if address is not None and (name, address) in debug_info_symbols:
+            exclusion_reason = "debug_info"
+        elif is_placeholder_symbol_name(name):
+            exclusion_reason = "name_shape"
         if len(user_symbol_locations) < 20 and address is not None:
             user_symbol_locations.append({"name": name, "address": address})
-        if placeholder:
+        if exclusion_reason is not None:
             placeholder_symbols += 1
+            symbol_exclusions.append(
+                {"name": name, "address": address, "reason": exclusion_reason}
+            )
         else:
             analyst_symbols += 1
             if len(analyst_symbol_locations) < 20 and address is not None:
@@ -549,6 +565,13 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         "analyst_symbols": analyst_symbols,
         "placeholder_symbols": placeholder_symbols,
         "analyst_symbol_locations": analyst_symbol_locations,
+        "symbol_exclusions": symbol_exclusions,
+        "symbol_exclusion_limitations": (
+            "name_shape is a heuristic, not provenance: analyst renames matching "
+            "excluded name families may remain undetected. Internal symbol "
+            "namespaces also occur on user renames and are not proof of origin. "
+            "debug_info requires the imported name and address to match."
+        ),
         # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
         # at 20, so whenever the analyst pair could report truncation the user
         # pair already does (#733 F2). Not because one sample contains the
