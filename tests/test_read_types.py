@@ -92,6 +92,160 @@ def test_types_declare_refuses_source_without_named_types(monkeypatch):
     assert bv.defined == []
 
 
+def test_types_declare_refuses_a_partially_dropped_declaration_760(monkeypatch):
+    """#760: the platform parser discards a declaration whose name collides with a
+    built-in type WITHOUT raising, so a multi-declaration string defined one type,
+    dropped another, and still reported `verified`. The drop is now a refusal --
+    nothing is applied, so the caller cannot read a partial declaration as success.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            names = [name for name in ("widget_cfg_t",) if name in source]
+            return _ParseResult(types={name: f"struct {name}" for name in names})
+
+    class _PartialBV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.platform = _Platform()
+            self.defined: list[tuple[str, object]] = []
+
+        def get_type_by_name(self, name):
+            return None
+
+        def define_user_type(self, name, type_obj):
+            self.defined.append((name, type_obj))
+
+    bv = _PartialBV()
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_types_declare(
+            bv,
+            {
+                "op": "types_declare",
+                "declaration": (
+                    "struct uint32_t { int shadow_x; }; "
+                    "struct widget_cfg_t { int y; };"
+                ),
+            },
+        )
+
+    assert exc.value.status == "invalid_request"
+    assert "define no named type" in exc.value.message
+    assert exc.value.observed["dropped_declarations"] == [
+        "struct uint32_t { int shadow_x; };"
+    ]
+    assert exc.value.observed["defined_types"] == ["widget_cfg_t"]
+    assert bv.defined == []          # refused before anything is applied
+
+
+def test_partial_declaration_check_passes_when_every_fragment_lands_760(monkeypatch):
+    """#760 negative control: a multi-declaration whose fragments all define a named
+    type is untouched -- the guard must not fire on ordinary multi-type input."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    module = bridge.mutation_engine
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            names = [name for name in ("widget_a_t", "widget_b_t") if name in source]
+            return _ParseResult(types={name: f"struct {name}" for name in names})
+
+    class _BV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.platform = _Platform()
+
+    dropped = module._declarations_without_named_types(
+        instance.ctx, _BV(),
+        "struct widget_a_t { int a; }; struct widget_b_t { int b; };",
+        None,
+    )
+
+    assert dropped == []
+
+
+def test_partial_declaration_check_skips_a_dependent_fragment_760(monkeypatch):
+    """#760: a fragment that only fails to parse alone because it uses a type an
+    earlier fragment defines is NOT a dropped declaration -- refusing it would turn a
+    working declaration into an error."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    module = bridge.mutation_engine
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            # The outer fragment depends on the inner type, so alone it cannot parse:
+            # raising there is what tells the check to stay silent.
+            if "widget_outer_t" in source and "widget_inner_t {" not in source:
+                raise SyntaxError("unknown type 'widget_inner_t'")
+            names = [
+                name for name in ("widget_inner_t", "widget_outer_t") if name in source
+            ]
+            return _ParseResult(types={name: f"struct {name}" for name in names})
+
+    class _BV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.platform = _Platform()
+
+    dropped = module._declarations_without_named_types(
+        instance.ctx, _BV(),
+        "struct widget_inner_t { int a; }; "
+        "struct widget_outer_t { struct widget_inner_t inner; };",
+        None,
+    )
+
+    assert dropped == []
+
+
+@pytest.mark.parametrize(
+    "fragment, declares",
+    [
+        ("struct widget_t { int x; };", True),
+        ("union widget_u { int x; };", True),
+        ("enum widget_e { WIDGET_A = 1 };", True),
+        ("class Widget { int x; };", True),
+        ("typedef struct { int x; } widget_alias_t;", True),
+        ("typedef unsigned short int32_t;", True),
+        ("struct widget_t x;", False),          # a usage, not a definition
+        ("struct widget_t;", False),            # a forward declaration
+        ("int widget_call(int a);", False),     # a function declaration
+        ("extern int widget_g;", False),
+    ],
+)
+def test_declares_a_type_classifies_fragments_760(fragment, declares, monkeypatch):
+    """#760: only a fragment that intends to DEFINE a type is inspectable. A usage or
+    a forward declaration legitimately defines nothing and must never be refused."""
+    bridge = _load_bridge(monkeypatch)
+    assert bridge.mutation_engine._declares_a_type(fragment) is declares
+
+
+def test_split_top_level_declarations_is_brace_and_quote_aware_760(monkeypatch):
+    """#760: the splitter must not break a declaration at a `;` inside a struct body,
+    an array bound, a string literal or a comment -- a bad split would mis-report a
+    dropped declaration and refuse a valid one."""
+    bridge = _load_bridge(monkeypatch)
+    split = bridge.mutation_engine._split_top_level_declarations
+
+    source = (
+        "struct widget_a_t { int a; int b; }; "     # a body `;`
+        "struct widget_b_t { char name[4]; }; "     # an array bound
+        'struct widget_c_t { char *fmt; }; /* ; */ '  # a `;` in a comment
+    )
+
+    fragments = split(source)
+
+    assert len(fragments) == 3
+    assert all(fragment.strip().endswith(";") for fragment in fragments)
+    assert "widget_a_t { int a; int b; }" in fragments[0]
+    assert split("struct widget_d_t { char *s; };") == [
+        "struct widget_d_t { char *s; };"
+    ]
+
+
 def test_declared_types_verifier_rejects_an_empty_apply_result(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

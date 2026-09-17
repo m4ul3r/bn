@@ -3543,6 +3543,101 @@ def _strip_c_comments(source: str) -> str:
     return _C_COMMENT_RE.sub(" ", source)
 
 
+def _split_top_level_declarations(source: str) -> list[str]:
+    """The top-level `;`-separated declarations in *source* (#760).
+
+    Brace/paren/bracket/quote/comment aware, so the `;` inside a struct body, an
+    array bound, a string literal or a comment never splits a declaration. A
+    trailing fragment with no `;` of its own is kept, so an unterminated
+    declaration is still inspected rather than silently ignored.
+    """
+    fragments: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "/" and source[index + 1:index + 2] == "*":
+            end = source.find("*/", index + 2)
+            index = len(source) if end < 0 else end + 2
+            continue
+        elif char == "/" and source[index + 1:index + 2] == "/":
+            end = source.find("\n", index + 2)
+            index = len(source) if end < 0 else end + 1
+            continue
+        elif char in "{([":
+            depth += 1
+        elif char in "})]":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            fragments.append(source[start:index + 1])
+            start = index + 1
+        index += 1
+    tail = source[start:]
+    if tail.strip():
+        fragments.append(tail)
+    # A fragment that is only whitespace/comments declares nothing: drop it so the
+    # split reflects declarations, not the comment layout around them.
+    return [
+        fragment for fragment in fragments if _strip_c_comments(fragment).strip()
+    ]
+
+
+_TOP_LEVEL_TYPE_DEF_RE = re.compile(r"^(?:typedef\s+)?(?:struct|union|enum|class)\b")
+
+
+def _declares_a_type(fragment: str) -> bool:
+    """Whether a top-level fragment intends to DEFINE a type (#760).
+
+    A braced body (`struct A { ... };`) or a `typedef` does; a usage
+    (`struct A x;`), a forward declaration (`struct A;`) or a function/variable
+    declaration does not. Deliberately narrow -- this gates a refusal, so a
+    fragment that merely mentions a type keyword must not qualify.
+    """
+    text = _strip_c_comments(fragment).strip()
+    if "{" not in text:
+        return text.startswith("typedef")
+    return bool(_TOP_LEVEL_TYPE_DEF_RE.match(text))
+
+
+def _declarations_without_named_types(ctx, bv, declaration: str,
+                                      source_path: str | None) -> list[str]:
+    """Top-level fragments that define no named type when parsed on their own (#760).
+
+    The platform parser DROPS a declaration whose name collides with a built-in
+    type instead of reporting it, so `struct uint32_t { int x; }; struct
+    widget_cfg_t { int y; };` applied one type, discarded the other, and reported
+    `verified`. Re-parsing each flaggable fragment alone is the available ground
+    truth for the discarded one. A fragment that FAILS to parse alone is skipped:
+    it may legitimately depend on a type an earlier fragment defines, so silence is
+    the honest answer. Single-fragment declarations are left to the all-dropped
+    guard in `_op_types_declare`, which already refuses them.
+    """
+    fragments = _split_top_level_declarations(declaration)
+    if len(fragments) < 2:
+        return []
+    dropped: list[str] = []
+    for fragment in fragments:
+        if not _declares_a_type(fragment):
+            continue
+        try:
+            parsed = _parse_declaration_source(ctx, bv, fragment, source_path=source_path)
+        except Exception:
+            continue
+        if not list(parsed.get("types") or []):
+            dropped.append(" ".join(fragment.split()))
+    return dropped
+
+
 def _declaration_has_bitfield(declaration: str) -> bool:
     text = _strip_c_comments(declaration)
     for match in _BITFIELD_MEMBER_RE.finditer(text):
@@ -3637,6 +3732,25 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
                 "defined_types": {},
                 "parsed_functions": [name for name, _ in parsed["functions"]],
                 "parsed_variables": [name for name, _ in parsed["variables"]],
+            },
+        )
+    # A declaration whose name collides with a built-in type is DROPPED by the
+    # parser without an error, so a multi-declaration string could define one type,
+    # discard another, and still report `verified` (#760). Refuse rather than apply
+    # a partial declaration: the caller sees the whole outcome or none, which is the
+    # behaviour the all-dropped guard above already establishes.
+    dropped = _declarations_without_named_types(ctx, bv, declaration, op.get("source_path"))
+    if dropped:
+        raise OperationFailure(
+            "invalid_request",
+            "these declarations define no named type and would be discarded: "
+            + "; ".join(dropped)
+            + ". A declaration whose name collides with a built-in type is dropped by "
+            "the parser; rename it, or declare the remaining types without it.",
+            requested=_operation_requested(ctx, op),
+            observed={
+                "defined_types": sorted(str(name) for name, _ in named_types),
+                "dropped_declarations": dropped,
             },
         )
     # Backstop for any OTHER malformed layout the parser might emit (beyond the
