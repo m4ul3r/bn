@@ -2148,6 +2148,33 @@ def test_render_class_show_text_no_note_when_vtable_not_truncated():
     assert "scan capped" not in text
 
 
+def test_render_class_show_text_notes_a_secondary_vtable_unreadable_stop():
+    # #822 review (round 2) minor: the secondary-vtable branch of the new note
+    # had no fixture, so the two parallel branches could drift unobserved.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": None,
+        "secondary_vtables": [{
+            "address": "0xa000",
+            "offset_to_top": -16,
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": False,
+            "total": None,
+            "total_lower_bound": 1,
+            "scan_truncated": True,
+            "truncated_reason": "unreadable_row",
+            "max_slots": 64,
+        }],
+    }
+    text = _render_class_show_text(rec)
+    assert "unreadable entry" in text
+    assert "at least 1" in text
+    assert "scan capped" not in text
+
+
 def test_render_class_show_text_notes_truncated_secondary_vtable():
     from bn.formatters import _render_class_show_text
     rec = {

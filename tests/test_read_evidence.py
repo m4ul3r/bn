@@ -3087,6 +3087,144 @@ def test_virtual_call_names_an_unreadable_stop_instead_of_the_cap(monkeypatch):
     assert "scan capped" not in out["unresolved_reason"]
 
 
+def test_virtual_call_reports_an_undecodable_provider_body_as_unknown(monkeypatch):
+    # #822 review (round 2): a provider whose vtable SYMBOL resolves but whose
+    # body this command refuses to decode (word[1] is not a typeinfo -- the
+    # import/GOT and relocated-to-zero shapes) was never SEARCHED for the slot.
+    # `slot_not_present` ("the provider's table genuinely ends before the index")
+    # therefore claimed an absence about a table this command never read. The
+    # base SHA emitted no reason code here at all; the wrong claim arrived with
+    # the code.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+
+    class _NoBodyCtx(_VcTableCtx):
+        def _typeinfo_name_at(self, b, addr):
+            return None
+
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    ctx = _NoBodyCtx({i: _vc_code_row(i) for i in range(8)})
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_body_unresolved"
+    assert "5" in out["unresolved_reason"]
+
+
+def test_virtual_call_reports_an_unreadable_provider_layout_as_unknown(monkeypatch):
+    # The other undecodable shape: reading the provider's layout RAISED. That was
+    # swallowed, and the swallowed failure read as a confirmed absence to
+    # anything branching on the reason code.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+
+    class _RaisingCtx(_VcTableCtx):
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            raise RuntimeError("provider vtable unreadable")
+
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+
+    out = re._resolve_virtual_call(_RaisingCtx({}), None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_body_unresolved"
+    assert "5" in out["unresolved_reason"]
+
+
+def test_virtual_call_warns_when_another_provider_body_could_not_be_decoded(monkeypatch):
+    # A resolved set must not imply every provider was consulted: a provider whose
+    # body could not be decoded may implement the slot, and that provider is
+    # silently absent from `candidates` otherwise.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+
+    class _MixedBodyCtx(_VcTableCtx):
+        """0x9000 decodes; 0xA000's word[1] is not a typeinfo, so it is refused."""
+        def _read_pointer_value(self, b, addr, *, size=None):
+            return 0x9100 if addr == 0x9008 else 0
+
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", lambda pv: {
+        "Provider": {"vtable": types.SimpleNamespace(address=0x9000)},
+        "Opaque": {"vtable": types.SimpleNamespace(address=0xA000)},
+    })
+    ctx = _MixedBodyCtx({i: _vc_code_row(i) for i in range(8)})
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is True
+    assert out["ambiguous"] is False
+    assert len(out["candidates"]) == 1
+    assert "unresolved_reason" not in out
+    assert len(out["warnings"]) == 1
+    assert "could not be decoded" in out["warnings"][0]
+    assert "not fully scanned" not in out["warnings"][0]
+
+
+def test_virtual_call_types_a_present_index_that_holds_no_method(monkeypatch):
+    # #822 review (round 2) major: the index IS in the table -- `class show`
+    # lists it as a slot -- but it holds no callable target (a null/pure-virtual
+    # placeholder). Typing that `slot_not_present` said the index was past the
+    # table's end, contradicting the listing the same command shows.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 2, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    # index 2 is an INTERIOR null placeholder (a trailing one would be trimmed as
+    # the next object's padding, and then it genuinely is not a listed slot).
+    rows = {0: _vc_code_row(0), 1: _vc_code_row(1),
+            2: {"index": 2, "entry_address": hex(0x9010 + 2 * 8), "value": "0x0",
+                "readable": True, "plausible": True,
+                "target": {"status": "null", "context": {"kind": "null"}}},
+            3: _vc_code_row(3),
+            4: {"index": 4, "entry_address": hex(0x9010 + 4 * 8), "value": "0xA100",
+                "readable": True, "plausible": True,
+                "target": {"status": "mapped", "function": None,
+                           "context": {"kind": "data", "segment": {"executable": False}}}}}
+    ctx = _VcTableCtx(rows)
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "slot_present_no_method"
+    assert "2" in out["unresolved_reason"]
+    # the index really is listed by the layout the same call reads
+    layout = bridge.read_class._vtable_layout(ctx, None, 0x9000)
+    assert 2 in [s["index"] for s in layout["slots"]]
+
+
+def test_virtual_call_types_a_present_beyond_cap_index_that_holds_no_method(monkeypatch):
+    # ...and the same holds for an index the targeted probe reaches past the
+    # display window: resolving a placeholder is not resolving a method.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 70, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    rows = {i: _vc_code_row(i) for i in range(80)}
+    rows[70] = {"index": 70, "entry_address": hex(0x9010 + 70 * 8), "value": "0x0",
+                "readable": True, "plausible": True,
+                "target": {"status": "null", "context": {"kind": "null"}}}
+    ctx = _VcTableCtx(rows)
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["slot_index"] == 70
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "slot_present_no_method"
+    assert "70" in out["unresolved_reason"]
+
+
 def test_virtual_call_reports_probe_limit_rather_than_a_false_absence(monkeypatch):
     # #822: the requested index comes from an MLIL constant. When it is so far
     # past the window that the targeted walk would exceed its bound, the result
