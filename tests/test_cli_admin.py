@@ -510,6 +510,40 @@ def test_install_refuses_a_destination_whose_parent_is_a_file(tmp_path, capsys):
     assert "Cannot create the parent directory" in capsys.readouterr().err
 
 
+def test_force_replaces_a_symlink_install_that_points_at_the_source(tmp_path):
+    # The default `--mode symlink` install leaves a link at the destination that
+    # points at the install source. Replacing it removes the link, never the
+    # source: the link's target must not be read as the thing being replaced,
+    # or every re-install of a symlinked install refuses for good.
+    destination = tmp_path / "store" / "bn_agent_bridge"
+
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 0
+    assert destination.is_symlink()
+
+    assert bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--force"]
+    ) == 0
+    assert bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--mode", "copy", "--force"]
+    ) == 0
+    assert (bn.cli.plugin_source_dir() / "bridge.py").is_file()
+    assert not destination.is_symlink()
+
+
+def test_skill_install_force_replaces_its_own_symlink_installs(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "codex")
+
+    assert bn.cli.main(["skill", "install"]) == 0
+    assert (claude_root / "bn").is_symlink()
+
+    assert bn.cli.main(["skill", "install", "--force"]) == 0
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 0
+    assert (claude_root / "bn" / "SKILL.md").is_file()
+    assert not (claude_root / "bn").is_symlink()
+
+
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
     import bn.paths as paths
 

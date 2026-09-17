@@ -323,35 +323,10 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
     them is somebody else's. Everything else is refused with the deliberate
     alternative named, the same "refuse and name the escape hatch" shape as
     the bridge's destructive-op gate, rather than learned from a half-populated
-    install.
-
-    The structural refusals come first because they hold even for an EMPTY
-    destination: a filesystem root, the home directory, or a directory
-    containing the bn cache/skill roots -- removing it takes the instance
-    registry, sticky pins and every other installed skill with it -- is never
-    an install destination. Paths are compared resolved, so a symlinked
-    ancestor cannot smuggle the rmtree past the check (`dest` itself is
-    unlinked un-followed by the caller, before this runs).
+    install. Paths are compared as `_install_path` resolved them, so a symlinked
+    ancestor cannot smuggle the rmtree past the check, and the pure path rules
+    (`_never_an_install_destination`) were already applied to this same path.
     """
-    resolved = dest.resolve()
-    if resolved == resolved.parent:
-        return "it is a filesystem root"
-    if resolved == Path.home().resolve():
-        return "it is your home directory"
-    for root in (
-        cli.cache_home(),
-        cli.claude_skills_dir(),
-        cli.codex_skills_dir(),
-        cli.omp_skills_dir(),
-    ):
-        if root.resolve().is_relative_to(resolved):
-            return f"it contains the bn installation root {root}"
-    source_resolved = source.resolve()
-    if resolved.is_relative_to(source_resolved) or source_resolved.is_relative_to(
-        resolved
-    ):
-        return f"it overlaps the install source {source}"
-
     if not any(dest.iterdir()):
         return None
     foreign = _foreign_install_entry(dest, source)
@@ -369,16 +344,49 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
 
 
 def _install_path(dest: Path) -> Path:
-    """The path `dest` actually names, decided without touching the disk.
+    """The path an install at `dest` works on, decided without touching disk.
 
-    `..` and symlinked ancestors are resolved -- so `store/missing/..` is
-    `store`, not a directory that only exists once something has created
-    `missing` -- while a symlink AT `dest` is kept as the link it is, because
-    that is what gets removed (a link is unlinked, never followed). Planning
+    Ancestors are resolved -- so `store/missing/..` is `store`, not a directory
+    that only exists once something has created `missing` -- while a symlink AT
+    `dest` stays the link it is: it is unlinked, never followed, so its own
+    location is what gets replaced and what the path rules must judge. Planning
     and acting on this one path is what keeps a spelling from naming two
     different directories either side of a `mkdir`.
     """
-    return dest if dest.is_symlink() else dest.resolve()
+    return dest.parent.resolve() / dest.name if dest.is_symlink() else dest.resolve()
+
+
+def _never_an_install_destination(dest: Path, source: Path) -> str | None:
+    """Why `dest` can never be an install destination, or None when it can.
+
+    Pure path rules, judged on the path the install would work on (`dest` as
+    `_install_path` returned it, so a symlink is its own location and not its
+    target): they hold whether or not `dest` exists yet, because creating an
+    install there is as wrong as replacing one. A filesystem root, the home
+    directory, or a destination containing the bn cache/skill roots -- the
+    instance registry, sticky pins and every installed skill live under them --
+    is not a destination, and neither is the source tree being copied, in
+    either direction: inside it, a copy-mode install walks the copy it is
+    writing, and a destination containing it would bury the artifact.
+    """
+    if dest == dest.parent:
+        return "it is a filesystem root"
+    if dest == Path.home().resolve():
+        return "it is your home directory"
+    for root in (
+        cli.cache_home(),
+        cli.claude_skills_dir(),
+        cli.codex_skills_dir(),
+        cli.omp_skills_dir(),
+    ):
+        if root.resolve().is_relative_to(dest):
+            return f"it contains the bn installation root {root}"
+    source_resolved = source.resolve()
+    if dest == source_resolved or dest.is_relative_to(source_resolved):
+        return f"it is the install source {source} itself or inside it"
+    if source_resolved.is_relative_to(dest):
+        return f"it contains the install source {source}"
+    return None
 
 
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
@@ -417,25 +425,25 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
     """The path this install will write to, or a refusal raised.
 
     Both `plugin install` and the `skill install` pre-pass call this, on the
-    same untouching disk, so the pre-pass cannot approve a destination the
+    same untouched disk, so the pre-pass cannot approve a destination the
     install then refuses: that disagreement used to leave a refused
     multi-destination `skill install` with the destinations it reached first
     already replaced (#766).
 
-    Nothing may be written inside the artifact's own source tree, even when
-    nothing is there yet -- a copy-mode install into it walks the copy it is
-    writing. Without `--force` any existing destination is an error. With it,
-    only a symlink (removed as a link, never recursed into), an empty
-    directory, or a previous install of `source` may be replaced; a regular
-    file under `--dest` is somebody else's and is refused instead of unlinked.
+    The pure path rules come first and hold for a destination that does not
+    exist yet (`_never_an_install_destination`). Without `--force` any existing
+    destination is an error. With it, only a symlink (removed as a link, never
+    recursed into), an empty directory, or a previous install of `source` may
+    be replaced; a regular file under `--dest` is somebody else's and is refused
+    instead of unlinked.
     """
     dest = _install_path(dest)
-    source_resolved = source.resolve()
-    if dest.resolve().is_relative_to(source_resolved):
+    forbidden = _never_an_install_destination(dest, source)
+    if forbidden is not None:
         raise BridgeError(
-            f"Refusing to install into {dest}: it is the install source itself "
-            f"or inside it ({source}). Choose a destination outside the "
-            "artifact's own tree."
+            f"Refusing to install into {dest}: {forbidden}. Choose a "
+            "destination outside the bn installation and outside the tree "
+            "being copied."
         )
     if not force:
         if dest.exists() or dest.is_symlink():
