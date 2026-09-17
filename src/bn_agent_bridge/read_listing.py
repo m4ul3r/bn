@@ -114,28 +114,42 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
 
         instruction_length = il_format._instruction_length(bv, call_addr, arch=func_arch)
         caller_static = call_addr + instruction_length
+        # #816: a recovered call whose address is absent from this function's
+        # structured-disasm index (the block walk never decoded an entry here --
+        # a decode hole, or a call the walk's block ranges do not cover) used to
+        # drop the row outright, so `callsites` reported fewer sites than the
+        # xrefs/dataflow-callgraph evidence it is supposed to agree with and
+        # said nothing about why. The IDENTITY of the site (callee, caller,
+        # addresses) is known and actionable whatever the disassembly sweep did,
+        # so emit the row with a null context plus a machine-readable reason --
+        # the `hlil_statement_reason` shape, for the same "localize or say why
+        # not" policy.
         disasm_index = index_by_addr.get(call_addr)
         if disasm_index is None:
-            continue
-
-        previous = [
-            {
-                "address": item["address"],
-                "text": item["text"],
+            previous: list[dict[str, Any]] = []
+            next_instructions: list[dict[str, Any]] = []
+            call_instruction: dict[str, Any] | None = None
+            disasm_context_reason: str | None = "no_structured_disasm_entry"
+        else:
+            previous = [
+                {
+                    "address": item["address"],
+                    "text": item["text"],
+                }
+                for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
+            ]
+            next_instructions = [
+                {
+                    "address": item["address"],
+                    "text": item["text"],
+                }
+                for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
+            ]
+            call_instruction = {
+                "address": disasm_entries[disasm_index]["address"],
+                "text": disasm_entries[disasm_index]["text"],
             }
-            for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
-        ]
-        next_instructions = [
-            {
-                "address": item["address"],
-                "text": item["text"],
-            }
-            for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
-        ]
-        call_instruction = {
-            "address": disasm_entries[disasm_index]["address"],
-            "text": disasm_entries[disasm_index]["text"],
-        }
+            disasm_context_reason = None
         # #557: when the HLIL statement can't be localized, expose a stable
         # machine-readable reason code alongside the null so an agent knows WHY
         # (e.g. an ambiguous BN call-fold) instead of re-running decompile and
@@ -158,6 +172,7 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
                 "call_instruction": call_instruction,
                 "previous_instructions": previous,
                 "next_instructions": next_instructions,
+                "disasm_context_reason": disasm_context_reason,
                 "hlil_statement": hlil_statement,
                 "hlil_statement_reason": hlil_reason,
                 "pre_branch_condition": il_format._hlil_pre_branch_condition(insn),

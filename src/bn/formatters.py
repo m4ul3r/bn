@@ -3149,9 +3149,15 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         for item in previous:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
-        lines.append(
-            f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
-        )
+        if row.get("disasm_context_reason"):
+            # #816: the call site is real (its identity fields are usable) but the
+            # disassembly sweep produced no entry at its address, so the context is
+            # null by evidence, not by omission -- say WHY, mirroring `hlil: null (...)`.
+            lines.append(f"> unavailable ({row['disasm_context_reason']})")
+        else:
+            lines.append(
+                f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
+            )
         for item in next_instructions:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())

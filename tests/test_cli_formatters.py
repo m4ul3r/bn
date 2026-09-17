@@ -621,6 +621,24 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     assert "bn evidence function parse_line" in out
 
 
+def test_render_callsites_shows_missing_context_reason():
+    # #816: a call whose address the disassembly sweep never decoded keeps its row
+    # (identity fields intact) with a null context -- text mode must say WHY the
+    # context is unavailable instead of printing a bare "<unknown>".
+    from bn.formatters import _render_callsites_text
+    value = {"items": [{
+        "callee": {"name": "target_fn", "address": "0x461746"},
+        "containing_function": {"name": "caller_fn", "address": "0x412470"},
+        "call_addr": "0x4124a6", "caller_static": "0x4124ab",
+        "call_instruction": None, "disasm_context_reason": "no_structured_disasm_entry",
+        "previous_instructions": [], "next_instructions": [],
+    }], "total": 1, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "> unavailable (no_structured_disasm_entry)" in out
+    assert "<unknown>" not in out
+
+
 def _callsite_row(call_addr: str) -> dict:
     return {
         "callee": {"name": "rotl8", "address": "0x401156"},

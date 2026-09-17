@@ -283,6 +283,65 @@ def test_callsites_finds_register_dest_call_via_code_ref_db(monkeypatch):
     assert rows[0]["caller_static"] == "0x4124a4"
 
 
+def test_callsites_keeps_call_absent_from_disasm_index_with_a_reason(monkeypatch):
+    """#816: a call the LLIL/code-ref union confirms but this function's structured
+    disassembly walk never decoded (a decode hole) used to be DROPPED -- no row, no
+    reason -- so `callsites` reported fewer sites than the `xrefs` evidence it is
+    meant to agree with, and an agent could not tell a hole from "not called". The
+    site's identity is known whatever the disassembly sweep managed, so emit the row
+    with a null context plus a machine-readable reason (the `hlil_statement_reason`
+    shape)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "target_fn")
+    fn = _FakeFunction(0x412470, "caller_fn")
+    fn.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124AE)]
+    fn.low_level_il = [[
+        _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746)),
+        _FakeLLILInstruction(0x4124A6, _FakeConstPtr(0x461746)),
+    ]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x4124A0: 5, 0x4124A5: 1, 0x4124A6: 5, 0x4124AB: 3},
+        disassembly={
+            0x4124A0: "call target_fn",
+            0x4124A5: "nop",
+            # 0x4124A6 is the hole: the walk decodes nothing here, so it emits no entry.
+            0x4124AB: "test al, 0x3f",
+        },
+        code_refs={0x461746: [
+            _FakeCodeRef(0x4124A0, fn),
+            _FakeCodeRef(0x4124A6, fn),
+        ]},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "target_fn", within_identifiers=["caller_fn"], context=1)
+
+    assert [row["call_addr"] for row in result["items"]] == ["0x4124a0", "0x4124a6"]
+    kept = result["items"][1]
+    # The identity of the site stays usable even though its context is missing.
+    assert kept["callee"] == {"name": "target_fn", "address": "0x461746"}
+    assert kept["containing_function"] == {"name": "caller_fn", "address": "0x412470"}
+    assert kept["call_kind"] == "call"
+    assert kept["instruction_length"] == 5
+    assert kept["caller_static"] == "0x4124ab"
+    assert kept["call_index"] == 1
+    # Context is null by evidence, and the row says why.
+    assert kept["call_instruction"] is None
+    assert kept["previous_instructions"] == []
+    assert kept["next_instructions"] == []
+    assert kept["disasm_context_reason"] == "no_structured_disasm_entry"
+    # A localized row is untouched: real context, no reason.
+    assert result["items"][0]["disasm_context_reason"] is None
+    assert result["items"][0]["call_instruction"] == {"address": "0x4124a0", "text": "call target_fn"}
+    assert result["items"][0]["next_instructions"] == [{"address": "0x4124a5", "text": "nop"}]
+    # Counts stay honest: callsites must not report fewer sites than xrefs for the
+    # same callee (the pre-fix drop made this 2 vs 1).
+    assert result["total"] == 2
+    assert instance._xrefs(None, "target_fn")["code_ref_count"] == result["total"]
+
+
 def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
