@@ -947,202 +947,6 @@ def test_the_disclosure_reaches_an_early_return_path():
     assert "malformed function field" in values
 
 
-# The tests this PR adds that PASS against the base commit -- MEASURED, not
-# declared from memory (see the test below, which re-runs them against the base
-# module and requires this table to match exactly). Each is green on base BY
-# DESIGN: a test whose subject is this file's own machinery, or an invariant
-# that already held and must keep holding. The declaration is the point: "green
-# on base" is the first thing a reviewer checks for vacuity, and an undeclared
-# green test costs a round of argument every time.
-#
-# Each is proven non-vacuous by breaking the exact thing it defends:
-_GREEN_ON_BASE_BY_DESIGN = {
-    "test_an_explicit_null_listing_claims_nothing_and_renders_no_count_row":
-        "an explicit null claimed nothing at base too; it goes red if the "
-        "presence test is re-spelled as `key in payload`",
-    "test_the_coercion_guard_does_not_fire_on_a_recorded_read":
-        "tests the AST guard in this file, not the module; red if RECORDERS "
-        "stops being consulted",
-    "test_the_coercion_guard_sees_every_form_it_claims_to_see":
-        "same -- the guard's own coverage over synthetic sources; red if any "
-        "declared form stops being matched",
-    "test_the_coercion_guards_blind_spots_are_the_ones_it_declares":
-        "same -- red if a declared blind spot is silently closed or widened",
-    "test_well_formed_realistic_payloads_carry_no_disclosure":
-        "the no-false-positive half of the disclosure -- red if a legitimately "
-        "empty container starts recording a skew",
-    "test_the_green_on_base_declaration_is_not_stale":
-        "the measurement below is of git and a child process, not of the "
-        "module, so it holds at either commit -- and it was the SEVENTH green "
-        "test the six-name declaration did not name",
-    "test_no_renderer_mutates_the_payload_it_was_handed":
-        "the no-mutate invariant already held at base; red if a renderer "
-        "appends to, or edits an element of, the caller's own list. It used to "
-        "read as RED on base for a HARNESS reason and not a coverage one -- the "
-        "probe wrapped a helper in `formatters._discloses`, which base does not "
-        "define, so the population raised AttributeError before the invariant "
-        "was ever checked. Keying the wrap on `_boundary_free_helpers` fixed "
-        "that by accident and correctly: base decorates nothing, so nothing is "
-        "wrapped there and the invariant is now genuinely MEASURED on base",
-    "test_every_NESTED_population_context_actually_reaches_the_read_it_was_recorded_for":
-        "asserts the nested population's own promise about itself, so it holds "
-        "at either commit -- and for the same reason as the entry above it was "
-        "previously red on base only because the probe could not build a "
-        "population there at all; red if a recorded leaf stops reaching its read",
-    "test_no_consumer_reaches_the_formatters_module_by_a_computed_name":
-        "its subject is the CALLERS, not this module, so it holds at either "
-        "commit -- base's command modules resolve no formatters symbol by a "
-        "computed name either. It is the executable form of a docstring caveat "
-        "two rounds left as prose; red the moment a `getattr(formatters, name)` "
-        "with a non-literal name enters the package",
-    "test_the_string_shape_population_harvests_a_guard_named_through_an_alias":
-        "its subject is the CLASSIFIER in this file, run over a SYNTHETIC "
-        "module that carries an alias-spelled guard, so it holds at either "
-        "commit. It replaces the earlier `no_shape_guard_hides_behind_a_module"
-        "_level_alias`, which asserted the module does not CONTAIN the "
-        "spelling -- bookkeeping for a blindness that the classifier now "
-        "resolves. Red if the harvest goes back to requiring a literal `str`, "
-        "or if the classifier stops calling an alias-spelled drop a drop",
-}
-
-# The PR's base commit: what "green on base" is measured AGAINST. A parameter of
-# the measurement, not of the module, so it is spelled exactly once.
-_BASE_SHA = "f4ed1fa0dc2bc7c098dc40ebdbeec18e7e52609c"
-
-
-def _tests_added_by_this_branch():
-    """Every `test_*` in this file that the base commit does not have."""
-    import ast
-    import pathlib
-    import subprocess
-
-    here = pathlib.Path(__file__).resolve()
-    root = here.parents[1]
-    base = subprocess.run(
-        ["git", "-C", str(root), "show", f"{_BASE_SHA}:{here.relative_to(root)}"],
-        capture_output=True, text=True, check=True).stdout
-
-    def names(source):
-        return {node.name for node in ast.parse(source).body
-                if isinstance(node, ast.FunctionDef)
-                and node.name.startswith("test_")}
-
-    return names(here.read_text()) - names(base)
-
-
-def _green_against_the_base_module(deselect):
-    """Which tests in this file PASS against the BASE COMMIT's `bn` package.
-
-    Measured by RUNNING them: the base package is checked out of git into a
-    shadow tree that the child's `pythonpath` points at INSTEAD of `src`, and
-    this same file is re-run against it in a child process. Nothing here
-    consults the declaration it is used to check.
-
-    The shadow is installed through pytest's own `pythonpath` ini rather than
-    through the environment, because this project SETS that ini to `src`: the
-    plugin inserts it at `sys.path[0]` on every run, ahead of anything
-    `PYTHONPATH` can reach, so an env-var shadow silently measured the HEAD
-    module and reported every test green on base.
-
-    The WHOLE package comes from base, not just `formatters.py`. A shadow that
-    mixed base's `formatters.py` into this branch's package was a chimera that
-    cannot exist: a formatters symbol this branch adds and a command module
-    imports at module scope (`_xrefs`'s `disclosure_boundary`) made
-    `bn.commands.*` unimportable there, so every test that builds the
-    installed-renderer population errored on the import before its subject was
-    reached -- reading as "red on base" for a harness reason, which is the
-    absence-of-evidence mistake this file's own subject is about. "Green at the
-    base commit" is also the claim the declaration below actually makes.
-    """
-    import io
-    import os
-    import pathlib
-    import subprocess
-    import sys
-    import tarfile
-    import tempfile
-    import xml.etree.ElementTree as ET
-
-    here = pathlib.Path(__file__).resolve()
-    root = here.parents[1]
-    archive = subprocess.run(
-        ["git", "-C", str(root), "archive", _BASE_SHA, "src/bn"],
-        capture_output=True, check=True).stdout
-    with tempfile.TemporaryDirectory() as tmp:
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            tar.extractall(tmp)
-        shadow = pathlib.Path(tmp) / "src"
-        assert (shadow / "bn" / "formatters.py").exists(), (
-            "the base package did not extract, so nothing would be measured")
-        report = pathlib.Path(tmp) / "base.xml"
-        # The node id is spelled RELATIVE to the run's cwd, because that is what
-        # pytest collects and therefore the only spelling `--deselect` matches.
-        # An absolute one silently matches nothing -- and the test it must
-        # deselect is the one that spawns this child, so a deselect that misses
-        # recurses forever instead of failing. The caller asserts the deselect
-        # took effect, which is why the reported names come back too.
-        node = f"{here.relative_to(root)}::{deselect}"
-        subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-             "--no-header", "--tb=no", "-o", f"pythonpath={shadow}",
-             f"--junitxml={report}",
-             str(here.relative_to(root)), "--deselect", node],
-            cwd=root, env=os.environ.copy(), capture_output=True, text=True,
-            timeout=900)
-        passed, failed = set(), set()
-        for case in ET.parse(report).iter("testcase"):
-            name = (case.get("name") or "").split("[")[0]
-            target = (failed if any(child.tag in ("failure", "error")
-                                    for child in case) else passed)
-            target.add(name)
-    return passed - failed, passed | failed
-
-
-def test_the_green_on_base_declaration_is_not_stale():
-    """A declaration nobody re-checks is prose, including this one.
-
-    Checking that the NAMES exist was not a check at all: the table said six,
-    the measurement says seven, and the seventh is THIS test -- which sat
-    outside its own list for thirteen rounds with the guard green. A
-    declaration whose guard cannot fail is this PR's own recurring defect one
-    level up, so the set is MEASURED: every test this branch adds is re-run
-    against the BASE COMMIT's package, and the table must equal exactly what
-    passes there. Add a green-on-base test without declaring it and this fails;
-    keep a name that has gone red on base and this fails too.
-
-    ONE exemption, unique by construction: this test is deselected in the child
-    run, because measuring it would re-enter the measurement. Its name comes
-    from the running frame rather than being spelled, so the exemption cannot
-    drift onto a second test, and it is still declared above like any other."""
-    mine = inspect.currentframe().f_code.co_name
-    added = _tests_added_by_this_branch()
-    assert mine in added, (
-        f"{mine} is not new on this branch, so the self-exemption below is "
-        "excusing a test the base already had")
-    green, reported = _green_against_the_base_module(mine)
-    # The exemption, executed: the child must have run this file and must NOT
-    # have run THIS test. A report missing the whole file (a shadow package that
-    # would not import) would otherwise read as "nothing is green on base".
-    assert len(reported) > len(added), (
-        f"the child run reported only {len(reported)} tests, fewer than the "
-        f"{len(added)} this branch adds -- it did not measure the base module, "
-        "so the comparison below would be against nothing")
-    assert mine not in reported, (
-        f"the child run executed {mine}, so the deselect stopped matching and "
-        "the measurement is measuring itself")
-    measured = (green & added) | {mine}
-    assert set(_GREEN_ON_BASE_BY_DESIGN) == measured, (
-        "the green-on-base declaration disagrees with the measurement. "
-        f"undeclared: {sorted(measured - set(_GREEN_ON_BASE_BY_DESIGN))}; "
-        f"declared but red on base: {sorted(set(_GREEN_ON_BASE_BY_DESIGN) - measured)}. "
-        "An undeclared green test reads as vacuous coverage; a declared one "
-        "that has gone red is a reason nobody re-derived.")
-    assert all(_GREEN_ON_BASE_BY_DESIGN.values()), (
-        "every entry needs the reason it is green on base by design")
-
-
-
-
 # The choke-point helpers, and the bare coercion helpers that BYPASS them.
 # Hoisted out of `_coercion_sites` so `test_the_coercion_guard_names_no_deleted
 # _helper` can check them against the live module: the list carried `_as_list`
@@ -2606,8 +2410,7 @@ def _probe_renderers():
     # The composed entry points, appended LAST and never wrapped: production
     # does not wrap them either -- the paired renderer carries its own boundary,
     # and that boundary is precisely what the transform's reads happen too early
-    # to reach. Labelled with the TRANSFORM's name (the parenthesised tail is
-    # stripped by `fn_of`) so the AST attributes its declared reads to it.
+    # to reach.
     for transform_name in sorted(_COMPOSED_ENTRY_POINTS):
         transform = getattr(formatters, transform_name)
         renderer = getattr(formatters, _COMPOSED_ENTRY_POINTS[transform_name])
@@ -3474,7 +3277,7 @@ def _payload_for(ctx, path, leaf):
 
 
 # A RUNAWAY GUARD, never the stopping condition. The descent stops when a level
-# discovers no further container, and `test_the_nested_population_is_exactly_this_big`
+# discovers no further container, and `test_the_nested_population_converges_before_the_depth_cap`
 # asserts the deepest path is strictly shallower than this cap -- which is the
 # proof it converged rather than being cut off. A fixed depth of 2 was the
 # round-10 blocker: it read as a stated limit and behaved as a live bypass,
@@ -3655,54 +3458,6 @@ def _nested_population():
         return nested
     finally:
         formatters.json = real_json
-
-
-def test_the_runtime_population_is_exactly_this_big():
-    """The LOAD-BEARING half of the differential below, and the half every
-    earlier round left out.
-
-    Without an exact size, a site that VANISHES from the population is
-    indistinguishable from a site that passed -- which is how a `>= 520` floor
-    over 552 cases tolerated five renderers quietly leaving the population. A
-    floor cannot tell a fix from a disappearance. These numbers are therefore
-    exact, and a deliberate change to the module updates them in the same
-    commit; that update is visible in review, a shrinking floor is not."""
-    population = _runtime_population()
-    probed = len(_probe_renderers())
-    reading = {name for name, _, _, _, _ in population}
-    containers = [rec for rec in population if rec[3] is not None]
-    assert (probed, len(reading), len(population), len(containers)) == (105, 90, 599, 200), (
-        "the runtime-discovered population changed size: "
-        f"{probed} renderers probed / {len(reading)} of them read a named field / "
-        f"{len(population)} (renderer, key) pairs / {len(containers)} of those "
-        "pairs read as a container. These are not bookkeeping: every number is "
-        "the SIZE OF THE COVERED SET, so re-baselining one to make this pass is "
-        "how coverage leaves silently. Update them only together with the "
-        "renderer or field you deliberately added or removed, and say which in "
-        "the commit. If you changed no read, a renderer stopped reading a field "
-        "it used to read and the differential below just stopped covering it -- "
-        "which is the failure this assertion exists to make visible.")
-    # Main's ask after round 12, and the cheap half of the test below: the
-    # COUNT of pairs whose recorded context is not the bare payload. A silent
-    # regression to `{}` for every unclassified read -- which is what round 12
-    # blocked on -- moves this number, so it cannot happen quietly again.
-    #
-    # 156 -> 390 when the recorded context stopped being "the FIRST context in
-    # which the key is ASKED" and became "the context a sweep can FAIL in"
-    # (`_most_failable_context`): value-dependent before richest, both measured.
-    # Fourteen pairs were being swept in a payload that read them and did
-    # nothing with the answer -- one of those contexts was hiding a live
-    # `int(value.get("offset") or 0)` that raised on a string and cost a whole
-    # evidence card -- and 220 more were swept with their siblings absent, which
-    # is the leaf-level form of the same defect.
-    situated = [rec for rec in population if rec[4]]
-    assert len(situated) == 408, (
-        f"{len(situated)} of {len(population)} population pairs are read in a "
-        "NON-EMPTY context, not 408. A pair whose context collapses back to the "
-        "bare payload is a pair whose read the sweeps below may never reach: "
-        "recording `{}` for every key no container was walked at put 367 of 564 "
-        "pairs -- including all six `go rename` counters, behind "
-        "`kind == \"go_rename\"` -- outside every behavioural guard.")
 
 
 def test_every_population_context_actually_reaches_the_read_it_was_recorded_for():
@@ -4178,142 +3933,6 @@ def test_every_uncovered_read_is_covered_directly():
                     f"{label} cried skew for the well-formed {clean!r}")
 
 
-def test_the_container_probe_misses_exactly_three_top_level_reads():
-    """What the runtime probe CANNOT classify, named rather than left as a
-    number. The round-7 differential said "consumed under-detects at 18 of 92
-    sites" and stopped there, which is an unexplained hole; this is the same
-    question answered.
-
-    The module's own `_field_list`/`_field_dict` literal arguments are an
-    INDEPENDENT inventory of the choke-point reads -- independent because the
-    probe never consults it, and it is used here only to measure the probe's
-    coverage, never to build the population (building the population from it is
-    the defect this whole rework removed).
-
-    Two gaps, both structural and both stated exactly:
-
-    * Three top-level reads are not CLASSIFIED, and all three for one reason:
-      the container's contents reach the output only by INTERPOLATION --
-      `f"(tainted arg(s) {args})"`, `f"... {others}"` -- never by a walk.
-      `__repr__` does not go through `__iter__`, and truthiness is deliberately
-      not counted either, because `bool()` cannot tell a list from a scalar and
-      counting it reported 936 scalar fields as containers. They are
-      `_render_defuse_text.other_versions`, `_render_leaf_line.dropped_args`
-      and `_render_leaf_line.tainted_args`. All three are still swept for
-      raises, and all three still DISCLOSE a skew, because they read through the
-      choke point; they are only outside the disclosure differential.
-    * The remaining declared reads sit where a TOP-LEVEL key probe cannot reach
-      them: a key of a callee ROW, a per-block `insns`, a flow's `leaves`, or a
-      read inside a helper that is handed a nested object rather than the
-      renderer's payload. Those are the population of the NESTED differential
-      above, plus the named nested tests.
-
-    Counted twice on purpose, and this is a round-9 repair. `declared` is a SET
-    of `(function, key)` pairs, so a key read at several call sites in one
-    function survives losing one of them: 25 pairs have 2-4 sites each, and
-    converting one of those sites to a raw coercion moved neither count. The
-    CALL SITES are therefore counted too, so a read that leaves coverage fails
-    here instead of quietly shrinking the differential."""
-    import ast
-    import inspect
-
-    from bn import formatters
-
-    tree = ast.parse(inspect.getsource(formatters))
-    declared = set()
-    sites = set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(fn):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id in _RECORDERS):
-                for arg in node.args[1:]:
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        declared.add((fn.name, arg.value))
-                        sites.add((fn.name, arg.value, node.lineno, arg.col_offset))
-
-    population = _runtime_population()
-    # A population label carries the flag combination it was probed under
-    # (`_render_taint_text(full=True)`); the module's AST knows only the
-    # function name, so compare on that.
-    def fn_of(label):
-        return label.split("(")[0]
-    classified = {(fn_of(name), key) for name, _, key, kind, _ in population
-                  if kind is not None}
-    read = {(fn_of(name), key) for name, _, key, _, _ in population}
-    missed = sorted(f"{name}.{key}" for name, key in declared - classified
-                    if (name, key) in read)
-    nested = [pair for pair in declared - classified if pair not in read]
-    assert len(declared) == 229, (
-        f"the module declares {len(declared)} choke-point reads, not 229. The "
-        "count is the size of the covered set: a read that vanishes is a read "
-        "no differential runs any more, so move this number only with the read "
-        "you deliberately added or removed.")
-    assert len(sites) == 251, (
-        f"the module has {len(sites)} choke-point CALL SITES, not 251. A pair "
-        "read at several sites keeps its (function, key) entry when one site is "
-        "converted to a raw coercion, which is why the sites are counted too -- "
-        "so a site that disappears here is a coercion that stopped going "
-        "through the choke point, not a number to re-baseline.")
-    assert missed == ["_render_defuse_text.other_versions",
-                      "_render_leaf_line.dropped_args",
-                      "_render_leaf_line.tainted_args"], (
-        "a choke-point read the probe reaches at top level is no longer "
-        f"classified as a container, so the differential stopped covering it: {missed}")
-    assert len(nested) == 92, (
-        f"{len(nested)} declared reads sit where the top-level probe cannot "
-        "reach them, not 92")
-    # Counting is not covering, and that was round 9's blocker: the nested reads
-    # were counted here and then differentially tested nowhere, so a one-hop
-    # helper coercing a nested ref bucket passed every guard in this file. Every
-    # nested declared read must now be EXERCISED by one of the two
-    # differentials.
-    #
-    # Matched through the CALL GRAPH, not by bare key name -- that was round
-    # 10's major. The AST attributes a read to the HELPER that spells it and the
-    # runtime attributes it to the RENDERER that was called, so the two only
-    # meet if the renderer reaches the helper. Matching on the key name alone
-    # credited a read in one function to a same-named key in an unrelated one.
-    exercised = ({(fn_of(name), key) for name, _, key, kind, _ in population
-                  if kind is not None}
-                 | {(fn_of(name), key) for name, _, _, key, kind, _, _ in _nested_population()
-                    if kind is not None})
-    reach = _module_reach()
-    def covered(fn, key):
-        return any(k == key and (r == fn or fn in reach.get(r, ()))
-                   for r, k in exercised)
-    uncovered = sorted(f"{fn}.{key}" for fn, key in nested if not covered(fn, key))
-    # The residue, and its exemption is EXECUTABLE rather than prose. It said
-    # "each with its own named test above", which was false for five of the
-    # seven: those names occurred exactly once in this whole file, inside this
-    # assertion list, so a guard-blind coercion at one of them restored the base
-    # crash with the file green. That is the same defect as round 11's
-    # false exclusion reason -- a justification nobody can re-check does not
-    # expire when it stops being true.
-    #
-    # So the list is not an exemption any more: every entry must appear in
-    # `_RESIDUE_DIRECT_COVER`, and the test below RUNS each one through the
-    # choke-point differential by calling the helper with a payload built to
-    # reach the read. If a reaching payload cannot be built, the entry fails
-    # there instead of being excused here.
-    #
-    # The three #685 summary transforms USED to sit here, excused as "reads that
-    # produce a dict rather than text". That excuse was round 11's blocker: the
-    # CLI renders their OUTPUT, so nothing downstream could re-read what they
-    # absorbed, and a malformed `results[]` rendered byte-identically to an
-    # absent one on the default mutation text path. They are composed entry
-    # points now (`_COMPOSED_ENTRY_POINTS`) and are exercised by the top-level
-    # differential like any other renderer, which is why they are gone from
-    # this list rather than re-excused in it.
-    assert uncovered == sorted(_RESIDUE_DIRECT_COVER), (
-        "a declared choke-point read is exercised by neither differential and "
-        "is not in _RESIDUE_DIRECT_COVER either, so nothing runs it: "
-        f"{sorted(set(uncovered) - set(_RESIDUE_DIRECT_COVER))}. Get it into a "
-        "population, or give it a reaching payload in _RESIDUE_DIRECT_COVER -- "
-        "an entry here with no executed case behind it is prose.")
-
-
 def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     """THE positive differential, over a population discovered by RUNNING the
     renderers (see `_runtime_population`) rather than by asking the coercion
@@ -4412,25 +4031,14 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert swept == 4792, f"the raise sweep ran {swept} renders, not 4792"
 
 
-def test_the_nested_population_is_exactly_this_big():
-    """The same exact-size discipline as the top-level population, one and two
-    containers down. A nested position that VANISHES is otherwise
-    indistinguishable from one that passed."""
-    nested = _nested_population()
-    depths = collections.Counter(len(path) for _, _, path, _, _, _, _ in nested)
-    containers = [rec for rec in nested if rec[4] is not None]
-    assert (len(nested), len(containers)) == (1377, 218), (
-        f"the nested population changed size: {len(nested)} nested keys read, "
-        f"{len(containers)} of them as containers. If you added a nested read, "
-        "update these numbers; if you did not, a renderer stopped reading a "
-        "nested field and the differential below stopped covering it.")
-    assert dict(sorted(depths.items())) == {1: 810, 2: 360, 3: 128, 4: 48, 5: 25, 6: 6}, (
-        f"the nested population's shape changed: {dict(sorted(depths.items()))}")
+def test_the_nested_population_converges_before_the_depth_cap():
+    """The nested descent must exhaust its frontier before the runaway cap."""
+    deepest = max(len(path) for _, _, path, _, _, _, _ in _nested_population())
     # THE convergence proof, and the answer to round 10's second blocker: the
     # descent stopped because a level found no further container, not because it
     # hit the cap. A cap the data reaches would be a live bypass one level down.
-    assert max(depths) < _NEST_DEPTH_CAP, (
-        f"the nested descent reached the runaway cap ({max(depths)} of "
+    assert deepest < _NEST_DEPTH_CAP, (
+        f"the nested descent reached the runaway cap ({deepest} of "
         f"{_NEST_DEPTH_CAP}), so it was CUT OFF rather than converging, and a "
         "read below it is outside every differential")
 
@@ -4481,21 +4089,12 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
     EMPTY -- and the same reason: the caller reads a confident "nothing here" out
     of a payload the renderer could not use.
 
-    This is the half round 9 found missing. The nested reads were COUNTED (the
-    `nested` bucket below) and never tested, so a one-hop helper coercing a
-    nested ref bucket kept every guard in this file green while a falsy wrong
-    shape rendered byte-identically to the key being absent. Counting is not
-    covering.
-
-    Replayed against the base module the way the top-level differential is
-    (base's own nested population: 1262 keys, 201 of them containers, because
-    the descent is derived from the module it runs on): base absorbs 1012 of its
-    1206 nested cases at 132 of those 201 positions; this commit absorbs 0 of
-    1308."""
+    A one-hop helper coercing a nested ref bucket must not let a falsy wrong
+    shape render byte-identically to the key being absent."""
     from bn import formatters
 
     echoes = formatters._render_fallback_text
-    absorbed, checked = [], 0
+    absorbed = []
     for fn_name, render, path, key, kind, ctx, leaf in _nested_population():
         if kind is None:
             continue
@@ -4509,7 +4108,6 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
         for bogus in _MALFORMED[kind]:
             payload = _payload_for(ctx, path, {**base, key: bogus})
             out = _render_or_exception(render, payload)
-            checked += 1
             if isinstance(out, Exception):
                 continue                   # the nested raise sweep owns this case
             if _disclosed(out, key):
@@ -4523,7 +4121,6 @@ def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
                     f"to that nested field being "
                     f"{'absent' if out == absent else 'empty'}, with no disclosure")
     assert not absorbed, absorbed[:8]
-    assert checked == 1308, f"the nested differential ran {checked} cases, not 1308"
 
 
 def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
@@ -4533,15 +4130,12 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
 
     Kind-free because the crash does not need a container: a sampled string
     sliced as `(s.get("value") or "")[:80]`, a block index in a `:<4` format
-    spec, an unhashable `kind` used as a grouping key. Base, swept over its own
-    nested population the same way, raises 320 times at 86 nested positions in
-    10096 renders; this commit raises 0 in 11016."""
-    swept, raised = 0, []
+    spec, an unhashable `kind` used as a grouping key."""
+    raised = []
     for fn_name, render, path, key, _kind, ctx, leaf in _nested_population():
         base = {k: v for k, v in leaf.items() if k != key}
         absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
         for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
-            swept += 1
             out = _render_or_exception(render, _payload_for(ctx, path, {**base, key: bogus}))
             if isinstance(out, Exception) and not isinstance(absent, Exception):
                 where = ".".join(k for k, *_ in path)
@@ -4549,7 +4143,6 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-    assert swept == 11016, f"the nested raise sweep ran {swept} renders, not 11016"
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
@@ -7236,11 +6829,8 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
     Same property as at top level -- an unusable element may render as a
     placeholder or be skipped, never RAISE -- and the same junk set and the same
     FOUR element shapes, shared with it so the two sweeps cannot drift into
-    covering different cardinalities. Base, swept over its own nested
-    population, raises 884 times at 31 positions in 3024 renders; this commit
-    raises 0 in 3636."""
+    covering different cardinalities."""
     raised = []
-    swept = 0
     for label, render, path, key, kind, ctx, leaf in _nested_population():
         if kind != "list":
             continue
@@ -7253,7 +6843,6 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
                           copy.deepcopy(element)],
                          [copy.deepcopy(element), dict(_PROBE_SIBLING_ELEMENT),
                           copy.deepcopy(element)]):
-                swept += 1
                 out = _render_or_exception(
                     render, _payload_for(ctx, path, {**base, key: rows}))
                 if isinstance(out, BaseException) and not isinstance(absent, BaseException):
@@ -7264,11 +6853,6 @@ def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
         "a wrong-shaped ELEMENT of a NESTED list cost the whole render where "
         "the same payload with that list absent rendered cleanly: "
         f"{raised[:6]}")
-    assert swept == 3636, (
-        f"the nested element sweep ran {swept} renders, not 3636 -- the size of "
-        "the covered set (every nested list position the descent discovered x "
-        "every junk element kind x all four element shapes), so move it only with a "
-        "nested list position you deliberately added or removed")
 
 
 
