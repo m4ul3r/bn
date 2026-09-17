@@ -966,6 +966,14 @@ def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
 
 
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
+    from .read_evidence import _function_thunk_summary
+
+    # Class-list's thunk suppression is name filtering, not method evidence.
+    # Inspect only this class's exact entries; a same-name body is not a target.
+    for method in rec["methods"]:
+        func = ctx._find_function(bv, method["address"])
+        method["thunk"] = _function_thunk_summary(ctx, bv, func)
+
     if rec.get("vtable"):
         rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
         # #412 (codex Finding 1): a multiple-inheritance class commonly keeps its

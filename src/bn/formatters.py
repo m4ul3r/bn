@@ -5456,6 +5456,19 @@ def _render_class_show_text(value: Any) -> str:
     return _render_one_class(value)
 
 
+def _class_method_label(method: dict[str, Any]) -> str:
+    label = f"{method.get('address', '?')}  {method.get('demangled', '')}"
+    thunk = _field_dict(method, "thunk")
+    target = _field_dict(thunk, "target")
+    if thunk.get("is_candidate"):
+        destination = f"target -> {_render_target_line(target)}" if target else "target unresolved"
+        reason = thunk.get("reason") or "no reason recorded"
+        label += f"  [thunk/veneer candidate: {reason}; {destination}]"
+    elif target:
+        label += f"  [local branch -> {_render_target_line(target)}; not a confirmed thunk/veneer]"
+    return label
+
+
 def _render_one_class(rec: Any) -> str:
     if not isinstance(rec, dict):
         return _render_fallback_text(rec)
@@ -5502,7 +5515,7 @@ def _render_one_class(rec: Any) -> str:
             lines.append(f"  method {m!r}")
             continue
         if m.get("kind") in ("ctor", "dtor"):
-            lines.append(f"  {m.get('kind'):<6} {m.get('address', '?')}  {m.get('demangled', '')}")
+            lines.append(f"  {m.get('kind'):<6} {_class_method_label(m)}")
     # A malformed slot container must fall through to the explanation below, not
     # to a class card that shows a vtable address and then nothing at all -- that
     # rendered strictly LESS than the genuinely-empty case (#619).
@@ -5551,7 +5564,7 @@ def _render_one_class(rec: Any) -> str:
     if member_methods:
         lines.append(f"  methods ({len(member_methods)}):")
         for m in member_methods:
-            lines.append(f"    {m.get('address', '?')}  {m.get('demangled', '')}")
+            lines.append(f"    {_class_method_label(m)}")
     inst = _field_dict(rec, "instances")
     parts = []
     for site in _field_list(inst, "construction_sites"):
