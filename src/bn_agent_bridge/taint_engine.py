@@ -3820,7 +3820,8 @@ class TaintEngine:
                         # hides whatever body it fronts. Gating this on the candidate's
                         # model left the indirect path -- an unmodeled call site whose
                         # resolved candidate carries a model -- stopping at the veneer
-                        # and minting the same false all-clear #807 is about.
+                        # and minting the same false all-clear #807 is about. Descent is
+                        # independent of the model: following never costs a model.
                         descend_fn = cfn
                         descend_internal = cfn_internal
                         if cfn is not None and not cfn_internal:
@@ -3832,17 +3833,20 @@ class TaintEngine:
                                 if self._is_internal(resolved):
                                     # An in-binary target is a BODY, and a body is
                                     # descended whether or not a model covers its name
-                                    # (#807). The body's own model, when it has one, is
-                                    # the more specific overlay and stands in for the
-                                    # candidate's; when it has none, the candidate's
-                                    # model stays this call site's overlay, so reaching
-                                    # the body never costs the model the veneer was
-                                    # called with.
-                                    if rmd is not None:
-                                        nm, mk, md = rnm, rmk, rmd
+                                    # (#807).
                                     descend_fn = resolved
                                     descend_internal = True
-                                elif rmd is not None:
+                                # A call site carries at most ONE model: the first one
+                                # the chain finds wins, which is the resolved caller's
+                                # own model when it has one and the reached target's
+                                # otherwise. Adopting `rmd` over a candidate that
+                                # already had a model would DISCARD the overlay the user
+                                # keyed on the callee they actually called -- the
+                                # modeled run then reports less than the unmodeled one.
+                                # Applying both is no better: two keys for one callee
+                                # are two spellings of one overlay, and both would
+                                # report at the same instruction.
+                                if md is None and rmd is not None:
                                     nm, mk, md = rnm, rmk, rmd
                         # Re-imported export: the call routed through a PLT/GOT
                         # stub to a symbol that is ALSO defined in this binary.
