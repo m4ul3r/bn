@@ -2389,6 +2389,11 @@ def test_assert_unannotated_classifies_loader_helpers_then_refuses_analyst_work(
     with pytest.raises(bn_kernel.BridgeError, match="inherited comments"):
         _run(session.assert_unannotated())
 
+    bv.address_comments.clear()
+    function.comments = {0x1000: "function-local address note"}
+    with pytest.raises(bn_kernel.BridgeError, match="inherited comments"):
+        _run(session.assert_unannotated())
+
 
 @pytest.mark.parametrize("within", [[], (), ""])
 def test_callsites_rejects_empty_scope(within):

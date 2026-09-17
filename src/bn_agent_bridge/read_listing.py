@@ -441,9 +441,8 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     On a cached/shared BNDB, inherited comments/names can bias analysis and let
     an agent over-credit itself for state a prior run produced. Surface counts
     and bounded annotation samples; symbol exclusions are uncapped so each has
-    a reason. Global address comments come from ``address_comments``; function
-    comments read one string attribute per function (the per-function
-    address-comment map is not materialized for this triage read)."""
+    a reason. Address-comment counts include both the global map and each
+    function's local map; function-doc comments have their own count."""
     comments = 0
     comment_locations: list[dict[str, Any]] = []
     try:
@@ -464,6 +463,18 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     function_comments = 0
     function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
+        local_comments = getattr(fn, "comments", {}) or {}
+        comments += len(local_comments)
+        for address, text in local_comments.items():
+            if len(comment_locations) >= 20:
+                break
+            comment_locations.append(
+                {
+                    "name": str(getattr(fn, "name", "")),
+                    "address": hex(int(address)),
+                    "comment": str(text)[:160],
+                }
+            )
         try:
             text = str(getattr(fn, "comment", "") or "").strip()
             if text:

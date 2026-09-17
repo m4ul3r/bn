@@ -244,6 +244,9 @@ comments still refuse, but an analyst rename matching an excluded name shape
 origin: user renames can carry it too. `symbol_exclusion_limitations` discloses
 this fallback in the payload. The older `*_locations` samples remain bounded;
 `locations_truncated` refers to those samples, not to `symbol_exclusions`.
+The `comments` count includes global and function-local address comments, even
+when both stores have entries at the same address; local sample rows also name
+their function. `function_comments` counts function-doc comments separately.
 
 Every collection and text helper validates **after** the backend branch, so `cli`
 and `native` enforce the same shape: malformed, nested, or silently truncated
