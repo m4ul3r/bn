@@ -9,6 +9,7 @@ the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import shutil
 import signal
@@ -16,7 +17,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .. import cli
 from ..cli import arg, command
@@ -255,10 +256,58 @@ def _plugin_install(args: argparse.Namespace) -> int:
 
 
 # Bytecode an install never writes, but that importing the installed plugin or
-# skill in place leaves behind. One list for both halves of `_install_tree`:
-# what `copytree` refuses to copy, and what `--force` may find in a
-# destination and still call this install's own.
-_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+# skill in place leaves behind. `copytree` refuses to copy it, and `--force`
+# tolerates it in a destination it is replacing -- but it is never evidence of
+# ownership: a directory holding only bytecode is refused, because nothing in
+# it proves an install of this artifact wrote it.
+_INSTALL_BYTECODE_PATTERNS = ("__pycache__", "*.pyc", "*.pyo")
+_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns(*_INSTALL_BYTECODE_PATTERNS)
+
+
+def _is_install_bytecode(name: str) -> bool:
+    """Whether `name` is a bytecode cache an install never copies or writes."""
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _INSTALL_BYTECODE_PATTERNS)
+
+
+def _foreign_install_entry(dest: Path, source: Path) -> str | None:
+    """The first entry under `dest` a copy-mode install of `source` would not
+    have produced, as a slash-joined path relative to `dest`, or None when
+    every entry mirrors the source tree -- directories included, so a user file
+    added inside a directory the source also has is not mistaken for ours.
+    """
+    for entry in sorted(dest.iterdir()):
+        if _is_install_bytecode(entry.name):
+            continue
+        counterpart = source / entry.name
+        if entry.is_symlink() or not counterpart.exists():
+            return entry.name
+        if entry.is_dir() != counterpart.is_dir():
+            return entry.name
+        if entry.is_dir():
+            nested = _foreign_install_entry(entry, counterpart)
+            if nested is not None:
+                return f"{entry.name}/{nested}"
+    return None
+
+
+def _any_file_matches_source(dest: Path, source: Path) -> bool:
+    """Whether one file under `dest` is still byte-identical to its source
+    counterpart. That is the content proof this tree is an install of `source`
+    rather than a directory that merely reuses its entry names -- a user's own
+    `plugin.json` sitting where ours sits is not ours (#766).
+    """
+    for entry in sorted(dest.iterdir()):
+        if _is_install_bytecode(entry.name):
+            continue
+        counterpart = source / entry.name
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            if counterpart.is_dir() and _any_file_matches_source(entry, counterpart):
+                return True
+        elif counterpart.is_file() and entry.read_bytes() == counterpart.read_bytes():
+            return True
+    return False
 
 
 def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
@@ -267,11 +316,14 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
     `--dest` is caller-supplied, so `--force` used to `shutil.rmtree` whatever
     was there -- unrelated user data included (#766). A directory is only
     replaceable when it is provably this artifact's own: empty, or a previous
-    install of `source` (its own installed layout, plus the bytecode caches
-    importing it in place leaves behind). Everything else is refused with the
-    deliberate alternative named, the same "refuse and name the escape hatch"
-    shape as the bridge's destructive-op gate, rather than learned from a
-    half-populated install.
+    install of `source` -- the source tree's own layout, entry for entry, with
+    at least one file still byte-identical to the source's, and the bytecode
+    caches importing it in place leaves behind tolerated but never counted as
+    proof. Entry names alone decide nothing: a directory that merely reuses
+    them is somebody else's. Everything else is refused with the deliberate
+    alternative named, the same "refuse and name the escape hatch" shape as
+    the bridge's destructive-op gate, rather than learned from a half-populated
+    install.
 
     The structural refusals come first because they hold even for an EMPTY
     destination: a filesystem root, the home directory, or a directory
@@ -300,17 +352,18 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
     ):
         return f"it overlaps the install source {source}"
 
-    entries = list(dest.iterdir())
-    if not entries:
+    if not any(dest.iterdir()):
         return None
-    names = [entry.name for entry in entries]
-    own = {entry.name for entry in source.iterdir()}
-    ignored = set(_IGNORED_INSTALL_ENTRIES(str(source), names))
-    foreign = sorted(name for name in names if name not in own and name not in ignored)
-    if foreign:
+    foreign = _foreign_install_entry(dest, source)
+    if foreign is not None:
         return (
-            "it is not this install's own destination "
-            f"({', '.join(foreign)} was not created by it)"
+            "it is not a previous install of this artifact "
+            f"({foreign} is not what this install writes)"
+        )
+    if not _any_file_matches_source(dest, source):
+        return (
+            "it is not a previous install of this artifact (no file under it "
+            "still matches the source tree)"
         )
     return None
 
@@ -319,24 +372,16 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
 
+    # The parent exists before the check so it and the removal below decide on
+    # the same path: a `--dest` spelled through a missing intermediate ("a/b/..")
+    # only becomes the directory it resolves to once the parent is there.
     dest.parent.mkdir(parents=True, exist_ok=True)
+    _check_install_destination(source, dest, force=force)
 
-    if dest.exists() or dest.is_symlink():
-        if not force:
-            raise BridgeError(f"Destination already exists: {dest}")
-        if dest.is_symlink() or dest.is_file():
-            dest.unlink()
-        else:
-            refusal = _unsafe_replace_reason(dest, source)
-            if refusal is not None:
-                raise BridgeError(
-                    f"Refusing to replace {dest} with --force: {refusal}. "
-                    "--force replaces this install's own destination (an empty "
-                    "directory, or a previous install of the same artifact), "
-                    "never an unrelated path. Move it aside by hand and re-run "
-                    "if that is what you want."
-                )
-            shutil.rmtree(dest)
+    if dest.is_symlink():
+        dest.unlink()
+    elif dest.is_dir():
+        shutil.rmtree(dest)
 
     if mode == "copy":
         shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
@@ -344,11 +389,36 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         os.symlink(source, dest, target_is_directory=True)
 
 
-def _check_install_destination(dest: Path, *, force: bool) -> None:
-    if force:
+def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
+    raise BridgeError(
+        f"Refusing to replace {dest} with --force: {reason}. "
+        "--force replaces this install's own destination (an empty directory, "
+        "or a previous install of the same artifact), never an unrelated path. "
+        "Move it aside by hand and re-run if that is what you want."
+    )
+
+
+def _check_install_destination(source: Path, dest: Path, *, force: bool) -> None:
+    """Raise unless `dest` may be written to right now.
+
+    Without `--force` any existing destination is an error. With it, only a
+    symlink (removed as a link, never recursed into), an empty directory, or a
+    previous install of `source` may be replaced -- a regular file under
+    `--dest` is somebody else's and is refused instead of unlinked (#766).
+    Deciding this before anything is written also makes the refusal
+    all-or-nothing across a multi-destination `skill install`.
+    """
+    if not force:
+        if dest.exists() or dest.is_symlink():
+            raise BridgeError(f"Destination already exists: {dest}")
         return
-    if dest.exists() or dest.is_symlink():
-        raise BridgeError(f"Destination already exists: {dest}")
+    if dest.is_symlink() or not dest.exists():
+        return
+    if not dest.is_dir():
+        _refuse_replacement(dest, "it is not a directory")
+    refusal = _unsafe_replace_reason(dest, source)
+    if refusal is not None:
+        _refuse_replacement(dest, refusal)
 
 
 @command("skill", "install", help="Install the bundled agent skills", fmt="text",
@@ -386,7 +456,7 @@ def _skill_install(args: argparse.Namespace) -> int:
         if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
             skipped_destinations.append(str(dest))
             continue
-        _check_install_destination(dest, force=args.force)
+        _check_install_destination(source, dest, force=args.force)
         pending_installs.append((source, dest))
 
     for source, dest in pending_installs:
