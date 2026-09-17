@@ -1760,6 +1760,397 @@ def test_internal_close64_not_aliased_to_close_system_sink_found_603(models):
     assert sinks[0]["metrics"]["fns_spanned"] == 2
 
 
+def _overlaid_wrapper_also_calls_system():
+    # app_read(dst, src): memcpy(dst, src, n); system(src). The wrapper is an
+    # in-binary function, so its body is analyzable; the user overlay below
+    # describes ONLY the copy (#807).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    app_read = FFunc("app_read", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "memcpy(dst#0, src#0, n#0)",
+               reads=[dst0, src0, n0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401100", constant=0x401100),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x402010, "MLIL_CALL_SSA", "system(src#0)",
+               reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src, n])
+
+    # t5(cmd): app_read(&buf, cmd)
+    cmd = FVar("cmd"); cmd0 = FSSA(cmd, 0)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "app_read(&buf, cmd#0)",
+               reads=[buf1, cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401100: "memcpy", 0x401200: "system"}, funcs={0x402000: app_read})
+    return t5, bv
+
+
+def test_forward_modeled_in_binary_callee_body_still_descended_807():
+    # #807: a model is an OVERLAY on a callee body this binary HAS, not a summary
+    # that replaces it. A partial user overlay here describes only app_read's copy
+    # rule, and the model branch used to `continue` -- so the walk stopped at the
+    # call, the system() sink inside app_read was invisible, and the run minted a
+    # confident `safe_to_report_all_clear: true` while the UNmodeled run of the
+    # same query found it. Models only ever ADD taint, so descending can only add
+    # coverage.
+    overlay = {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    models = te.load_models(overlay)
+    func, bv = _overlaid_wrapper_also_calls_system()
+    engine = te.TaintEngine(bv, models)
+
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    sinks = [s for s in result["reached_sinks"]
+             if s["sink"]["class"] == "command_injection"]
+    assert sinks, "the body of the modeled callee must still be descended"
+    # and the finding is the callee's own, i.e. the walk really crossed the call
+    assert any("app_read" in (st.get("reason") or "") for st in sinks[0]["path"])
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
+    # The pre-fix false all-clear was the PAIR (reached_sinks == [], a zero-sink
+    # `diagnostics` block whose gate read true). The gate is minted from the SAME
+    # `unique_findings` list this test already pins non-empty, so no separate
+    # assertion for it can carry independent evidence -- the sink assertion above
+    # IS the evidence, and `matches_unmodeled_807` below is what proves the
+    # overlay does not drop it.
+
+
+def test_forward_modeled_callee_body_descended_matches_unmodeled_807():
+    # The overlay must not LOSE anything the unmodeled run found: the two runs
+    # differ only in what the model ADDS.
+    func, bv = _overlaid_wrapper_also_calls_system()
+
+    unmodeled = te.TaintEngine(bv, te.load_models()).forward(
+        func, [te.parse_locator("param:0")])
+    overlaid = te.TaintEngine(bv, te.load_models(
+        {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    )).forward(func, [te.parse_locator("param:0")])
+
+    def classes(res):
+        return sorted(s["sink"]["class"] for s in res["reached_sinks"])
+
+    assert classes(overlaid) == classes(unmodeled)
+    assert classes(unmodeled), "the fixture must reach a sink unmodeled"
+
+
+def test_forward_modeled_veneer_body_still_descended_807():
+    # The shape the first cut of this fix missed, and the common one on a real
+    # target: the call goes through a PLT/veneer stub that BN names after the
+    # SYMBOL, so a `--models` overlay keys on the stub's name. The stub is not a
+    # body -- following it is the only way to reach the in-binary app_read body --
+    # so a model on the call target must not stop the thunk-follow either. A
+    # veneer is no more a summary of its target than a model is of a body.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    app_read = FFunc("app_read", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "system(src#0)", reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+
+    # The veneer carries the symbol's own name -- exactly what the overlay keys on.
+    veneer = FFunc("app_read", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", "tailcall(0x402000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)),
+    ]), is_thunk=True)
+
+    cmd = FVar("cmd"); cmd0 = FSSA(cmd, 0)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "app_read(&buf, cmd#0)",
+               reads=[buf1, cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x404000", constant=0x404000),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401200: "system", 0x402000: "app_read", 0x404000: "app_read"},
+             funcs={0x402000: app_read, 0x404000: veneer})
+    models = te.load_models(
+        {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}})
+    result = te.TaintEngine(bv, models).forward(t5, [te.parse_locator("param:0")])
+
+    sinks = [s for s in result["reached_sinks"]
+             if s["sink"]["class"] == "command_injection"]
+    assert sinks, "the veneer's real body must still be descended behind a model"
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
+
+
+def _overlaid_wrapper_behind_decorated_veneer():
+    # The same overlay as above, but reached through the DECORATED spelling of the
+    # model's own key: the call site's symbol is `app_read@plt`, whose PLT stub
+    # tail-calls the in-binary body under the plain `app_read`. `lookup_model`
+    # resolves BOTH spellings to the one key `app_read` (that is what its alias
+    # ladder is for), which is the shape that made a raw-name guard read one model
+    # as two.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    body = FFunc("app_read", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "system(src#0)", reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+    veneer = FFunc("app_read@plt", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", "tailcall(0x402000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)),
+    ]), is_thunk=True)
+
+    cmd = FVar("cmd"); cmd0 = FSSA(cmd, 0)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "app_read@plt(&buf, cmd#0)",
+               reads=[buf1, cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x404000", constant=0x404000),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401200: "system", 0x402000: "app_read", 0x404000: "app_read@plt"},
+             funcs={0x402000: body, 0x404000: veneer})
+    return t5, bv
+
+
+def test_forward_modeled_callee_applied_once_per_site_807():
+    # A model is applied ONCE per call site. `lookup_model` resolves several
+    # spellings to one key, and the descent re-looks-up the resolved body under its
+    # OWN spelling -- so a guard comparing raw names let the very same model run
+    # twice at one instruction, narrating its propagation twice for one call.
+    overlay = {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    func, bv = _overlaid_wrapper_behind_decorated_veneer()
+    result = te.TaintEngine(bv, te.load_models(overlay)).forward(
+        func, [te.parse_locator("param:0")])
+
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+    # a veneer is not a body, so the decorated call site must still reach the real
+    # body behind it and the sink inside it
+    sinks = [s for s in result["reached_sinks"]
+             if s["sink"]["class"] == "command_injection"]
+    assert sinks, result["reached_sinks"]
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
+
+
+def test_forward_indirect_modeled_callee_names_target_once_807():
+    # The "resolved via ... to:" assumption names each resolved CANDIDATE once. With
+    # the model and the descent now independent decisions (#807), an arm-local
+    # append named a target that is both modeled and descended twice, breaking the
+    # single-canonical-name form #290 pins.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    d = FVar("d"); d0 = FSSA(d, 0)
+    s = FVar("s"); s0 = FSSA(s, 0)
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    wrapper = FFunc("wrappercopy", 0x4000, FSSAFunc([
+        FInstr(0, 0x4004, "MLIL_CALL_SSA", "memcpy(d#0, s#0, n#0)", reads=[d0, s0, n0],
+               writes=[], dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "d#0", reads=[d0]),
+                       FExpr("MLIL_VAR_SSA", "s#0", reads=[s0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[d, s, n])
+    handler = FFunc("handler", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "[slot#1](d, s, n#0)", reads=[slot1, n0],
+               writes=[], dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[n])
+    bv = FBV({0x1080: "memcpy"}, funcs={0x4000: wrapper})
+    models = te.load_models(
+        {"wrappercopy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}})
+    result = te.TaintEngine(bv, models, resolve_map={"0x3008": ["0x4000"]}).forward(
+        handler, [te.parse_locator("param:0")])
+
+    via = [a for a in result["assumptions"] if "resolved via" in a and " to: " in a]
+    assert len(via) == 1, via
+    assert via[0].endswith("to: wrappercopy"), via[0]
+
+
+def _dispatch_to_modeled_veneer():
+    # The indirect form of the #807 shape. A dispatch-slot call resolves (via
+    # --resolve-map) to a VENEER that carries the model's name and tail-calls the
+    # in-binary body under a DIFFERENT symbol name that is NOT in the model DB. The
+    # call site has no name of its own, so nothing here can be decided from the
+    # call site's model; only following the veneer reaches the body.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    app_body = FFunc("app_read_body", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "system(src#0)", reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+    # the veneer's symbol is the name the overlay keys on
+    veneer = FFunc("app_read", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", "tailcall(0x402000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)),
+    ]), is_thunk=True)
+
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    cmd = FVar("cmd"); cmd1 = FSSA(cmd, 1)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "[slot#1](&buf, cmd#1)", reads=[slot1, cmd1],
+               writes=[], dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#1", reads=[cmd1])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401200: "system", 0x402000: "app_read_body", 0x404000: "app_read"},
+             funcs={0x402000: app_body, 0x404000: veneer})
+    return t5, bv
+
+
+def test_forward_dispatch_to_modeled_veneer_body_descended_807():
+    # A model must not stop the walk at a VENEER either, on the indirect path. The
+    # call site is unnamed (dispatch slot), so the model here is reachable only
+    # through the resolved candidate's name -- gating the thunk-follow on the
+    # candidate's model made the modeled run return reached_sinks [] with
+    # `safe_to_report_all_clear: true` while the unmodeled run of the same fixture
+    # reached the command_injection sink inside the body: the false all-clear #807
+    # is about, one call shape over.
+    overlay = {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    func, bv = _dispatch_to_modeled_veneer()
+    result = te.TaintEngine(bv, te.load_models(overlay), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["command_injection"], result["reached_sinks"]
+
+    # The overlay is still applied exactly once, against the body that was reached:
+    # following the veneer must not cost the veneer's own model.
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+
+    # and the unmodeled run must not do better than the modeled one
+    plain = te.TaintEngine(bv, te.load_models(), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+    assert sorted(s["sink"]["class"] for s in plain["reached_sinks"]) == classes
+
+
+def _dispatch_to_modeled_veneer_chain(target_name, target_addr=0x402000, body=True):
+    # Indirect dispatch call -> VENEER that the overlay keys on -> a tail-call target
+    # that carries its OWN model key. The chain therefore has a model at two levels,
+    # and the call site has no name of its own. With `body=False` the target carries a
+    # symbol but NO function body (an import), so nothing but the applied model can
+    # report a sink at this call.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    target = FFunc(target_name, target_addr, FSSAFunc([
+        FInstr(0, target_addr + 4, "MLIL_CALL_SSA", "system(src#0)", reads=[src0],
+               writes=[], dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+    veneer = FFunc("app_read", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", f"tailcall({hex(target_addr)})",
+               dest=FExpr("MLIL_CONST_PTR", hex(target_addr), constant=target_addr)),
+    ]), is_thunk=True)
+
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    cmd = FVar("cmd"); cmd1 = FSSA(cmd, 1)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "[slot#1](&buf, cmd#1)", reads=[slot1, cmd1],
+               writes=[], dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#1", reads=[cmd1])]),
+    ]), params=[cmd])
+
+    funcs = {0x404000: veneer}
+    if body:
+        funcs[target_addr] = target
+    bv = FBV({0x401200: "system", target_addr: target_name, 0x404000: "app_read"},
+             funcs=funcs)
+    return t5, bv
+
+
+def test_forward_chain_model_not_discarded_by_the_followed_target_807():
+    # The chain may hold a model at TWO levels: the resolved candidate (here the
+    # veneer the overlay keys on) and the target its tail call reaches. Following the
+    # veneer must not DISCARD the candidate's overlay in favour of the target's -- a
+    # sink declared on the veneer's key is a real contract, and replacing it made the
+    # modeled run report LESS than the unmodeled one and mint
+    # `safe_to_report_all_clear: true`. The reached target is an import with no body,
+    # so only the model that lands can report here.
+    overlay = {
+        "app_read": {"sink": {"class": "command_injection", "tainted_args": [1]}},
+        "app_read_body": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+    }
+    func, bv = _dispatch_to_modeled_veneer_chain("app_read_body", body=False)
+    result = te.TaintEngine(bv, te.load_models(overlay), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["command_injection"], result["reached_sinks"]
+
+
+def test_forward_one_model_per_call_site_when_two_keys_cover_it_807():
+    # Two DB keys can describe ONE callee (a decorated stub spelling and the plain
+    # name). A call site still carries ONE model: the first the chain finds. Both
+    # armed sinks reporting at the same instruction is one fact counted twice.
+    n = FVar("n"); n1 = FSSA(n, 1)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    veneer = FFunc("app_read@plt", 0x2100, FSSAFunc([
+        FInstr(0, 0x2100, "MLIL_TAILCALL_SSA", "tailcall(0x1080)",
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080)),
+    ]), is_thunk=True)
+    handler = FFunc("handler", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "app_read@plt(dst#0, n#1)", reads=[dst0, n1],
+               writes=[], dest=FExpr("MLIL_CONST_PTR", "0x2100", constant=0x2100),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+    ]), params=[n])
+    bv = FBV({0x1080: "app_read"}, funcs={0x2100: veneer})
+    models = te.load_models({
+        "app_read@plt": {"sink": {"class": "command_injection", "tainted_args": [1]}},
+        "app_read": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+    })
+    result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["command_injection"], result["reached_sinks"]
+
+
+def test_forward_chain_applies_both_models_each_distinct_key_once_807():
+    # The chain may hold a model at TWO levels, and BOTH describe the callee that
+    # runs. Keeping only the first (the pre-PR rule, restored while fixing round 3's
+    # reported duplication) discarded the reached target's armed sink: the modeled run
+    # then answered reached_sinks [] with `safe_to_report_all_clear: true` where the
+    # unmodeled run of the same fixture found it -- #807's failure mode one level out.
+    # Every distinct key applies, so an armed sink on EITHER level fires, and the
+    # shared per-call-site reporting signature keeps it to one finding per tainted arg.
+    overlay = {
+        "app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]},
+        "app_read_body": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+    }
+    func, bv = _dispatch_to_modeled_veneer_chain("app_read_body", body=False)
+    result = te.TaintEngine(bv, te.load_models(overlay), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["overflow_len"], result["reached_sinks"]
+    # and the candidate's overlay still applies alongside it -- one narration
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+
+
 def _recv_sink_func():
     # handler(n): recv(3, &buf, n) -- the LENGTH (arg2) written into buf is
     # attacker-controlled (param 0). recv is now an opt-in bounded-write sink (#499).
