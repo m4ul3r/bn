@@ -198,7 +198,7 @@ def test_mutation_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
     lock = instance._target_lock
     states: dict = {}
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         states["apply_writer"] = lock._writer
         states["apply_gate"] = instance._write_gate.locked()
         return {"op": "rename_symbol", "requested": {}}
@@ -246,7 +246,7 @@ def test_mutation_reanalysis_leaves_concurrent_reads_live(monkeypatch):
 
     _mutation_with_stubs(
         monkeypatch, bridge, instance, bv,
-        apply=lambda bv_, op, restores=None: {"op": "rename_symbol", "requested": {}},
+        apply=lambda bv_, op, restores=None, **kwargs: {"op": "rename_symbol", "requested": {}},
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
     original = bv.update_analysis_and_wait
@@ -301,7 +301,7 @@ def test_mutation_write_gate_serializes_a_second_writer_during_reanalysis(monkey
     entered_second = threading.Event()
     calls = {"n": 0}
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
             entered_second.set()
@@ -362,7 +362,7 @@ def test_mutation_rollback_settle_still_runs_under_exclusive_lock(monkeypatch):
 
     _mutation_with_stubs(
         monkeypatch, bridge, instance, bv,
-        apply=lambda bv_, op, restores=None: {"op": "local_rename", "requested": {}},
+        apply=lambda bv_, op, restores=None, **kwargs: {"op": "local_rename", "requested": {}},
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
     # A non-empty var snapshot makes the pre-drift settle reanalyze on the
