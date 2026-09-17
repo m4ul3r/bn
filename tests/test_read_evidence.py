@@ -3069,13 +3069,21 @@ def test_argument_confidence_empty_hlil_list_is_a_count_742(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[])
 
-    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    evidence = instance._function_evidence("active", "probe_device", context=0)
+    call = evidence["calls"][0]
     assert call["argument_source"] == "hlil"
     assert call["arguments"] == []
     assert call["arity_mismatch"] is True
     assert call["declared_arity"] == 3
     assert call["arity_unknown"] is False
     assert call["argument_confidence"] == "inferred"
+
+    from bn.formatters import _render_function_evidence_text
+    out = _render_function_evidence_text(evidence)
+    assert "arguments: (hlil inferred)" in out
+    assert "arity: MISMATCH" in out
+    assert "HLIL rendered 0 argument(s)" in out
+    assert "prototype declares 3" in out
 
 
 def test_argument_confidence_missing_hlil_list_uses_mlil_provenance_742(monkeypatch):

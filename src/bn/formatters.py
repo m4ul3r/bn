@@ -2402,7 +2402,8 @@ def _render_function_evidence_text(value: Any) -> str:
         if call.get("llil"):
             lines.append(f"  llil: {call['llil']}")
         args = [arg for arg in _field_list(call, "arguments") if isinstance(arg, dict)]
-        if args:
+        # Confidence and arity diagnostics also describe empty argument lists.
+        if args or call.get("argument_confidence") or call.get("arity_mismatch"):
             source = call.get("argument_source")
             # #549: mark whether `arguments` is canonical (authoritative HLIL/ABI) or a
             # heuristic lower-IL fallback, so an agent traces the right field.
