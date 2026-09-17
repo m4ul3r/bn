@@ -3433,6 +3433,89 @@ def test_unrevertible_preview_prototypes_flags_only_auto_changing_ops(monkeypatc
     assert flagged == ["auto_fn"]
 
 
+# ---------------------------------------------------------------------------
+# #802: the OTHER half of the preview-proto revert -- a function that ALREADY
+# carries a genuine USER prototype, so _register_prototype_restore takes the
+# had_user_type=True branch. The #630 preflight only lets such a function be
+# previewed, so this is the branch every real `--preview` proto set takes; a
+# regression there would leave the previewed prototype committed to the view.
+# ---------------------------------------------------------------------------
+
+class _UserPrototypePathFunction(_FakeFunction):
+    """A function that records which side of BN's prototype provenance each write
+    took: the USER path (`set_user_type`, also reached by the `.type` setter) or
+    the AUTO one (`set_auto_type`). Per the fakes' provenance contract
+    (tests/test_fakes_provenance.py) only the user path pins BNFunctionHasUserType,
+    so the two are not interchangeable -- but for a baseline that was ALREADY
+    user-typed the apply has pinned that flag and BN offers no API to clear it
+    (#630), so both paths leave the same (value, flag) pair. The write path is
+    therefore the only observable that tells the two revert branches apart.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prototype_writes: list[str] = []
+
+    def set_user_type(self, value):
+        self.prototype_writes.append("user")
+        super().set_user_type(value)
+
+    def set_auto_type(self, value):
+        self.prototype_writes.append("auto")
+        super().set_auto_type(value)
+
+
+def test_preview_proto_re_asserts_prior_user_prototype_802(monkeypatch):
+    """A `--preview` prototype change on a function that ALREADY carries a
+    user-declared prototype must revert to that PRIOR USER prototype -- not to an
+    AUTO baseline, not to the previewed one -- and report rolled_back. Driven
+    through the REAL apply/verify/revert path, so _op_set_prototype really
+    registers and replays the restore with had_user_type=True; the neighbouring
+    test_preview_proto_plus_safe_ops_on_user_typed_function_allowed stubs apply,
+    so it never registers a restore at all (#802)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    fn = _UserPrototypePathFunction(0x402000, "sub_402000")
+    # A genuine prior user prototype, as BN hands one back: a Type object, no
+    # declarator name.
+    fn.set_user_type(_FakeType("uint64_t(int32_t arg1)", type_class="FunctionTypeClass"))
+    assert fn.has_user_type is True
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    # Only the snapshot/diff machinery is stubbed: it takes no part in the
+    # register/restore path under test.
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, b, ops: [fn])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, b, fns: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "set_prototype", "identifier": "sub_402000",
+          "prototype": "void sub_402000(uint32_t* p)"}],
+    )
+
+    assert result["success"] is True
+    assert result["rolled_back"] is True
+    assert result["message"] == "Preview verified and reverted."
+    assert "prototype_user_type_residue" not in result
+    # The user's PRIOR prototype is back -- not the previewed one, and not an AUTO
+    # baseline -- and the function is still USER-typed.
+    assert str(fn.type) == "uint64_t(int32_t arg1)"
+    assert fn.has_user_type is True
+    # ...and the revert re-asserted it through the USER path: pin, apply, revert.
+    # A revert that "treated the baseline as AUTO" writes the auto side of BN's
+    # provenance instead, which is exactly the regression this branch forbids
+    # (#582) -- see the class docstring for why the path is the observable.
+    assert fn.prototype_writes == ["user", "user", "user"]
+
+
 def test_live_verify_fail_with_proto_on_auto_reports_residue_and_fails(monkeypatch):
     """An INVOLUNTARY rollback -- a live batch where a proto-set-on-AUTO applied
     but a sibling op failed verification -- must report success:false /
