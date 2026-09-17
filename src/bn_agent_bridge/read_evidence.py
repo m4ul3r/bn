@@ -2622,6 +2622,11 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
     classes_scanned = 0
     classes_total = 0
     probe_limit: int | None = None
+    # #822 review (round 1): WHY a provider could not reach the requested slot --
+    # "scan_capped" (the display cap) or "unreadable_row" (the scan stopped on an
+    # entry that could not be read). Both leave the slot UNDECIDED, and the
+    # disclosure below names which, so neither is ever reported as absent.
+    undecided: str | None = None
     for pv, pname in provider_views:
         try:
             maps = read_class._rtti_symbol_maps(pv)
@@ -2643,35 +2648,46 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
             except Exception:
                 continue
             slot = next((s for s in layout.get("slots", []) if s.get("index") == slot_index), None)
-            if slot is None and layout.get("truncated"):
+            if slot is None and layout.get("scan_truncated"):
                 # #822 (#584 residual): `_vtable_layout`'s 64-slot window bounds
                 # the LISTING, not the table -- #584's acceptance says a valid
                 # slot 70 must resolve even though `class show` displays 64. So
                 # probe just that slot (the walk re-checks every row between the
                 # window and the requested index, so a boundary is still a
                 # boundary) instead of reporting a resolvable method as
-                # unresolvable. A probe that cannot decide leaves the old
-                # "beyond the recovered window" reading in place: absence of
-                # proof is not proof the slot is absent.
+                # unresolvable.
+                #
+                # `scan_truncated`, not `truncated`: a scan the cap truncated and
+                # a scan that stopped on a row it could not READ both leave the
+                # total unknown, and both leave this slot undecided. The walk
+                # starts after the entries the layout actually PROVED (`slots`),
+                # so a row that stopped the scan is re-read, never skipped.
                 try:
                     probe = read_class._vtable_slot_probe(
                         ctx, pv, int(vt_addr), slot_index,
-                        scanned_through=layout.get("scanned") or 0,
+                        scanned_through=len(layout.get("slots") or []),
                     )
                 except Exception:
                     probe = {"status": "unavailable"}
-                if probe.get("status") == "resolved":
+                status = probe.get("status")
+                if status == "resolved":
                     slot = probe.get("slot")
-                elif probe.get("status") == "limit_reached":
-                    truncated_cap = truncated_cap or layout.get("max_slots")
-                    probe_limit = read_class._VTABLE_SLOT_PROBE_MAX_ROWS
-                    continue
-                elif probe.get("status") == "unavailable":
-                    truncated_cap = truncated_cap or layout.get("max_slots")
+                elif status == "not_present":
+                    # The table's end was OBSERVED before this index (a real
+                    # boundary), so the slot is absent -- not truncated.
                     continue
                 else:
-                    # "not_present": the table genuinely ends before this index
-                    # (a real boundary), so the slot is absent -- NOT truncated.
+                    # "unknown" (a row that could not be read), "limit_reached"
+                    # (the targeted read's own bound) or "unavailable" (the read
+                    # raised): the slot is UNKNOWN -- absence of proof, never
+                    # proof of absence.
+                    if undecided is None:
+                        undecided = ("scan_capped" if layout.get("truncated")
+                                     else layout.get("truncated_reason") or "unreadable_row")
+                    if undecided == "scan_capped":
+                        truncated_cap = truncated_cap or layout.get("max_slots")
+                    if status == "limit_reached":
+                        probe_limit = read_class._VTABLE_SLOT_PROBE_MAX_ROWS
                     continue
             if slot is None:
                 continue
@@ -2706,29 +2722,37 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
         "ambiguous": len(candidates) > 1,
         "resolved": len(candidates) == 1,
     }
-    if truncated_cap is not None or probe_limit is not None:
+    if undecided is not None:
+        # #822: the typed discriminator alongside the prose. "capped" and
+        # "unreadable" must not be the same shape as "genuinely absent" to a
+        # machine consumer, only to a reader.
+        unreachable = ("beyond the recovered vtable window (scan capped at "
+                       f"{truncated_cap} slots)" if undecided == "scan_capped"
+                       else "past an entry that could not be read")
         if not candidates:
-            result["unresolved_reason"] = (
-                f"slot {slot_index} is beyond the recovered vtable window (scan capped at "
-                f"{truncated_cap} slots) in at least one provider -- the target method may "
-                f"exist past the cap rather than being genuinely unresolvable")
-            # #822: the typed discriminator alongside the prose. "capped" and
-            # "genuinely absent" must not be the same shape to a machine
-            # consumer, only to a reader.
             result["unresolved_reason_code"] = "vtable_scan_truncated"
+            if undecided == "scan_capped":
+                result["unresolved_reason"] = (
+                    f"slot {slot_index} is beyond the recovered vtable window (scan capped at "
+                    f"{truncated_cap} slots) in at least one provider -- the target method may "
+                    f"exist past the cap rather than being genuinely unresolvable")
+            else:
+                result["unresolved_reason"] = (
+                    f"slot {slot_index} could not be reached in at least one provider: its "
+                    f"vtable scan stopped at an entry that could not be read, so the target "
+                    f"method may exist rather than being genuinely absent")
         else:
             # Round-2 finding 9: a candidate here only means SOME provider's
-            # vtable resolved this slot -- `truncated_cap` is set independently
-            # whenever a DIFFERENT provider's scan hit its cap before reaching
+            # vtable resolved this slot -- `undecided` is set independently
+            # whenever a DIFFERENT provider's scan stopped before reaching
             # `slot_index` (the `slot is None` branch above `continue`s without
             # ever checking that provider for this slot). That provider could
             # supply another candidate this loop never saw, so a clean-looking
             # `resolved: true` / `ambiguous: false` must not imply every
             # provider was actually consulted.
             result["warnings"] = [
-                f"resolution may be incomplete: slot {slot_index} is beyond the "
-                f"recovered vtable window (scan capped at {truncated_cap} slots) in "
-                f"at least one OTHER provider that was not fully scanned for this "
+                f"resolution may be incomplete: slot {slot_index} is {unreachable} "
+                f"in at least one OTHER provider that was not fully scanned for this "
                 f"slot -- it could supply an additional candidate not reflected in "
                 f"`resolved`/`ambiguous`"]
         if probe_limit is not None:
@@ -2747,9 +2771,9 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
             else:
                 result["warnings"] = [*(result.get("warnings") or []), limit_note]
     elif not candidates:
-        # #822: no cap was hit and no provider supplied the slot, so this is a
-        # genuine absence -- the shape that must never be confused with the
-        # truncated one above.
+        # #822: no scan stopped before this slot and no provider supplied it, so
+        # this is a genuine absence -- the shape that must never be confused with
+        # the truncated one above.
         result["unresolved_reason_code"] = "slot_not_present"
     if classes_total > classes_scanned:
         # #813: the class sweep stopped at `_VC_MAX_CLASSES`, so classes past the

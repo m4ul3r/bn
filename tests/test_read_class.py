@@ -1743,15 +1743,75 @@ def test_vtable_layout_early_return_carries_truncation_keys():
         "truncated": False,
         "max_slots": 64,
         "scanned": 0,
-        # #822: the "not a vtable object" path discloses the SAME key set as the
-        # main return, now including the cap-independent disclosure -- an exact
-        # total of 0 (nothing was left unscanned), no bound, no truncation.
-        "total": 0,
+        # #822 review (round 1): the "not a vtable object" path decides there is
+        # no DECODABLE local body -- it never read a slot, so an exact total of 0
+        # was an unqualified count claim about a table that can be populated.
+        # Unknown, with the reason; no bound (nothing was proven), no scan stop.
+        "total": None,
         "total_lower_bound": None,
         "slots_truncated": False,
         "scan_truncated": False,
-        "truncated_reason": None,
+        "truncated_reason": "no_local_vtable_body",
     }
+
+
+def test_vtable_layout_makes_no_exact_total_claim_without_a_local_vtable_body():
+    # #822 review (round 1): the same path over a POPULATED table (the GOT /
+    # relocated-to-zero shapes the gate's own comment names, plus RTTI-less
+    # builds). `total: 0` read as "this class has no vtable entries" while the
+    # address demonstrably holds code pointers, so the count must be unknown --
+    # and no scan stop may be claimed, or `evidence virtual-call` would probe a
+    # table this gate deliberately refused to decode (#205 review).
+    rows = [_code_row(i) for i in range(5)]
+    layout = read_class._vtable_layout(_SlotCtx(rows, ti_ok=False), object(), 0x9000)
+    assert layout["slots"] == []
+    assert layout["scanned"] == 0
+    assert layout["total"] is None
+    assert layout["total_lower_bound"] is None
+    assert layout["truncated_reason"] == "no_local_vtable_body"
+    assert layout["scan_truncated"] is False
+
+
+def test_vtable_layout_reports_an_unreadable_row_as_an_unknown_total():
+    # #822 review (round 1): a row that could not be READ is not an observed
+    # table END. The scan still stops there (there is nothing to classify), but
+    # the result must not claim an exact total it never established: the total is
+    # unknown with the entries it did prove as a lower bound, so a consumer
+    # cannot read "the table ends here" out of a failed read.
+    rows = [_code_row(0),
+            {"index": 1, "entry_address": "0x9018", "value": None, "readable": False},
+            _code_row(2)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0]
+    assert layout["total"] is None
+    assert layout["total_lower_bound"] == 1
+    assert layout["scan_truncated"] is True
+    assert layout["truncated_reason"] == "unreadable_row"
+    # The cap did not truncate the LISTING, so `truncated` stays False -- only
+    # the total is unestablished.
+    assert layout["truncated"] is False and layout["slots_truncated"] is False
+
+
+def test_vtable_layout_exact_total_needs_an_observed_end_not_an_unreadable_lookahead():
+    # The one-entry lookahead resolves a full window: a READABLE boundary row
+    # (the next object's typeinfo) proves the table ends at 64, so the total is
+    # exact; an UNREADABLE row proves nothing, so the same 64 entries must come
+    # back with an unknown total instead of the fabricated 64.
+    ended_rows = {i: _code_row(i) for i in range(64)}
+    ended_rows[64] = _data_row(64)
+    ended = read_class._vtable_layout(_WindowCtx(ended_rows), object(), 0x9000)
+    assert ended["total"] == 64
+    assert ended["scan_truncated"] is False and ended["truncated_reason"] is None
+
+    blocked_rows = {i: _code_row(i) for i in range(64)}
+    blocked_rows[64] = {"index": 64, "entry_address": "0x9210", "value": None,
+                        "readable": False}
+    blocked = read_class._vtable_layout(_WindowCtx(blocked_rows), object(), 0x9000)
+    assert len(blocked["slots"]) == 64
+    assert blocked["total"] is None
+    assert blocked["total_lower_bound"] == 64
+    assert blocked["scan_truncated"] is True
+    assert blocked["truncated_reason"] == "unreadable_row"
 
 
 def _code_row(index):
@@ -1904,10 +1964,34 @@ def test_vtable_slot_probe_refuses_an_unbounded_walk():
     assert probe["slot"] is None
 
 
-def test_vtable_slot_probe_reports_no_slot_for_a_short_table():
-    # A table that simply has no row N (the reader returns fewer rows than the
-    # requested index needs) is an absence, not an unreadable row.
+def test_vtable_slot_probe_reports_unknown_for_a_row_it_cannot_read():
+    # #822 review (round 1): the probe's own boundary rules are only sound for a
+    # row it could READ. A failed read proves nothing about the table's end, so
+    # the slot is UNKNOWN -- the same reason `class show` refuses to claim an
+    # exact total there. (The reader pads an ended window with readable:false
+    # rows, which is exactly this shape.)
     ctx = _WindowCtx({i: _code_row(i) for i in range(66)})
+    probe = read_class._vtable_slot_probe(ctx, object(), 0x9000, 70, scanned_through=64)
+    assert probe["status"] == "unknown"
+    assert probe["slot"] is None
+
+
+def test_vtable_slot_probe_reports_no_slot_when_the_reader_returns_no_such_row():
+    # A reader that simply has no row for the requested index -- it returns fewer
+    # rows than asked, with no unreadable row among them -- is an ABSENCE, not a
+    # failed read: the table stopped before the index.
+    class _ShortCtx(_WindowCtx):
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            first = (start - self._BASE) // stride
+            out = []
+            for i in range(first, first + entries):
+                row = self._rows.get(i)
+                if row is None:
+                    break                      # no such row: the table has no more
+                out.append({**row, "index": i})
+            return {"kind": "pointer_table", "items": out}
+
+    ctx = _ShortCtx({i: _code_row(i) for i in range(66)})
     probe = read_class._vtable_slot_probe(ctx, object(), 0x9000, 70, scanned_through=64)
     assert probe["status"] == "not_present"
     assert probe["slot"] is None
@@ -1984,6 +2068,32 @@ def test_render_class_show_text_vtable_cap_note_names_the_lower_bound():
     text = _render_class_show_text(rec)
     assert "at least 65" in text
     assert "scan capped at 64" in text
+
+
+def test_render_class_show_text_discloses_a_stop_on_an_unreadable_row():
+    # #822 review (round 1): a scan that stopped at a row it could not READ has
+    # the same unknown total as a capped one, and the note must say so -- the
+    # display cap did not truncate anything here, so reusing the cap sentence
+    # would name the wrong cause (and re-read as "you are seeing a prefix").
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session", "confidence": "rtti", "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": False,
+            "slots_truncated": False,
+            "total": None,
+            "total_lower_bound": 1,
+            "scan_truncated": True,
+            "truncated_reason": "unreadable_row",
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "unreadable" in text
+    assert "at least 1" in text
+    assert "scan capped" not in text
 
 
 def test_render_class_show_text_no_cap_note_when_instances_complete():

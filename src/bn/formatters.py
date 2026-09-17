@@ -5638,14 +5638,28 @@ def _render_one_class(rec: Any) -> str:
                      "(defined in another module, or applied at load time via relocations)")
     if vt.get("truncated"):
         # #822: the cap note now carries the bound instead of only the cap, so a
-        # reader can tell a 65-entry table from a 4000-entry one -- an unknown
-        # exact total is named as a lower bound, never as a count.
+        # reader can see how much the cap hid -- the validated minimum, never a
+        # count. (At a fixed cap the bound does NOT recover the real total: an
+        # 80-entry and a 4000-entry table both report `max_slots + 1`. An exact
+        # total is what `total` is for, and it is present exactly when the
+        # table's end was observed.)
         bound = vt.get("total_lower_bound")
         bound_s = f"of at least {bound} entries" if isinstance(bound, int) else "of an unknown total"
         lines.append(
             f"  vtable: showing {len(vt_slots)} slots {bound_s}; scan capped at "
             f"{vt.get('max_slots')} -- more may exist (raise the cap or inspect the "
             "table directly)"
+        )
+    elif vt.get("scan_truncated"):
+        # #822 review (round 1): the total is not exact for a reason the display
+        # cap did not cause -- the scan stopped at an entry it could not READ, so
+        # the table's end was never observed. Say which, instead of claiming a
+        # complete table or blaming a cap nothing hit.
+        bound = vt.get("total_lower_bound")
+        bound_s = f"of at least {bound} entries" if isinstance(bound, int) else "of an unknown total"
+        lines.append(
+            f"  vtable: showing {len(vt_slots)} slots {bound_s}; the scan stopped at an "
+            "unreadable entry -- more may exist (inspect the table directly)"
         )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
     # single-inheritance class isn't cluttered (there are none to show there).
@@ -5668,6 +5682,15 @@ def _render_one_class(rec: Any) -> str:
                 f"    vtable: showing {len(_field_list(sec, 'slots'))} slots {sec_bound_s}; "
                 f"scan capped at {sec.get('max_slots')} -- "
                 "more may exist (raise the cap or inspect the table directly)"
+            )
+        elif sec.get("scan_truncated"):
+            sec_bound = sec.get("total_lower_bound")
+            sec_bound_s = (f"of at least {sec_bound} entries" if isinstance(sec_bound, int)
+                           else "of an unknown total")
+            lines.append(
+                f"    vtable: showing {len(_field_list(sec, 'slots'))} slots {sec_bound_s}; "
+                "the scan stopped at an unreadable entry -- "
+                "more may exist (inspect the table directly)"
             )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`

@@ -3015,6 +3015,11 @@ def test_virtual_call_reports_truncated_reason_when_the_probe_cannot_decide(monk
                             "truncated": True,
                             "max_slots": 64,
                             "scanned": 64,
+                            "total": None,
+                            "total_lower_bound": 65,
+                            "slots_truncated": True,
+                            "scan_truncated": True,
+                            "truncated_reason": "scan_capped",
                         })
 
     class _UnreadableCtx:
@@ -3031,6 +3036,55 @@ def test_virtual_call_reports_truncated_reason_when_the_probe_cannot_decide(monk
     assert out["unresolved_reason_code"] == "vtable_scan_truncated"
     assert "70" in out["unresolved_reason"]
     assert "64" in out["unresolved_reason"]
+
+
+def test_virtual_call_keeps_the_slot_unknown_when_an_unreadable_row_blocks_the_probe(monkeypatch):
+    # #822 review (round 1): the probe walks the rows between the display window
+    # and the requested slot, and a row it cannot READ does not prove the table
+    # ends there. Reporting `slot_not_present` turned a failed read into a
+    # confident absence -- the inverse of g-584-5's discriminator (the capped
+    # scan's "may exist past" disclosure must survive).
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 70, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    rows = {i: _vc_code_row(i) for i in range(80)}
+    rows[66] = {"index": 66, "entry_address": hex(0x9010 + 66 * 8), "value": None,
+                "readable": False}
+    ctx = _VcTableCtx(rows)
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_scan_truncated"
+    assert "70" in out["unresolved_reason"]
+    assert "64" in out["unresolved_reason"]
+
+
+def test_virtual_call_names_an_unreadable_stop_instead_of_the_cap(monkeypatch):
+    # The other unreadable shape: the provider's WINDOW scan stopped early on a
+    # row it could not read, so no cap was involved. The disclosure must name
+    # that stop -- reusing the cap sentence would blame a bound nothing hit.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 70, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    rows = {i: _vc_code_row(i) for i in range(80)}
+    rows[3] = {"index": 3, "entry_address": hex(0x9010 + 3 * 8), "value": None,
+               "readable": False}
+    ctx = _VcTableCtx(rows)
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_scan_truncated"
+    assert "70" in out["unresolved_reason"]
+    assert "could not be read" in out["unresolved_reason"]
+    assert "scan capped" not in out["unresolved_reason"]
 
 
 def test_virtual_call_reports_probe_limit_rather_than_a_false_absence(monkeypatch):
@@ -3083,6 +3137,8 @@ def test_virtual_call_unresolved_without_truncation_omits_reason(monkeypatch):
                             "slots": [{"index": i, "method": {"name": f"m{i}"}} for i in range(3)],
                             "truncated": False,
                             "max_slots": 64,
+                            "scan_truncated": False,
+                            "truncated_reason": None,
                         })
 
     out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
@@ -3111,9 +3167,12 @@ def test_virtual_call_resolved_flags_uncertainty_from_other_truncated_provider(m
     def _fake_layout(ctx, pv, addr):
         if addr == 0x9000:
             return {"slots": [{"index": 2, "method": {"name": "doWork", "address": "0x4100"}}],
-                    "truncated": False, "max_slots": 64}
+                    "truncated": False, "max_slots": 64,
+                    "scan_truncated": False, "truncated_reason": None}
         return {"slots": [{"index": i, "method": {"name": f"o{i}"}} for i in range(2)],
-                "truncated": True, "max_slots": 2}
+                "truncated": True, "max_slots": 2, "total": None, "total_lower_bound": 3,
+                "slots_truncated": True, "scan_truncated": True,
+                "truncated_reason": "scan_capped"}
 
     monkeypatch.setattr(bridge.read_class, "_vtable_layout", _fake_layout)
 
