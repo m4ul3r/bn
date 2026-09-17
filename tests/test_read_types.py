@@ -75,25 +75,33 @@ def test_types_declare_refuses_source_without_named_types(monkeypatch):
 
     bv = _SourceOnlyBV()
 
-    result = instance._op_types_declare(
-        bv,
-        {
-            "op": "types_declare",
-            "declaration": "extern const GUID GUID_SysKeyboard;",
-            "source_path": "/tmp/win32_min.h",
-        },
-    )
-
-    assert result["count"] == 0
-    assert result["defined_types"] == {}
-    assert result["parsed_functions"] == ["DirectInput8Create"]
-    assert result["parsed_variables"] == ["GUID_SysKeyboard"]
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_types_declare(
+            bv,
+            {
+                "op": "types_declare",
+                "declaration": "extern const GUID GUID_SysKeyboard;",
+                "source_path": "/tmp/win32_min.h",
+            },
+        )
+    assert exc.value.status == "invalid_request"
+    assert "no named types" in exc.value.message
+    assert exc.value.observed["defined_types"] == {}
+    assert exc.value.observed["parsed_functions"] == ["DirectInput8Create"]
+    assert exc.value.observed["parsed_variables"] == ["GUID_SysKeyboard"]
     assert bv.defined == []
-    verified = instance._verify_operation(bv, result)
-    assert verified["status"] == "invalid_request"
-    assert "no named types" in verified["message"]
-    assert verified["observed"]["parsed_functions"] == ["DirectInput8Create"]
-    assert verified["observed"]["parsed_variables"] == ["GUID_SysKeyboard"]
+
+
+def test_declared_types_verifier_rejects_an_empty_apply_result(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    verified = instance._verify_operation(_FakeBV(), {
+        "op": "types_declare", "defined_types": {},
+        "requested": {"declaration": "struct Example { int value; };"},
+    })
+    assert verified["status"] == "verification_failed"
+    assert verified["observed"]["defined_types"] == {}
+    assert bridge.mutation_engine._has_failed_results(instance.ctx, [verified])
 
 
 def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
@@ -169,7 +177,7 @@ def test_empty_type_parse_rolls_back_and_reports_reason(
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeCommentMutationBV(comments={0x1000: "original"})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult())
+    monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult(), raising=False)
     result = instance._mutation("active", preview, [
         {"op": "set_comment", "address": "0x1000", "comment": "temporary"},
         {"op": "types_declare", "declaration": "struct Example { int value; };"},

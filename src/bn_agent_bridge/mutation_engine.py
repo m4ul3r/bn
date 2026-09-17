@@ -1575,12 +1575,8 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             "parsed_functions": list(item.get("parsed_functions") or []),
             "parsed_variables": list(item.get("parsed_variables") or []),
         }
-        item["status"] = "invalid_request"
-        item["message"] = (
-            "Parsed declarations but no named types were defined. "
-            "Provide a named type declaration and check for names that collide "
-            "with built-in types."
-        )
+        item["status"] = "verification_failed"
+        item["message"] = "No declared named types were available for live verification."
         return item
     observed_types: dict[str, str | None] = {}
     observed_type_layouts: dict[str, str | None] = {}
@@ -3630,6 +3626,19 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             requested=_operation_requested(ctx, op),
         ) from exc
     named_types = list(parsed["types"])
+    if not named_types:
+        raise OperationFailure(
+            "invalid_request",
+            "Parsed declarations but no named types were defined. "
+            "Provide a named type declaration and check for names that collide "
+            "with built-in types.",
+            requested=_operation_requested(ctx, op),
+            observed={
+                "defined_types": {},
+                "parsed_functions": [name for name, _ in parsed["functions"]],
+                "parsed_variables": [name for name, _ in parsed["variables"]],
+            },
+        )
     # Backstop for any OTHER malformed layout the parser might emit (beyond the
     # bitfield case caught above): a member extending past the struct width is a
     # corrupt layout that must not be applied and reported `verified` (#322).
