@@ -20,7 +20,10 @@ FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_reque
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
 # the row stays on one line and the name is still readable (#370.1). JSON output
-# is untouched -- it round-trips the raw name faithfully.
+# is untouched -- it round-trips the raw name faithfully. #771 routes the other
+# operator-settable free-text cells -- comment text, tag data, local names, and
+# the import library / raw symbol name columns -- through the same helper, for
+# the same reason: each is one cell of a row.
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -531,7 +534,10 @@ def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
 
 
 def _format_local_entry(item: dict[str, Any]) -> str:
-    name = str(item.get("name", "<unknown>"))
+    # The name is operator-set (`local rename`), so a control char in it would
+    # split the `params:` / `locals:` row across two lines; escape it before the
+    # width padding so the column measures what actually prints (#771).
+    name = _escape_control_chars(item.get("name", "<unknown>"))
     type_str = str(item.get("type", "<unknown>"))
     line = f"  {name:<20} {type_str}"
     # local_id is the stable handle `local rename` / `local retype` take; show it
@@ -966,16 +972,22 @@ def _render_comment_text(value: Any) -> str:
         lines = []
         doc = value.get("function_doc")
         if doc:
-            lines.append(f"[doc] {doc}")
+            # The doc rides at the top of this listing as a row (the same store
+            # `comment list` marks `[doc] `), so a multi-line doc gets the same
+            # escaping as the address rows below (#771).
+            lines.append(f"[doc] {_escape_control_chars(doc)}")
         if not comments and not doc:
             return "(no comment)"
         lines.extend(
-            f"{c.get('address', '?')}  {c.get('comment', '')}"
+            f"{c.get('address', '?')}  {_escape_control_chars(c.get('comment', ''))}"
             for c in comments if isinstance(c, dict)
         )
         return "\n".join(lines)
     comment = value.get("comment")
     if isinstance(comment, str):
+        # Single-comment form (`comment get <addr>`): the payload IS the comment,
+        # a document rather than a row, so its own newlines are the content and
+        # stay raw -- same as the decompile/IL/type-layout text renderers (#771).
         return comment if comment else "(no comment)"
     return _render_fallback_text(value)
 
@@ -1002,7 +1014,7 @@ def _render_comment_list_text(value: Any) -> str:
         # distinguishable in one listing -- same `[doc]` marker `comment get
         # --function` already uses.
         prefix = "[doc] " if item.get("scope") == "function_doc" else ""
-        lines.append(f"{address}  {func}  {prefix}{comment}")
+        lines.append(f"{address}  {func}  {prefix}{_escape_control_chars(comment)}")
     return "\n".join(lines)
 
 
@@ -1039,7 +1051,10 @@ def _render_tag_row(t: dict) -> str:
     # text renderer just surfaces it (address scope keeps the address, which is
     # the more precise locator when both are present).
     loc = t.get("address") or t.get("function") or "<function>"
-    return f"{loc}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
+    # `data` is the tag's operator-supplied text (`tag add --data`); escape it so
+    # a multi-line tag cannot split the row (#771).
+    return (f"{loc}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  "
+            f"{_escape_control_chars(t.get('data', ''))}")
 
 
 @_discloses
@@ -1568,10 +1583,14 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
             line += f" ({kind})"
         library = item.get("library")
         if library:
-            line += f" [{library}]"
+            line += f" [{_escape_control_chars(library)}]"
         raw_name = item.get("raw_name")
         if raw_name and raw_name != name:
-            line += f" (raw: {raw_name})"
+            # Both extra columns carry target-supplied text (an import's library
+            # and the pre-demangle symbol), so escape them like the name cell
+            # above -- one raw cell splits the row just as well (#771). The
+            # `raw_name != name` test still compares the RAW values.
+            line += f" (raw: {_escape_control_chars(raw_name)})"
         size = item.get("size")
         if size is not None:
             # #411: surface basic_block_count (a real complexity metric) here too,

@@ -29,6 +29,99 @@ def test_render_name_address_rows_escapes_control_chars():
     assert "\x07" not in out                     # raw control byte gone
 
 
+def test_render_comment_list_row_escapes_control_chars():
+    """#771: the comment cell of a `comment list` row is operator-supplied free
+    text (`comment set <addr> $'a\\nb'`), so a control char in it used to split
+    the row across two lines for every consumer of the text view -- including
+    `--format text --out` files. It now goes through the same escaper as the
+    symbol-name cell (#370.1). The JSON path is a rendering-independent concern
+    and must stay raw."""
+    from bn.formatters import _render_comment_list_text
+    from bn.output import render_value
+    payload = [{"address": "0x1000", "function": "parse_one",
+                "comment": "line1\nline2\twith\rctrl\x07char"}]
+    out = _render_comment_list_text(payload)
+    assert out.splitlines() == [
+        "0x1000  parse_one  line1\\nline2\\twith\\rctrl\\x07char"], out
+    # --format json is untouched: the raw comment round-trips byte-for-byte.
+    assert json.loads(render_value(payload, "json")) == payload
+
+
+def test_render_comment_function_view_escapes_doc_and_address_rows():
+    """#771: `comment get --function` lists the same two stores as `comment
+    list` (the function doc + the in-function address comments), so both row
+    kinds stay on one line. The standalone single-comment form is the whole
+    payload -- a document, not a row -- so its newlines stay content."""
+    from bn.formatters import _render_comment_text
+    out = _render_comment_text({
+        "function": {"name": "parse_one", "address": "0x1000"},
+        "has_function_doc": True,
+        "function_doc": "doc line1\ndoc line2",
+        "comments": [{"address": "0x1010", "comment": "a\nb"}],
+    })
+    assert out.splitlines() == ["[doc] doc line1\\ndoc line2", "0x1010  a\\nb"], out
+    assert _render_comment_text({"comment": "a\nb"}) == "a\nb"
+
+
+def test_comment_list_text_is_one_line_end_to_end(fake_transport, capsys):
+    """#771 at the CLI level: `comment list --format text` must render a comment
+    carrying a newline on ONE line (a `--out` file's rows are read line-wise),
+    while `--format json` still round-trips the raw comment untouched."""
+    fake_transport({"list_comments": {"ok": True, "result": {
+        "items": [{"address": "0x401000", "function": "parse_one",
+                   "comment": "line1\nline2"}],
+        "total": 1, "offset": 0, "limit": 50, "returned": 1, "has_more": False}}})
+    rc = bn.cli.main(["comment", "list", "--target", "active", "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines() == ["0x401000  parse_one  line1\\nline2"], out
+
+    rc = bn.cli.main(["comment", "list", "--target", "active", "--format", "json"])
+    assert rc == 0
+    row = json.loads(capsys.readouterr().out)["items"][0]
+    assert row["comment"] == "line1\nline2"
+
+
+def test_render_tag_row_escapes_control_chars():
+    """#771: a tag's `data` is operator-supplied text (`tag add --data`); a
+    multi-line tag must not split the tag row (`tag get` / `tag list`)."""
+    from bn.formatters import _render_tag_list_text, _render_tag_row
+    tag = {"address": "0x2000", "scope": "address", "icon": "🎯",
+           "type": "Bookmarks", "data": "first\nsecond\x1b[0m"}
+    row = _render_tag_row(tag)
+    assert row.splitlines() == [row], row
+    assert "first\\nsecond\\x1b[0m" in row
+    listed = _render_tag_list_text([tag])
+    assert listed.splitlines() == [row], listed
+
+
+def test_render_local_list_escapes_local_name_control_chars():
+    """#771: `local rename` can put a newline in a local's name; the `locals:`
+    row must stay one physical line instead of becoming two."""
+    from bn.formatters import _render_local_list_text
+    out = _render_local_list_text({
+        "function": {"name": "parse_one", "address": "0x1000"},
+        "items": [{"name": "ev\nil", "type": "int", "local_id": "L1"}],
+    })
+    # header + "" + "locals:" + the one row
+    assert len(out.splitlines()) == 4, out
+    assert "  ev\\nil" in out
+    assert "L1" in out
+
+
+def test_render_name_address_rows_escapes_library_and_raw_name():
+    """#771: :1565 escaped the name cell of a name/address row but left its
+    `library` and `raw_name` columns raw -- either one splits the row on its
+    own, so they take the same escaper."""
+    from bn.formatters import _render_name_address_rows
+    out = _render_name_address_rows([
+        {"address": "0x3000", "name": "alloc_thing", "kind": "import",
+         "library": "lib\nc.so", "raw_name": "raw\rname"},
+    ])
+    assert out.splitlines() == [
+        "0x3000  alloc_thing (import) [lib\\nc.so] (raw: raw\\rname)"], out
+
+
 def test_render_name_address_rows_shows_basic_block_count():
     """#411: text is the DEFAULT read output, so the real complexity metric
     (basic_block_count) must be visible there, not only in JSON. A row carrying
