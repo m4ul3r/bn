@@ -3086,6 +3086,35 @@ def test_argument_confidence_empty_hlil_list_is_a_count_742(monkeypatch):
     assert "prototype declares 3" in out
 
 
+@pytest.mark.parametrize(
+    "argument_fields",
+    [
+        pytest.param({}, id="absent"),
+        pytest.param({"arguments": None}, id="null"),
+        pytest.param({"arguments": {}}, id="wrong-shape"),
+        pytest.param({"arguments": [None]}, id="invalid-member"),
+        pytest.param({"arguments": [{"text": "1"}, None]}, id="partly-renderable"),
+    ],
+)
+def test_argument_mismatch_text_does_not_invent_unavailable_count_742(
+    monkeypatch, argument_fields,
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[])
+    evidence = instance._function_evidence("active", "probe_device", context=0)
+    call = evidence["calls"][0]
+    del call["arguments"]
+    call.update(argument_fields)
+
+    from bn.formatters import _render_function_evidence_text
+    out = _render_function_evidence_text(evidence)
+    assert "arguments: (hlil inferred)" in out
+    assert "arity: MISMATCH" in out
+    assert "rendered a different argument count" in out
+    assert "argument(s) but" not in out
+
+
 def test_argument_confidence_missing_hlil_list_uses_mlil_provenance_742(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
