@@ -389,17 +389,25 @@ def _never_an_install_destination(dest: Path, source: Path) -> str | None:
     return None
 
 
-def _uncreatable_parent_reason(dest: Path) -> str | None:
-    """Why `dest`'s parent chain cannot be created, or None when it can.
+def _unusable_parent_reason(dest: Path) -> str | None:
+    """Why `dest`'s parent chain cannot be written to, or None when it can.
 
-    `mkdir(parents=True)` fails when a component of the chain is already
-    something other than a directory. Deciding that in the plan keeps the
-    failure out of the install loop, where it would arrive after the
-    destinations reached first had already been written.
+    `mkdir(parents=True)` fails on a component that is not a directory, or when
+    the deepest component that already exists is not writable. Deciding that in
+    the plan keeps the failure out of the install loop, where it would arrive
+    after the destinations reached first had already been written.
+    `os.access` is a hint, not a guarantee -- the install still maps any
+    remaining OS error (a race, a filesystem that fills) to a BridgeError, with
+    the destinations already written left in place.
     """
     for parent in reversed(dest.parents):
         if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
             return f"{parent} is not a directory"
+    existing = dest.parent
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if not os.access(existing, os.W_OK | os.X_OK):
+        return f"{existing} is not writable"
     return None
 
 
@@ -459,9 +467,9 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
             "destination outside the bn installation and outside the tree "
             "being copied."
         )
-    uncreatable = _uncreatable_parent_reason(dest)
-    if uncreatable is not None:
-        raise BridgeError(f"Cannot install into {dest}: {uncreatable}.")
+    unusable = _unusable_parent_reason(dest)
+    if unusable is not None:
+        raise BridgeError(f"Cannot install into {dest}: {unusable}.")
     if not force:
         if dest.exists() or dest.is_symlink():
             raise BridgeError(f"Destination already exists: {dest}")
@@ -512,8 +520,10 @@ def _skill_install(args: argparse.Namespace) -> int:
             skipped_destinations.append(str(dest))
             continue
         # Planned, not just checked: the path validated here is the path the
-        # install writes to, and every destination is validated before the
-        # first one is written -- a refused skill install installs nothing.
+        # install writes to, and every destination is refused before the first
+        # one is written -- so no refusal can leave half a store installed. An
+        # OS error while writing (a filesystem that fills, a race) still can,
+        # with the destinations reached first left in place.
         # Two target roots can name one directory (a symlinked skills root, or
         # an equal CLAUDE_HOME and CODEX_HOME), and installing there twice would
         # write the same skills over the copy the first entry just made.

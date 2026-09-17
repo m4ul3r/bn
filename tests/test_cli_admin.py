@@ -563,6 +563,28 @@ def test_skill_install_installs_a_shared_default_root_once(tmp_path, monkeypatch
     assert bn.cli.main(["skill", "install", "--force"]) == 0
 
 
+def test_skill_install_is_all_or_nothing_with_an_unwritable_root(tmp_path, monkeypatch):
+    # A default root under a directory the caller cannot write is refused in
+    # the plan, so the other root is not populated first. A caller who can
+    # write there (root) installs normally; either way the first root is never
+    # left half-populated.
+    claude_root = tmp_path / "claude" / "skills"
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: locked)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: locked / "skills")
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc in (0, 2)
+    if rc == 2:
+        assert not claude_root.exists()
+    else:
+        assert (claude_root / "bn-vr" / "SKILL.md").is_file()
+
+
 def test_a_refused_skill_install_with_an_unusable_root_writes_nothing(tmp_path, monkeypatch):
     # A default root that cannot be created -- a file where the root belongs --
     # has to be refused in the plan: refusing it in the install loop instead
