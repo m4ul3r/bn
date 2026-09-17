@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 import types
 
 import pytest
+
+from _bridge_fakes import _FakeBV, _FakeConstPtr, _FakeLLILInstruction, _FakeSection
 
 read_class = importlib.import_module("bn_agent_bridge.read_class")
 seam = importlib.import_module("bn_agent_bridge.seam")
@@ -106,6 +109,9 @@ class _RegistryBV:
 
     def get_symbols(self):
         return list(self._symbols)
+
+    def get_function_at(self, address):
+        return next((fn for fn in self.functions if fn.start == address), None)
 
 
 def _make_registry_bv():
@@ -1086,6 +1092,9 @@ def test_class_show_assembles_full_record():
     bv = _make_registry_bv()
 
     class _ShowCtx:
+        _find_function = seam.BridgeContext._find_function
+        _sections_at = seam.BridgeContext._sections_at
+
         def _resolve_view(self, sel):
             return bv
         def _pointer_size(self, b):
@@ -1106,6 +1115,118 @@ def test_class_show_assembles_full_record():
     assert out["size"]["value"] == "0xd0"
     assert out["bases"][0]["name"] == "net::Endpoint"
     assert out["vtable"]["slots"][0]["method"]["name"] == "onData"
+
+
+@pytest.fixture
+def class_method_ctx(monkeypatch):
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: None)
+    monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
+    monkeypatch.setattr(ctx, "_instances_for", lambda bv, rec: {
+        "construction_sites": [], "stored_globals": []})
+    return ctx
+
+
+@pytest.mark.parametrize(("mangled", "demangled", "kind"), [
+    ("_ZN6Gadget3runEv", "Gadget::run()", "method"),
+    ("_ZN6GadgetC1Ev", "Gadget::Gadget()", "ctor"),
+    ("_ZN6GadgetD1Ev", "Gadget::~Gadget()", "dtor"),
+])
+def test_class_show_marks_same_name_plt_without_resolving_by_name(
+    monkeypatch, class_method_ctx, mangled, demangled, kind,
+):
+    from bn.formatters import _render_class_show_text
+
+    veneer = _Fn(0x1000, mangled, demangled)
+    body = _Fn(0x2000, mangled, demangled)
+    for fn in (veneer, body):
+        fn.symbol.type = types.SimpleNamespace(name="FunctionSymbol")
+    bv = _FakeBV(functions=[veneer, body], sections={
+        ".plt": _FakeSection(".plt", 0x1000, 0x1100),
+        ".text": _FakeSection(".text", 0x2000, 0x2100),
+    })
+    monkeypatch.setattr(class_method_ctx, "_resolve_view", lambda selector: bv)
+
+    # Exercise the real detector, then consume the serializable class response.
+    result = json.loads(json.dumps(read_class._class_show(class_method_ctx, None, "Gadget")))
+    rows = {row["address"]: row for row in result["methods"]}
+    assert set(rows) == {"0x1000", "0x2000"}
+    assert [row["mangled"] for row in result["methods"]] == [mangled, mangled]
+    assert all(row["kind"] == kind for row in result["methods"])
+    assert rows["0x1000"]["thunk"]["is_candidate"] is True
+    assert rows["0x1000"]["thunk"]["target"] is None
+    assert rows["0x1000"]["thunk"]["sections"][0]["name"] == ".plt"
+    assert rows["0x2000"]["thunk"]["is_candidate"] is False
+    assert rows["0x2000"]["thunk"]["target"] is None
+    assert rows["0x2000"]["thunk"]["sections"][0]["name"] == ".text"
+
+    lines = _render_class_show_text(result).splitlines()
+    veneer_line = next(line for line in lines if f"0x1000  {demangled}" in line)
+    body_line = next(line for line in lines if f"0x2000  {demangled}" in line)
+    assert "thunk/veneer candidate" in veneer_line
+    assert "target unresolved" in veneer_line
+    assert "0x2000" not in veneer_line
+    assert "thunk/veneer" not in body_line
+
+
+@pytest.mark.parametrize("imported", [True, False], ids=["import-target", "local-forwarding"])
+def test_class_show_preserves_detector_target_and_candidate_status(
+    monkeypatch, class_method_ctx, imported,
+):
+    from bn.formatters import _render_class_show_text
+
+    callee = _Fn(0x3000, "helper", "helper")
+    callee.symbol.type = types.SimpleNamespace(
+        name="ImportedFunctionSymbol" if imported else "FunctionSymbol")
+    methods = [
+        _Fn(0x2000, "_ZN6Gadget3runEv", "Gadget::run()"),
+        _Fn(0x2010, "_ZN6GadgetC1Ev", "Gadget::Gadget()"),
+        _Fn(0x2020, "_ZN6GadgetD1Ev", "Gadget::~Gadget()"),
+    ]
+    for fn in methods:
+        fn.low_level_il = [[_FakeLLILInstruction(
+            fn.start, _FakeConstPtr(callee.start), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(functions=[*methods, callee], sections={
+        ".text": _FakeSection(".text", 0x2000, 0x3100),
+    })
+    monkeypatch.setattr(class_method_ctx, "_resolve_view", lambda selector: bv)
+
+    result = json.loads(json.dumps(read_class._class_show(class_method_ctx, None, "Gadget")))
+    assert {row["address"] for row in result["methods"]} == {"0x2000", "0x2010", "0x2020"}
+    lines = _render_class_show_text(result).splitlines()
+    for row in result["methods"]:
+        thunk = row["thunk"]
+        assert thunk["is_candidate"] is imported
+        assert thunk["target"]["function"]["address"] == "0x3000"
+        assert thunk["target"]["function"]["name"] == "helper"
+        line = next(line for line in lines if f"{row['address']}  {row['demangled']}" in line)
+        assert "helper @ 0x3000" in line
+        assert "target unresolved" not in line
+        if imported:
+            assert "thunk/veneer candidate" in line
+            assert "target ->" in line
+        else:
+            assert "local branch ->" in line
+            assert "not a confirmed thunk/veneer" in line
+            assert "thunk/veneer candidate" not in line
+
+
+def test_class_show_detects_thunks_only_for_requested_class(monkeypatch, class_method_ctx):
+    class _UnrelatedFn(_Fn):
+        @property
+        def low_level_il(self):
+            pytest.fail("class show inspected IL for an unrelated class")
+
+    bv = _FakeBV(functions=[
+        _Fn(0x1000, "_ZN6Gadget3runEv", "Gadget::run()"),
+        _UnrelatedFn(0x2000, "_ZN5Other3runEv", "Other::run()"),
+    ], sections={".plt": _FakeSection(".plt", 0x1000, 0x1100)})
+    monkeypatch.setattr(class_method_ctx, "_resolve_view", lambda selector: bv)
+
+    result = read_class._class_show(class_method_ctx, None, "Gadget")
+    assert result["methods"][0]["thunk"]["is_candidate"] is True
+    listed = read_class._class_list(class_method_ctx, None, include_all=True)
+    assert {row["name"] for row in listed["items"]} == {"Gadget", "Other"}
 
 
 def test_class_show_unknown_name_errors_with_hint():
@@ -1146,6 +1267,9 @@ def test_class_show_ambiguous_returns_all_matches():
     bv = _RegistryBV(fns, [])
 
     class _Ctx:
+        _find_function = seam.BridgeContext._find_function
+        _sections_at = seam.BridgeContext._sections_at
+
         def _resolve_view(self, sel):
             return bv
         def _vtable_layout_for(self, b, a):
