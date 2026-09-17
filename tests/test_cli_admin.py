@@ -507,7 +507,7 @@ def test_install_refuses_a_destination_whose_parent_is_a_file(tmp_path, capsys):
 
     assert rc == 2
     assert blocker.read_text() == "not a directory\n"
-    assert "Cannot create the parent directory" in capsys.readouterr().err
+    assert "is not a directory" in capsys.readouterr().err
 
 
 def test_force_replaces_a_symlink_install_that_points_at_the_source(tmp_path):
@@ -561,6 +561,25 @@ def test_skill_install_installs_a_shared_default_root_once(tmp_path, monkeypatch
     assert (claude_root / "bn" / "SKILL.md").is_file()
     assert (claude_root / "bn-vr" / "SKILL.md").is_file()
     assert bn.cli.main(["skill", "install", "--force"]) == 0
+
+
+def test_a_refused_skill_install_with_an_unusable_root_writes_nothing(tmp_path, monkeypatch):
+    # A default root that cannot be created -- a file where the root belongs --
+    # has to be refused in the plan: refusing it in the install loop instead
+    # leaves the other root already populated with the skills it reached.
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "skills").write_text("not a directory\n")
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+
+    rc = bn.cli.main(["skill", "install"])
+
+    assert rc == 2
+    assert not claude_root.exists()
+    assert (codex_home / "skills").read_text() == "not a directory\n"
 
 
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):

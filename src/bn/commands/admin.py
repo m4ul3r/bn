@@ -389,6 +389,20 @@ def _never_an_install_destination(dest: Path, source: Path) -> str | None:
     return None
 
 
+def _uncreatable_parent_reason(dest: Path) -> str | None:
+    """Why `dest`'s parent chain cannot be created, or None when it can.
+
+    `mkdir(parents=True)` fails when a component of the chain is already
+    something other than a directory. Deciding that in the plan keeps the
+    failure out of the install loop, where it would arrive after the
+    destinations reached first had already been written.
+    """
+    for parent in reversed(dest.parents):
+        if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
+            return f"{parent} is not a directory"
+    return None
+
+
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
@@ -445,6 +459,9 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
             "destination outside the bn installation and outside the tree "
             "being copied."
         )
+    uncreatable = _uncreatable_parent_reason(dest)
+    if uncreatable is not None:
+        raise BridgeError(f"Cannot install into {dest}: {uncreatable}.")
     if not force:
         if dest.exists() or dest.is_symlink():
             raise BridgeError(f"Destination already exists: {dest}")
