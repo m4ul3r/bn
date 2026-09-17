@@ -6032,6 +6032,13 @@ def test_plain_vprintf_family_format_models_present_and_shaped():
     assert models["vsnprintf"]["sink"]["tainted_args"] == [2]
     assert models["vsnprintf"]["sink"]["class"] == "format_or_overflow"
     assert models["vsnprintf"]["propagates"] == [{"from": "*arg:2", "to": "*arg:0"}]
+    # #808: the write SIZE (arg1) is a SECOND, length-shaped sink on the
+    # size-bounded formatters. It is declared as the bounded-write len_arg/buf_arg
+    # pair (dest is arg0) rather than as an extra `tainted_args` entry, which is
+    # why the pinned format-arg list above stays [2] -- the size arm is pinned
+    # here instead. See test_forward_tainted_snprintf_size_arg_reaches_sink_808.
+    assert models["vsnprintf"]["sink"]["len_arg"] == 1
+    assert models["vsnprintf"]["sink"]["buf_arg"] == 0
     assert models["asprintf"]["sink"]["tainted_args"] == [1]
     assert models["vasprintf"]["sink"]["tainted_args"] == [1]
     # stream formatters -> format_string
@@ -6042,6 +6049,111 @@ def test_plain_vprintf_family_format_models_present_and_shaped():
     assert models["dprintf"]["sink"]["tainted_args"] == [1]
     # decorated/PLT forms still resolve to the plain key
     assert te.lookup_model(models, "vsnprintf@plt")[0] == "vsnprintf"
+
+
+# --------------------------------------------------------------------------
+# #808 -- the size-bounded formatters' write SIZE is a sink too
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("callee", ["snprintf", "vsnprintf"])
+def test_forward_tainted_snprintf_size_arg_reaches_sink_808(models, callee):
+    # #808: snprintf/vsnprintf write AT MOST `size` bytes into the destination, so
+    # an attacker-controlled size (arg1) is a write-length sink into arg0 -- the
+    # same shape as strncpy's count. The model armed only the format arg (arg2)
+    # while its own detail claimed size coverage, so `snprintf(dst, n, "%s", "xy")`
+    # with a tainted n returned reached_sinks=[] and safe_to_report_all_clear=true:
+    # a false all-clear on a genuine overflow.
+    dst = FVar("dst", typ="char[0x20]"); n = FVar("n"); n0 = FSSA(n, 0)
+    call = FInstr(0, 0x10, "MLIL_CALL_SSA", f'{callee}(&dst, n#0, "%s", "xy")',
+                  reads=[n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                  params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                          FExpr("MLIL_CONST_PTR", "%s", constant=0x4000),
+                          FExpr("MLIL_CONST_PTR", "xy", constant=0x4100)])
+    func = FFunc("fmt", 0x10, FSSAFunc([call]), params=[n])
+    engine = te.TaintEngine(FBV({0x3000: callee}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"]]
+    assert [(s["callee"], s["tainted_arg_index"], s["class"]) for s in sinks] == \
+        [(callee, 1, "format_or_overflow")], sinks
+    # A non-empty reached_sinks is what suppresses the zero-sink all-clear block;
+    # assert the gate directly too so this test also fails if that block returns.
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is not True, diag
+
+
+def test_forward_tainted_snprintf_format_arg_still_arms_format_sink_808(models):
+    # #808 guard: arming the write size must not disturb the tainted-FORMAT sink on
+    # arg2 -- same index, class and detail as before the size arm.
+    dst = FVar("dst", typ="char[0x20]"); fmt = FVar("fmt", typ="char *")
+    fmt0 = FSSA(fmt, 0)
+    call = FInstr(0, 0x10, "MLIL_CALL_SSA", "snprintf(&dst, 0x20, fmt#0)",
+                  reads=[fmt0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                  params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                          FExpr("MLIL_CONST", "0x20", constant=0x20),
+                          FExpr("MLIL_VAR_SSA", "fmt#0", reads=[fmt0])])
+    func = FFunc("fmt", 0x10, FSSAFunc([call]), params=[fmt])
+    engine = te.TaintEngine(FBV({0x3000: "snprintf"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"]]
+    assert [(s["callee"], s["tainted_arg_index"], s["class"]) for s in sinks] == \
+        [("snprintf", 2, "format_or_overflow")], sinks
+    assert sinks[0]["detail"] == models["snprintf"]["sink"]["detail"]
+
+
+def test_forward_snprintf_size_provably_bounded_downgrades_808(models):
+    # #808: `dst = malloc(n); snprintf(dst, n, "%s", "xy")` -- the write size IS the
+    # allocation size, so the size sink is a bounded copy, not an overflow. Seeing
+    # the destination at all is what the declared `buf_arg` (arg0) buys: the size
+    # arm is a bounded-write `len_arg`, so the engine's provably-bounded downgrade
+    # applies instead of the model over-claiming an overflow.
+    dst = FVar("dst"); n = FVar("n"); n0 = FSSA(n, 0); dst1 = FSSA(dst, 1)
+    instrs = [
+        FInstr(0, 0x08, "MLIL_CALL_SSA", "dst#1 = malloc(n#0)", reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x0c, "MLIL_CALL_SSA", 'snprintf(dst#1, n#0, "%s", "xy")',
+               reads=[dst1, n0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                       FExpr("MLIL_CONST_PTR", "%s", constant=0x4000),
+                       FExpr("MLIL_CONST_PTR", "xy", constant=0x4100)]),
+    ]
+    func = FFunc("fmt", 0x08, FSSAFunc(instrs), params=[n])
+    engine = te.TaintEngine(FBV({0x2000: "malloc", 0x3000: "snprintf"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # malloc(tainted) fires its own alloc_size sink; isolate the snprintf one.
+    snp = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "snprintf"]
+    assert len(snp) == 1, snp
+    assert snp[0]["class"] == "bounded_len", snp[0]        # downgraded, not an overflow
+    assert "provably bounded" in snp[0]["detail"], snp[0]
+
+
+def test_forward_snprintf_chk_tainted_maxlen_reaches_sink_808(models):
+    # #808: the fortified form is __snprintf_chk(dst, maxlen, flag, dstlen, fmt, ...):
+    # maxlen STAYS arg1 (only the format shifts, to arg4), so the write-length arm is
+    # arg1 there too. The class stays fortified_format -- this call aborts at runtime
+    # instead of overflowing, which is the _chk copy family's convention.
+    dst = FVar("dst", typ="char[0x20]"); n = FVar("n"); n0 = FSSA(n, 0)
+    call = FInstr(0, 0x10, "MLIL_CALL_SSA", 'snprintf_chk(&dst, n#0, 1, 0x20, "%s", "xy")',
+                  reads=[n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                  params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                          FExpr("MLIL_CONST", "1", constant=1),
+                          FExpr("MLIL_CONST", "0x20", constant=0x20),
+                          FExpr("MLIL_CONST_PTR", "%s", constant=0x4000),
+                          FExpr("MLIL_CONST_PTR", "xy", constant=0x4100)])
+    func = FFunc("fmt", 0x10, FSSAFunc([call]), params=[n])
+    engine = te.TaintEngine(FBV({0x3000: "snprintf_chk"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"]]
+    assert [(s["callee"], s["tainted_arg_index"], s["class"]) for s in sinks] == \
+        [("snprintf_chk", 1, "fortified_format")], sinks
 
 
 def test_forward_recvmsg_arg_seed_nudges_to_buffer_306(models):

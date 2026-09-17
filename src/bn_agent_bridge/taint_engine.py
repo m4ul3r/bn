@@ -3484,8 +3484,23 @@ class TaintEngine:
                                     _dest_idx = (int(sink["buf_arg"])
                                                  if (sink.get("buf_arg") is not None
                                                      and argidx == sink.get("len_arg")) else 0)
+                                    # #808: a declared len_arg+buf_arg pair IS a
+                                    # bounded-write declaration, so the provably-bounded
+                                    # relabel must not hinge on the model's class hint --
+                                    # one entry arms several args under ONE class, and a
+                                    # class describing a sibling arg (snprintf: the write
+                                    # length arg1 shares format_or_overflow with the
+                                    # format arg2) says nothing about this length. Still
+                                    # gated on argidx == len_arg, so a non-length arg of
+                                    # such an entry is never relabeled by another arg's
+                                    # length. Inert for every pre-existing model: the
+                                    # read/recv family reaches the same `_bnd_reason`
+                                    # through its `overflow_len` class already, and a
+                                    # `len_arg` without `buf_arg` took the branch above.
+                                    _len_pair = (sink.get("buf_arg") is not None
+                                                 and argidx == sink.get("len_arg"))
                                     _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx, dest_idx=_dest_idx)
-                                                   if sink.get("class") == "overflow_len" else None)
+                                                   if (sink.get("class") == "overflow_len" or _len_pair) else None)
                                 if _bnd_reason is not None:
                                     eff_sink = {
                                         **sink,
