@@ -1575,8 +1575,12 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             "parsed_functions": list(item.get("parsed_functions") or []),
             "parsed_variables": list(item.get("parsed_variables") or []),
         }
-        item["status"] = "noop"
-        item["message"] = "Parsed declarations but no named types were defined."
+        item["status"] = "invalid_request"
+        item["message"] = (
+            "Parsed declarations but no named types were defined. "
+            "Provide a named type declaration and check for names that collide "
+            "with built-in types."
+        )
         return item
     observed_types: dict[str, str | None] = {}
     observed_type_layouts: dict[str, str | None] = {}

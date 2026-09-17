@@ -31,7 +31,7 @@ A no-op edit reports `changed: false` ("No effective change detected").
 Per-op statuses:
 
 - `verified` — change applied and read back as requested.
-- `noop` — already in the requested state.
+- `noop` — already in the requested state. For `types declare`, the named types must resolve in the live database; parsing no named types is `invalid_request`, with the reason in `first_error` and the default status output, not a successful no-op.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
 - `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. Exit 2 still covers everything on this path that is *not* one of those statuses: a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), a transport failure, a bridge error carrying some other status or none, and a response this CLI cannot parse.
