@@ -49,6 +49,7 @@ One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target
   - **loop-invariant bound pointers** — a hoisted fixed limit (`add x8, base, #0x100` at entry) can render relative to the *moving* write pointer (`if (&p[0x100] <= &p[k+1]) break;`), so a real total-size cap looks like it never fires → phantom overflow;
   - **accumulator / shift structure** — a size-parse loop that should be `size = (size << 4) | nibble` but *lacks* the `<< 4` renders as a normal accumulate, concealing that it only ever keeps the last nibble.
   Each of these produced a near-false-positive *critical* finding in dogfooding; the pseudo-C alone is not enough for a bounds claim.
+  **ARM32 predication / Thumb `IT` guards** need a separate check: ARM conditional instructions and Thumb `it`/`itt`/`ite` blocks are the ARM32 counterpart, not AArch64 `csel`/`ccmp`. Disassembly names the `IT` and each covered physical instruction on separate rows, including mixed 16/32-bit instructions. Native per-instruction text may omit the condition inherited from `IT`: read the preceding IT mask with those operands, and cross-check LLIL/MLIL predicate and flag flow before calling a move/load/store unconditional. A window starting inside an IT block lacks that context; include the preceding IT. HLIL may express the resulting select as a useful ternary, but still verify its predicate and operands.
 
 ## Command index (what exists — flags live in reference)
 

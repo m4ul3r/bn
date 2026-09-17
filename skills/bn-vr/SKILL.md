@@ -87,6 +87,8 @@ On stripped static firmware (busybox, embedded ARM/MIPS), `bn imports` is empty 
 
 5. **Confirm the bound in disasm — not just widths.** Stripped + ARM means the decompiler's story is frequently wrong for more than operand size: confirm field loads (`ldrb` vs `ldr`) **and** the guard/loop shape in `bn disasm` before concluding off-by-one / truncation / overflow. HLIL flattens `ccmp`/`csel` range guards into misleading ternaries, can render a hoisted loop-invariant limit relative to a *moving* pointer (so a real cap looks like it never fires), and hides a missing `<< 4` in a size accumulator — each has faked a critical finding. See the "HLIL can mislead beyond access width" note in the `bn` skill.
 
+   **ARM32 predication needs its own check.** AArch64 `csel`/`ccmp` do not describe ARM32: inspect ARM conditional instructions and Thumb `IT` masks with every covered instruction. `bn disasm` lists the IT and its physical 16/32-bit operands separately; native per-instruction mnemonics may not repeat the IT-derived condition. Include the preceding IT when a window starts inside its block, then cross-check LLIL/MLIL predicate and flag flow before treating a load/store/move as unconditional or dismissing an HLIL ternary as wrong.
+
 **Worked example — busybox.** BusyBox is an applet multiplexer: `main` dispatches on `argv[0]`/`argv[1]` to applet handlers, so its real attack surface is the applet table plus the strings that name applets:
 ```bash
 bn strings --regex --query 'httpd|telnetd|login|/etc/(passwd|shadow)' --no-crt

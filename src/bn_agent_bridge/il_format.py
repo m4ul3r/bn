@@ -755,15 +755,24 @@ def _instruction_length(bv, address: int, *, arch=None, strict: bool = False) ->
     return 1
 
 
-def _disasm_entry(bv, address: int, *, arch=None, strict: bool = False) -> dict[str, Any]:
+def _disasm_instruction(bv, address: int, *, arch=None, strict: bool = False) -> tuple[str, int]:
+    """Pair rendered text with its physical width, not an analysis span.
+
+    Thumb IT instruction-info spans can include the following predicated
+    instructions; the text decoder's length covers only the named instruction.
+    Keep _instruction_length unchanged for analysis/callsite consumers.
+    """
     text = ""
     if arch is not None:
         try:
             max_length = int(getattr(arch, "max_instr_length", 16) or 16)
             data = bv.read(address, max_length)
-            tokens, _length = arch.get_instruction_text(data, address)
+            tokens, length = arch.get_instruction_text(data, address)
             if tokens:
                 text = "".join(str(t) for t in tokens)
+                length = int(length)
+                if text and length > 0:
+                    return text, length
         except Exception:
             pass
     # In strict mode (forced linear --mode) a failed forced-arch decode must NOT
@@ -772,6 +781,11 @@ def _disasm_entry(bv, address: int, *, arch=None, strict: bool = False) -> dict[
     # (#382). Leave text empty so the caller emits the honest `.byte` form.
     if not text and not strict:
         text = bv.get_disassembly(address) or ""
+    return text, _instruction_length(bv, address, arch=arch, strict=strict)
+
+
+def _disasm_entry(bv, address: int, *, arch=None, strict: bool = False) -> dict[str, Any]:
+    text, _length = _disasm_instruction(bv, address, arch=arch, strict=strict)
     return {
         "address": hex(int(address)),
         "text": text,
@@ -785,11 +799,10 @@ def _structured_disasm_entries(bv, func) -> list[dict[str, Any]]:
         addr = int(block.start)
         end = int(block.end)
         while addr < end:
-            entry = _disasm_entry(bv, addr, arch=arch)
-            if entry["text"]:
-                entry["_address_int"] = addr
-                entries.append(entry)
-            addr += max(1, _instruction_length(bv, addr, arch=arch))
+            text, length = _disasm_instruction(bv, addr, arch=arch)
+            if text:
+                entries.append({"address": hex(addr), "text": text, "_address_int": addr})
+            addr += length
     entries.sort(key=lambda item: int(item["_address_int"]))
     return entries
 
@@ -801,10 +814,8 @@ def _disasm_text(bv, func) -> str:
         addr = int(block.start)
         end = int(block.end)
         while addr < end:
-            length = max(1, _instruction_length(bv, addr, arch=arch))
-            entry = _disasm_entry(bv, addr, arch=arch)
+            text, length = _disasm_instruction(bv, addr, arch=arch)
             raw = bv.read(addr, length)
-            text = entry["text"]
             if not text:
                 if raw:
                     text = ".byte " + ", ".join(f"0x{byte:02x}" for byte in raw)

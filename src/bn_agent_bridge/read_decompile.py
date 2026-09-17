@@ -577,8 +577,8 @@ def _linear_decode_arch(ctx, bv, address: int, mode):
 def _function_instruction_starts(bv, func) -> set[int]:
     """The set of recovered instruction START addresses in *func* (#550).
 
-    Walks BN's basic blocks with the function's own arch instruction lengths --
-    the authoritative decode boundaries. Used to detect a ``--linear`` start that
+    Walks BN's basic blocks with physical text-decode widths, including the
+    instructions covered by a Thumb IT analysis span. Used to detect a start that
     lands INSIDE a function but mid-instruction (which would decode junk that
     looks plausible)."""
     arch = getattr(func, "arch", None)
@@ -595,7 +595,8 @@ def _function_instruction_starts(bv, func) -> set[int]:
             continue
         while addr < end:
             starts.add(addr)
-            addr += max(1, il_format._instruction_length(bv, addr, arch=arch))
+            _text, length = il_format._disasm_instruction(bv, addr, arch=arch)
+            addr += length
     return starts
 
 
@@ -618,10 +619,11 @@ def _linear_boundary_check(bv, func, address: int) -> dict[str, Any] | None:
 
 def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
                    snap_to_instruction: bool = False) -> dict[str, Any]:
-    """Linear disassembly of *count* instructions from an arbitrary MAPPED address,
-    independent of function membership (#314). The stripped/static lane needs to
-    read the bytes at a suspected missed handler -- a dispatch/vtable slot BN left
-    as data -- before deciding whether to `function create` it; the
+    """Linear disassembly of *count* units (one physical instruction or one
+    undecodable byte) from any MAPPED address, independent of functions (#314).
+    The stripped/static lane needs to read the bytes at a suspected missed handler
+    -- a dispatch/vtable slot BN left as data -- before deciding whether to
+    `function create` it; the
     function-scoped path refuses such addresses outright.
 
     The decode architecture honors the address's function arch (or an explicit
@@ -681,9 +683,7 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
     for _ in range(count):
         if not _address_is_mapped(bv, addr):
             break
-        length = max(1, il_format._instruction_length(bv, addr, arch=arch, strict=strict))
-        entry = il_format._disasm_entry(bv, addr, arch=arch, strict=strict)
-        text = entry.get("text") or ""
+        text, length = il_format._disasm_instruction(bv, addr, arch=arch, strict=strict)
         if not text:
             # Mapped, but no valid instruction decodes here (data / an invalid
             # opcode -- the very thing you point --linear at to confirm). Surface
@@ -721,11 +721,12 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
         except Exception:
             in_function = None
     note = (
-        f"linear disassembly of {len(entries)} instruction"
+        f"linear disassembly of {len(entries)} unit"
         f"{'' if len(entries) == 1 else 's'} from {hex(address)} "
         # #550: name the ordering explicitly -- this is address-linear (byte order),
         # NOT the basic-block/graph order a function-scoped `disasm <fn>` renders.
-        f"(address-linear order, not function-bounded)"
+        f"(one physical instruction or one undecodable byte (.byte) per unit; "
+        f"address-linear order, not function-bounded)"
     )
     if thumb_tag_normalized is not None:
         note += (

@@ -639,6 +639,144 @@ class TestDisasmLinear:
         assert result.get("instruction_count", 0) >= 1
 
 
+class TestDisasmThumbIT741:
+    """Real native decoders over synthetic raw bytes, without a cross-compiler."""
+
+    @staticmethod
+    def _load_raw(shared_bn, tmp_path, raw, platform):
+        path = tmp_path / "disasm741.raw"
+        path.write_bytes(raw)
+        selector = shared_bn.load(path)
+        setup = shared_bn.run(
+            "py", "exec",
+            "import binaryninja as bn\n"
+            f"bv.platform = bn.Platform[{platform!r}]\n"
+            "bv.add_function(bv.start)\n"
+            "bv.update_analysis_and_wait()\n"
+            "assert bv.get_function_at(bv.start) is not None\n"
+            "print('START741=' + hex(bv.start))",
+            "--target", selector,
+        )
+        assert setup.returncode == 0, f"{setup.stdout}\n{setup.stderr}"
+        start = next(
+            line.removeprefix("START741=")
+            for line in setup.stdout.splitlines() if line.startswith("START741=")
+        )
+        return selector, int(start, 16)
+
+    @pytest.mark.parametrize(
+        ("hex_bytes", "widths"),
+        [
+            ("14bf022300237047", (2, 2, 2, 2)),
+            ("14bf4ff0020300237047", (2, 4, 2, 2)),
+        ],
+        ids=["thumb16-it", "thumb-mixed-it"],
+    )
+    def test_physical_rows_counts_evidence_and_boundaries(self, shared_bn, tmp_path, hex_bytes, widths):
+        raw = bytes.fromhex(hex_bytes)
+        selector, start = self._load_raw(shared_bn, tmp_path, raw, "linux-thumb2")
+        offsets = [sum(widths[:i]) for i in range(len(widths))]
+        addresses = [hex(start + offset) for offset in offsets]
+        full = shared_bn.run("disasm", hex(start), "--format", "json", "--target", selector)
+        assert full.returncode == 0, f"{full.stdout}\n{full.stderr}"
+        listing = TestDisasmLinear._unwrap(json.loads(full.stdout))
+        lines = listing["text"].splitlines()
+        assert listing["total_lines"] == listing["returned_lines"] == len(widths)
+        assert len(lines) == len(widths)
+        texts = []
+        for line, offset, width, mnemonic in zip(lines, offsets, widths, ("ite", "mov", "mov", "bx")):
+            parts = line.split()
+            assert int(parts[0], 16) == start + offset
+            assert bytes.fromhex(" ".join(parts[1:1 + width])) == raw[offset:offset + width]
+            assert parts[1 + width].startswith(mnemonic), line
+            texts.append(" ".join(parts[1 + width:]))
+        assert "r3" in texts[1] and "r3" in texts[2]
+
+        sliced = shared_bn.run(
+            "disasm", hex(start), "--lines", "2:3", "--format", "json", "--target", selector
+        )
+        assert sliced.returncode == 0, f"{sliced.stdout}\n{sliced.stderr}"
+        window = TestDisasmLinear._unwrap(json.loads(sliced.stdout))
+        assert window["text"].splitlines() == lines[1:3]
+        assert window["total_lines"] == 4 and window["returned_lines"] == 2
+
+        counted = shared_bn.run(
+            "disasm", hex(start), "--count", "2", "--format", "json", "--target", selector
+        )
+        assert counted.returncode == 0, f"{counted.stdout}\n{counted.stderr}"
+        assert TestDisasmLinear._unwrap(json.loads(counted.stdout))["text"].splitlines() == lines[:2]
+
+        linear = shared_bn.run(
+            "disasm", hex(start), "--linear", "2", "--mode", "thumb",
+            "--format", "json", "--target", selector,
+        )
+        assert linear.returncode == 0, f"{linear.stdout}\n{linear.stderr}"
+        decoded = TestDisasmLinear._unwrap(json.loads(linear.stdout))
+        assert decoded["instruction_count"] == decoded["requested_count"] == 2
+        assert [row["address"] for row in decoded["instructions"]] == addresses[:2]
+        assert [row["length"] for row in decoded["instructions"]] == list(widths[:2])
+        assert bytes.fromhex(" ".join(row["bytes"] for row in decoded["instructions"])) == raw[:sum(widths[:2])]
+        assert [" ".join(row["text"].split()) for row in decoded["instructions"]] == texts[:2]
+
+        evidence = shared_bn.run(
+            "py", "exec",
+            "import json\n"
+            "from bn_agent_bridge.il_format import _structured_disasm_entries\n"
+            "fn = bv.get_function_at(bv.start)\n"
+            # BasicBlock.instruction_count aggregates IT; native disassembly
+            # lines, not that analysis-span count, are the physical-row oracle.
+            "native_addresses = sorted(line.address for block in fn.basic_blocks "
+            "for line in block.disassembly_text)\n"
+            "print('ROWS741=' + json.dumps({"
+            "'entries': _structured_disasm_entries(bv, fn), "
+            "'native_addresses': [hex(address) for address in native_addresses]}))",
+            "--target", selector,
+        )
+        assert evidence.returncode == 0, f"{evidence.stdout}\n{evidence.stderr}"
+        native = json.loads(next(
+            line.removeprefix("ROWS741=")
+            for line in evidence.stdout.splitlines() if line.startswith("ROWS741=")
+        ))
+        assert native["native_addresses"] == addresses
+        assert [line.split()[0] for line in lines] == native["native_addresses"]
+        assert [row["address"] for row in native["entries"]] == addresses
+        assert [" ".join(row["text"].split()) for row in native["entries"]] == texts
+
+        boundary = shared_bn.run(
+            "disasm", addresses[1], "--linear", "1", "--snap-to-instruction",
+            "--format", "json", "--target", selector,
+        )
+        assert boundary.returncode == 0, f"{boundary.stdout}\n{boundary.stderr}"
+        at_start = TestDisasmLinear._unwrap(json.loads(boundary.stdout))
+        assert at_start["address"] == addresses[1]
+        assert at_start["boundary_warning"] is None and at_start["snapped_from"] is None
+        if widths[1] == 4:
+            snapped = shared_bn.run(
+                "disasm", hex(start + 4), "--linear", "1", "--snap-to-instruction",
+                "--format", "json", "--target", selector,
+            )
+            assert snapped.returncode == 0, f"{snapped.stdout}\n{snapped.stderr}"
+            at_start = TestDisasmLinear._unwrap(json.loads(snapped.stdout))
+            assert at_start["address"] == addresses[1]
+            assert at_start["snapped_from"] == hex(start + 4)
+            assert at_start["instructions"][0]["length"] == 4
+
+    def test_forced_arm_retains_four_byte_rows(self, shared_bn, tmp_path):
+        raw = bytes.fromhex("00f020e31eff2fe1")  # ARM nop; bx lr
+        selector, start = self._load_raw(shared_bn, tmp_path, raw, "linux-armv7")
+        result = shared_bn.run(
+            "disasm", hex(start), "--linear", "2", "--mode", "arm",
+            "--format", "json", "--target", selector,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        decoded = TestDisasmLinear._unwrap(json.loads(result.stdout))
+        assert decoded["decode_arch"] == "armv7"
+        assert [row["address"] for row in decoded["instructions"]] == [hex(start), hex(start + 4)]
+        assert [row["length"] for row in decoded["instructions"]] == [4, 4]
+        assert [row["text"].split()[0] for row in decoded["instructions"]] == ["nop", "bx"]
+        assert bytes.fromhex(" ".join(row["bytes"] for row in decoded["instructions"])) == raw
+
+
 def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
     """Cross-build the AArch64 probe and pay for its analysis ONCE.
 
