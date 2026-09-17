@@ -470,20 +470,33 @@ def test_start_headless_clears_global_when_start_raises(monkeypatch, tmp_path):
 def test_start_rolls_back_a_failure_after_the_bind(monkeypatch, tmp_path):
     """A start() that fails after binding must not leave a listener behind.
 
-    start() assigned `_server`, started the serve_forever daemon, and THEN
-    called _write_registry() with no rollback. A failure there (a full cache
-    filesystem is enough) raised out of start() and orphaned both the bound
-    socket and its thread -- and nothing could reap them: start_headless
-    publishes the module global only after start() returns, and _stop_bridge()
-    early-returns on None, so atexit had no handle either (#800).
+    start() started the serve_forever daemon and THEN called _write_registry()
+    with no rollback. A failure there (a full cache filesystem is enough) raised
+    out of start() and orphaned both the bound socket and its thread -- and
+    nothing could reap them: start_headless publishes the module global only
+    after start() returns, and _stop_bridge() early-returns on None, so atexit
+    had no handle either (#800).
 
-    Asserted on the resources the leak consists of -- the bound socket file, the
-    serving thread, the registry -- never on `_server`/`_thread`, because
-    whether stop() also clears those handles is #799's contract and this test
-    has to hold with or without that fix."""
+    Asserted on the resources the leak consists of -- the bound socket file and
+    the serving thread -- never on `_server`/`_thread`, because whether stop()
+    also clears those handles is #799's contract and this test has to hold with
+    or without that fix. The thread is JOINED rather than sampled: shutdown()
+    returns from inside serve_forever's own finally block, before the thread
+    object flips to not-alive, so is_alive() read straight after start() raises
+    is a coin flip -- and a thread that exits on its own is not the leak.
+
+    The artifacts of an earlier incarnation that shared this instance id are
+    asserted to SURVIVE. The rolled-back start never published them (registering
+    is what failed), and the log is the file the spawning client is holding open
+    to diagnose this very failure. Asserting they are absent would only be
+    measuring the stub below."""
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
     inst = module.BinaryNinjaBridge(instance_id="rollback1")
+    inst.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    inst.registry_path.write_text('{"pid": 1}')
+    log_path = inst.registry_path.with_suffix(".log")
+    log_path.write_text("earlier incarnation output\n")
 
     created: list[threading.Thread] = []
     real_thread = threading.Thread
@@ -503,8 +516,8 @@ def test_start_rolls_back_a_failure_after_the_bind(monkeypatch, tmp_path):
         inst.start()
 
     assert not inst.socket_path.exists(), "a bound socket file was left behind"
-    assert not inst.registry_path.exists()
     assert created, "the serve thread was never started"
+    created[0].join(timeout=5.0)
     assert not created[0].is_alive(), "the serve_forever daemon thread leaked"
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(1.0)
@@ -512,6 +525,78 @@ def test_start_rolls_back_a_failure_after_the_bind(monkeypatch, tmp_path):
         assert probe.connect_ex(str(inst.socket_path)) != 0
     finally:
         probe.close()
+    assert log_path.read_text() == "earlier incarnation output\n"
+    assert inst.registry_path.read_text() == '{"pid": 1}'
+
+
+def test_start_raises_instead_of_hanging_when_the_serve_thread_will_not_start(
+    monkeypatch, tmp_path
+):
+    """A serve thread that never comes up must fail the start, not wedge it.
+
+    stop() is not a safe rollback for a failure this early: BaseServer.shutdown()
+    blocks on an event only serve_forever() ever sets, so a rollback routed
+    through it hangs start() -- and the caller with it -- instead of raising.
+    start() therefore closes the listener out itself when the thread never came
+    up (#800)."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    real_thread = threading.Thread
+
+    class RefusingThread:
+        """Stands in for Thread.start() failing under resource exhaustion."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(module.threading, "Thread", RefusingThread)
+    inst = module.BinaryNinjaBridge(instance_id="refuse1")
+
+    raised: list[BaseException] = []
+
+    def run_start():
+        try:
+            inst.start()
+        except BaseException as exc:  # noqa: BLE001 - the failure is the point
+            raised.append(exc)
+
+    # A REAL thread drives start(), so a wedged start() fails this assertion
+    # instead of hanging the suite.
+    driver = real_thread(target=run_start, daemon=True)
+    driver.start()
+    driver.join(timeout=5.0)
+
+    assert not driver.is_alive(), "start() never returned"
+    assert [type(exc) for exc in raised] == [RuntimeError]
+    assert not inst.socket_path.exists(), "a bound socket file was left behind"
+
+
+def test_start_rolls_back_a_failure_inside_the_server_constructor(
+    monkeypatch, tmp_path
+):
+    """bind() can succeed before the server's own construction fails.
+
+    socketserver's constructor binds and then activates (listen); when activate
+    raises it closes the socket but cannot remove the AF_UNIX file bind() put on
+    disk, and the server handle is never published, so no later path can unlink
+    it. start() has to (#800)."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    class RefusingListen(module.ThreadedUnixServer):
+        def server_activate(self):
+            raise OSError(105, "ENOBUFS")
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", RefusingListen)
+    inst = module.BinaryNinjaBridge(instance_id="construct1")
+
+    with pytest.raises(OSError, match="ENOBUFS"):
+        inst.start()
+
+    assert not inst.socket_path.exists(), "a bound socket file was left behind"
 
 
 def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
