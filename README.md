@@ -352,7 +352,7 @@ Any status above other than `verified`/`noop` puts a mutation at exit code `3`. 
 
 `bn types declare` now uses Binary Ninja's source parser when available. When you pass `--file`, the CLI also forwards the source path so relative includes resolve the same way they would during header import in the GUI.
 
-If a declaration only parses functions or extern variables and introduces no named types to persist, `types declare` returns a verified no-op instead of failing with `No named types found in declaration`.
+If a declaration parses no named types to persist (including function/extern-variable-only source), `types declare` refuses it as `invalid_request` with exit `3`; the parser-outcome reason appears in `first_error` and the default status output. A genuine idempotent named declaration remains `noop` only when its named types resolve in the live database.
 
 `bn local list` and `bn function info` return stable `local_id` values for parameters and locals. Prefer those IDs for `bn local rename`, `bn local retype`, and batch manifests; legacy name-based targeting still works for compatibility.
 

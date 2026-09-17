@@ -43,7 +43,7 @@ Per-op statuses:
 | Boundary | Exit | Meaning |
 |---|---|---|
 | CLI operation preflight | 3 | Nothing sent. Missing/conflicting comment or tag locations, empty rename names, missing/conflicting declaration sources, and a parsed manifest object missing an `ops` array are `invalid_request`. |
-| Argument parser, input file/document, or routing | 2 | Invalid flags/choices, unreadable files, empty stdin, invalid manifest JSON, a non-object manifest, or missing/ambiguous instance/target routing. These are not operation refusals. |
+| Argument parser, input file/document, or routing | 2 | Invalid flags/choices, unreadable files, empty batch-manifest stdin, invalid manifest JSON, a non-object manifest, or missing/ambiguous instance/target routing. These are not operation refusals. |
 | Bridge mutation refusal | 3 | A failed mutation status; consult the result for rollback and observed state. |
 | Read operation or bridge/transport fault | 2 | Read refusals stay read errors. An unreachable bridge or a bridge error without a failed mutation status is not proof that a write did or did not land. |
 
