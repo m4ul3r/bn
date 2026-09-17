@@ -612,6 +612,52 @@ def test_successor_started_inside_stops_join_window_survives_the_resumed_stop(
     successor.stop()
 
 
+def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_path):
+    """Both directions of the ownership rule, in one test because each direction
+    is red on a different tree.
+
+    The one-shot that keeps a stale stop() off a successor's files is a property
+    of the CURRENT bind, not of the object's lifetime: a bridge that binds the
+    path again owns it again, so the stop() that ends that later bind must still
+    remove the files. A flag that latches for the object's lifetime leaves the
+    socket behind as exactly the clutter a clean shutdown is supposed to drop.
+
+    Direction 2 is red on the pre-fix base (#799); direction 1 is red on a
+    one-shot that never re-arms.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    # Direction 1: the stop() that ends a bind this object made removes it.
+    reowner = _live_bridge(module, "rearm1")
+    reowner.stop()
+    reowner.start()  # the same object binds the path again
+    assert _socket_answers(reowner.socket_path), "the rebind is not serving"
+    reowner.stop()
+    assert not reowner.socket_path.exists(), (
+        "the stop() that ended the rebind left that bind's own socket behind"
+    )
+
+    # Direction 2: a stale stop() on an object that never rebound leaves alone
+    # whatever a successor owns.
+    owner = _live_bridge(module, "rearm2")
+    owner.stop()
+    successor = _live_bridge(module, "rearm2")
+    log_path = successor.registry_path.with_suffix(".log")
+    log_path.write_text("successor serving\n", encoding="utf-8")
+
+    owner.stop()  # stale: this object did not rebind
+
+    assert _socket_answers(successor.socket_path), "successor's endpoint was unlinked"
+    assert successor.socket_path.exists()
+    assert json.loads(
+        successor.registry_path.read_text(encoding="utf-8")
+    )["instance_token"] == successor.instance_token
+    assert log_path.read_text(encoding="utf-8") == "successor serving\n"
+
+    successor.stop()
+
+
 def _start_gate_bridge(monkeypatch, tmp_path, bound, *, listing=True):
     """A bridge whose socket path already holds a file, with the kernel's
     bound-socket evidence stubbed to *bound* and the availability of that

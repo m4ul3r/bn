@@ -1268,6 +1268,13 @@ class BinaryNinjaBridge:
             self.socket_path.unlink()
 
         self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        # A fresh bind owns the discovery files again, so re-arm the one-shot
+        # (#799): the stop() that ends THIS bind must still remove them. Re-arming
+        # is safe because only start() does it, and start() binds only while no
+        # socket file is in the way -- so from here to the stop() that releases
+        # this bind, no successor can have taken the paths (a successor's start()
+        # refuses to displace ours, see above).
+        self._instance_state_released = False
         # #612: tighten the freshly-bound socket to owner-only. Even with the
         # peercred check this is defense-in-depth (a wrong-uid peer can't even
         # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
@@ -1304,8 +1311,9 @@ class BinaryNinjaBridge:
             # bind -- so a stale stop cannot unlink a successor's (#799).
             self._release_own_instance_state_locked()
         # Only now release the bind. Nothing below this line unlinks anything.
+        # `_server` is cleared here too, so a repeat stop() cannot reach a live
+        # server -- the one-shot above is already spent by then.
         server, self._server = self._server, None
-        thread, self._thread = self._thread, None
         if server is not None:
             with contextlib.suppress(Exception):
                 server.shutdown()
@@ -1340,7 +1348,9 @@ class BinaryNinjaBridge:
         * ONCE, because a second stop() on this object must not unlink whatever
           now lives at those paths. The flag below is what makes stop()
           idempotent; `_server` is additionally cleared by stop() so a repeat
-          call cannot even reach a live server.
+          call cannot even reach a live server. "Once" is once per BIND, not
+          once per object: start() re-arms the flag when it binds again, so the
+          stop() that ends a later bind still removes that bind's files.
         """
         if self._instance_state_released:
             return
