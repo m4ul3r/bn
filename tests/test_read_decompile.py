@@ -732,17 +732,20 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     function = _FakeFunction(0x401000, "parse_record")
-    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401004)]
     function.comment = "inherited function note"
+    function.comments = {0x401002: "function-local address note"}
     bv = _FakeBV(
         functions=[function],
-        comments={0x401000: "inherited address note"},
+        # A grouped instruction span must not skip a rendered comment within it.
+        instruction_lengths={0x401000: 4},
+        comments={0x401002: "inherited address note", 0x401004: "outside function"},
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     text = (
         "void parse_record() {  // inherited function note\n"
         "    // inherited address note\n"
-        "    return; // inherited address note\n"
+        "    return; // function-local address note\n"
         "}"
     )
     monkeypatch.setattr(
@@ -762,11 +765,37 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     )
     assert redacted["comments"] == {}
     assert redacted["annotation_summary"] == {
-        "comment_count": 2,
+        "comment_count": 3,
         "redacted": True,
     }
     assert included["text"] == text
-    assert included["comments"] == {"0x401000": "inherited address note"}
+    # The legacy map stays global-only; local bodies are collected independently.
+    assert included["comments"] == {"0x401002": "inherited address note"}
+
+
+@pytest.mark.parametrize("store", ["global", "local"])
+def test_decompile_does_not_hide_an_unreadable_comment_store(monkeypatch, store):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class UnreadableLocalComments(_FakeFunction):
+        @property
+        def comments(self):
+            raise RuntimeError("local comment store unavailable")
+
+    class UnreadableGlobalComments(_FakeBV):
+        @property
+        def address_comments(self):
+            raise RuntimeError("global comment store unavailable")
+
+    function_type = UnreadableLocalComments if store == "local" else _FakeFunction
+    view_type = UnreadableGlobalComments if store == "global" else _FakeBV
+    function = function_type(0x401000, "parse_record")
+    bv = view_type(functions=[function])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match=f"{store} comment store unavailable"):
+        instance._decompile("active", "parse_record")
 
 
 @pytest.mark.parametrize("body,code", [

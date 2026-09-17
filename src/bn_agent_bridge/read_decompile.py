@@ -204,6 +204,9 @@ def _decompile(
     function_comment = str(getattr(func, "comment", "") or "")
     annotation_bodies = [
         *comments.values(),
+        # Local and global bodies can differ at the same address; do not merge
+        # their maps and silently discard one of the two annotations.
+        *(getattr(func, "comments", {}) or {}).values(),
         *([function_comment] if function_comment else []),
     ]
     text = il_format._decompile_text(bv, func, addresses=addresses)
