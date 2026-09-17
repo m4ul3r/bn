@@ -534,11 +534,13 @@ def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
 
 
 def _format_local_entry(item: dict[str, Any]) -> str:
-    # The name is operator-set (`local rename`), so a control char in it would
-    # split the `params:` / `locals:` row across two lines; escape it before the
-    # width padding so the column measures what actually prints (#771).
+    # Both cells are operator-set (`local rename` / `local retype`), so a control
+    # char in either would split the `params:` / `locals:` row across two lines;
+    # escape before the width padding so the column measures what actually prints
+    # (#771). The type cell carries the same row, so it takes the same escaper --
+    # one raw cell splits the row just as well as the name.
     name = _escape_control_chars(item.get("name", "<unknown>"))
-    type_str = str(item.get("type", "<unknown>"))
+    type_str = _escape_control_chars(item.get("type", "<unknown>"))
     line = f"  {name:<20} {type_str}"
     # local_id is the stable handle `local rename` / `local retype` take; show it
     # so the text view is self-sufficient and doesn't force a --format json
@@ -852,7 +854,11 @@ def _render_local_list_text(value: Any) -> str:
                    if isinstance(item, dict) and not item.get("is_parameter")]
     malformed = [item for item in all_items if not isinstance(item, dict)]
 
-    header = f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}"
+    # The header name is escaped exactly like `function info`'s header (#370.1):
+    # the same cell must not split this row just because a different renderer
+    # prints it (#771).
+    header = (f"{_escape_control_chars(function.get('name', '<unknown>'))} @ "
+              f"{function.get('address', '<unknown>')}")
     header += f" ({len(params)} params, {len(locals_only)} locals)"
     lines = [header]
 
@@ -1014,7 +1020,12 @@ def _render_comment_list_text(value: Any) -> str:
         # distinguishable in one listing -- same `[doc]` marker `comment get
         # --function` already uses.
         prefix = "[doc] " if item.get("scope") == "function_doc" else ""
-        lines.append(f"{address}  {func}  {prefix}{_escape_control_chars(comment)}")
+        # Both cells carry settable text -- `comment` via `comment set`, and the
+        # containing function's symbol name via `rename`, which accepts a control
+        # char (`_require_nonempty_name` rejects only empty/whitespace). Either
+        # one raw splits the row (#771).
+        lines.append(f"{address}  {_escape_control_chars(func)}  {prefix}"
+                     f"{_escape_control_chars(comment)}")
     return "\n".join(lines)
 
 
@@ -1031,7 +1042,11 @@ def _render_tag_types_text(value: Any) -> str:
             lines.append(_render_fallback_text(t))
             continue
         builtin = "  [builtin]" if t.get("is_builtin") else ""
-        lines.append(f"{t.get('icon', '')}  {t.get('name', '<unknown>')}{builtin}")
+        # Both cells are operator-set and pass to the view with no charset check
+        # (`tag type create <name> [--icon]`), so they take the same escaper as
+        # the tag row -- one raw cell splits the row (#771).
+        lines.append(f"{_escape_control_chars(t.get('icon', ''))}  "
+                     f"{_escape_control_chars(t.get('name', '<unknown>'))}{builtin}")
     return "\n".join(lines)
 
 
@@ -1051,9 +1066,14 @@ def _render_tag_row(t: dict) -> str:
     # text renderer just surfaces it (address scope keeps the address, which is
     # the more precise locator when both are present).
     loc = t.get("address") or t.get("function") or "<function>"
-    # `data` is the tag's operator-supplied text (`tag add --data`); escape it so
-    # a multi-line tag cannot split the row (#771).
-    return (f"{loc}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  "
+    # Every settable cell carries text that can split the row: `data` via
+    # `tag add --data`, `type`/`icon` via `tag type create` (both reach the view
+    # with no charset check), and the function-scope `loc` is a symbol name
+    # (`rename` accepts a control char). Each takes the escaper -- one raw cell
+    # splits the row just as well as `data` did (#771).
+    return (f"{_escape_control_chars(loc)}  [{t.get('scope', '?')}]  "
+            f"{_escape_control_chars(t.get('icon', ''))} "
+            f"{_escape_control_chars(t.get('type', ''))}  "
             f"{_escape_control_chars(t.get('data', ''))}")
 
 

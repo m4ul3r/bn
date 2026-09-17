@@ -122,6 +122,61 @@ def test_render_name_address_rows_escapes_library_and_raw_name():
         "0x3000  alloc_thing (import) [lib\\nc.so] (raw: raw\\rname)"], out
 
 
+def test_render_comment_list_row_escapes_func_cell():
+    """#771 round 2: escaping the comment cell alone did not make the row
+    one-line-safe -- the same row interpolates the containing function's symbol
+    name, which `rename` accepts with a newline (`_require_nonempty_name` only
+    rejects empty/whitespace). The row must stay one physical line whichever
+    cell carries the control char."""
+    from bn.formatters import _render_comment_list_text
+    out = _render_comment_list_text([{"address": "0x1000", "function": "fn\nname",
+                                      "comment": "plain"}])
+    assert out.splitlines() == ["0x1000  fn\\nname  plain"], out
+
+
+def test_render_tag_row_escapes_loc_type_and_icon_cells():
+    """#771 round 2: the tag row's other three settable cells split it just as
+    well as `data` did -- `tag type create <name> [--icon]` passes both through
+    to the view with no charset check, and the function-scope `loc` is a symbol
+    name. Every cell of the row goes through the same escaper."""
+    from bn.formatters import _render_tag_row
+    row = _render_tag_row({"scope": "function", "function": "fn\nname",
+                           "icon": "i\nc", "type": "Book\nmarks", "data": "plain"})
+    assert row.splitlines() == [row], row
+    assert row == "fn\\nname  [function]  i\\nc Book\\nmarks  plain", row
+
+
+def test_render_tag_types_text_escapes_name_and_icon():
+    """#771 round 2: `tag types` lists the same settable name/icon pair as the
+    tag row, so it stays one line per type too."""
+    from bn.formatters import _render_tag_types_text
+    out = _render_tag_types_text({"tag_types": [{"name": "Book\nmarks",
+                                                 "icon": "i\nc"}]})
+    assert out.splitlines() == ["i\\nc  Book\\nmarks"], out
+
+
+def test_render_local_list_header_escapes_function_name():
+    """#771 round 2: `local list` prints the function name in its header raw,
+    while `function info` escapes the same value in its own header (#370.1) --
+    one of the two could still be split by a renamed function."""
+    from bn.formatters import _render_local_list_text
+    out = _render_local_list_text({
+        "function": {"name": "fn\nname", "address": "0x1000"},
+        "items": [{"name": "ok", "type": "int", "local_id": "L1"}]})
+    assert len(out.splitlines()) == 4, out
+    assert out.splitlines()[0].startswith("fn\\nname @ 0x1000"), out
+
+
+def test_format_local_entry_escapes_type_cell():
+    """#771 round 2: the local entry's neighbouring `type` cell is interpolated
+    into the same row as the name the PR escaped, so it takes the escaper too --
+    one raw cell splits the row just as well."""
+    from bn.formatters import _format_local_entry
+    line = _format_local_entry({"name": "ok", "type": "in\nt", "local_id": "L1"})
+    assert line.splitlines() == [line], line
+    assert "in\\nt" in line
+
+
 def test_render_name_address_rows_shows_basic_block_count():
     """#411: text is the DEFAULT read output, so the real complexity metric
     (basic_block_count) must be visible there, not only in JSON. A row carrying
