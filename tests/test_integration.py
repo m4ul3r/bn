@@ -1911,3 +1911,84 @@ class TestCommentListFunctionDocs:
                                             "--query", "TODO643", "--scope", "address",
                                             "--format", "json").stdout)
         assert narrowed["total"] == 0, narrowed
+
+
+class TestTypesDeclarePartialDrop760:
+    """#760: the platform parser DROPS a declaration whose name collides with a
+    built-in type instead of raising, so `struct uint32_t { … }; struct cfg_t { … };`
+    applied one type, discarded the other, and reported `verified` with exit 0.
+
+    That premise is a property of the REAL parser -- the mocked lane has to hardcode
+    it -- so this class is the only place the guard is validated against the
+    behaviour it exists for, and the only place a change in BN's drop behaviour would
+    be caught (the guard would go quiet, and these tests with it).
+    """
+
+    MIXED = "struct uint32_t { int shadow_x; }; struct rv_drop_probe_t { int y; };"
+
+    def _exists(self, shared_bn, name: str) -> bool:
+        """True when the view resolves *name*.
+
+        `types show <missing>` exits 2 and writes its "Type not found" message to
+        STDERR, so stdout is not a usable signal -- the exit code is.
+        """
+        return shared_bn.run("types", "show", name).returncode == 0
+
+    def test_a_single_named_type_declaration_is_accepted(self, shared_bn):
+        """Baseline on the real parser: the non-colliding half of the mixed string is
+        accepted on its own, so the refusal below is about the dropped declaration and
+        not about the declaration syntax."""
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run("types", "declare", "struct rv_ok_probe_t { int y; };",
+                            "--format", "json")
+        assert res.returncode == 0, res.stdout
+        assert [r.get("status") for r in json.loads(res.stdout)["results"]] == ["verified"]
+        assert self._exists(shared_bn, "rv_ok_probe_t")
+
+    def test_mixed_declaration_is_refused_and_nothing_lands(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run("types", "declare", self.MIXED, "--format", "json")
+        assert res.returncode == 3, res.stdout
+        parsed = json.loads(res.stdout)
+        assert parsed["success"] is False, parsed
+        result = parsed["results"][0]
+        assert result["status"] == "invalid_request", result
+        assert result["observed"]["dropped_declarations"] == [
+            "struct uint32_t { int shadow_x; };"
+        ], result
+        # Refused before anything was applied: neither name resolves afterwards.
+        assert not self._exists(shared_bn, "rv_drop_probe_t")
+        assert not self._exists(shared_bn, "uint32_t")
+
+    @pytest.mark.parametrize(
+        "prefix",
+        ["__attribute__((packed)) ", "__attribute__((aligned(8))) ", "static "],
+        ids=["packed", "nested-aligned", "static"],
+    )
+    def test_prefixed_drop_is_refused(self, shared_bn, prefix):
+        """The prefix shapes #760's harm also reproduces on: the drop used to stay
+        silent behind them. `aligned(8)` nests its parens, which a single-level prefix
+        match cannot cross (review of #761)."""
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run(
+            "types", "declare",
+            f"{prefix}struct uint32_t {{ int shadow_x; }}; struct rv_pack_t {{ int y; }};",
+            "--format", "json",
+        )
+        assert res.returncode == 3, res.stdout
+        assert json.loads(res.stdout)["results"][0]["status"] == "invalid_request"
+        assert not self._exists(shared_bn, "rv_pack_t")
+
+    def test_all_good_multi_declaration_still_applies(self, shared_bn):
+        """Negative control on the real parser: a multi-declaration whose fragments
+        all define a type is not refused (--preview, so the shared view stays clean)."""
+        shared_bn.load(HELLO_BINARY)
+        res = shared_bn.run(
+            "types", "declare",
+            "struct rv_a_t { int a; }; struct rv_b_t { int b; };",
+            "--preview", "--format", "json",
+        )
+        assert res.returncode == 0, res.stdout
+        parsed = json.loads(res.stdout)
+        assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
+        assert parsed["committed"] is False, parsed
