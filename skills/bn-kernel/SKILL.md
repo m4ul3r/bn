@@ -116,10 +116,13 @@ Omit the spawn line only for the confirmed non-ownership collision below or when
 the user explicitly selected another positive idle timeout; merely describing an
 idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
 
-A deliberate alternative timeout must be positive; never use `0`, `none`, or
-`off` for an agent-owned bridge. The reaper starts after preload, resets after
-completed requests, and never fires during an in-flight request or active load
-job. It covers hard agent/process death; it does not replace normal cleanup.
+`BN_IDLE_TIMEOUT` is opt-in: unset means no idle reaper. A positive number of
+seconds arms headless idle shutdown; the agent-owned spawn above uses `3600`
+(one hour). A deliberate alternative timeout must be positive; never use `0`,
+`none`, or `off` for an agent-owned bridge. With it enabled, the reaper starts
+after preload, resets after completed requests, and never fires during an
+in-flight request or active load job. Only an enabled reaper provides the
+fallback after the owning agent/process dies; it does not replace normal cleanup.
 
 On every reachable exit, close only the exact selector returned by the bridge
 when a target opened. Never infer it from a path or basename; a basename is valid
@@ -403,7 +406,7 @@ GUI tabs `bn` never loaded. Close the target, then stop the instance.
 
 ## Load cost and memory
 
-Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), stop every owned instance deterministically as soon as its work ends, and rely on one-hour idle reaping only as the crash fallback.
+Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop every owned instance deterministically as soon as its work ends. One-hour idle reaping is a crash fallback only for a headless bridge started with `BN_IDLE_TIMEOUT=3600` (another positive value changes the idle interval); unset means no idle reaper.
 
 For high-fanout cold starts, the orchestration tool's command timeout must exceed
 `BN_SPAWN_TIMEOUT`; otherwise the harness can kill `bn session start` while its
