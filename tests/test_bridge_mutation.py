@@ -4532,3 +4532,177 @@ def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
     # readback, not a claim: the view really carries no comment now
     assert bv.get_comment_at(0x1000) == ""
     assert 0x1000 not in bv.address_comments
+
+
+# ===========================================================================
+# #782 -- the tag/comment half of the undo journal. BN's undo buffer carries
+# more than function provenance and the global address-comment store: it also
+# carries `Function.comment` (the whole-function doc comment), the function tag
+# collections, the function ADDRESS tag collections, the view-level data tags
+# and the tag types -- all verified live on BN 5.4, where a reverted transaction
+# comes back with the prior comment and the prior tags, including tags it
+# removed and a tag type it removed. The fake journaled none of those, so a
+# `comment set --function` / `tag add` --preview reported rolled_back:true while
+# the view still held the write, and a rollback of those two ops could not be
+# asserted at all.
+# ===========================================================================
+
+_DOC_FN_START = 0x401000
+_DOC_FN_END = _DOC_FN_START + 0x100
+
+
+def _tag_comment_bv(*, comment: str = ""):
+    """One function plus one tag type, ready for a function-scoped
+    comment/tag preview through the real _mutation path."""
+    fn = _FakeFunction(_DOC_FN_START, "handle_request")
+    fn.basic_blocks = [_FakeBasicBlock(_DOC_FN_START, _DOC_FN_END)]
+    bv = _FakeMutationBV()
+    bv.functions = [fn]
+    fn.view = bv
+    bv.create_tag_type("Bug", "!")
+    fn.comment = comment
+    return bv, fn
+
+
+def _preview_mutation(monkeypatch, instance, bv, ops):
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance._mutation("active", True, ops)
+
+
+def _fn_tags(fn):
+    return [(t.type.name, t.data) for t in fn.get_function_tags()]
+
+
+def test_fake_undo_restores_function_doc_tags_and_tag_types_782():
+    """The journal must carry the doc comment, both function tag collections and
+    the view tag types, restoring the PRIOR values -- a comment and a tag the
+    transaction removed come back, and a tag type it removed does too."""
+    bv = _FakeMutationBV()
+    fn = _FakeFunction(_DOC_FN_START, "handle_request")
+    fn.view = bv
+    bv.functions = [fn]
+    bv.create_tag_type("Bug", "!")
+    addr = _DOC_FN_START + 4
+    fn.comment = "previous doc"
+    fn.add_tag("Bug", "existing function tag", None)
+    fn.add_tag("Bug", "existing address tag", addr, arch=bv.arch)
+    bv.add_tag(_DOC_FN_START + 8, "Bug", "existing data tag")
+    before = fn.tag_comment_snapshot()
+
+    state = bv.begin_undo_actions()
+    fn.comment = "replacement doc"
+    fn.remove_user_function_tag(fn.get_function_tags()[0])
+    fn.add_tag("Bug", "fresh function tag", None)
+    fn.remove_user_address_tag(addr, fn.get_tags_at(addr)[0], arch=bv.arch)
+    bv.remove_tag_type("Bug")
+    bv.create_tag_type("Scratch", "?")
+
+    bv.revert_undo_actions(state)
+
+    assert fn.comment == "previous doc"
+    assert _fn_tags(fn) == [("Bug", "existing function tag")]
+    assert [(t.type.name, t.data) for t in fn.get_tags_at(addr)] == [("Bug", "existing address tag")]
+    assert fn.tag_comment_snapshot() == before        # exact prior state, not just "not empty"
+    assert sorted(bv.tag_types) == ["Bug"]
+    assert [(hex(a), t.data) for a, t in bv.get_tags()] == [(hex(_DOC_FN_START + 8), "existing data tag")]
+
+
+def test_preview_function_doc_comment_revert_restores_previous_782(monkeypatch):
+    """A --preview of `comment set --function` must leave fn.comment EXACTLY as
+    it was: empty when the function had no doc comment, and the previous text
+    when it had one. Pre-fix the preview reported rolled_back:true with the new
+    comment still in place."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    bv, fn = _tag_comment_bv()
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "function": "handle_request", "comment": "fresh doc"}])
+    assert result["preview"] is True and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"   # it DID land, then reverted
+    assert fn.comment == ""
+
+    bv, fn = _tag_comment_bv(comment="previous doc")
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "function": "handle_request", "comment": "fresh doc"}])
+    assert result["rolled_back"] is True
+    assert fn.comment == "previous doc"
+
+    # `comment delete --function` writes the SAME journaled property, so its
+    # preview must put the doc comment back too.
+    bv, fn = _tag_comment_bv(comment="previous doc")
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "delete_comment", "function": "handle_request"}])
+    assert result["rolled_back"] is True
+    assert fn.comment == "previous doc"
+
+
+def test_preview_tag_add_revert_restores_the_tag_list_782(monkeypatch):
+    """A --preview of `tag add --function` must leave the function's tag list as
+    it was: empty when the function carried no tag, and exactly the prior tag
+    when it carried one. Pre-fix the preview reported rolled_back:true with the
+    new tag still attached."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    bv, fn = _tag_comment_bv()
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_add", "function": "handle_request", "type": "Bug", "data": "look here"}])
+    assert result["preview"] is True and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert fn.get_function_tags() == []
+
+    bv, fn = _tag_comment_bv()
+    fn.add_tag("Bug", "pre-existing", None)
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_add", "function": "handle_request", "type": "Bug", "data": "look here"}])
+    assert result["rolled_back"] is True
+    assert _fn_tags(fn) == [("Bug", "pre-existing")]
+
+
+def test_preview_tag_remove_revert_restores_the_removed_tag_782(monkeypatch):
+    """The other direction of the same journal: a --preview that REMOVES a tag
+    must put it back, not leave the function tagless."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    bv, fn = _tag_comment_bv()
+    fn.add_tag("Bug", "doomed", None)
+    tag_id = str(fn.get_function_tags()[0].id)
+
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_remove", "tag_id": tag_id}])
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert _fn_tags(fn) == [("Bug", "doomed")]
+
+
+def test_preview_data_tag_and_tag_type_revert_restore_view_state_782(monkeypatch):
+    """The view-level half of the journal: a --preview of a data-scope tag add
+    drops the tag it added, and a tag-type create/remove preview leaves the type
+    set unchanged."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    bv, _fn = _tag_comment_bv()
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_add", "address": hex(_DOC_FN_START + 0x40), "type": "Bug",
+         "data": "view tag", "force_data": True}])
+    assert result["rolled_back"] is True
+    assert bv.get_tags() == []
+
+    bv, _fn = _tag_comment_bv()
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_type_create", "name": "Scratch", "icon": "?"}])
+    assert result["rolled_back"] is True
+    assert sorted(bv.tag_types) == ["Bug"]
+
+    bv, _fn = _tag_comment_bv()
+    bv.create_tag_type("Scratch", "?")
+    result = _preview_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_type_remove", "name": "Scratch"}])
+    assert result["rolled_back"] is True
+    assert sorted(bv.tag_types) == ["Bug", "Scratch"]
+

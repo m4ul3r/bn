@@ -396,6 +396,28 @@ class _FakeFunction:
             var.name = name
             var.type = var_type
 
+    def tag_comment_snapshot(self):
+        """The tag/comment half of the undo journal: this function's doc comment
+        (`Function.comment`) plus BOTH of its tag collections (function tags and
+        address tags).
+
+        Verified live on BN 5.4: a transaction that writes a doc comment, adds a
+        function/address tag and REMOVES a pre-existing tag comes back, after
+        `revert_undo_actions`, with the prior comment and the prior tags --
+        removals included. A --preview of `comment set --function` / `tag add`
+        therefore really restores this state (#782).
+        """
+        return (
+            self.comment,
+            list(self._function_tags),
+            {addr: list(bucket) for addr, bucket in self._address_tags.items()},
+        )
+
+    def tag_comment_restore(self, snapshot):
+        self.comment, fn_tags, address_tags = snapshot
+        self._function_tags = list(fn_tags)
+        self._address_tags = {addr: list(bucket) for addr, bucket in address_tags.items()}
+
     def reanalyze(self, *args, **kwargs):
         self.reanalyzed = True
 
@@ -946,14 +968,20 @@ class _FakeMutationBV(_FakeBV):
     The undo buffer also carries the GLOBAL address-comment store (verified
     live), so a reverted transaction drops comments written through
     `set_comment_at`; a commit keeps them (#624).
+
+    So do the function doc comment (`Function.comment`), every function's tag
+    collections, the view-level data tags and the tag types -- all verified live
+    on BN 5.4: a reverted transaction restores the prior comment, the prior
+    tags (including ones it removed) and the prior tag types (#782).
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.events: list[tuple[str, str] | str] = []
-        # (state, function provenance snapshots, address-comment snapshot) per
-        # open transaction, newest last.
-        self._undo_journal: list[tuple[str, list, dict]] = []
+        # (state, function provenance snapshots, address-comment snapshot,
+        #  function tag/comment snapshots, tag-type snapshot, view data-tag
+        #  snapshot) per open transaction, newest last.
+        self._undo_journal: list[tuple[str, list, dict, list, dict, dict]] = []
         self._undo_states = 0
 
     def begin_undo_actions(self):
@@ -968,7 +996,13 @@ class _FakeMutationBV(_FakeBV):
              [(fn, fn.provenance_snapshot()) for fn in self.functions
               if hasattr(fn, "provenance_snapshot")],
              # Shallow is enough: the values are comment strings.
-             dict(self._comments))
+             dict(self._comments),
+             [(fn, fn.tag_comment_snapshot()) for fn in self.functions
+              if hasattr(fn, "tag_comment_snapshot")],
+             dict(self._tag_types),
+             # Tag objects are immutable here, so the lists can be re-snapshotted
+             # rather than deep-copied.
+             {addr: list(bucket) for addr, bucket in self._data_tags.items()})
         )
         return state
 
@@ -991,10 +1025,14 @@ class _FakeMutationBV(_FakeBV):
         entry = self._pop_journal(state)
         if entry is None:
             return
-        _, fn_snapshots, comments = entry
+        _, fn_snapshots, comments, tag_snapshots, tag_types, data_tags = entry
         self._comments = dict(comments)
         for fn, snapshot in fn_snapshots:
             fn.provenance_restore(snapshot)
+        for fn, snapshot in tag_snapshots:
+            fn.tag_comment_restore(snapshot)
+        self._tag_types = dict(tag_types)
+        self._data_tags = {addr: list(bucket) for addr, bucket in data_tags.items()}
 
     def commit_undo_actions(self, state):
         self.events.append(("commit", state))
@@ -1118,7 +1156,10 @@ class _FakeCommentMutationBV(_FakeMutationBV):
 
 class _FakeTagMutationBV(_FakeMutationBV):
     """Records begin/revert/commit and stores tags so a tag mutation can be
-    applied then reverted by a batch (mirrors _FakeCommentMutationBV)."""
+    applied then reverted by a batch (mirrors _FakeCommentMutationBV). The
+    inherited journal carries the tag collections and the tag types, so a revert
+    really drops a tag the transaction added and puts back one it removed
+    (#782)."""
 
     def __init__(self):
         super().__init__()
