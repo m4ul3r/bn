@@ -152,8 +152,9 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
     One LLIL call can map to several HLIL call expressions (BN folds adjacent
     statements); blindly merging their params attributes another call's
     arguments to this one. Prefer the single HLIL call whose address matches
-    this call site; if that is ambiguous fall back to MLIL, then LLIL. Other
-    candidates are returned separately (JSON-only, not shown in text).
+    this call site; if that is ambiguous or has no argument list, fall back to
+    MLIL, then LLIL. An explicit empty list is still a recovered zero-argument
+    call. Other candidates are returned separately (JSON-only, not shown in text).
     """
     roots = il_format._hlil_call_roots(insn)
     chosen = None
@@ -164,12 +165,13 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
         chosen = roots[0]
 
     mlil = _true_mlil(insn)
-    if chosen is not None:
-        source, texts = "hlil", _il_argument_texts(ctx, chosen)
-    elif mlil is not None:
-        source, texts = "mlil", _il_argument_texts(ctx, mlil)
-    else:
-        source, texts = "llil", _il_argument_texts(ctx, insn)
+    source, texts = "llil", []
+    for candidate_source, node in (("hlil", chosen), ("mlil", mlil), ("llil", insn)):
+        if node is not None and any(
+            getattr(node, attr, None) is not None for attr in ("params", "parameters")
+        ):
+            source, texts = candidate_source, _il_argument_texts(ctx, node)
+            break
 
     primary: list[dict[str, Any]] = []
     for index, text in enumerate(texts):
@@ -305,9 +307,9 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     an unmatched address is ``indirect_call`` absent, ``callee_unresolved: True``:
     the call SHAPE is direct, but the callee's arity is still unknowable. HLIL
     can also render MORE OR FEWER arguments than a resolved callee's recovered
-    prototype declares (an invented/dropped ABI-register arg -- ``arity_mismatch``,
-    only checked against a non-empty rendered list; an empty list usually means no
-    IL layer supplied one at all, not a real mismatch).
+    prototype declares (an invented/dropped ABI-register arg -- ``arity_mismatch``).
+    An explicit empty HLIL list counts as zero; an unavailable list falls back to
+    lower IL and cannot establish a mismatch.
 
     ``arity_mismatch`` is checked ONLY when ``arg_source == "hlil"`` (#704 round 3):
     ``arguments`` falls back to MLIL, then LLIL, whenever the HLIL roots are an
@@ -331,29 +333,21 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     if callee_fn is None:
         evidence["callee_unresolved"] = True
         return evidence
-    if bool(getattr(callee_fn, "has_user_type", False)):
-        return evidence          # a user prototype pins the arity
+    has_user_type = bool(getattr(callee_fn, "has_user_type", False))
     func_type = getattr(callee_fn, "type", None)
     declared = getattr(func_type, "parameters", None)
     if declared is None:
         declared = getattr(callee_fn, "parameter_vars", None)
     try:
-        declared_count = len(declared) if declared is not None else 0
+        declared_count = len(declared) if declared is not None else None
     except TypeError:
-        declared_count = 0
+        declared_count = None
     is_variadic = il_format._function_is_variadic(callee_fn)
-    if declared_count > 0:
-        # A recovered/bundled prototype: the arity itself is known, but HLIL can
-        # still have rendered MORE OR FEWER arguments than declared (an invented
-        # ABI-register arg riding along, or an under-recovered call) -- flag that
-        # without claiming the whole arity is unknown. Guarded on a non-empty
-        # rendered list: an empty list usually means no IL layer supplied
-        # arguments at all (e.g. a non-SSA LLIL call with neither `params` nor
-        # `parameters`), not a genuine mismatch (#704 round-2 correction). Also
-        # guarded on `arg_source == "hlil"` (#704 round-3 correction): the note
-        # this flag drives names HLIL explicitly, so only raise it when HLIL is
-        # what actually produced `arguments`.
-        if arg_source == "hlil" and not is_variadic and arguments and len(arguments) != declared_count:
+    if declared_count is not None and (declared_count > 0 or has_user_type):
+        # User prototypes also establish zero arity, but do not guarantee that
+        # HLIL recovered that many arguments. Only compare an actual HLIL list;
+        # lower-IL fallbacks retain their heuristic provenance (#704, #742).
+        if arg_source == "hlil" and not is_variadic and len(arguments) != declared_count:
             evidence["arity_mismatch"] = True
             evidence["declared_arity"] = declared_count
         return evidence
@@ -362,7 +356,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # Zero declared parameters yet HLIL rendered arguments: the list is BN's
     # register guess, not the callee's signature. A genuinely void callee rendering
     # zero arguments agrees with its prototype and is left alone.
-    if not arguments:
+    if declared_count == 0 and not arguments:
         return evidence
     evidence["arity_unknown"] = True
     abi_regs = _abi_arg_register_count(bv, callee_fn)

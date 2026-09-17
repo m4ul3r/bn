@@ -2787,14 +2787,20 @@ def test_function_evidence_marks_argument_confidence(monkeypatch):
         assert cand["source"] in ("llil", "mlil", "hlil")
 
 
-def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8):
-    """A direct call to `hw_get_version` where HLIL rendered *arg_texts*, with the
-    callee declaring *callee_params* parameters (#648)."""
+def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
+              user_type=False):
+    """A direct call with a structured prototype and independently rendered args."""
     callee = _FakeFunction(0x401100, "hw_get_version")
     callee.parameter_vars = [
         _FakeVariable(name=f"a{i}", storage=i, var_type="int64_t", identifier=i + 1)
         for i in range(callee_params)
     ]
+    prototype = types.SimpleNamespace(
+        parameters=list(callee.parameter_vars), has_variable_arguments=False)
+    if user_type:
+        callee.set_user_type(prototype)
+    else:
+        callee.set_auto_type(prototype)
     callee.calling_convention = types.SimpleNamespace(
         int_arg_regs=[f"x{i}" for i in range(arg_regs)])
     caller = _FakeFunction(0x401400, "probe_device")
@@ -2880,18 +2886,67 @@ def test_argument_confidence_unknown_arity_below_abi_width_648(monkeypatch):
     assert "abi_register_saturated" not in call
 
 
-def test_argument_confidence_user_prototype_is_authoritative_648(monkeypatch):
-    """#648: a user prototype pins the arity, so a `proto set`-corrected callee is
-    authoritative even with zero declared params -- the escape hatch the error text
-    points agents at."""
+@pytest.mark.parametrize(
+    "declared, arguments, confidence, mismatch",
+    [
+        pytest.param(3, ["1"], "inferred", True, id="under-recovered"),
+        pytest.param(3, ["1", "2", "3", "4"], "inferred", True, id="extra"),
+        pytest.param(3, ["1", "2", "3"], "authoritative", False, id="matching"),
+        pytest.param(3, [], "inferred", True, id="zero-rendered"),
+        pytest.param(0, [], "authoritative", False, id="user-void"),
+        pytest.param(0, ["1"], "inferred", True, id="user-void-extra"),
+    ],
+)
+def test_argument_confidence_checks_user_prototype_742(
+    monkeypatch, declared, arguments, confidence, mismatch,
+):
+    """A user prototype establishes the expected count, not the rendered count."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=["&var_20"])
-    bv.get_function_at(0x401100).set_user_type("int32_t hw_get_version(void*)")
+    _arity_bv(monkeypatch, instance, callee_params=declared,
+              arg_texts=arguments, user_type=True)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_source"] == "hlil"
+    assert call["arity_unknown"] is False
+    assert call["argument_confidence"] == confidence
+    if mismatch:
+        assert call["arity_mismatch"] is True
+        assert call["declared_arity"] == declared
+    else:
+        assert "arity_mismatch" not in call
+    assert "abi_register_saturated" not in call
+
+
+@pytest.mark.parametrize("arguments", [[], ["1"]], ids=["zero-rendered", "nonzero-rendered"])
+def test_argument_confidence_unavailable_user_prototype_742(monkeypatch, arguments):
+    """User provenance alone cannot establish a count when neither API supplies it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0,
+                   arg_texts=arguments, user_type=True)
+    callee = bv.get_function_at(0x401100)
+    callee.type.parameters = None
+    callee.parameter_vars = None
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["arity_unknown"] is True
+    assert call["argument_confidence"] == "inferred"
+    assert "arity_mismatch" not in call
+
+
+@pytest.mark.parametrize("fixed_count", [0, 1], ids=["no-fixed-parameters", "fixed-parameter"])
+def test_argument_confidence_user_variadic_has_no_exact_count_742(monkeypatch, fixed_count):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=fixed_count,
+                   arg_texts=["1", "2"], user_type=True)
+    bv.get_function_at(0x401100).type.has_variable_arguments = True
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["arity_unknown"] is False
     assert call["argument_confidence"] == "authoritative"
+    assert "arity_mismatch" not in call
 
 
 def test_argument_confidence_arity_mismatch_more_args_than_declared_648(monkeypatch):
@@ -3008,24 +3063,51 @@ def test_argument_confidence_arity_mismatch_note_names_true_provenance_704(monke
     assert "HLIL rendered" not in out
 
 
-def test_argument_confidence_arity_mismatch_absent_for_empty_hlil_list_704(monkeypatch):
-    """#704 round 3 follow-up: the `arguments and` guard in
-    `_argument_arity_evidence` must keep protecting a prototyped callee (3
-    declared params) whose HLIL-sourced argument list is EMPTY -- e.g. a
-    non-SSA LLIL call the mapper could not populate. An empty list means no IL
-    layer actually supplied arguments, not that the callee was called with
-    zero -- flagging `arity_mismatch` here would be a fresh false positive of
-    exactly the class this guard exists to prevent, and demoting confidence
-    would punish a prototype the tool never contradicted."""
+def test_argument_confidence_empty_hlil_list_is_a_count_742(monkeypatch):
+    """An actual params=[] contradicts a positive prototype; it is not missing IL."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[])
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_source"] == "hlil"
-    assert "arity_mismatch" not in call
+    assert call["arguments"] == []
+    assert call["arity_mismatch"] is True
+    assert call["declared_arity"] == 3
     assert call["arity_unknown"] is False
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "inferred"
+
+
+def test_argument_confidence_missing_hlil_list_uses_mlil_provenance_742(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[], user_type=True)
+    insn = bv.get_function_at(0x401400).low_level_il[0][0]
+    insn.hlils[0].params = None
+    insn.mlil = types.SimpleNamespace(params=["1", "2"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_source"] == "mlil"
+    assert [arg["text"] for arg in call["arguments"]] == ["1", "2"]
+    assert call["argument_confidence"] == "heuristic"
+    assert call["arity_unknown"] is False
+    assert "arity_mismatch" not in call
+
+
+def test_argument_confidence_unavailable_argument_lists_are_heuristic_742(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[], user_type=True)
+    insn = bv.get_function_at(0x401400).low_level_il[0][0]
+    del insn.hlils[0].params
+    del insn.params
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_source"] == "llil"
+    assert call["arguments"] == []
+    assert call["argument_confidence"] == "heuristic"
+    assert call["arity_unknown"] is False
+    assert "arity_mismatch" not in call
 
 
 def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
@@ -3049,6 +3131,7 @@ def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
     assert call["direct"] is False
     assert call["argument_source"] == "hlil"
     assert call["indirect_call"] is True
+    assert call["callee_unresolved"] is True
     assert call["argument_confidence"] == "heuristic"
 
 
