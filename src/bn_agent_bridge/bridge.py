@@ -1071,9 +1071,11 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, socket_path: str, handler, bridge):
+    def __init__(
+        self, socket_path: str, handler, bridge, *, bind_and_activate: bool = True
+    ):
         self.bridge = bridge
-        super().__init__(socket_path, handler)
+        super().__init__(socket_path, handler, bind_and_activate=bind_and_activate)
 
 
 # _STRING_TYPE_NAMES moved to read_misc.py with the strings op (#33).
@@ -1267,9 +1269,9 @@ class BinaryNinjaBridge:
                 )
             self.socket_path.unlink()
 
-        # Everything after the bind can fail -- the server's own constructor can
-        # raise once bind() has already put the socket file on disk, the thread
-        # can refuse to start, and _write_registry() touches the disk.
+        # Everything after the bind can fail -- the bind and the listen below are
+        # taken as two explicit steps so that a failure between them lands here,
+        # the thread can refuse to start, and _write_registry() touches the disk.
         # start() used to leave the bound socket and its serve_forever daemon
         # thread behind on any such failure, and no handle could reap them:
         # start_headless publishes the module global only after start() returns
@@ -1289,9 +1291,23 @@ class BinaryNinjaBridge:
         # diagnostic for the failure being reported, for no gain. What start()
         # actually created is the bound socket file and -- maybe -- a serve loop.
         server = None
+        holds_bind = False
         serving = False
         try:
-            server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+            # The bind and the listen are taken in two explicit steps. The
+            # constructor would do the pair itself and, when the second one
+            # fails, call server_close() ITSELF -- giving the bind up inside the
+            # constructor, before the rollback below can unlink, so a successor
+            # that took the freed path in between would have its socket deleted
+            # (#799). Held apart, the bind is still ours when that unlink runs;
+            # and `holds_bind` is set only once bind() has succeeded, so a bind
+            # that never happened leaves the path alone.
+            server = ThreadedUnixServer(
+                str(self.socket_path), BridgeHandler, self, bind_and_activate=False
+            )
+            server.server_bind()
+            holds_bind = True
+            server.server_activate()
             self._server = server
             # A fresh bind owns the discovery files again, so re-arm the one-shot
             # (#799): the stop() that ends THIS bind must still remove them. Re-arming
@@ -1336,15 +1352,17 @@ class BinaryNinjaBridge:
             # Unlink the socket path BEFORE server_close() gives the bind up, in
             # the #799 order stop() documents: a successor can only take these
             # paths once they are free, and nothing after this line unlinks
-            # anything, so the file removed here is provably the one bind() just
+            # anything, so the file removed here is provably the one this bind
             # made rather than a successor's. shutdown() above stops the loop
-            # without releasing the bind -- server_close() is what does that --
-            # so the path is still ours at this point. start() cleared whatever
-            # sat at this path before binding it (only after proving nothing
-            # owned it), so a file at it is ours; the registry and the log above
-            # are the spawn's and are left alone.
-            with contextlib.suppress(OSError):
-                self.socket_path.unlink()
+            # without releasing the bind -- server_close() is what does that, so
+            # the path is still ours while this runs. `holds_bind` gates it: a
+            # path this start() never bound is not ours to remove. start()
+            # cleared whatever sat at this path before binding it (only after
+            # proving nothing owned it), so a file at it is ours; the registry
+            # and the log above are the spawn's and are left alone.
+            if holds_bind:
+                with contextlib.suppress(OSError):
+                    self.socket_path.unlink()
             if server is not None:
                 with contextlib.suppress(Exception):
                     server.server_close()

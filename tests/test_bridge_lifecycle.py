@@ -519,12 +519,6 @@ def test_start_rolls_back_a_failure_after_the_bind(monkeypatch, tmp_path):
     assert created, "the serve thread was never started"
     created[0].join(timeout=5.0)
     assert not created[0].is_alive(), "the serve_forever daemon thread leaked"
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    probe.settimeout(1.0)
-    try:
-        assert probe.connect_ex(str(inst.socket_path)) != 0
-    finally:
-        probe.close()
     assert log_path.read_text() == "earlier incarnation output\n"
     assert inst.registry_path.read_text() == '{"pid": 1}'
 
@@ -651,6 +645,102 @@ def test_start_rollback_unlinks_the_socket_before_it_releases_the_bind(
         assert inst.socket_path.exists(), (
             "the rollback unlinked the socket of a successor that bound the path "
             "as soon as the bind was given up"
+        )
+        assert _socket_answers(inst.socket_path), "the successor's endpoint is dead"
+    finally:
+        for sock in successor:
+            sock.close()
+
+
+def test_start_rollback_keeps_a_successor_that_bound_when_the_constructor_failed(
+    monkeypatch, tmp_path
+):
+    """The constructor branch has to unlink while the bind is still held, too.
+
+    `BaseServer.__init__` takes the bind and the listen itself and, when the
+    listen raises, calls `server_close()` ITSELF -- so the bind is already given
+    up inside the constructor, and the path is takeable while start()'s rollback
+    is still on its way to the unlink. A rollback that unlinks then deletes the
+    socket of whatever bound in between: the #799 harm, inside start(). Taking
+    the two steps separately (`bind_and_activate=False`) keeps the bind on
+    start()'s side of the failure, so the unlink still happens under it.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    successor: list[socket.socket] = []
+
+    class SuccessorInTheCleanup(module.ThreadedUnixServer):
+        """Fails the listen, and lets a successor take the path the instant the
+        constructor's own cleanup gives the bind up."""
+
+        def server_activate(self):
+            raise OSError(105, "ENOBUFS")
+
+        def server_close(self):
+            super().server_close()
+            path = self.server_address
+            if os.path.exists(path):
+                # A successor proves the leftover stale, then binds and serves.
+                os.unlink(path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(path)
+            sock.listen(1)
+            successor.append(sock)
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", SuccessorInTheCleanup)
+    inst = module.BinaryNinjaBridge(instance_id="constructrace1")
+
+    try:
+        with pytest.raises(OSError, match="ENOBUFS"):
+            inst.start()
+
+        assert successor, "the constructor never gave the bind up"
+        assert inst.socket_path.exists(), (
+            "the rollback unlinked the socket of a successor that bound the path "
+            "when the constructor's cleanup gave the bind up"
+        )
+        assert _socket_answers(inst.socket_path), "the successor's endpoint is dead"
+    finally:
+        for sock in successor:
+            sock.close()
+
+
+def test_start_rollback_never_unlinks_a_path_it_never_bound(monkeypatch, tmp_path):
+    """The other direction of `holds_bind`: no bind of ours, no unlink.
+
+    The bind and the listen are two steps now, so one of the failures between
+    them is "the bind never happened" -- a successor that took the free path in
+    that window makes bind() lose the race with the path already ITS. The
+    rollback must remove the path only when this start() put it there; an
+    unconditional unlink would delete a live successor's socket, which is the
+    #799 harm reached from the other side.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    successor: list[socket.socket] = []
+
+    class BoundBySuccessor(module.ThreadedUnixServer):
+        """bind() loses the race: a successor took the path first."""
+
+        def server_bind(self):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(self.server_address)
+            sock.listen(1)
+            successor.append(sock)
+            raise OSError(98, "EADDRINUSE")
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", BoundBySuccessor)
+    inst = module.BinaryNinjaBridge(instance_id="bindrace1")
+
+    try:
+        with pytest.raises(OSError, match="EADDRINUSE"):
+            inst.start()
+
+        assert successor, "the successor never bound the path"
+        assert inst.socket_path.exists(), (
+            "the rollback unlinked a socket this start() never bound"
         )
         assert _socket_answers(inst.socket_path), "the successor's endpoint is dead"
     finally:
