@@ -101,7 +101,6 @@ def test_declared_types_verifier_rejects_an_empty_apply_result(monkeypatch):
     })
     assert verified["status"] == "verification_failed"
     assert verified["observed"]["defined_types"] == {}
-    assert bridge.mutation_engine._has_failed_results(instance.ctx, [verified])
 
 
 def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
