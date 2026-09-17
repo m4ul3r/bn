@@ -2453,17 +2453,55 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
     if addr_expr is None:
         return None
     off, base = 0, addr_expr
-    if _op(addr_expr) == "MLIL_ADD":
-        rc = _vc_const(getattr(addr_expr, "right", None))
-        if rc is not None:
-            off, base = rc, getattr(addr_expr, "left", None)
-        else:
-            # MLIL_ADD is commutative; BN usually canonicalizes the constant to the
-            # right, but not always -- handle `[const + base]` too so a vtable slot
-            # with the offset on the LEFT is not mis-resolved to the whole ADD expr.
-            lc = _vc_const(getattr(addr_expr, "left", None))
-            if lc is not None:
-                off, base = lc, getattr(addr_expr, "right", None)
+    # #790: the slot offset may live in its OWN instruction rather than in the
+    # load's address. g++ -O0 does not fold `vptr + 0x10` into the dispatch --
+    #   rax_3 = rax_2 + 0x10 ; rdx = [rax_3].q ; rdx(rdi)
+    # so the load's src is an MLIL_VAR and every -O0 dispatch read as slot 0: a
+    # silently WRONG provider method (the -O2 build of the same source folds the
+    # ADD and resolved correctly), while the reported `resolved: true` made it
+    # look authoritative. Walk the address var's reaching-def chain, summing EVERY
+    # constant addend on it (at -O0 a vtable-base adjustment and the slot offset
+    # are separate ADDs) -- one hop further out than #544's call-dest hop, and for
+    # the same reason. The walk stops of itself, with no hop cap that would hand
+    # back a truncated -- i.e. too small, i.e. wrong-slot -- sum as fact, at:
+    # the vtable pointer (`vptr = [obj]`, where `base` must stay the VAR the
+    # factory trace below resolves rather than the LOAD it does not), a
+    # non-variable/non-ADD value, and a variable already walked (a loop-carried
+    # address, whose addends are all counted).
+    seen: set[tuple] = set()
+    while True:
+        if _op(base) == "MLIL_ADD":
+            right_const = _vc_const(getattr(base, "right", None))
+            left_const = _vc_const(getattr(base, "left", None))
+            # MLIL_ADD is commutative; BN usually canonicalizes the constant to
+            # the right, but not always -- handle `const + base` too so a vtable
+            # slot with the offset on the LEFT is not mis-resolved to the whole
+            # ADD expr.
+            if right_const is not None:
+                off += right_const
+                base = getattr(base, "left", None)
+            elif left_const is not None:
+                off += left_const
+                base = getattr(base, "right", None)
+            else:
+                break  # ADD of two non-constants: nothing further to read
+            continue
+        var = _vc_var(base)
+        if var is None:
+            break  # a constant/global address, or the vtable LOAD itself
+        vkey = _vc_vkey(var)
+        if vkey in seen:
+            break  # a loop-carried address: its addends are already summed
+        seen.add(vkey)
+        if instrs is None:
+            instrs = list(caller.mlil.instructions)
+        d = _vc_def_ins(instrs, var, call_addr)
+        if d is None or _op(d) != "MLIL_SET_VAR":
+            break
+        src = getattr(d, "src", None)
+        if src is None or "LOAD" in _op(src):
+            break  # the vtable pointer: keep `base` the var, not the vtable load
+        base = src
     # Best-effort factory trace: base (the vtable) is `[obj]`; obj is `factory()`.
     factory = None
     try:
