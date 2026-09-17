@@ -686,6 +686,110 @@ def _lookahead_row_confirms_continuation(row: dict[str, Any] | None) -> bool:
     return _slot_is_code(target) or status == "null" or kind == "extern"
 
 
+def _vtable_row_slot(bv, index: int, row: dict[str, Any]) -> dict[str, Any] | None:
+    """The slot a raw pointer-table ROW contributes to a vtable, or ``None``
+    when the row is a genuine table BOUNDARY (unreadable, or a mapped
+    data/unmapped pointer -- the next object). Shared by the capped window scan
+    in ``_vtable_layout`` and the one-slot probe ``_vtable_slot_probe`` (#822)
+    so both classify a row identically: a probe that accepted a row the window
+    scan would have stopped at could name a method from the object AFTER the
+    table."""
+    if not row.get("readable"):
+        return None
+    target = row.get("target") if isinstance(row.get("target"), dict) else {}
+    value = row.get("value")
+    status = target.get("status")
+    kind = (target.get("context") or {}).get("kind")
+    if _slot_is_code(target):
+        fn = target.get("function")
+        name = (fn or {}).get("name") if isinstance(fn, dict) else None
+        method = None
+        if isinstance(fn, dict):
+            # The pointer-table function dict carries the MANGLED fn.name; add
+            # the demangled display name (symbol short_name) so slots read like
+            # the methods list, not raw `_ZN...`. Mangled `name` is kept. (#205)
+            method = {**fn, "display_name": _demangled_slot_name(bv, fn)}
+        return {
+            "index": index,
+            "address": value,
+            "method": method,
+            "pure_virtual": name == "__cxa_pure_virtual",
+            "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
+        }
+    if status == "null":
+        # Interior null slot (pure-virtual placeholder / unresolved reloc).
+        # Kept so a leading/interior null doesn't truncate the vtable; a
+        # trailing run of these is trimmed below.
+        return {
+            "index": index, "address": value, "method": None,
+            "pure_virtual": False, "unnamed": True, "null": True,
+        }
+    if kind == "extern":
+        # External slot: `__cxa_pure_virtual` (a pure-virtual marker) or a
+        # cross-module virtual method. A valid vtable entry -- don't stop.
+        ext_name = _slot_external_name(bv, value)
+        return {
+            "index": index, "address": value, "method": None,
+            "pure_virtual": ext_name == "__cxa_pure_virtual",
+            "external": True, "external_name": ext_name,
+            "unnamed": ext_name is None,
+        }
+    return None
+
+
+# #822: how many raw rows past the display window `_vtable_slot_probe` will walk
+# to reach ONE requested slot. The slot index comes from an MLIL constant, so an
+# obfuscated/garbage offset must not turn a single slot lookup into an unbounded
+# table walk; hitting this bound is DISCLOSED (`vtable_slot_probe_limit`), never
+# silently read as an absent slot.
+_VTABLE_SLOT_PROBE_MAX_ROWS = 4096
+
+
+def _vtable_slot_probe(
+    ctx, bv, vtable_addr: int, slot_index: int, *, scanned_through: int,
+) -> dict[str, Any]:
+    """Resolve ONE requested slot that lies past the display window (#822).
+
+    ``_vtable_layout``'s cap bounds the LISTING, not the vtable: a caller asking
+    for slot 70 of an 80-slot table must not be told the slot is unresolved just
+    because `class show` stops displaying at 64. Reading row 70 in isolation
+    would be unsound -- a boundary (the next object) between the window and row
+    70 must end the table first -- so this walks the contiguous run of rows from
+    where the window scan stopped up to the requested index.
+
+    Returns ``{"status", "slot", "rows_scanned"}`` with ``status`` one of:
+      * ``"resolved"`` -- the requested row is a valid vtable entry (``slot``);
+      * ``"not_present"`` -- a genuine table boundary was reached first, so the
+        requested index is past the end of this table;
+      * ``"limit_reached"`` -- the walk would exceed
+        ``_VTABLE_SLOT_PROBE_MAX_ROWS`` rows, so the slot is UNKNOWN.
+    """
+    if not vtable_addr or slot_index < 0:
+        return {"status": "not_present", "slot": None, "rows_scanned": 0}
+    ptr = ctx._pointer_size(bv)
+    first_row = max(0, int(scanned_through))
+    count = slot_index - first_row + 1
+    if count <= 0:
+        return {"status": "not_present", "slot": None, "rows_scanned": 0}
+    if count > _VTABLE_SLOT_PROBE_MAX_ROWS:
+        return {"status": "limit_reached", "slot": None, "rows_scanned": 0}
+    start = int(vtable_addr) + 2 * ptr + first_row * ptr
+    table = ctx._pointer_table_layout(bv, start, entries=count, stride=ptr)
+    rows = table.get("items") or table.get("entries") or []
+    slot: dict[str, Any] | None = None
+    for offset, row in enumerate(rows):
+        slot = _vtable_row_slot(bv, first_row + offset, row if isinstance(row, dict) else {})
+        if slot is None:
+            # The table ended on a boundary (or the row was unreadable) before
+            # the requested index -- a genuine absence, not a capped scan.
+            return {"status": "not_present", "slot": None, "rows_scanned": offset + 1}
+    if slot is None or len(rows) < count:
+        # The reader returned fewer rows than the requested index needs: this
+        # table has no such row (absence of the row, not proof of a boundary).
+        return {"status": "not_present", "slot": None, "rows_scanned": len(rows)}
+    return {"status": "resolved", "slot": slot, "rows_scanned": count}
+
+
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
@@ -693,7 +797,26 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
 
     The returned ``scanned`` count is raw table entries examined, including
     any terminating row that stopped the scan -- it is neither ``len(slots)``
-    nor a virtual-method count."""
+    nor a virtual-method count.
+
+    ``max_slots`` caps the returned LISTING, and the result says so instead of
+    letting a prefix read as the whole table (#584, #822):
+      * ``total`` -- the EXACT number of vtable entries, or ``None`` when the
+        scan was capped before the table's end was observed. Entries, not
+        virtual methods: a null/external placeholder row is an entry (the
+        listing keeps it), a trailing padding run is not;
+      * ``total_lower_bound`` -- an int only when ``total`` is ``None``: the
+        validated minimum, i.e. the window's entries plus the lookahead row that
+        proved the table continues;
+      * ``truncated``/``slots_truncated`` -- the listing is a PREFIX of a longer
+        table (``slots_truncated`` is the same fact under the name #584 asked
+        for; both are kept);
+      * ``scan_truncated`` -- the total is unknown because the scan stopped at
+        the cap (the ``read_listing`` callsites convention: ``scan_truncated``
+        pairs with ``total: None``, never with a fabricated count);
+      * ``truncated_reason`` -- the machine-readable ``"scan_capped"`` for that
+        case, ``None`` otherwise.
+    ``_vtable_slot_probe`` resolves a requested slot past this window."""
     ptr = ctx._pointer_size(bv)
     # Itanium invariant: word[1] (vtable_addr + ptr) points to the class's
     # typeinfo. If it doesn't resolve to a typeinfo symbol, this address is NOT
@@ -703,12 +826,21 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # (#205 review), so report no slots and let the caller note it.
     ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
     if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
+        # #822: this is a DECIDED "no local vtable body", not a capped scan --
+        # nothing was left unread, so the total is an exact 0 and no truncation
+        # is claimed. `total: 0` matches the empty `slots` listing that the
+        # renderer already explains.
         return {
             "address": hex(int(vtable_addr)),
             "slots": [],
             "truncated": False,
             "max_slots": max_slots,
             "scanned": 0,
+            "total": 0,
+            "total_lower_bound": None,
+            "slots_truncated": False,
+            "scan_truncated": False,
+            "truncated_reason": None,
         }
     start = vtable_addr + 2 * ptr
     # #706 follow-up: read one entry PAST the cap. Row `max_slots` is a
@@ -744,50 +876,14 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # past `max_slots` (the lookahead below resolves it).
     for i, row in enumerate(window):
         scanned = i + 1
-        if not row.get("readable"):
+        # #822: the row -> slot classification lives in `_vtable_row_slot` so the
+        # one-slot probe past the window applies the SAME boundary rules; `None`
+        # here is the genuine terminator that ends the scan (unreadable row, or
+        # a mapped data pointer: the next object's typeinfo / ott).
+        slot = _vtable_row_slot(bv, i, row if isinstance(row, dict) else {})
+        if slot is None:
             break
-        target = row.get("target") if isinstance(row.get("target"), dict) else {}
-        value = row.get("value")
-        status = target.get("status")
-        kind = (target.get("context") or {}).get("kind")
-        if _slot_is_code(target):
-            fn = target.get("function")
-            name = (fn or {}).get("name") if isinstance(fn, dict) else None
-            method = None
-            if isinstance(fn, dict):
-                # The pointer-table function dict carries the MANGLED fn.name; add
-                # the demangled display name (symbol short_name) so slots read like
-                # the methods list, not raw `_ZN...`. Mangled `name` is kept. (#205)
-                method = {**fn, "display_name": _demangled_slot_name(bv, fn)}
-            slots.append({
-                "index": i,
-                "address": value,
-                "method": method,
-                "pure_virtual": name == "__cxa_pure_virtual",
-                "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
-            })
-        elif status == "null":
-            # Interior null slot (pure-virtual placeholder / unresolved reloc).
-            # Kept so a leading/interior null doesn't truncate the vtable; a
-            # trailing run of these is trimmed below.
-            slots.append({
-                "index": i, "address": value, "method": None,
-                "pure_virtual": False, "unnamed": True, "null": True,
-            })
-        elif kind == "extern":
-            # External slot: `__cxa_pure_virtual` (a pure-virtual marker) or a
-            # cross-module virtual method. A valid vtable entry -- don't stop.
-            ext_name = _slot_external_name(bv, value)
-            slots.append({
-                "index": i, "address": value, "method": None,
-                "pure_virtual": ext_name == "__cxa_pure_virtual",
-                "external": True, "external_name": ext_name,
-                "unnamed": ext_name is None,
-            })
-        else:
-            # A mapped data pointer / unmapped garbage: the next object
-            # (typeinfo / secondary-vtable header) -- the vtable ends here.
-            break
+        slots.append(slot)
     else:
         # #706 follow-up: the window's `for...else` completion is ambiguous by
         # itself -- a trailing null run consumed to reach `max_slots` reads
@@ -811,12 +907,24 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     if not truncated:
         while slots and slots[-1].get("null"):
             slots.pop()
+    # #822 (the #584 residual): two different questions, two flags, one truth.
+    # `truncated` answers "is my LISTING a prefix?"; `scan_truncated` answers
+    # "is `total` exact?" -- and the answer to the second is what keeps a capped
+    # scan from reading as a complete table. The lookahead proved the table
+    # continues past the window, so the exact total is UNKNOWN (never a
+    # fabricated count) while the window's entries plus that one validated row
+    # are a lower bound.
     return {
         "address": hex(int(vtable_addr)),
         "slots": slots,
         "truncated": truncated,
         "max_slots": max_slots,
         "scanned": scanned,
+        "total": None if truncated else len(slots),
+        "total_lower_bound": len(slots) + 1 if truncated else None,
+        "slots_truncated": truncated,
+        "scan_truncated": truncated,
+        "truncated_reason": "scan_capped" if truncated else None,
     }
 
 
@@ -937,10 +1045,24 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
 
 def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
     """Best-effort: where objects of this class are constructed and which
-    globals hold one. Empty (not an error) when nothing is found."""
-    sites = ctx._ctor_construction_sites(bv, record)[:cap]
-    stored = ctx._global_vtable_stores(bv, record)[:cap] if record.get("vtable") else []
-    return {"construction_sites": sites, "stored_globals": stored}
+    globals hold one. Empty (not an error) when nothing is found.
+
+    ``cap`` bounds each LISTING only (#822: the same shape as the vtable cap),
+    so the result also reports what the cap hid: ``*_total`` is the exact number
+    found and ``*_truncated`` says the listing is a prefix. A capped 128 must
+    never read as "this class is constructed exactly 128 times"."""
+    sites = ctx._ctor_construction_sites(bv, record)
+    stored = ctx._global_vtable_stores(bv, record) if record.get("vtable") else []
+    shown_sites = sites[:cap]
+    shown_stored = stored[:cap]
+    return {
+        "construction_sites": shown_sites,
+        "stored_globals": shown_stored,
+        "construction_sites_total": len(sites),
+        "construction_sites_truncated": len(sites) > len(shown_sites),
+        "stored_globals_total": len(stored),
+        "stored_globals_truncated": len(stored) > len(shown_stored),
+    }
 
 
 def _query_leaf(name: str) -> str:

@@ -1743,7 +1743,264 @@ def test_vtable_layout_early_return_carries_truncation_keys():
         "truncated": False,
         "max_slots": 64,
         "scanned": 0,
+        # #822: the "not a vtable object" path discloses the SAME key set as the
+        # main return, now including the cap-independent disclosure -- an exact
+        # total of 0 (nothing was left unscanned), no bound, no truncation.
+        "total": 0,
+        "total_lower_bound": None,
+        "slots_truncated": False,
+        "scan_truncated": False,
+        "truncated_reason": None,
     }
+
+
+def _code_row(index):
+    """A readable CODE row, the shape the pointer-table reader hands back."""
+    value = 0x400000 + index * 8
+    return {"index": index, "entry_address": hex(0x9010 + index * 8),
+            "value": hex(value), "readable": True, "plausible": True,
+            "target": {"status": "function", "normalized": hex(value),
+                       "function": {"name": f"m{index}", "address": hex(value)}}}
+
+
+def _data_row(index, value=0xA100):
+    """A mapped DATA row: the next object's typeinfo -- a TABLE BOUNDARY."""
+    return {"index": index, "entry_address": hex(0x9010 + index * 8),
+            "value": hex(value), "readable": True, "plausible": True,
+            "target": {"status": "mapped", "function": None,
+                       "context": {"kind": "data", "segment": {"executable": False}}}}
+
+
+class _WindowCtx:
+    """ctx whose pointer-table reader is ADDRESS-keyed like the real
+    ``_pointer_table_for_view``: it returns the rows the requested ``start``
+    covers, so a caller asking for a window PAST the table head gets that range
+    rather than the head again (the head-returning fakes above would let a
+    probe that mis-computed its start still resolve the right slot)."""
+    _BASE = 0x9010          # vtable_addr + 2*ptr for the 0x9000 vtables below
+
+    def __init__(self, rows):
+        self._rows = rows    # absolute row index -> row dict
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return 0x9100        # word[1] -> a valid typeinfo, so the gate passes
+
+    def _typeinfo_name_at(self, bv, addr):
+        return "net::Klass"
+
+    def _pointer_table_layout(self, bv, start, *, entries, stride):
+        first = (start - self._BASE) // stride
+        out = []
+        for i in range(first, first + entries):
+            row = self._rows.get(i)
+            # A row the table does not cover reads as unreadable, exactly like
+            # the real reader's `readable: False` rows.
+            out.append({**row, "index": i} if row is not None
+                       else {"index": i, "value": None, "readable": False})
+        return {"kind": "pointer_table", "items": out}
+
+
+def test_vtable_layout_reports_totals_independent_of_the_display_cap():
+    # #822 / #584 residual (g-584-main + g-584-1): the cap bounds the listing,
+    # so the result must say what the cap hid. `max_slots` alone cannot: the
+    # same 80-entry table capped at 16 and at 64 both reported "truncated, 16/64
+    # slots, no total", so the two were indistinguishable to a consumer.
+    too_large = _VtableCtx([(0x400000 + i * 8, f"m{i}") for i in range(80)])
+    wide = read_class._vtable_layout(too_large, object(), 0x9000)
+    narrow = read_class._vtable_layout(too_large, object(), 0x9000, max_slots=16)
+
+    assert len(wide["slots"]) == 64 and len(narrow["slots"]) == 16
+    assert wide["truncated"] is True and narrow["truncated"] is True
+    # The cap is not the total: the total is UNKNOWN (never a fabricated count)
+    # with a validated lower bound, and the bound is the window plus the
+    # lookahead row that proved the table keeps going.
+    assert wide["total"] is None and narrow["total"] is None
+    assert wide["total_lower_bound"] == 65
+    assert narrow["total_lower_bound"] == 17
+    assert wide["slots_truncated"] is True and narrow["slots_truncated"] is True
+    assert wide["scan_truncated"] is True and narrow["scan_truncated"] is True
+    assert wide["truncated_reason"] == "scan_capped"
+    # ...and the LOW bound is what distinguishes the two results: >16 vs >64.
+    assert narrow["total_lower_bound"] != wide["total_lower_bound"]
+
+
+def test_vtable_layout_reports_exact_total_when_table_ends_at_the_cap():
+    # #822 (g-584-1): a table whose end IS observed reports an EXACT total --
+    # the window filled with 64 valid rows, but the one-entry lookahead is the
+    # next object's typeinfo (a data pointer), so nothing exists past row 63.
+    # A consumer may trust `total` here; it must not be null.
+    rows = [_code_row(i) for i in range(64)] + [_data_row(64)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["truncated"] is False
+    assert layout["scanned"] == 64
+    assert layout["total"] == 64
+    assert layout["total_lower_bound"] is None
+    assert layout["slots_truncated"] is False
+    assert layout["scan_truncated"] is False
+    assert layout["truncated_reason"] is None
+
+
+def test_vtable_layout_reports_exact_total_when_table_ends_early():
+    # The other exact-total shape: a genuine boundary INSIDE the window. The
+    # trailing null that precedes it is the next object's padding and is not a
+    # slot, so the total is the 3 real entries -- not the 4 rows scanned.
+    rows = [_code_row(0), _code_row(1), _code_row(2),
+            {"index": 3, "value": "0x0", "readable": True,
+             "target": {"status": "null", "context": {"kind": "null"}}},
+            _data_row(4)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["truncated"] is False
+    assert len(layout["slots"]) == 3
+    assert layout["scanned"] == 5      # includes the terminating row
+    assert layout["total"] == 3        # ...which is NOT the total
+    assert layout["total_lower_bound"] is None
+    assert layout["truncated_reason"] is None
+
+
+def test_vtable_slot_probe_resolves_slot_beyond_display_window():
+    # #822 (g-584-3): #584's acceptance -- a valid slot 70 must resolve even
+    # though the DISPLAY listing stops at 64. The probe walks the rows between
+    # the window and the requested index, so it resolves the requested slot
+    # without widening (or uncapping) the listing.
+    ctx = _WindowCtx({i: _code_row(i) for i in range(80)})
+    layout = read_class._vtable_layout(ctx, object(), 0x9000)
+    assert len(layout["slots"]) == 64                 # listing stays capped
+    assert layout["total_lower_bound"] == 65
+
+    probe = read_class._vtable_slot_probe(
+        ctx, object(), 0x9000, 70, scanned_through=layout["scanned"])
+    assert probe["status"] == "resolved"
+    assert probe["slot"]["index"] == 70
+    assert probe["slot"]["method"]["name"] == "m70"
+    assert probe["rows_scanned"] == 7                 # rows 64..70 inclusive
+
+
+def test_vtable_slot_probe_stops_at_a_boundary_before_the_requested_slot():
+    # Soundness of the targeted read: rows 64..67 exist, row 68 is the next
+    # object's typeinfo and row 70 is a code address belonging to whatever
+    # object follows. Reading row 70 in isolation would name a method that is
+    # NOT in this vtable; the walk must report the slot absent instead.
+    rows = {i: _code_row(i) for i in range(68)}
+    rows[68] = _data_row(68)
+    rows[70] = _code_row(70)
+    ctx = _WindowCtx(rows)
+    probe = read_class._vtable_slot_probe(ctx, object(), 0x9000, 70, scanned_through=64)
+    assert probe["status"] == "not_present"
+    assert probe["slot"] is None
+
+
+def test_vtable_slot_probe_refuses_an_unbounded_walk():
+    # The requested index comes from an MLIL constant, so a garbage offset must
+    # not turn one slot lookup into a million-row walk. Hitting the probe's own
+    # bound is a THIRD state (unknown), never "absent" and never "resolved".
+    ctx = _WindowCtx({i: _code_row(i) for i in range(5000)})
+    probe = read_class._vtable_slot_probe(
+        ctx, object(), 0x9000, read_class._VTABLE_SLOT_PROBE_MAX_ROWS + 64,
+        scanned_through=64)
+    assert probe["status"] == "limit_reached"
+    assert probe["slot"] is None
+
+
+def test_vtable_slot_probe_reports_no_slot_for_a_short_table():
+    # A table that simply has no row N (the reader returns fewer rows than the
+    # requested index needs) is an absence, not an unreadable row.
+    ctx = _WindowCtx({i: _code_row(i) for i in range(66)})
+    probe = read_class._vtable_slot_probe(ctx, object(), 0x9000, 70, scanned_through=64)
+    assert probe["status"] == "not_present"
+    assert probe["slot"] is None
+
+
+def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
+    # #822 (g-584-4): 400 recoverable ctor sites / stored globals came back as
+    # exactly 128 with no total and no flag, so a capped scan was
+    # indistinguishable from a complete one.
+    sites = [{"address": hex(0x443000 + i * 16), "function": f"caller{i}",
+              "kind": "ctor-call", "size": None} for i in range(400)]
+    globals_ = [{"symbol": f"g_slot{i}", "address": hex(0x4c0000 + i * 8)}
+                for i in range(400)]
+    ctx = _InstCtx(sites, globals_)
+    rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
+    out = read_class._instances(ctx, object(), rec)
+
+    assert len(out["construction_sites"]) == 128       # listing still capped
+    assert len(out["stored_globals"]) == 128
+    assert out["construction_sites_total"] == 400      # ...but the total is exact
+    assert out["stored_globals_total"] == 400
+    assert out["construction_sites_truncated"] is True
+    assert out["stored_globals_truncated"] is True
+
+
+def test_instances_reports_exact_totals_without_truncation():
+    # The uncapped shape: real totals, no truncation claimed.
+    ctx = _InstCtx([{"address": "0x443abc", "function": "main",
+                     "kind": "ctor-call", "size": None}],
+                   [{"symbol": "g_session", "address": "0x4cabcd"}])
+    rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
+    out = read_class._instances(ctx, object(), rec)
+    assert out["construction_sites_total"] == 1
+    assert out["stored_globals_total"] == 1
+    assert out["construction_sites_truncated"] is False
+    assert out["stored_globals_truncated"] is False
+
+
+def test_class_instances_renderer_discloses_the_cap_with_totals():
+    # The text renderer must not present a capped listing as a complete one.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session", "confidence": "rtti", "methods": [],
+        "vtable": {"address": "0x9000", "slots": [{"index": 0, "address": "0x400000"}]},
+        "instances": {
+            "construction_sites": [{"kind": "ctor-call", "address": "0x443000"}],
+            "stored_globals": [],
+            "construction_sites_total": 400,
+            "construction_sites_truncated": True,
+            "stored_globals_total": 0,
+            "stored_globals_truncated": False,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "capped" in text
+    assert "1 of 400" in text
+
+
+def test_render_class_show_text_vtable_cap_note_names_the_lower_bound():
+    # #822: the cap note carries the validated bound, so "capped at 64" can no
+    # longer be read as "this class has 64 virtuals".
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session", "confidence": "rtti", "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "total": None,
+            "total_lower_bound": 65,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "at least 65" in text
+    assert "scan capped at 64" in text
+
+
+def test_render_class_show_text_no_cap_note_when_instances_complete():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session", "confidence": "rtti", "methods": [],
+        "vtable": {"address": "0x9000", "slots": [{"index": 0, "address": "0x400000"}]},
+        "instances": {
+            "construction_sites": [{"kind": "ctor-call", "address": "0x443000"}],
+            "stored_globals": [],
+            "construction_sites_total": 1,
+            "construction_sites_truncated": False,
+            "stored_globals_total": 0,
+            "stored_globals_truncated": False,
+        },
+    }
+    assert "capped" not in _render_class_show_text(rec)
 
 
 def test_render_class_show_text_notes_truncated_vtable():

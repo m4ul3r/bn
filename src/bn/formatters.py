@@ -2671,12 +2671,18 @@ def _render_virtual_call_text(value: Any) -> str:
     if not cands:
         # #531: an unresolved slot (e.g. an unaligned offset that can't map to a slot
         # index) carries a concrete reason -- surface it instead of the generic hint.
+        # #822: the typed discriminator rides along in parens (the
+        # `hlil: null (reason_code)` shape) so a reader sees WHICH kind of
+        # non-resolution this is: a capped scan is not an absent slot.
         reason = value.get("unresolved_reason")
+        code = value.get("unresolved_reason_code")
+        code_s = f" ({code})" if code else ""
         if reason:
-            lines.append(f"  unresolved: {reason}")
+            lines.append(f"  unresolved: {reason}{code_s}")
         else:
             lines.append("  no provider class implements this slot "
-                         "(check --providers, or the slot is beyond the recovered vtable)")
+                         "(check --providers; a slot the provider's table ends "
+                         f"before is absent, not truncated){code_s}")
         return "\n".join(lines)
     if value.get("ambiguous"):
         lines.append(f"  AMBIGUOUS: {len(cands)} provider classes implement slot "
@@ -5631,9 +5637,15 @@ def _render_one_class(rec: Any) -> str:
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
     if vt.get("truncated"):
+        # #822: the cap note now carries the bound instead of only the cap, so a
+        # reader can tell a 65-entry table from a 4000-entry one -- an unknown
+        # exact total is named as a lower bound, never as a count.
+        bound = vt.get("total_lower_bound")
+        bound_s = f"of at least {bound} entries" if isinstance(bound, int) else "of an unknown total"
         lines.append(
-            f"  vtable: showing {len(vt_slots)} slots; scan capped at {vt.get('max_slots')} -- "
-            "more may exist (raise the cap or inspect the table directly)"
+            f"  vtable: showing {len(vt_slots)} slots {bound_s}; scan capped at "
+            f"{vt.get('max_slots')} -- more may exist (raise the cap or inspect the "
+            "table directly)"
         )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
     # single-inheritance class isn't cluttered (there are none to show there).
@@ -5649,8 +5661,12 @@ def _render_one_class(rec: Any) -> str:
                 continue
             lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
         if sec.get("truncated"):
+            sec_bound = sec.get("total_lower_bound")
+            sec_bound_s = (f"of at least {sec_bound} entries" if isinstance(sec_bound, int)
+                           else "of an unknown total")
             lines.append(
-                f"    vtable: showing {len(_field_list(sec, 'slots'))} slots; scan capped at {sec.get('max_slots')} -- "
+                f"    vtable: showing {len(_field_list(sec, 'slots'))} slots {sec_bound_s}; "
+                f"scan capped at {sec.get('max_slots')} -- "
                 "more may exist (raise the cap or inspect the table directly)"
             )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
@@ -5677,4 +5693,14 @@ def _render_one_class(rec: Any) -> str:
         parts.append(f"stored -> {g.get('symbol') or '?'} @ {g.get('address', '?')}")
     if parts:
         lines.append("  instances: " + " ; ".join(parts))
+    hidden = []
+    for field, label in (("construction_sites", "construction sites"),
+                         ("stored_globals", "stored globals")):
+        if inst.get(f"{field}_truncated"):
+            hidden.append(f"{label}: showing {len(_field_list(inst, field))} "
+                          f"of {inst.get(f'{field}_total')}")
+    if hidden:
+        # #822: the 128-per-list cap is disclosed with exact totals, so a capped
+        # result is never read as a complete one (the vtable cap's shape).
+        lines.append("  instances (capped): " + "; ".join(hidden))
     return "\n".join(lines)

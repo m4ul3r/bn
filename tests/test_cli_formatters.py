@@ -601,6 +601,34 @@ def test_render_virtual_call_text_surfaces_warnings_alongside_candidates():
     assert "resolution may be incomplete" in out
 
 
+def test_render_virtual_call_text_shows_typed_reason_code_822():
+    # #822: the prose alone cannot be branched on, so the typed discriminator
+    # renders alongside it in parens -- the `hlil: null (reason_code)` shape.
+    from bn.formatters import _render_virtual_call_text
+    truncated = {
+        "callsite": "0x1000", "caller": "consumer", "slot_offset": "0x230",
+        "slot_index": 70, "factory": None, "candidates": [], "resolved": False,
+        "unresolved_reason": "slot 70 is beyond the recovered vtable window (scan capped at "
+                            "64 slots) in at least one provider -- the target method may "
+                            "exist past the cap rather than being genuinely unresolvable",
+        "unresolved_reason_code": "vtable_scan_truncated",
+    }
+    out = _render_virtual_call_text(truncated)
+    assert "unresolved:" in out
+    assert "(vtable_scan_truncated)" in out
+
+    # An absent slot carries the code with the generic hint (no prose), so a
+    # reader still sees WHY nothing resolved.
+    absent = {
+        "callsite": "0x1000", "caller": "consumer", "slot_offset": "0x28",
+        "slot_index": 5, "factory": None, "candidates": [], "resolved": False,
+        "unresolved_reason_code": "slot_not_present",
+    }
+    out = _render_virtual_call_text(absent)
+    assert "(slot_not_present)" in out
+    assert "no provider class implements this slot" in out
+
+
 def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     # #557 + #558: text output surfaces the null-hlil reason code and the
     # variadic-callee steer.
@@ -4197,13 +4225,17 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 605 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 606 read keys
     rather than the 201 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4840.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4848.
+    (#822 taught `_render_virtual_call_text` to render the typed
+    `unresolved_reason_code`, which is the renderer read that takes this
+    population from its base's 4840 to 4848 -- the population follows the
+    renderers, which is the point of deriving it.)
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4222,7 +4254,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4840, f"the raise sweep ran {swept} renders, not 4840"
+    assert swept == 4848, f"the raise sweep ran {swept} renders, not 4848"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4371,7 +4403,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1411, f"the mirror ran {checked} renders, not 1411"
+    assert checked == 1413, f"the mirror ran {checked} renders, not 1413"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
