@@ -31,12 +31,36 @@ A no-op edit reports `changed: false` ("No effective change detected").
 Per-op statuses:
 
 - `verified` — change applied and read back as requested.
-- `noop` — already in the requested state.
+- `noop` — already in the requested state. For `types declare`, the named types must resolve in the live database; parsing no named types is `invalid_request`, with the reason in `first_error` and the default status output, not a successful no-op.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. Exit 2 still covers everything on this path that is *not* one of those statuses: a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), a transport failure, a bridge error carrying some other status or none, and a response this CLI cannot parse.
+- `invalid_request` — the operation was refused: a bad field *value*, a missing required field, an ambiguous operation target, or conflicting options. Local semantic preflights (before sending), the bridge's pre-apply checks, and apply-time refusals all exit 3 on mutation commands. Anything already applied in the mutation/batch is reverted. An unknown op kind is `unsupported` and likewise exit 3. Only these mutation boundaries classify failure statuses as exit 3; read/resolver errors remain exit 2 (#625/#716/#744).
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
+
+#### Refusal versus request/bridge failure
+
+| Boundary | Exit | Meaning |
+|---|---|---|
+| CLI operation preflight | 3 | Nothing sent. Missing/conflicting comment or tag locations, empty rename names, missing/conflicting declaration sources, and a parsed manifest object missing an `ops` array are `invalid_request`. |
+| CLI argument parser or handled file/document/routing error | 2 | Invalid flags/choices, missing declaration files, manifest I/O errors converted to `BridgeError`, empty batch-manifest stdin, invalid manifest JSON, a non-object manifest, or missing/ambiguous instance/target routing. This does not classify unhandled I/O exceptions as exit 2. These are not operation refusals. |
+| Bridge mutation refusal | 3 | A failed mutation status; consult the result for rollback and observed state. |
+| Read operation or bridge/transport fault | 2 | Read refusals stay read errors. An unreachable bridge or a bridge error without a failed mutation status is not proof that a write did or did not land. |
+
+Pre-send operation refusals reuse the structured error envelope, not a fabricated
+apply/rollback result. With `--format json` (or `ndjson`), for example:
+
+```json
+{"ok": false, "status": "invalid_request", "error": "comment set needs a location: an address (positional or --address) or --function", "observed": {"request_sent": false}}
+```
+
+The explanation is also printed to stderr (including under `--format text`).
+`observed.request_sent: false` distinguishes this local refusal from an error
+received from the bridge. `comment get` and `tag get` use the same location
+checks as their mutation siblings but remain read errors (exit 2, no mutation
+status). For batch input, document parsing must succeed first: invalid JSON or
+a non-object document stays exit 2; an object whose `ops` field is missing or
+not an array is an operation-level `invalid_request` (exit 3), before any send.
 
 ### Output shape — compact by default, detail on request
 
@@ -79,10 +103,11 @@ undeliverable output replaces the code with 2 and can never turn a failed or an
 unmeasured mutation into a clean zero. But do NOT read that backwards: on this
 path a 2 is also the code for a bridge this CLI could not reach, a reply it
 could not classify at all, and a flag value rejected before anything was sent.
-Two things are NOT in that list. A refusal: on a mutation a refusal is exit 3,
-as the status table above says. And a reply carrying ONE field this CLI cannot
-read: that field is refused and disclosed by name, a verdict is still derived
-from the rest, and the run exits 3 or 4 accordingly.
+Two things are NOT in that list. An operation-level refusal: on a mutation it
+is exit 3, as the boundary table above says (not an argparse, input-document,
+or routing error). And a reply carrying ONE field this CLI cannot read: that
+field is refused and disclosed by name, a verdict is still derived from the
+rest, and the run exits 3 or 4 accordingly.
 So a 2 alone does not tell you whether the write landed; the stderr line names
 which of them it was, and when it names the delivery step, re-read the view
 rather than re-issuing the mutation.

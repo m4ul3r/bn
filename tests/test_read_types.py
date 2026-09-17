@@ -47,7 +47,7 @@ def test_parse_declaration_source_uses_platform_parser_with_source_path(monkeypa
     assert recorded["kwargs"]["include_dirs"] == [str(header_path.parent.resolve())]
 
 
-def test_op_types_declare_accepts_source_without_named_types(monkeypatch):
+def test_types_declare_refuses_source_without_named_types(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
@@ -75,20 +75,32 @@ def test_op_types_declare_accepts_source_without_named_types(monkeypatch):
 
     bv = _SourceOnlyBV()
 
-    result = instance._op_types_declare(
-        bv,
-        {
-            "op": "types_declare",
-            "declaration": "extern const GUID GUID_SysKeyboard;",
-            "source_path": "/tmp/win32_min.h",
-        },
-    )
-
-    assert result["count"] == 0
-    assert result["defined_types"] == {}
-    assert result["parsed_functions"] == ["DirectInput8Create"]
-    assert result["parsed_variables"] == ["GUID_SysKeyboard"]
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_types_declare(
+            bv,
+            {
+                "op": "types_declare",
+                "declaration": "extern const GUID GUID_SysKeyboard;",
+                "source_path": "/tmp/win32_min.h",
+            },
+        )
+    assert exc.value.status == "invalid_request"
+    assert "no named types" in exc.value.message
+    assert exc.value.observed["defined_types"] == {}
+    assert exc.value.observed["parsed_functions"] == ["DirectInput8Create"]
+    assert exc.value.observed["parsed_variables"] == ["GUID_SysKeyboard"]
     assert bv.defined == []
+
+
+def test_declared_types_verifier_rejects_an_empty_apply_result(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    verified = instance._verify_operation(_FakeBV(), {
+        "op": "types_declare", "defined_types": {},
+        "requested": {"declaration": "struct Example { int value; };"},
+    })
+    assert verified["status"] == "verification_failed"
+    assert verified["observed"]["defined_types"] == {}
 
 
 def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
@@ -139,6 +151,60 @@ def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
     verified = instance._verify_operation(bv, result)
     assert verified["status"] == "verified"
     assert verified["observed"]["defined_types"]["DamageGaugeController"] == "struct DamageGaugeController"
+
+    # A real idempotent declaration still resolves and is a successful noop.
+    repeated = instance._op_types_declare(
+        bv, {"op": "types_declare", "declaration": "struct DamageGaugeController { int state; };"}
+    )
+    assert instance._verify_operation(bv, repeated)["status"] == "noop"
+    assert bv.get_type_by_name("DamageGaugeController") is not None
+
+    # Matching before-state cannot turn a missing live type into a noop.
+    monkeypatch.setattr(bv, "get_type_by_name", lambda name: None)
+    missing = instance._verify_operation(bv, repeated)
+    assert missing["status"] == "verification_failed"
+    assert missing["observed"]["defined_types"]["DamageGaugeController"] is None
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("output", [[], ["--format", "json"], ["--format", "json", "--summary"]])
+def test_empty_type_parse_rolls_back_and_reports_reason(
+        monkeypatch, capsys, preview, output):
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV(comments={0x1000: "original"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult(), raising=False)
+    result = instance._mutation("active", preview, [
+        {"op": "set_comment", "address": "0x1000", "comment": "temporary"},
+        {"op": "types_declare", "declaration": "struct Example { int value; };"},
+    ])
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    assert bv.get_comment_at(0x1000) == "original"
+    assert result["results"][-1]["status"] == "invalid_request"
+
+    monkeypatch.setattr(bn.cli, "send_request", lambda *a, **k: {"ok": True, "result": result})
+    argv = ["types", "declare", "--target", "active", "struct Example { int value; };"]
+    assert bn.cli.main(argv + (["--preview"] if preview else []) + output) == 3
+    stdout = capsys.readouterr().out
+    if "--summary" in output:
+        summary = json.loads(stdout)
+        assert summary["ok"] is False
+        assert summary["failed_count"] == 1
+        assert summary["noop_count"] == 0
+        assert "no named types" in summary["first_error"]
+    elif output:
+        payload = json.loads(stdout)
+        assert payload["ok"] is False
+        assert payload["results"][-1]["status"] == "invalid_request"
+    else:
+        assert "mutation: committed" not in stdout
+        assert "first_error:" in stdout
+        assert "no named types" in stdout
 
 
 def test_types_declare_malformed_declaration_is_clean_invalid_request(monkeypatch):

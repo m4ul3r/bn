@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutate, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _render_type_info_text,
     _render_type_list_text,
@@ -82,13 +82,14 @@ def _types_declare(args: argparse.Namespace) -> int:
             ("a declaration string", args.declaration is not None),
         ) if present
     ]
-    if not provided:
-        raise BridgeError("Provide a declaration string, --file, or --stdin")
-    if len(provided) > 1:
-        raise BridgeError(
-            f"Provide exactly one declaration source, but got {len(provided)}: "
-            f"{', '.join(provided)}."
-        )
+    with _mutation_preflight(args):
+        if not provided:
+            raise BridgeError("Provide a declaration string, --file, or --stdin")
+        if len(provided) > 1:
+            raise BridgeError(
+                f"Provide exactly one declaration source, but got {len(provided)}: "
+                f"{', '.join(provided)}."
+            )
     source_path = None
     if args.file is not None:
         if not args.file.exists():
@@ -165,8 +166,9 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
     # any op is sent rather than letting the bridge "verify" a degenerate
     # unnamed field (#605). The bridge enforces the same contract for batch /
     # raw-socket callers.
-    if not args.new_name.strip():
-        raise BridgeError("new name must be non-empty")
+    with _mutation_preflight(args):
+        if not args.new_name.strip():
+            raise BridgeError("new name must be non-empty")
     return _mutate(
         args,
         "struct_field_rename",

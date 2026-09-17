@@ -55,6 +55,18 @@ def test_types_declare_passes_source_path_for_file_input(fake_transport, tmp_pat
     assert calls[-1]["params"]["source_path"] == str(declaration_file)
 
 
+def test_declaration_missing_file_is_not_a_semantic_refusal(fake_transport, capsys, tmp_path):
+    calls = fake_transport()
+    assert bn.cli.main(["types", "declare", "--file", str(tmp_path / "missing.h"),
+                        "--format", "json"]) == 2
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "status" not in payload
+    assert calls == []
+
+
 def test_proto_get_renders_prototype_text(fake_transport, capsys):
     fake_transport({"get_prototype": {
         "ok": True,
@@ -79,7 +91,7 @@ def test_types_declare_rejects_multiple_sources(fake_transport, capsys, tmp_path
     fake_transport()  # empty results -> any bridge call raises; rejection must precede it
 
     rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(f), "struct T { int b; };"])
-    assert rc == 2  # BridgeError -> exit 2
+    assert rc == 3
     assert "exactly one declaration source" in capsys.readouterr().err
 
 
@@ -112,12 +124,12 @@ def test_proto_get_splices_name_that_is_substring_of_return_type(monkeypatch, ca
 
 @pytest.mark.parametrize("bad_name", ["", "   "])
 def test_struct_field_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
-    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    """An empty/whitespace-only new name is refused client-side (exit 3) before
     any struct_field_rename op is sent -- mirrors _symbol_rename's guard (#605)."""
     calls = fake_transport({"struct_field_rename": {"ok": True, "result": {"preview": True}}})
 
     rc = bn.cli.main(["struct", "field", "rename", "--target", "123:1:7", "S", "old", bad_name])
 
-    assert rc == 2
+    assert rc == 3
     assert "new name must be non-empty" in capsys.readouterr().err
     assert [call["op"] for call in calls] == []

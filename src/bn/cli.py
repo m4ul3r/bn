@@ -7,6 +7,7 @@ import stat
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1403,6 +1404,21 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any]) -> int:
     return 0
 
 
+@contextmanager
+def _mutation_preflight(args: argparse.Namespace):
+    """Classify local operation checks only; keep I/O and routing outside."""
+    try:
+        yield
+    except BridgeError as exc:
+        args._mutation_call = True
+        raise BridgeError(
+            str(exc),
+            status="invalid_request",
+            requested=exc.requested,
+            observed={"request_sent": False},
+        ) from exc
+
+
 def _mutate(
     args: argparse.Namespace,
     op: str,
@@ -1429,10 +1445,9 @@ def _mutate(
     ``preview`` param so handlers don't each repeat ``"preview": bool(args.preview)``.
     Extra keyword args (e.g. ``bridge_writes_output``) pass through to ``_call``.
     """
-    # F3 exit-code scoping: an escaped `BridgeError` maps its `status` to exit
-    # 3 only for genuine mutation calls (this flag), never for a read op that
-    # happens to share a FAILED_MUTATION_STATUSES status string (e.g.
-    # "unsupported"/"invalid_request" on a read-only bridge op).
+    # Escaped failure statuses map to exit 3 only on mutation paths. Local
+    # semantic refusals enter through _mutation_preflight before reaching here;
+    # read/resolver errors and statusless transport faults keep exit 2.
     setattr(args, "_mutation_call", True)
     if preview is not None:
         params = {**params, "preview": preview}
@@ -2286,11 +2301,9 @@ def main(argv: list[str] | None = None) -> int:
                 status=status, requested=requested, observed=observed,
             ))
         print(msg, file=sys.stderr)
-        # #625: an escaped OperationFailure's status maps to exit 3 only for a
-        # genuine mutation call (`_mutate`-marked). dispatch() attaches `status`
-        # to every OperationFailure, including read/resolver ops that raise
-        # "unsupported"/"invalid_request" -- those keep exit 2 so a read-op
-        # failure's exit code does not silently widen alongside mutations.
+        # Escaped failure statuses map to exit 3 only for genuine mutation calls
+        # or local operation preflights. Read failures keep exit 2, even when
+        # they share the same status strings.
         # The status is COERCED before the lookup: a set membership test hashes
         # its left operand, and this handler is the last code that runs before a
         # failure becomes an exit code -- so a bridge answering with a structured

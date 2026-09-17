@@ -671,12 +671,11 @@ def test_exports_list_alias_routes_to_export_enumerator(fake_transport, capsys):
     pytest.param(None, "Manifest file not found", id="missing-file"),
     pytest.param("{not valid json", "Invalid JSON in manifest", id="invalid-json"),
     pytest.param('[{"op": "set_comment", "address": "0x1000", "comment": "x"}]', "must be a JSON object", id="bare-array"),
-    pytest.param('{"target": "x"}', '"ops" array', id="without-ops"),
 ])
 def test_batch_apply_file_clean_error(fake_transport, capsys, tmp_path, manifest, expected):
     # Bad manifest files must surface a clean BridgeError (exit 2), never a
     # client-side traceback (e.g. a bare array hitting _call's dict(params), #48).
-    fake_transport()
+    calls = fake_transport()
     if manifest is None:
         path = tmp_path / "no" / "such" / "manifest.json"
     else:
@@ -689,6 +688,7 @@ def test_batch_apply_file_clean_error(fake_transport, capsys, tmp_path, manifest
     err = capsys.readouterr().err
     assert expected in err
     assert "Traceback" not in err
+    assert calls == []
 
 
 @pytest.mark.parametrize("stdin, expected", [
@@ -700,7 +700,7 @@ def test_batch_apply_stdin_clean_error(monkeypatch, fake_transport, capsys, stdi
     import io
 
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
-    fake_transport()
+    calls = fake_transport()
 
     rc = bn.cli.main(["batch", "apply", "-"])
 
@@ -708,6 +708,31 @@ def test_batch_apply_stdin_clean_error(monkeypatch, fake_transport, capsys, stdi
     err = capsys.readouterr().err
     assert expected in err
     assert "Traceback" not in err
+    assert calls == []
+
+
+@pytest.mark.parametrize("manifest", [{}, {"ops": None}, {"ops": {}}])
+@pytest.mark.parametrize("from_stdin", [False, True])
+def test_batch_operation_shape_refusal_is_presend_invalid_request(
+        monkeypatch, fake_transport, capsys, tmp_path, manifest, from_stdin):
+    import io
+
+    raw = json.dumps(manifest)
+    if from_stdin:
+        monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+        source = "-"
+    else:
+        path = tmp_path / "manifest.json"
+        path.write_text(raw, encoding="utf-8")
+        source = str(path)
+    calls = fake_transport()
+    assert bn.cli.main(["batch", "apply", source, "--format", "json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["status"] == "invalid_request"
+    assert "ops" in payload["error"]
+    assert payload["observed"]["request_sent"] is False
+    assert calls == []
 
 
 

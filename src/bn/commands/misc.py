@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
-                   _mutation_exit_code, _non_negative_int, _out_path_is_process_local, _pick,
+                   _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
@@ -599,11 +599,12 @@ def _batch_apply(args: argparse.Namespace) -> int:
             f"{type(manifest).__name__}. (A bare list of ops should be wrapped as "
             f'{{"ops": [...]}}.)'
         )
-    if not isinstance(manifest.get("ops"), list):
-        raise BridgeError(
-            f'Manifest ({source}) must have an "ops" array (the list of '
-            f"operations to apply)."
-        )
+    with _mutation_preflight(args):
+        if not isinstance(manifest.get("ops"), list):
+            raise BridgeError(
+                f'Manifest ({source}) must have an "ops" array (the list of '
+                f"operations to apply)."
+            )
     # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and
     # naturally put that id in the manifest "target" -- but an instance id is a
     # bridge, not a target selector, so it gets rejected. When the manifest target

@@ -588,14 +588,14 @@ def test_symbol_rename_builds_preview_payload(fake_transport):
 
 
 def test_symbol_rename_rejects_empty_new_name(fake_transport, capsys):
-    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    """An empty/whitespace-only new name is refused client-side (exit 3) before
     any rename_symbol op is sent -- never accepted as a 'verified' degenerate
     rename that leaves the function unnamed (#363)."""
     calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
 
     rc = bn.cli.main(["symbol", "rename", "--target", "123:1:7", "mput", ""])
 
-    assert rc == 2
+    assert rc == 3
     assert "new name must be non-empty" in capsys.readouterr().err
     assert [call["op"] for call in calls] == []
 
@@ -606,20 +606,20 @@ def test_symbol_rename_rejects_whitespace_new_name(fake_transport, capsys):
 
     rc = bn.cli.main(["symbol", "rename", "--target", "123:1:7", "mput", "   "])
 
-    assert rc == 2
+    assert rc == 3
     assert "new name must be non-empty" in capsys.readouterr().err
     assert [call["op"] for call in calls] == []
 
 
 @pytest.mark.parametrize("bad_name", ["", "   "])
 def test_local_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
-    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    """An empty/whitespace-only new name is refused client-side (exit 3) before
     any local_rename op is sent -- mirrors _symbol_rename's guard (#605)."""
     calls = fake_transport({"local_rename": {"ok": True, "result": {"preview": True}}})
 
     rc = bn.cli.main(["local", "rename", "--target", "123:1:7", "sub_401000", "var_8", bad_name])
 
-    assert rc == 2
+    assert rc == 3
     assert "new name must be non-empty" in capsys.readouterr().err
     assert [call["op"] for call in calls] == []
 
@@ -3511,11 +3511,11 @@ def test_comment_get_requires_a_locator(capsys):
 
 def test_tag_add_rejects_function_with_data_scope(capsys):
     # --data-scope is address-based and can't be combined with --function; the
-    # CLI rejects the contradiction up front (BridgeError, exit 2) before any
+    # CLI rejects the contradiction up front (invalid_request, exit 3) before any
     # bridge round-trip, parity with the function/address "not both" check.
     rc = bn.cli.main(["tag", "add", "--target", "active", "--function", "main",
                       "--type", "Important", "--data-scope"])
-    assert rc == 2
+    assert rc == 3
     assert "data-scope" in capsys.readouterr().err.lower()
 
 
@@ -3713,7 +3713,7 @@ def test_comment_set_positional_address_conflicts_with_function(fake_transport, 
     # don't silently drop one.
     calls = fake_transport({"set_comment": _COMMENT_SET_OK})
     rc = bn.cli.main(["comment", "set", "0x1234", "a note", "--function", "main", "--target", "active"])
-    assert rc == 2
+    assert rc == 3
     assert not calls  # errored before reaching the bridge
 
 
@@ -3723,7 +3723,7 @@ def test_comment_set_too_many_positionals_gives_clear_error(fake_transport, caps
     # names the right form, and never reaches the bridge.
     calls = fake_transport({"set_comment": _COMMENT_SET_OK})
     rc = bn.cli.main(["comment", "set", "DoCommand", "0x403b69", "test note", "--target", "active"])
-    assert rc == 2
+    assert rc == 3
     assert not calls
     err = capsys.readouterr().err.lower()
     assert "comment set" in err and ("single address" in err or "--function" in err)
@@ -3733,7 +3733,7 @@ def test_comment_set_too_many_positionals_gives_clear_error(fake_transport, caps
 def test_comment_set_positional_and_flag_address_differ_conflicts(fake_transport):
     calls = fake_transport({"set_comment": _COMMENT_SET_OK})
     rc = bn.cli.main(["comment", "set", "0x1", "a note", "--address", "0x2", "--target", "active"])
-    assert rc == 2
+    assert rc == 3
     assert not calls
 
 
@@ -3742,8 +3742,83 @@ def test_comment_set_requires_address_or_function(fake_transport):
     # silently dropped value.
     calls = fake_transport({"set_comment": _COMMENT_SET_OK})
     rc = bn.cli.main(["comment", "set", "a note", "--target", "active"])
-    assert rc == 2
+    assert rc == 3
     assert not calls
+
+
+@pytest.mark.parametrize("argv", [
+    ["comment", "set", "orphan"],
+    ["comment", "delete"],
+    ["comment", "delete", "0x1000", "--function", "example"],
+    ["comment", "set", "0x1000", "note", "--address", "0x2000"],
+    ["comment", "set", "example", "0x1000", "note"],
+    ["symbol", "rename", "example", ""],
+    ["rename", "example", ""],
+    ["local", "rename", "example", "var", ""],
+    ["struct", "field", "rename", "Example", "old", ""],
+    ["types", "declare"],
+    ["types", "declare", "struct Example;", "--stdin"],
+    ["tag", "add", "--type", "Important"],
+    ["tag", "add", "--function", "example", "--type", "Important", "--data-scope"],
+    ["tag", "add", "0x1000", "--type", "Important", "--function", "example"],
+    ["tag", "add", "0x1000", "--type", "Important", "--address", "0x2000"],
+    ["tag", "remove"],
+    ["tag", "remove", "--type", "Important"],
+    ["tag", "remove", "0x1000", "--type", "Important", "--function", "example"],
+    ["tag", "remove", "0x1000", "--id", "example", "--address", "0x2000"],
+])
+def test_operation_preflight_refusals_are_structured_without_sending(
+        fake_transport, capsys, argv):
+    calls = fake_transport()
+    assert bn.cli.main(argv + ["--format", "json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["status"] == "invalid_request"
+    assert payload["error"]
+    assert payload["observed"]["request_sent"] is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("extra", [[], ["--format", "text"], ["--verbose"],
+                                  ["--summary"], ["--preview"], ["--format", "ndjson"]])
+def test_comment_presend_refusal_keeps_failure_across_output_modes(fake_transport, capsys, extra):
+    calls = fake_transport()
+    assert bn.cli.main(["comment", "set", "orphan"] + extra) == 3
+    captured = capsys.readouterr()
+    assert "location" in captured.err
+    assert calls == []
+
+
+@pytest.mark.parametrize("argv", [
+    ["comment", "get"],
+    ["comment", "get", "0x1000", "--function", "example"],
+    ["comment", "get", "0x1000", "--address", "0x2000"],
+    ["tag", "get"],
+    ["tag", "get", "0x1000", "--function", "example"],
+    ["tag", "get", "0x1000", "--address", "0x2000"],
+])
+def test_shared_locator_read_refusals_keep_exit_two(fake_transport, capsys, argv):
+    calls = fake_transport()
+    assert bn.cli.main(argv + ["--format", "json"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "status" not in payload
+    assert calls == []
+
+
+def test_comment_transport_fault_is_not_a_presend_refusal(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail(*args, **kwargs):
+        raise BridgeError("connection failed")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail)
+    assert bn.cli.main(["comment", "set", "--target", "active",
+                        "--function", "example", "note", "--format", "json"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "status" not in payload
+    assert "observed" not in payload
 
 
 # --- #291.1 review (m1): comment get/delete also accept a positional address ---

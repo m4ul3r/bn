@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _effective_limit, _mutate, _pick, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -31,8 +31,9 @@ def _symbol_rename(args: argparse.Namespace) -> int:
     # any op is sent rather than letting the bridge "verify" a degenerate
     # unnamed function (#363). The bridge enforces the same contract for batch /
     # raw-socket callers.
-    if not args.new_name.strip():
-        raise BridgeError("new name must be non-empty")
+    with _mutation_preflight(args):
+        if not args.new_name.strip():
+            raise BridgeError("new name must be non-empty")
     return _mutate(
         args,
         "rename_symbol",
@@ -122,16 +123,17 @@ def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, s
                       "entry-line note use the function's entry address instead."),
          ])
 def _comment_set(args: argparse.Namespace) -> int:
-    if getattr(args, "extra", None):
-        raise BridgeError(
-            "comment set takes one address and one (quoted) comment: "
-            "`comment set <addr> \"<text>\"`, or attach to a function with "
-            "`comment set --function <name> \"<text>\"`. A comment is set at a "
-            "single address, not at both a function and an address positionally; "
-            f"got extra argument(s): {' '.join(args.extra)!r}. "
-            "If the comment text has spaces, quote it as one argument."
-        )
-    address, function = _comment_locator(args, "set")
+    with _mutation_preflight(args):
+        if getattr(args, "extra", None):
+            raise BridgeError(
+                "comment set takes one address and one (quoted) comment: "
+                "`comment set <addr> \"<text>\"`, or attach to a function with "
+                "`comment set --function <name> \"<text>\"`. A comment is set at a "
+                "single address, not at both a function and an address positionally; "
+                f"got extra argument(s): {' '.join(args.extra)!r}. "
+                "If the comment text has spaces, quote it as one argument."
+            )
+        address, function = _comment_locator(args, "set")
     return _mutate(
         args,
         "set_comment",
@@ -165,7 +167,8 @@ def _comment_get(args: argparse.Namespace) -> int:
 @command("comment", "delete", help="Delete a comment", target=True, fmt="json",
          args=[preview_arg(), *mutation_output_args(), *_comment_locator_args()])
 def _comment_delete(args: argparse.Namespace) -> int:
-    address, function = _comment_locator(args, "delete")
+    with _mutation_preflight(args):
+        address, function = _comment_locator(args, "delete")
     return _mutate(
         args,
         "delete_comment",
@@ -235,8 +238,9 @@ def _local_rename(args: argparse.Namespace) -> int:
     # any op is sent rather than letting the bridge "verify" a degenerate
     # unnamed local (#605). The bridge enforces the same contract for batch /
     # raw-socket callers.
-    if not args.new_name.strip():
-        raise BridgeError("new name must be non-empty")
+    with _mutation_preflight(args):
+        if not args.new_name.strip():
+            raise BridgeError("new name must be non-empty")
     return _mutate(
         args,
         "local_rename",

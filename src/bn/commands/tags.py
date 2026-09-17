@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _effective_limit, _mutate, _pick, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_tag_types_text
 from ..transport import BridgeError
 
@@ -105,15 +105,16 @@ def _tag_add(args: argparse.Namespace) -> int:
         bn tag add --function sub_1000 --type Important --data "doc"
         bn tag add 0x1000 --type Library --data "libc" --data-scope
     """
-    address = _pick(args.address, args.address_flag, "tag address", required=False)
-    if address is not None and args.function is not None:
-        raise BridgeError("tag add takes an address or --function, not both")
-    if address is None and args.function is None:
-        raise BridgeError("tag add needs a location: an address or --function")
-    if args.function is not None and args.force_data:
-        raise BridgeError(
-            "tag add: --data-scope can't be combined with --function "
-            "(a function tag has no address); drop one")
+    with _mutation_preflight(args):
+        address = _pick(args.address, args.address_flag, "tag address", required=False)
+        if address is not None and args.function is not None:
+            raise BridgeError("tag add takes an address or --function, not both")
+        if address is None and args.function is None:
+            raise BridgeError("tag add needs a location: an address or --function")
+        if args.function is not None and args.force_data:
+            raise BridgeError(
+                "tag add: --data-scope can't be combined with --function "
+                "(a function tag has no address); drop one")
     return _mutate(
         args,
         "tag_add",
@@ -144,13 +145,14 @@ def _tag_remove(args: argparse.Namespace) -> int:
         bn tag remove 0x1000 --type Important
         bn tag remove --function sub_1000 --type Important --data "doc"
     """
-    address = _pick(args.address, args.address_flag, "tag address", required=False)
-    if args.tag_id is None and args.type is None:
-        raise BridgeError("tag remove needs --id, or --type with a location (address or --function)")
-    if args.tag_id is None and address is None and args.function is None:
-        raise BridgeError("tag remove by --type needs an address or --function")
-    if address is not None and args.function is not None:
-        raise BridgeError("tag remove takes an address or --function, not both")
+    with _mutation_preflight(args):
+        address = _pick(args.address, args.address_flag, "tag address", required=False)
+        if args.tag_id is None and args.type is None:
+            raise BridgeError("tag remove needs --id, or --type with a location (address or --function)")
+        if args.tag_id is None and address is None and args.function is None:
+            raise BridgeError("tag remove by --type needs an address or --function")
+        if address is not None and args.function is not None:
+            raise BridgeError("tag remove takes an address or --function, not both")
     return _mutate(
         args,
         "tag_remove",
