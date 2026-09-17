@@ -467,6 +467,53 @@ def test_start_headless_clears_global_when_start_raises(monkeypatch, tmp_path):
     assert module._bridge is None
 
 
+def test_start_rolls_back_a_failure_after_the_bind(monkeypatch, tmp_path):
+    """A start() that fails after binding must not leave a listener behind.
+
+    start() assigned `_server`, started the serve_forever daemon, and THEN
+    called _write_registry() with no rollback. A failure there (a full cache
+    filesystem is enough) raised out of start() and orphaned both the bound
+    socket and its thread -- and nothing could reap them: start_headless
+    publishes the module global only after start() returns, and _stop_bridge()
+    early-returns on None, so atexit had no handle either (#800).
+
+    Asserted on the resources the leak consists of -- the bound socket file, the
+    serving thread, the registry -- never on `_server`/`_thread`, because
+    whether stop() also clears those handles is #799's contract and this test
+    has to hold with or without that fix."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="rollback1")
+
+    created: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    def recording_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        created.append(thread)
+        return thread
+
+    monkeypatch.setattr(module.threading, "Thread", recording_thread)
+    monkeypatch.setattr(
+        inst, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError(28, "ENOSPC")),
+    )
+
+    with pytest.raises(OSError, match="ENOSPC"):
+        inst.start()
+
+    assert not inst.socket_path.exists(), "a bound socket file was left behind"
+    assert not inst.registry_path.exists()
+    assert created, "the serve thread was never started"
+    assert not created[0].is_alive(), "the serve_forever daemon thread leaked"
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        assert probe.connect_ex(str(inst.socket_path)) != 0
+    finally:
+        probe.close()
+
+
 def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)

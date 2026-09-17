@@ -1275,25 +1275,41 @@ class BinaryNinjaBridge:
         # this bind, no successor can have taken the paths (a successor's start()
         # refuses to displace ours, see above).
         self._instance_state_released = False
-        # #612: tighten the freshly-bound socket to owner-only. Even with the
-        # peercred check this is defense-in-depth (a wrong-uid peer can't even
-        # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
-        # platform that ignores Unix modes just keeps whatever bind() produced,
-        # but a chmod that actively FAILS is not swallowed -- on non-Linux, where
-        # the SO_PEERCRED peer check is skipped, this socket mode is the primary
-        # cross-user boundary, so a failure to restrict it must be surfaced (#612
-        # follow-up) rather than silently serving a world-accessible socket.
+        # Everything after the bind can fail (chmod is best-effort, but the
+        # thread can refuse to start and _write_registry() touches the disk).
+        # start() used to leave the bound socket and its serve_forever daemon
+        # thread behind on any such failure, and no handle could reap them:
+        # start_headless publishes the module global only after start() returns
+        # and _stop_bridge() early-returns on None (#800). Tear the half-started
+        # bridge down through the one path that owns that job -- stop() -- and
+        # report the original failure, not a teardown error.
         try:
-            os.chmod(self.socket_path, 0o600)
-        except OSError as exc:
-            bn.log_warn(
-                f"BN Agent Bridge: could not restrict socket {self.socket_path} "
-                f"to owner-only 0o600 ({exc}); on a platform without the "
-                "SO_PEERCRED peer check this socket may be reachable by other users"
-            )
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        self._write_registry()
+            # #612: tighten the freshly-bound socket to owner-only. Even with the
+            # peercred check this is defense-in-depth (a wrong-uid peer can't even
+            # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
+            # platform that ignores Unix modes just keeps whatever bind() produced,
+            # but a chmod that actively FAILS is not swallowed -- on non-Linux, where
+            # the SO_PEERCRED peer check is skipped, this socket mode is the primary
+            # cross-user boundary, so a failure to restrict it must be surfaced (#612
+            # follow-up) rather than silently serving a world-accessible socket.
+            try:
+                os.chmod(self.socket_path, 0o600)
+            except OSError as exc:
+                bn.log_warn(
+                    f"BN Agent Bridge: could not restrict socket {self.socket_path} "
+                    f"to owner-only 0o600 ({exc}); on a platform without the "
+                    "SO_PEERCRED peer check this socket may be reachable by other users"
+                )
+            self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+            self._thread.start()
+            self._write_registry()
+        except BaseException:
+            # No load jobs can be queued yet, so the join in stop() has nothing
+            # to wait for; pass 0 so a failed start() does not block for the
+            # full load_join_timeout.
+            with contextlib.suppress(Exception):
+                self.stop(load_join_timeout=0)
+            raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
     def stop(self, *, load_join_timeout: float = 2.0):
