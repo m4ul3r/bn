@@ -5125,11 +5125,16 @@ class TaintEngine:
         if not caller_sites:
             return []
         results: list[dict[str, Any]] = []
-        if len(caller_sites) > MAX_CALLERS:
-            self._bw_note_caller_cap(func, len(caller_sites))
+        # The cap offers only the first MAX_CALLERS sites; ``ascended`` records how
+        # many of those the ascent actually followed, because an offered site still
+        # yields nothing when it has no call instruction at its recorded address,
+        # its caller is unlifted, or the sink's arg index is past the recovered
+        # arity (#810). The disclosure reports the measurement, never the constant.
+        considered = caller_sites[:MAX_CALLERS]
+        ascended: set[int] = set()
         for pidx, pvar in terminal_params.items():
             followed = False
-            for site in caller_sites[:MAX_CALLERS]:
+            for idx, site in enumerate(considered):
                 caller = getattr(site, "function", None)
                 if caller is None:
                     continue
@@ -5161,26 +5166,39 @@ class TaintEngine:
                             "crossed": [str(func.name)] + sub["crossed"],
                         })
                         followed = True
+                        ascended.add(idx)
             if not followed:
                 results.append({"steps": base_steps,
                                 "origin": {"kind": "parameter", "index": pidx, "var": var_label(pvar)},
                                 "crossed": []})
+        if len(caller_sites) > MAX_CALLERS:
+            self._bw_note_caller_cap(
+                func, len(caller_sites), len(considered), len(ascended))
         return results
 
-    def _bw_note_caller_cap(self, func: Any, total: int) -> None:
-        """Disclose that the caller ascent dropped sites past ``MAX_CALLERS`` (#810).
+    def _bw_note_caller_cap(self, func: Any, total: int, considered: int,
+                            followed: int) -> None:
+        """Disclose that the caller ascent dropped caller sites (#810).
 
-        ``_continue_into_callers`` follows only the first ``MAX_CALLERS`` caller
-        sites of a function whose slice bottoms out at a parameter; the rest were
-        dropped with an assumption string only -- prose no consumer can gate on, so
-        a capped ascent returned exactly the envelope of a complete one. Record the
-        truncation on the run (``stats.truncated``/``truncation_cause``, the pair
-        the forward side already carries, #579/#576) AND emit a blocking frontier
-        leaf into the existing ``leaves`` channel, so the dropped callers are
-        machine-readable in ``--format json`` and named in the text frontiers +
-        verdict lines. The assumption is kept: it is the human-readable half."""
-        dropped = int(total) - MAX_CALLERS
-        self._bw_assume(f"{func.name} has {total} callers; followed first {MAX_CALLERS}")
+        ``_continue_into_callers`` offers only the first ``MAX_CALLERS`` caller
+        sites of a function whose slice bottoms out at a parameter, and an offered
+        site still yields nothing when its recorded address carries no call
+        instruction, its caller is unlifted, the sink's arg index is past the
+        recovered arity, or the arg has no trackable scalar read. ``followed`` is
+        how many sites actually ascended -- reported as measured, never as the cap
+        constant, so a consumer gating on the count is not told the cap's coverage
+        when resolution lost most of it. The drop was previously an assumption
+        string only -- prose no consumer can gate on, so a capped ascent returned
+        exactly the envelope of a complete one. Record the truncation on the run
+        (``stats.truncated``/``truncation_cause``, the pair the forward side
+        already carries, #579/#576), emit a blocking frontier leaf into the
+        existing ``leaves`` channel so the loss is machine-readable in ``--format
+        json`` and named in the text frontiers + verdict lines, and keep the
+        assumption as the human-readable half carrying the same measurement."""
+        dropped = int(total) - int(followed)
+        unresolved = int(considered) - int(followed)
+        self._bw_assume(f"{func.name} has {total} callers; "
+                        f"caller ascent followed {followed}, capped at {MAX_CALLERS}")
         self._bw_truncated = True
         self._bw_truncation_causes.add("caller_cap")
         leaf = {
@@ -5189,11 +5207,13 @@ class TaintEngine:
             "function": {"name": str(getattr(func, "name", "?")),
                          "address": hex(int(getattr(func, "start", 0)))},
             "callers_total": int(total),
-            "callers_followed": MAX_CALLERS,
+            "callers_followed": int(followed),
             "callers_dropped": dropped,
-            "note": (f"caller-site cap: only the first {MAX_CALLERS} of {total} callers "
-                     f"were followed ({dropped} dropped) -- an origin reachable only "
-                     "from a dropped caller is missing from this slice"),
+            "note": (f"caller-site cap: the ascent followed {followed} of {total} "
+                     f"callers ({unresolved} of the {considered} sites the cap let "
+                     f"through could not be followed, {dropped - unresolved} left "
+                     "past the cap) -- an origin reachable only from an unfollowed "
+                     "caller is missing from this slice"),
         }
         if leaf not in self._bw_leaves:
             self._bw_leaves.append(leaf)

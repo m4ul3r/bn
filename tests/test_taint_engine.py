@@ -3860,7 +3860,59 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert "caller_sites_truncated" in BLOCKING_LEAF_KINDS
     # Only the followed callers contributed slices: the dropped 4 did not.
     assert len(result["slices"]) == 16
-    assert any("followed first 16" in a for a in result["assumptions"])
+    # The caveat names the MEASURED ascent (this fixture resolves every site, so
+    # it equals the cap) -- never the cap constant as if it were coverage.
+    assert any("caller ascent followed 16, capped at 16" in a
+               for a in result["assumptions"]), result["assumptions"]
+
+
+def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(models):
+    # #810 review round 1: the frontier's counts must be MEASURED, not the cap
+    # constant. A site whose recorded address carries no call instruction never
+    # ascends -- the same silent skip that made this cap worth a leaf at all -- so
+    # reporting the constant tells a count-gating consumer 80% coverage where the
+    # truth is 30%, and 0% in the degenerate case pinned below.
+    use_len, bv = _caller_fan_in_program(20)
+    for site in use_len.caller_sites[3:13]:      # 10 of the 16 in-cap sites
+        site.address = int(site.address) + 8     # -> no call instruction there
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
+    assert len(caps) == 1, result["leaves"]
+    assert caps[0]["callers_total"] == 20
+    assert caps[0]["callers_followed"] == 6
+    assert caps[0]["callers_dropped"] == 14
+    # The 6 resolvable sites are exactly the ones that produced slices.
+    assert len(result["slices"]) == 6
+    # The human-readable half must agree with the machine-readable one.
+    assert any("caller ascent followed 6, capped at 16" in a
+               for a in result["assumptions"]), result["assumptions"]
+    # ... and the real text frontier (what a human reads) prints the measurement
+    # the JSON carries, on an envelope that says INCOMPLETE.
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text(result)
+    assert "6 of 20 caller(s) followed; 14 dropped" in text
+    assert "verdict: INCOMPLETE" in text
+
+
+def test_backward_caller_cap_reports_a_zero_ascent_as_zero(models):
+    # #810 review round 1: with every in-cap site unresolvable, no caller ascends
+    # at all. The truncation must still be disclosed, and the frontier must report
+    # the measured 0 -- the value a falsy check would swallow into the constant.
+    use_len, bv = _caller_fan_in_program(20)
+    for site in use_len.caller_sites[:16]:
+        site.address = int(site.address) + 8
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
+    assert len(caps) == 1, result["leaves"]
+    assert caps[0]["callers_total"] == 20
+    assert caps[0]["callers_followed"] == 0
+    assert caps[0]["callers_dropped"] == 20
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
 
 
 def test_backward_under_caller_cap_stays_complete(models):
