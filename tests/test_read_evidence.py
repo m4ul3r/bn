@@ -559,6 +559,95 @@ def test_callsites_returns_empty_for_unreferenced_import_symbol(monkeypatch):
     assert result["total"] == 0
     assert result["callee_symbol_only"] is True
 
+
+def test_callsites_enumerates_import_callers_absent_from_the_code_ref_db(monkeypatch):
+    """#816: `xrefs` covers an import BN recorded no code ref for with a bounded
+    LLIL call scan (#622), but callsites enumerated its callers from the code-ref
+    DB alone -- so the same callee came back "no callers" here while `xrefs`
+    reported a confirmed call. That is the silent drop this op is not allowed to
+    have, on the path where it is hardest to notice: an empty list."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    symbol = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportAddressSymbol, 0x461746, "receive_record"
+    )
+    symbol.short_name = "receive_record"
+    caller = _FakeFunction(0x412470, "handle_packet")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124AE)]
+    caller.low_level_il = [[
+        _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746)),
+        _FakeLLILInstruction(0x4124A6, _FakeConstPtr(0x461746)),
+    ]]
+    bv = _FakeBV(
+        functions=[caller],
+        symbols=[symbol],
+        code_refs={},
+        instruction_lengths={0x4124A0: 5, 0x4124A5: 1, 0x4124A6: 5},
+        disassembly={
+            0x4124A0: "call receive_record",
+            0x4124A5: "nop",
+            0x4124A6: "call receive_record",
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(
+        "active", "receive_record", within_identifiers=[], context=1, limit=10
+    )
+
+    assert [row["call_addr"] for row in result["items"]] == ["0x4124a0", "0x4124a6"]
+    assert {row["containing_function"]["name"] for row in result["items"]} == {"handle_packet"}
+    # Both ops answer the same question on the same view, and now agree.
+    assert instance._xrefs(None, "receive_record")["code_ref_count"] == result["total"] == 2
+    assert result["callee_symbol_only"] is True
+    # A complete scan claims nothing it cannot back.
+    assert result["caller_scan_truncated"] is False
+    assert result["caller_scan_note"] is None
+
+
+def test_callsites_discloses_a_capped_caller_scan(monkeypatch):
+    """#816/#622: when the caller ENUMERATION is itself partial, every count under
+    it is a lower bound. Both consumers must say so -- JSON via
+    `caller_scan_truncated`/`caller_scan_note` and a `null` total, text via the
+    reason -- because a capped scan returning no rows is exactly the case that
+    would otherwise read as proof the callee is never called."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    symbol = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportAddressSymbol, 0x461746, "receive_record"
+    )
+    symbol.short_name = "receive_record"
+    unrelated = _FakeFunction(0x400000, "unrelated")
+    unrelated.low_level_il = [[_FakeLLILInstruction(0x400010, _FakeConstPtr(0x999999))]]
+    caller = _FakeFunction(0x412470, "handle_packet")
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(functions=[unrelated, caller], symbols=[symbol], code_refs={})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 1)
+    from bn.formatters import _render_callsites_text
+
+    result = instance._callsites(
+        "active", "receive_record", within_identifiers=[], context=1, limit=10
+    )
+
+    assert result["items"] == []
+    assert result["has_more"] is False
+    assert result["total"] is None
+    assert result["total_lower_bound"] == 0
+    # The row scan itself was not capped: the caller list below it was, and the
+    # two are separately disclosed.
+    assert result["scan_truncated"] is False
+    assert result["caller_scan_truncated"] is True
+    assert result["caller_total"] is None
+    assert isinstance(result["caller_scan_note"], str) and result["caller_scan_note"]
+
+    text = _render_callsites_text(result)
+    assert "the caller scan was incomplete" in text
+    assert "absence is not established" in text
+
+
 def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -35,6 +35,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import il_format
 from . import read_misc
+from . import read_xrefs
 from ._shared import (
     OperationFailure,
     _parse_address,
@@ -220,6 +221,54 @@ def _all_caller_functions(
     ]
 
 
+def _scan_caller_functions(
+    ctx, bv, callee_addresses: set[int]
+) -> tuple[list[tuple[str, Any]], bool, str | None]:
+    """Callers of *callee_addresses* recovered by scanning function LLIL.
+
+    #816: `_all_caller_functions` enumerates callers from BN's code-ref DB alone.
+    For an IMPORTED callee BN recorded no code ref for, `xrefs` covers exactly that
+    class with its own bounded LLIL call scan (#622) -- so enumerating from code
+    refs alone makes `callsites <import>` report "no callers" for a callee `xrefs`
+    reports a confirmed call to, which is the silent drop this op exists to avoid.
+    Reuse that scan (same budgets, same reasons) instead of a second walk.
+
+    Returns ``(scope_functions, truncated, note)``. *truncated* True means the
+    enumeration is PARTIAL -- the scan stopped on its budget or could not read
+    some LLIL -- so the caller set (and therefore every count below it) must
+    never be presented as complete; *note* names which happened.
+    """
+    callers: dict[int, Any] = {}
+    # The scan reports its hits as `caller_function` address/name pairs; the row
+    # builder needs the function OBJECTS, and it walks the same `bv.functions` the
+    # scan did, so index that instead of re-resolving each address.
+    by_start = {
+        int(getattr(function, "start", -1)): function
+        for function in (getattr(bv, "functions", None) or [])
+    }
+    truncated = False
+    notes: list[str] = []
+    for address in sorted(callee_addresses):
+        refs, scan_truncated, note = read_xrefs._scan_for_calls_to(ctx, bv, address)
+        truncated = truncated or scan_truncated
+        if note and note not in notes:
+            notes.append(note)
+        for ref in refs:
+            caller = ref.get("caller_function") or {}
+            try:
+                start = int(str(caller.get("address")), 16)
+            except (TypeError, ValueError):
+                continue
+            function = by_start.get(start)
+            if function is not None:
+                callers.setdefault(start, function)
+    scope_functions = [
+        (str(getattr(function, "name", "") or hex(start)), function)
+        for start, function in sorted(callers.items())
+    ]
+    return scope_functions, truncated, "; ".join(notes) if notes else None
+
+
 def _callsites(
     ctx,
     selector: str | None,
@@ -293,12 +342,23 @@ def _callsites(
         stub_addrs = frozenset(int(s.start) for s in ctx._same_name_stub_functions(bv, callee))
     except Exception:
         stub_addrs = frozenset()
+    caller_scan_truncated, caller_scan_note = False, None
     if within_identifiers:
         scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
     else:
         scope_functions = _all_caller_functions(
             bv, {int(callee.start), *stub_addrs}
         )
+        if not scope_functions and callee_symbol_only:
+            # #816: BN recorded no code ref to this imported callee, so the
+            # code-ref enumeration above can only answer "no callers" -- which is
+            # exactly the false certainty `xrefs` refuses to report for the same
+            # callee (it falls back to its #622 LLIL call scan). Enumerate the same
+            # way here, and carry the scan's truncation up so a partial caller list
+            # can never read as "not called".
+            scope_functions, caller_scan_truncated, caller_scan_note = (
+                _scan_caller_functions(ctx, bv, {int(callee.start), *stub_addrs})
+            )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
     variadic_hint = _callee_variadic_hint(callee)
@@ -331,6 +391,33 @@ def _callsites(
     # page validators (`src/bn/client.py` and
     # `skills/bn-kernel/src/bn_kernel/__init__.py`) enforce that monotonicity
     # across pages of one collection.
+    if caller_scan_truncated:
+        # #816: the caller ENUMERATION itself is partial (the #622-style LLIL call
+        # scan ran out of budget, or some IL could not be read), so every count
+        # derived from the caller set is a LOWER BOUND and none of it may be
+        # presented as complete -- same monotone-`total` contract as the row-scan
+        # cap below (#694 item 3), with the reason named so text and JSON alike
+        # disclose it. `has_more` stays a fact about THIS page (paging advances
+        # through what was found) rather than a promise about the missing tail.
+        result = read_misc._paged_list_result(
+            rows, offset=offset, limit=limit, kind="callsites"
+        )
+        result.update(
+            {
+                "total": None,
+                "total_lower_bound": len(rows),
+                "scan_truncated": scan_truncated,
+                "caller_scan_truncated": True,
+                "caller_scan_note": caller_scan_note,
+                "callers_scanned": callers_scanned,
+                # How many callers EXIST is what the scan was deciding; when it
+                # stopped early that number is unknown, not `len(scope_functions)`.
+                "caller_total": None,
+                "callee_symbol_only": callee_symbol_only,
+            }
+        )
+        return result
+
     if scan_truncated:
         assert limit is not None
         page = rows[offset:offset + limit]
@@ -344,6 +431,8 @@ def _callsites(
             "total_lower_bound": len(rows),
             "has_more": True,
             "scan_truncated": True,
+            "caller_scan_truncated": caller_scan_truncated,
+            "caller_scan_note": caller_scan_note,
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
@@ -355,6 +444,8 @@ def _callsites(
     result.update(
         {
             "scan_truncated": False,
+            "caller_scan_truncated": caller_scan_truncated,
+            "caller_scan_note": caller_scan_note,
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
