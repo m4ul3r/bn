@@ -599,6 +599,114 @@ def test_start_rolls_back_a_failure_inside_the_server_constructor(
     assert not inst.socket_path.exists(), "a bound socket file was left behind"
 
 
+# --------------------------------------------------------------------------
+# The #800 rollback under #799's ownership rule
+# --------------------------------------------------------------------------
+
+
+def test_start_rollback_unlinks_the_socket_before_it_releases_the_bind(
+    monkeypatch, tmp_path
+):
+    """The rollback's unlink has to be the last thing that frees the path.
+
+    Releasing the bind is what makes the socket path takeable: the instant
+    server_close() gives it up, a successor can prove the leftover stale, bind
+    and register. A rollback that closes first and unlinks after therefore walks
+    the very race #799 closes inside stop() -- it deletes the successor's socket
+    and leaves that bridge serving on an inode no client can name. The unlink
+    happens while the listener still holds the bind (shutdown() stops the loop
+    without releasing it), and nothing unlinks after it.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    successor: list[socket.socket] = []
+
+    class ReleasingServer(module.ThreadedUnixServer):
+        """Hands the path to a successor the instant our bind is released."""
+
+        def server_close(self):
+            super().server_close()
+            path = self.server_address
+            if os.path.exists(path):
+                # A successor proves the leftover stale, then binds and serves.
+                os.unlink(path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(path)
+            sock.listen(1)
+            successor.append(sock)
+
+    monkeypatch.setattr(module, "ThreadedUnixServer", ReleasingServer)
+    inst = module.BinaryNinjaBridge(instance_id="rollbackrace1")
+    monkeypatch.setattr(
+        inst, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError(28, "ENOSPC")),
+    )
+
+    try:
+        with pytest.raises(OSError, match="ENOSPC"):
+            inst.start()
+
+        assert successor, "the rollback never released the bind"
+        assert inst.socket_path.exists(), (
+            "the rollback unlinked the socket of a successor that bound the path "
+            "as soon as the bind was given up"
+        )
+        assert _socket_answers(inst.socket_path), "the successor's endpoint is dead"
+    finally:
+        for sock in successor:
+            sock.close()
+
+
+def test_stop_after_a_rolled_back_start_owns_nothing(monkeypatch, tmp_path):
+    """A stop() that reaches an instance whose start() rolled back owns no bind.
+
+    The rollback removed the socket file its own bind() made and clears
+    `_server`, so the instance has no endpoint left to take away and nothing to
+    shut down. #799's release path keys ownership off `_server`, so leaving the
+    closed handle set would make that stop() unlink the registry and the log
+    this start() never wrote -- they belong to whoever spawned the bridge -- and
+    then wait forever in BaseServer.shutdown() on a serve loop that never ran.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    real_thread = threading.Thread
+
+    class RefusingThread:
+        """Stands in for Thread.start() failing under resource exhaustion."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(module.threading, "Thread", RefusingThread)
+    inst = module.BinaryNinjaBridge(instance_id="rollback2")
+    inst.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    inst.registry_path.write_text('{"pid": 1}', encoding="utf-8")
+    log_path = inst.registry_path.with_suffix(".log")
+    log_path.write_text("earlier incarnation output\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        inst.start()
+    assert not inst.socket_path.exists(), "a bound socket file was left behind"
+
+    # A REAL thread drives stop(), so a wedged stop() fails this assertion
+    # instead of hanging the suite.
+    stopper = real_thread(target=inst.stop, daemon=True)
+    stopper.start()
+    stopper.join(timeout=5.0)
+
+    # The ownership rule first: these are the files a stop() that owes this
+    # instance nothing must leave exactly as it found them.
+    assert inst.registry_path.exists(), "stop() deleted a registry it never wrote"
+    assert log_path.exists(), "stop() deleted a log it never wrote"
+    assert inst.registry_path.read_text(encoding="utf-8") == '{"pid": 1}'
+    assert log_path.read_text(encoding="utf-8") == "earlier incarnation output\n"
+    assert not stopper.is_alive(), "stop() never returned"
+
+
 def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
