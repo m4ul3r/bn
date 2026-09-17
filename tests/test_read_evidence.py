@@ -3115,6 +3115,25 @@ def test_argument_mismatch_text_does_not_invent_unavailable_count_742(
     assert "argument(s) but" not in out
 
 
+@pytest.mark.parametrize("malformed_first", [True, False])
+def test_argument_mismatch_text_counts_are_row_local_742(monkeypatch, malformed_first):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[])
+    evidence = instance._function_evidence("active", "probe_device", context=0)
+    genuine_empty = evidence["calls"][0]
+    malformed = {**genuine_empty, "address": "0x401404", "arguments": {}}
+    evidence["calls"] = (
+        [malformed, genuine_empty] if malformed_first else [genuine_empty, malformed]
+    )
+
+    from bn.formatters import _render_function_evidence_text
+    out = _render_function_evidence_text(evidence)
+    assert "HLIL rendered 0 argument(s)" in out
+    assert "prototype declares 3" in out
+    assert "rendered a different argument count" in out
+
+
 def test_argument_confidence_missing_hlil_list_uses_mlil_provenance_742(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -2438,11 +2438,10 @@ def _render_function_evidence_text(value: Any) -> str:
                 # the whole evidence card (#619).
                 layer = str(source).upper() if source else "the rendered list"
                 # A missing/malformed list or discarded member supplies no exact
-                # count. Keep the mismatch visible without inventing a zero.
+                # count. Validate this row, not render-wide skew from other calls.
                 if (
                     isinstance(declared, int)
-                    and _field_present(call, "arguments")
-                    and not _field_skewed("arguments")
+                    and isinstance(call.get("arguments"), list)
                     and len(args) == len(argument_rows)
                 ):
                     note = (f"  arity: MISMATCH — {layer} rendered {len(args)} argument(s) but "
