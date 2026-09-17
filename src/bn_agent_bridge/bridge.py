@@ -1071,9 +1071,11 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, socket_path: str, handler, bridge):
+    def __init__(
+        self, socket_path: str, handler, bridge, *, bind_and_activate: bool = True
+    ):
         self.bridge = bridge
-        super().__init__(socket_path, handler)
+        super().__init__(socket_path, handler, bind_and_activate=bind_and_activate)
 
 
 # _STRING_TYPE_NAMES moved to read_misc.py with the strings op (#33).
@@ -1267,33 +1269,110 @@ class BinaryNinjaBridge:
                 )
             self.socket_path.unlink()
 
-        self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
-        # A fresh bind owns the discovery files again, so re-arm the one-shot
-        # (#799): the stop() that ends THIS bind must still remove them. Re-arming
-        # is safe because only start() does it, and start() binds only while no
-        # socket file is in the way -- so from here to the stop() that releases
-        # this bind, no successor can have taken the paths (a successor's start()
-        # refuses to displace ours, see above).
-        self._instance_state_released = False
-        # #612: tighten the freshly-bound socket to owner-only. Even with the
-        # peercred check this is defense-in-depth (a wrong-uid peer can't even
-        # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
-        # platform that ignores Unix modes just keeps whatever bind() produced,
-        # but a chmod that actively FAILS is not swallowed -- on non-Linux, where
-        # the SO_PEERCRED peer check is skipped, this socket mode is the primary
-        # cross-user boundary, so a failure to restrict it must be surfaced (#612
-        # follow-up) rather than silently serving a world-accessible socket.
+        # Everything after the bind can fail -- the bind and the listen below are
+        # taken as two explicit steps so that a failure between them lands here,
+        # the thread can refuse to start, and _write_registry() touches the disk.
+        # start() used to leave the bound socket and its serve_forever daemon
+        # thread behind on any such failure, and no handle could reap them:
+        # start_headless publishes the module global only after start() returns
+        # and _stop_bridge() early-returns on None (#800). Roll the half-started
+        # bridge back and report the ORIGINAL failure, never a teardown error.
+        #
+        # The rollback deliberately does NOT go through stop(). stop() assumes a
+        # bridge that served: its BaseServer.shutdown() waits on an event only
+        # serve_forever() ever sets, so routing a failure that happened before
+        # the serve loop existed there would hang start() forever instead of
+        # raising -- a worse outcome than the leak it replaced. And the registry
+        # and the log are the SPAWN's, not start()'s: _write_registry() publishes
+        # atomically (temp file + replace) and so has either not touched the
+        # registry at all when it raises, or already succeeded, and the log is
+        # the one `bn` is holding open to diagnose this very failure. Unlinking
+        # either would destroy a previous incarnation's crash trail, or the
+        # diagnostic for the failure being reported, for no gain. What start()
+        # actually created is the bound socket file and -- maybe -- a serve loop.
+        server = None
+        holds_bind = False
+        serving = False
         try:
-            os.chmod(self.socket_path, 0o600)
-        except OSError as exc:
-            bn.log_warn(
-                f"BN Agent Bridge: could not restrict socket {self.socket_path} "
-                f"to owner-only 0o600 ({exc}); on a platform without the "
-                "SO_PEERCRED peer check this socket may be reachable by other users"
+            # The bind and the listen are taken in two explicit steps. The
+            # constructor would do the pair itself and, when the second one
+            # fails, call server_close() ITSELF -- giving the bind up inside the
+            # constructor, before the rollback below can unlink, so a successor
+            # that took the freed path in between would have its socket deleted
+            # (#799). Held apart, the bind is still ours when that unlink runs;
+            # and `holds_bind` is set only once bind() has succeeded, so a bind
+            # that never happened leaves the path alone.
+            server = ThreadedUnixServer(
+                str(self.socket_path), BridgeHandler, self, bind_and_activate=False
             )
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        self._write_registry()
+            server.server_bind()
+            holds_bind = True
+            server.server_activate()
+            self._server = server
+            # A fresh bind owns the discovery files again, so re-arm the one-shot
+            # (#799): the stop() that ends THIS bind must still remove them. Re-arming
+            # is safe because only start() does it, and start() binds only while no
+            # socket file is in the way -- so from here to the stop() that releases
+            # this bind, no successor can have taken the paths (a successor's start()
+            # refuses to displace ours, see above).
+            #
+            # The rollback below clears `_server` again when start() fails, so a
+            # stop() that reaches an instance whose start() never returned takes
+            # #799's `_server is None` early return: what this bind owns is the
+            # socket file the rollback already removed, and the registry and the log
+            # belong to the spawn.
+            self._instance_state_released = False
+            # #612: tighten the freshly-bound socket to owner-only. Even with the
+            # peercred check this is defense-in-depth (a wrong-uid peer can't even
+            # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
+            # platform that ignores Unix modes just keeps whatever bind() produced,
+            # but a chmod that actively FAILS is not swallowed -- on non-Linux, where
+            # the SO_PEERCRED peer check is skipped, this socket mode is the primary
+            # cross-user boundary, so a failure to restrict it must be surfaced (#612
+            # follow-up) rather than silently serving a world-accessible socket.
+            try:
+                os.chmod(self.socket_path, 0o600)
+            except OSError as exc:
+                bn.log_warn(
+                    f"BN Agent Bridge: could not restrict socket {self.socket_path} "
+                    f"to owner-only 0o600 ({exc}); on a platform without the "
+                    "SO_PEERCRED peer check this socket may be reachable by other users"
+                )
+            self._thread = threading.Thread(target=server.serve_forever, daemon=True)
+            self._thread.start()
+            serving = True
+            self._write_registry()
+        except BaseException:
+            if serving:
+                # serve_forever() reads the shutdown request before it polls, so
+                # this also covers a thread still between start() and its first
+                # poll: it exits without ever accepting a connection.
+                with contextlib.suppress(Exception):
+                    server.shutdown()
+            # Unlink the socket path BEFORE server_close() gives the bind up, in
+            # the #799 order stop() documents: a successor can only take these
+            # paths once they are free, and nothing after this line unlinks
+            # anything, so the file removed here is provably the one this bind
+            # made rather than a successor's. shutdown() above stops the loop
+            # without releasing the bind -- server_close() is what does that, so
+            # the path is still ours while this runs. `holds_bind` gates it: a
+            # path this start() never bound is not ours to remove. start()
+            # cleared whatever sat at this path before binding it (only after
+            # proving nothing owned it), so a file at it is ours; the registry
+            # and the log above are the spawn's and are left alone.
+            if holds_bind:
+                with contextlib.suppress(OSError):
+                    self.socket_path.unlink()
+            if server is not None:
+                with contextlib.suppress(Exception):
+                    server.server_close()
+            # Clear the handle as well. The listener is closed by now, and a
+            # stop() on this instance would otherwise take #799's release path
+            # (unlinking the spawn's registry and log, which start() never owned)
+            # and then block forever in BaseServer.shutdown(), waiting on a serve
+            # loop that never ran.
+            self._server = None
+            raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
     def stop(self, *, load_join_timeout: float = 2.0):
