@@ -3164,7 +3164,7 @@ def test_virtual_call_warns_when_another_provider_body_could_not_be_decoded(monk
     assert len(out["candidates"]) == 1
     assert "unresolved_reason" not in out
     assert len(out["warnings"]) == 1
-    assert "could not be decoded" in out["warnings"][0]
+    assert "may be incomplete" in out["warnings"][0]
     assert "not fully scanned" not in out["warnings"][0]
 
 
@@ -3223,6 +3223,74 @@ def test_virtual_call_types_a_present_beyond_cap_index_that_holds_no_method(monk
     assert out["candidates"] == []
     assert out["unresolved_reason_code"] == "slot_present_no_method"
     assert "70" in out["unresolved_reason"]
+
+
+def test_virtual_call_reports_a_view_with_no_provider_table_to_search(monkeypatch):
+    # #822 review (round 3): NOTHING was searched -- this view yields no RTTI
+    # class with a vtable at all (stripped/imported RTTI) -- so
+    # `slot_not_present` ("a provider's table was READ and genuinely ends before
+    # the index") claimed an absence the command never established. The
+    # "unsearched is unknown" rule has to hold for every trigger, not only the
+    # round-2 named pair.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+
+    class _BareView:
+        def get_symbols(self):
+            return []
+
+    class _BareCtx(_VcTableCtx):
+        def _resolve_view(self, s):
+            return _BareView()
+
+    out = re._resolve_virtual_call(_BareCtx({}), None, "0x1000")   # real discovery: {}
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_body_unresolved"
+    assert "5" in out["unresolved_reason"]
+
+
+def test_virtual_call_types_a_provider_class_without_a_located_vtable_as_unknown(monkeypatch):
+    # The other unsearched trigger: a provider class that is IN the view's map
+    # but has no vtable symbol to read (RTTI only). Its table was never
+    # searched, so nothing there proves the slot absent.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", lambda pv: {
+        "TypeinfoOnly": {"typeinfo": types.SimpleNamespace(address=0xB000)},
+    })
+
+    out = re._resolve_virtual_call(_VcTableCtx({}), None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["unresolved_reason_code"] == "vtable_body_unresolved"
+    assert "5" in out["unresolved_reason"]
+
+
+def test_virtual_call_warns_about_a_provider_class_without_a_located_vtable(monkeypatch):
+    # ...and a resolved set must say so too: the unsearched class could hold a
+    # competing implementation, so `resolved: true` must not imply that every
+    # provider was consulted.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", lambda pv: {
+        "Provider": {"vtable": types.SimpleNamespace(address=0x9000)},
+        "TypeinfoOnly": {"typeinfo": types.SimpleNamespace(address=0xB000)},
+    })
+    ctx = _VcTableCtx({i: _vc_code_row(i) for i in range(8)})
+
+    out = re._resolve_virtual_call(ctx, None, "0x1000")
+    assert out["resolved"] is True
+    assert len(out["candidates"]) == 1
+    assert "unresolved_reason" not in out
+    assert len(out["warnings"]) == 1
+    assert "may be incomplete" in out["warnings"][0]
 
 
 def test_virtual_call_reports_probe_limit_rather_than_a_false_absence(monkeypatch):

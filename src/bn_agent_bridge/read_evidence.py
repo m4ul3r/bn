@@ -2627,24 +2627,34 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
     # entry that could not be read). Both leave the slot UNDECIDED, and the
     # disclosure below names which, so neither is ever reported as absent.
     undecided: str | None = None
-    # #822 review (round 2): two more shapes that say NOTHING about the slot and
-    # must not be typed as an absence either. `undecodable`: the provider's
-    # vtable address is known but its body was never decoded (word[1] is not a
-    # typeinfo -- the import/GOT and relocated-to-zero shapes), or reading the
-    # layout raised. `present_without_method`: the requested index EXISTS in a
-    # provider's table -- `class show` lists it as a slot -- but holds no
-    # callable target (a null/pure-virtual placeholder, or a cross-module entry).
-    undecodable = False
+    # #822 review (round 2 + 3): a provider that was never SEARCHED for this slot
+    # says nothing about it and must not be typed as an absence. Four triggers,
+    # all of them "there is no vtable here to read": the view's symbol map is
+    # empty (RTTI stripped or discovery failed), a class in it has no vtable
+    # symbol (defined in another module, or gone), the located table's body does
+    # not decode (word[1] is not a typeinfo -- the GOT / relocated-to-zero
+    # shapes), or reading it raised. `present_without_method` is the other
+    # direction: the requested index EXISTS in a provider's table -- `class show`
+    # lists it as a slot when it is interior -- but holds no callable target (a
+    # null/pure-virtual placeholder, the next object's padding, or a cross-module
+    # entry).
+    unsearched = False
     present_without_method = False
     for pv, pname in provider_views:
         try:
             maps = read_class._rtti_symbol_maps(pv)
         except Exception:
             maps = {}
+        if not maps:
+            # Nothing in this view has a vtable to read (#822 review round 3).
+            unsearched = True
         for cls_name, syms in maps.items():
             vt = syms.get("vtable")
             vt_addr = getattr(vt, "address", None) if vt is not None else None
             if vt_addr is None:
+                # A class with RTTI but no vtable symbol: its table was never
+                # located, let alone read (#822 review round 3).
+                unsearched = True
                 continue
             classes_total += 1
             if classes_scanned >= _VC_MAX_CLASSES:
@@ -2658,7 +2668,7 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
                 # A failed read of a table we know the address of: the slot was
                 # never searched here, so this provider says nothing about it
                 # (#822 review round 2) -- it must not fall through to "absent".
-                undecodable = True
+                unsearched = True
                 continue
             slot = next((s for s in layout.get("slots", []) if s.get("index") == slot_index), None)
             if slot is None and layout.get("scan_truncated"):
@@ -2707,13 +2717,14 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
                     # The provider's vtable address is known but its body was
                     # refused (not read and searched): nothing here says the slot
                     # is missing (#822 review round 2).
-                    undecodable = True
+                    unsearched = True
                 continue
             if not slot.get("method"):
-                # The index EXISTS -- `_vtable_layout` lists it as a slot -- but
-                # holds no callable target: a null / `__cxa_pure_virtual`
-                # placeholder, or a cross-module entry. Present, target
-                # unresolvable here; not "past the end of the table".
+                # The index holds something -- a null placeholder row, or a
+                # cross-module entry -- but no callable target. Whether that row
+                # is an interior placeholder or the next object's padding is not
+                # decided by this read, so the claim is "nothing resolvable
+                # here", never "the index does not exist".
                 present_without_method = True
                 continue
             m = slot["method"]
@@ -2774,21 +2785,22 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
                     f"slot {slot_index} could not be reached in at least one provider: its "
                     f"vtable scan stopped at an entry that could not be read, so the target "
                     f"method may exist rather than being genuinely absent")
-        elif undecodable:
-            # A provider table exists at a known address and was never decoded,
+        elif unsearched:
+            # At least one provider class had no vtable this command could read,
             # so the slot was not searched there: unknown, never absent.
             result["unresolved_reason_code"] = "vtable_body_unresolved"
             result["unresolved_reason"] = (
-                f"slot {slot_index} was not searched in at least one provider: that provider's "
-                f"vtable body could not be decoded (defined in another module, or applied at "
-                f"load time via relocations), so this slot is unknown rather than absent")
+                f"slot {slot_index} was not searched everywhere it could exist: at least one "
+                f"provider has no vtable this command could read (defined in another module, "
+                f"applied at load time via relocations, or no such symbol is present), so this "
+                f"slot is unknown rather than absent")
         elif present_without_method:
-            # The index is in the table but carries no callable target.
+            # Something is at the index but carries no callable target.
             result["unresolved_reason_code"] = "slot_present_no_method"
             result["unresolved_reason"] = (
-                f"slot {slot_index} exists in a provider's vtable but holds no resolved "
-                f"method -- a null/pure-virtual placeholder or a cross-module entry -- so it "
-                f"has no locally resolvable target")
+                f"slot {slot_index} holds no callable target in a provider's vtable -- a "
+                f"null/pure-virtual placeholder, the next object's padding, or a cross-module "
+                f"entry -- so nothing resolves locally at that index")
         else:
             result["unresolved_reason_code"] = "slot_not_present"
     else:
@@ -2805,10 +2817,10 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
                 f"in at least one OTHER provider that was not fully scanned for this "
                 f"slot -- it could supply an additional candidate not reflected in "
                 f"`resolved`/`ambiguous`")
-        if undecodable:
+        if unsearched:
             warnings.append(
-                f"resolution may be incomplete: at least one OTHER provider's vtable body "
-                f"could not be decoded, so it was never searched for slot {slot_index} -- it "
+                f"resolution may be incomplete: at least one OTHER provider has no vtable this "
+                f"command could read, so it was never searched for slot {slot_index} -- it "
                 f"could supply an additional candidate not reflected in "
                 f"`resolved`/`ambiguous`")
         if probe_limit is not None:
