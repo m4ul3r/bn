@@ -2522,6 +2522,99 @@ def test_virtual_call_slot_offset_own_instruction_commutative_790(monkeypatch):
     assert off == 0x18
 
 
+def test_virtual_call_folded_shape_keeps_factory_790(monkeypatch):
+    """#790: the def-walk must not run PAST the vtable pointer. On the folded
+    (-O2-style) shape the walk still visits the vtable var -- `[vtable + 0x18]`
+    with `vtable = [obj]` and `obj = factory()` -- so `base` must stay the
+    vtable VAR; ending on the vtable LOAD instead makes the factory trace below
+    read `_vc_var(<load>)`, get None, and drop the factory from a dispatch that
+    resolved it before #790. This is the half of the change that is meant to be
+    unchanged, hence asserted here rather than left to the slot-offset tests."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    _, obj_var = _vc_var_expr("rax", 1)
+    get_obj = _vc_expr("MLIL_CALL", dest=_vc_expr("MLIL_CONST_PTR", constant=0x4200),
+                       output=[obj_var], address=0x1000)
+    vt_expr, vt_var = _vc_var_expr("rcx", 2)
+    set_vt = _vc_expr("MLIL_SET_VAR", dest=vt_var,
+                      src=_vc_expr("MLIL_LOAD", src=_vc_var_expr("rax", 1)[0]),
+                      address=0x1004)
+    dest = _vc_expr("MLIL_LOAD", src=_vc_expr("MLIL_ADD", left=vt_expr,
+                                              right=_vc_expr("MLIL_CONST", constant=0x18)))
+    call = _vc_expr("MLIL_CALL", dest=dest, output=[], address=0x1008)
+    bv = types.SimpleNamespace(
+        get_symbol_at=lambda a: types.SimpleNamespace(short_name="get_instance",
+                                                      name="get_instance"))
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[get_obj, set_vt, call]), view=bv)
+
+    off, factory = re_mod._vc_slot_and_factory(caller, call, 8)
+
+    assert off == 0x18
+    assert factory == "get_instance", "the folded path's factory trace must survive the walk"
+
+
+def test_virtual_call_stacked_addends_resolve_790(monkeypatch):
+    """#790: stacked constant addends. `-O0` emits a vtable-base adjustment and
+    the slot offset as SEPARATE ADDs --
+
+        0x101000  a = vtable + 8     (base adjustment)
+        0x101004  b = a + 8          (base adjustment)
+        0x101008  c = b + 0x10       (the slot offset)
+        0x10100c  t = [c].q
+        0x101010  t(...)
+
+    so the slot really is at 0x20 (index 4). A walk bounded to a fixed handful of
+    hops sums only the tail, hands back a too-small offset, and the resolver then
+    names the provider method at the WRONG slot while still reporting
+    `resolved: true` -- the silently-wrong-answer class #790 is about. Asserted
+    through the resolver, because the wrong slot index is what a caller sees."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    vt_expr, vt_var = _vc_var_expr("rcx", 2)
+    a_expr, a_var = _vc_var_expr("a", 3)
+    set_a = _vc_expr("MLIL_SET_VAR", dest=a_var,
+                     src=_vc_expr("MLIL_ADD", left=vt_expr,
+                                  right=_vc_expr("MLIL_CONST", constant=8)),
+                     address=0x101000)
+    b_expr, b_var = _vc_var_expr("b", 4)
+    set_b = _vc_expr("MLIL_SET_VAR", dest=b_var,
+                     src=_vc_expr("MLIL_ADD", left=a_expr,
+                                  right=_vc_expr("MLIL_CONST", constant=8)),
+                     address=0x101004)
+    c_expr, c_var = _vc_var_expr("c", 5)
+    set_c = _vc_expr("MLIL_SET_VAR", dest=c_var,
+                     src=_vc_expr("MLIL_ADD", left=b_expr,
+                                  right=_vc_expr("MLIL_CONST", constant=0x10)),
+                     address=0x101008)
+    _, t_var = _vc_var_expr("t", 6)
+    set_t = _vc_expr("MLIL_SET_VAR", dest=t_var, src=_vc_expr("MLIL_LOAD", src=c_expr),
+                     address=0x10100c)
+    call = _vc_expr("MLIL_CALL", dest=_vc_var_expr("t", 6)[0], output=[], address=0x101010)
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[set_a, set_b, set_c, set_t, call]),
+        view=None)
+
+    class _Ctx:
+        def _resolve_view(self, s): return object()
+        def _pointer_size(self, b): return 8
+        def _find_function(self, b, addr, contained=True): return caller
+
+    monkeypatch.setattr(re, "_mlil_call_at", lambda c, a: call)
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {"slots": [
+                            {"index": 4, "method": {"name": "doWork", "address": "0x4200"}}]})
+
+    out = re._resolve_virtual_call(_Ctx(), None, "0x101010")
+
+    assert out["slot_offset"] == "0x20", "all stacked addends belong to the slot offset"
+    assert out["slot_index"] == 4
+    assert out["resolved"] is True
+    assert out["candidates"][0]["method"] == "doWork"
+
+
 # --- #530 Thumb-pointer miss count normalization -----------------------------
 
 class _ThumbSurfBV:
