@@ -7481,3 +7481,461 @@ def test_model_overlay_sources_folded_entry_keeps_model_count(monkeypatch, tmp_p
     folded2 = [s for s in sources2 if s["kind"] == "override_default"]
     assert len(folded2) == 1, sources2
     assert folded2[0]["count"] == 1, folded2[0]
+
+
+# --------------------------------------------------------------------------
+# #809: missing model families -- kernel user<->kernel copies, the parser string
+# searches, qsort/bsearch, and the multi-destination scanf family.
+#
+# The model DB is data, so every test here asserts a TAINT FLOW through a real
+# engine run rather than the DB's shape: the family is exercised on a synthetic
+# MLIL-SSA program and the model's effect is read where an agent would see it --
+# a reached sink, a frontier leaf, or the absence of the "external <name> has no
+# model" disclosure that marks a call as unanalyzed. At base (family unmodeled)
+# each claimed flow resolves to nothing: either no sink, or -- for a search call
+# whose RETURN the default policy taints conservatively anyway -- only that
+# unanalyzed-call disclosure. The tests that pin a flow therefore add
+# `unknown_call_policy="stop"`, where an unmodeled external propagates nothing at
+# all, so the flow can only come from the model.
+# --------------------------------------------------------------------------
+
+def _ext_call(index, addr, text, target, params, reads=(), writes=(),
+              dest_op="MLIL_CONST_PTR"):
+    """A direct MLIL_CALL_SSA to a constant target -- the shape the bridge passes
+    for a libc import (MLIL_CONST_PTR) or for a statically-linked kernel stub
+    (MLIL_EXTERN_PTR, which ``taint_il.const_target`` name-resolves to the model)."""
+    return FInstr(index, addr, "MLIL_CALL_SSA", text, reads=list(reads),
+                  writes=list(writes),
+                  dest=FExpr(dest_op, hex(target), constant=target),
+                  params=list(params))
+
+
+def _user_copy_in_func(name, *, arity):
+    """handler(uptr#0): <name>(&kbuf, uptr#0[, 0x40]); system(&kbuf).
+
+    The kernel copy-IN shape: the callee is an EXTERN_PTR stub (a .ko ``bl`` to a
+    kernel helper), the kernel-side destination is arg0 and the user pointer is
+    arg1. ``arity=3`` is copy_from_user's (dest, src, n); 2 is get_user's
+    (destination lvalue, user source)."""
+    kbuf = FVar("kbuf", typ="char[0x40]")
+    uptr = FVar("uptr")
+    uptr0 = FSSA(uptr, 0)
+    KERN, SYS = 0x900, 0x901
+    args = [FExpr("MLIL_ADDRESS_OF", "&kbuf", src=kbuf),
+            FExpr("MLIL_VAR_SSA", "uptr#0", reads=[uptr0])]
+    if arity == 3:
+        args.append(FExpr("MLIL_CONST", "0x40", constant=0x40))
+    instrs = [
+        _ext_call(0, 0x10, f"{name}(&kbuf, uptr#0)", KERN, args, reads=[uptr0],
+                  dest_op="MLIL_EXTERN_PTR"),
+        _ext_call(1, 0x14, "system(&kbuf)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&kbuf", src=kbuf)]),
+    ]
+    return FFunc("cfg_handler", 0x10, FSSAFunc(instrs), params=[uptr])
+
+
+@pytest.mark.parametrize("name,arity", [("copy_from_user", 3), ("get_user", 2)])
+def test_kernel_copy_in_models_source_the_kernel_buffer_809(models, name, arity):
+    # copy_from_user/get_user take an untrusted USER pointer and fill a
+    # kernel-side buffer, so the model SOURCES that buffer (``*arg:0``): the
+    # bytes are attacker-controlled no matter how the user pointer itself was
+    # computed -- the same reasoning as the read/recv/fread family. `--source
+    # call:<name>` presets exactly the model's declared outputs, so a missing
+    # model cannot even be posed (at base this raises "no taint-model sources to
+    # seed") and a wrongly-directed one seeds nothing here.
+    func = _user_copy_in_func(name, arity=arity)
+    bv = FBV({0x900: name, 0x901: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator(f"call:{name}")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+def _user_copy_out_func(name, *, value_arg0):
+    """handler(kbuf#0): <name>(&ubuf, &kbuf[, 0x40]); system(&ubuf).
+
+    The kernel copy-OUT shape. copy_to_user takes (user dst, kernel src, n);
+    put_user passes the VALUE as arg0 and the user destination pointer as arg1."""
+    ubuf = FVar("ubuf", typ="char[0x40]")
+    kbuf = FVar("kbuf", typ="char[0x40]")
+    kbuf0 = FSSA(kbuf, 0)
+    KERN, SYS = 0x900, 0x901
+    if value_arg0:
+        args = [FExpr("MLIL_VAR_SSA", "kbuf#0", reads=[kbuf0]),
+                FExpr("MLIL_ADDRESS_OF", "&ubuf", src=ubuf)]
+    else:
+        args = [FExpr("MLIL_ADDRESS_OF", "&ubuf", src=ubuf),
+                FExpr("MLIL_ADDRESS_OF", "&kbuf", src=kbuf),
+                FExpr("MLIL_CONST", "0x40", constant=0x40)]
+    instrs = [
+        _ext_call(0, 0x10, f"{name}(&ubuf, &kbuf)", KERN, args, reads=[kbuf0]),
+        _ext_call(1, 0x14, "system(&ubuf)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&ubuf", src=ubuf)]),
+    ]
+    return FFunc("fill_reply", 0x10, FSSAFunc(instrs), params=[kbuf])
+
+
+@pytest.mark.parametrize("name,value_arg0", [("copy_to_user", False), ("put_user", True)])
+def test_kernel_copy_out_models_are_direction_only_809(models, name, value_arg0):
+    # Both halves of the copy-OUT direction contract in ONE test, because each
+    # half alone is green without the model: `call:<name>` raises "no taint-model
+    # sources to seed" for an ABSENT key exactly as it does for a key that
+    # declares no source, and the propagation half alone would assert nothing
+    # when the key is missing. Together they pin the direction:
+    #  - the kernel buffer PROPAGATES into the user destination, so seeding the
+    #    kernel side (param:0) is what fills the user-visible buffer; and
+    #  - the pair declares no source of its own -- `--source call:<name>` presets
+    #    a model's declared sources, and symmetrizing copy_to_user/put_user with
+    #    copy_from_user/get_user would invent taint on every kernel->user copy,
+    #    the one direction error this family can make.
+    func = _user_copy_out_func(name, value_arg0=value_arg0)
+    bv = FBV({0x900: name, 0x901: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    with pytest.raises(te.TaintError):
+        te.TaintEngine(bv, models).forward(func, [te.parse_locator(f"call:{name}")])
+
+
+_SEARCH_ARITY_809 = {"strchr": 2, "strrchr": 2, "strstr": 2, "memchr": 3}
+
+
+def _search_func(callee, *, store_dest=False):
+    """parse(buf#0): p#1 = <callee>(&buf, ...); system(p#1).
+
+    The parser shape: the searched buffer is arg0 and the token the callee
+    RETURNS is what the rest of the parser consumes. ``store_dest=True`` points
+    the same sink at an unrelated, untouched buffer instead -- to show the model
+    does not taint a destination the function never writes."""
+    buf = FVar("buf", typ="char[0x40]")
+    p = FVar("p")
+    dst = FVar("dst", typ="char[0x40]")
+    p1 = FSSA(p, 1)
+    SEARCH, SYS = 0x900, 0x901
+    args = [FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+            FExpr("MLIL_CONST", "0x78", constant=0x78)]
+    if _SEARCH_ARITY_809[callee] == 3:
+        args.append(FExpr("MLIL_CONST", "0x40", constant=0x40))
+    tail = (_ext_call(1, 0x14, "system(&dst)", SYS,
+                      [FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)]) if store_dest else
+            _ext_call(1, 0x14, "system(p#1)", SYS,
+                      [FExpr("MLIL_VAR_SSA", "p#1", reads=[p1])], reads=[p1]))
+    instrs = [_ext_call(0, 0x10, f"p#1 = {callee}(&buf, ...)", SEARCH, args,
+                        writes=[p1]), tail]
+    return FFunc("parse", 0x10, FSSAFunc(instrs), params=[buf])
+
+
+@pytest.mark.parametrize("callee", sorted(_SEARCH_ARITY_809))
+def test_parser_search_models_propagate_the_return_809(models, callee):
+    # A search function RETURNS a pointer INTO the buffer it was given, so the
+    # edge is buffer -> return. Pinned under --unknown-call stop, where an
+    # unmodeled external propagates nothing at all: at base the token stays clean
+    # and the run reports a `unmodeled_callee` frontier instead of a sink.
+    func = _search_func(callee)
+    bv = FBV({0x900: callee, 0x901: "system"})
+    engine = te.TaintEngine(bv, models, unknown_call_policy="stop")
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+
+
+@pytest.mark.parametrize("callee", ["strchr", "strstr", "memchr"])
+def test_parser_search_models_taint_the_return_not_a_destination_809(models, callee):
+    # Anti-pattern guard: modelling a search as buffer -> destination would taint
+    # an output buffer the function never writes (and would lose the token, which
+    # is the value a parser actually keeps). The untouched destination must stay
+    # clean AND the call must no longer read as an unanalyzed external.
+    func = _search_func(callee, store_dest=True)
+    bv = FBV({0x900: callee, 0x901: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result
+    assert not any("has no model" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_strtok_r_saveptr_is_a_modeled_destination_809(models):
+    # strtok_r(str, delim, saveptr) also WRITES the next token pointer into the
+    # caller's saveptr, and the continuation call (str == NULL) tokenizes from it
+    # -- the one place in the search family where taint legitimately lands in a
+    # destination (`*arg:0 -> *arg:2`). Without that edge the saveptr slot stays
+    # clean: the conservative policy taints only the RETURN.
+    buf = FVar("buf", typ="char[0x40]")
+    sp = FVar("sp")
+    p = FVar("p")
+    sp0 = FSSA(sp, 0)
+    p1 = FSSA(p, 1)
+    STRTOK_R, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "p#1 = strtok_r(&buf, delim, &sp)", STRTOK_R,
+                  [FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&sp", src=sp)], writes=[p1]),
+        _ext_call(1, 0x14, "system(sp#0)", SYS,
+                  [FExpr("MLIL_VAR_SSA", "sp#0", reads=[sp0])], reads=[sp0]),
+    ]
+    func = FFunc("tokenize", 0x10, FSSAFunc(instrs), params=[buf])
+    bv = FBV({STRTOK_R: "strtok_r", SYS: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+def _qsort_func():
+    """sort_records(buf#0): qsort(&buf, 4, 8, cmp); system(&buf).
+
+    A keyable stack array, so the model's in/out edge resolves to the buffer."""
+    buf = FVar("buf", typ="char[0x40]")
+    QSORT, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "qsort(&buf, 4, 8, cmp)", QSORT,
+                  [FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                   FExpr("MLIL_CONST", "4", constant=4),
+                   FExpr("MLIL_CONST", "8", constant=8),
+                   FExpr("MLIL_CONST_PTR", "0x800", constant=0x800)]),
+        _ext_call(1, 0x14, "system(&buf)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    return FFunc("sort_records", 0x10, FSSAFunc(instrs), params=[buf])
+
+
+def test_qsort_model_keeps_the_array_tainted_and_analyzed_809(models):
+    # What a qsort MODEL buys for a keyable stack array: the call stops being an
+    # unanalyzed external frontier, so the array's flow is no longer cut there.
+    # Deliberately NOT claimed here: that the in/out edge is what preserves the
+    # array's taint. For a keyable buffer the engine's store/load model keeps it
+    # tainted either way, so an empty `{"qsort": {}}` model reproduces the two
+    # assertions below as well; the edge's own effect is observable only where
+    # the destination cannot be keyed, which is what
+    # test_qsort_unkeyable_array_pointer_discloses_the_write_809 pins. The
+    # counterfactual at the end keeps THIS test honest about the part it does
+    # own -- with the model key gone the frontier disclosure comes back, so the
+    # test cannot stay green without the model.
+    func = _qsort_func()
+    bv = FBV({0x900: "qsort", 0x901: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not any("has no model" in a for a in result["assumptions"]), result["assumptions"]
+
+    stopped = te.TaintEngine(bv, models, unknown_call_policy="stop")
+    result_stop = stopped.forward(func, [te.parse_locator("param:0")])
+    assert not [l for l in result_stop["leaves"] if l["kind"] == "unmodeled_callee"], result_stop["leaves"]
+    assert [s["sink"]["class"] for s in result_stop["reached_sinks"]] == ["command_injection"], result_stop
+
+    unmodeled = {k: v for k, v in models.items() if k != "qsort"}
+    gone = te.TaintEngine(bv, unmodeled, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [l["kind"] for l in gone["leaves"] if l["kind"] == "unmodeled_callee"] == ["unmodeled_callee"], gone["leaves"]
+
+
+def test_qsort_unkeyable_array_pointer_discloses_the_write_809(models):
+    # The "does not vanish silently" guarantee. When the array pointer is one the
+    # engine cannot key (here an opaque scalar parameter), the in/out edge cannot
+    # taint a tracked buffer, so the model must emit a coarse_memory_store
+    # frontier leaf and withhold the all-clear -- at base the same program
+    # reports nothing at all about the unkeyed write.
+    obj = FVar("obj")
+    obj0 = FSSA(obj, 0)
+    QSORT = 0x900
+    instrs = [
+        _ext_call(0, 0x10, "qsort(obj#0, 4, 8, cmp)", QSORT,
+                  [FExpr("MLIL_VAR_SSA", "obj#0", reads=[obj0]),
+                   FExpr("MLIL_CONST", "4", constant=4),
+                   FExpr("MLIL_CONST", "8", constant=8),
+                   FExpr("MLIL_CONST_PTR", "0x800", constant=0x800)], reads=[obj0]),
+    ]
+    func = FFunc("sort_records", 0x10, FSSAFunc(instrs), params=[obj])
+    bv = FBV({QSORT: "qsort"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
+    assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is False, result.get("diagnostics")
+
+    # ...and the in/out RULE is what produces that disclosure, not the mere
+    # presence of a `qsort` key: remove only the rule (key kept, propagates
+    # empty, i.e. an unmodelled in-place write) and the unkeyable destination is
+    # written with nothing recorded -- no frontier leaf, and the all-clear is
+    # handed back. So an empty `{"qsort": {}}` model does NOT reproduce this
+    # test, and the assertions above go red if the edge leaves the DB.
+    edgeless = {**models, "qsort": {"propagates": []}}
+    bare = te.TaintEngine(bv, edgeless).forward(func, [te.parse_locator("param:0")])
+    assert [l["kind"] for l in bare["leaves"]] == [], bare["leaves"]
+    assert (bare.get("diagnostics") or {}).get("safe_to_report_all_clear") is True, bare.get("diagnostics")
+
+
+def test_bsearch_model_propagates_base_taint_into_the_return_809(models):
+    # bsearch(key, base, ...) returns a pointer INTO base, exactly like the str*
+    # searches (the key only steers the lookup), so its model is base -> return.
+    # Pinned under --unknown-call stop: at base the located element never reaches
+    # the sink, the run discloses an unmodeled_callee frontier instead.
+    key = FVar("key", typ="char[0x10]")
+    base = FVar("base", typ="char[0x40]")
+    p = FVar("p")
+    key0 = FSSA(key, 0)
+    base0 = FSSA(base, 0)
+    p1 = FSSA(p, 1)
+    BSEARCH, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "p#1 = bsearch(&key, &base, 4, 8, cmp)", BSEARCH,
+                  [FExpr("MLIL_ADDRESS_OF", "&key", src=key),
+                   FExpr("MLIL_ADDRESS_OF", "&base", src=base),
+                   FExpr("MLIL_CONST", "4", constant=4),
+                   FExpr("MLIL_CONST", "8", constant=8),
+                   FExpr("MLIL_CONST_PTR", "0x800", constant=0x800)], writes=[p1]),
+        _ext_call(1, 0x14, "system(p#1)", SYS,
+                  [FExpr("MLIL_VAR_SSA", "p#1", reads=[p1])], reads=[p1]),
+    ]
+    func = FFunc("lookup_record", 0x10, FSSAFunc(instrs), params=[key, base])
+    bv = FBV({BSEARCH: "bsearch", SYS: "system"})
+    engine = te.TaintEngine(bv, models, unknown_call_policy="stop")
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+
+
+def _scanf_func(*, stream=False):
+    """read_cfg(): scanf(fmt, &a, &b) / fscanf(f, fmt, &a, &b); system(&b).
+
+    Two destinations, where the SECOND one (arg2 for scanf, arg3 for fscanf) is
+    the destination a single-destination model misses."""
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SCANF, SYS = 0x900, 0x901
+    args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[]),
+             FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)] if stream else
+            [FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)])
+    args += [FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+             FExpr("MLIL_ADDRESS_OF", "&b", src=b)]
+    instrs = [
+        _ext_call(0, 0x10, "scanf(fmt, &a, &b)", SCANF, args),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    return FFunc("read_cfg", 0x10, FSSAFunc(instrs), params=[])
+
+
+@pytest.mark.parametrize("callee,stream", [("scanf", False), ("fscanf", True)])
+def test_scanf_family_models_seed_every_destination_in_the_run_809(models, callee, stream):
+    # The scanf destinations are variadic POINTER args: `--source call:<callee>`
+    # presets every `sources.to` the model declares, so the second destination is
+    # seeded only if the model names it. At base scanf seeds *arg:1 alone (and
+    # fscanf *arg:2 alone), so a `%s` into the second destination never reaches
+    # the sink.
+    func = _scanf_func(stream=stream)
+    SCANF, SYS = 0x900, 0x901
+    bv = FBV({SCANF: callee, SYS: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator(f"call:{callee}")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+def test_sscanf_model_propagates_into_every_destination_in_the_run_809(models):
+    # sscanf reads from the caller's string (arg0) rather than a stream, so it
+    # PROPAGATES that buffer into each destination; the second destination is the
+    # one the single-destination model drops. At base only *arg:2 is written.
+    src = FVar("src", typ="char[0x40]")
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SSCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "sscanf(&src, fmt, &a, &b)", SSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("parse_cfg", 0x10, FSSAFunc(instrs), params=[src])
+    bv = FBV({SSCANF: "sscanf", SYS: "system"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+def test_sscanf_c99_spelling_is_not_bypassed_809(models):
+    # stdio.h REDIRECTs sscanf under __USE_ISOC99 and a real compiler emits
+    # `__isoc99_sscanf` for a source-level sscanf (verified on a linked binary
+    # with the local toolchain), so a family that models only the un-prefixed key
+    # is bypassed on exactly the binaries it targets -- which is the lock-step the
+    # scanf-family entry in the DB claims to keep. The SAME two-destination
+    # program must reach the sink whichever spelling the callee carries; pinned
+    # under --unknown-call stop, where an unmodeled external propagates nothing,
+    # so the flow can only come from the model.
+    src = FVar("src", typ="char[0x40]")
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SSCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "__isoc99_sscanf(&src, fmt, &a, &b)", SSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("parse_cfg", 0x10, FSSAFunc(instrs), params=[src])
+    bv = FBV({SSCANF: "__isoc99_sscanf", SYS: "system"})
+    result = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
+
+
+def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
+    # vsscanf's destinations live inside the va_list (arg2), which the engine
+    # cannot walk, so the model is deliberately the honest-partial shape readv
+    # already uses: the input buffer (arg0) propagates into the assigned-field
+    # count returned, and the destinations are NOT claimed. `--source
+    # call:vsscanf` must therefore fail loudly instead of returning a confident
+    # empty result for a va_list-driven parse.
+    src = FVar("src", typ="char[0x40]")
+    ap = FVar("ap")
+    n = FVar("n")
+    dst = FVar("dst")
+    src2 = FVar("src2")
+    ap0 = FSSA(ap, 0)
+    n1 = FSSA(n, 1)
+    VSSCANF, MEMCPY = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "n#1 = vsscanf(&src, fmt, ap#0)", VSSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_VAR_SSA", "ap#0", reads=[ap0])],
+                  reads=[ap0], writes=[n1]),
+        _ext_call(1, 0x14, "memcpy(&dst, &src2, n#1)", MEMCPY,
+                  [FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                   FExpr("MLIL_ADDRESS_OF", "&src2", src=src2),
+                   FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])], reads=[n1]),
+    ]
+    func = FFunc("parse_va", 0x10, FSSAFunc(instrs), params=[src, ap])
+    bv = FBV({VSSCANF: "vsscanf", MEMCPY: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:vsscanf:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["overflow_len"], result
+    # the seeded-return edge is the MODEL's (at base the same flow only exists as
+    # the default policy's blanket "unmodeled external" guess, disclosed as such)
+    assert not any("has no model" in a for a in result["assumptions"]), result["assumptions"]
+    with pytest.raises(te.TaintError):
+        engine.forward(func, [te.parse_locator("call:vsscanf")])
+
+    # ...and the same program spelled the way the compiler emits it: the twin
+    # must carry the MODEL's edge, not the default policy's blanket
+    # "unmodeled external" guess -- which is exactly what the "has no model"
+    # assumption above distinguishes.
+    twin_bv = FBV({VSSCANF: "__isoc99_vsscanf", MEMCPY: "memcpy"})
+    twin = te.TaintEngine(twin_bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in twin["reached_sinks"]] == ["overflow_len"], twin
+    assert not any("has no model" in a for a in twin["assumptions"]), twin["assumptions"]
+
+
+def test_new_809_model_keys_resolve_by_their_real_names_only(models):
+    # The #603 aliasing hazard, applied to the families #809 adds: a model keyed
+    # by a real libc/kernel name must never be handed to an unrelated same-named
+    # internal function. lookup_model's PRE-EXISTING decorations still resolve --
+    # `@plt`, and leading underscores (which is how a .ko's `__copy_from_user` /
+    # `__get_user` internal spellings reach these keys) -- but nothing else does:
+    # no suffix strip (`strchr64`, a user symbol that merely ends in "64") and no
+    # prefix/contains match (`user_strchr`) may borrow one.
+    for name in ("copy_from_user", "get_user", "copy_to_user", "put_user",
+                 "strchr", "strrchr", "strstr", "memchr", "strtok", "strtok_r",
+                 "strsep", "qsort", "bsearch", "vsscanf"):
+        assert te.lookup_model(models, name)[0] == name, name
+        assert te.lookup_model(models, f"__{name}")[0] == name, name
+        assert te.lookup_model(models, f"{name}@plt")[0] == name, name
+        assert te.lookup_model(models, f"{name}64")[0] is None, name
+        assert te.lookup_model(models, f"user_{name}")[0] is None, name
+        assert te.lookup_model(models, f"{name}_ex")[0] is None, name
