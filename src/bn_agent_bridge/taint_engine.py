@@ -3704,11 +3704,15 @@ class TaintEngine:
                     params = self._call_params(ins)
 
                     # 1+2) model-driven sink detection + propagation (shared helper).
-                    # `modeled_name` records that this site's model was applied HERE,
-                    # so the descent below does not apply it a second time. A model
-                    # whose callee has no name (or no target) cannot be looked up, so
-                    # `name` is exactly the model's key.
-                    modeled_name = name if model is not None else None
+                    # `modeled_key` records WHICH model was applied HERE, so the
+                    # descent below does not apply that model a second time. It is the
+                    # DB key `lookup_model` matched -- NOT the raw callee spelling:
+                    # one model key is reachable through several spellings
+                    # (`memcpy@plt`, `_memcpy`, a mangled/demangled pair), and the
+                    # descent re-looks-up the resolved body's own spelling, so a
+                    # raw-name comparison would read one model as two and apply it
+                    # twice at this one call site.
+                    modeled_key = mkey if model is not None else None
                     if model is not None:
                         mchanged, propagated = apply_model(ins, params, model, mkey, name)
                         if mchanged:
@@ -3816,7 +3820,7 @@ class TaintEngine:
                         # model on it still leaves the target's body unanalyzed.
                         descend_fn = cfn
                         descend_internal = cfn_internal
-                        if (md is None or nm == modeled_name) and cfn is not None \
+                        if (md is None or mk == modeled_key) and cfn is not None \
                                 and not cfn_internal:
                             resolved = self._follow_thunk_cached(cfn)
                             if resolved is not None and resolved is not cfn:
@@ -3851,13 +3855,13 @@ class TaintEngine:
                         # Both decisions are independent for the same reason the
                         # model branch no longer stops the walk (#807): a resolved
                         # target can be modeled AND have a body, and the model is an
-                        # overlay. `nm != modeled_name` keeps a model already applied
-                        # at this site from being applied twice.
-                        if md is not None and nm != modeled_name:
+                        # overlay. `mk != modeled_key` keeps the model already applied
+                        # at this site from being applied twice -- compared by KEY, so
+                        # two spellings of one model do not count as two models.
+                        if md is not None and mk != modeled_key:
                             mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
                             if mchanged:
                                 changed = True
-                            resolved_names.append(report_name)
                         if descend_internal:
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
@@ -3883,7 +3887,6 @@ class TaintEngine:
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
-                            resolved_names.append(report_name)
                         elif md is None:
                             # Genuinely unmodeled: no model here and none applied
                             # above, so the conservative external rule is the only
@@ -3914,7 +3917,13 @@ class TaintEngine:
                                 }
                                 if _stop_leaf not in leaves:
                                     leaves.append(_stop_leaf)
-                            resolved_names.append(report_name)
+                        # EXACTLY ONE entry per resolved CANDIDATE, so the append
+                        # sits after the branch chain rather than in each arm. Base
+                        # appended through three mutually-exclusive branches; the two
+                        # decisions are independent now (#807), so a target that is
+                        # both modeled and descended would otherwise be named twice in
+                        # the "resolved via ... to:" assumption (#290 pins its form).
+                        resolved_names.append(report_name)
 
                     if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
                         changed = True

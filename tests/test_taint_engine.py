@@ -1818,7 +1818,13 @@ def test_forward_modeled_in_binary_callee_body_still_descended_807():
     # and the finding is the callee's own, i.e. the walk really crossed the call
     assert any("app_read" in (st.get("reason") or "") for st in sinks[0]["path"])
     assert sinks[0]["metrics"]["fns_spanned"] == 2
-    assert not result.get("diagnostics", {}).get("safe_to_report_all_clear")
+    # The pre-fix false all-clear was the PAIR (reached_sinks == [], a zero-sink
+    # `diagnostics` block whose gate read true). A run WITH findings attaches no
+    # diagnostics block at all (it is minted only for unique_findings == []), so the
+    # gate cannot sit beside this finding. Asserting the block's absence is the
+    # honest form: the former `not ...get("safe_to_report_all_clear")` could never
+    # fail, because that key exists only on the run that reached nothing.
+    assert "diagnostics" not in result
 
 
 def test_forward_modeled_callee_body_descended_matches_unmodeled_807():
@@ -1882,6 +1888,96 @@ def test_forward_modeled_veneer_body_still_descended_807():
              if s["sink"]["class"] == "command_injection"]
     assert sinks, "the veneer's real body must still be descended behind a model"
     assert sinks[0]["metrics"]["fns_spanned"] == 2
+
+
+def _overlaid_wrapper_behind_decorated_veneer():
+    # The same overlay as above, but reached through the DECORATED spelling of the
+    # model's own key: the call site's symbol is `app_read@plt`, whose PLT stub
+    # tail-calls the in-binary body under the plain `app_read`. `lookup_model`
+    # resolves BOTH spellings to the one key `app_read` (that is what its alias
+    # ladder is for), which is the shape that made a raw-name guard read one model
+    # as two.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    body = FFunc("app_read", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "system(src#0)", reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+    veneer = FFunc("app_read@plt", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", "tailcall(0x402000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)),
+    ]), is_thunk=True)
+
+    cmd = FVar("cmd"); cmd0 = FSSA(cmd, 0)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "app_read@plt(&buf, cmd#0)",
+               reads=[buf1, cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x404000", constant=0x404000),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401200: "system", 0x402000: "app_read", 0x404000: "app_read@plt"},
+             funcs={0x402000: body, 0x404000: veneer})
+    return t5, bv
+
+
+def test_forward_modeled_callee_applied_once_per_site_807():
+    # A model is applied ONCE per call site. `lookup_model` resolves several
+    # spellings to one key, and the descent re-looks-up the resolved body under its
+    # OWN spelling -- so a guard comparing raw names let the very same model run
+    # twice at one instruction, narrating its propagation twice for one call.
+    overlay = {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    func, bv = _overlaid_wrapper_behind_decorated_veneer()
+    result = te.TaintEngine(bv, te.load_models(overlay)).forward(
+        func, [te.parse_locator("param:0")])
+
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+    # a veneer is not a body, so the decorated call site must still reach the real
+    # body behind it and the sink inside it
+    sinks = [s for s in result["reached_sinks"]
+             if s["sink"]["class"] == "command_injection"]
+    assert sinks, result["reached_sinks"]
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
+
+
+def test_forward_indirect_modeled_callee_names_target_once_807():
+    # The "resolved via ... to:" assumption names each resolved CANDIDATE once. With
+    # the model and the descent now independent decisions (#807), an arm-local
+    # append named a target that is both modeled and descended twice, breaking the
+    # single-canonical-name form #290 pins.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    d = FVar("d"); d0 = FSSA(d, 0)
+    s = FVar("s"); s0 = FSSA(s, 0)
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    wrapper = FFunc("wrappercopy", 0x4000, FSSAFunc([
+        FInstr(0, 0x4004, "MLIL_CALL_SSA", "memcpy(d#0, s#0, n#0)", reads=[d0, s0, n0],
+               writes=[], dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "d#0", reads=[d0]),
+                       FExpr("MLIL_VAR_SSA", "s#0", reads=[s0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[d, s, n])
+    handler = FFunc("handler", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "[slot#1](d, s, n#0)", reads=[slot1, n0],
+               writes=[], dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[n])
+    bv = FBV({0x1080: "memcpy"}, funcs={0x4000: wrapper})
+    models = te.load_models(
+        {"wrappercopy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}})
+    result = te.TaintEngine(bv, models, resolve_map={"0x3008": ["0x4000"]}).forward(
+        handler, [te.parse_locator("param:0")])
+
+    via = [a for a in result["assumptions"] if "resolved via" in a and " to: " in a]
+    assert len(via) == 1, via
+    assert via[0].endswith("to: wrappercopy"), via[0]
 
 
 def _recv_sink_func():
