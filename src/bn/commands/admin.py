@@ -254,6 +254,67 @@ def _plugin_install(args: argparse.Namespace) -> int:
     return 0
 
 
+# Bytecode an install never writes, but that importing the installed plugin or
+# skill in place leaves behind. One list for both halves of `_install_tree`:
+# what `copytree` refuses to copy, and what `--force` may find in a
+# destination and still call this install's own.
+_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+
+
+def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
+    """Why `--force` must not remove directory `dest`, or None when it may.
+
+    `--dest` is caller-supplied, so `--force` used to `shutil.rmtree` whatever
+    was there -- unrelated user data included (#766). A directory is only
+    replaceable when it is provably this artifact's own: empty, or a previous
+    install of `source` (its own installed layout, plus the bytecode caches
+    importing it in place leaves behind). Everything else is refused with the
+    deliberate alternative named, the same "refuse and name the escape hatch"
+    shape as the bridge's destructive-op gate, rather than learned from a
+    half-populated install.
+
+    The structural refusals come first because they hold even for an EMPTY
+    destination: a filesystem root, the home directory, or a directory
+    containing the bn cache/skill roots -- removing it takes the instance
+    registry, sticky pins and every other installed skill with it -- is never
+    an install destination. Paths are compared resolved, so a symlinked
+    ancestor cannot smuggle the rmtree past the check (`dest` itself is
+    unlinked un-followed by the caller, before this runs).
+    """
+    resolved = dest.resolve()
+    if resolved == resolved.parent:
+        return "it is a filesystem root"
+    if resolved == Path.home().resolve():
+        return "it is your home directory"
+    for root in (
+        cli.cache_home(),
+        cli.claude_skills_dir(),
+        cli.codex_skills_dir(),
+        cli.omp_skills_dir(),
+    ):
+        if root.resolve().is_relative_to(resolved):
+            return f"it contains the bn installation root {root}"
+    source_resolved = source.resolve()
+    if resolved.is_relative_to(source_resolved) or source_resolved.is_relative_to(
+        resolved
+    ):
+        return f"it overlaps the install source {source}"
+
+    entries = list(dest.iterdir())
+    if not entries:
+        return None
+    names = [entry.name for entry in entries]
+    own = {entry.name for entry in source.iterdir()}
+    ignored = set(_IGNORED_INSTALL_ENTRIES(str(source), names))
+    foreign = sorted(name for name in names if name not in own and name not in ignored)
+    if foreign:
+        return (
+            "it is not this install's own destination "
+            f"({', '.join(foreign)} was not created by it)"
+        )
+    return None
+
+
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
@@ -266,14 +327,19 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         if dest.is_symlink() or dest.is_file():
             dest.unlink()
         else:
+            refusal = _unsafe_replace_reason(dest, source)
+            if refusal is not None:
+                raise BridgeError(
+                    f"Refusing to replace {dest} with --force: {refusal}. "
+                    "--force replaces this install's own destination (an empty "
+                    "directory, or a previous install of the same artifact), "
+                    "never an unrelated path. Move it aside by hand and re-run "
+                    "if that is what you want."
+                )
             shutil.rmtree(dest)
 
     if mode == "copy":
-        shutil.copytree(
-            source,
-            dest,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-        )
+        shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
     else:
         os.symlink(source, dest, target_is_directory=True)
 

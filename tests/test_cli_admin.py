@@ -232,6 +232,107 @@ def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path)
     assert rc == 2
 
 
+def test_plugin_install_force_refuses_an_unrelated_destination(tmp_path, capsys):
+    # #766: `--dest` is caller-supplied, so --force used to shutil.rmtree
+    # whatever was there. It may only replace a destination this install
+    # provably owns, and must refuse with the deliberate alternative named.
+    destination = tmp_path / "user-data"
+    (destination / "sub").mkdir(parents=True)
+    (destination / "keepme.txt").write_text("irreplaceable")
+    (destination / "sub" / "notes.txt").write_text("also irreplaceable")
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / "keepme.txt").read_text() == "irreplaceable"
+    assert (destination / "sub" / "notes.txt").read_text() == "also irreplaceable"
+    assert not (destination / "bridge.py").exists()
+    assert "Refusing to replace" in capsys.readouterr().err
+
+
+def test_skill_install_force_refuses_an_unrelated_destination(tmp_path):
+    # Same guard, reached through the other `_install_tree` caller.
+    destination = tmp_path / "skill-store"
+    (destination / "bn").mkdir(parents=True)
+    (destination / "bn" / "keepme.txt").write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / "bn" / "keepme.txt").read_text() == "irreplaceable"
+    assert not (destination / "bn" / "SKILL.md").exists()
+
+
+def test_force_refuses_a_destination_that_contains_the_cache_root(tmp_path, monkeypatch):
+    # Empty, so only the confinement check can refuse it: wiping the cache
+    # root's parent takes the instance registry and the sticky pins with it.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / ".cache" / "bn"))
+    destination = tmp_path / ".cache"
+    destination.mkdir(parents=True)
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert destination.is_dir()
+    assert not (destination / "bridge.py").exists()
+
+
+def test_force_refuses_the_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(tmp_path), "--force"]
+    )
+
+    assert rc == 2
+    assert tmp_path.is_dir()
+    assert not (tmp_path / "bridge.py").exists()
+
+
+def test_force_reinstalls_over_this_install_s_own_previous_copy(tmp_path):
+    destination = tmp_path / "store" / "bn_agent_bridge"
+
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    # Importing the installed plugin in place leaves a bytecode cache the copy
+    # never wrote; the destination is still this install's own.
+    (destination / "__pycache__").mkdir()
+    (destination / "bridge.py").write_text("# PRIOR-INSTALL-MARKER\n")
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert "PRIOR-INSTALL-MARKER" not in (destination / "bridge.py").read_text()
+
+
+def test_force_installs_into_an_empty_destination(tmp_path):
+    destination = tmp_path / "empty-destination"
+    destination.mkdir()
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert (destination / "bridge.py").exists()
+
+
+def test_force_unlinks_a_symlink_destination_without_following_it(tmp_path):
+    real = tmp_path / "real-directory"
+    real.mkdir()
+    (real / "keepme.txt").write_text("irreplaceable")
+    destination = tmp_path / "linked-destination"
+    destination.symlink_to(real, target_is_directory=True)
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert (real / "keepme.txt").read_text() == "irreplaceable"
+    assert not destination.is_symlink()
+
 
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
     import bn.paths as paths
