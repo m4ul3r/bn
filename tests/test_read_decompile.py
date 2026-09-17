@@ -214,6 +214,165 @@ def test_function_disasm_reports_unreadable_instead_of_bare_byte_directive(monke
     assert text.startswith("0x1000")
 
 
+def _thumb_it_disasm_bv_741():
+    # Physical text lengths differ from the IT instruction-info span. The
+    # 32-bit move also rules out a fixed two-byte stepping workaround.
+    rows = [
+        (0x1000, bytes.fromhex("14bf"), "ite ne"),
+        (0x1002, bytes.fromhex("4ff00203"), "mov.w r3, #2"),
+        (0x1006, bytes.fromhex("0023"), "movs r3, #0"),
+        (0x1008, bytes.fromhex("7047"), "bx lr"),
+    ]
+    arch = _FakeArch(
+        {0x1000: 8, 0x1002: 4, 0x1006: 2, 0x1008: 2}, name="thumb2"
+    )
+
+    def get_instruction_text(data, address):
+        for addr, raw, text in rows:
+            if address == addr:
+                return [text], len(raw)
+        return [], 0
+
+    arch.get_instruction_text = get_instruction_text
+    function = _FakeFunction(0x1000, "thumb_guard", arch=arch)
+    function.basic_blocks = [
+        _FakeBasicBlock(0x1008, 0x100A),
+        _FakeBasicBlock(0x1000, 0x1008),
+    ]
+    bv = _FakeBV(
+        functions=[function],
+        arch=arch,
+        memory={0x1000: b"".join(raw for _, raw, _ in rows) + b"\xff"},
+    )
+    return bv, function, rows
+
+
+def test_function_disasm_thumb_it_physical_rows_and_slice_741(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, function, rows = _thumb_it_disasm_bv_741()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._disasm(None, function.name)
+    expected = [
+        [hex(addr), *raw.hex(" ").split(), *text.split()]
+        for addr, raw, text in rows
+    ]
+    assert [line.split() for line in result["text"].splitlines()] == expected
+    assert result["total_lines"] == result["returned_lines"] == 4
+
+    sliced = instance._disasm(
+        None, function.name, line_start=2, line_end=3, strict_range=True
+    )
+    assert [line.split() for line in sliced["text"].splitlines()] == expected[1:3]
+    assert sliced["total_lines"] == 4
+    assert sliced["returned_lines"] == 2
+
+
+def test_structured_disasm_thumb_it_keeps_predicated_rows_741(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv, function, rows = _thumb_it_disasm_bv_741()
+
+    entries = bridge.il_format._structured_disasm_entries(bv, function)
+    assert entries == [
+        {"address": hex(addr), "text": text, "_address_int": addr}
+        for addr, _, text in rows
+    ]
+    # Evidence callers receive the same two-field entry, not internal length
+    # metadata or a changed tuple return type.
+    assert bridge.il_format._disasm_entry(bv, 0x1000, arch=function.arch) == {
+        "address": "0x1000", "text": "ite ne",
+    }
+
+
+@pytest.mark.parametrize("mode", [None, "thumb"])
+def test_disasm_linear_thumb_it_count_stops_inside_block_741(monkeypatch, mode):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, function, _ = _thumb_it_disasm_bv_741()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.read_decompile.bn, "Architecture", {"thumb2": function.arch}, raising=False
+    )
+
+    result = instance._disasm(None, "0x1000", linear=2, mode=mode)
+    assert result["instruction_count"] == result["requested_count"] == 2
+    assert result["instructions"] == [
+        {"address": "0x1000", "bytes": "14 bf", "length": 2, "text": "ite ne"},
+        {"address": "0x1002", "bytes": "4f f0 02 03", "length": 4, "text": "mov.w r3, #2"},
+    ]
+
+
+def test_disasm_linear_thumb_it_byte_fallback_count_741(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _, rows = _thumb_it_disasm_bv_741()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._disasm(None, "0x1000", linear=5)
+    assert result["instruction_count"] == 5
+    assert result["instructions"] == [
+        {"address": hex(addr), "bytes": raw.hex(" "), "length": len(raw), "text": text}
+        for addr, raw, text in rows
+    ] + [{"address": "0x100a", "bytes": "ff", "length": 1, "text": ".byte 0xff"}]
+    # A byte directive consumes one count unit; it is not a decoded instruction.
+    assert ".byte" in result["note"] and "unit" in result["note"]
+
+
+def test_disasm_linear_thumb_it_boundaries_and_snap_741(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _, _ = _thumb_it_disasm_bv_741()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    at_boundary = instance._disasm(None, "0x1002", linear=1, snap_to_instruction=True)
+    assert at_boundary["boundary_warning"] is None
+    assert at_boundary["snapped_from"] is None
+    assert at_boundary["instructions"][0]["text"] == "mov.w r3, #2"
+
+    interior = instance._disasm(None, "0x1004", linear=1)
+    assert interior["boundary_warning"]["nearest_start_at_or_below"] == "0x1002"
+    assert interior["boundary_warning"]["nearest_start_above"] == "0x1006"
+
+    snapped = instance._disasm(None, "0x1004", linear=1, snap_to_instruction=True)
+    assert snapped["address"] == "0x1002"
+    assert snapped["snapped_from"] == "0x1004"
+    assert snapped["boundary_warning"] is None
+    assert snapped["instructions"][0]["bytes"] == "4f f0 02 03"
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["no-decode", "decoder-error"])
+def test_disasm_decoder_failure_preserves_mode_fallbacks_741(monkeypatch, raises):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    arch = _FakeArch(name="armv7")
+
+    def failed_decode(data, address):
+        if raises:
+            raise ValueError("synthetic decoder failure")
+        return None
+
+    arch.get_instruction_info = failed_decode
+    arch.get_instruction_text = failed_decode
+    bv = _FakeBV(
+        arch=arch, memory={0x1000: bytes.fromhex("00f020e3")},
+        disassembly={0x1000: "nop"}, instruction_lengths={0x1000: 4},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.read_decompile.bn, "Architecture", {"armv7": arch}, raising=False
+    )
+
+    lenient = instance._disasm(None, "0x1000", linear=1)
+    assert lenient["instructions"] == [
+        {"address": "0x1000", "bytes": "00 f0 20 e3", "length": 4, "text": "nop"},
+    ]
+    forced = instance._disasm(None, "0x1000", linear=1, mode="arm")
+    assert forced["instructions"] == [
+        {"address": "0x1000", "bytes": "00", "length": 1, "text": ".byte 0x00"},
+    ]
+
+
 def test_function_disasm_rejects_out_of_range_line_window(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -412,7 +571,7 @@ def test_disasm_linear_byte_fallback_on_undecodable(monkeypatch):
     # --linear at data is a primary use.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    # No disassembly entries -> _disasm_entry returns "" (the fake _FakeArch has
+    # No disassembly entries -> _disasm_instruction returns empty text (the fake _FakeArch has
     # no get_instruction_text), so every byte trips the .byte fallback.
     bv = _FakeBV(memory={0x1000: b"\xff\xfe\xfd"})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)

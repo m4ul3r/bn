@@ -389,25 +389,25 @@ def _render_disasm_text(value: Any) -> str:
                       "recovered instruction boundary, snap to the nearest valid start "
                       "at/below it (default: warn only)"),
          ],
-         # --lines and --count are two spellings of the same slice; one disasm
-         # line is one instruction, so --count N is the first N instructions
-         # (#291.2). Mutually exclusive -- combining a window and a count is
-         # ambiguous.
+         # --lines and --count are two spellings of the same row slice:
+         # --count N selects the first N function-listing rows (#291.2).
+         # Mutually exclusive -- combining a window and a count is ambiguous.
          mutex_groups=[
              mutex(False,
                    arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                        help="Show only lines START through END (1-indexed, inclusive)"),
                    arg("--count", "--limit", type=_positive_int, default=None, metavar="N",
                        dest="count",
-                       help="Show only the first N instructions (one instruction per line; "
-                            "--limit is an accepted alias)"),
+                       help="Show only the first N function-listing rows "
+                            "(--limit is an accepted alias)"),
                    # --linear is a different MODE, not a slice of a function: it
-                   # linearly disassembles N instructions from any mapped address,
+                   # linearly disassembles N units from any mapped address,
                    # even one BN left as data (a missed handler / vtable slot), so
                    # you can inspect the bytes before `function create` (#314).
                    arg("--linear", nargs="?", const=32, type=_positive_int, default=None, metavar="N",
-                       help="Linear-disassemble N instructions (default 32) from any mapped "
-                            "address, independent of function membership")),
+                       help="Linear-disassemble up to N units (default 32): one physical "
+                            "instruction or one undecodable byte (.byte) per unit, from "
+                            "any mapped address, independent of function membership")),
          ])
 def _disasm(args: argparse.Namespace) -> int:
     linear = getattr(args, "linear", None)
@@ -418,8 +418,8 @@ def _disasm(args: argparse.Namespace) -> int:
     if snap and linear is None:
         raise BridgeError("--snap-to-instruction applies only to --linear disassembly")
     if linear is not None:
-        # Linear mode: the bridge walks N instructions from the address and
-        # returns exactly that window, so there is no client-side slice and no
+        # Linear mode: the bridge walks up to N units from the address and
+        # returns that window, so there is no client-side slice and no
         # text-only restriction -- it works in JSON too.
         params: dict[str, Any] = {"identifier": args.identifier, "linear": int(linear)}
         if mode is not None:
