@@ -232,6 +232,377 @@ def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path)
     assert rc == 2
 
 
+def test_plugin_install_force_refuses_an_unrelated_destination(tmp_path, capsys):
+    # #766: `--dest` is caller-supplied, so --force used to shutil.rmtree
+    # whatever was there. It may only replace a destination this install
+    # provably owns, and must refuse with the deliberate alternative named.
+    destination = tmp_path / "user-data"
+    (destination / "sub").mkdir(parents=True)
+    (destination / "keepme.txt").write_text("irreplaceable")
+    (destination / "sub" / "notes.txt").write_text("also irreplaceable")
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / "keepme.txt").read_text() == "irreplaceable"
+    assert (destination / "sub" / "notes.txt").read_text() == "also irreplaceable"
+    assert not (destination / "bridge.py").exists()
+    assert "Refusing to replace" in capsys.readouterr().err
+
+
+def test_skill_install_force_refuses_an_unrelated_destination(tmp_path):
+    # Same guard, reached through the other `_install_tree` caller.
+    destination = tmp_path / "skill-store"
+    (destination / "bn").mkdir(parents=True)
+    (destination / "bn" / "keepme.txt").write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / "bn" / "keepme.txt").read_text() == "irreplaceable"
+    assert not (destination / "bn" / "SKILL.md").exists()
+
+
+def test_force_refuses_a_destination_that_contains_the_cache_root(tmp_path, monkeypatch):
+    # Empty, so only the confinement check can refuse it: wiping the cache
+    # root's parent takes the instance registry and the sticky pins with it.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / ".cache" / "bn"))
+    destination = tmp_path / ".cache"
+    destination.mkdir(parents=True)
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert destination.is_dir()
+    assert not (destination / "bridge.py").exists()
+
+
+def test_force_refuses_the_home_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Park every other guarded root outside the home directory, so the home
+    # rule itself -- not the root-containment rule -- is what refuses here.
+    elsewhere = tmp_path.parent / "guarded-roots"
+    monkeypatch.setattr(bn.cli, "cache_home", lambda: elsewhere / "cache", raising=False)
+    monkeypatch.setattr(
+        bn.cli, "claude_skills_dir", lambda: elsewhere / "claude", raising=False
+    )
+    monkeypatch.setattr(
+        bn.cli, "codex_skills_dir", lambda: elsewhere / "codex", raising=False
+    )
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(tmp_path), "--force"]
+    )
+
+    assert rc == 2
+    assert tmp_path.is_dir()
+    assert not (tmp_path / "bridge.py").exists()
+    assert "it is your home directory" in capsys.readouterr().err
+
+
+def test_force_reinstalls_over_this_install_s_own_previous_copy(tmp_path):
+    destination = tmp_path / "store" / "bn_agent_bridge"
+
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    # Importing the installed plugin in place leaves a bytecode cache the copy
+    # never wrote; the destination is still this install's own.
+    (destination / "__pycache__").mkdir()
+    (destination / "bridge.py").write_text("# PRIOR-INSTALL-MARKER\n")
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert "PRIOR-INSTALL-MARKER" not in (destination / "bridge.py").read_text()
+
+
+def test_force_installs_into_an_empty_destination(tmp_path):
+    destination = tmp_path / "empty-destination"
+    destination.mkdir()
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert (destination / "bridge.py").exists()
+
+
+def test_force_unlinks_a_symlink_destination_without_following_it(tmp_path):
+    real = tmp_path / "real-directory"
+    real.mkdir()
+    (real / "keepme.txt").write_text("irreplaceable")
+    destination = tmp_path / "linked-destination"
+    destination.symlink_to(real, target_is_directory=True)
+
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert (real / "keepme.txt").read_text() == "irreplaceable"
+    assert not destination.is_symlink()
+
+
+def test_force_refuses_a_destination_whose_entry_names_only_collide(tmp_path):
+    # Matching entry NAMES is not ownership: a user's own file sitting under a
+    # name the source also uses does not make the directory this install's.
+    source = bn.cli.plugin_source_dir()
+    colliding = next(entry.name for entry in sorted(source.iterdir()) if entry.is_file())
+    destination = tmp_path / "user-data"
+    destination.mkdir()
+    (destination / colliding).write_text("the user's own file\n")
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / colliding).read_text() == "the user's own file\n"
+
+
+def test_force_refuses_a_destination_holding_only_bytecode(tmp_path):
+    # Bytecode is tolerated inside a verified install, never evidence of one: a
+    # directory whose entries are all bytecode caches is refused, not wiped.
+    destination = tmp_path / "bytecode-only"
+    (destination / "__pycache__").mkdir(parents=True)
+    (destination / "__pycache__" / "stale.pyc").write_bytes(b"user bytecode")
+    (destination / "loose.pyc").write_bytes(b"user bytecode")
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / "loose.pyc").read_bytes() == b"user bytecode"
+
+
+def test_force_refuses_a_foreign_file_inside_a_source_named_directory(tmp_path):
+    # The source's own directory names are not a licence to recurse into them:
+    # a file the user added inside one makes the destination not ours.
+    skills_root = bn.cli.skills_source_dir()
+    skill = next(entry for entry in sorted(skills_root.iterdir()) if entry.is_dir())
+    nested = next(entry.name for entry in sorted(skill.iterdir()) if entry.is_dir())
+    destination_root = tmp_path / "skill-store"
+    destination = destination_root / skill.name
+    assert bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination_root)]
+    ) == 0
+    (destination / nested / "mine.md").write_text("the user's own file\n")
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination_root), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination / nested / "mine.md").read_text() == "the user's own file\n"
+
+
+def test_force_refuses_a_file_destination(tmp_path, capsys):
+    # A regular file where a directory install belongs is the user's file, not
+    # a previous install: --force used to unlink it and copy over the grave.
+    victim = tmp_path / "notes.txt"
+    victim.write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(victim), "--force"]
+    )
+
+    assert rc == 2
+    assert victim.read_text() == "irreplaceable"
+    assert "Refusing to replace" in capsys.readouterr().err
+
+
+def test_a_refused_skill_install_replaces_no_other_destination(tmp_path):
+    # The refusal is decided before anything is written, so one unsafe
+    # destination cannot leave the other destinations half-installed.
+    skills = sorted(
+        entry
+        for entry in bn.cli.skills_source_dir().iterdir()
+        if (entry / "SKILL.md").exists()
+    )
+    unsafe = skills[-1]
+    destination_root = tmp_path / "skill-store"
+    (destination_root / unsafe.name).mkdir(parents=True)
+    (destination_root / unsafe.name / "keepme.txt").write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination_root), "--force"]
+    )
+
+    assert rc == 2
+    assert (destination_root / unsafe.name / "keepme.txt").read_text() == "irreplaceable"
+    assert not (destination_root / skills[0].name).exists()
+
+
+def test_a_refused_skill_install_writes_nothing_for_a_spelled_destination(tmp_path):
+    # A destination spelled through a missing intermediate names the same
+    # directory the validated one does, and deciding that must not create the
+    # intermediate: the pre-pass used to approve "store/missing/.." (nothing
+    # there yet) and the per-destination install then replaced the skills it
+    # reached before refusing the unsafe one.
+    skills = sorted(
+        entry
+        for entry in bn.cli.skills_source_dir().iterdir()
+        if (entry / "SKILL.md").exists()
+    )
+    unsafe = skills[-1]
+    store = tmp_path / "store"
+    (store / unsafe.name).mkdir(parents=True)
+    (store / unsafe.name / "keepme.txt").write_text("irreplaceable")
+
+    rc = bn.cli.main(
+        [
+            "skill",
+            "install",
+            "--mode",
+            "copy",
+            "--dest",
+            str(store / "missing" / ".."),
+            "--force",
+        ]
+    )
+
+    assert rc == 2
+    assert (store / unsafe.name / "keepme.txt").read_text() == "irreplaceable"
+    assert not (store / skills[0].name).exists()
+    assert not (store / "missing").exists()
+
+
+def test_install_refuses_a_destination_inside_the_install_source(tmp_path, monkeypatch):
+    # Copying the artifact into its own source tree walks the copy being
+    # written, so a destination under the source is refused even though there
+    # is nothing there to remove yet.
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "bridge.py").write_text("PLUGIN = 1\n")
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source)
+
+    rc = bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(source / "nested"), "--force"]
+    )
+
+    assert rc == 2
+    assert sorted(entry.name for entry in source.iterdir()) == ["bridge.py", "sub"]
+
+
+def test_install_refuses_a_destination_whose_parent_is_a_file(tmp_path, capsys):
+    # A regular file where a parent directory belongs cannot be a destination
+    # path; the refusal is a clean exit 2, not a traceback out of main().
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory\n")
+
+    rc = bn.cli.main(
+        [
+            "plugin",
+            "install",
+            "--mode",
+            "copy",
+            "--dest",
+            str(blocker / "sub"),
+            "--force",
+        ]
+    )
+
+    assert rc == 2
+    assert blocker.read_text() == "not a directory\n"
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_force_replaces_a_symlink_install_that_points_at_the_source(tmp_path):
+    # The default `--mode symlink` install leaves a link at the destination that
+    # points at the install source. Replacing it removes the link, never the
+    # source: the link's target must not be read as the thing being replaced,
+    # or every re-install of a symlinked install refuses for good.
+    destination = tmp_path / "store" / "bn_agent_bridge"
+
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 0
+    assert destination.is_symlink()
+
+    assert bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--force"]
+    ) == 0
+    assert bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--mode", "copy", "--force"]
+    ) == 0
+    assert (bn.cli.plugin_source_dir() / "bridge.py").is_file()
+    assert not destination.is_symlink()
+
+
+def test_skill_install_force_replaces_its_own_symlink_installs(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "codex")
+
+    assert bn.cli.main(["skill", "install"]) == 0
+    assert (claude_root / "bn").is_symlink()
+
+    assert bn.cli.main(["skill", "install", "--force"]) == 0
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 0
+    assert (claude_root / "bn" / "SKILL.md").is_file()
+    assert not (claude_root / "bn").is_symlink()
+
+
+def test_skill_install_installs_a_shared_default_root_once(tmp_path, monkeypatch):
+    # Two default roots can name one directory -- a symlinked skills root, or an
+    # equal CLAUDE_HOME and CODEX_HOME. Each skill is installed there once: the
+    # second entry used to install nothing, exit 2, and leave the first root
+    # populated with only the skills it reached first.
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "skills").symlink_to(claude_root)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+
+    assert bn.cli.main(["skill", "install"]) == 0
+    assert (claude_root / "bn" / "SKILL.md").is_file()
+    assert (claude_root / "bn-vr" / "SKILL.md").is_file()
+    assert bn.cli.main(["skill", "install", "--force"]) == 0
+
+
+def test_skill_install_is_all_or_nothing_with_an_unwritable_root(tmp_path, monkeypatch):
+    # A default root under a directory the caller cannot write is refused in
+    # the plan, so the other root is not populated first. A caller who can
+    # write there (root) installs normally; either way the first root is never
+    # left half-populated.
+    claude_root = tmp_path / "claude" / "skills"
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: locked)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: locked / "skills")
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc in (0, 2)
+    if rc == 2:
+        assert not claude_root.exists()
+    else:
+        assert (claude_root / "bn-vr" / "SKILL.md").is_file()
+
+
+def test_a_refused_skill_install_with_an_unusable_root_writes_nothing(tmp_path, monkeypatch):
+    # A default root that cannot be created -- a file where the root belongs --
+    # has to be refused in the plan: refusing it in the install loop instead
+    # leaves the other root already populated with the skills it reached.
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "skills").write_text("not a directory\n")
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+
+    rc = bn.cli.main(["skill", "install"])
+
+    assert rc == 2
+    assert not claude_root.exists()
+    assert (codex_home / "skills").read_text() == "not a directory\n"
+
 
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
     import bn.paths as paths

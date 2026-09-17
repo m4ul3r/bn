@@ -30,6 +30,7 @@ from .target_hint import SELECT_HINT_LINE
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
 # can monkeypatch a single well-known location, `bn.cli`.
 from .paths import (  # noqa: F401
+    cache_home,
     claude_skills_dir,
     codex_home,
     codex_skills_dir,
