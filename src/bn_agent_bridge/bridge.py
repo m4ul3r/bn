@@ -1170,6 +1170,10 @@ class BinaryNinjaBridge:
         self.registry_path = bridge_registry_path(instance_id)
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
+        # Whether stop() has already removed this bridge's socket/registry/log.
+        # The one-shot arm that keeps a second stop() from deleting a successor's
+        # files (#799).
+        self._instance_state_released: bool = False
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
@@ -1296,11 +1300,17 @@ class BinaryNinjaBridge:
         with self._teardown_lock:
             self._stopped = True
             self._refuse_queued_load_jobs_locked()
-        if self._server is not None:
+            # Take our discovery files away HERE -- before anything releases our
+            # bind -- so a stale stop cannot unlink a successor's (#799).
+            self._release_own_instance_state_locked()
+        # Only now release the bind. Nothing below this line unlinks anything.
+        server, self._server = self._server, None
+        thread, self._thread = self._thread, None
+        if server is not None:
             with contextlib.suppress(Exception):
-                self._server.shutdown()
+                server.shutdown()
             with contextlib.suppress(Exception):
-                self._server.server_close()
+                server.server_close()
         # Join what can be joined. A load already inside
         # update_analysis_and_wait() is not interruptible, so the latch -- not
         # this join -- is what makes teardown final; the join just gives a
@@ -1308,22 +1318,54 @@ class BinaryNinjaBridge:
         for thread in self._load_worker_threads():
             with contextlib.suppress(RuntimeError):
                 thread.join(timeout=load_join_timeout)
-        with self._teardown_lock:
-            if self._server is not None:
-                if self.socket_path.exists():
-                    with contextlib.suppress(OSError):
-                        self.socket_path.unlink()
-                if self.registry_path.exists():
-                    with contextlib.suppress(OSError):
-                        self.registry_path.unlink()
-                # On a clean shutdown there's no crash to diagnose, so drop the log
-                # file too rather than leave it as clutter in the instances dir. A
-                # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
-                # preserved for `bn`'s empty-response diagnostic to point at.
-                log_path = self.registry_path.with_suffix(".log")
-                if log_path.exists():
-                    with contextlib.suppress(OSError):
-                        log_path.unlink()
+
+    def _release_own_instance_state_locked(self):
+        """Remove this bridge's discovery files. Caller MUST hold _teardown_lock.
+
+        ONCE, and only while we still hold the bind -- both halves are load
+        bearing (#799):
+
+        * A successor reaches the same paths by (a) finding no socket file at
+          the path, (b) binding it, then (c) writing its registry. So if the
+          unlinks happen while our listener is still bound, (a) cannot come true
+          until the socket unlink below has already run, which makes every
+          successor's registry write strictly LATER than our registry unlink --
+          the paths are ours to destroy for the whole window. Releasing the bind
+          first (the pre-#799 order: shutdown + close, join, then unlink) opened
+          a window in which a successor bound and registered, and the resuming
+          teardown deleted it. The filesystem cannot supply a substitute proof:
+          a successor that unlinks and immediately re-binds the same path gets
+          the same (dev, ino) back, and ext4/tmpfs timestamps are coarse enough
+          that st_ctime_ns matches too -- so identity is not a discriminator.
+        * ONCE, because a second stop() on this object must not unlink whatever
+          now lives at those paths. The flag below is what makes stop()
+          idempotent; `_server` is additionally cleared by stop() so a repeat
+          call cannot even reach a live server.
+        """
+        if self._instance_state_released:
+            return
+        self._instance_state_released = True
+        if self._server is None:
+            # Never bound: these paths may belong to another live instance that
+            # happens to share the id (#585).
+            return
+        # Log first, then registry, then socket. The log is opened by whoever
+        # SPAWNS a bridge (the CLI), not by the bridge process, so its creation
+        # is not ordered by the bind and cannot be reasoned about like the other
+        # two -- deleting it first keeps the window in which a spawner could
+        # truncate it after us as an ordinary "spawner wins" race rather than a
+        # deletion of a file we can see. On a clean shutdown there's no crash to
+        # diagnose, so dropping the log avoids leaving clutter in the instances
+        # dir; a crash skips stop() entirely (SIGKILL/segfault), so crash logs
+        # are preserved for `bn`'s empty-response diagnostic to point at.
+        for path in (
+            self.registry_path.with_suffix(".log"),
+            self.registry_path,
+            self.socket_path,
+        ):
+            if path.exists():
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
     def _load_worker_threads(self) -> list[threading.Thread]:
         with self._load_jobs_lock:

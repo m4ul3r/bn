@@ -482,6 +482,136 @@ def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
     assert not inst.socket_path.exists()
 
 
+# --------------------------------------------------------------------------
+# stop() destroys only what it still owns (#799)
+# --------------------------------------------------------------------------
+
+
+def _socket_answers(path) -> bool:
+    """Whether a client can actually reach `path` -- the observable a bridge's
+    socket file exists to make true, and the one a successor loses when a stale
+    stop unlinks it."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        return probe.connect_ex(str(path)) == 0
+    finally:
+        probe.close()
+
+
+def _live_bridge(module, instance_id):
+    """A bridge with a REAL bind and a REAL serve thread.
+
+    The defect is a teardown that unlinks files a *different listener* owns, so
+    the sockets have to be real: a stubbed `_server` holds no bind and no
+    backlog, and the proof under test is that a successor cannot reach the same
+    paths while the one before it still holds them."""
+    inst = module.BinaryNinjaBridge(instance_id=instance_id)
+    inst.start()
+    return inst
+
+
+def test_stale_stop_keeps_a_successor_that_rebound_the_same_instance(
+    monkeypatch, tmp_path
+):
+    """A stop() on an already-torn-down bridge must not delete the successor
+    that rebound its instance id.
+
+    `_server` was assigned in start() and never cleared, and the teardown arm
+    was gated on `_server is not None` alone -- so a second stop() on the same
+    object walked right over whatever had taken the paths since, deleting the
+    successor's socket, registry and log and leaving it serving on an inode no
+    client can name (#799)."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    first = _live_bridge(module, "rebind1")
+    assert _socket_answers(first.socket_path)
+    first.stop()
+    assert first._server is None, "stop() must clear the handle it tore down"
+
+    successor = _live_bridge(module, "rebind1")
+    # The log is opened by whatever SPAWNS a bridge, not by the bridge, so it is
+    # not this process's to account for by any identity -- only by ordering.
+    log_path = successor.registry_path.with_suffix(".log")
+    log_path.write_text("successor serving\n", encoding="utf-8")
+    assert _socket_answers(successor.socket_path)
+
+    first.stop()  # stale: a second stop() on the torn-down object
+
+    assert _socket_answers(successor.socket_path), "successor's endpoint was unlinked"
+    assert successor.socket_path.exists()
+    assert json.loads(
+        successor.registry_path.read_text(encoding="utf-8")
+    )["instance_token"] == successor.instance_token
+    assert log_path.read_text(encoding="utf-8") == "successor serving\n"
+
+    successor.stop()
+
+
+def test_successor_started_inside_stops_join_window_survives_the_resumed_stop(
+    monkeypatch, tmp_path
+):
+    """The same takeover, one layer earlier: inside stop() itself.
+
+    stop() may wait up to `load_join_timeout` for a load worker that is inside
+    an uninterruptible update_analysis_and_wait(). The unlinks used to happen
+    AFTER that join, so a successor that started in the window could bind and
+    register and then be deleted by the teardown resuming behind it (#799).
+    Releasing the bind is what makes the paths takeable, so the unlinks must
+    happen before it -- while we still own them -- and never after."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+
+    first = _live_bridge(module, "join1")
+
+    release = threading.Event()
+
+    def slow_worker():
+        release.wait(10.0)
+
+    worker = threading.Thread(target=slow_worker, daemon=True)
+    worker.start()
+    first._load_job_threads["probe"] = worker
+
+    in_join = threading.Event()
+    original = first._load_worker_threads
+
+    def observing_join():
+        threads = original()
+        in_join.set()  # latched, discovery files gone, now waiting on the worker
+        return threads
+
+    first._load_worker_threads = observing_join
+    stopper = threading.Thread(target=first.stop)
+    stopper.start()
+
+    successor = None
+    try:
+        assert in_join.wait(10.0), "stop() never reached the join"
+        # The successor starts while the previous owner is still inside stop():
+        # at this point the path is already free, so its bind succeeds.
+        successor = _live_bridge(module, "join1")
+        successor.registry_path.with_suffix(".log").write_text(
+            "successor serving\n", encoding="utf-8"
+        )
+    finally:
+        release.set()
+        stopper.join(10.0)
+
+    assert not stopper.is_alive()
+    assert successor is not None
+    assert _socket_answers(successor.socket_path), "the resuming stop unlinked it"
+    assert json.loads(
+        successor.registry_path.read_text(encoding="utf-8")
+    )["instance_token"] == successor.instance_token
+    assert successor.registry_path.with_suffix(".log").read_text(
+        encoding="utf-8"
+    ) == "successor serving\n"
+
+    successor.stop()
+
+
 def _start_gate_bridge(monkeypatch, tmp_path, bound, *, listing=True):
     """A bridge whose socket path already holds a file, with the kernel's
     bound-socket evidence stubbed to *bound* and the availability of that
