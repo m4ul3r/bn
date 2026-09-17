@@ -544,6 +544,25 @@ def test_skill_install_force_replaces_its_own_symlink_installs(tmp_path, monkeyp
     assert not (claude_root / "bn").is_symlink()
 
 
+def test_skill_install_installs_a_shared_default_root_once(tmp_path, monkeypatch):
+    # Two default roots can name one directory -- a symlinked skills root, or an
+    # equal CLAUDE_HOME and CODEX_HOME. Each skill is installed there once: the
+    # second entry used to install nothing, exit 2, and leave the first root
+    # populated with only the skills it reached first.
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "skills").symlink_to(claude_root)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+
+    assert bn.cli.main(["skill", "install"]) == 0
+    assert (claude_root / "bn" / "SKILL.md").is_file()
+    assert (claude_root / "bn-vr" / "SKILL.md").is_file()
+    assert bn.cli.main(["skill", "install", "--force"]) == 0
+
+
 def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
     import bn.paths as paths
 

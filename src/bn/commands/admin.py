@@ -497,9 +497,13 @@ def _skill_install(args: argparse.Namespace) -> int:
         # Planned, not just checked: the path validated here is the path the
         # install writes to, and every destination is validated before the
         # first one is written -- a refused skill install installs nothing.
-        pending_installs.append(
-            (source, _plan_install(source, dest, force=args.force))
-        )
+        # Two target roots can name one directory (a symlinked skills root, or
+        # an equal CLAUDE_HOME and CODEX_HOME), and installing there twice would
+        # write the same skills over the copy the first entry just made.
+        planned = _plan_install(source, dest, force=args.force)
+        if any(queued == planned for _, queued in pending_installs):
+            continue
+        pending_installs.append((source, planned))
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
