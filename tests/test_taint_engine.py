@@ -5220,6 +5220,100 @@ def test_forward_heap_buffer_store_read_correlates_319a(models):
     assert sinks[0]["class"] == "command_injection"
 
 
+def _concat_return_store_func():
+    # dst = g_strconcat(src, 0); *dst = p; system(dst)
+    # The caller stores a tainted value THROUGH the buffer a model-declared
+    # buffer-return ('*ret') handed back. The concat ARG stays clean, so the only
+    # taint in play is the stored value: reaching system(dst) requires the
+    # returned buffer to be a tracked buffer (alloc-site keyed at the call), not
+    # merely a tainted pointer value (#806). g_strconcat is the sharp case -- its
+    # NAME carries no allocator hint, so nothing but the model marks the site.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    p = FVar("p"); p0 = FSSA(p, 0)
+    dst = FVar("dst"); dst1 = FSSA(dst, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = g_strconcat(src#0, 0)",
+               reads=[src0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(1, 0x14, "MLIL_STORE_SSA", "*dst#1 = p#0", reads=[p0],
+               dest=FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+               src=FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "system(dst#1)", reads=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])]),
+    ]
+    return FFunc("vuln", 0x10, FSSAFunc(instrs), params=[src, p])
+
+
+def test_forward_ret_token_keys_returned_buffer_806(models):
+    # '#ret' in the grammar is the buffer the returned pointer points at -- a
+    # 'to' token must key that buffer at the CALL SITE (the same heap-key
+    # identity a recognized allocator's call gets), not just taint the pointer's
+    # value. A store into it then correlates with a later use of a pointer
+    # re-derived from the same call. Before #806 the '*ret' branch was collapsed
+    # into 'ret' (value only) and the store fell to an un-keyable
+    # coarse_memory_store frontier: system(dst) unreached -- a false all-clear.
+    func = _concat_return_store_func()
+    bv = FBV({0x2000: "g_strconcat", 0x2010: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sinks) == 1, result.get("reached_sinks")
+    assert sinks[0]["class"] == "command_injection"
+    # the flow is FOLLOWED through the returned buffer, not disclosed as a
+    # frontier whose downstream reads are untracked
+    assert not [l for l in result["leaves"] if l["kind"] == "coarse_memory_store"], result["leaves"]
+
+
+def test_forward_plain_ret_token_does_not_key_returned_buffer_806(models):
+    # GUARD, other direction: 'ret' is the returned VALUE only. The SAME call and
+    # shape, with the token spelled 'ret', must keep the pre-#806 behaviour -- the
+    # returned pointer is not a keyed buffer, so the store stays an honest
+    # coarse_memory_store frontier and no sink is reported. Pins that the fix
+    # widened '*ret' alone and left the plain 'ret' value semantics (and every
+    # non-'*ret' model call) a non-alloc site.
+    models["g_strconcat"] = {"propagates": [{"from": "*arg:0", "to": "ret"}]}
+    func = _concat_return_store_func()
+    bv = FBV({0x2000: "g_strconcat", 0x2010: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    assert [s for s in result["reached_sinks"] if s["sink"]["callee"] == "system"] == [], result
+    assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
+
+
+def _concat_return_store_func_clean():
+    # dst = g_strconcat(src, 0); system(dst)  -- same call, but nothing is ever
+    # written into the returned buffer and the concat arg stays clean.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    p = FVar("p"); p0 = FSSA(p, 0)
+    dst = FVar("dst"); dst1 = FSSA(dst, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = g_strconcat(src#0, 0)",
+               reads=[src0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(1, 0x18, "MLIL_CALL_SSA", "system(dst#1)", reads=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])]),
+    ]
+    return FFunc("vuln", 0x10, FSSAFunc(instrs), params=[src, p])
+
+
+def test_forward_ret_token_no_false_positive_for_clean_returned_buffer_806(models):
+    # GUARD, no-false-positive direction: keying the returned buffer must not
+    # taint a buffer that was never written and whose source arg is clean. The
+    # run's only tainted entry is param:1, which never flows into this call, so
+    # system(dst) must stay unreached.
+    func = _concat_return_store_func_clean()
+    bv = FBV({0x2000: "g_strconcat", 0x2010: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+
+
 def _elem_addr(ptr_ssa, idx_ssa, field):
     # [ptr + idx*0x20 + field] -- a descriptor-array element field at a symbolic
     # (loop-counter) index, stride 0x20 (the http_hdr / iovec descriptor shape).
