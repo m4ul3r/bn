@@ -3806,22 +3806,24 @@ class TaintEngine:
                         mk, md = lookup_model(self.models, nm)
                         cfn_internal = self._is_internal(cfn)
                         # A .plt/veneer thunk must be resolved to its real target,
-                        # then BOTH re-modeled and re-classified. When the candidate
-                        # is neither a descendable in-binary function nor a modeled
-                        # import, follow a single-instruction thunk to its real
-                        # target and re-run the model lookup + internal check on
-                        # THAT target. Without re-modeling, a decorated veneer whose
-                        # own name misses the model DB but that tail-calls a modeled
-                        # sink (j_memcpy -> memcpy) would fall through to the
-                        # conservative external tail and the sink be silently missed.
+                        # then BOTH re-modeled and re-classified: the candidate is
+                        # not a body, so follow a single-instruction thunk and re-run
+                        # the model lookup + internal check on THAT target. Without
+                        # re-modeling, a decorated veneer whose own name misses the
+                        # model DB but that tail-calls a modeled sink (j_memcpy ->
+                        # memcpy) would fall through to the conservative external tail
+                        # and the sink be silently missed.
                         #
-                        # This runs for a MODELED candidate too when the model was
-                        # this call site's own (#807): a veneer is not a body, so a
-                        # model on it still leaves the target's body unanalyzed.
+                        # Followed for a MODELED candidate too, on the direct AND the
+                        # indirect path (#807). A model is an overlay on the callee,
+                        # not a summary that replaces it, so a modeled veneer still
+                        # hides whatever body it fronts. Gating this on the candidate's
+                        # model left the indirect path -- an unmodeled call site whose
+                        # resolved candidate carries a model -- stopping at the veneer
+                        # and minting the same false all-clear #807 is about.
                         descend_fn = cfn
                         descend_internal = cfn_internal
-                        if (md is None or mk == modeled_key) and cfn is not None \
-                                and not cfn_internal:
+                        if cfn is not None and not cfn_internal:
                             resolved = self._follow_thunk_cached(cfn)
                             if resolved is not None and resolved is not cfn:
                                 rnm = self._callee_name(int(getattr(resolved, "start", 0))) \
@@ -3829,11 +3831,15 @@ class TaintEngine:
                                 rmk, rmd = lookup_model(self.models, rnm)
                                 if self._is_internal(resolved):
                                     # An in-binary target is a BODY, and a body is
-                                    # descended whether or not a model also covers its
-                                    # name (#807) -- so descent is preferred over
-                                    # re-modeling here, and the resolved name's model
-                                    # (if any) is applied below as the overlay it is.
-                                    nm, mk, md = rnm, rmk, rmd
+                                    # descended whether or not a model covers its name
+                                    # (#807). The body's own model, when it has one, is
+                                    # the more specific overlay and stands in for the
+                                    # candidate's; when it has none, the candidate's
+                                    # model stays this call site's overlay, so reaching
+                                    # the body never costs the model the veneer was
+                                    # called with.
+                                    if rmd is not None:
+                                        nm, mk, md = rnm, rmk, rmd
                                     descend_fn = resolved
                                     descend_internal = True
                                 elif rmd is not None:

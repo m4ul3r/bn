@@ -1819,12 +1819,11 @@ def test_forward_modeled_in_binary_callee_body_still_descended_807():
     assert any("app_read" in (st.get("reason") or "") for st in sinks[0]["path"])
     assert sinks[0]["metrics"]["fns_spanned"] == 2
     # The pre-fix false all-clear was the PAIR (reached_sinks == [], a zero-sink
-    # `diagnostics` block whose gate read true). A run WITH findings attaches no
-    # diagnostics block at all (it is minted only for unique_findings == []), so the
-    # gate cannot sit beside this finding. Asserting the block's absence is the
-    # honest form: the former `not ...get("safe_to_report_all_clear")` could never
-    # fail, because that key exists only on the run that reached nothing.
-    assert "diagnostics" not in result
+    # `diagnostics` block whose gate read true). The gate is minted from the SAME
+    # `unique_findings` list this test already pins non-empty, so no separate
+    # assertion for it can carry independent evidence -- the sink assertion above
+    # IS the evidence, and `matches_unmodeled_807` below is what proves the
+    # overlay does not drop it.
 
 
 def test_forward_modeled_callee_body_descended_matches_unmodeled_807():
@@ -1978,6 +1977,69 @@ def test_forward_indirect_modeled_callee_names_target_once_807():
     via = [a for a in result["assumptions"] if "resolved via" in a and " to: " in a]
     assert len(via) == 1, via
     assert via[0].endswith("to: wrappercopy"), via[0]
+
+
+def _dispatch_to_modeled_veneer():
+    # The indirect form of the #807 shape. A dispatch-slot call resolves (via
+    # --resolve-map) to a VENEER that carries the model's name and tail-calls the
+    # in-binary body under a DIFFERENT symbol name that is NOT in the model DB. The
+    # call site has no name of its own, so nothing here can be decided from the
+    # call site's model; only following the veneer reaches the body.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    dst = FVar("dst"); dst0 = FSSA(dst, 0)
+    app_body = FFunc("app_read_body", 0x402000, FSSAFunc([
+        FInstr(0, 0x402004, "MLIL_CALL_SSA", "system(src#0)", reads=[src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401200", constant=0x401200),
+               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[dst, src])
+    # the veneer's symbol is the name the overlay keys on
+    veneer = FFunc("app_read", 0x404000, FSSAFunc([
+        FInstr(0, 0x404000, "MLIL_TAILCALL_SSA", "tailcall(0x402000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)),
+    ]), is_thunk=True)
+
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    cmd = FVar("cmd"); cmd1 = FSSA(cmd, 1)
+    buf = FVar("buf", typ="char[0x40]"); buf1 = FSSA(buf, 1)
+    t5 = FFunc("t5", 0x403000, FSSAFunc([
+        FInstr(0, 0x403004, "MLIL_SET_VAR_SSA", "rdi#1 = &buf", writes=[buf1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x403010, "MLIL_CALL_SSA", "[slot#1](&buf, cmd#1)", reads=[slot1, cmd1],
+               writes=[], dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "&buf", reads=[buf1]),
+                       FExpr("MLIL_VAR_SSA", "cmd#1", reads=[cmd1])]),
+    ]), params=[cmd])
+
+    bv = FBV({0x401200: "system", 0x402000: "app_read_body", 0x404000: "app_read"},
+             funcs={0x402000: app_body, 0x404000: veneer})
+    return t5, bv
+
+
+def test_forward_dispatch_to_modeled_veneer_body_descended_807():
+    # A model must not stop the walk at a VENEER either, on the indirect path. The
+    # call site is unnamed (dispatch slot), so the model here is reachable only
+    # through the resolved candidate's name -- gating the thunk-follow on the
+    # candidate's model made the modeled run return reached_sinks [] with
+    # `safe_to_report_all_clear: true` while the unmodeled run of the same fixture
+    # reached the command_injection sink inside the body: the false all-clear #807
+    # is about, one call shape over.
+    overlay = {"app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}
+    func, bv = _dispatch_to_modeled_veneer()
+    result = te.TaintEngine(bv, te.load_models(overlay), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["command_injection"], result["reached_sinks"]
+
+    # The overlay is still applied exactly once, against the body that was reached:
+    # following the veneer must not cost the veneer's own model.
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+
+    # and the unmodeled run must not do better than the modeled one
+    plain = te.TaintEngine(bv, te.load_models(), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+    assert sorted(s["sink"]["class"] for s in plain["reached_sinks"]) == classes
 
 
 def _recv_sink_func():
