@@ -3564,11 +3564,13 @@ def _split_top_level_declarations(source: str) -> list[str]:
                 continue
             if char == quote:
                 quote = None
-        elif char == "'" and index > 0 and source[index - 1].isalnum():
-            # A C++14 digit separator (`1'000`), not a character literal. Opening a
-            # quote here leaves it open, swallows every later top-level `;` into one
-            # fragment and silently stops the guard inspecting the rest of the
-            # string -- a missed refusal rather than a false one, but free to avoid.
+        elif char == "'" and index > 0 and source[index - 1].isdigit():
+            # A C++14 digit separator (`1'000`), not a character literal -- and
+            # `isdigit`, not `isalnum`, so the widish/UTF char-literal prefixes
+            # (`L';'`, `u'x'`, `U'x'`) still open a literal as they should. Opening a
+            # quote where none belongs swallows every later top-level `;` into one
+            # fragment and silently stops the guard inspecting the rest of the string
+            # -- a missed refusal rather than a false one, but free to avoid.
             pass
         elif char in "\"'":
             quote = char
@@ -3598,27 +3600,75 @@ def _split_top_level_declarations(source: str) -> list[str]:
     ]
 
 
-_TYPE_DEFINITION_RE = re.compile(
-    r"^(?:"
-    r"(?:static|extern|const|volatile|register|inline)\s+"
-    r"|__attribute__\s*\(\([^)]*\)\)\s*"
-    r")*"
-    r"(?:typedef\s+)?"
-    r"(?:struct|union|enum|class)\b"
-    r"[^;={]*\{"
-)
+_LEADING_QUALIFIER_RE = re.compile(r"^(?:static|extern|const|volatile|register|inline)\b")
+_TYPE_TAG_RE = re.compile(r"^(?:typedef\s+)?(?:struct|union|enum|class)\b[^;={]*\{")
+
+
+def _skip_balanced_parens(text: str) -> int | None:
+    """Index just past the balanced `( ... )` group *text* begins with, else None.
+
+    A scanner rather than a regex because the groups nest:
+    `__attribute__((aligned(8)))` has an inner `)`, which a `[^)]*` class stops at
+    (review of #761 -- the shape that let a drop stay silent).
+    """
+    if not text.startswith("("):
+        return None
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _strip_leading_declaration_noise(text: str) -> str:
+    """Consume the prefixes a definition may carry ahead of its tag (#760).
+
+    Storage-class keywords, an `extern "C"` linkage specifier, and
+    `__attribute__((...))` / `__declspec(...)` groups -- the attribute groups with a
+    balanced-paren scan, since they nest. Anything else (including malformed
+    prefixes) is returned unconsumed, so the tag matcher decides.
+    """
+    remaining = text
+    while remaining:
+        match = _LEADING_QUALIFIER_RE.match(remaining)
+        if match:
+            remaining = remaining[match.end():].lstrip()
+            continue
+        if remaining.startswith('"'):
+            end = remaining.find('"', 1)
+            if end < 0:
+                return remaining
+            remaining = remaining[end + 1:].lstrip()
+            continue
+        for keyword in ("__attribute__", "__attribute", "__declspec"):
+            if not remaining.startswith(keyword):
+                continue
+            rest = remaining[len(keyword):].lstrip()
+            end = _skip_balanced_parens(rest)
+            if end is None:
+                return remaining
+            remaining = rest[end:].lstrip()
+            break
+        else:
+            return remaining
+    return remaining
 
 
 def _declares_a_type(fragment: str) -> bool:
     """Whether a top-level fragment intends to DEFINE a type (#760).
 
     A fragment qualifies when it STARTS with a definition: an optional run of
-    storage/attribute prefixes, an optional `typedef`, then a tag whose body opens
-    before any `;` or `=`. The `=` exclusion is load-bearing: a variable
-    declaration with a brace initializer (`struct A x = {};`) is a USAGE whose
-    braces are initializer braces, and an earlier cut of this check that only
-    looked for `{` refused it -- breaking working input and diagnosing a variable
-    as a dropped type declaration (review of #761).
+    storage-class keywords, an `extern "C"` specifier and `__attribute__`/
+    `__declspec` groups, an optional `typedef`, then a tag whose body opens before
+    any `;` or `=`. The `=` exclusion is load-bearing: a variable declaration with a
+    brace initializer (`struct A x = {};`) is a USAGE whose braces are initializer
+    braces, and an earlier cut of this check that only looked for `{` refused it --
+    breaking working input and diagnosing a variable as a dropped type declaration
+    (review of #761).
 
     A brace-less fragment qualifies only when it is a `typedef`, so a usage
     (`struct A x;`), a forward declaration (`struct A;`) or a function/variable
@@ -3628,7 +3678,7 @@ def _declares_a_type(fragment: str) -> bool:
     text = _strip_c_comments(fragment).strip()
     if "{" not in text:
         return text.startswith("typedef")
-    return bool(_TYPE_DEFINITION_RE.match(text))
+    return bool(_TYPE_TAG_RE.match(_strip_leading_declaration_noise(text)))
 
 
 def _declarations_without_named_types(ctx, bv, declaration: str,

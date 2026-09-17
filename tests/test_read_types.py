@@ -223,6 +223,44 @@ def test_types_declare_refuses_a_drop_after_a_digit_separator_760(monkeypatch):
     assert any("uint32_t" in item for item in exc.value.observed["dropped_declarations"])
 
 
+def test_types_declare_refuses_a_drop_behind_a_nested_attribute_prefix_760(monkeypatch):
+    """#760 review follow-up: `__attribute__((aligned(8)))` nests its parens, so a
+    `[^)]*` prefix match stopped at the inner `)` and the drop stayed silent behind a
+    prefix the docs claimed was covered."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        _declare(instance, bv, (
+            "__attribute__((aligned(8))) struct uint32_t { int x; }; "
+            "struct widget_a_t { int a; };"
+        ))
+
+    assert exc.value.status == "invalid_request"
+    assert any("uint32_t" in item for item in exc.value.observed["dropped_declarations"])
+    assert bv.defined == []
+
+
+def test_types_declare_refuses_a_drop_after_a_wide_char_literal_760(monkeypatch):
+    """#760 review follow-up: the digit-separator rule must key on a DIGIT, not any
+    alphanumeric -- `L';'` is a character literal, and treating its opening quote as a
+    separator left the literal's closing quote to swallow the rest of the string."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        _declare(instance, bv, (
+            "struct widget_a_t { int a; }; "
+            "wchar_t widget_w = L';'; "
+            "struct uint32_t { int x; };"
+        ))
+
+    assert exc.value.status == "invalid_request"
+    assert any("uint32_t" in item for item in exc.value.observed["dropped_declarations"])
+
+
 def test_types_declare_allows_a_variable_declaration_with_a_brace_initializer_760(monkeypatch):
     """#760 review item 1: a variable declaration with a brace initializer is a USAGE,
     not a definition. An earlier cut of the classifier saw `{`, treated it as a body

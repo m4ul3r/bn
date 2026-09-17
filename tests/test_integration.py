@@ -1960,14 +1960,19 @@ class TestTypesDeclarePartialDrop760:
         assert not self._exists(shared_bn, "rv_drop_probe_t")
         assert not self._exists(shared_bn, "uint32_t")
 
-    def test_attribute_prefixed_drop_is_refused(self, shared_bn):
-        """The prefix shape #760's harm also reproduces on: the drop used to stay
-        silent behind `__attribute__((packed))`."""
+    @pytest.mark.parametrize(
+        "prefix",
+        ["__attribute__((packed)) ", "__attribute__((aligned(8))) ", "static "],
+        ids=["packed", "nested-aligned", "static"],
+    )
+    def test_prefixed_drop_is_refused(self, shared_bn, prefix):
+        """The prefix shapes #760's harm also reproduces on: the drop used to stay
+        silent behind them. `aligned(8)` nests its parens, which a single-level prefix
+        match cannot cross (review of #761)."""
         shared_bn.load(HELLO_BINARY)
         res = shared_bn.run(
             "types", "declare",
-            "__attribute__((packed)) struct uint32_t { int shadow_x; }; "
-            "struct rv_pack_t { int y; };",
+            f"{prefix}struct uint32_t {{ int shadow_x; }}; struct rv_pack_t {{ int y; }};",
             "--format", "json",
         )
         assert res.returncode == 3, res.stdout
