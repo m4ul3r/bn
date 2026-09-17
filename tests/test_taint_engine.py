@@ -2128,6 +2128,29 @@ def test_forward_one_model_per_call_site_when_two_keys_cover_it_807():
     assert classes == ["command_injection"], result["reached_sinks"]
 
 
+def test_forward_chain_applies_both_models_each_distinct_key_once_807():
+    # The chain may hold a model at TWO levels, and BOTH describe the callee that
+    # runs. Keeping only the first (the pre-PR rule, restored while fixing round 3's
+    # reported duplication) discarded the reached target's armed sink: the modeled run
+    # then answered reached_sinks [] with `safe_to_report_all_clear: true` where the
+    # unmodeled run of the same fixture found it -- #807's failure mode one level out.
+    # Every distinct key applies, so an armed sink on EITHER level fires, and the
+    # shared per-call-site reporting signature keeps it to one finding per tainted arg.
+    overlay = {
+        "app_read": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]},
+        "app_read_body": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+    }
+    func, bv = _dispatch_to_modeled_veneer_chain("app_read_body", body=False)
+    result = te.TaintEngine(bv, te.load_models(overlay), resolve_map={
+        "0x403010": ["0x404000"]}).forward(func, [te.parse_locator("param:0")])
+
+    classes = sorted(s["sink"]["class"] for s in result["reached_sinks"])
+    assert classes == ["overflow_len"], result["reached_sinks"]
+    # and the candidate's overlay still applies alongside it -- one narration
+    notes = [a for a in result["assumptions"] if "propagated to the destination" in a]
+    assert len(notes) == 1, notes
+
+
 def _recv_sink_func():
     # handler(n): recv(3, &buf, n) -- the LENGTH (arg2) written into buf is
     # attacker-controlled (param 0). recv is now an opt-in bounded-write sink (#499).

@@ -3733,10 +3733,12 @@ class TaintEngine:
                         # `safe_to_report_all_clear: true` while the UNmodeled run of
                         # the same query found the sink. Models only ever ADD taint
                         # (there is no suppression rule), so descending can only add
-                        # coverage: the modeled run stays a superset of the unmodeled
-                        # one. The common model shape -- a libc/kernel name whose
-                        # callee is an import -- has no body, and `descend_internal`
-                        # below is False for it, so this costs one internal check.
+                        # coverage: the modeled run's SINK coverage stays a superset of
+                        # the unmodeled one. (The leaves channel is not a superset --
+                        # a modeled call skips the #381 unrecovered-arg frontier
+                        # below.) The common model shape -- a libc/kernel name whose
+                        # callee is an import -- has no body, so `descend_internal` is
+                        # False for it and following its thunk is a cache hit.
 
                     # 3) resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
@@ -3822,6 +3824,7 @@ class TaintEngine:
                         # resolved candidate carries a model -- stopping at the veneer
                         # and minting the same false all-clear #807 is about. Descent is
                         # independent of the model: following never costs a model.
+                        rnm = rmk = rmd = None
                         descend_fn = cfn
                         descend_internal = cfn_internal
                         if cfn is not None and not cfn_internal:
@@ -3836,25 +3839,15 @@ class TaintEngine:
                                     # (#807).
                                     descend_fn = resolved
                                     descend_internal = True
-                                # A call site carries at most ONE model: the first one
-                                # the chain finds wins, which is the resolved caller's
-                                # own model when it has one and the reached target's
-                                # otherwise. Adopting `rmd` over a candidate that
-                                # already had a model would DISCARD the overlay the user
-                                # keyed on the callee they actually called -- the
-                                # modeled run then reports less than the unmodeled one.
-                                # Applying both is no better: two keys for one callee
-                                # are two spellings of one overlay, and both would
-                                # report at the same instruction.
-                                if md is None and rmd is not None:
-                                    nm, mk, md = rnm, rmk, rmd
                         # Re-imported export: the call routed through a PLT/GOT
                         # stub to a symbol that is ALSO defined in this binary.
                         # Bridge to the local definition so taint descends into
                         # its body instead of stopping at a conservative external
-                        # leaf (#46 item 3). Only when unmodeled and not already
-                        # internal, and only to a real in-binary definition.
-                        if md is None and not descend_internal:
+                        # leaf (#46 item 3). Only when UNMODELED at both levels and
+                        # not already internal, and only to a real in-binary
+                        # definition -- a model anywhere in the chain already owns
+                        # this call's story.
+                        if md is None and rmd is None and not descend_internal:
                             local = self._local_definition_for(nm)
                             if local is not None:
                                 descend_fn = local
@@ -3862,14 +3855,28 @@ class TaintEngine:
                                 add_assumption(
                                     f"bridged re-imported export {nm} to its in-binary "
                                     f"definition at {hex(int(getattr(local, 'start', 0)))}")
-                        # Both decisions are independent for the same reason the
-                        # model branch no longer stops the walk (#807): a resolved
-                        # target can be modeled AND have a body, and the model is an
-                        # overlay. `mk != modeled_key` keeps the model already applied
-                        # at this site from being applied twice -- compared by KEY, so
-                        # two spellings of one model do not count as two models.
-                        if md is not None and mk != modeled_key:
-                            mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
+                        # EVERY distinct model in the chain applies at this call: the
+                        # call site's own already did above, and here the resolved
+                        # candidate's and the reached target's. A model is an overlay on
+                        # the callee that runs, so letting either stand in for the
+                        # other -- in either direction -- makes the modeled run report
+                        # LESS than the unmodeled one, which is #807 at one more level:
+                        # an armed sink declared on the callee the user actually called
+                        # was discarded by the reached target's model, and an armed sink
+                        # on the reached target was discarded by the candidate's.
+                        # Same DB key is applied at most once (that is what makes this
+                        # idempotent), and both share ONE reporting signature per call
+                        # site, so two keys describing one callee still report one
+                        # finding at this instruction instead of the same fact twice.
+                        sig_taddr = taddr if target is None else None
+                        applied_keys: set = set()
+                        for _key, _mdl, _mname in ((mk, md, nm), (rmk, rmd, rnm)):
+                            if _mdl is None or _key is None or _key == modeled_key \
+                                    or _key in applied_keys:
+                                continue
+                            applied_keys.add(_key)
+                            mchanged, _ = apply_model(ins, params, _mdl, _key,
+                                                      _mname or nm, site_taddr=sig_taddr)
                             if mchanged:
                                 changed = True
                         if descend_internal:
@@ -3897,13 +3904,12 @@ class TaintEngine:
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
-                        elif md is None:
-                            # Genuinely unmodeled: no model here and none applied
-                            # above, so the conservative external rule is the only
-                            # information available. (A callee whose model WAS applied
-                            # above and whose target has no body -- the common libc
-                            # import -- needs nothing here: the model already
-                            # describes its return and propagation.)
+                        elif md is None and rmd is None:
+                            # Genuinely unmodeled: no model anywhere in the chain (the
+                            # call site's own included), so the conservative external
+                            # rule is the only information available. (A callee whose
+                            # model WAS applied -- at any level -- needs nothing here:
+                            # the model already describes its return and propagation.)
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
                                 add_assumption(f"external {nm or hex(taddr)} has no model; return conservatively tainted")
