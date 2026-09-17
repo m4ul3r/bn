@@ -4225,17 +4225,18 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 606 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 610 read keys
     rather than the 201 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4848.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4880.
     (#822 taught `_render_virtual_call_text` to render the typed
     `unresolved_reason_code`, which is the renderer read that takes this
     population from its base's 4840 to 4848 -- the population follows the
-    renderers, which is the point of deriving it.)
+    renderers, which is the point of deriving it. #820's quick-load warning adds
+    the four scalar `partial` reads that take it from 4848 to 4880 the same way.)
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4254,7 +4255,13 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4848, f"the raise sweep ran {swept} renders, not 4848"
+    # 4848 -> 4880 (#820): four more `(renderer, ctx)` pairs, because
+    # `_render_type_list_text`, `_render_function_evidence_text` and
+    # `_render_class_list_text` now READ `partial` (the quick-load warning), and a
+    # discovered read is a discovered pair -- 4 pairs x 8 bogus values, MEASURED
+    # on the rebased tree rather than carried over from the pre-merge branch. The
+    # assertion still exists to catch the population SHRINKING silently.
+    assert swept == 4880, f"the raise sweep ran {swept} renders, not 4880"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4403,7 +4410,10 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1413, f"the mirror ran {checked} renders, not 1413"
+    # 1413 -> 1421 with the same four pairs the raise sweep gained (#820): the
+    # quick-load warning reads `partial` in three more renderers, and the mirror
+    # contributes 2 benign payloads per pair. Measured on the rebased tree.
+    assert checked == 1421, f"the mirror ran {checked} renders, not 1421"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

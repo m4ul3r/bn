@@ -3456,3 +3456,37 @@ def test_every_containment_read_leaves_exact_hex_and_names_unannotated(
 
     assert result["function"]["address"] == "0x401000", surface
     assert "resolved_from" not in result, surface
+
+
+def test_decompile_discloses_quick_analysis_state(monkeypatch):
+    """#820: `decompile` ANSWERS on a --quick view (matrix: partial), so the
+    envelope must carry the VIEW's analysis state. `analysis_skipped` cannot
+    stand in for it: that is a per-FUNCTION "BN declined to analyze this one"
+    flag, and it is False on a quick view whose body is unresolved-name Pseudo-C
+    with an empty `warnings` list -- exactly the answer that read as analyzed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "small_fn")
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [[(0x401000, "int32_t small_fn()")], [(0x401000, "{")], [(0x401000, "}")]],
+    )
+
+    full = instance._decompile("active", "small_fn")
+    assert full["analysis_state"] == "full"
+    assert full["partial"] is False
+
+    bridge._quick_loaded_views.add(bv)
+    try:
+        quick = instance._decompile("active", "small_fn")
+    finally:
+        bridge._quick_loaded_views.discard(bv)
+
+    assert quick["analysis_state"] == "quick"
+    assert quick["partial"] is True
+    # The per-function flag is NOT the view state -- it stays False here, which is
+    # why it could never carry this disclosure.
+    assert quick["analysis_skipped"] is False

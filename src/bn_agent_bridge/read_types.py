@@ -27,6 +27,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import read_misc
 from ._shared import _validate_count
+from .read_listing import _analysis_state_fields
 
 
 def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None,
@@ -42,11 +43,17 @@ def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None,
             continue
         items.append(entry)
     if count_only:
-        return {"kind": "types", "count": len(items), "total": len(items)}
+        return {"kind": "types", "count": len(items), "total": len(items),
+                **_analysis_state_fields(bv)}
     items.sort(key=lambda item: item["name"].lower())
     # Honest paging envelope ({kind,items,total,offset,limit,returned,has_more}),
     # matching strings/imports/sections/function-list (#122/#131).
-    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind="types")
+    result = read_misc._paged_list_result(items, offset=offset, limit=limit, kind="types")
+    # #820: a --quick view's type set is what the loader parsed, not what analysis
+    # would have synthesized, so the listing carries the same analysis-state
+    # disclosure function list does -- the page is real, its completeness is not.
+    result.update(_analysis_state_fields(bv))
+    return result
 
 
 # ``typedef struct { ... } Alias;`` is registered by BN the idiomatic C way: the

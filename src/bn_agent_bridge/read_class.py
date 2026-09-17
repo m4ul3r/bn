@@ -13,6 +13,7 @@ from typing import Any
 
 from . import il_format
 from ._shared import OperationFailure, _validate_count
+from .read_listing import _analysis_state_fields
 from .seam import _view_memo
 
 
@@ -609,6 +610,7 @@ def _class_list(
             "include_all": include_all,
             "no_stl": no_stl,
             "no_vendor": no_vendor,
+            **_analysis_state_fields(bv),
         }
         if total == 0:
             result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
@@ -643,6 +645,7 @@ def _class_list(
         "vendor_suppressed": vendor_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
+        **_analysis_state_fields(bv),
     }
     if total == 0:
         # #653.6: make "no classes" attributable -- C target vs failed clustering.

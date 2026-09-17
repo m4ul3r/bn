@@ -44,6 +44,7 @@ from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address  # noqa: F401
 from .bridge_state import require_analysis
+from .read_listing import _analysis_state_fields
 
 
 def _force_function_analysis(ctx, bv, func):
@@ -238,6 +239,13 @@ def _decompile(
         "analysis_force_requested": bool(force_analysis),
         "analysis_forced": forced,
         "include_annotations": bool(include_annotations),
+        # #820: the quick-mode matrix lets decompile ANSWER (partial) rather than
+        # refuse, so the envelope must carry the view-level state too. Without it
+        # a --quick body renders plausible Pseudo-C with unresolved `sub_<addr>`
+        # callees and `warnings: []`, and `analysis_skipped` (a PER-FUNCTION flag
+        # on an analyzed view) reads as "nothing was degraded". Distinct from
+        # analysis_skipped: this is the VIEW's state, forced=False notwithstanding.
+        **_analysis_state_fields(bv),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result

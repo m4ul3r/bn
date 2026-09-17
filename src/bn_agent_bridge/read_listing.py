@@ -714,7 +714,12 @@ def _analysis_state_fields(bv: Any) -> dict[str, Any]:
     analyzed. A ``--quick`` function count is partial, but the ``functions``
     envelope looked complete ({count, total}); thread the same signal the bridge
     already derives for ``target info`` / the orient digest through the listing
-    paths so a partial count is never mistaken for the whole binary (#437)."""
+    paths so a partial count is never mistaken for the whole binary (#437).
+
+    The SAME shape is attached by the other read ops that answer on a quick view
+    (decompile, evidence function, types, class list -- #820), so a consumer sees
+    one contract for "this answer may be incomplete" across commands instead of a
+    per-op spelling. Import it from here; never re-derive the fields."""
     quick = bv in _quick_loaded_views
     return {"analysis_state": "quick" if quick else "full", "partial": quick}
 

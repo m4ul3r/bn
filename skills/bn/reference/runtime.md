@@ -166,6 +166,8 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
 
+**Every op that ANSWERS on a quick view says so in its own envelope.** `analysis_state` (`"quick"` / `"full"`) plus `partial` (bool) ride on the result of `function list`/`search` and its `--count`, `decompile`, `evidence function`, `types` (and `--count`) and `class list` (and `--count`) — one shape from one helper, so a consumer reads `partial: true` once and treats that answer as incomplete. Text mode prefixes the same statement: `WARNING: target is quick-loaded; <what> is partial.` followed by the `bn refresh` directive. The hard-error rows below carry no such field because they refuse instead. Note `decompile`'s `analysis_skipped` is a **different, per-function** flag (BN declined to analyze *this* function on an analyzed view) — it is `false` on a quick view, so it can never stand in for the view-level state.
+
 **Quick-mode capability matrix.** Per-command behavior on a `--quick` / `--no-analysis` view. A **hard-error** row refuses with a `--quick` directive — that is a capability boundary, **NOT** absence of results; never read it as "nothing found." Distinguish `bn decompile <fn> --force-analysis` (analyzes one *existing* function in place — works on a quick view) from `bn function create` (materializes a *missing* function — refused on quick, see #479).
 
 | Command | Quick-mode behavior |
@@ -173,14 +175,15 @@ Run `bn refresh` once to promote the view to full analysis (`analysis_state` fli
 | `sections`, `imports` | **quick-safe** — container is parsed at load |
 | `target info` / `target list` | **quick-safe** — flagged `[not analyzed]` / `analysis_state:"quick"` |
 | `strings` | **hard-error until `bn refresh`** (string set isn't built) |
-| `function list` / `search` | **partial** — only entry-point + symbol functions exist; count grows after refresh |
-| `decompile`, `il` | **partial** — render only already-analyzed functions; `bn decompile <fn> --force-analysis` analyzes one function in place (the flag is on `decompile` only), after which `il` works on it |
+| `function list` / `search` | **partial** — only entry-point + symbol functions exist; count grows after refresh; carries `partial: true` |
+| `decompile`, `il` | **partial** — render only already-analyzed functions, which on a quick view is unresolved-name Pseudo-C; `decompile` carries `partial: true` (`il` does not yet). `bn decompile <fn> --force-analysis` analyzes one function in place (the flag is on `decompile` only), after which `il` works on it |
 | `disasm <fn>` | **partial** (needs the function) · `disasm <addr> --linear N` — **quick-safe** (raw linear decode, no function required) |
 | `xrefs`, `callsites`, `function info`, `taint` | **hard-error until `bn refresh`** (`require_analysis`) |
 | `trace` | **function-specific** — needs the containing function's MLIL; `--force-analysis` that function first, else refresh |
-| `class list` / `show` | **quick-safe** — from demangled symbols + RTTI/defined types present at load (method-body xrefs still need analysis) |
+| `types` / `--count` | **partial** — lists the types the loader parsed; analysis-defined types (and the type set analysis would synthesize) are missing, so it carries `partial: true` |
+| `class list` / `show` | **answers, partial** — from demangled symbols + RTTI/defined types present at load (method-body xrefs and analysis-derived methods still need analysis); `class list` carries `partial: true` (`show` does not yet) |
 | `evidence init` / `table` | **quick-safe** — read raw memory / `.init_array` / symbols |
-| `evidence function` | **partial** — reads one function's call ABI; needs that function analyzed |
+| `evidence function` | **partial** — reads one function's call ABI; needs that function analyzed; carries `partial: true` |
 | `function create --preview` | **hard-error until `bn refresh`** — refused on quick even in preview (#479); all batch mutations refuse identically |
 
 After `bn refresh` (or `--force-analysis` on a single function) every row promotes to full behavior; branch on `analysis_state`, not on an empty or errored result.

@@ -5040,3 +5040,53 @@ def test_call_descriptors_refuses_a_run_with_no_declared_field(monkeypatch):
         instance._call_descriptor_evidence(None, "register_handler", arg_index=0,
                                            field_specs=[])
     assert excinfo.value.status == "invalid_request"
+
+
+def test_function_evidence_discloses_quick_analysis_state(monkeypatch):
+    """#820: `evidence function` answers on a --quick view (matrix: partial), so
+    the card carries the view's analysis state -- the call/ABI read is real, its
+    fidelity is not."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x412470, "build_response")
+    bv = _FakeBV(functions=[caller])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, caller, [[(0x412470, "int32_t build_response()")]]
+    )
+
+    full = instance._function_evidence("active", "build_response", context=0)
+    assert full["analysis_state"] == "full"
+    assert full["partial"] is False
+
+    bridge._quick_loaded_views.add(bv)
+    try:
+        quick = instance._function_evidence("active", "build_response", context=0)
+    finally:
+        bridge._quick_loaded_views.discard(bv)
+
+    assert quick["analysis_state"] == "quick"
+    assert quick["partial"] is True
+
+
+def test_render_function_evidence_text_warns_when_quick_loaded():
+    """#820: the warning leads the card -- including the empty-call-set card,
+    which returns early, because a quick-loaded read with no calls is exactly
+    what a reader would take for a complete answer."""
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "build_response", "address": "0x412470"},
+        "prototype": "int32_t build_response()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 0, "matched_calls": 0, "offset": 0, "limit": None,
+        "calls": [], "warnings": [],
+        "analysis_state": "quick", "partial": True,
+    }
+    out = _render_function_evidence_text(value)
+    lines = out.splitlines()
+    assert lines[0] == "WARNING: target is quick-loaded; function evidence is partial. "                        "Run `bn refresh` for full analysis."
+    assert lines[1] == "build_response @ 0x412470"
+
+    full = _render_function_evidence_text({**value, "analysis_state": "full", "partial": False})
+    assert "WARNING" not in full
+    assert full.splitlines()[0] == "build_response @ 0x412470"

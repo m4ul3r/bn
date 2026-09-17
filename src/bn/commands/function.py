@@ -29,6 +29,7 @@ from ..formatters import (
     _render_trace_text,
     _render_xrefs_any_text,
     _render_xrefs_text,
+    _quick_partial_prefix,
     _resolution_note,
     _slice_text_lines,
     _text_field,
@@ -285,7 +286,11 @@ def _decompile(args: argparse.Namespace) -> int:
         warnings = value.get("warnings") if isinstance(value, dict) else None
         if warnings:
             text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
-        return _resolution_note(value) + text
+        # #820: a --quick view's body is unresolved-name Pseudo-C with an empty
+        # `warnings` list, so text mode stated nothing was wrong. Lead with the
+        # view-level state -- `analysis_skipped` is a PER-FUNCTION flag and is
+        # False here, so it cannot carry this.
+        return _quick_partial_prefix(value, "decompile") + _resolution_note(value) + text
 
     return _call(
         args,

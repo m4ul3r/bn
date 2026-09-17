@@ -1111,3 +1111,61 @@ def test_self_referential_anonymous_aggregate_still_terminates(monkeypatch):
     text = ctx._render_type_layout(cycle)
     assert "truncated at depth" in text
     assert _flagged_json_depth(ctx._type_entry("Cycle", cycle)) is not None
+
+
+def test_types_listing_discloses_quick_analysis_state():
+    """#820: `types` answers on a --quick view, so both envelopes carry the
+    view-level analysis state -- what the loader parsed is not the whole type set
+    analysis would produce."""
+    bridge_state = importlib.import_module("bn_agent_bridge.bridge_state")
+    read_types = importlib.import_module("bn_agent_bridge.read_types")
+    bv = _FakeBV(types_={"Widget": _FakeType("struct Widget")})
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+        def _type_entry(self, name, type_obj):
+            return {"name": name, "kind": "struct", "decl": "struct Widget"}
+
+    full = read_types._types(_Ctx(), None, query=None, offset=0, limit=None)
+    assert full["kind"] == "types"
+    assert full["analysis_state"] == "full"
+    assert full["partial"] is False
+    full_count = read_types._types(_Ctx(), None, query=None, offset=0, limit=None,
+                                   count_only=True)
+    assert full_count["analysis_state"] == "full"
+    assert full_count["partial"] is False
+
+    bridge_state._quick_loaded_views.add(bv)
+    try:
+        quick = read_types._types(_Ctx(), None, query=None, offset=0, limit=None)
+        quick_count = read_types._types(_Ctx(), None, query=None, offset=0, limit=None,
+                                        count_only=True)
+    finally:
+        bridge_state._quick_loaded_views.discard(bv)
+
+    assert quick["analysis_state"] == "quick"
+    assert quick["partial"] is True
+    assert quick_count["analysis_state"] == "quick"
+    assert quick_count["partial"] is True
+
+
+def test_render_type_list_text_warns_when_quick_loaded():
+    """#820: the type listing states its own partiality in text -- once, on the
+    envelope (the per-row recursion is handed a bare list and must not repeat it)."""
+    from bn.formatters import _render_type_list_text
+    value = {
+        "kind": "types",
+        "items": [{"name": "Widget", "kind": "struct", "decl": "struct Widget"}],
+        "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False,
+        "analysis_state": "quick", "partial": True,
+    }
+    out = _render_type_list_text(value)
+    assert out.startswith("WARNING: target is quick-loaded; type list is partial.")
+    assert "bn refresh" in out
+    assert "Widget | struct" in out
+    assert out.count("WARNING") == 1
+
+    full = _render_type_list_text({**value, "analysis_state": "full", "partial": False})
+    assert "WARNING" not in full
