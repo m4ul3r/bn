@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import refuse_silent_skip
 
 from bn.paths import instances_dir
 
@@ -1136,7 +1137,10 @@ class TestFunctionCreatePreviewHonesty:
                 chosen = hexaddr
                 break
         if chosen is None:
-            pytest.skip("no creatable gap address found in this fixture")
+            refuse_silent_skip(
+                "no creatable gap address in this fixture, so the preview/live "
+                "agreement #304 fixed is unexercised; restore the gap between "
+                "two adjacent analysed functions in tests/fixtures")
 
         # The live create at the SAME address must ALSO verify -- before the
         # fix the preview's remove_user_function suppressed it and this
@@ -1223,7 +1227,10 @@ class TestBatchFunctionCreate:
                 addr = hex(cand)
                 break
         if addr is None:
-            pytest.skip("no creatable gap address found in this fixture")
+            refuse_silent_skip(
+                "no creatable gap address in this fixture, so the atomic batch "
+                "create/revert #308 added is unexercised; restore the gap "
+                "between two adjacent analysed functions in tests/fixtures")
 
         mf = tmp_path / "batch.json"
         mf.write_text(json.dumps({"ops": [
@@ -1272,7 +1279,11 @@ class TestFunctionCreateSkippedAddress:
         probe = shared_bn.run("py", "exec", code)
         line = next((l for l in probe.stdout.splitlines() if l.startswith("ADDR=")), None)
         if line is None:
-            pytest.skip("no caller-less auto-skipped function in this fixture")
+            refuse_silent_skip(
+                "no caller-less function that auto-analysis declines to "
+                "recreate in this fixture, so the skipped-address create #360 "
+                "fixed is unexercised; restore a fixture function with no code "
+                "refs that disappears after remove_user_function")
         addr = line.split("=", 1)[1].strip()
 
         # create on the skipped address: must verify and commit (#360). With
@@ -1324,7 +1335,11 @@ class TestTaintEmptyVerdictHonesty:
                 assert "NOT an all-clear" in out.stdout, out.stdout
                 assert "structurally see" in out.stdout, out.stdout
         if not saw_empty:
-            pytest.skip("no empty-verdict function found in this fixture")
+            refuse_silent_skip(
+                "no function in this fixture yields an empty forward-taint "
+                "verdict, so the 'NOT an all-clear' caveat #310.1 added is "
+                "unexercised; restore a fixture function whose taint run "
+                "reaches no sink and no frontier")
 
 
 class TestTaintUnderRecoveredArgFrontier:

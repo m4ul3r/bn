@@ -573,6 +573,23 @@ def test_concurrent_builds_are_serialized(tmp_path):
     assert peak == 1, f"{peak} builds ran concurrently -- the build lock is not held"
 
 
+@contextlib.contextmanager
+def _strict_failure():
+    """`pytest.raises(Failed)`, but a SKIP escaping is itself a failure.
+
+    A cell that regresses to a bare `pytest.skip` raises `Skipped`, which does
+    NOT match `pytest.raises(Failed)`: it escapes the cell and pytest records
+    it as SKIPPED -- exit 0, green. A strict-mode gate test that can go green
+    by skipping is the very masquerade this section exists to catch (#784), so
+    catch both outcomes and insist on the one the gate promises.
+    """
+    with pytest.raises((Failed, Skipped)) as excinfo:
+        yield excinfo
+    assert isinstance(excinfo.value, Failed), (
+        f"strict mode raised {type(excinfo.value).__name__} instead of failing: "
+        f"{excinfo.value}")
+
+
 def test_bn_absence_skips_by_default_but_fails_in_strict_mode(monkeypatch):
     """Positive + negative control for the strict gate: absence is a visible
     skip by default, and `BN_REQUIRE_REAL_TESTS=1` turns it into a failure so
@@ -584,7 +601,7 @@ def test_bn_absence_skips_by_default_but_fails_in_strict_mode(monkeypatch):
         conftest.require_real_bn()
 
     monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
-    with pytest.raises(Failed) as excinfo:
+    with _strict_failure() as excinfo:
         conftest.require_real_bn()
     assert "BN_REQUIRE_REAL_TESTS" in str(excinfo.value)
 
@@ -608,12 +625,100 @@ def test_an_unfixable_skip_is_a_failure_in_strict_mode(monkeypatch):
         conftest.refuse_silent_skip(reason)
 
     monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
-    with pytest.raises(Failed) as excinfo:
+    with _strict_failure() as excinfo:
         conftest.refuse_silent_skip(reason)
     assert reason in str(excinfo.value)
     # The message names the knob that produced the failure, so a reader who did
     # not set it knows where it came from; the remedy rides in the reason.
     assert conftest.STRICT_ENV_VAR in str(excinfo.value)
+
+
+# --- #784: a fixture-SHAPE skip is gated too ------------------------------
+
+class _ShapeProbeBridge:
+    """Just enough of `conftest.SharedBridge` to drive a shape probe to empty.
+
+    A fixture-shape skip says "this fixture no longer presents what the test
+    asserts". The interesting half of that condition is the probe's answer, not
+    BN's analysis, so `run` replays the EMPTY shape (no functions, no `ADDR=`
+    line) and `load` is a no-op: no real bridge, no analysis, no fixtures.
+    """
+
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
+
+    def load(self, binary, *, copy: bool = True, timeout: float = 60.0) -> str:
+        self.loaded.append(str(binary))
+        return str(binary)
+
+    def run(self, *args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("function", "list"):
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        if args[:2] == ("py", "exec"):
+            # No `ADDR=` line: auto-analysis recreated every function, so the
+            # fixture offers no address it declines to recreate.
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(f"unexpected command for a shape probe: {args}")
+
+
+#: Every fixture-SHAPE skip in `tests/test_integration.py`, as
+#: (class, method, needs tmp_path, a phrase only that cell's reason carries).
+#: A shape skip is a defect in the fixture, not a property of the host, so
+#: strict mode must turn each of them red. The module's OTHER skips are
+#: toolchain prerequisites (a missing cross-compiler, a failed compile) that a
+#: machine can un-skip by installing the toolchain -- the convention this
+#: module already uses for `_cc_available` -- so they stay plain skips.
+_FIXTURE_SHAPE_SKIP_CELLS = (
+    ("TestFunctionCreatePreviewHonesty", "test_preview_then_live_agree", False,
+     "preview/live"),
+    ("TestBatchFunctionCreate", "test_batch_function_create_preview_then_live_atomic",
+     True, "atomic batch"),
+    ("TestFunctionCreateSkippedAddress", "test_create_on_auto_skipped_address", False,
+     "skipped-address"),
+    ("TestTaintEmptyVerdictHonesty", "test_empty_forward_verdict_is_caveated", False,
+     "NOT an all-clear"),
+)
+
+
+def _run_shape_skip_cell(class_name: str, method_name: str, needs_tmp_path: bool,
+                         tmp_path: Path) -> None:
+    """Run one cell with its shape probe stubbed empty."""
+    module = importlib.import_module("test_integration")
+    method = getattr(getattr(module, class_name)(), method_name)
+    method(_ShapeProbeBridge(), *([tmp_path] if needs_tmp_path else []))
+
+
+def test_a_fixture_shape_skip_is_a_failure_in_strict_mode(monkeypatch, tmp_path):
+    """#784: the gate covered an absent BN and an un-un-skippable host
+    precondition, but a fixture that lost the SHAPE a test asserts is worse
+    than either -- nothing about the host is wrong, so the skip reads as green
+    forever and the regression it was there to catch disappears. Every cell
+    below drives its own probe false, so a cell reverted to a bare
+    `pytest.skip` raises `Skipped` where the strict pass demands `Failed` --
+    and `_strict_failure` turns that escape into a hard failure rather than the
+    green skip it would otherwise be.
+
+    Behavioral, not a source scan: the probe's answer is the only thing
+    stubbed, and the marker proves the FAILURE carries that cell's own reason
+    (and therefore its own remedy, which `refuse_silent_skip` requires).
+    """
+    for class_name, method_name, needs_tmp_path, marker in _FIXTURE_SHAPE_SKIP_CELLS:
+        monkeypatch.setenv(conftest.STRICT_ENV_VAR, "1")
+        with _strict_failure() as failed:
+            _run_shape_skip_cell(class_name, method_name, needs_tmp_path, tmp_path)
+        assert marker in str(failed.value), (
+            f"{class_name}.{method_name} does not carry its own remedy under "
+            f"strict mode: {failed.value}")
+        assert conftest.STRICT_ENV_VAR in str(failed.value)
+
+        # And the skip it replaces is still a visible skip when the lane is not
+        # claiming to be complete -- the gate must not turn every run red.
+        monkeypatch.delenv(conftest.STRICT_ENV_VAR, raising=False)
+        with pytest.raises(Skipped) as skipped:
+            _run_shape_skip_cell(class_name, method_name, needs_tmp_path, tmp_path)
+        assert marker in str(skipped.value), (
+            f"{class_name}.{method_name} skipped for an unexpected reason: "
+            f"{skipped.value}")
 
 
 # --- #733 F5: the suite cannot leak a headless bridge ---------------------
