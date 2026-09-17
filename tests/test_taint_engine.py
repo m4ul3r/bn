@@ -7574,24 +7574,22 @@ def _user_copy_out_func(name, *, value_arg0):
 
 
 @pytest.mark.parametrize("name,value_arg0", [("copy_to_user", False), ("put_user", True)])
-def test_kernel_copy_out_models_propagate_into_the_user_buffer_809(models, name, value_arg0):
-    # The kernel->user direction carries no untrusted origin of its own: it only
-    # PROPAGATES the kernel buffer into the user destination, so seeding the
-    # kernel side (param:0) is what fills the user-visible buffer.
+def test_kernel_copy_out_models_are_direction_only_809(models, name, value_arg0):
+    # Both halves of the copy-OUT direction contract in ONE test, because each
+    # half alone is green without the model: `call:<name>` raises "no taint-model
+    # sources to seed" for an ABSENT key exactly as it does for a key that
+    # declares no source, and the propagation half alone would assert nothing
+    # when the key is missing. Together they pin the direction:
+    #  - the kernel buffer PROPAGATES into the user destination, so seeding the
+    #    kernel side (param:0) is what fills the user-visible buffer; and
+    #  - the pair declares no source of its own -- `--source call:<name>` presets
+    #    a model's declared sources, and symmetrizing copy_to_user/put_user with
+    #    copy_from_user/get_user would invent taint on every kernel->user copy,
+    #    the one direction error this family can make.
     func = _user_copy_out_func(name, value_arg0=value_arg0)
     bv = FBV({0x900: name, 0x901: "system"})
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
-
-
-@pytest.mark.parametrize("name,value_arg0", [("copy_to_user", False), ("put_user", True)])
-def test_kernel_copy_out_models_declare_no_source_809(models, name, value_arg0):
-    # Direction guard. `--source call:<name>` presets the sources a model
-    # declares, so it must fail loudly for the copy-OUT pair: symmetrizing them
-    # with copy_from_user/get_user would invent taint on every kernel->user copy
-    # -- the one direction error this family can make.
-    func = _user_copy_out_func(name, value_arg0=value_arg0)
-    bv = FBV({0x900: name, 0x901: "system"})
     with pytest.raises(te.TaintError):
         te.TaintEngine(bv, models).forward(func, [te.parse_locator(f"call:{name}")])
 
@@ -7696,13 +7694,17 @@ def _qsort_func():
 
 
 def test_qsort_model_keeps_the_array_tainted_and_analyzed_809(models):
-    # qsort permutes the caller's array in place and calls the comparator back
-    # through libc; the model declares the array in AND out (`*arg:0 -> *arg:0`).
-    # Two observable effects, both of which the unmodeled call gets wrong: the
-    # array's taint survives the call (it reaches the sink), and the call is no
-    # longer disclosed as an unanalyzed external frontier -- under --unknown-call
-    # stop that disclosure is the `unmodeled_callee` leaf, i.e. the array's flow
-    # was NOT propagated through the call.
+    # What a qsort MODEL buys for a keyable stack array: the call stops being an
+    # unanalyzed external frontier, so the array's flow is no longer cut there.
+    # Deliberately NOT claimed here: that the in/out edge is what preserves the
+    # array's taint. For a keyable buffer the engine's store/load model keeps it
+    # tainted either way, so an empty `{"qsort": {}}` model reproduces the two
+    # assertions below as well; the edge's own effect is observable only where
+    # the destination cannot be keyed, which is what
+    # test_qsort_unkeyable_array_pointer_discloses_the_write_809 pins. The
+    # counterfactual at the end keeps THIS test honest about the part it does
+    # own -- with the model key gone the frontier disclosure comes back, so the
+    # test cannot stay green without the model.
     func = _qsort_func()
     bv = FBV({0x900: "qsort", 0x901: "system"})
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
@@ -7713,6 +7715,11 @@ def test_qsort_model_keeps_the_array_tainted_and_analyzed_809(models):
     result_stop = stopped.forward(func, [te.parse_locator("param:0")])
     assert not [l for l in result_stop["leaves"] if l["kind"] == "unmodeled_callee"], result_stop["leaves"]
     assert [s["sink"]["class"] for s in result_stop["reached_sinks"]] == ["command_injection"], result_stop
+
+    unmodeled = {k: v for k, v in models.items() if k != "qsort"}
+    gone = te.TaintEngine(bv, unmodeled, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [l["kind"] for l in gone["leaves"] if l["kind"] == "unmodeled_callee"] == ["unmodeled_callee"], gone["leaves"]
 
 
 def test_qsort_unkeyable_array_pointer_discloses_the_write_809(models):
@@ -7736,6 +7743,17 @@ def test_qsort_unkeyable_array_pointer_discloses_the_write_809(models):
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
     assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
     assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is False, result.get("diagnostics")
+
+    # ...and the in/out RULE is what produces that disclosure, not the mere
+    # presence of a `qsort` key: remove only the rule (key kept, propagates
+    # empty, i.e. an unmodelled in-place write) and the unkeyable destination is
+    # written with nothing recorded -- no frontier leaf, and the all-clear is
+    # handed back. So an empty `{"qsort": {}}` model does NOT reproduce this
+    # test, and the assertions above go red if the edge leaves the DB.
+    edgeless = {**models, "qsort": {"propagates": []}}
+    bare = te.TaintEngine(bv, edgeless).forward(func, [te.parse_locator("param:0")])
+    assert [l["kind"] for l in bare["leaves"]] == [], bare["leaves"]
+    assert (bare.get("diagnostics") or {}).get("safe_to_report_all_clear") is True, bare.get("diagnostics")
 
 
 def test_bsearch_model_propagates_base_taint_into_the_return_809(models):
@@ -7826,6 +7844,37 @@ def test_sscanf_model_propagates_into_every_destination_in_the_run_809(models):
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
 
 
+def test_sscanf_c99_spelling_is_not_bypassed_809(models):
+    # stdio.h REDIRECTs sscanf under __USE_ISOC99 and a real compiler emits
+    # `__isoc99_sscanf` for a source-level sscanf (verified on a linked binary
+    # with the local toolchain), so a family that models only the un-prefixed key
+    # is bypassed on exactly the binaries it targets -- which is the lock-step the
+    # scanf-family entry in the DB claims to keep. The SAME two-destination
+    # program must reach the sink whichever spelling the callee carries; pinned
+    # under --unknown-call stop, where an unmodeled external propagates nothing,
+    # so the flow can only come from the model.
+    src = FVar("src", typ="char[0x40]")
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SSCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "__isoc99_sscanf(&src, fmt, &a, &b)", SSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("parse_cfg", 0x10, FSSAFunc(instrs), params=[src])
+    bv = FBV({SSCANF: "__isoc99_sscanf", SYS: "system"})
+    result = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
+
+
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
     # vsscanf's destinations live inside the va_list (arg2), which the engine
     # cannot walk, so the model is deliberately the honest-partial shape readv
@@ -7862,6 +7911,15 @@ def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
     assert not any("has no model" in a for a in result["assumptions"]), result["assumptions"]
     with pytest.raises(te.TaintError):
         engine.forward(func, [te.parse_locator("call:vsscanf")])
+
+    # ...and the same program spelled the way the compiler emits it: the twin
+    # must carry the MODEL's edge, not the default policy's blanket
+    # "unmodeled external" guess -- which is exactly what the "has no model"
+    # assumption above distinguishes.
+    twin_bv = FBV({VSSCANF: "__isoc99_vsscanf", MEMCPY: "memcpy"})
+    twin = te.TaintEngine(twin_bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in twin["reached_sinks"]] == ["overflow_len"], twin
+    assert not any("has no model" in a for a in twin["assumptions"]), twin["assumptions"]
 
 
 def test_new_809_model_keys_resolve_by_their_real_names_only(models):
