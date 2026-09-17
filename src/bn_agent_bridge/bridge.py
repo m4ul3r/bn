@@ -1590,9 +1590,28 @@ class BinaryNinjaBridge:
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
         op = payload.get("op")
-        params = payload.get("params") or {}
+        params = payload.get("params")
         target = payload.get("target")
         try:
+            # `params` is the one wire field EVERY binder indexes into
+            # (params[...] / params.get(...)), and the lock-escalation probes
+            # read it before any binder runs, yet only the payload's own
+            # object-ness was ever validated (#91 shipped the boolean half
+            # only). A raw client's non-object `params` reached a binder as-is
+            # and came back as an AttributeError-shaped `internal error`,
+            # while a falsy one (0, "", [], false) silently coerced to {} and
+            # ran the op against no parameters. Refuse a present non-object
+            # before the registry/lock/handler path, with the same clean
+            # invalid_request the param helpers raise. An absent `params` --
+            # JSON null included, the optional-params case the helpers already
+            # spell with ``None`` -- stays {}.
+            if params is None:
+                params = {}
+            elif not isinstance(params, dict):
+                raise OperationFailure(
+                    "invalid_request",
+                    f"params must be a JSON object, got {type(params).__name__}",
+                )
             spec = REGISTRY.spec(op)
             lock = contextlib.nullcontext()
             if spec is not None:

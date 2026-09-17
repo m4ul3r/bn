@@ -2959,6 +2959,71 @@ def test_dispatch_error_without_operation_failure_has_no_metadata(monkeypatch):
     assert "observed" not in resp
 
 
+@pytest.mark.parametrize("op", ["target_info", "rename_symbol"])
+@pytest.mark.parametrize("params", ["not-a-dict", 0])
+def test_dispatch_refuses_non_object_params_before_any_handler(monkeypatch, op, params):
+    """#773 (the residual half of #91): ``params`` is the one wire field EVERY
+    binder indexes into (``params[...]`` / ``params.get(...)``) and the
+    lock-escalation probes read just before that, yet only the PAYLOAD's own
+    object-ness was validated. So a raw client's non-object ``params`` reached
+    the handler as-is and came back as an AttributeError-shaped
+    ``internal error``, while a falsy one (``0``/``""``/``[]``/``false``)
+    silently coerced to ``{}`` and ran the op against no parameters at all.
+    Both must be the same clean ``invalid_request`` the param helpers
+    (``_validate_bool``/``_validate_count``) raise, naming the field and the
+    type received, and refused BEFORE any op handler runs -- pinned over a read
+    op and over a mutation-shaped one, whose refusal the CLI classifies through
+    the envelope's ``status``."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    reached = []
+
+    def _handler(op_name, params, target):
+        reached.append((op_name, params, target))
+        return {"kind": "probe"}
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _handler)
+
+    resp = instance.dispatch({"op": op, "params": params, "target": "active"})
+
+    assert resp["ok"] is False
+    assert resp["status"] == "invalid_request"
+    assert resp["error"] == f"params must be a JSON object, got {type(params).__name__}"
+    # A clean refusal, not the leaked Python traceback this used to be.
+    assert "internal error" not in resp["error"]
+    assert reached == []
+
+
+@pytest.mark.parametrize("op", ["target_info", "rename_symbol"])
+def test_dispatch_keeps_absent_and_empty_params_working(monkeypatch, op):
+    """The guard refuses only a params that is PRESENT and not an object: the
+    optional-params protocol case is untouched. An absent key, an explicit
+    ``{}`` and a JSON ``null`` (how an optional field is spelled on the wire,
+    and how ``_validate_bool``/``_validate_count`` already read a missing
+    param) all still reach the handler as ``{}``."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    reached = []
+
+    def _handler(op_name, params, target):
+        reached.append(params)
+        return {"kind": "probe"}
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _handler)
+
+    for request in (
+        {"op": op, "target": "active"},
+        {"op": op, "params": {}, "target": "active"},
+        {"op": op, "params": None, "target": "active"},
+    ):
+        resp = instance.dispatch(request)
+        assert resp["ok"] is True, (request, resp)
+
+    assert reached == [{}, {}, {}]
+
+
 def test_serialize_error_prefixes_unexpected_exceptions(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 
