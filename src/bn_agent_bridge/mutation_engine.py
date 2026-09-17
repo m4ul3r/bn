@@ -3564,6 +3564,12 @@ def _split_top_level_declarations(source: str) -> list[str]:
                 continue
             if char == quote:
                 quote = None
+        elif char == "'" and index > 0 and source[index - 1].isalnum():
+            # A C++14 digit separator (`1'000`), not a character literal. Opening a
+            # quote here leaves it open, swallows every later top-level `;` into one
+            # fragment and silently stops the guard inspecting the rest of the
+            # string -- a missed refusal rather than a false one, but free to avoid.
+            pass
         elif char in "\"'":
             quote = char
         elif char == "/" and source[index + 1:index + 2] == "*":
@@ -3592,21 +3598,37 @@ def _split_top_level_declarations(source: str) -> list[str]:
     ]
 
 
-_TOP_LEVEL_TYPE_DEF_RE = re.compile(r"^(?:typedef\s+)?(?:struct|union|enum|class)\b")
+_TYPE_DEFINITION_RE = re.compile(
+    r"^(?:"
+    r"(?:static|extern|const|volatile|register|inline)\s+"
+    r"|__attribute__\s*\(\([^)]*\)\)\s*"
+    r")*"
+    r"(?:typedef\s+)?"
+    r"(?:struct|union|enum|class)\b"
+    r"[^;={]*\{"
+)
 
 
 def _declares_a_type(fragment: str) -> bool:
     """Whether a top-level fragment intends to DEFINE a type (#760).
 
-    A braced body (`struct A { ... };`) or a `typedef` does; a usage
+    A fragment qualifies when it STARTS with a definition: an optional run of
+    storage/attribute prefixes, an optional `typedef`, then a tag whose body opens
+    before any `;` or `=`. The `=` exclusion is load-bearing: a variable
+    declaration with a brace initializer (`struct A x = {};`) is a USAGE whose
+    braces are initializer braces, and an earlier cut of this check that only
+    looked for `{` refused it -- breaking working input and diagnosing a variable
+    as a dropped type declaration (review of #761).
+
+    A brace-less fragment qualifies only when it is a `typedef`, so a usage
     (`struct A x;`), a forward declaration (`struct A;`) or a function/variable
-    declaration does not. Deliberately narrow -- this gates a refusal, so a
-    fragment that merely mentions a type keyword must not qualify.
+    declaration is never inspected. A definition whose tag is introduced by a macro
+    expansion (`DECL(uint32);`) stays invisible to any text-level check like this.
     """
     text = _strip_c_comments(fragment).strip()
     if "{" not in text:
         return text.startswith("typedef")
-    return bool(_TOP_LEVEL_TYPE_DEF_RE.match(text))
+    return bool(_TYPE_DEFINITION_RE.match(text))
 
 
 def _declarations_without_named_types(ctx, bv, declaration: str,

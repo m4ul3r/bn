@@ -141,109 +141,141 @@ def test_types_declare_refuses_a_partially_dropped_declaration_760(monkeypatch):
     assert bv.defined == []          # refused before anything is applied
 
 
-def test_partial_declaration_check_passes_when_every_fragment_lands_760(monkeypatch):
-    """#760 negative control: a multi-declaration whose fragments all define a named
-    type is untouched -- the guard must not fire on ordinary multi-type input."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    module = bridge.mutation_engine
+def _declare_probe_bv(monkeypatch, *, good=("widget_a_t", "widget_b_t"),
+                      variables=("widget_inst",), raise_when=None):
+    """A view whose platform parser behaves the way the real one does for #760.
+
+    `good` are the names it materializes; anything else in an inspected fragment is
+    dropped with no named type and no exception -- exactly how a declaration whose
+    name collides with a built-in type disappears. `variables` come back through the
+    `variables` slot, so a variable declaration with a brace initializer parses to
+    zero types WITHOUT raising (the shape that broke an earlier cut of the guard).
+    `raise_when` models a fragment that cannot parse on its own.
+    """
 
     class _Platform:
         def parse_types_from_source(self, source, **kwargs):
-            names = [name for name in ("widget_a_t", "widget_b_t") if name in source]
-            return _ParseResult(types={name: f"struct {name}" for name in names})
+            if raise_when is not None and raise_when(source):
+                raise SyntaxError(f"cannot parse {source!r} alone")
+            return _ParseResult(
+                types={name: _FakeType(name, width=4, members=[])
+                       for name in good if name in source},
+                variables={name: "int" for name in variables if name in source},
+            )
 
-    class _BV(_FakeBV):
+    class _DeclareBV(_FakeBV):
         def __init__(self):
             super().__init__()
             self.platform = _Platform()
+            self.defined: list[str] = []
+            self.types_defined: dict[str, object] = {}
 
-    dropped = module._declarations_without_named_types(
-        instance.ctx, _BV(),
-        "struct widget_a_t { int a; }; struct widget_b_t { int b; };",
-        None,
+        def get_type_by_name(self, name):
+            return self.types_defined.get(str(name))
+
+        def define_user_type(self, name, type_obj):
+            self.types_defined[str(name)] = _FakeType(str(name), width=4, members=[])
+            self.defined.append(str(name))
+
+    return _DeclareBV()
+
+
+def _declare(instance, bv, declaration):
+    return instance._op_types_declare(
+        bv, {"op": "types_declare", "declaration": declaration}
     )
 
-    assert dropped == []
+
+def test_types_declare_refuses_a_drop_after_tricky_syntax_760(monkeypatch):
+    """#760: the drop is caught even when earlier fragments carry the syntax that
+    makes splitting hard -- a `;` inside a struct body and inside a comment."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        _declare(instance, bv, (
+            "struct widget_a_t { char *s; }; "        # a `;` inside a body
+            "/* ; */ struct uint32_t { int x; };"     # a `;` inside a comment
+        ))
+
+    assert exc.value.status == "invalid_request"
+    assert any("uint32_t" in item for item in exc.value.observed["dropped_declarations"])
+    assert bv.defined == []
 
 
-def test_partial_declaration_check_skips_a_dependent_fragment_760(monkeypatch):
+def test_types_declare_refuses_a_drop_after_a_digit_separator_760(monkeypatch):
+    """#760 review item 4: an odd `'` (a C++14 digit separator, which the parser
+    accepts) used to open a quote, merge every later fragment into one and switch the
+    guard off for the rest of the string."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        _declare(instance, bv, (
+            "struct widget_a_t { int a; }; "
+            "static const int widget_k = 1'000; "
+            "struct uint32_t { int x; };"
+        ))
+
+    assert exc.value.status == "invalid_request"
+    assert any("uint32_t" in item for item in exc.value.observed["dropped_declarations"])
+
+
+def test_types_declare_allows_a_variable_declaration_with_a_brace_initializer_760(monkeypatch):
+    """#760 review item 1: a variable declaration with a brace initializer is a USAGE,
+    not a definition. An earlier cut of the classifier saw `{`, treated it as a body
+    and refused the request -- breaking working input and diagnosing a variable as a
+    dropped type declaration."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch, variables=("widget_inst",))
+
+    result = _declare(instance, bv, (
+        "struct widget_a_t { int a; }; "
+        "struct widget_known_t widget_inst = {};"
+    ))
+
+    assert set(result["defined_types"]) == {"widget_a_t"}
+    assert result["count"] == 1
+    assert bv.defined == ["widget_a_t"]          # nothing refused, nothing extra applied
+
+
+def test_types_declare_allows_a_multi_declaration_that_all_land_760(monkeypatch):
+    """#760 negative control: ordinary multi-type input is untouched."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    result = _declare(instance, bv, (
+        "struct widget_a_t { int a; }; struct widget_b_t { int b; };"
+    ))
+
+    assert set(result["defined_types"]) == {"widget_a_t", "widget_b_t"}
+    assert result["count"] == 2
+
+
+def test_types_declare_allows_a_fragment_that_depends_on_an_earlier_one_760(monkeypatch):
     """#760: a fragment that only fails to parse alone because it uses a type an
-    earlier fragment defines is NOT a dropped declaration -- refusing it would turn a
+    earlier fragment defines is skipped, not refused -- refusing it would turn a
     working declaration into an error."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    module = bridge.mutation_engine
+    bv = _declare_probe_bv(
+        monkeypatch,
+        good=("widget_inner_t", "widget_outer_t"),
+        raise_when=lambda source: (
+            "widget_outer_t" in source and "widget_inner_t {" not in source
+        ),
+    )
 
-    class _Platform:
-        def parse_types_from_source(self, source, **kwargs):
-            # The outer fragment depends on the inner type, so alone it cannot parse:
-            # raising there is what tells the check to stay silent.
-            if "widget_outer_t" in source and "widget_inner_t {" not in source:
-                raise SyntaxError("unknown type 'widget_inner_t'")
-            names = [
-                name for name in ("widget_inner_t", "widget_outer_t") if name in source
-            ]
-            return _ParseResult(types={name: f"struct {name}" for name in names})
-
-    class _BV(_FakeBV):
-        def __init__(self):
-            super().__init__()
-            self.platform = _Platform()
-
-    dropped = module._declarations_without_named_types(
-        instance.ctx, _BV(),
+    result = _declare(instance, bv, (
         "struct widget_inner_t { int a; }; "
-        "struct widget_outer_t { struct widget_inner_t inner; };",
-        None,
-    )
+        "struct widget_outer_t { struct widget_inner_t inner; };"
+    ))
 
-    assert dropped == []
-
-
-@pytest.mark.parametrize(
-    "fragment, declares",
-    [
-        ("struct widget_t { int x; };", True),
-        ("union widget_u { int x; };", True),
-        ("enum widget_e { WIDGET_A = 1 };", True),
-        ("class Widget { int x; };", True),
-        ("typedef struct { int x; } widget_alias_t;", True),
-        ("typedef unsigned short int32_t;", True),
-        ("struct widget_t x;", False),          # a usage, not a definition
-        ("struct widget_t;", False),            # a forward declaration
-        ("int widget_call(int a);", False),     # a function declaration
-        ("extern int widget_g;", False),
-    ],
-)
-def test_declares_a_type_classifies_fragments_760(fragment, declares, monkeypatch):
-    """#760: only a fragment that intends to DEFINE a type is inspectable. A usage or
-    a forward declaration legitimately defines nothing and must never be refused."""
-    bridge = _load_bridge(monkeypatch)
-    assert bridge.mutation_engine._declares_a_type(fragment) is declares
-
-
-def test_split_top_level_declarations_is_brace_and_quote_aware_760(monkeypatch):
-    """#760: the splitter must not break a declaration at a `;` inside a struct body,
-    an array bound, a string literal or a comment -- a bad split would mis-report a
-    dropped declaration and refuse a valid one."""
-    bridge = _load_bridge(monkeypatch)
-    split = bridge.mutation_engine._split_top_level_declarations
-
-    source = (
-        "struct widget_a_t { int a; int b; }; "     # a body `;`
-        "struct widget_b_t { char name[4]; }; "     # an array bound
-        'struct widget_c_t { char *fmt; }; /* ; */ '  # a `;` in a comment
-    )
-
-    fragments = split(source)
-
-    assert len(fragments) == 3
-    assert all(fragment.strip().endswith(";") for fragment in fragments)
-    assert "widget_a_t { int a; int b; }" in fragments[0]
-    assert split("struct widget_d_t { char *s; };") == [
-        "struct widget_d_t { char *s; };"
-    ]
+    assert set(result["defined_types"]) == {"widget_inner_t", "widget_outer_t"}
 
 
 def test_declared_types_verifier_rejects_an_empty_apply_result(monkeypatch):
