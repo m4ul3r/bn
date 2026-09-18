@@ -4225,7 +4225,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1206, f"the differential ran {checked} cases, not 1206"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
+    assert checked == 1212, f"the differential ran {checked} cases, not 1212"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4269,7 +4270,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # 4880 -> 4888 (#755): ONE more pair, because `_render_trace_text` now reads
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
-    assert swept == 4888, f"the raise sweep ran {swept} renders, not 4888"
+    #
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
+    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4423,7 +4426,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # contributes 2 benign payloads per pair. Measured on the rebased tree.
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
-    assert checked == 1423, f"the mirror ran {checked} renders, not 1423"
+    #
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
+    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

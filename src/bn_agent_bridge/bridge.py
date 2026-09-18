@@ -582,6 +582,31 @@ class TargetManager:
             if vid is not None:
                 self._database_paths[vid] = str(path)
 
+    def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
+        """The open target whose file IS *path*, other than *exclude*, or None.
+
+        A save that lands on a file another target already has open makes the two
+        targets one database from that moment: BN dedups views by file, so a
+        later restart reloads one file for both rows and the instance comes back
+        with fewer targets. That is not fixable by choosing a different path --
+        they genuinely ARE the same database once the save lands -- so what must
+        not happen is it being SILENT (#857 round 4).
+        """
+        if not path:
+            return None
+        with self._lock:
+            own = self._stable_view_id(exclude)
+        for row in self.refresh():
+            if row.get("view_id") == own:
+                continue
+            if row.get("filename") == path or row.get("database_path") == path:
+                return {
+                    "target_id": row.get("target_id"),
+                    "selector": row.get("selector"),
+                    "filename": row.get("filename"),
+                }
+        return None
+
     def is_dirty(self, bv) -> bool:
         with self._lock:
             vid = self._stable_view_id(bv)
@@ -2656,6 +2681,7 @@ class BinaryNinjaBridge:
             # added in one commit, and invisible because the test's fake did not
             # re-home the way BN does (#857 review round 3).
             self.targets.note_database(bv, saved)
+            _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
 
         # `bv.create_database` re-homes the live view to whatever .bndb it wrote,
@@ -2691,8 +2717,19 @@ class BinaryNinjaBridge:
         # here on nothing in the view says where its analysis actually lives.
         # Record it, or `session restart` reopens the raw bytes and discards this
         # save silently.
-        self.targets.note_database(bv, saved)
-        return {"ok": True, "saved": True, "path": saved}
+        #
+        # DEFAULT saves only. An explicit `--path` save is a copy -- an EXPORT,
+        # not the target's new home -- so recording it re-pointed the target's
+        # restart identity at the copy: restart reopened the export instead of
+        # the database the target IS, and a since-deleted scratch export made
+        # that target fail to reload and vanish. That is the identity move
+        # `_restore_filename` exists to prevent, deferred one step to restart
+        # (#857 round-4 regression, introduced by this change).
+        if not explicit:
+            self.targets.note_database(bv, saved)
+        result = {"ok": True, "saved": True, "path": saved}
+        _disclose_open_target_collision(self.targets, bv, saved, result)
+        return result
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
         bv = self.targets.resolve(selector)
@@ -4700,6 +4737,30 @@ def _bind_batch_apply(bridge, params, target):
 # snapshotting phases, never around the post-apply reanalysis.
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
+
+
+def _disclose_open_target_collision(targets, bv, saved: str, result: dict) -> None:
+    """Annotate *result* when the save landed on a file another target has open.
+
+    Best-effort and non-fatal: a save that reached disk must never fail because
+    the collision probe did. Both a structured key and a rendered note, because
+    the harm is that a later `session restart` silently returns fewer targets
+    than it had, and an agent needs to see that at save time (#857 round 4).
+    """
+    try:
+        other = targets.open_target_for_path(saved, exclude=bv)
+    except Exception:  # noqa: BLE001 - never fail a completed save
+        return
+    if not other:
+        return
+    result["collides_with_open_target"] = other
+    note = (
+        f"this database is also open as target {other.get('selector')!r} "
+        f"({other.get('target_id')}); the two targets are now one database, so a "
+        "`session restart` will return one target for both -- close one first if "
+        "you need them separate"
+    )
+    result["note"] = f"{result['note']} {note}" if result.get("note") else note
 
 
 def _cache_bndb_path(binary_path: str) -> Path:

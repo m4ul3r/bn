@@ -5430,8 +5430,11 @@ def test_save_records_the_backing_database_for_restart_857(monkeypatch, tmp_path
     assert rows_before[0]["database_path"] is None, (
         "a view with no saved database must report null, not a guessed path")
 
+    # DEFAULT save (no --path): the narrative is "load raw, annotate, bn save",
+    # which writes the adjacent sibling. An explicit --path here would be an
+    # EXPORT and is deliberately not recorded.
     out = tmp_path / "svc_a.bndb"
-    result = instance._save_database(None, str(out))
+    result = instance._save_database(None, None)
 
     assert result["saved"] is True
     # The live filename is back to the RAW file -- which is exactly why the row
@@ -5453,7 +5456,7 @@ def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
     monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
     monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
     instance.targets.refresh()
-    instance._save_database(None, str(tmp_path / "svc_b.bndb"))
+    instance._save_database(None, None)          # default save -> the sibling
     assert instance.targets.refresh()[0]["database_path"] is not None
 
     instance.targets.forget(bv)
@@ -5541,16 +5544,19 @@ def test_save_in_place_records_no_separate_database_857(monkeypatch, tmp_path):
         "exists to name a divergence must stay null")
 
 
-def test_save_over_another_open_target_is_disclosed_not_silent_857(monkeypatch, tmp_path):
-    """#857 review round 2 MAJOR, scoped honestly. If a raw target's default save
-    lands on a file that is ITSELF open as a second target, the two targets now
-    share one database, and a restart reopens one file for both rows -- the
-    instance comes back with fewer targets than it had.
+def test_save_onto_an_open_target_is_disclosed_at_save_time_857(monkeypatch, tmp_path):
+    """#857 round-4 MAJOR. If a raw target's default save lands on a file that is
+    ITSELF open as a second target, the two targets are one database from that
+    moment: BN dedups views by file, so a later `session restart` reloads one
+    file for both rows and the instance comes back with fewer targets.
 
-    That is not fixable by choosing a different path: the two targets genuinely
-    ARE the same database once the save lands, and BN dedups views by file. What
-    must not happen is it being silent, so this pins that the bridge reports the
-    collision at save time. The residual is routed rather than claimed fixed."""
+    That is NOT fixable by choosing a different path, so the fix is that it stops
+    being silent. Round 4's version of this test asserted only the pre-existing
+    row state and pinned field existence, not a disclosure -- it was named for a
+    disclosure the bridge did not emit. It now asserts the real one: a structured
+    key naming the other target, and a rendered line."""
+    from bn import formatters
+
     raw = tmp_path / "svc"
     raw.write_bytes(b"\x7fELF")
     sidecar = tmp_path / "svc.bndb"
@@ -5565,11 +5571,79 @@ def test_save_over_another_open_target_is_disclosed_not_silent_857(monkeypatch, 
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    instance._save_database(None, None)
+    result = instance._save_database(None, None)
 
+    collision = result["collides_with_open_target"]
+    assert collision["filename"] == str(sidecar)
+    assert collision["target_id"]
+    assert "session restart" in result["note"]
+    # And it reaches the surface an operator actually reads.
+    rendered = formatters._render_save_text(result)
+    assert "also open as target" in rendered
+    assert "one database" in rendered
+
+    # The row state that made this reachable is still observable.
     rows = {r["filename"]: r for r in instance.targets.refresh()}
-    # The raw target's database is the OTHER target's file: observable, so a
-    # reader (and a future fix) can detect the collision from the rows alone.
     assert rows[str(raw)]["database_path"] == str(sidecar)
-    assert rows[str(sidecar)]["filename"] == str(sidecar)
     assert rows[str(sidecar)]["database_path"] is None
+
+
+def test_a_save_with_no_other_target_on_that_file_discloses_nothing_857(monkeypatch, tmp_path):
+    """The control: the collision key must not appear on an ordinary save, or the
+    disclosure becomes noise an operator learns to skip."""
+    from bn import formatters
+
+    raw = tmp_path / "solo"
+    raw.write_bytes(b"\x7fELF")
+    bv = _RehomingSaveBV(str(raw))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    assert "collides_with_open_target" not in result
+    assert "note" not in result
+    assert "also open as target" not in formatters._render_save_text(result)
+
+
+def test_an_explicit_path_save_is_an_export_not_a_new_home_857(monkeypatch, tmp_path):
+    """#857 round-4 REGRESSION introduced by this PR. `bn save --path <export>`
+    is a copy-save: an export, not the target's new home. Recording it as the
+    backing database re-pointed the target's restart identity at the copy, so a
+    following `session restart` reopened the export instead of the database the
+    target IS -- and if the export was a scratch file since deleted, that target
+    failed to reload and was dropped.
+
+    That is precisely the identity move `_restore_filename` exists to prevent
+    (#256/#285), deferred one step to restart. At base the same restart reopened
+    the target's own database.
+
+    Uses the RE-HOMING fake, because `create_database` rebinds the live filename
+    to the export and the restore is what puts it back -- the interaction this
+    test is about."""
+    own_db = tmp_path / "svc.bndb"
+    own_db.write_text("bndb")
+    export = tmp_path / "exports" / "svc-copy.bndb"
+    export.parent.mkdir()
+    bv = _RehomingSaveBV(str(own_db))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, str(export))
+
+    assert result["saved"] is True
+    assert bv.created_with == str(export.resolve())
+    # Identity did not move: the live view is still its own database...
+    assert str(bv.file.filename) == str(own_db)
+    row = instance.targets.refresh()[0]
+    assert row["filename"] == str(own_db)
+    # ...and nothing points restart at the export.
+    assert row["database_path"] is None, (
+        "an explicit --path save is an export; recording it would make restart "
+        "reopen the copy instead of the target's own database")

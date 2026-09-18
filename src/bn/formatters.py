@@ -1157,6 +1157,16 @@ def _render_save_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     line = f"saved: {value.get('path', '<unknown>')}"
+    collision = _field_dict(value, "collides_with_open_target")
+    if collision:
+        # #857 r4: a save landing on a file another target already has open makes
+        # the two targets one database, so a later restart returns one target for
+        # both. Not silent.
+        line += (
+            "\nnote: also open as target "
+            f"{collision.get('selector', '<unknown>')}; the two targets are now "
+            "one database and a session restart will return one for both"
+        )
     if value.get("fallback"):
         # The default path was unwritable (e.g. a read-only firmware mount); the
         # database landed in the writable cache instead (#214).
@@ -1182,7 +1192,15 @@ def _render_session_start_text(value: Any) -> str:
             if isinstance(item, dict):
                 error = item.get("error")
                 if error:
-                    lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
+                    # #857 r4 minor: name the path actually TRIED. A restart
+                    # reloads a saved target from its backing database, so
+                    # printing only the target's filename pointed the reader at a
+                    # file that was never opened and hid the missing database.
+                    attempted = item.get("attempted_path")
+                    where = f"{item.get('path', '<unknown>')}"
+                    if attempted and attempted != item.get("path"):
+                        where += f" (tried {attempted})"
+                    lines.append(f"- {where} [error: {error}]")
                 elif value.get("detached"):
                     lines.append(
                         f"- {item.get('path', '<unknown>')} "
