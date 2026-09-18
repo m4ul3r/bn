@@ -1509,6 +1509,51 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+@_discloses
+def _render_target_info_annotations_text(value: Any) -> str:
+    """Render the #793 annotation counts / provenance block for `target info`.
+
+    Its own function (composed onto `_render_target_info_text` by the command,
+    NOT folded into `_render_target_summary`) because `target list` renders every
+    row through that summary: folding it in would print a provenance block per
+    named target, and the fact this block states is about ONE view.
+
+    The wording is deliberately the same as `_render_orient_text`'s
+    `existing_annotations` block: one bridge key, one fact, two commands -- an
+    agent that read the line on `evidence orient` must recognize it here. The
+    INDENT follows this renderer's own grammar (tab-indented detail lines).
+
+    Returns "" when the payload carries no block at all -- an older bridge, or a
+    `target list` row -- so ABSENT stays distinguishable from a block that
+    reported zeroes, and the composed render is then byte-identical to the
+    pre-#793 output.
+    """
+    if not _field_present(value, "existing_annotations"):
+        return ""
+    annotations = _field_dict(value, "existing_annotations")
+    if annotations.get("unavailable"):
+        return f"\texisting annotations: unavailable — {annotations['unavailable']}"
+    # #733 F2: the analyst/placeholder split prints only when the bridge reports
+    # it, each fragment through the count choke point -- an absent key omits its
+    # fragment, an unreadable one prints `?` rather than a fabricated 0. Same
+    # rule, same helpers, as the orient card's block.
+    row = (
+        f"\texisting annotations: comments={annotations.get('comments', 0)}, "
+        f"function-docs={annotations.get('function_comments', 0)}, "
+        f"user-symbols={annotations.get('user_symbols', 0)}"
+    )
+    if _field_present(annotations, "analyst_symbols"):
+        row += f", analyst-symbols={_stated_count(annotations, 'analyst_symbols')}"
+        if _field_present(annotations, "placeholder_symbols"):
+            row += f", placeholders={_stated_count(annotations, 'placeholder_symbols')}"
+    row += f", cache-restored={annotations.get('analysis_cache_restored', False)}"
+    lines = [row]
+    hint = annotations.get("provenance_hint")
+    if hint:
+        lines.append(f"\t! {hint}")
+    return "\n".join(lines)
+
+
 def _render_target_choice(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

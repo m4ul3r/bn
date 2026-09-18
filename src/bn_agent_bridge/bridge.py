@@ -2842,6 +2842,15 @@ class BinaryNinjaBridge:
                 "import_symbol_count": "rows returned by imports",
                 "imported_function_count": "callable imported function targets",
             },
+            # #793: the SAME annotation block `evidence orient` publishes, from
+            # the same builder, so the two surfaces cannot disagree about whether
+            # this view already carries inherited state. Orient answered this
+            # while `target info` -- the command every agent reaches for first --
+            # had no annotation key at all, so a cached .bndb read as a pristine
+            # view until a separate `bn comment list` pass contradicted it.
+            "existing_annotations": read_listing._existing_annotations(
+                self.ctx, selector, filename=filename
+            ),
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
         # target info -- the natural reflex, since function info accepts it -- is
@@ -3700,41 +3709,18 @@ class BinaryNinjaBridge:
         # BNDB, inherited comments/names bias analysis and let an agent over-credit
         # itself; surface bounded counts + a provenance hint so the inherited baseline
         # is visible up front instead of requiring a separate `bn comment list` pass.
-        # Annotation counting is best-effort -- if the view can't be resolved/read it
-        # degrades to an `unavailable` marker rather than erroring the whole digest.
+        # #793: the block is built by `read_listing._existing_annotations` -- the ONE
+        # builder, shared with `target info`, which is why the two surfaces can no
+        # longer disagree. `_target_info` (called at the top of this digest) has
+        # already published it, so reuse that rather than pay the function/symbol
+        # walk a second time; the fallback keeps the field a dict for a double that
+        # answers `_target_info` without the key.
         filename = str(target.get("filename", "") or "")
-        analysis_cache_restored = filename.endswith(".bndb")
-        try:
-            bv = self._resolve_view(selector)
-            annotations = read_listing._annotation_summary(self.ctx, bv)
-            # #733 F2: keyed on ANALYST work, not the raw non-auto count -- the
-            # loader's own placeholders made a pristine view hint that its
-            # entirely-current-run analysis may predate the run.
-            total_annotations = (
-                annotations["comments"] + annotations["function_comments"]
-                + annotations["analyst_symbols"]
+        existing_annotations = target.get("existing_annotations")
+        if not isinstance(existing_annotations, dict):
+            existing_annotations = read_listing._existing_annotations(
+                self.ctx, selector, filename=filename
             )
-            hint = None
-            if analysis_cache_restored or total_annotations:
-                hint = (
-                    f"existing BNDB annotations may predate this run: "
-                    f"{annotations['comments']} comment(s), "
-                    f"{annotations['function_comments']} function doc(s), "
-                    f"{annotations['analyst_symbols']} analyst symbol(s) already present "
-                    f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
-                    + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
-                    + " -- do not over-credit current-run analysis"
-                )
-            existing_annotations = {
-                **annotations,
-                "analysis_cache_restored": analysis_cache_restored,
-                "provenance_hint": hint,
-            }
-        except Exception as exc:
-            existing_annotations = {
-                "unavailable": f"annotation counts unavailable: {exc}",
-                "analysis_cache_restored": analysis_cache_restored,
-            }
         return {
             "kind": "orient_digest",
             "target": target,

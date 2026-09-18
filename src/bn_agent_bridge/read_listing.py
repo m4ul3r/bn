@@ -697,6 +697,58 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     }
 
 
+def _existing_annotations(ctx, selector: str | None, *, filename: str = "") -> dict[str, Any]:
+    """Counts + provenance hint for annotations ALREADY present in the view (#561).
+
+    ONE builder for the two surfaces that answer "can I trust this view as
+    pristine?" -- `target info` (#793) and the orient digest. #793 was filed on
+    the two of them DISAGREEING: the digest published ``existing_annotations``
+    (with ``analysis_cache_restored`` and ``provenance_hint``) while `target
+    info` -- the command every agent runs first -- had no annotation key at all,
+    so the same cached target read annotated on one surface and clean on the
+    other. Both now publish this block under the same key, from here.
+
+    Resolving the view is INSIDE the guard: an unresolvable selector degrades to
+    the ``unavailable`` marker the digest has always published for it, rather
+    than failing a read whose whole job here is best-effort. ``analysis_cache_
+    restored`` is derived from *filename*: a ``.bndb`` carries the analysis
+    cache, which is where inherited comments/names come from. ``provenance_hint``
+    is keyed on ANALYST work, not the raw non-auto count -- the loader's own
+    placeholders made a pristine view hint that its entirely-current-run analysis
+    may predate the run (#733 F2). The marker is the contract the kernel's
+    ``_require_orient_digest`` refuses as a violation, so it must never be
+    swallowed into a clean-looking digest.
+    """
+    analysis_cache_restored = str(filename or "").endswith(".bndb")
+    try:
+        annotations = _annotation_summary(ctx, ctx._resolve_view(selector))
+    except Exception as exc:
+        return {
+            "unavailable": f"annotation counts unavailable: {exc}",
+            "analysis_cache_restored": analysis_cache_restored,
+        }
+    total_annotations = (
+        annotations["comments"] + annotations["function_comments"]
+        + annotations["analyst_symbols"]
+    )
+    hint = None
+    if analysis_cache_restored or total_annotations:
+        hint = (
+            f"existing BNDB annotations may predate this run: "
+            f"{annotations['comments']} comment(s), "
+            f"{annotations['function_comments']} function doc(s), "
+            f"{annotations['analyst_symbols']} analyst symbol(s) already present "
+            f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
+            + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
+            + " -- do not over-credit current-run analysis"
+        )
+    return {
+        **annotations,
+        "analysis_cache_restored": analysis_cache_restored,
+        "provenance_hint": hint,
+    }
+
+
 def _parse_function_address_bounds(
     ctx,
     min_address: Any = None,

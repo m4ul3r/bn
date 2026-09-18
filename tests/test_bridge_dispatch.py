@@ -454,6 +454,58 @@ def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
     }
 
 
+def test_target_info_and_orient_digest_agree_on_existing_annotations_793(monkeypatch):
+    """#793: `target info` published NO annotation key while `evidence orient`
+    published `existing_annotations`, so the same cached view read annotated on
+    one surface and pristine on the other -- and `target info` is the command
+    every agent runs first. Both now publish the same block, from one builder
+    (`read_listing._existing_annotations`), counts and provenance hint included.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    info = instance._target_info("active")
+    digest = instance._orient_digest("active")
+
+    assert info["existing_annotations"]["comments"] == 1
+    assert info["existing_annotations"]["analysis_cache_restored"] is True
+    assert "predate this run" in info["existing_annotations"]["provenance_hint"]
+    # The agreement IS the fix: one builder, one answer, whichever surface asks.
+    assert digest["existing_annotations"] == info["existing_annotations"]
+
+
+def test_target_info_annotation_counts_degrade_but_stay_present_793(monkeypatch):
+    """The other half of #793's contract: the key is never silently ABSENT. A view
+    whose annotation counts cannot be read publishes the `unavailable` marker (the
+    shape `bn_kernel.assert_unannotated` refuses), so an unreadable summary can
+    never pass as a pristine target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary",
+                        lambda ctx, view: (_ for _ in ()).throw(RuntimeError("view is dead")))
+
+    annotations = instance._target_info("active")["existing_annotations"]
+
+    assert "view is dead" in annotations["unavailable"]
+    assert annotations["analysis_cache_restored"] is True
+
+
 def test_target_info_surfaces_image_base(monkeypatch):
     """#564: target info exposes image_base from bv.start so dynamic tools can
     rebase a BN address to runtime instead of guessing the preferred base."""
