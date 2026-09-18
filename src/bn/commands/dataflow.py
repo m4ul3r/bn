@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, arg, command
+from ..cli import _call, _depth_int, arg, command, read_text_input
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -56,9 +56,14 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     if not flag and not resolved.exists():
         return
     try:
-        params["user_models"] = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise BridgeError(f"could not read {source} {path}: {exc}")
+        params["user_models"] = json.loads(
+            read_text_input(resolved, what=f"{source} file"))
+    except ValueError as exc:
+        # #864: the shared reader already refused a missing, unreadable or
+        # blocking path by name (a FIFO here hung with no envelope at all), so
+        # what reaches this wrap is a malformed JSON body. #669's silent-degrade
+        # above keeps an env-sourced missing file out of here entirely.
+        raise BridgeError(f"could not read {source} {path}: {exc}") from None
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
@@ -186,9 +191,13 @@ def _taint_forward(args: argparse.Namespace) -> int:
     }
     if args.resolve_map:
         try:
-            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+            params["resolve_map"] = json.loads(
+                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
+        except ValueError as exc:
+            # #864: the shared reader refuses a directory/FIFO/device by kind --
+            # a FIFO here blocked forever with no envelope; what reaches this
+            # wrap is malformed JSON.
+            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
     _add_user_models(args, params)
     return _call(
         args,
@@ -232,9 +241,13 @@ def _taint_backward(args: argparse.Namespace) -> int:
     }
     if args.resolve_map:
         try:
-            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+            params["resolve_map"] = json.loads(
+                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
+        except ValueError as exc:
+            # #864: the shared reader refuses a directory/FIFO/device by kind --
+            # a FIFO here blocked forever with no envelope; what reaches this
+            # wrap is malformed JSON.
+            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
     _add_user_models(args, params)
     return _call(
         args,

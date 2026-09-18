@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import bn.cli
 import pytest
 
@@ -159,3 +161,35 @@ def test_types_declare_file_failures_are_structured_refusals_754(
     assert "Traceback" not in captured.err and "Traceback" not in captured.out
     assert '"ok":false' in captured.out.replace(" ", "")
     assert str(target) in captured.out
+
+
+def test_types_declare_refuses_a_fifo_instead_of_hanging(fake_transport, capsys, tmp_path):
+    """#864: `--file <fifo>` blocked forever with no output and no envelope; the
+    shared reader refuses the kind instead of reading it."""
+    fifo = tmp_path / "decl.h"
+    os.mkfifo(fifo)
+    calls = fake_transport()
+
+    rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(fifo)])
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "FIFO" in captured.err
+    assert str(fifo) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_types_declare_dev_null_still_reaches_the_op(fake_transport):
+    """The #864 rule must not swallow /dev/null, which #754/#855 deliberately
+    keep working as an empty declaration."""
+    calls = fake_transport({
+        "types_declare": {"ok": True, "result": {"preview": False, "success": True,
+                                                 "results": [{"status": "verified"}]}},
+    })
+
+    rc = bn.cli.main(["types", "declare", "--target", "active", "--file", "/dev/null"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "types_declare"
+    assert calls[-1]["params"]["declaration"] == ""

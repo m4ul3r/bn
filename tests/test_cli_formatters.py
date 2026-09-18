@@ -7982,3 +7982,37 @@ def test_render_trace_text_states_a_readable_arg_index_755():
     # missing key must not manufacture a disclosure.
     assert "arg[0] of memcpy" in _render_trace_text(base)
     assert "malformed arg_index" not in _render_trace_text(base)
+
+
+def test_close_single_entry_carries_the_unsaved_marker():
+    """#824: the marker belongs to the ROW, not the listing form -- the
+    single-entry branch dropped it while the multi-entry branch printed it."""
+    from bn.formatters import _render_close_text
+
+    single = _render_close_text({"closed": [{"path": "/tmp/a.bndb", "unsaved": True}]})
+    assert "closed: /tmp/a.bndb  [unsaved changes discarded]" in single
+    assert _render_close_text({"closed": [{"path": "/tmp/a.bndb"}]}) == "closed: /tmp/a.bndb"
+
+
+def test_empty_results_use_one_vocabulary():
+    """#824: renderers disagreed between "none", "no targets" and "(no tags)" for
+    the same state; every empty result comes from _empty_result now."""
+    from bn.formatters import (
+        _render_comment_list_text,
+        _render_tag_get_text,
+        _render_tag_types_text,
+        _render_target_list_text,
+    )
+
+    assert _render_comment_list_text([]) == "(none)"
+    assert _render_tag_types_text({"tag_types": []}) == "(none)"
+    assert _render_tag_get_text({}) == "(no tags)"
+    assert _render_target_list_text({"items": []}) == "(no targets)"
+
+
+def test_record_table_renderer_falls_back_on_a_non_dict():
+    """#824: its siblings gate on isinstance(dict); without one the first `.get`
+    raised AttributeError out of a renderer internal callers can reach."""
+    from bn.formatters import _render_record_table_text
+
+    assert "not-a-dict" in _render_record_table_text(["not-a-dict"])

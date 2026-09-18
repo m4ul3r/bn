@@ -1620,3 +1620,42 @@ def test_call_rejects_malformed_request_timeout_before_sending_anything(monkeypa
     assert calls == []
     err = capsys.readouterr().err
     assert "not a valid timeout" in err
+
+
+# --- #765: a --lines range accepts the same bases as a bare count -----------
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("0x2", (1, 2)),
+    ("0x1:0x2", (1, 2)),
+    ("0x10-0x20", (16, 32)),
+    ("1:6", (1, 6)),
+    ("1-6", (1, 6)),
+])
+def test_parse_line_range_accepts_hex_ends(value, expected):
+    """#765: the bare form already parsed base-0 (`--lines 0x2` worked) while the
+    range ends were decimal-only, so two spellings of one flag disagreed about
+    what an integer is."""
+    assert bn.cli._parse_line_range(value) == expected
+
+
+@pytest.mark.parametrize("value", ["0x0:0x2", "0x2:0x1", "1:2:3", "0xzz:0x3"])
+def test_parse_line_range_still_rejects_invalid_ranges(value):
+    with pytest.raises(bn.cli.argparse.ArgumentTypeError):
+        bn.cli._parse_line_range(value)
+
+
+def test_machine_error_format_does_not_leak_into_the_next_parse(capsys):
+    """#824: main() sets a module global so argparse errors can honor
+    --format json, and never reset it -- so the NEXT in-process parse printed a
+    JSON envelope to stdout for a caller that never asked for one."""
+    with pytest.raises(SystemExit):
+        bn.cli.main(["--format", "json", "function", "list", "--limit", "not-an-int"])
+    first = capsys.readouterr()
+    assert '"ok":false' in first.out.replace(" ", "")
+
+    with pytest.raises(SystemExit):
+        bn.cli.build_parser().parse_args(["function", "list", "--definitely-not-a-flag"])
+    second = capsys.readouterr()
+    assert second.out == ""
+    assert "--definitely-not-a-flag" in second.err

@@ -474,3 +474,25 @@ def test_tag_list_explicit_limit_wins(fake_transport):
     rc = bn.cli.main(["tag", "list", "--target", "active", "--limit", "17"])
     assert rc == 0
     assert calls[-1]["params"]["limit"] == 17
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["tag", "add", "--target", "active", "--type", "Important"],
+     "tag add needs a location"),
+    (["tag", "remove", "--target", "active", "--type", "Important"],
+     "tag remove needs a location"),
+    (["tag", "add", "--target", "active", "0x1000", "--function", "sub_1000", "--type", "Important"],
+     "tag add takes an address or --function, not both"),
+    (["tag", "remove", "--target", "active", "0x1000", "--function", "sub_1000", "--type", "Important"],
+     "tag remove takes an address or --function, not both"),
+])
+def test_tag_locator_messages_come_from_one_rule(fake_transport, capsys, argv, expected):
+    """#824: add/remove re-implemented the locator exclusion inline, each with its
+    own wording; the rule and its messages live in _tag_locator now."""
+    calls = fake_transport()
+
+    rc = bn.cli.main(argv)
+
+    assert rc == 3  # a mutation preflight refusal is invalid_request
+    assert calls == []
+    assert expected in capsys.readouterr().err

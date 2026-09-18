@@ -8,8 +8,8 @@ from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
-                   _positive_int, arg, command, mutex, mutation_output_args,
-                   preview_arg)
+                   _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args,
+                   preview_arg, read_text_input)
 from ..formatters import (
     _render_data_symbols_text,
     _render_data_vars_text,
@@ -129,6 +129,10 @@ def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
     if args.count:
+        # #767: --summary and the paging flags vanished silently here while
+        # `go functions` refused the same combination at the parser; refuse by
+        # name instead of returning a number the flags did not shape.
+        _refuse_count_only_slices(args, command="imports")
         return _call(
             args,
             "imports",
@@ -518,17 +522,11 @@ def _py_exec(args: argparse.Namespace) -> int:
     elif inline is not None:
         script = inline
     elif args.script:
-        if not args.script.exists():
-            raise BridgeError(f"Script file not found: {args.script}. Use --code for inline Python.")
-        # Same shape as #754's `types declare --file`: `exists()` is true for a
-        # directory, so the read died with a raw IsADirectoryError at exit 1 with
-        # no envelope. A non-UTF-8 file did the same through UnicodeDecodeError.
-        if args.script.is_dir():
-            raise BridgeError(f"Script file is a directory: {args.script}. Use --code for inline Python.")
-        try:
-            script = args.script.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise BridgeError(f"Script file could not be read: {args.script}: {exc}") from exc
+        # #864: one reader for every CLI text input -- it refuses a directory or
+        # a FIFO/device by kind (a FIFO here blocked forever with no envelope)
+        # and wraps the read, keeping #754's structured-refusal envelope.
+        script = read_text_input(
+            args.script, what="Script file", hint="Use --code for inline Python.")
     elif args.stdin:
         script = sys.stdin.read()
     else:
@@ -590,14 +588,9 @@ def _batch_apply(args: argparse.Namespace) -> int:
             )
     else:
         source = f"file {args.manifest}"
-        if not args.manifest.exists():
-            raise BridgeError(f"Manifest file not found: {args.manifest}")
-        try:
-            raw = args.manifest.read_text(encoding="utf-8")
-        # OSError alone left a non-UTF-8 manifest to raise UnicodeDecodeError as a
-        # raw traceback at exit 1, while the directory case was already wrapped (#754).
-        except (OSError, UnicodeDecodeError) as exc:
-            raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
+        # #864: same shared reader as the other --file shapes; a FIFO manifest
+        # blocked here forever with no envelope.
+        raw = read_text_input(args.manifest, what="Manifest file")
     try:
         manifest = json.loads(raw)
     except json.JSONDecodeError as exc:
