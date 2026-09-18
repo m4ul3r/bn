@@ -2564,11 +2564,29 @@ def _render_function_evidence_text(value: Any) -> str:
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
+            #
+            # #827 item 6: both lines below are derived from an ABI+format
+            # HEURISTIC -- `read_evidence` stamps the diagnostic
+            # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
+            # that stamp reached JSON only. A text reader saw "expected >= N
+            # argument(s)" in the same authoritative voice the recovered facts on
+            # this card use, with nothing saying the count came from counting
+            # conversion specifiers in a string literal. Print the marker the
+            # payload already carries rather than inventing a second vocabulary,
+            # and omit it entirely if a future producer states a firmer
+            # confidence, so this never contradicts its own payload.
+            # Read through `_text_value`, not an inline isinstance: a bare shape
+            # test DROPS a present-but-unreadable confidence with nothing
+            # rendered and nothing recorded, so the line comes out
+            # byte-identical to a payload that never carried the field -- the
+            # same silent-absence defect this marker exists to close.
+            _conf = _text_value(variadic, "confidence")
+            _mark = f" [{_conf}]" if _conf else ""
             if variadic.get("under_recovered") and variadic.get("warning"):
-                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+                lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:
                 lines.append(
-                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"  variadic: {variadic.get('callee', '?')}{_mark} "
                     f"format={variadic['format_string']!r} "
                     f"conversions={variadic.get('format_conversions')}"
                 )

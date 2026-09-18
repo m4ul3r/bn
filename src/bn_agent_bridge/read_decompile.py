@@ -554,7 +554,29 @@ _ARM_MODE_ARCHES = {
 def _is_classic_arm_or_thumb_arch(name: str) -> bool:
     """True for classic 32-bit ARM/Thumb arch names (armv7/thumb2 and variants);
     False for AArch64 (#600 -- "arm64" starts with "arm" and would otherwise be
-    misclassified as classic ARM/Thumb) and for any non-ARM arch."""
+    misclassified as classic ARM/Thumb) and for any non-ARM arch.
+
+    #827 item 3 pairs this with ``seam._supports_thumb_pointer_tags`` as the
+    #600 drift pair. They share ONE genuinely identical rule -- the
+    aarch64/arm64 exclusion, which IS what #600 fixed -- and differ in two ways
+    that are not cosmetic:
+
+    * this takes an arch NAME; the seam takes a ``bv``, gates on a 4-byte
+      pointer size first, and collects candidate names from both ``arch`` and
+      ``platform`` (``name``, ``raw_name`` and ``str()``);
+    * this matches by PREFIX (``startswith("arm")``) while the seam matches by
+      SUBSTRING over the joined names (``"arm" in joined``).
+
+    The prefix/substring split is the load-bearing one: a platform string like
+    ``linux-armv7`` CONTAINS "arm" but does not START with it, so the two
+    predicates genuinely disagree on it. Unifying them means choosing one, and
+    choosing wrongly either drops Thumb pointer tags on real ARM binaries or
+    starts tagging things the prefix rule excludes. That needs a measurement of
+    the arch/platform strings each caller actually sees on live views, which is
+    a real-BN question -- so the pair is documented here rather than merged on
+    inspection. Merging them blind is how the #600 drift was created in the
+    first place.
+    """
     n = (name or "").lower()
     if "aarch64" in n or "arm64" in n:
         return False
@@ -805,6 +827,27 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
 
 
 def _address_is_mapped(bv, address: int) -> bool:
+    """True if *address* looks mapped, with a read-probe fallback.
+
+    #827 item 3 lists this beside ``_shared._require_mapped_address`` as a
+    duplicated mapped check. They are NOT the same rule and are deliberately
+    NOT merged: they disagree on the INDETERMINATE case, which is the only case
+    that matters here.
+
+    ``_require_mapped_address`` returns quietly when the view cannot answer --
+    its contract is that a caller must not reject on an indeterminate result,
+    so a mapped address with zero refs stays a clean exit 0 (#374). This one
+    falls back to a 1-byte read and, if that also fails, answers **False** --
+    it treats "cannot tell" as "not mapped". Collapsing the two would silently
+    flip one of those policies: give this the permissive contract and a
+    decompile at a genuinely bad address proceeds; give the other this one's
+    contract and #374's clean-zero case starts erroring on any view without
+    ``is_valid_offset``.
+
+    Whether the read-probe fallback SHOULD answer False is a fair question, but
+    changing it is a behaviour change neither #827 nor #600 asked for, so the
+    divergence is named here rather than resolved silently.
+    """
     try:
         if hasattr(bv, "is_valid_offset"):
             return bool(bv.is_valid_offset(int(address)))

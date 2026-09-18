@@ -106,11 +106,11 @@ _NO_CRT_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-_IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
-    ("ImportedFunctionSymbol", "function"),
-    ("ImportedDataSymbol", "data"),
-    ("ImportAddressSymbol", "address"),
-]
+# #827 item 3: read from the one owner rather than keeping a verbatim twin.
+# Re-bound at module scope so every existing reference in this file (and any
+# `read_misc._IMPORT_SYMBOL_TYPES` reader) keeps working unchanged; the list is
+# defined once, in the module this one already imports.
+_IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = read_xrefs._IMPORT_SYMBOL_TYPES
 
 # BN tags standard-ELF import symbols with these namespace sentinels rather
 # than a real shared-object name (the dynamic linker only resolves the actual
