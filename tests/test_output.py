@@ -954,3 +954,63 @@ def test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823():
         "candidate_count": 2, "candidate_bytes": 10, "kept_count": 1,
     })
     assert unknown.startswith("spill gc: ? dry run unknown -- ")
+
+
+def test_gc_max_bytes_spares_the_current_day_823(tmp_path):
+    """A cap is a request to shrink the cache, never to delete the directory
+    the spill writer is still appending to: the size pass must stop at TODAY,
+    or `--max-bytes 0` reaps the live day -- the same footgun `--older-than 0`
+    is refused at parse time to prevent.
+
+    The consequence of the refusal is stated in the report rather than implied:
+    a cap below the live day's own bytes leaves `kept_bytes > max_bytes`.
+    """
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    live = _make_day(tmp_path, today)
+    (live / "big.bin").write_bytes(b"x" * 400)
+    old = _make_day(tmp_path, today - timedelta(days=30))
+
+    report = output.gc_spills(root=tmp_path, today=today, max_bytes=0)
+
+    assert [row["day"] for row in report["candidates"]] == [old.name]
+    assert live.exists() and not old.exists()
+    assert report["kept_count"] == 1 and report["kept_bytes"] == _tree_bytes(live)
+    assert report["kept_bytes"] > report["max_bytes"] == 0
+
+    # Same root, dry run: the live day is not a candidate even with nothing left
+    # but a cap of zero to satisfy.
+    dry = output.gc_spills(root=tmp_path, today=today, max_bytes=0, dry_run=True)
+    assert [row["day"] for row in dry["candidates"]] == []
+    assert dry["kept_bytes"] == _tree_bytes(live)
+
+
+def test_gc_discloses_a_non_canonical_day_name_823(tmp_path):
+    """`202611` parses as 2026-01-01 under `%Y%m%d` and is not a name the writer
+    (which always calls `strftime`) can produce. It was already refused, but
+    SILENTLY -- so the report could not distinguish "nothing here" from "here is
+    a day-shaped name this command will not touch", while a symlink and a plain
+    file each got a reason.
+
+    A name that is not day-shaped at all stays silent on purpose: `notes` makes
+    no claim about a spill day, which is the line #618 draws.
+    """
+    from datetime import date
+
+    import bn.output as output
+
+    odd = tmp_path / "202611"
+    odd.mkdir()
+    (odd / "keep.txt").write_text("someone else's data")
+    unrelated = tmp_path / "notes"
+    unrelated.mkdir()
+
+    report = output.gc_spills(root=tmp_path, today=date(2026, 9, 15))
+
+    assert report["skipped"] == [{"path": str(odd), "reason": "non-canonical day name"}]
+    assert report["candidate_count"] == 0 and report["removed_count"] == 0
+    assert (odd / "keep.txt").read_text() == "someone else's data"
+    assert unrelated.exists()

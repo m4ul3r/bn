@@ -171,6 +171,7 @@ def resolve_spill_retention_days(default: int = DEFAULT_SPILL_RETENTION_DAYS) ->
 _SKIP_SYMLINK = "symlink"
 _SKIP_NOT_A_DIRECTORY = "not a directory"
 _SKIP_OUTSIDE_ROOT = "outside the spill root"
+_SKIP_NON_CANONICAL = "non-canonical day name"
 
 
 @dataclass(frozen=True)
@@ -202,7 +203,10 @@ def _spill_day_entries(root: Path) -> tuple[list[_SpillDayDir], list[dict[str, s
       directory by that name -- which this writer, which always calls
       ``strftime``, could not have produced -- was recursively deleted. The
       round-trip is the check: a name is eligible only if formatting the parsed
-      date reproduces the name byte for byte.
+      date reproduces the name byte for byte. A day-SHAPED name that fails it is
+      a disclosed refusal (``non-canonical day name``); a name that is not
+      day-shaped at all is left alone in silence, because it makes no claim
+      about a spill day.
     * the entry is NOT a symlink. ``shutil.rmtree`` refuses a symlink outright,
       so the old loop "survived" one only by suppressing the ``OSError`` that
       refusal raised -- a refusal it never asked for and could not report, and
@@ -231,8 +235,15 @@ def _spill_day_entries(root: Path) -> tuple[list[_SpillDayDir], list[dict[str, s
         try:
             day = datetime.strptime(entry.name, "%Y%m%d").date()
         except ValueError:
+            # Not day-shaped at all (`notes`, `tmp`, another tool's file): it
+            # carries no claim about a spill day, which is #618's line between
+            # "leave it alone" and "say why".
             continue
         if day.strftime("%Y%m%d") != entry.name:
+            # Day-SHAPED but not a name this writer can produce, so it is a
+            # refusal the caller can inspect rather than a silent skip -- the
+            # same treatment a symlink or a plain file gets below.
+            skipped.append({"path": str(entry), "reason": _SKIP_NON_CANONICAL})
             continue
         # The name parses as a day, so a refusal from here on is about the
         # entry, not about the name, and is worth surfacing.
@@ -345,7 +356,12 @@ def gc_spills(
     * SIZE -- when *max_bytes* is given, the OLDEST days that survive the age
       pass join the candidates until the eligible days fit the cap. It is a
       second bound, not an override: an engagement that widens the retention
-      window can still hold the root to a byte budget.
+      window can still hold the root to a byte budget. TODAY's directory is
+      never a candidate on either pass -- it is the day the writer is still
+      appending to -- so a cap smaller than the live day's own bytes leaves the
+      root above the cap (``kept_bytes > max_bytes`` in the returned report,
+      which is where that consequence is visible) rather than deleting live
+      cache state.
 
     *dry_run* builds the full report -- candidates, sizes, kept counts -- and
     removes nothing.
@@ -382,6 +398,14 @@ def gc_spills(
                 break
             if item[0].entry in stale:
                 continue
+            if item[0].day >= resolved_today:
+                # TODAY's directory (or a future-dated one, which only a clock
+                # skew can produce) is never a candidate, however small the cap:
+                # it is the day the writer is still appending to, and the age
+                # pass cannot reach it either (cutoff < today for every
+                # retention >= 1). Nothing sorts at or after it, so this is the
+                # end of the loop.
+                break
             candidates.append(item)
             held -= item[1]
     candidates.sort(key=lambda item: item[0].day)
