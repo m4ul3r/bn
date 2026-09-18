@@ -442,19 +442,55 @@ class TaintEngine:
         """``("heap", call_addr)`` if call-def *d* defines *var* via a recognized
         allocator -- a modeled / size-resolvable allocator (malloc, C++ new,
         single-arg wrapper) OR a callee whose name carries an allocator hint
-        (malloc/calloc/realloc/ecalloc/xmalloc/strdup ...). The name hint catches
-        the 2-arg calloc family (e.g. less's `ecalloc`) the size-focused _dest_alloc
-        misses. Deliberately NOT the bare pointer-return heuristic -- too broad for
-        a STABLE buffer key (it would conflate the returns of distinct non-allocator
-        pointer functions and over-link). None for a non-allocator return pointer."""
+        (malloc/calloc/realloc/ecalloc/xmalloc/strdup ...) OR a callee whose MODEL
+        declares a buffer return ('*ret', #806). The name hint catches the 2-arg
+        calloc family (e.g. less's `ecalloc`) the size-focused _dest_alloc misses;
+        the model-declared return catches the buffer-returning helpers whose name
+        hints at nothing (a concat helper) but whose model asserts the returned
+        pointer is a buffer the callee wrote -- without it such a call site could
+        never be re-resolved from a later pointer (its key would exist but be
+        unreachable). Deliberately NOT the bare pointer-return heuristic -- too
+        broad for a STABLE buffer key (it would conflate the returns of distinct
+        non-allocator pointer functions and over-link). None for a non-allocator
+        return pointer."""
         if d is None or "CALL" not in op_name(d):
             return None
-        callee_nm = (self._callee_name(self._resolve_direct_target(d))
-                     or "").split("@", 1)[0].lstrip("_").lower()
+        callee = self._callee_name(self._resolve_direct_target(d)) or ""
+        callee_nm = callee.split("@", 1)[0].lstrip("_").lower()
         if (any(tok in callee_nm for tok in self._ALLOC_NAME_HINTS)
-                or self._dest_alloc(ssaf, var)[0] is not None):
+                or self._dest_alloc(ssaf, var)[0] is not None
+                or self._model_declares_returned_buffer(callee)):
             return ("heap", int(getattr(d, "address", 0)))
         return None
+
+    def _model_declares_returned_buffer(self, callee: str | None) -> bool:
+        """True when *callee*'s model declares a buffer return -- a ``'*ret'``
+        token (grammar: the pointee of the returned pointer) in a ``propagates``
+        or ``sources`` rule. The model is asserting "this call hands back a
+        pointer into a buffer I wrote", which makes the CALL SITE a buffer
+        identity: the same ``("heap", call_addr)`` key space the allocator-name
+        hints produce, so a later pointer derived from this call (a copy, an
+        indexed cursor, a PHI entry) re-resolves to the key and correlates.
+        Looked up through the SAME ``lookup_model``/name path the apply site uses,
+        so recognition can never disagree with the model actually applied."""
+        if not callee:
+            return False
+        _, model = lookup_model(self.models, callee)
+        if not model:
+            return False
+        toks = [r.get("to") for r in (model.get("propagates") or [])]
+        toks += [s.get("to") for s in (model.get("sources") or [])]
+        return "*ret" in toks
+
+    @staticmethod
+    def _returned_buffer_key(ins: Any) -> tuple:
+        """The buffer identity a model-declared buffer return ('*ret') is keyed
+        by: the CALL SITE itself, in the ``("heap", addr)`` space
+        :meth:`_heap_buffer_key` produces for allocator calls (and the store path
+        keys through). One definition shared by every place a model's ``'*ret'``
+        token is applied, so the key a model creates is always the key a later
+        pointer re-resolves to through :meth:`_recognized_alloc_key`."""
+        return ("heap", int(getattr(ins, "address", 0)))
 
     @staticmethod
     def _key_tainted(key: Any, tainted: set) -> bool:
@@ -4300,8 +4336,34 @@ class TaintEngine:
         parents = parents or []
         if not tok:
             return False
-        if tok == "ret" or tok == "*ret":
+        if tok == "ret":
             done = False
+            for w in ssa_writes(ins):
+                node = (var_key(w), getattr(w, "version", None))
+                if taint_node(node, var_label(w), ins, f"return of {callee} (model propagate)", parents):
+                    done = True
+            return done
+        if tok == "*ret":
+            # Grammar: '*ret' is the buffer the RETURNED POINTER points at -- not
+            # the pointer's own value. Both channels are tainted: the returned
+            # value (loads through the pointer, `arg_taint`'s value-read check --
+            # the coarse memory approximation every pointer-return path relies
+            # on), AND the buffer itself, keyed by THIS call site's alloc-site key
+            # so a pointer re-derived from the call (a copy, an indexed cursor, a
+            # PHI entry, or the same pointer handed to another model's '*arg:N')
+            # re-resolves to it through `_heap_buffer_key`. Without the key the
+            # promise was only ever met as "the pointer is tainted" (the old
+            # `tok == "ret" or tok == "*ret"` collapse), so a store into that
+            # buffer never correlated downstream unless the callee's NAME happened
+            # to carry an allocator hint (#806). Keyed off the call address
+            # unconditionally: the model is the authority that this site hands
+            # back a buffer it wrote, unlike the name-hint path which has to guess.
+            done = False
+            hk = self._returned_buffer_key(ins)
+            if taint_node((hk, None), f"heap_{hex(hk[1])}", ins,
+                          f"buffer returned by {callee} (model '*ret', alloc-site memory_approx)",
+                          parents):
+                done = True
             for w in ssa_writes(ins):
                 node = (var_key(w), getattr(w, "version", None))
                 if taint_node(node, var_label(w), ins, f"return of {callee} (model propagate)", parents):
@@ -4564,7 +4626,19 @@ class TaintEngine:
                     params = self._call_params(c)
                     for sd in src_defs:
                         to = str(sd.get("to") or "")
-                        if to == "ret":
+                        if to == "ret" or to == "*ret":
+                            # 'ret' seeds the returned VALUE. '*ret' is the buffer
+                            # the returned pointer points at: key it at THIS call
+                            # site (the model is the authority that the call hands
+                            # back a buffer it wrote) in addition to the value, so
+                            # a pointer re-derived from the call correlates
+                            # through _heap_buffer_key (#806).
+                            if to == "*ret":
+                                hk = self._returned_buffer_key(c)
+                                if taint_node((hk, None), f"heap_{hex(hk[1])}", c,
+                                              f"source: {callee} returns a buffer "
+                                              f"(call: preset, model '*ret')", []):
+                                    seeded = True
                             for w in ssa_writes(c):
                                 if taint_node((var_key(w), getattr(w, "version", None)), var_label(w), c,
                                               f"source: return of {callee} (call: preset)", []):
