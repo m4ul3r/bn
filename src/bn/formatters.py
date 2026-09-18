@@ -968,19 +968,19 @@ def _render_field_xrefs_text(value: Any) -> str:
         for ref in malformed_refs:
             lines.append(f"- {ref!r}")
 
-    # #532: field xrefs now page like every other xref path. Surface the paging
-    # metadata whenever the page isn't the whole ref set -- either more pages remain
-    # (has_more) or an --offset skipped earlier refs -- so a partial view (including
-    # the last, has_more=False page of an --offset run) isn't read as the full set.
-    total = value.get("total")
-    returned = value.get("returned", len(items))
-    offset = value.get("offset", 0) or 0
-    has_more = bool(value.get("has_more"))
-    if isinstance(total, int) and (has_more or offset or returned != total):
-        note = f"showing {returned} of {total} refs (offset {offset})"
-        if has_more:
-            note += "; more available -- raise --limit or use --offset"
-        lines.extend(["", note])
+    # #532/#770: field xrefs page like every other xref path, so the footer is the
+    # SHARED one. This renderer's own "showing {n} of {total} refs (offset {o});
+    # more available -- raise --limit or use --offset" was a second footer with a
+    # second wording and none of the shared one's refusals: it stated a position
+    # from counts it had read raw (a string `total` killed the footer silently,
+    # an impossible window rendered like a partial page), and it said "more
+    # available" where the shared footer states the actual resume offset. The
+    # page key here is a literal, so the page's third state is askable at the
+    # read above -- the same question `_render_paged_list_text` asks of its
+    # runtime key (#619).
+    footer = _paging_footer(value, items, _field_skewed("items"))
+    if footer:
+        lines.extend(["", footer])
 
     return "\n".join(lines)
 
@@ -2910,15 +2910,26 @@ def _render_message_lens_text(value: Any) -> str:
         if suffix:
             lines.append(f"  context{suffix}")
         xrefs = _field_dict(match, "xrefs")
-        code_count = len(_field_list(xrefs, "code_refs"))
-        data_count = len(_field_list(xrefs, "data_refs"))
+        code_refs = _field_list(xrefs, "code_refs")
+        data_refs = _field_list(xrefs, "data_refs")
+        code_count = len(code_refs)
+        data_count = len(data_refs)
         lines.append(f"  xrefs: {code_count} code, {data_count} data")
-        for ref in _field_list(xrefs, "code_refs")[:3]:
-            if isinstance(ref, dict):
-                lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(_field_dict(ref, 'context'))}")
-        for ref in _field_list(xrefs, "data_refs")[:3]:
-            if isinstance(ref, dict):
-                lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(_field_dict(ref, 'context'))}")
+        # #770: the per-match rows are display-capped at 3, and the cap said
+        # nothing -- an 8-code-ref match rendered three rows under a header that
+        # stated 8, so the five missing ones were unaccounted for. State the true
+        # total and how many are shown, the convention `_render_xrefs_text` uses
+        # for the same cap (a bare cap with no "N more" hides that refs exist).
+        code_shown = [r for r in code_refs[:3] if isinstance(r, dict)]
+        for ref in code_shown:
+            lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(_field_dict(ref, 'context'))}")
+        if code_count > len(code_shown):
+            lines.append(f"    code refs: {code_count} total, showing first {len(code_shown)}")
+        data_shown = [r for r in data_refs[:3] if isinstance(r, dict)]
+        for ref in data_shown:
+            lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(_field_dict(ref, 'context'))}")
+        if data_count > len(data_shown):
+            lines.append(f"    data refs: {data_count} total, showing first {len(data_shown)}")
         table_windows = _field_list(match, "metadata_table_windows")
         if table_windows:
             lines.append(f"  metadata table windows: {len(table_windows)}")
@@ -5619,13 +5630,24 @@ def _render_class_list_text(value: Any) -> str:
     # disclosure. Reading first leaves the branch condition alone and still
     # makes the skew reach the note (#619).
     rows = _field_list(value, "items", "classes")
+    # The third state of the PAGE, asked right after the read (and before any row
+    # can record a same-named key of its own), exactly as
+    # `_render_paged_list_text` asks it of its runtime key (#619). The page key
+    # here is the `items`/`classes` alias pair, so either spelling being wrong is
+    # a page nobody could read.
+    page_unreadable = _field_skewed("items") or _field_skewed("classes")
     if "count" in value and not value.get("items") and not value.get("classes"):
         n = value.get("count", 0)
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
         return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
-    total = value.get("total", len(rows))
-    header = f"classes: {len(rows)} shown of {total}"
+    # #770: the count line states the PAGE, and the shared paging footer carries
+    # the total/resume half -- the same split every other paged list uses. This
+    # header used to assert "classes: N shown of TOTAL" unconditionally, so a
+    # COMPLETE page claimed a paging comparison nobody asked for (and diverged
+    # from the --count line, which has always been a bare `classes: N`), while a
+    # partial page stated no resume instruction at all.
+    header = f"classes: {len(rows)}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
     hidden_parts = []
     cv = value.get("construction_vtables_suppressed") or 0
@@ -5665,6 +5687,9 @@ def _render_class_list_text(value: Any) -> str:
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )
+    footer = _paging_footer(value, rows, page_unreadable)
+    if footer is not None:
+        lines.extend(["", footer])
     return quick_prefix + "\n".join(lines)
 
 

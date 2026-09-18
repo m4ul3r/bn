@@ -528,15 +528,23 @@ def test_render_field_xrefs_text_paging_note_532():
             "items": [{"kind": "code", "address": "0x1000"}],
             "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False}
     assert "showing" not in _render_field_xrefs_text(full)
-    # More pages remain: note + "more available".
+    # More pages remain: the SHARED footer, with the real resume offset (#770 --
+    # this renderer used to print its own "more available -- raise --limit or use
+    # --offset" wording, which named neither the remainder nor the next offset).
     more = {**full, "total": 12, "returned": 5, "limit": 5, "has_more": True}
     out_more = _render_field_xrefs_text(more)
-    assert "showing 5 of 12" in out_more and "more available" in out_more
+    assert "// showing 5 of 12 (7 more); rerun with --offset 5" in out_more
     # Last page of an --offset run (has_more False but returned != total): still noted,
     # so the skipped refs aren't silently dropped.
     tail = {**full, "total": 12, "offset": 10, "returned": 2, "limit": 5, "has_more": False}
     out_tail = _render_field_xrefs_text(tail)
-    assert "showing 2 of 12" in out_tail and "offset 10" in out_tail
+    assert "// showing 2 of 12" in out_tail and "--offset" not in out_tail
+    # A self-contradicting window is REFUSED by name instead of rendered as a
+    # partial page (the shared footer's rule, which the bespoke one had no way to
+    # state) -- and the render still says so.
+    impossible = {**full, "total": 2, "offset": 0, "returned": 9, "has_more": False}
+    out_impossible = _render_field_xrefs_text(impossible)
+    assert "page position not stated" in out_impossible and "offset + returned exceeds total" in out_impossible
 
 
 def test_render_virtual_call_text_includes_method_address_533():
@@ -3982,7 +3990,11 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
 # right.
 # 49 -> 48 (#858 review r5): `_render_trace_text`'s `arg_index` was the last
 # raw numeric spelling in that renderer and now goes through `_stated_count`.
-_RAW_COUNT_SPELLINGS = 48
+# 48 -> 46 (#770): `_render_field_xrefs_text`'s bespoke paging footer read
+# `value.get('offset', 0)` twice (bare and `or 0`) to build its own note; the
+# renderer now delegates to `_paging_footer`, which reads all three counts
+# through the choke point, so both spellings are deliberately GONE.
+_RAW_COUNT_SPELLINGS = 46
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -4275,7 +4287,12 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
+    # 4896 -> 4920 (#770): `_render_class_list_text` now delegates its paging to
+    # the SHARED `_paging_footer`, which reads `returned`, `offset` and
+    # `has_more` -- three keys that renderer did not ask for while it built its
+    # own footer (it already read `total`). 3 pairs x 8 bogus values = 24,
+    # MEASURED by diffing `_runtime_population()` rather than carried over.
+    assert swept == 4920, f"the raise sweep ran {swept} renders, not 4920"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4431,7 +4448,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
+    # 1426 -> 1432 (#770): the same three `_render_class_list_text` pairs above,
+    # x 2 benign payloads each. Measured, not carried over.
+    assert checked == 1432, f"the mirror ran {checked} renders, not 1432"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8044,3 +8063,58 @@ def test_count_field_reads_an_integral_number_866():
         "trace": [],
     })
     assert "arg[2] of memcpy" in out and "malformed arg_index" not in out, out
+
+
+def test_the_three_divergent_paging_footers_converge_770():
+    """#770: three renderers stated their page position their own way.
+
+    (a) `field xrefs` built a bespoke footer -- "showing 5 of 12 refs (offset 0);
+    more available -- raise --limit or use --offset" -- with no `//` and no next
+    offset, while every other paged list used `_paging_footer`. (b) `class list`
+    asserted "classes: N shown of TOTAL" UNCONDITIONALLY, so a page that WAS the
+    whole set claimed a paging comparison the --count line for the same op never
+    makes, and a partial page still stated no resume instruction. (c) `evidence
+    message` printed at most 3 code + 3 data refs per match under a header that
+    stated the true counts, so an 8-ref match lost five rows with nothing said.
+    All three now read the same way: the count line states the page, the shared
+    footer states the total/remainder/resume, and a display cap says what it kept.
+    """
+    from bn.formatters import (_render_class_list_text, _render_field_xrefs_text,
+                               _render_message_lens_text)
+
+    field = {"type_name": "Hot", "field_name": "f", "offset": 8, "field_type": "int"}
+    partial = {"field": field, "items": [{"kind": "code", "address": "0x1000"}],
+               "total": 12, "returned": 5, "offset": 0, "limit": 5, "has_more": True}
+    out = _render_field_xrefs_text(partial)
+    assert "// showing 5 of 12 (7 more); rerun with --offset 5" in out, out
+    assert "more available" not in out, out    # the bespoke second wording is gone
+
+    whole = {"items": [{"name": "Widget", "method_count": 1, "has_vtable": True,
+                        "size": None, "bases": [], "confidence": "rtti"}],
+             "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False}
+    whole_out = _render_class_list_text(whole)
+    assert "classes: 1" in whole_out and "shown of" not in whole_out, whole_out
+    # A partial page states the same footer every other paged list does.
+    paged = {**whole, "total": 30, "returned": 1, "limit": 1, "has_more": True}
+    paged_out = _render_class_list_text(paged)
+    assert "classes: 1" in paged_out and "shown of" not in paged_out, paged_out
+    assert "// showing 1 of 30 (29 more); rerun with --offset 1" in paged_out, paged_out
+
+    lens = {"query": "Codec", "count": 1, "total": 1, "items": [{
+        "type_string": {"address": "0x5000", "value": "CodecInfo"},
+        "xrefs": {"code_refs": [{"address": f"0x40{i:04x}", "function": f"f{i}"}
+                                for i in range(8)],
+                  "data_refs": [{"address": f"0x50{i:04x}"} for i in range(4)]},
+    }]}
+    lens_out = _render_message_lens_text(lens)
+    assert "xrefs: 8 code, 4 data" in lens_out, lens_out
+    assert lens_out.count("    code 0x") == 3 and lens_out.count("    data 0x") == 3, lens_out
+    assert "code refs: 8 total, showing first 3" in lens_out, lens_out
+    assert "data refs: 4 total, showing first 3" in lens_out, lens_out
+    # A match whose refs fit is not made noisy by the disclosure.
+    small = {"query": "Codec", "count": 1, "total": 1, "items": [{
+        "type_string": {"address": "0x5000", "value": "CodecInfo"},
+        "xrefs": {"code_refs": [{"address": "0x401000", "function": "parse"}],
+                  "data_refs": []}}]}
+    small_out = _render_message_lens_text(small)
+    assert "total, showing first" not in small_out, small_out
