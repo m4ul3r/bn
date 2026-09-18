@@ -33,6 +33,40 @@ def _build_pclntab(*, magic=0xFFFFFFF1, ptr_size=8, text_start=0x400000):
     return bytes(blob)
 
 
+def _build_pclntab_many(count, *, text_start=0x400000, entry_step=0x1000):
+    """A Go 1.20-format .gopclntab declaring *count* functions at distinct starts
+    (`main.f0` @ text_start+entry_step = 0x401000, `main.f1` @ +2*entry_step, ...).
+
+    Same layout as `_build_pclntab`, parameterized on the population so a test can
+    drive a view where a RATIO decides the answer (#883 item 1) instead of the
+    two-row fixture where any share is 0%, 50% or 100%.
+    """
+    funcname_off = 72
+    names = bytearray()
+    name_offsets: list[int] = []
+    for i in range(count):
+        name_offsets.append(len(names))
+        names += f"main.f{i}\x00".encode()
+    pcln_off = funcname_off + len(names)
+    func_off = count * 8                      # the _func table follows the functab
+    blob = bytearray(pcln_off + func_off + count * 8)
+    struct.pack_into("<I", blob, 0, 0xFFFFFFF1)
+    blob[6] = 1                               # minLC
+    blob[7] = 8                               # ptrSize
+    struct.pack_into("<Q", blob, 8, count)    # nfunc
+    struct.pack_into("<Q", blob, 24, text_start)
+    struct.pack_into("<Q", blob, 32, funcname_off)
+    struct.pack_into("<Q", blob, 64, pcln_off)
+    blob[funcname_off:funcname_off + len(names)] = names
+    for i in range(count):
+        struct.pack_into("<I", blob, pcln_off + i * 8 + 4, func_off + i * 8)
+        struct.pack_into("<I", blob, pcln_off + func_off + i * 8,
+                         entry_step * (i + 1))     # _func entryoff
+        struct.pack_into("<i", blob, pcln_off + func_off + i * 8 + 4,
+                         name_offsets[i])          # nameoff
+    return bytes(blob)
+
+
 class _GoBV:
     def __init__(self, blob, *, base=0x500000, defined=(), text_start=0x400000):
         self._blob = blob or b""
@@ -511,3 +545,73 @@ def test_go_functions_summary_carries_the_note_and_the_start_matches_818(monkeyp
     text = _render_go_functions_summary_text(summary)
     assert "start_matches: 0" in text
     assert "interior PC" in text
+
+
+def test_go_functions_rebase_note_survives_a_single_start_match_883(monkeypatch):
+    """#883 item 1: a binary gate on `start_match_count` is not a gate on the
+    question the note asks.
+
+    Forced with exactly ONE matching address on a view whose other rows resolve
+    only as interior PCs: `defined 10`, `start_match_count 1`, and before this the
+    note was suppressed -- so the summary read clean while 9 of the 10 resolved
+    addresses were off-prolog, which is the shape a constant rebase delta
+    produces. A START match is evidence about THAT row, not about the table.
+
+    The bucket partition stays self-consistent while the gate changes: the note
+    states `defined - start_match` interior rows and invents no counter, so
+    `start_match + interior == defined` still reconciles both views.
+    """
+    from bn.formatters import _render_go_functions_summary_text, _render_go_functions_text
+
+    blob = _build_pclntab_many(10)               # starts at 0x401000, 0x402000, ...
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob, starts={0x401000: "sub_401000"}))
+
+    listed = inst._go_functions(None)
+
+    assert listed["defined_count"] == 10 and listed["start_match_count"] == 1
+    assert listed["defined_count"] - listed["start_match_count"] == 9   # the interior share
+    assert "note" in listed, "9 of 10 resolved rows being interior PCs must not read clean"
+    assert "9 of the 10" in listed["note"] and "1 matched a START" in listed["note"]
+    assert "interior PC" in listed["note"]
+    # The text face carries it, and carries it on a SLICE: the note lives on the
+    # envelope, not on a row, so `--offset`/`--limit` pages cannot lose it.
+    sliced = inst._go_functions(None, offset=2, limit=3)
+    assert "note" in sliced and "9 of the 10" in sliced["note"]
+    assert "interior PC" in _render_go_functions_text(sliced)
+
+    summary = inst._go_functions(None, summary=True)
+    assert summary["defined"] == 10 and summary["start_match_count"] == 1
+    assert "note" in summary and "interior PC" in summary["note"]
+    text = _render_go_functions_summary_text(summary)
+    assert "start_matches: 1" in text and "interior PC" in text
+
+
+def test_go_functions_rebase_note_ratio_boundary_883(monkeypatch):
+    """The other half of the ratio: it must not turn a well-based table into an
+    alarm. 2 interior rows in 10 (20%) stays quiet -- the counters still state the
+    split -- while exactly half is where the note starts firing."""
+    from bn.formatters import _render_go_functions_text
+
+    blob = _build_pclntab_many(10)
+    every_start = {0x400000 + 0x1000 * (i + 1): f"sub_{0x400000 + 0x1000 * (i + 1):x}"
+                   for i in range(10)}
+
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob, starts=every_start))
+    quiet = inst._go_functions(None)
+    assert quiet["defined_count"] == 10 and quiet["start_match_count"] == 10
+    assert "note" not in quiet
+
+    # Eight of ten matching at their start: two interior rows, below the gate.
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(
+        blob, starts={a: n for a, n in every_start.items() if a < 0x409000}))
+    below = inst._go_functions(None)
+    assert below["defined_count"] == 10 and below["start_match_count"] == 8
+    assert "note" not in below
+    assert "interior PC" not in _render_go_functions_text(below)
+
+    # Exactly half -- the boundary the constant names.
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(
+        blob, starts={a: n for a, n in every_start.items() if a < 0x406000}))
+    half = inst._go_functions(None)
+    assert half["defined_count"] == 10 and half["start_match_count"] == 5
+    assert "note" in half and "5 of the 10" in half["note"]

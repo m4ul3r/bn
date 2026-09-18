@@ -74,6 +74,18 @@ def resolve_pcln_function(bv, addr: int):
     return None, False
 
 
+# #883 item 1: how much of the resolved population must be interior-only before
+# the rebase note fires DESPITE a start match. `interior_count * this >=
+# defined_count` == "at least half", kept as an integer comparison so the gate
+# never depends on float rounding, and named so the policy is one edit rather
+# than a literal buried in the branch. Half is already the warning shape (a
+# constant rebase delta over a dense .text resolves rows to *some* body while
+# matching few starts, alongside the BN splits that leave whole tails interior);
+# a handful of interior rows in a well-based table stays below it and stays
+# quiet.
+_INTERIOR_MAJORITY = 2
+
+
 def _rebase_note(items: list[Any], *, start_match_count: int, defined_count: int,
                  text_start: int, text_sec: int | None) -> str | None:
     """The #217/#818 rebase-or-incomplete-analysis note, or None when none applies.
@@ -85,9 +97,40 @@ def _rebase_note(items: list[Any], *, start_match_count: int, defined_count: int
     suppress the warning this note exists to give. The wording says which
     relation matched, so a reader is not sent to rebase addresses that are merely
     off-prolog.
+
+    The gate is a RATIO, not "any start matched" (#883 item 1). A single pcln
+    entry that happens to land on a start suppressed the note on a view whose
+    1821 other rows resolved only as interior PCs -- and a rebased table is
+    exactly the shape where most rows land interior while one hits a start. A
+    START match is evidence about THAT row, not about the table, so the note
+    fires while `interior_count` is still the majority of the rows that resolved
+    at all.
     """
-    if not items or start_match_count:
+    if not items:
         return None
+    # Rows that resolved to a BN function but not at its start: `defined` is
+    # satisfied by containment (#818), and `start_match_count` counts the subset
+    # that also matched a START, so this is the interior-PC share. Not a bucket
+    # of its own -- `interior_count + start_match_count == defined_count` holds
+    # by construction, and the note states both numbers rather than adding a
+    # counter the surfaces would have to keep reconciling.
+    interior_count = defined_count - start_match_count
+    if start_match_count:
+        if interior_count * _INTERIOR_MAJORITY < defined_count:
+            return None
+        extra = (
+            " The pcln table's textStart also differs from BN's .text start, which "
+            "points at a load-base mismatch."
+            if text_sec is not None and text_sec != text_start else ""
+        )
+        return (
+            f"{interior_count} of the {defined_count} recovered addresses that resolve "
+            f"to a BN function match only an interior PC, not a function START "
+            f"({start_match_count} matched a START). BN analysis may be incomplete "
+            "(run `bn refresh`), or the table is rebased by a delta that lands rows "
+            "off-prolog: compare text_start vs text_start_bv before trusting the "
+            f"addresses.{extra}"
+        )
     if text_sec is not None and text_sec != text_start:
         return (
             "None of the recovered addresses match a BN function START, and the "
