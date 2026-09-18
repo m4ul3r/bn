@@ -1435,22 +1435,31 @@ _COUNT_SLICE_FLAGS: tuple[tuple[str, str, Any], ...] = (
 )
 
 
-def _refuse_count_only_slices(args: argparse.Namespace, *, command: str) -> None:
-    """Refuse a ``--count`` run that also carries a slice-shaped flag.
+def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
+                              mode: str = "--count") -> None:
+    """Refuse an aggregate run that also carries a slice-shaped flag.
 
     Each flag is compared against its own "not given" value and read with
     ``getattr``, so a command that does not declare the flag cannot trip it.
     ``--sort address`` on an address-sorted command is not an offender: it is
     indistinguishable from the default and means the same thing anyway.
+
+    *mode* names the aggregate flag that makes the slice meaningless, and is
+    excluded from its own offender list. `--summary` is the second such mode
+    (#872): it returns ONE object, so `--limit`/`--offset` were forwarded to
+    a bridge that cannot apply them and vanished there -- the same
+    accepts-and-discards shape #767/#768 refused for `--count`, one flag
+    over. One helper rather than two, so the next aggregate inherits the
+    refusal instead of re-deriving which flags are meaningless.
     """
     offenders = [
         flag for attr, flag, unset in _COUNT_SLICE_FLAGS
-        if getattr(args, attr, unset) != unset
+        if flag != mode and getattr(args, attr, unset) != unset
     ]
     if offenders:
         raise BridgeError(
-            f"{command} --count reports the whole-target total, so "
-            f"{', '.join(offenders)} would be silently ignored. Drop --count for "
+            f"{command} {mode} reports the whole-target total, so "
+            f"{', '.join(offenders)} would be silently ignored. Drop {mode} for "
             "the paged list, or drop the flags for the count."
         )
 

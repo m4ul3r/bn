@@ -1579,6 +1579,84 @@ def test_imports_count_refuses_flags_it_would_ignore(fake_transport, capsys, ext
     assert extra[0] in err
 
 
+# --- #872: the SIBLING aggregates #767/#768 did not name ---------------------
+
+
+# One table, so the next audit reads the covered set instead of re-deriving
+# it -- #767/#768 fixed only the handlers their own issues named, which is
+# exactly how five siblings kept the defect for another release.
+_COUNT_SIBLINGS = [
+    (["exports", "--count"], "exports", "list_exports"),
+    (["sections", "--count"], "sections", "sections"),
+    (["strings", "--count"], "strings", "strings"),
+    (["types", "--count"], "types", "types"),
+    (["class", "list", "--count"], "class list", "class_list"),
+    (["go", "functions", "--count"], "go functions", "go_functions"),
+]
+
+
+@pytest.mark.parametrize("argv,label,op", _COUNT_SIBLINGS,
+                         ids=[lbl for _, lbl, _op in _COUNT_SIBLINGS])
+@pytest.mark.parametrize("extra", [["--limit", "5"], ["--offset", "1"]])
+def test_count_siblings_refuse_the_paging_flags_they_would_ignore_872(
+        fake_transport, capsys, argv, label, op, extra):
+    # #872: each of these returned the whole-target count and dropped the
+    # paging flags on the floor -- `class list` was worse, FORWARDING a limit
+    # the bridge cannot apply to a scalar. Same refusal as imports (#767).
+    calls = fake_transport()
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", *argv, *extra])
+
+    assert rc == 2, label
+    assert calls == [], f"{label} sent a request it should have refused"
+    err = capsys.readouterr().err
+    assert "--count" in err and extra[0] in err, label
+
+
+@pytest.mark.parametrize("argv,label,op", _COUNT_SIBLINGS,
+                         ids=[lbl for _, lbl, _op in _COUNT_SIBLINGS])
+def test_count_siblings_alone_still_count_872(fake_transport, argv, label, op):
+    # Must-not-fire twin for the whole family: the refusal is conditional on
+    # a slice flag, so a bare --count must still reach the bridge with
+    # count_only set. A guard that broke the feature it protects is worse
+    # than the silent drop it replaced.
+    calls = fake_transport({op: {"ok": True, "result": {"count": 3, "total": 3}}})
+
+    bn.cli.main(["-i", "fake", "-t", "t.bndb", *argv])
+
+    assert calls, f"{label} --count sent nothing"
+    assert calls[-1]["params"].get("count_only") is True, label
+    assert "limit" not in calls[-1]["params"], label
+
+
+@pytest.mark.parametrize("extra", [["--limit", "5"], ["--offset", "1"]])
+def test_imports_summary_refuses_paging_it_would_ignore_872(
+        fake_transport, capsys, extra):
+    # The second aggregate MODE, not just the second command: `--summary`
+    # returns one object, so the paging flags were forwarded to a bridge that
+    # cannot apply them and vanished there. The handler's own comment said
+    # "ignores paging entirely" while the params dict forwarded `offset`.
+    calls = fake_transport()
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--summary", *extra])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "--summary" in err and extra[0] in err
+    # `--summary` is the MODE here, so it must not be listed as its own offender.
+    assert err.count("--summary") == 2      # "imports --summary" + "Drop --summary"
+
+
+def test_imports_summary_alone_still_summarises_872(fake_transport):
+    calls = fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports", "summary": {"total": 3}}}})
+
+    bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--summary"])
+
+    assert calls and calls[-1]["params"]["summary"] is True
+
+
 def test_imports_count_alone_still_counts(fake_transport):
     calls = fake_transport({"imports": {"ok": True, "result": {"kind": "imports", "count": 7, "total": 7}}})
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from ..cli import _call, _effective_limit, arg, command
+from ..cli import _call, _effective_limit, _refuse_count_only_slices, arg, command
 from ..formatters import _render_class_list_text, _render_class_show_text
 
 
@@ -34,8 +34,13 @@ def _class_list(args: argparse.Namespace) -> int:
     if args.no_vendor:
         params["no_vendor"] = True
     if args.count_only:
+        # #872: `class list --count` used to FORWARD --limit alongside
+        # count_only, so the bridge received a page size it cannot apply to a
+        # scalar. Refuse by name like every other count surface (#767/#768)
+        # rather than sending a flag that cannot mean anything.
+        _refuse_count_only_slices(args, command="class list")
         params["count_only"] = True
-    limit = _effective_limit(args)
+    limit = _effective_limit(args) if not args.count_only else None
     if limit is not None:
         params["limit"] = limit
     return _call(

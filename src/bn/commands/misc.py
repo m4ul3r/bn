@@ -62,6 +62,7 @@ def _strings(args: argparse.Namespace) -> int:
         "probable_format_strings": bool(args.probable_format_strings),
     }
     if args.count:
+        _refuse_count_only_slices(args, command="strings")
         return _call(
             args,
             "strings",
@@ -143,6 +144,11 @@ def _imports(args: argparse.Namespace) -> int:
             stem="imports-count",
         )
     summary_mode = bool(args.summary)
+    if summary_mode:
+        # #872: the summary is ONE aggregate object, so --limit/--offset were
+        # forwarded to a bridge that cannot apply them and vanished there --
+        # the same accepts-and-discards shape #767/#768 refused for --count.
+        _refuse_count_only_slices(args, command="imports", mode="--summary")
     # Summary is a single aggregate object, so it ignores paging entirely. The
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
@@ -193,6 +199,7 @@ _EXPORT_ARGS = [
 )
 def _exports(args: argparse.Namespace) -> int:
     if args.count:
+        _refuse_count_only_slices(args, command="exports")
         return _call(
             args,
             "list_exports",
@@ -224,6 +231,7 @@ def _exports(args: argparse.Namespace) -> int:
                                help="Show the section count instead of listing")])
 def _sections(args: argparse.Namespace) -> int:
     if args.count:
+        _refuse_count_only_slices(args, command="sections")
         return _call(
             args,
             "sections",
@@ -314,6 +322,7 @@ def _data_symbols(args: argparse.Namespace) -> int:
          ])
 def _go_functions(args: argparse.Namespace) -> int:
     if args.count:
+        _refuse_count_only_slices(args, command="go functions")
         return _call(
             args, "go_functions", {"count_only": True},
             require_target=True,
