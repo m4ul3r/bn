@@ -2680,7 +2680,8 @@ class BinaryNinjaBridge:
             # raw bytes: the round-2 fix defeated by its companion guard, both
             # added in one commit, and invisible because the test's fake did not
             # re-home the way BN does (#857 review round 3).
-            self.targets.note_database(bv, saved)
+            if _is_own_database_destination(saved, filename):
+                self.targets.note_database(bv, saved)
             _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
 
@@ -2697,10 +2698,12 @@ class BinaryNinjaBridge:
             # rather than a clean one so callers know the original identity moved and
             # `bn close <selector>` may no longer resolve it (#256 review).
             self.targets.clear_dirty(bv)  # the bytes are persisted regardless
-            # Degraded, but the database is real and holds the annotations, so a
-            # restart must reopen it rather than the raw file (#753).
-            self.targets.note_database(bv, saved)
-            return {
+            # No record needed here, and this is not an omission: the restore
+            # FAILED, so the live view is still homed at `saved` and a restart
+            # reloads `filename` -- which IS that database. `note_database`'s
+            # divergence guard would skip it for exactly this reason, so calling
+            # it was dead code that read as if it were doing something (#857 r5).
+            degraded = {
                 "ok": True,
                 "saved": True,
                 "path": saved,
@@ -2712,6 +2715,11 @@ class BinaryNinjaBridge:
                     "original path to restore its selector."
                 ),
             }
+            # The collision disclosure is unconditional in the docs, so it must
+            # be unconditional here too -- this degraded path wrote a real file
+            # and can land on another open target exactly like the clean one.
+            _disclose_open_target_collision(self.targets, bv, saved, degraded)
+            return degraded
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         # #753: the live filename was just restored to the ORIGINAL path, so from
         # here on nothing in the view says where its analysis actually lives.
@@ -2725,7 +2733,7 @@ class BinaryNinjaBridge:
         # that target fail to reload and vanish. That is the identity move
         # `_restore_filename` exists to prevent, deferred one step to restart
         # (#857 round-4 regression, introduced by this change).
-        if not explicit:
+        if _is_own_database_destination(saved, filename):
             self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
         _disclose_open_target_collision(self.targets, bv, saved, result)
@@ -4737,6 +4745,35 @@ def _bind_batch_apply(bridge, params, target):
 # snapshotting phases, never around the post-apply reanalysis.
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
+
+
+def _is_own_database_destination(saved: str, filename: str) -> bool:
+    """Is *saved* this target's OWN database, rather than an export elsewhere?
+
+    The record has to key on the DESTINATION, not on how the save was spelled.
+    Gating on "was `--path` given" made an explicit `bn save <target>.bndb` --
+    aimed at exactly the file a default save would have chosen -- record nothing,
+    so restart reopened the raw bytes and discarded the analysis even though the
+    sibling existed on disk (#857 round-5 regression). The two destinations that
+    ARE the target's own database:
+
+    * its adjacent sibling, ``<filename>.bndb`` -- what a default save writes;
+    * its cache copy, ``_cache_bndb_path(filename)`` -- what a default save
+      falls back to when the adjacent path is not writable.
+
+    Anything else is a copy the caller asked for, and recording it would move
+    the target's restart identity onto an export (the other half of the same
+    round-4/round-5 pair).
+    """
+    if not saved or not filename:
+        return False
+    try:
+        written = Path(saved).expanduser().resolve()
+        if written == Path(filename + ".bndb").expanduser().resolve():
+            return True
+        return written == _cache_bndb_path(filename).expanduser().resolve()
+    except Exception:  # noqa: BLE001 - an unresolvable path is simply not ours
+        return False
 
 
 def _disclose_open_target_collision(targets, bv, saved: str, result: dict) -> None:

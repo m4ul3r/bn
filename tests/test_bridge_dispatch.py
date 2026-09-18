@@ -5459,10 +5459,18 @@ def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
     instance._save_database(None, None)          # default save -> the sibling
     assert instance.targets.refresh()[0]["database_path"] is not None
 
+    # A SECOND view stays open, so `refresh()` is non-empty and the assertion can
+    # actually fail: asserting `refresh() == []` after closing the only view held
+    # for any implementation, including one that never dropped the entry (#857 r5).
+    other = _SaveBV(str(tmp_path / "other"), result=True, write=True)
     instance.targets.forget(bv)
-    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([], True))
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state", lambda strict=False: ([other], True))
 
-    assert instance.targets.refresh() == []
+    rows = instance.targets.refresh()
+    assert [r["filename"] for r in rows] == [str(tmp_path / "other")]
+    assert all(r["database_path"] is None for r in rows), (
+        "the closed view's recorded database must not survive onto anyone else")
 
 
 def test_save_records_the_CACHE_database_for_restart_857(monkeypatch, tmp_path):
@@ -5647,3 +5655,62 @@ def test_an_explicit_path_save_is_an_export_not_a_new_home_857(monkeypatch, tmp_
     assert row["database_path"] is None, (
         "an explicit --path save is an export; recording it would make restart "
         "reopen the copy instead of the target's own database")
+
+
+def test_an_explicit_save_to_its_OWN_sibling_is_still_recorded_857(monkeypatch, tmp_path):
+    """#857 round-5 BLOCKER: the record was gated on the save's SPELLING, not its
+    DESTINATION. `bn save <target>.bndb` -- an explicit path aimed at exactly the
+    file a DEFAULT save would have chosen -- recorded nothing, so the row read
+    `database_path: null`, restart reopened the raw bytes, and the saved analysis
+    was discarded at rc 0 with no note, even though the sibling existed on disk.
+    A regression against both the round-4 head and base (whose sidecar
+    preference resolved the sibling).
+
+    Same destination, two spellings, one outcome: that is the property."""
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sibling = str(raw) + ".bndb"
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def row_after(save_arg):
+        bv = _RehomingSaveBV(str(raw))
+        monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+        monkeypatch.setattr(
+            bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+        instance.targets.refresh()
+        instance._save_database(None, save_arg)
+        row = instance.targets.refresh()[0]
+        instance.targets.forget(bv)
+        return row
+
+    explicit = row_after(sibling)     # `bn save <target>.bndb`
+    default = row_after(None)         # `bn save`
+
+    assert explicit["database_path"] == sibling, (
+        "an explicit path aimed at the target's own sibling is not an export")
+    assert default["database_path"] == sibling
+    assert explicit["database_path"] == default["database_path"], (
+        "the same destination must record the same way whichever spelling asked "
+        "for it -- the round-5 regression was exactly this asymmetry")
+
+
+def test_an_explicit_save_to_the_cache_path_is_also_its_own_database_857(monkeypatch, tmp_path):
+    """The other own-database destination: a caller naming the cache copy
+    explicitly is still naming this target's database, not an export."""
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    cache_db = bridge._cache_bndb_path(str(raw))
+    cache_db.parent.mkdir(parents=True, exist_ok=True)
+    bv = _RehomingSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    instance._save_database(None, str(cache_db))
+
+    assert instance.targets.refresh()[0]["database_path"] == str(cache_db)

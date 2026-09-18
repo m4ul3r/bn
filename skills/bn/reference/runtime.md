@@ -141,7 +141,7 @@ bn save /path/to/output.bndb             # explicit path (positional)
 bn save --path /path/to/output.bndb      # --path is an accepted alias for the positional
 ```
 
-> **Selector rebind after save.** `bn save` / `bn save <path>` rebinds the in-memory view's filename, so its basename / filename selector changes (e.g. `foo` becomes `foo.bndb`). A `-t foo` that worked before the save can stop resolving afterward. Post-save commands should target the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`), not the basename, to avoid `Unknown target selector` after a save.
+> **Selectors survive a save — unless the save says otherwise.** Binary Ninja rebinds the in-memory view's filename to whatever `.bndb` it writes, but a save is persistence, not an identity move, so the bridge restores the original filename afterwards and your `-t foo` keeps resolving (#256/#285). The one exception is reported rather than left to be discovered: if that restore fails, the result carries `rehomed: true` and a note saying where the view is now homed, and only then can the basename selector have moved. Targeting the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`) is still the robust habit for post-save commands.
 
 `bn load <raw>` and `bn session start <raw> [...]` auto-prefer a sibling `<raw>.bndb` when one exists, so saved annotations come back without you having to retype the `.bndb` suffix. The CLI prints which file was actually opened:
 
