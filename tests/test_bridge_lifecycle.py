@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import threading
+import types
 import time
 
 import pytest
@@ -1358,3 +1359,77 @@ def test_same_file_degrades_to_false_without_identity_evidence_869(monkeypatch):
     assert module._same_file("/nope/a.bndb", "/nope/b.bndb") is False
     assert module._same_file("", "/nope/b.bndb") is False
     assert module._same_file(None, None) is False
+
+
+# --- #867: refuse a save whose destination is another OPEN target ----------
+
+
+def _collision_bridge(monkeypatch, tmp_path, collision):
+    """A bridge whose single view saves for real, with the collision probe
+    answering *collision*. Uses the suite's own `_SaveBV` and `targets.resolve`
+    seam, i.e. the wiring every other save test uses."""
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    bv = _SaveBV(str(tmp_path / "target"), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: collision)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+    monkeypatch.setattr(instance.targets, "note_database", lambda _bv, _p: None)
+    return module, instance, bv
+
+
+def test_save_refuses_a_destination_another_target_has_open_867(monkeypatch, tmp_path):
+    # #867: the save used to LAND and then disclose. Both rows then name one
+    # database, and `session restart` returns one target for both -- measured
+    # 2 -> 1 at rc 0. Disclosure after an irreversible write is the weaker
+    # half; refusing costs nothing the caller cannot recover.
+    other = {"target_id": "t:2", "selector": "other.bndb",
+             "filename": str(tmp_path / "other")}
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, other)
+    dest = tmp_path / "target.bndb"
+
+    with pytest.raises(module.OperationFailure) as excinfo:
+        instance._save_database(None, str(dest))
+
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    # It must name BOTH ways out, or the refusal is a wall.
+    assert "--path" in excinfo.value.message
+    assert "close the other target" in excinfo.value.message
+    # And nothing may have been written -- that is the whole point of moving
+    # the check ahead of the write.
+    assert not dest.exists()
+    assert bv.created_with is None
+
+
+def test_save_without_a_collision_still_writes_867(monkeypatch, tmp_path):
+    # Must-not-fire twin: the ordinary save is the common path and must be
+    # untouched by the new refusal.
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    assert result["saved"] is True
+    assert dest.exists()
+
+
+def test_save_proceeds_when_the_collision_probe_cannot_answer_867(
+        monkeypatch, tmp_path):
+    # Degrade-safely, the same direction the post-write disclosure already
+    # takes: a probe that RAISES has no evidence of a collision, and must not
+    # block a legitimate save. Only a positive match refuses.
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+
+    def _boom(path, *, exclude):
+        raise RuntimeError("target map unavailable")
+
+    monkeypatch.setattr(instance.targets, "open_target_for_path", _boom)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    assert result["saved"] is True
+    assert dest.exists()

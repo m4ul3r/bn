@@ -5731,20 +5731,29 @@ def test_save_onto_an_open_target_is_disclosed_at_save_time_857(monkeypatch, tmp
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867 SUPERSEDES the disclosure this test was written for. Disclosing an
+    # irreversible write is the weaker half of the pair: the save had already
+    # landed, and `session restart` then returned one target for both rows
+    # (measured 2 -> 1, rc 0). The destination is now REFUSED before the
+    # write, so nothing is lost and the caller is one command from safety.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    collision = result["collides_with_open_target"]
-    assert collision["filename"] == str(sidecar)
-    assert collision["target_id"]
-    assert "session restart" in result["note"]
-    # And it reaches the surface an operator actually reads.
-    rendered = formatters._render_save_text(result)
-    assert "also open as target" in rendered
-    assert "one database" in rendered
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert "session restart" in excinfo.value.message
+    assert str(sidecar) in excinfo.value.message
+    # Nothing was written: the sidecar still holds what it held.
+    assert sidecar.read_text() == "bndb"
+    assert raw_view.created_with is None
 
-    # The row state that made this reachable is still observable.
+    # THE payoff of #867, and the assertion worth keeping: the row state that
+    # made the collapse reachable is never created. Under the old behaviour
+    # the raw row's `database_path` was recorded as the sidecar -- the two
+    # rows naming one database, which is what made `session restart` return
+    # one target for both. Refusing before the write means neither row moved.
     rows = {r["filename"]: r for r in instance.targets.refresh()}
-    assert rows[str(raw)]["database_path"] == str(sidecar)
+    assert rows[str(raw)]["database_path"] is None
     assert rows[str(sidecar)]["database_path"] is None
 
 
@@ -5947,11 +5956,14 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867: the destination collision is decided BEFORE the write, so it wins
+    # over the degradation this test was named for -- the save never reaches
+    # the re-home path, because it never reaches the write at all. That
+    # ordering is the point: a degraded save that still collapses two targets
+    # is not a better outcome than a refusal.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    # Degraded, and still disclosed on both halves.
-    assert result["rehomed"] is True
-    assert result["collides_with_open_target"]["filename"] == str(sidecar)
-    assert "session restart" in result["note"]
-    assert "could not restore" in result["note"]
-    assert "also open as target" in formatters._render_save_text(result)
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert sidecar.read_text() == "bndb"          # nothing written

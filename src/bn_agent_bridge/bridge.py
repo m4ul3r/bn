@@ -2632,6 +2632,45 @@ class BinaryNinjaBridge:
         else:
             out = filename + ".bndb"
 
+        # #867: REFUSE before the write, rather than disclosing after it.
+        #
+        # A save landing on a file another target already has open makes the
+        # two targets one database from that moment -- BN dedups views by
+        # file -- so a later `session restart` returns one target for both and
+        # the instance comes back with fewer targets than it had (measured
+        # 2 -> 1, rc 0). #857 made that DISCLOSED; the collapse itself
+        # survived, and disclosure after an irreversible write is the weaker
+        # half of the pair.
+        #
+        # Refusing costs nothing the caller cannot recover: nothing is
+        # written, so no annotation is lost and the two ways out are one
+        # command away. The alternative considered and rejected was to keep
+        # the save and have restart reopen the re-homed target from its own
+        # binary -- that preserves the COUNT by bringing the target back as
+        # raw bytes with its analysis gone, which is the silent-data-loss
+        # shape #753 exists to stop.
+        #
+        # Best-effort in the same direction as the post-write disclosure: a
+        # probe that cannot answer must not block a legitimate save, so only
+        # a POSITIVE match refuses. The post-write disclosure stays as the
+        # backstop for the window between this check and the write.
+        try:
+            collision = self.targets.open_target_for_path(out, exclude=bv)
+        except Exception:  # noqa: BLE001 - an unanswerable probe refuses nothing
+            collision = None
+        if collision:
+            raise OperationFailure(
+                "invalid_request",
+                f"save refused: {out} is already open as target "
+                f"{collision.get('selector')!r} ({collision.get('target_id')}). "
+                "Saving here would make the two targets one database, so a "
+                "later `session restart` would return one target for both. "
+                "Save elsewhere with --path, or close the other target first.",
+                requested={"path": out},
+                observed={"collides_with_open_target": collision,
+                          "request_sent": True, "written": False},
+            )
+
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
             if make_parent:
