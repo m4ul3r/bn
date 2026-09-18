@@ -1152,12 +1152,13 @@ def _cpp_method_this_caveat(func, decompiled_text: str = "") -> str | None:
 def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2,
                        offset: int = 0, limit: int | None = None,
                        address_window: tuple[int, int] | None = None):
-    if context < 0:
-        raise OperationFailure("invalid_context", f"Invalid evidence context size: {context}")
-    if offset < 0:
-        raise OperationFailure("invalid_request", f"Invalid offset: {offset}")
-    if limit is not None and limit < 1:
-        raise OperationFailure("invalid_request", f"Invalid limit: {limit}")
+    # #827 item 8: the same shared validation (and wording) every other paged read
+    # uses. A raw-socket / `py exec` client reaches this handler directly, so the
+    # bridge re-enforces the CLI's argparse contract (`_positive_int` /
+    # `_non_negative_int`) rather than raising ad-hoc messages of its own.
+    context = _validate_count(context, label="context", minimum=0)
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
     # #471 slicing/windowing controls so a large call-heavy dispatch function can be

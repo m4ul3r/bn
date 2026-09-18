@@ -2059,6 +2059,31 @@ def test_function_evidence_slicing_471(monkeypatch):
         instance._function_evidence("active", "dispatch", limit=0)
 
 
+def test_function_evidence_paging_validation_matches_the_shared_helper_827(monkeypatch):
+    """#827 item 8: the bridge re-enforces the CLI's argparse contract for a raw
+    socket / `py exec` client, and it must do so with the SAME code and wording
+    every other paged read uses (`_validate_count`) instead of ad-hoc
+    `invalid_context`/"Invalid offset: -1" messages that no sibling op emits.
+    Validation runs before the view is resolved, so no view is needed here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    with pytest.raises(bridge.OperationFailure) as context_exc:
+        instance._function_evidence("active", "dispatch", context=-1)
+    assert context_exc.value.status == "invalid_request"
+    assert context_exc.value.message == "context must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as offset_exc:
+        instance._function_evidence("active", "dispatch", offset=-1)
+    assert offset_exc.value.status == "invalid_request"
+    assert offset_exc.value.message == "offset must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as limit_exc:
+        instance._function_evidence("active", "dispatch", limit=0)
+    assert limit_exc.value.status == "invalid_request"
+    assert limit_exc.value.message == "limit must be >= 1, got 0"
+
+
 def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     """#622: a paged read returns the call PAGE without paying for the full
     Pseudo-C decompile, and says so -- `decompile_deferred` + a warning line, so
