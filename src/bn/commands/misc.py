@@ -389,7 +389,10 @@ def _resolved_out_format(args: argparse.Namespace) -> str:
 
 
 @command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
-         args=[arg("identifier")])
+         args=[arg("identifier"),
+               arg("--include-annotations", action="store_true", default=False,
+                   help="Include inherited comment bodies in the bundle's "
+                        "decompilation (default: redact, matching bn decompile)")])
 def _bundle_function(args: argparse.Namespace) -> int:
     # #665: `--out` is already absolute here (`_resolve_out_path`), so the
     # bridge writes it where the CALLER meant. The one destination the bridge
@@ -422,7 +425,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
         args,
         "bundle_function",
         {"identifier": args.identifier,
-         "out_path": str(args.out) if bridge_writes else None},
+         "out_path": str(args.out) if bridge_writes else None,
+         "include_annotations": bool(args.include_annotations)},
         require_target=True,
         text_renderer=_render_function_bundle_text,
         stem="function-bundle",

@@ -184,6 +184,25 @@ def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str
     return _COMMENT_SPAN_RE.sub(redact, text)
 
 
+def _annotation_bodies(func, comments: dict) -> list[str]:
+    """Every stored annotation body that can surface in this function's rendered
+    text: the global comment map (passed in, already computed by the caller), the
+    function-local map, and the function's own documentation comment.
+
+    Shared with ``bridge._bundle_function``, which renders the same text through
+    its own call path: #752 was precisely those two paths disagreeing about what
+    counts as an annotation, so the rule lives in one place.
+    """
+    function_comment = str(getattr(func, "comment", "") or "")
+    return [
+        *comments.values(),
+        # Local and global bodies can differ at the same address; do not merge
+        # their maps and silently discard one of the two annotations.
+        *(getattr(func, "comments", {}) or {}).values(),
+        *([function_comment] if function_comment else []),
+    ]
+
+
 
 def _decompile(
     ctx,
@@ -202,14 +221,7 @@ def _decompile(
         forced = True
 
     comments = il_format._comment_map(bv, func)
-    function_comment = str(getattr(func, "comment", "") or "")
-    annotation_bodies = [
-        *comments.values(),
-        # Local and global bodies can differ at the same address; do not merge
-        # their maps and silently discard one of the two annotations.
-        *(getattr(func, "comments", {}) or {}).values(),
-        *([function_comment] if function_comment else []),
-    ]
+    annotation_bodies = _annotation_bodies(func, comments)
     text = il_format._decompile_text(bv, func, addresses=addresses)
     if not include_annotations:
         text = _redact_rendered_annotations(text, annotation_bodies)
