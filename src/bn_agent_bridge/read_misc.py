@@ -133,32 +133,59 @@ _SECTION_SEMANTICS_NAMES: dict[int, str] = {
 }
 
 
-def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
-                       limit: int | None, kind: str) -> dict[str, Any]:
-    """Return a list page WITH paging metadata (the strings/imports/sections
-    envelope).
+def _page_window(total: int, *, offset: int, limit: int | None) -> tuple[int, int]:
+    """The ``[start, stop)`` window of a filtered population that this request
+    must materialize ROWS for (#814).
 
-    Mirrors ``read_listing._paged_function_result`` so the simple list ops
-    expose the same honest paging contract -- the true total plus the remainder
-    -- as ``function list``/``function search`` (#122). `items` is the universal
-    data container and `kind` the envelope discriminator (#275); every caller
-    passes its own `kind` (required, so a new list read can't omit it). The CLI
-    can't compute the true total itself (it asks for a bounded page), so the
-    bridge, which has the full filtered set, returns total/offset/limit/
-    returned/has_more alongside the page."""
-    total = len(items)
-    page = items[offset:]
-    if limit is not None:
-        page = page[:limit]
+    The paging contract reports the exact size of the filtered population plus
+    the remainder, so a read still has to *scan* the population (and know its
+    order) before it can answer -- but it never has to build a row, project a
+    display name, or count xrefs for anything outside this window. `stop` clamps
+    to `total`, so an offset past the end yields an empty window (`has_more`
+    False) exactly as the slicing envelope did."""
+    start = min(offset, total)
+    stop = total if limit is None else min(start + limit, total)
+    return start, stop
+
+
+def _paged_envelope(*, kind: str, items: list[dict[str, Any]], total: int,
+                    offset: int, limit: int | None) -> dict[str, Any]:
+    """The ONE paging envelope every list read returns: ``items`` is the returned
+    PAGE and ``total`` the size of the whole filtered population it was drawn
+    from (#122).
+
+    `items` is the universal data container and `kind` the envelope discriminator
+    (#275); every caller passes its own `kind` (required, so a new list read
+    can't omit it). The CLI can't compute the true total itself (it asks for a
+    bounded page), so the bridge -- which has the filtered population -- returns
+    total/offset/limit/returned/has_more alongside the page. Callers that
+    already hold the page (the #814 paging paths build rows for the window only)
+    share this shape with the ones that still slice a materialized list."""
     return {
         "kind": kind,
-        "items": page,
+        "items": items,
         "total": total,
         "offset": offset,
         "limit": limit,
-        "returned": len(page),
-        "has_more": (offset + len(page)) < total,
+        "returned": len(items),
+        "has_more": (offset + len(items)) < total,
     }
+
+
+def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
+                       limit: int | None, kind: str) -> dict[str, Any]:
+    """Return a list page WITH paging metadata (the strings/imports/sections
+    envelope) from an already-materialized *items* list.
+
+    Mirrors ``read_listing._paged_function_result`` so the simple list ops
+    expose the same honest paging contract -- the true total plus the remainder
+    -- as ``function list``/``function search`` (#122). Slices the requested
+    window here, then wraps it; a caller whose per-row work is expensive should
+    instead page its population first (``_page_window``) and build rows for that
+    window only (#814)."""
+    start, stop = _page_window(len(items), offset=offset, limit=limit)
+    return _paged_envelope(kind=kind, items=items[start:stop], total=len(items),
+                           offset=offset, limit=limit)
 
 
 # Sections that hold loader/linker METADATA strings rather than domain literals
@@ -211,7 +238,6 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             "Strings are not available: this target was loaded with --quick (no analysis). "
             "Run `bn refresh` to build the full string set first."
         )
-    items = []
     needle = str(query) if query else None
     pattern = None
     if needle and regex:
@@ -221,15 +247,20 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             raise OperationFailure("invalid_regex", f"Invalid string regex: {exc}") from exc
     elif needle:
         needle = needle.lower()
+    # #814: the scanning pass below (query/length/section/no-crt/format filters)
+    # has to see every string -- the honest `total` is the size of the filtered
+    # population, and the (address, value) order is only known once the scan is
+    # done. What it must NOT do is build the enrichment the caller will never be
+    # shown, so a survivor is retained as a lightweight tuple: the parsed fields
+    # the order needs plus the source ref, with the `type` decode and -- in
+    # --probable-format-strings mode -- the per-survivor code-xref count deferred
+    # to `_string_entry`, which runs for the returned page only. Before #814 a
+    # `strings --limit 20` paid both for every survivor of a 50k-string scan.
+    survivors: list[tuple[int, str, int, Any, list[str] | None]] = []
     for item in list(getattr(bv, "strings", [])):
         value = str(getattr(item, "value", ""))
         length = int(getattr(item, "length", 0))
         address = int(getattr(item, "start", 0))
-        raw_type = getattr(item, "type", "")
-        try:
-            string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
-        except (TypeError, ValueError):
-            string_type = str(raw_type)
 
         if pattern is not None:
             if not pattern.search(value):
@@ -264,31 +295,58 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             if directives is None:
                 continue
 
-        entry = {
-            "address": hex(address),
-            "length": length,
-            "chars": len(value),
-            "type": string_type,
-            "value": value,
-        }
-        if directives is not None:
-            # Provenance for the model: WHICH printf directives the candidate
-            # carries (a `%n`/`%s` here is a signal to weigh, not a verdict), and
-            # the code-xref count -- a plausible format string is usually
-            # referenced by code. Reuse the existing xref helper rather than
-            # recompute, and only for the already-filtered survivors so the mode
-            # stays cheap. code_refs stays enrichment, NOT a hard filter: a format
-            # string reached indirectly can have zero direct xrefs, and dropping
-            # it would be a false negative.
-            entry["format_directives"] = directives
-            entry["directive_count"] = len(directives)
-            entry["code_refs"] = read_xrefs._code_ref_count(bv, address)
-        items.append(entry)
+        survivors.append((address, value, length, item, directives))
     if count_only:
         # `total` mirrors the list envelope key for the same number (#165).
-        return {"kind": "strings", "count": len(items), "total": len(items)}
-    items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
-    return _paged_list_result(items, offset=offset, limit=limit, kind="strings")
+        return {"kind": "strings", "count": len(survivors), "total": len(survivors)}
+    # Same order as the pre-#814 full build: (address, value), stable against the
+    # scan order for ties -- only now over the lightweight survivors.
+    survivors.sort(key=lambda row: (row[0], row[1]))
+    start, stop = _page_window(len(survivors), offset=offset, limit=limit)
+    return _paged_envelope(
+        kind="strings",
+        items=[_string_entry(row, bv) for row in survivors[start:stop]],
+        total=len(survivors),
+        offset=offset,
+        limit=limit,
+    )
+
+
+def _string_entry(row: tuple[int, str, int, Any, list[str] | None], bv) -> dict[str, Any]:
+    """Build ONE `strings` row from a retained survivor tuple (#814).
+
+    Split out so a row's per-row work -- the string-`type` decode and, in
+    --probable-format-strings mode, the code-xref count plus the directive
+    provenance -- is paid for the rows actually returned, never for the whole
+    filtered population. (The directives themselves were already computed as the
+    mode's FILTER and are handed through, so this cannot disagree with the
+    filter that admitted the string.)"""
+    address, value, length, item, directives = row
+    raw_type = getattr(item, "type", "")
+    try:
+        string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
+    except (TypeError, ValueError):
+        string_type = str(raw_type)
+    entry = {
+        "address": hex(address),
+        "length": length,
+        "chars": len(value),
+        "type": string_type,
+        "value": value,
+    }
+    if directives is not None:
+        # Provenance for the model: WHICH printf directives the candidate
+        # carries (a `%n`/`%s` here is a signal to weigh, not a verdict), and
+        # the code-xref count -- a plausible format string is usually
+        # referenced by code. Reuse the existing xref helper rather than
+        # recompute, and only for the returned page so the mode stays cheap.
+        # code_refs stays enrichment, NOT a hard filter: a format
+        # string reached indirectly can have zero direct xrefs, and dropping
+        # it would be a false negative.
+        entry["format_directives"] = directives
+        entry["directive_count"] = len(directives)
+        entry["code_refs"] = read_xrefs._code_ref_count(bv, address)
+    return entry
 
 
 def _needed_libraries(bv) -> list[str]:

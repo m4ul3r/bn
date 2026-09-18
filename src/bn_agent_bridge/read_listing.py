@@ -638,30 +638,86 @@ def _filtered_functions(
     return functions
 
 
-def _sort_function_items(
-    items: list[dict[str, Any]],
+def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
+    """The order key for *sort* read off the LIVE Function (#814) -- the same
+    keys ``--sort`` used on a materialized row before it (``size`` or 0 for
+    ``size``, the lowercased name for ``name``, the address otherwise).
+
+    Ordering the population rather than the rows is sound because every base
+    sort was a STABLE sort over rows built in ``_filtered_functions`` order
+    (``(start, name)``): keying on the sort key alone reproduces that order,
+    tie-break included. ``size`` is the one key that costs a per-function read
+    (``il_format._function_size``: ``total_bytes`` or a basic-block walk); it is
+    recorded in *sizes* so the page rows reuse it instead of paying twice, the
+    way the full build handed each row its size. ``address``/``name`` read a
+    field the filter pass already touched.
+    """
+    if sort == "size":
+        size = il_format._function_size(fn)
+        sizes[id(fn)] = size
+        return size or 0
+    if sort == "name":
+        return str(getattr(fn, "name", "")).lower()
+    return int(fn.start)
+
+
+def _order_function_population(
+    population: list[Any],
     sort: str,
     reverse: bool = False,
-) -> list[dict[str, Any]]:
-    """Order address, size, or name ascending unless ``reverse`` is set."""
+    function_of=None,
+) -> dict[int, Any]:
+    """Order address, size, or name ascending unless ``reverse`` is set.
+
+    Sorts the filtered POPULATION in place -- live Functions, or tuples whose
+    first element is one (*function_of* extracts it) -- and returns the sizes it
+    had to read (``{id(fn): size}``; empty unless *sort* is ``size``). #814:
+    ordering the population instead of the rows is what lets the row build, the
+    display projection and the xref enrichment happen for the returned page
+    only."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
             f"Invalid sort '{sort}'; choose one of {', '.join(_FUNCTION_SORTS)}",
         )
-    if sort == "size":
-        items.sort(key=lambda item: (item.get("size") or 0), reverse=reverse)
-    elif sort == "name":
-        items.sort(
-            key=lambda item: str(item.get("name", "")).lower(),
-            reverse=reverse,
-        )
-    elif reverse:
-        items.sort(
-            key=lambda item: int(str(item.get("address", "0x0")), 16),
-            reverse=True,
-        )
-    return items
+    sizes: dict[int, Any] = {}
+    if sort == "address" and not reverse:
+        # The population arrives in ``(start, name)`` order -- already the
+        # address order, tie-break included -- so this is not a skip.
+        return sizes
+    get_fn = function_of or (lambda item: item)
+    population.sort(
+        key=lambda item: _function_population_key(get_fn(item), sort, sizes),
+        reverse=reverse,
+    )
+    return sizes
+
+
+_NO_SIZE = object()
+
+
+def _function_list_row(fn, *, display_name: str | None = None, size: Any = _NO_SIZE) -> dict[str, Any]:
+    """Build ONE ``function list`` / ``function search`` row (#814).
+
+    Called once per RETURNED row, never per filtered function. Everything else a
+    consumer sees on the row (``display_name``, ``size``, ``basic_block_count``,
+    the #653.4 ``imported``/``auto_named`` labels) is filled by
+    ``_project_page_fields`` for the page, so a bounded page never pays a
+    population-wide projection. ``search`` passes the ``display_name`` it already
+    computed while matching (it is a match key there), and ``--sort size`` passes
+    the size the ordering pass already read; both otherwise stay deferred.
+    """
+    row = {
+        "name": fn.name,
+        "address": hex(fn.start),
+        "raw_name": getattr(fn, "raw_name", fn.name),
+        "_fn": fn,   # transient: page projection reads this, then drops it
+    }
+    if display_name is not None:
+        row["display_name"] = display_name
+    if size is not _NO_SIZE:
+        row["size"] = size
+    return row
 
 
 def _list_functions(
@@ -707,30 +763,26 @@ def _list_functions(
                 **_analysis_state_fields(bv)}
     # #411 established that per-page display projection (basic_block_count) must
     # not be computed for the whole filtered set. display_name (a per-function
-    # symbol lookup) and size follow the same rule: neither is needed to build
-    # the full set here -- display_name is never a sort key, and size is only
-    # needed full-set for `--sort size`. Deferring them to the returned page
-    # (via _project_page_fields) is the difference between a `function list
-    # --limit 100` that demangles + sizes 100 functions and one that pays it for
-    # all 24k. `_fn` carries the live Function to the page projection, then drops.
-    include_size = sort == "size"  # sorting the FULL set by size needs it per-row
+    # symbol lookup) and size follow the same rule, and #814 extends it to the
+    # row dicts themselves: the filtered population is ORDERED as live Functions
+    # and a row is built only for the returned window, so a `function list
+    # --limit 100` over a 50k-function target no longer materializes (and sorts)
+    # 50k rows to hand back 100. `_fn` carries the live Function to the page
+    # projection, then drops.
+    sizes = _order_function_population(functions, sort, reverse)
+    start, stop = read_misc._page_window(len(functions), offset=offset, limit=limit)
     items = [
-        {
-            "name": fn.name,
-            "address": hex(fn.start),
-            "raw_name": getattr(fn, "raw_name", fn.name),
-            **({"size": il_format._function_size(fn)} if include_size else {}),
-            # #653.4's `imported`/`auto_named` are page projections, NOT full-set
-            # fields: `is_imported_function` is a per-function `fn.symbol` lookup,
-            # the same cost #639 moved off the filtered set. Computing them here
-            # would hand back most of that win. The --named/--unnamed FILTER above
-            # reads the live Function directly, so it is unaffected.
-            "_fn": fn,   # transient: page projection reads this, then drops it
-        }
-        for fn in functions
+        # #653.4's `imported`/`auto_named` are page projections, NOT full-set
+        # fields: `is_imported_function` is a per-function `fn.symbol` lookup,
+        # the same cost #639 moved off the filtered set. Computing them here
+        # would hand back most of that win. The --named/--unnamed FILTER above
+        # reads the live Function directly, so it is unaffected.
+        _function_list_row(fn, size=sizes[id(fn)] if sort == "size" else _NO_SIZE)
+        for fn in functions[start:stop]
     ]
-    _sort_function_items(items, sort, reverse)
-    result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result = read_misc._paged_envelope(
+        kind="functions", items=items, total=len(functions), offset=offset, limit=limit,
+    )
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(result)
 
@@ -793,26 +845,21 @@ def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
                            limit: int | None, kind: str = "functions") -> dict[str, Any]:
     """Return a function-listing page WITH paging metadata.
 
-    The CLI can't compute the true total itself -- it fetches a bounded page
-    -- so the bridge, which has the full filtered set, returns total/offset/
-    limit/returned/has_more alongside the page. This lets `function list`
-    state the real total + remainder (text) and expose paging in JSON, the
-    same honesty convention as evidence xrefs (#59). `kind` is the envelope
-    discriminator (#275); `items` is the sole data container (the legacy
-    `functions` alias was dropped in the #275 clean break)."""
-    total = len(items)
-    page = items[offset:]
-    if limit is not None:
-        page = page[:limit]
-    return {
-        "kind": kind,
-        "items": page,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "returned": len(page),
-        "has_more": (offset + len(page)) < total,
-    }
+    Slices an already-materialized *items* list to the requested window; the
+    #814 paths in ``_list_functions`` / ``_search_functions`` build rows for the
+    window up front instead and share ``read_misc._paged_envelope`` directly,
+    which keeps ONE envelope shape for both. The CLI can't compute the true
+    total itself -- it fetches a bounded page -- so the bridge, which has the
+    filtered population, returns total/offset/limit/returned/has_more alongside
+    the page. This lets `function list` state the real total + remainder (text)
+    and expose paging in JSON, the same honesty convention as evidence xrefs
+    (#59). `kind` is the envelope discriminator (#275); `items` is the sole data
+    container (the legacy `functions` alias was dropped in the #275 clean
+    break)."""
+    start, stop = read_misc._page_window(len(items), offset=offset, limit=limit)
+    return read_misc._paged_envelope(
+        kind=kind, items=items[start:stop], total=len(items), offset=offset, limit=limit,
+    )
 
 
 def _search_functions(
@@ -836,7 +883,6 @@ def _search_functions(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    items = []
     if regex:
         try:
             pattern = re.compile(query, re.IGNORECASE)
@@ -869,6 +915,7 @@ def _search_functions(
         def matches(name: str) -> bool:
             return needle in name.lower()
 
+    matched: list[tuple[Any, str]] = []
     for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
         # Match across name forms (mangled fn.name, demangled display_name, raw)
         # so a demangled C++ query finds a function BN named with the mangled
@@ -876,25 +923,39 @@ def _search_functions(
         display = il_format._display_name(fn)
         raw = str(getattr(fn, "raw_name", fn.name))
         if any(matches(str(form)) for form in (fn.name, display, raw) if form):
-            items.append({
-                "name": fn.name,
-                "address": hex(fn.start),
-                "raw_name": raw,
-                "display_name": display,
-                "size": il_format._function_size(fn),
-                "_fn": fn,   # transient: enrich the returned page only (perf), then drop
-            })
+            # #814: retain the live Function plus the display name this match
+            # already computed -- NOT a row. The row (and the size/block/label
+            # projections behind it) is built for the returned page only, so a
+            # `function search --limit 20` over a 50k-function target no longer
+            # sizes and materializes every match.
+            matched.append((fn, display))
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
-        # doesn't return each export twice (16-byte veneer + real body).
-        items = [it for it in items if (it.get("size") or 0) >= min_size]
+        # doesn't return each export twice (16-byte veneer + real body). size IS
+        # the filter key here, so this pass still reads it per match (as it did
+        # before #814); it is only deferred when nothing filters or sorts on it.
+        matched = [
+            (fn, display) for fn, display in matched
+            if (il_format._function_size(fn) or 0) >= min_size
+        ]
     if count_only:
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
-        return {"kind": "functions", "count": len(items), "total": len(items),
+        return {"kind": "functions", "count": len(matched), "total": len(matched),
                 **_analysis_state_fields(bv)}
-    _sort_function_items(items, sort, reverse)
-    result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
+    start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
+    items = [
+        _function_list_row(
+            fn,
+            display_name=display,
+            size=sizes[id(fn)] if sort == "size" else _NO_SIZE,
+        )
+        for fn, display in matched[start:stop]
+    ]
+    result = read_misc._paged_envelope(
+        kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
+    )
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(result)

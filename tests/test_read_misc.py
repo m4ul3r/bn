@@ -243,6 +243,163 @@ def test_strings_probable_format_keeps_indirect_zero_xref_candidate(monkeypatch)
     assert entry["code_refs"] == 0
 
 
+# --- #814: strings paging builds rows for the returned page only ---
+
+
+class _CountingStringRef(_FakeStringRef):
+    """A string ref that counts reads of `type`.
+
+    `type` is read exactly once per materialized `strings` row (the row's `type`
+    field, decoded from BN's numeric StringType) and never by the query /
+    length / section / domain / no-crt / format-directive FILTERS, so the count
+    IS the number of rows this read built. `_FakeStringRef` exposes `type` as a
+    plain attribute, so it cannot measure this.
+    """
+
+    def __init__(self, start: int, length: int, value: str, string_type: int = 0):
+        self.type_reads = 0
+        super().__init__(start, length, value, string_type)
+
+    @property
+    def type(self):
+        self.type_reads += 1
+        return self._type
+
+    @type.setter
+    def type(self, value):
+        self._type = value
+
+
+def _count_code_ref_calls(monkeypatch, bridge):
+    """Wrap `read_xrefs._code_ref_count` -- the per-survivor xref enrichment --
+    with a call counter, without changing its result."""
+    real = bridge.read_xrefs._code_ref_count
+    calls: list[int] = []
+
+    def counting(bv, address):
+        calls.append(address)
+        return real(bv, address)
+
+    monkeypatch.setattr(bridge.read_xrefs, "_code_ref_count", counting)
+    return calls
+
+
+def test_strings_builds_rows_for_the_page_only(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    strings = [_CountingStringRef(0x100000 + i * 0x20, 12, f"frame {i}") for i in range(3000)]
+    bv = _FakeBV(strings=strings)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=25)
+
+    # Observable contract first: a 25-row page out of 3000, exactly as before.
+    assert result["total"] == 3000
+    assert result["returned"] == 25
+    assert result["has_more"] is True
+    assert result["items"][0]["address"] == hex(0x100000)
+    built = sum(s.type_reads for s in strings)
+    assert built <= 26, f"{built} row(s) materialized for a 25-row page of 3000 strings"
+
+
+def test_strings_probable_format_counts_code_refs_for_the_page_only(monkeypatch):
+    # --probable-format-strings is the expensive mode: it used to run the xref
+    # helper for EVERY survivor of the scan, not just for the returned page.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    strings = [_FakeStringRef(0x200000 + i * 0x20, 16, f"slot %d of %d #{i}") for i in range(2000)]
+    bv = _FakeBV(
+        strings=strings,
+        code_refs={s.start: [_FakeCodeRef(0x400000 + i)] for i, s in enumerate(strings)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    calls = _count_code_ref_calls(monkeypatch, bridge)
+
+    result = instance._strings(None, query=None, offset=0, limit=15, probable_format_strings=True)
+
+    assert result["total"] == 2000
+    assert result["returned"] == 15 and result["has_more"] is True
+    # ...the page still carries its enrichment (directives + code_refs)...
+    assert [item["format_directives"] for item in result["items"]] == [["%d", "%d"]] * 15
+    assert [item["code_refs"] for item in result["items"]] == [1] * 15
+    # ...and the xref helper ran for the page only.
+    assert len(calls) <= 16, (
+        f"_code_ref_count ran {len(calls)}x for a 15-row page of 2000 survivors"
+    )
+
+
+def test_strings_query_filter_pages_without_building_the_rest(monkeypatch):
+    # A filter must still see every string (the honest `total` is the filtered
+    # population), but the rows are built for the page.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    strings = [
+        _CountingStringRef(0x300000 + i * 0x20, 12, f"err {i}" if i % 2 else f"ok {i}")
+        for i in range(1000)
+    ]
+    bv = _FakeBV(strings=strings)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query="err", offset=0, limit=10)
+
+    assert result["total"] == 500 and result["returned"] == 10 and result["has_more"] is True
+    assert all("err" in item["value"] for item in result["items"])
+    built = sum(s.type_reads for s in strings)
+    assert built <= 11, f"{built} row(s) materialized for a 10-row filtered page"
+
+    counted = instance._strings(None, query="err", offset=0, limit=10, count_only=True)
+    assert counted == {"kind": "strings", "count": 500, "total": 500}
+
+
+@pytest.mark.parametrize("offset,limit,expected", [
+    (0, 2, ["first", "second"]),
+    (1, 2, ["second", "third"]),
+    (3, 2, ["wide"]),
+    (4, 2, []),
+    (0, None, ["first", "second", "third", "wide"]),
+])
+def test_strings_page_contents_total_and_has_more_unchanged(monkeypatch, offset, limit, expected):
+    # Scan order is deliberately NOT address order: the page is address-ordered
+    # (address, value) and total/has_more describe the whole filtered set.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    strings = [
+        _FakeStringRef(0x3000, 5, "third"),
+        _FakeStringRef(0x1000, 5, "first"),
+        _FakeStringRef(0x2000, 6, "second"),
+        _FakeStringRef(0x4000, 4, "wide", 1),
+    ]
+    bv = _FakeBV(strings=strings)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=offset, limit=limit)
+
+    assert [item["value"] for item in result["items"]] == expected
+    assert result["total"] == 4
+    assert result["offset"] == offset and result["limit"] == limit
+    assert result["returned"] == len(expected)
+    assert result["has_more"] is (offset + len(expected) < 4)
+
+
+def test_strings_page_rows_keep_their_parsed_fields(monkeypatch):
+    # The retained survivor tuple must carry everything a row needs: the type
+    # decode (utf16 here), the reported length and the char count.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[
+        _FakeStringRef(0x1000, 12, "hi", 1),
+        _FakeStringRef(0x2000, 7, "plain"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=1)
+
+    assert result["items"] == [{"address": hex(0x1000), "length": 12, "chars": 2,
+                               "type": "utf16", "value": "hi"}]
+    assert [i["type"] for i in instance._strings(None, query=None, offset=0, limit=10)["items"]] == \
+        ["utf16", "ascii"]
+
+
 # --- I5: sections ---
 
 
