@@ -4398,8 +4398,29 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # internal noise and moves out of the default line.
         declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
+        # #890 obs 2: the #778 disclosure was JSON-only, so a text-mode reader
+        # of a MIXED declare saw `verified` and was never told the prototype
+        # or variable in the same source went unapplied -- the same family as
+        # #883 and #887 item 6. The types really were defined, so the row
+        # stays a success; it just stops being silent about the rest.
+        unapplied = _field_dict(item, "unapplied_prototypes")
+        extra = ""
+        if unapplied:
+            parts = []
+            for kind in ("functions", "variables"):
+                # Read through the choke point, not a bare isinstance: a
+                # `functions` that arrives malformed would otherwise be
+                # skipped and render BYTE-IDENTICALLY to a clean declare --
+                # telling a reader nothing was unapplied on exactly the
+                # payload that said otherwise. #619's boundary discloses it.
+                entries = _field_list(unapplied, kind)
+                if entries:
+                    listed = ", ".join(str(name) for name in entries)
+                    parts.append(f"{kind}: {listed}")
+            if parts:
+                extra = f"  [unapplied -- {'; '.join(parts)}]"
         if names:
-            return f"types_declare {', '.join(names)}"
+            return f"types_declare {', '.join(names)}{extra}"
         # No names, so the COUNT is the whole claim -- and it may only be stated
         # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
         # listing printed "types_declare 0 types", which reads as a declare that

@@ -669,6 +669,47 @@ def _operation_requested(ctx, op: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in op.items() if key != "preview"}
 
 
+def _refuse_unmapped_mutation_address(
+    ctx, bv, op: dict[str, Any], address: int, consequence: str
+) -> None:
+    """Refuse an affirmatively-unmapped mutation target, and ONLY that.
+
+    A typo'd address used to be accepted by the address-taking mutations,
+    writing into nowhere and then reporting `verified` against its own
+    readback -- while `comment get` rejected the identical address. An
+    unmapped target is a bad REQUEST, not an unsupported operation, hence
+    `invalid_request`.
+
+    The guard is deliberately TRI-STATE and the middle state is the whole
+    reason this is a helper rather than an inlined `if` (#890, the #777 drift
+    shape): `is_valid_offset` answers mapped, unmapped, or nothing at all.
+    Only an AFFIRMATIVE "unmapped" refuses. A view that does not implement
+    the probe, or whose probe raises, is INDETERMINATE and must keep working
+    -- reduced views and test fakes live there, and hardening the middle
+    state into a refusal would reject perfectly good requests. That is the
+    same distinction that kept `_require_mapped_address` and
+    `_address_is_mapped` separate under #827 item 3c, so it is stated once
+    here instead of being re-derived at each callsite.
+
+    *consequence* completes "Address 0x… is not mapped in this binary, so …",
+    because the actionable half of the message is what the caller was trying
+    to do, which the callsite knows and this helper does not.
+    """
+    is_valid = getattr(bv, "is_valid_offset", None)
+    if not callable(is_valid):
+        return
+    try:
+        mapped = bool(is_valid(address))
+    except Exception:  # noqa: BLE001 - a raising probe is indeterminate, not invalid
+        mapped = True
+    if not mapped:
+        raise OperationFailure(
+            "invalid_request",
+            f"Address {hex(address)} is not mapped in this binary, so {consequence}",
+            requested=_operation_requested(ctx, op),
+        )
+
+
 
 def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) -> dict[str, Any]:
     op_label = str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>"
@@ -2580,27 +2621,9 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
             "requested": _operation_requested(ctx, op),
         }
     address = _parse_address(op["address"])
-    # #781: a typo'd/unmapped address used to be accepted here, writing a comment
-    # into nowhere and reporting it `verified` against its own readback, while
-    # `comment get` (via `_require_mapped_address`) and `data_retype` both reject
-    # the identical address. Same rule as `data_retype` below, and deliberately
-    # the same status: an unmapped target is a bad REQUEST, not an unsupported
-    # operation. Only an AFFIRMATIVE "unmapped" is refused -- a view with no
-    # `is_valid_offset` is indeterminate, not invalid, so fakes and reduced
-    # shapes keep working.
-    is_valid = getattr(bv, "is_valid_offset", None)
-    if callable(is_valid):
-        try:
-            mapped = bool(is_valid(address))
-        except Exception:
-            mapped = True
-        if not mapped:
-            raise OperationFailure(
-                "invalid_request",
-                f"Address {hex(address)} is not mapped in this binary, so no "
-                "comment can be set there.",
-                requested=_operation_requested(ctx, op),
-            )
+    _refuse_unmapped_mutation_address(
+        ctx, bv, op, address, "no comment can be set there."
+    )
     before_comment = bv.get_comment_at(address) or ""
     if before_comment != comment:
         bv.set_comment_at(address, comment)
@@ -3282,23 +3305,9 @@ def _op_data_retype(ctx, bv, op: dict[str, Any]):
     buffer (verified live: revert_undo_actions restores the prior auto type), so the
     standard preview/rollback machinery covers it with no explicit restore."""
     address = _parse_address(op["address"])
-    # A typo'd/unmapped address must be a clean invalid_request, not a data var
-    # defined into nowhere and then reported `verified` against itself. (An
-    # indeterminate view -- no is_valid_offset -- is not rejected; only an
-    # affirmative "unmapped" is, mirroring _require_mapped_address.)
-    is_valid = getattr(bv, "is_valid_offset", None)
-    if callable(is_valid):
-        try:
-            mapped = bool(is_valid(address))
-        except Exception:
-            mapped = True
-        if not mapped:
-            raise OperationFailure(
-                "invalid_request",
-                f"Address {hex(address)} is not mapped in this binary, so no data "
-                "variable can be defined there.",
-                requested=_operation_requested(ctx, op),
-            )
+    _refuse_unmapped_mutation_address(
+        ctx, bv, op, address, "no data variable can be defined there."
+    )
     expected_type, _ = _parse_concrete_type(ctx, bv, op, op["new_type"], label="type")
     before = bv.get_data_var_at(address)
     before_type = str(before.type) if before is not None else None

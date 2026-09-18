@@ -4875,6 +4875,59 @@ def test_set_comment_on_an_indeterminate_view_still_works_781(monkeypatch):
     assert result["results"][0]["status"] == "verified", result["results"][0]
 
 
+def test_unmapped_address_guard_is_one_helper_serving_both_mutations_890():
+    # #890 obs 1: the comment guard shipped as a SECOND TEXTUAL COPY of the
+    # data-retype guard -- the exact drift shape #777 fixed elsewhere in this
+    # same branch. Both callsites now route through one helper, so the
+    # tri-state cannot be hardened on one path and left alone on the other.
+    import inspect
+    from bn_agent_bridge import mutation_engine as me
+
+    source = inspect.getsource(me)
+    # The probe is read in exactly one place: the helper.
+    assert source.count('getattr(bv, "is_valid_offset", None)') == 1, (
+        "the affirmative-unmapped probe is duplicated again; route the new "
+        "callsite through _refuse_unmapped_mutation_address instead")
+    for fn in (me._op_set_comment, me._op_data_retype):
+        assert "_refuse_unmapped_mutation_address" in inspect.getsource(fn), fn
+
+
+def test_data_retype_refuses_an_unmapped_address_through_the_shared_guard_890(monkeypatch):
+    # The data-retype half of the shared guard, exercised for real rather than
+    # inferred from the comment half sharing a helper with it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _tag_comment_bv()
+    bv.is_valid_offset = lambda addr: False
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "data_retype", "address": "0xdead0000", "new_type": "int32_t"}])
+    row = result["results"][0]
+    assert row["status"] == "invalid_request", row
+    assert "not mapped" in row.get("message", "")
+    # The consequence clause is the callsite's, not the helper's.
+    assert "data variable" in row.get("message", "")
+
+
+def test_a_raising_mapped_probe_is_indeterminate_not_invalid_890(monkeypatch):
+    # The third state, and the one no test covered: a probe that RAISES is
+    # indeterminate, exactly like a view that does not implement it. Treating
+    # a raising probe as "unmapped" would refuse good requests on any view
+    # whose offset check throws.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _tag_comment_bv()
+
+    def _boom(addr):
+        raise RuntimeError("offset probe unavailable")
+
+    bv.is_valid_offset = _boom
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "address": "0x1000", "comment": "note"}])
+    assert result["results"][0]["status"] == "verified", result["results"][0]
+
+
 def test_batch_revert_gate_reads_the_shared_failure_status_set_777():
     # #777: `_has_failed_results` carried its own inline
     # {"unsupported", "verification_failed"} literal -- a strict subset of the
