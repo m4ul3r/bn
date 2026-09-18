@@ -8413,29 +8413,46 @@ def _two_recv_callsites():
     return FFunc("recv_both", 0x10, FSSAFunc(instrs), params=[fd])
 
 
-def _residual_chunk_func():
-    """fill(fd, cap): n#1 = cap#0 - progress#1; read(fd, &staging + progress#1, n#1).
+def _residual_chunk_func(*, inline_dest: bool = False):
+    """fill(fd, cap): dst#1 = &staging + progress#1; n#1 = cap#0 - progress#1;
+    read(fd, dst#1, n#1).
 
-    #791's shape reduced: a var-minus-var length whose cursor also indexes the
-    destination, writing into a FIXED stack array -- precisely the destination
-    this engine cannot size, which is why the finding must survive."""
+    #791's shape reduced. BOTH operands are call arguments that are plain SSA
+    VARIABLES, because that is what a real lifter produces -- the address
+    arithmetic and the subtraction each live in their own `MLIL_SET_VAR_SSA`,
+    and the call just reads the two results. An earlier version of this fixture
+    inlined the `MLIL_ADD` directly into the call's parameter list; that shape
+    does not occur in real MLIL, and it let the recogniser pass here while
+    being dead on every real binary (found by cross-dogfood against a live
+    bridge). `inline_dest=True` keeps the inlined variant covered too, since the
+    matcher checks the operand before its definition.
+
+    The destination is a FIXED stack array -- precisely what this engine cannot
+    size, which is why the finding must survive."""
     fd, cap = FVar("fd"), FVar("cap")
     staging = FVar("staging", typ="uint8_t[0x1000]")
-    cap0, prog1, n1 = FSSA(cap, 0), FSSA(FVar("progress"), 1), FSSA(FVar("n"), 1)
+    cap0 = FSSA(cap, 0)
+    prog1, n1, dst1 = FSSA(FVar("progress"), 1), FSSA(FVar("n"), 1), FSSA(FVar("dst"), 1)
     sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
                 left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
                 right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
-    dest = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
-                 left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
-                 right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
-    instrs = [
-        FInstr(0, 0x20, "MLIL_SET_VAR_SSA", "n#1 = cap#0 - progress#1",
-               reads=[cap0, prog1], writes=[n1], src=sub),
-        _ext_call(1, 0x24, "read(fd, &staging[progress], n#1)", 0x910,
-                  [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest,
-                   FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])],
-                  reads=[n1, prog1]),
-    ]
+    addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                      left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                      right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    instrs = []
+    if inline_dest:
+        dest_param = addr_expr
+    else:
+        instrs.append(FInstr(0, 0x1C, "MLIL_SET_VAR_SSA", "dst#1 = &staging + progress#1",
+                             reads=[prog1], writes=[dst1], src=addr_expr))
+        dest_param = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    base = len(instrs)
+    instrs.append(FInstr(base, 0x20, "MLIL_SET_VAR_SSA", "n#1 = cap#0 - progress#1",
+                         reads=[cap0, prog1], writes=[n1], src=sub))
+    instrs.append(_ext_call(base + 1, 0x24, "read(fd, dst#1, n#1)", 0x910,
+                            [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest_param,
+                             FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])],
+                            reads=[n1, dst1]))
     return FFunc("fill", 0x10, FSSAFunc(instrs), params=[fd, cap])
 
 
@@ -8534,7 +8551,9 @@ def test_forward_run_params_echo_the_configured_knobs_812(models):
     assert result["stats"]["max_depth"] <= 3
 
 
-def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models):
+@pytest.mark.parametrize("inline_dest", [False, True],
+                         ids=["dest_via_def_chain", "dest_inlined"])
+def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, inline_dest):
     # #791 asked for the chunked-read residual (`n = cap - progress;
     # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
     # by default. It is deliberately recognised and NOT downgraded: the loop
@@ -8544,7 +8563,10 @@ def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models):
     # controlled `cap` into a fixed stack buffer -- so suppressing on the shape
     # would clear a real overflow. The class must survive; only the open
     # question is named.
-    func = _residual_chunk_func()
+    # Both destination shapes: the def-chain one a real lifter emits (the case
+    # the first implementation missed entirely, caught by cross-dogfood against
+    # a live bridge) and the inlined one.
+    func = _residual_chunk_func(inline_dest=inline_dest)
     result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
         func, [te.parse_locator("param:1")],
         enabled_sink_classes={"recv_overflow"})

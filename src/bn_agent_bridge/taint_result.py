@@ -414,6 +414,17 @@ def backward_diagnostics(
             "the walk crossed a coarse-memory frontier (a pointer/store not "
             "precisely tracked); inspect the frontier leaves or re-seed on the "
             "destination buffer directly")
+    elif not sinks_seeded:
+        # Must precede the no-slices branch: with nothing seeded there are also
+        # no slices, so the generic "the sink seeded but no slice was produced"
+        # fired and contradicted this same block's own
+        # `complete_slice_reason` ("no sink seeded, so nothing was walked").
+        # Two lines of one diagnostic disagreeing about whether a sink seeded is
+        # worse than either line alone (found in cross-dogfood).
+        next_action = (
+            "no sink seeded, so nothing was walked; check that the --sink "
+            "locator names a call this function actually makes and an operand "
+            "that reads a variable")
     elif not slices:
         next_action = (
             "the sink seeded but no slice was produced; confirm the --sink "

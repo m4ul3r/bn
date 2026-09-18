@@ -2817,14 +2817,38 @@ class TaintEngine:
         if self._int_const(left) is not None or self._int_const(right) is not None:
             return None
         cursor_c = self._canonical_ssa_var(ssaf, cursor_v)
-        # The SAME cursor must index the destination -- that is what makes this
-        # a residual chunk rather than an unrelated subtraction. Comparing
-        # canonical roots follows pure SSA copies, so `buf + progress` still
-        # matches when the address was materialised through a temporary.
-        for r in expr_reads(params[dest_idx]):
-            rc = self._canonical_ssa_var(ssaf, r)
-            if (var_key(rc) == var_key(cursor_c)
-                    and getattr(rc, "version", None) == getattr(cursor_c, "version", None)):
+        # The SAME cursor must index the destination -- that is what makes this a
+        # residual chunk rather than an unrelated subtraction.
+        #
+        # The destination operand needs the SAME def-chain resolution the length
+        # just had, and for the same reason. On real MLIL SSA a call operand is a
+        # VARIABLE (`read(fd, rsi#2, n#1)`), so reading the operand's own
+        # `expr_reads` yields the destination pointer itself and never the
+        # cursor -- the address arithmetic lives in that variable's DEFINITION
+        # (`rsi#2 = &staging + progress#3`). Matching only on the operand made
+        # this recogniser dead on every real binary while still passing a unit
+        # test whose fixture inlined the ADD into the call, a shape the lifter
+        # does not produce. Check the operand first (cheap, and covers an
+        # inlined address), then its definition.
+        def _mentions_cursor(expr: Any) -> bool:
+            for r in expr_reads(expr):
+                rc = self._canonical_ssa_var(ssaf, r)
+                if (var_key(rc) == var_key(cursor_c)
+                        and getattr(rc, "version", None) == getattr(cursor_c, "version", None)):
+                    return True
+            return False
+
+        dest_expr = params[dest_idx]
+        if _mentions_cursor(dest_expr):
+            return str(left), str(right)
+        dest_var = self._as_single_ssa_var(dest_expr)
+        if dest_var is not None:
+            try:
+                d = ssaf.get_ssa_var_definition(dest_var)
+            except Exception:
+                d = None
+            dest_def = getattr(d, "src", None) if d is not None else None
+            if dest_def is not None and _mentions_cursor(dest_def):
                 return str(left), str(right)
         return None
 
