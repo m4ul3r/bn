@@ -5340,15 +5340,27 @@ def _render_trace_text(value: Any) -> str:
     # was never what was traced).
     arg_lbl = _field_dict(value, "arg_label")
     arg_desc = f"arg[{arg_index}]"
-    if arg_lbl.get("callee"):
-        arg_desc += f" of {arg_lbl['callee']}"
-    else:
-        # #755: never leave the callee slot silent. An indirect call (a vtable
-        # slot, a register target) resolves to no name, and the header then said
-        # nothing about which call it answered -- three such calls in one
-        # function rendered headers differing only by address, so an analyst who
-        # copied a nearby address got an equally confident slice about a
-        # different call with no signal to catch it with.
+    # #755: never leave the callee slot silent when the producer COMPUTED one. An
+    # indirect call (a vtable slot, a register target) resolves to no name, and
+    # the header then said nothing about which call it answered -- two such calls
+    # in one function rendered headers differing only by address, so an analyst
+    # who copied a nearby address got an equally confident slice about a
+    # different call with no signal to catch it with.
+    #
+    # But ABSENT is not null (#619's `_field_present`/`_field_skewed` rule): a
+    # payload carrying neither `arg_label` nor `callee` had nothing computed for
+    # the callee, and asserting `<unresolved callee>` there would state an
+    # affirmative finding about a question never asked. Such a payload keeps the
+    # pre-existing no-claim header.
+    # `_field_declared`, not raw membership: "does the envelope carry this key at
+    # all, null included" is the question this module already answers in one
+    # place, and a second decider spelled `in value` is what #619 forbids.
+    computed = (_field_declared(value, "arg_label")
+                or _field_declared(value, "callee"))
+    callee_name = arg_lbl.get("callee") or value.get("callee")
+    if callee_name:
+        arg_desc += f" of {callee_name}"
+    elif computed:
         arg_desc += " of <unresolved callee>"
     if arg_lbl.get("register"):
         arg_desc += f" ({arg_lbl['register']})"

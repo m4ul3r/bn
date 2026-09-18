@@ -4261,7 +4261,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # discovered read is a discovered pair -- 4 pairs x 8 bogus values, MEASURED
     # on the rebased tree rather than carried over from the pre-merge branch. The
     # assertion still exists to catch the population SHRINKING silently.
-    assert swept == 4880, f"the raise sweep ran {swept} renders, not 4880"
+    #
+    # 4880 -> 4888 (#755): ONE more pair, because `_render_trace_text` now reads
+    # the top-level `callee` to tell an unresolved callee from a callee nothing
+    # was computed for -- 1 pair x 8 bogus values, measured the same way.
+    assert swept == 4888, f"the raise sweep ran {swept} renders, not 4888"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4413,7 +4417,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1413 -> 1421 with the same four pairs the raise sweep gained (#820): the
     # quick-load warning reads `partial` in three more renderers, and the mirror
     # contributes 2 benign payloads per pair. Measured on the rebased tree.
-    assert checked == 1421, f"the mirror ran {checked} renders, not 1421"
+    # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
+    # sweep also gained, x 2 benign payloads.
+    assert checked == 1423, f"the mirror ran {checked} renders, not 1423"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -5111,13 +5117,14 @@ def test_render_trace_text_header_names_callee_not_parameter():
 
 
 def test_render_trace_text_header_discloses_an_unresolved_callee_755():
-    """#755: the header used to OMIT the callee when it did not resolve, so the
-    output said nothing about which call it answered. Measured on a real binary:
-    three indirect calls through different vtable slots in one function rendered
-    headers differing only by address, so an analyst who copied a nearby address
-    got an equally confident slice about a different call with no signal at all.
+    """#755: the header used to OMIT the callee when the payload said it did not
+    resolve, so the output claimed nothing about which call it answered -- two
+    indirect calls in one function then rendered headers differing only by
+    address, and an analyst who copied a nearby address got an equally confident
+    slice about a different call with no signal at all.
 
-    The callee slot is now never silent; the register stays optional."""
+    The callee slot is never silent when the producer computed one; the register
+    stays optional."""
     from bn.formatters import _render_trace_text
     value = {
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
@@ -5125,10 +5132,38 @@ def test_render_trace_text_header_discloses_an_unresolved_callee_755():
     }
     out = _render_trace_text(value)
     assert "backward trace of arg[0] of <unresolved callee> in f @ 0x1010" in out
-    # A resolved callee is still named, and neither form invents a register.
+    # No register in the label, so the header must not invent one: the arg
+    # descriptor ends at the callee and carries no parenthesised register.
+    assert "<unresolved callee> in f" in out and "(" not in out.splitlines()[0]
     resolved = _render_trace_text(dict(value, arg_label={"index": 0, "callee": "memcpy"}))
     assert "backward trace of arg[0] of memcpy in f @ 0x1010" in resolved
-    assert "unresolved" not in resolved
+    assert "(" not in resolved.splitlines()[0]
+
+
+def test_render_trace_text_makes_no_callee_claim_when_none_was_computed_755():
+    """#755 review: the disclosure must not become its own absent-vs-null
+    conflation. A payload carrying NEITHER `arg_label` NOR `callee` had nothing
+    computed for the callee, so asserting `<unresolved callee>` would state an
+    affirmative finding about a question never asked -- the exact shape
+    `_field_present`/`_field_skewed` exists to keep apart (#619).
+
+    Absent -> the pre-existing no-claim header. Present-but-unresolved -> the
+    disclosure."""
+    from bn.formatters import _render_trace_text
+    bare = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "trace": [],
+    }
+    out = _render_trace_text(bare)
+    assert "backward trace of arg[0] in f @ 0x1010" in out
+    assert "unresolved callee" not in out
+
+    # A producer that DID compute it and found nothing says so, via either the
+    # label or the explicit top-level null.
+    assert "of <unresolved callee>" in _render_trace_text(
+        dict(bare, arg_label={"index": 0}))
+    assert "of <unresolved callee>" in _render_trace_text(dict(bare, callee=None))
+    assert "of parse_header" in _render_trace_text(dict(bare, callee="parse_header"))
 
 
 def test_render_trace_text_renders_caveats_from_assumptions():
