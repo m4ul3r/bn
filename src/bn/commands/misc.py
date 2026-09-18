@@ -65,7 +65,8 @@ def _strings_count_text(value: Any) -> str:
                       "assert a format-string vulnerability."),
              arg("--count", action="store_true", default=False,
                  help="Show the matching string count instead of listing"),
-         ])
+         ],
+         estimable=True)
 def _strings(args: argparse.Namespace) -> int:
     common = {
         "query": args.query,
@@ -139,7 +140,8 @@ def _imports_count_text(value: Any) -> str:
                    help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
-                        "(collapsed by default)")])
+                        "(collapsed by default)")],
+         estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
@@ -192,6 +194,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 @command(
     "exports",
@@ -201,6 +204,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 def _exports(args: argparse.Namespace) -> int:
     if args.count:
@@ -232,7 +236,8 @@ def _exports(args: argparse.Namespace) -> int:
                                     "label (e.g. 'code' matches .text=ReadOnlyCode); broadens to "
                                     "all matching-semantics sections, not just name matches"),
                            arg("--count", action="store_true", default=False,
-                               help="Show the section count instead of listing")])
+                               help="Show the section count instead of listing")],
+         estimable=True)
 def _sections(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
@@ -271,7 +276,8 @@ def _sections(args: argparse.Namespace) -> int:
              arg("--limit", type=_positive_int, default=None, metavar="N",
                  help="Maximum rows to return (default 400); when truncated the result "
                       "sets has_more and text mode prints a --start resume hint"),
-         ])
+         ],
+         estimable=True)
 def _data_vars(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -297,7 +303,8 @@ def _data_vars(args: argparse.Namespace) -> int:
                       "with --limit/--offset)"),
              arg("--offset", type=_non_negative_int, default=0, metavar="N",
                  help="Skip the first N symbols (paging)"),
-         ])
+         ],
+         estimable=True)
 def _data_symbols(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -322,7 +329,8 @@ def _data_symbols(args: argparse.Namespace) -> int:
                        help="Show the recovered Go function count instead of listing"),
                    arg("--summary", action="store_true", default=False,
                        help="Show recovered/defined/renamable counts + pclntab status (decide whether to `go rename`)")),
-         ])
+         ],
+         estimable=True)
 def _go_functions(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
@@ -407,7 +415,8 @@ def _resolved_out_format(args: argparse.Namespace) -> str:
          args=[arg("identifier"),
                arg("--include-annotations", action="store_true", default=False,
                    help="Include inherited comment bodies in the bundle's "
-                        "decompilation (default: redact, matching bn decompile)")])
+                        "decompilation (default: redact, matching bn decompile)")],
+         estimable=True)
 def _bundle_function(args: argparse.Namespace) -> int:
     # #665: `--out` is already absolute here (`_resolve_out_path`), so the
     # bridge writes it where the CALLER meant. The one destination the bridge
@@ -459,7 +468,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
              arg("--encoding", choices=("hex", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default) or raw bytes"),
-         ])
+         ],
+         estimable=True)
 def _read(args: argparse.Namespace) -> int:
     address = _pick(args.address, args.address_flag, "read address")
     if args.encoding == "bytes":

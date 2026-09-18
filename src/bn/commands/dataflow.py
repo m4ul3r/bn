@@ -84,7 +84,8 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
                       "stack-passed arguments from the call model; `uses` still lists "
                       "the argument stores, and the result carries the same "
                       "`hints` disclosure `trace` prints (`bn proto set` fixes it)"),
-         ])
+         ],
+         estimable=True)
 def _dataflow_defuse(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -104,7 +105,8 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
                  help="Which edges to resolve (default: both)"),
              arg("--no-resolve-indirect", dest="resolve_indirect", action="store_false", default=True,
                  help="Skip value-set resolution of indirect call targets"),
-         ])
+         ],
+         estimable=True)
 def _dataflow_callgraph(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -126,7 +128,8 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--at", dest="at", required=True,
                  help="Instruction address (hex 0x.. or decimal) within the function"),
-         ])
+         ],
+         estimable=True)
 def _dataflow_values(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -182,7 +185,8 @@ _SINK_LOCATOR_HELP = (
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
-         ])
+         ],
+         estimable=True)
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -230,7 +234,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
-         ])
+         ],
+         estimable=True)
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -270,7 +275,8 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present sink's callsite addresses"),
              _models_arg(),
-         ])
+         ],
+         estimable=True)
 def _taint_models(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.role:

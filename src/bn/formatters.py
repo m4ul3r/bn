@@ -218,15 +218,24 @@ def _count_field(source: Any, key: str) -> int:
     for a payload that said ``1.5``: not a disclosure of a skew but a confident,
     plausible number the producer never wrote, which is worse than the ``?``
     the same reader gives a dict. Same rule the flag sibling applies to a
-    non-flag: read it only when the value IS the thing being read. The
-    comparison below says exactly that, in two halves -- the value IS the
-    integer (``2.0``, ``Decimal("2")``, ``Fraction(4, 2)``) or it SPELLS it
-    (``"2"``, the numeric-string contract the bridge has always been allowed,
-    padding included). ``bytes``/``bytearray`` do neither: ``int(b"1")`` is a
-    coercion Python hands out for the string-literal spelling, not a count a
-    wire format states, so it is refused with everything else that is present
-    but not the integer it looks like -- as is an ``__int__``-only object,
-    whose truncation nothing could detect."""
+    non-flag: read it only when the value IS the thing being read.
+
+    Two ways a count can be stated, and only two. It IS the integer (``2.0``,
+    ``Decimal("2")``, ``Fraction(4, 2)``), or its TEXT reads back as one --
+    whatever Python's own numeric parsers accept, because the numeric-string
+    contract is about a producer that SPELLS counts as text: ``"2"``, and
+    equally the honest spellings a canonical-rendering comparison used to
+    reject (``"+2"``, ``"02"``, ``"0002"``, ``"-02"``, ``"+0"``, ``"1_0"``,
+    ``" 2 "``), plus a text spelling of the integral VALUE (``"2.0"``,
+    ``"2e0"``). A fraction is still refused in every spelling (``1.5``,
+    ``"1.5"``, ``Decimal("2.5")``, ``Fraction(7, 2)``): truncation is the one
+    thing this reader will not do.
+
+    ``bytes``/``bytearray`` state neither: ``int(b"1")`` is a coercion Python
+    hands out for the string-literal spelling, not a count a wire format states,
+    so it is refused with everything else that is present but not the integer it
+    looks like -- as is an ``__int__``-only object, whose integer nothing in the
+    payload's own text corroborates."""
     src = _as_dict(source)
     if key not in src:
         return 0
@@ -238,19 +247,37 @@ def _count_field(source: Any, key: str) -> int:
         return 0
     if isinstance(raw, int):
         return raw
-    # Every other shape must BE the integer it is read as, or spell it. Inside
-    # ONE try: a hostile `__eq__`/`__format__`/`__int__` is a skew for the
-    # enclosing boundary, never an exception out of a renderer.
+    # ONE try, and ONE rule: every dunder and every parser below is fed an
+    # untrusted payload, so anything a hostile shape raises is a skew for the
+    # enclosing boundary rather than an exception out of a renderer -- EXCEPT a
+    # BridgeError, which is the CLI refusing to trust the whole reply and must
+    # reach `main()` as exit 2 (re-raised first, ahead of the catch-all).
     try:
-        exact = int(raw)
-        stated = raw == exact or f"{raw}".strip() == f"{exact}"
-    except (ArithmeticError, TypeError, ValueError):
-        _record_skew(key)
-        return 0
-    if not stated:
-        _record_skew(key)
-        return 0
-    return exact
+        # Does the VALUE state the integer? A fraction that truncates must NOT
+        # fall through to the text route with a truncated `exact`, so the two
+        # routes are separate: this one either returns or declines.
+        try:
+            exact = int(raw)
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+        else:
+            if raw == exact:
+                return exact
+        # Otherwise its TEXT must, parsed the way the count's own producers spell
+        # numbers: as an integer, else as a number that has to BE integral.
+        text = f"{raw}".strip()
+        try:
+            return int(text)
+        except ValueError:
+            number = float(text)
+        if number.is_integer():
+            return int(number)
+    except BridgeError:
+        raise
+    except Exception:
+        pass
+    _record_skew(key)
+    return 0
 
 
 def _stated_count(source: Any, key: str) -> str:

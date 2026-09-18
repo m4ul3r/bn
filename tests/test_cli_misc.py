@@ -1685,28 +1685,133 @@ def test_estimate_output_covers_per_function_reads_796(fake_transport, capsys):
     assert '"str0"' not in strings_out            # the rows are NOT printed
 
 
-def test_estimate_output_refuses_what_it_cannot_preflight_796(fake_transport, capsys):
-    """The two combinations that cannot mean anything are REFUSED, not ignored.
+def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
+    """#796 review: the flag lives on the code path that implements it, not on
+    every command that happens to share an output-option group.
 
-    A `--out` write asks for the payload on disk while the estimate asks for its
-    size instead, and a mutation's status line IS the answer (#645) -- a write
-    whose outcome is replaced by a number desyncs an agent's model of the
-    database. Both refuse before the request is sent, so a contradictory
-    invocation costs no bridge work.
+    The wide placement advertised `--estimate-output` on all 90 leaf parsers while
+    only the `_call` -> `_render_result` path honors it, so `bn close`, `bn save`,
+    `bn load`, `bn refresh` and `bn py exec` executed their side effect and then
+    printed a byte count over the outcome (`save` wrote a BNDB while the flag's own
+    help promised nothing was written), and 18 `_emit_result` commands ignored it
+    outright -- `bn capabilities --estimate-output` printed the very payload the
+    flag exists to avoid.
+
+    The rule is the `fanout=True` precedent (#169 L1 review): an EXPLICIT
+    allow-list on the registry, and a coverage claim DERIVED here from the handlers
+    themselves, so a new command can neither silently inherit the flag nor quietly
+    lose it. Both directions are asserted, because either half alone is a list
+    that can drift from the code.
     """
+    import argparse
+    import inspect
+    import re
+
+    # Commands whose RESULT IS their side effect: they render through `_call`, so
+    # the allow-list has to exclude them by name. `save` writes a database, the
+    # rest mutate or destroy the session's state -- replacing any of those
+    # outcomes with a size is the defect this test exists for.
+    side_effecting = {("save",), ("close",), ("target", "close"), ("load",),
+                      ("refresh",), ("py", "exec")}
+
+    def derived_estimable():
+        """Re-derive the allow-list from the handlers: a command is estimable iff
+        its handler renders through `_call` and is neither a mutation helper, an
+        `_emit_result` command, nor a named side effect."""
+        found = set()
+        for spec in bn.cli._COMMANDS:
+            path = tuple(spec["path"])
+            if path in side_effecting:
+                continue
+            src = inspect.getsource(spec["handler"])
+            calls = set(re.findall(r"\b(_call|_mutate|_emit_result)\(", src))
+            if "_call" in calls and not (calls & {"_mutate", "_emit_result"}):
+                found.add(path)
+        return found
+
+    parser = bn.cli.build_parser()
+
+    def leaf(path):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        return current
+
+    advertised = {tuple(spec["path"]) for spec in bn.cli._COMMANDS
+                  if "--estimate-output" in bn.cli._known_option_strings(leaf(spec["path"]))}
+    marked = {tuple(spec["path"]) for spec in bn.cli._COMMANDS if spec.get("estimable")}
+
+    asserted = derived_estimable()
+    assert marked == asserted, (
+        f"the registry marks {sorted(marked - asserted)} estimable and misses "
+        f"{sorted(asserted - marked)}; `estimable=True` is the allow-list for the "
+        "flag, so it must agree with the handlers that implement it")
+    assert advertised == marked, (
+        f"advertised {sorted(advertised - marked)} without being marked, or marked "
+        f"and not advertised {sorted(marked - advertised)}")
+    assert len(marked) == 49, (
+        f"the flag is implemented on {len(marked)} commands, not 49 -- a command "
+        "that joins or leaves this set is a deliberate change to the coverage "
+        "claim, so move the number in the same commit")
+    # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
+    # stronger than a bespoke refusal: there is no path on which the flag is
+    # accepted and ignored, because the parser never builds it.
+    assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
+               if tuple(spec["path"]) not in marked)
+    assert len(bn.cli._COMMANDS) - len(marked) == 43
+
+
+def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_commands_796(
+        fake_transport, capsys):
+    """The other half of the scoping: the commands that must never take it.
+
+    A mutation prints a status line because that line IS the answer (#645), and a
+    side-effecting `_call` command (`save`/`close`/`load`/`refresh`/`py exec`)
+    performs its work and then reports it -- for both, `--estimate-output` would
+    replace an outcome with a byte count. Neither advertises the flag, so both
+    refuse it the way argparse refuses any unknown option (rc 2), before any
+    request is sent.
+    """
+    import argparse
+
+    a_mutation = bn.cli._selected_parser_for_argv(
+        bn.cli.build_parser(), ["comment", "set", "0x401000", "note"])
+    assert "--estimate-output" not in bn.cli._known_option_strings(a_mutation)
+
+    parser = bn.cli.build_parser()
+    calls = fake_transport()
+
+    # An argparse refusal exits 2 the same way a usage error always does (the
+    # text-format path raises SystemExit; see `test_argparse_error_text_format_
+    # keeps_stdout_empty`), so the flag is refused by the PARSER, not by a gate
+    # somebody has to remember to write.
+    with pytest.raises(SystemExit) as refused:
+        bn.cli.main(["comment", "set", "0x401000", "note", "--estimate-output",
+                     "--target", "active"])
+    assert refused.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+    assert not calls                       # refused by the parser, before the request
+
+    for path in (["save"], ["close"], ["target", "close"], ["load"], ["refresh"],
+                 ["py", "exec"], ["go", "rename"], ["batch", "apply"]):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        assert "--estimate-output" not in bn.cli._known_option_strings(current), path
+
+    # Where it IS advertised, the two answers to "where does this go" are refused
+    # by argparse's own mutually exclusive group rather than one silently winning:
+    # a caller who asked for a size AND a file asked for two different things.
     calls = fake_transport({"list_functions": {"ok": True, "result": {
         "items": [], "total": 0, "offset": 0, "limit": 5, "returned": 0,
         "has_more": False}}})
-
-    rc = bn.cli.main(["function", "list", "--estimate-output", "--out", "/tmp/bn-est.json",
-                      "--target", "active"])
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "--estimate-output" in err and "--out" in err
-    assert not calls                                  # refused before the request
-
-    rc = bn.cli.main(["comment", "set", "0x401000", "note", "--estimate-output",
-                      "--target", "active"])
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "mutation" in err and "--estimate-output" in err
+    with pytest.raises(SystemExit) as conflicting:
+        bn.cli.main(["function", "list", "--estimate-output", "--out", "/tmp/bn-est.json",
+                     "--target", "active"])
+    assert conflicting.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+    assert not calls

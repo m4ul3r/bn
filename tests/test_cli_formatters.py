@@ -8074,12 +8074,31 @@ def test_count_field_refuses_a_value_that_is_not_that_integer_866(stated, trunca
 
 def test_count_field_reads_an_integral_number_866():
     """The other direction, so the strictness cannot silently turn every number
-    into a skew: a value that IS the integer reads as it, and the wire formats
-    that state counts as strings keep working (`_count_field`'s contract)."""
-    from bn.formatters import _count_field, _render_trace_text
+    into a skew: a value that IS the integer reads as it, and EVERY honest way a
+    producer can spell one as text reads too.
 
-    for stated in (2, 2.0, Decimal("2"), Fraction(4, 2), "2"):
+    #866 review: the first cut compared against the canonical rendering of the
+    integer, which re-rejected spellings base read correctly (`"+2"`, `"02"`,
+    `"0002"`, `"-02"`, `"+0"`, `"1_0"`) and a text spelling of the integral VALUE
+    (`"2.0"`). The contract is "the payload stated this integer", not "the payload
+    rendered it the way Python would" -- a producer that pads, signs or zero-fills
+    a count is stating it, and refusal here costs a line of real output."""
+    from bn.formatters import _count_field, _field_skewed, _render_trace_text
+
+    for stated in (2, 2.0, Decimal("2"), Decimal("2.0"), Fraction(4, 2), "2",
+                   "+2", "02", "0002", "2.0", "2e0", " 2 "):
         assert _count_field({"count": stated}, "count") == 2, repr(stated)
+    # A ZERO spelled with a sign is still a zero, not a refusal -- the only
+    # spelling where a wrong answer would be invisible.
+    assert _count_field({"count": "+0"}, "count") == 0
+    assert not _field_skewed("count")
+    # Python's own digit-separator spelling reads too (base read it): the rule is
+    # "the text parses as this integer", not "the text is the canonical digits".
+    assert _count_field({"count": "1_0"}, "count") == 10
+    # ...and the SIGN is read, not stripped: a negative count stays negative
+    # (base read `"-02"` as -2, and a headline must not gain 4 out of nowhere).
+    for stated in (-2, "-02", " -2 "):
+        assert _count_field({"count": stated}, "count") == -2, repr(stated)
     out = _render_trace_text({
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
         "arg_index": Decimal("2"), "arg_label": {"index": 0, "callee": "memcpy"},

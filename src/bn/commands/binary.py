@@ -275,7 +275,8 @@ def _refresh(args: argparse.Namespace) -> int:
          args=[
              arg("--verbose", "-v", action="store_true",
                  help="Include the segment map (r/w/x address ranges)"),
-         ])
+         ],
+         estimable=True)
 def _target_info(args: argparse.Namespace) -> int:
     return _call(
         args,
