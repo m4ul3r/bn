@@ -265,6 +265,50 @@ def test_list_functions_named_filter_pages_without_building_the_rest(monkeypatch
     assert _rows_built(functions) <= 11
 
 
+def test_function_listing_collapses_duplicate_start_addresses_757(monkeypatch):
+    # #757: BN can hold two Function RECORDS for one start address with
+    # conflicting sizes, both asserting `size_known: true` -- and the phantom is
+    # the SMALLER (stub-shaped) one, exactly what a size-sorted triage or a
+    # "small function = stub" heuristic reads as fact. One address is one
+    # function here: the larger extent is kept and the collapse is disclosed.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        # the conflicting pair: same start, both size_known, 96 bytes are real
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=4),
+        _FakeFunction(0x401080, "widget_flush", total_bytes=16),
+    ]
+    _view(monkeypatch, instance, functions)
+
+    result = instance._list_functions(None)
+
+    assert result["total"] == 3 and result["duplicate_starts_collapsed"] == 1
+    by_address = {row["address"]: row for row in result["items"]}
+    # No address is listed twice, and the surviving row is the real 96-byte body
+    # rather than the 4-byte phantom.
+    assert len(by_address) == result["returned"] == 3
+    assert by_address["0x401014"]["size"] == 96
+    assert by_address["0x401014"]["size_known"] is True
+
+    # `--count` reads the same collapsed population, so it can no longer report
+    # more functions than there are distinct starts -- and says why it is lower.
+    counted = instance._list_functions(None, count_only=True)
+    assert counted["count"] == counted["total"] == 3
+    assert counted["duplicate_starts_collapsed"] == 1
+
+    # `function search` collapses the population BEFORE matching, so the phantom
+    # twin cannot match as a second row with the conflicting size.
+    searched = instance._search_functions("active", "widget_poll")
+    assert searched["total"] == 1 and searched["returned"] == 1
+    assert searched["items"][0]["size"] == 96
+    # The address filter (`--min-address`/`--max-address`) runs on the same
+    # population, so the colliding window reports one row, not two.
+    windowed = instance._list_functions(None, min_address="0x401014", max_address="0x401014")
+    assert windowed["returned"] == 1 and windowed["items"][0]["size"] == 96
+
+
 def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypatch):
     # #861: `_annotation_summary` walked `list(address_comments.items())` -- the
     # ITEMS VIEW of BN's live global comment map -- so an entry analysis adds

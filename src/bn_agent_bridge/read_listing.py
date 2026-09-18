@@ -752,6 +752,67 @@ def _filtered_functions(
     return functions
 
 
+def _duplicate_extent_key(fn) -> tuple[int, int]:
+    """Order two records that claim the SAME start address by extent (#757).
+
+    A record whose size cannot be read sorts BELOW one with a known size: an
+    unreadable extent cannot out-vote a stated one, and the phantom record of
+    the #757 report is the one carrying the smaller (stub-shaped) size anyway.
+    """
+    size = il_format._function_size(fn)
+    known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+    return (1 if known else 0, size if known else -1)
+
+
+def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int]:
+    """Keep ONE record per start address, and count the addresses that had more.
+
+    BN can hold several Function records for a single start address (an
+    overlapping or duplicated definition), and their sizes DISAGREE while both
+    rows assert ``size_known: true`` -- so a size-sorted triage or a "small
+    function = stub" heuristic reads whichever record sorted first as fact, per
+    address, with no round trip that could tell the two apart (#757). One
+    address is one function here: the record with the LARGER extent is retained
+    (the real body; the phantom is the smaller, stub-shaped one), and every
+    address that had more than one record is reported so the collapse is
+    disclosed rather than silent.
+
+    Cheap by construction: addresses with a single record (every address on a
+    well-formed target) are never sized -- the extent read happens only inside a
+    group that actually collided. Ordering is preserved (the population arrives
+    ``(start, name)``-ordered, so first-seen grouping is address order).
+    """
+    grouped: dict[int, list[Any]] = {}
+    for fn in functions:
+        grouped.setdefault(int(fn.start), []).append(fn)
+    if len(grouped) == len(functions):
+        return functions, 0
+    collapsed = 0
+    kept: list[Any] = []
+    for group in grouped.values():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        collapsed += 1
+        kept.append(max(group, key=_duplicate_extent_key))
+    return kept, collapsed
+
+
+def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int) -> dict[str, Any]:
+    """Attach the #757 duplicate-start collapse count, when there was one.
+
+    Only present when a collapse happened, so the common envelope keeps the key
+    set every consumer already parses (the ``got_collapsed`` /
+    ``self_defined_excluded`` convention in ``read_misc._imports``). A caller
+    whose ``total`` lands below its own count of raw BN records can then tell
+    why -- and that the retained row carries the LARGER extent, not an
+    arbitrary one of the colliding pair.
+    """
+    if collapsed:
+        result["duplicate_starts_collapsed"] = collapsed
+    return result
+
+
 def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
     """The order key for *sort* read off the LIVE Function (#814) -- the same
     keys ``--sort`` used on a materialized row before it (``size`` or 0 for
@@ -852,7 +913,9 @@ def _list_functions(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    functions = list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    functions, collapsed_starts = _collapse_duplicate_starts(
+        list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    )
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers (typically <= 16 bytes) that
         # otherwise list under the same name as the real body.
@@ -873,8 +936,9 @@ def _list_functions(
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
-        return {"kind": "functions", "count": len(functions), "total": len(functions),
-                **_analysis_state_fields(bv)}
+        result = {"kind": "functions", "count": len(functions), "total": len(functions),
+                  **_analysis_state_fields(bv)}
+        return _disclose_collapsed_starts(result, collapsed_starts)
     # #411 established that per-page display projection (basic_block_count) must
     # not be computed for the whole filtered set. display_name (a per-function
     # symbol lookup) and size follow the same rule, and #814 extends it to the
@@ -898,7 +962,7 @@ def _list_functions(
         kind="functions", items=items, total=len(functions), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(result)
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts))
 
 
 def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
@@ -1030,7 +1094,13 @@ def _search_functions(
             return needle in name.lower()
 
     matched: list[tuple[Any, str]] = []
-    for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
+    # #757: collapse the duplicate records BN can hold for one start address
+    # BEFORE matching, so a phantom twin cannot match twice (under two conflicting
+    # sizes) and reach the page.
+    population, collapsed_starts = _collapse_duplicate_starts(
+        list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    )
+    for fn in population:
         # Match across name forms (mangled fn.name, demangled display_name, raw)
         # so a demangled C++ query finds a function BN named with the mangled
         # symbol -- the same greppability `--demangle` gives the listing (#196).
@@ -1056,8 +1126,9 @@ def _search_functions(
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
-        return {"kind": "functions", "count": len(matched), "total": len(matched),
-                **_analysis_state_fields(bv)}
+        result = {"kind": "functions", "count": len(matched), "total": len(matched),
+                  **_analysis_state_fields(bv)}
+        return _disclose_collapsed_starts(result, collapsed_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     items = [
@@ -1072,4 +1143,4 @@ def _search_functions(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(result)
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts))
