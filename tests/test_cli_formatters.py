@@ -7803,3 +7803,25 @@ def test_the_go_rename_ok_key_reads_the_same_on_both_cli_paths(fake_transport, c
         assert detail_rc == compact_rc, (
             f"{name}: exit code differs across the detail flag: "
             f"{detail_rc} vs {compact_rc}")
+
+
+@pytest.mark.parametrize(
+    "bad", [{"name": "x"}, 0, 1, True, ["x"]],
+    ids=["dict", "zero", "int", "bool", "list"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_callee_755(bad):
+    """#858 review round-2 minor: the top-level `callee` read was a bare `.get`,
+    so a wrong-shaped value rendered straight into the header -- a dict became
+    the raw Python repr `arg[0] of {'name': 'x'}`, and a number read as
+    "unresolved" in silence. Routed through `_text_value`, the module's string
+    sibling of `_field_list`/`_field_dict`/`_count_field`, so a key present in a
+    shape no name reads out of is DISCLOSED rather than interpolated."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0}, "callee": bad, "trace": [],
+    })
+    assert "malformed callee field" in out
+    # Never the value itself, and never a silent claim of a resolved name.
+    assert "{'name'" not in out and "['x']" not in out
+    assert "of <unresolved callee>" in out

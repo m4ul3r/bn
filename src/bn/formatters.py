@@ -5362,7 +5362,13 @@ def _render_trace_text(value: Any) -> str:
     # A name may still arrive on either key; the top-level `callee` is the name
     # when known and, being nullable, claims nothing by itself.
     computed = isinstance(value.get("arg_label"), dict)
-    callee_name = arg_lbl.get("callee") or value.get("callee")
+    # `_text_value`, not a bare `.get`: it is this module's string sibling of
+    # `_field_list`/`_field_dict`/`_count_field`, so a key PRESENT in a shape no
+    # name reads out of records the skew for the enclosing boundary to disclose
+    # instead of interpolating a raw Python repr into the header (a dict rendered
+    # as `arg[0] of {'name': 'x'}`) or reading a number as "unresolved" in
+    # silence (#858 review round 2 minor).
+    callee_name = _text_value(arg_lbl, "callee") or _text_value(value, "callee")
     if callee_name:
         arg_desc += f" of {callee_name}"
     elif computed:
