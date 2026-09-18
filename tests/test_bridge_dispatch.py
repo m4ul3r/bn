@@ -5405,3 +5405,55 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
     assert result["items"] == []
     missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in result["row_fields"]]
     assert not missing, f"{kind}: empty-page row_fields missing {missing}"
+
+
+def test_save_records_the_backing_database_for_restart_857(monkeypatch, tmp_path):
+    """#857 review: after a save the live view's filename is restored to the
+    ORIGINAL path on purpose (#256/#285), so nothing in the view says where its
+    analysis now lives -- and `session restart` reopened the raw bytes, silently
+    discarding the save. The bridge records the written database against the
+    view and publishes it, which is the only thing that can tell a saved
+    raw-loaded target from one deliberately opened raw."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    raw = tmp_path / "svc_a"
+    raw.write_bytes(b"\x7fELF")
+    bv = _SaveBV(str(raw), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    # Register the view so it has a stable id to key the record on.
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    rows_before = instance.targets.refresh()
+    assert rows_before[0]["database_path"] is None, (
+        "a view with no saved database must report null, not a guessed path")
+
+    out = tmp_path / "svc_a.bndb"
+    result = instance._save_database(None, str(out))
+
+    assert result["saved"] is True
+    # The live filename is back to the RAW file -- which is exactly why the row
+    # needs the separate field.
+    assert str(bv.file.filename) == str(raw)
+    rows_after = instance.targets.refresh()
+    assert rows_after[0]["filename"] == str(raw)
+    assert rows_after[0]["database_path"] == str(out.resolve())
+
+
+def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
+    """The record is per-view state and must not outlive the view: a stale entry
+    would send a restart at a database belonging to a target nobody has open."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    raw = tmp_path / "svc_b"
+    raw.write_bytes(b"\x7fELF")
+    bv = _SaveBV(str(raw), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+    instance._save_database(None, str(tmp_path / "svc_b.bndb"))
+    assert instance.targets.refresh()[0]["database_path"] is not None
+
+    instance.targets.forget(bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([], True))
+
+    assert instance.targets.refresh() == []
+    assert instance.targets._database_paths == {}

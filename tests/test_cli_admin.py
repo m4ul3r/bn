@@ -918,9 +918,24 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
     )
     calls = []
 
+    # The fake MODELS the bridge instead of echoing: with the sidecar preference
+    # on, a raw path resolves to its existing sibling `.bndb`, and a path already
+    # open comes back as the SAME target rather than a duplicate. Without that,
+    # both the path list and `loaded == 2` hold on base too (the echo answers
+    # whatever it is handed), so nothing but the pinned flag distinguished the two
+    # worlds and the collapse symptom went untested (#857 review).
+    sidecars = {"/fw/svc_a": "/fw/svc_a.bndb"}
+    opened: dict[str, str] = {}
+
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append((op, instance_id, params))
-        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+        if op != "load_binary":
+            return {"ok": True, "result": {}}
+        path = (params or {}).get("path")
+        if (params or {}).get("prefer_bndb") and path in sidecars:
+            path = sidecars[path]
+        target_id = opened.setdefault(path, f"999:{len(opened) + 1}:7")
+        return {"ok": True, "result": {"path": path, "target_id": target_id}}
 
     monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
     monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
@@ -946,6 +961,11 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
     assert [p["path"] for p in loads] == ["/fw/svc_a", "/fw/svc_a.bndb"]
     assert [p["prefer_bndb"] for p in loads] == [False, False]
     assert len(json.loads(capsys.readouterr().out)["loaded"]) == 2
+    # The symptom, not just the flag: two DISTINCT views. On base the raw row
+    # resolves to the sidecar and both rows land on one target_id -- 7 targets
+    # came back as 6 in the live repro.
+    assert len(set(opened.values())) == 2
+    assert set(opened) == {"/fw/svc_a", "/fw/svc_a.bndb"}
 
 
 def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch, capsys):
@@ -3274,3 +3294,70 @@ def test_session_list_with_an_explicit_selector_still_filters(monkeypatch, capsy
 
     items = json.loads(capsys.readouterr().out)["items"]
     assert [item["instance_id"] for item in items] == ["zz9999"]
+
+
+def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeypatch, capsys):
+    """#857 review blocker -- silent data loss. Turning the sidecar preference
+    off is right for a target deliberately opened raw, but it also stopped
+    restoring the SAVED DATABASE of a target whose analysis lives there: load
+    raw, annotate, `bn save` (sibling, or the cache copy on a read-only mount),
+    restart -> the raw bytes came back re-analysed and un-annotated, at exit 0
+    with no note.
+
+    The captured filename cannot be the discriminator: `_save_database` restores
+    `bv.file.filename` to the original path after every save on purpose (a save
+    is persistence, not an identity move, #256/#285), so a saved raw-loaded
+    target reports the RAW file. The bridge now reports `database_path` for it
+    and restart reopens THAT -- named exactly, with the sidecar preference still
+    off, so nothing is guessed."""
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"), "meta": {},
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me")
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, params))
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": [
+            # Saved: filename is the raw file, the analysis is in the sibling DB.
+            {"filename": "/fw/svc_a", "analysis_state": "full",
+             "database_path": "/fw/svc_a.bndb"},
+            # Saved on a read-only mount: the DB is the global cache copy.
+            {"filename": "/ro/svc_b", "analysis_state": "full",
+             "database_path": "/home/u/.cache/bn/bndb/svc_b.deadbeefdeadbeef.bndb"},
+            # Deliberately raw and never saved: no database backs it, so it must
+            # come back raw -- the #753 fix this must not undo.
+            {"filename": "/fw/svc_c", "analysis_state": "quick",
+             "database_path": None},
+        ]},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    loads = [params for op, params in calls if op == "load_binary"]
+    assert [p["path"] for p in loads] == [
+        "/fw/svc_a.bndb",
+        "/home/u/.cache/bn/bndb/svc_b.deadbeefdeadbeef.bndb",
+        "/fw/svc_c",
+    ]
+    # Never re-enabled: the database is NAMED, not guessed at.
+    assert [p["prefer_bndb"] for p in loads] == [False, False, False]
+    assert [p["quick"] for p in loads] == [False, False, True]
+    assert len(json.loads(capsys.readouterr().out)["loaded"]) == 3

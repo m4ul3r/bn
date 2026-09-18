@@ -525,6 +525,20 @@ class TargetManager:
         # discard annotations. We track dirtiness ourselves: set on a committed
         # change, cleared on save, surfaced by close. (L15)
         self._dirty_view_ids: set[str] = set()
+        # Stable view_id -> the .bndb that actually BACKS this view's analysis.
+        #
+        # Needed because `filename` cannot answer it: `_save_database` restores
+        # `bv.file.filename` to the original path after every save on purpose (a
+        # save is persistence, not an identity move -- #256/#285), so a target
+        # loaded raw and then saved reports the RAW file while its analysis and
+        # annotations live in the sibling/cache database. `session restart` read
+        # that filename and reopened the raw bytes, silently discarding the saved
+        # work at exit 0 with no note (#753 review).
+        #
+        # Written on a successful save only, which is the one divergence: a
+        # load-time sidecar/cache substitution OPENS the database, so `filename`
+        # already names it.
+        self._database_paths: dict[str, str] = {}
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
@@ -541,6 +555,19 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
+
+    def note_database(self, bv, path: str) -> None:
+        """Record that *path* is the database backing *bv*'s analysis.
+
+        Called after a successful save, whose written path is the one thing
+        `bv.file.filename` will not tell a later reader (see ``_database_paths``).
+        """
+        if not path:
+            return
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is not None:
+                self._database_paths[vid] = str(path)
 
     def is_dirty(self, bv) -> bool:
         with self._lock:
@@ -574,6 +601,7 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
+                self._database_paths.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
 
@@ -758,6 +786,14 @@ class TargetManager:
             # follows (#618).
             if complete:
                 self._dirty_view_ids &= set(alive)
+                # Same rule, same reason: bounded by the live record ids, and
+                # ONLY on a complete snapshot -- pruning off a lossy walk would
+                # drop the backing-database path of a view nobody closed, and
+                # restart would then reopen its raw bytes (#753 review).
+                self._database_paths = {
+                    vid: path for vid, path in self._database_paths.items()
+                    if vid in alive
+                }
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -798,6 +834,13 @@ class TargetManager:
                         # covers analysis churn, so the two stay separate.
                         "unsaved": view_id in self._dirty_view_ids,
                         "engine_modified": _view_engine_modified(view),
+                        # #753: the database that BACKS this view's analysis when
+                        # it is not the file `filename` names -- i.e. after a save
+                        # that re-homed and then restored the live filename. null
+                        # when this view's analysis is not backed by a separate
+                        # database, so a consumer can tell "no database" from
+                        # "database unknown" without inspecting paths.
+                        "database_path": self._database_paths.get(view_id),
                     }
                 )
             return result
@@ -2605,6 +2648,9 @@ class BinaryNinjaBridge:
             # rather than a clean one so callers know the original identity moved and
             # `bn close <selector>` may no longer resolve it (#256 review).
             self.targets.clear_dirty(bv)  # the bytes are persisted regardless
+            # Degraded, but the database is real and holds the annotations, so a
+            # restart must reopen it rather than the raw file (#753).
+            self.targets.note_database(bv, saved)
             return {
                 "ok": True,
                 "saved": True,
@@ -2618,6 +2664,11 @@ class BinaryNinjaBridge:
                 ),
             }
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
+        # #753: the live filename was just restored to the ORIGINAL path, so from
+        # here on nothing in the view says where its analysis actually lives.
+        # Record it, or `session restart` reopens the raw bytes and discards this
+        # save silently.
+        self.targets.note_database(bv, saved)
         return {"ok": True, "saved": True, "path": saved}
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):

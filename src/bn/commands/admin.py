@@ -865,7 +865,17 @@ def _session_restart(args: argparse.Namespace) -> int:
         for t in (unwrap_result(resp, "list_targets") or []):
             path = t.get("filename")
             if path:
-                captured.append({"path": path, "quick": t.get("analysis_state") == "quick"})
+                captured.append({
+                    "path": path,
+                    "quick": t.get("analysis_state") == "quick",
+                    # #753 review: the database that actually backs this target's
+                    # analysis, when it is not the file `filename` names. The
+                    # bridge restores `bv.file.filename` to the original path
+                    # after every save, so for a target loaded raw and then saved
+                    # the filename is the RAW file while the annotations live in
+                    # the sibling/cache database.
+                    "database_path": t.get("database_path"),
+                })
         # Commit only after the whole capture succeeds -- a mid-iteration
         # exception (a malformed row) must never leave a partially populated
         # reload_targets that gets reloaded and reported as a complete `loaded`.
@@ -929,7 +939,17 @@ def _session_restart(args: argparse.Namespace) -> int:
         try:
             r = cli.send_request(
                 "load_binary",
-                params={"path": t["path"], "prefer_bndb": False, "quick": t["quick"]},
+                params={
+                    # Reopen the DATABASE when one backs this target, else the
+                    # file itself. `prefer_bndb` stays off in both cases: naming
+                    # the database is exact, whereas re-enabling the sidecar
+                    # preference would GUESS -- which is #753 itself, silently
+                    # substituting a sibling for a target deliberately opened raw
+                    # and collapsing two targets onto one file.
+                    "path": t.get("database_path") or t["path"],
+                    "prefer_bndb": False,
+                    "quick": t["quick"],
+                },
                 instance_id=instance.instance_id,
             )
             reloaded.append(unwrap_result(r, "load_binary"))
