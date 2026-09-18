@@ -5110,14 +5110,25 @@ def test_render_trace_text_header_names_callee_not_parameter():
     assert "count" not in out.splitlines()[0]
 
 
-def test_render_trace_text_header_omits_missing_callee_or_register():
+def test_render_trace_text_header_discloses_an_unresolved_callee_755():
+    """#755: the header used to OMIT the callee when it did not resolve, so the
+    output said nothing about which call it answered. Measured on a real binary:
+    three indirect calls through different vtable slots in one function rendered
+    headers differing only by address, so an analyst who copied a nearby address
+    got an equally confident slice about a different call with no signal at all.
+
+    The callee slot is now never silent; the register stays optional."""
     from bn.formatters import _render_trace_text
     value = {
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
         "arg_index": 0, "arg_label": {"index": 0}, "trace": [],
     }
     out = _render_trace_text(value)
-    assert "backward trace of arg[0] in f @ 0x1010" in out
+    assert "backward trace of arg[0] of <unresolved callee> in f @ 0x1010" in out
+    # A resolved callee is still named, and neither form invents a register.
+    resolved = _render_trace_text(dict(value, arg_label={"index": 0, "callee": "memcpy"}))
+    assert "backward trace of arg[0] of memcpy in f @ 0x1010" in resolved
+    assert "unresolved" not in resolved
 
 
 def test_render_trace_text_renders_caveats_from_assumptions():

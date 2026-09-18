@@ -5342,6 +5342,14 @@ def _render_trace_text(value: Any) -> str:
     arg_desc = f"arg[{arg_index}]"
     if arg_lbl.get("callee"):
         arg_desc += f" of {arg_lbl['callee']}"
+    else:
+        # #755: never leave the callee slot silent. An indirect call (a vtable
+        # slot, a register target) resolves to no name, and the header then said
+        # nothing about which call it answered -- three such calls in one
+        # function rendered headers differing only by address, so an analyst who
+        # copied a nearby address got an equally confident slice about a
+        # different call with no signal to catch it with.
+        arg_desc += " of <unresolved callee>"
     if arg_lbl.get("register"):
         arg_desc += f" ({arg_lbl['register']})"
     header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"

@@ -1948,7 +1948,9 @@ def test_trace_render_shows_arg_register_and_field_load_meta():
         "hints": [],
     }
     text = formatters._render_trace_text(value)
-    assert "arg[1] (x1)" in text
+    # #755: the callee slot is never silent, so an unresolved callee is stated
+    # rather than dropped; the register still renders after it.
+    assert "arg[1] of <unresolved callee> (x1)" in text
     # #662: a stale `name` in arg_label must not leak back into the header.
     assert '"buf"' not in text
     assert "field load" in text
