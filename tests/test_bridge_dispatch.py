@@ -5238,6 +5238,11 @@ def test_empty_collections_still_declare_their_row_fields(monkeypatch, op, param
     def empty_view(selector):
         if op == "callsites":
             return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        if op == "xrefs":
+            # The queried address must be MAPPED: an empty page is only a real
+            # answer for an address that exists, and the #374 gate now rejects an
+            # unmapped one by default (#783).
+            return _FakeBV(memory={int(params["identifier"], 16): b"\x90"})
         return _FakeBV()
 
     monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
@@ -5396,6 +5401,11 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
     def empty_view(selector):
         if kind == "callsites":
             return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        if kind == "xrefs":
+            # Mapped but ref-less: the #374 gate rejects an unmapped address by
+            # default now (#783), and a zero-hit page is only a real answer for
+            # an address the view actually holds.
+            return _FakeBV(memory={int(op_params["identifier"], 16): b"\x90"})
         return _FakeBV()
 
     monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)

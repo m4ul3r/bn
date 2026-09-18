@@ -621,10 +621,37 @@ class _FakeSection:
 
 
 class _FakeSegment:
-    def __init__(self, *, readable: bool = True, writable: bool = False, executable: bool = False):
+    """A BN Segment. *start*/*end* are the half-open address range it covers.
+
+    Both default to None: the common seeding style keys `segments={addr: seg}` by
+    the segment's base address alone, and the extent then comes from the memory
+    blob seeded at that same base (see `_FakeBV.get_segment_at`), so a range query
+    does not need every call site to spell it out. A test that wants a wider
+    segment than its seeded memory passes them explicitly.
+    """
+    def __init__(self, *, start: int | None = None, end: int | None = None,
+                 readable: bool = True, writable: bool = False, executable: bool = False):
+        self.start = start
+        self.end = end
         self.readable = readable
         self.writable = writable
         self.executable = executable
+
+
+def _function_span(fn) -> tuple[int, int]:
+    """The half-open (start, end) a function's body covers: its basic-block
+    extent, exactly as `_FakeBV.get_functions_containing` computes it. A function
+    with no blocks still covers its entry byte.
+
+    ONE rule for both callers: a body that counts as "containing" an address must
+    also be the body that makes the address mapped in `is_valid_offset`, or an
+    xref at a body address would resolve while the same address read as unmapped.
+    """
+    start = int(fn.start)
+    end = start
+    for block in getattr(fn, "basic_blocks", []) or []:
+        end = max(end, int(block.end))
+    return start, end if end > start else start + 1
 
 
 class _FakeReloc:
@@ -866,12 +893,7 @@ class _FakeBV:
     def get_functions_containing(self, address: int):
         result = []
         for fn in self.functions:
-            start = int(fn.start)
-            end = start
-            for block in getattr(fn, "basic_blocks", []) or []:
-                end = max(end, int(block.end))
-            if end == start:
-                end = start + 1
+            start, end = _function_span(fn)
             if start <= int(address) < end:
                 result.append(fn)
         return result
@@ -896,7 +918,63 @@ class _FakeBV:
         return result
 
     def get_segment_at(self, address: int):
-        return self._segments.get(address)
+        """The segment CONTAINING *address*, like real BN's get_segment_at --
+        not only the one based exactly at it.
+
+        A segment seeded as `segments={base: seg}` takes its extent from the
+        memory blob seeded at the same base, so `get_segment_at(base + 0x10)`
+        answers for the blob the test actually mapped; a segment with explicit
+        start/end uses those. Nothing widens beyond what the view was seeded
+        with: an address outside every seeded extent stays None, so
+        `is_offset_executable` cannot report a segment the view never had.
+        """
+        for base, seg in self._segments.items():
+            start, end = self._segment_extent(base, seg)
+            if start <= int(address) < end:
+                return seg
+        return None
+
+    def _segment_extent(self, base, seg) -> tuple[int, int]:
+        """The half-open range one seeded segment covers."""
+        start = int(base) if seg.start is None else int(seg.start)
+        if seg.end is not None:
+            return start, int(seg.end)
+        blob = self._memory.get(start)
+        # With no blob at the base there is no extent the fake can honestly
+        # claim, so the segment covers the single byte it was seeded at.
+        return start, start + (len(blob) if blob else 1)
+
+    def is_valid_offset(self, address: int) -> bool:
+        """Real BN's BinaryView.is_valid_offset: True only for a MAPPED address.
+
+        Implemented so that "#374/`_require_mapped_address` rejects an unmapped
+        address" is the DEFAULT under the mocks, not something each unmapped-path
+        test has to hand-patch: a bare `_FakeBV()` maps nothing, so every address
+        in it is invalid, and a read that a live view would refuse cannot pass a
+        test here (#783, the #616 class).
+
+        Mapped means the view was seeded with something AT that address: a memory
+        blob, a segment extent, a section range, or a function body. Those are the
+        fake's structural mapping records. Deliberately NOT included: `code_refs`/
+        `data_refs` keys and comment/tag addresses -- `0x0` is real BN's placeholder
+        for unresolved indirect-call sites, so an address can carry refs, comments
+        or tags while still being unmapped, which is the case #374's follow-up
+        tests exist to pin (and why they must keep patching this member).
+        """
+        address = int(address)
+        for base, blob in self._memory.items():
+            if int(base) <= address < int(base) + len(blob):
+                return True
+        if self.get_segment_at(address) is not None:
+            return True
+        for sec in self.sections.values():
+            if int(sec.start) <= address < int(sec.end):
+                return True
+        for fn in self.functions:
+            start, end = _function_span(fn)
+            if start <= address < end:
+                return True
+        return False
 
     def read(self, address: int, length: int):
         # Binary Ninja's bv.read returns only the contiguous mapped bytes
