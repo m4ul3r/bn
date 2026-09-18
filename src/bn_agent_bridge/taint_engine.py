@@ -3839,7 +3839,11 @@ class TaintEngine:
                                             "engine cannot establish here (it sizes a buffer "
                                             "only from an allocating call, and proving "
                                             "cursor <= total needs the loop guard). Check "
-                                            "the destination's capacity against the total)",
+                                            "the destination's capacity against the total. "
+                                            "residual_total/residual_cursor are IL variable "
+                                            "names, not source identifiers -- an optimised "
+                                            "build reuses registers, so read them against "
+                                            "the IL rather than expecting `cap`/`progress`)",
                                         }
                                 findings.append(_tag_unconditional_flow(
                                     self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
