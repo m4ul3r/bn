@@ -564,6 +564,19 @@ class TargetManager:
         """
         if not path:
             return
+        # Only when it DIVERGES from the live filename. A target loaded from a
+        # `.bndb` and saved in place has `saved == filename`, and recording that
+        # contradicted this field's own contract ("the database when it is not the
+        # file `filename` names") and the runtime reference built on it -- a
+        # consumer could not tell the interesting case from the ordinary one
+        # (#857 review round 2). Checked here rather than at each call site so a
+        # third one cannot forget it.
+        try:
+            live = str(getattr(getattr(bv, "file", None), "filename", "") or "")
+        except Exception:  # noqa: BLE001 - an odd view must not break a save
+            live = ""
+        if live and str(path) == live:
+            return
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
@@ -2620,6 +2633,13 @@ class BinaryNinjaBridge:
                 # error -- that's the actionable message, not the fallback's.
                 raise exc
             self.targets.clear_dirty(bv)
+            # #857 review r2: the CACHE branch needs this exactly as much as the
+            # sibling one -- more, in fact, since a read-only mount can never grow
+            # an adjacent `.bndb`, so the cache copy is the ONLY place this
+            # target's analysis exists. Recording it here was missed in round 1
+            # and `database_path` came back null, so restart reopened the raw
+            # bytes and discarded the save at exit 0 with no note.
+            self.targets.note_database(bv, saved)
             result = {"ok": True, "saved": True, "path": saved, "fallback": True, "requested_path": out}
             # The cache write re-homed the live view to the copy; the RO original
             # is intact, so restore the original filename -- otherwise the

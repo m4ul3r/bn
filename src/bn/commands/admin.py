@@ -954,7 +954,15 @@ def _session_restart(args: argparse.Namespace) -> int:
             )
             reloaded.append(unwrap_result(r, "load_binary"))
         except BridgeError as exc:
-            reloaded.append({"path": t["path"], "error": str(exc)})
+            # Name the path actually attempted, not the target's filename: when a
+            # saved target's database is what failed to reopen, "could not load
+            # <raw file>" points at a file that was never tried and hides the
+            # missing database (#857 review round 2).
+            attempted = t.get("database_path") or t["path"]
+            entry = {"path": t["path"], "error": str(exc)}
+            if attempted != t["path"]:
+                entry["attempted_path"] = attempted
+            reloaded.append(entry)
 
     project_roots, association_error = _associate_project_roots(
         instance.instance_id, inherited_roots

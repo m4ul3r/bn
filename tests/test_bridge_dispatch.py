@@ -5457,3 +5457,109 @@ def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
 
     assert instance.targets.refresh() == []
     assert instance.targets._database_paths == {}
+
+
+def test_save_records_the_CACHE_database_for_restart_857(monkeypatch, tmp_path):
+    """#857 review round 2 BLOCKER: the cache-fallback branch returned WITHOUT
+    recording the database, so a read-only-mount save reported
+    `database_path: null` and restart reopened the raw bytes -- discarding the
+    only copy of that analysis, since an RO mount can never grow an adjacent
+    `.bndb`. Round 1 named both save shapes and fixed only the sibling one.
+
+    The adjacent write is failed at the BN seam rather than by chmod, so the test
+    means the same thing when the suite runs as root."""
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache_root))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _ROSaveBV(_SaveBV):
+        """Adjacent `<binary>.bndb` is unwritable; the cache copy succeeds."""
+
+        def create_database(self, out: str):
+            self.created_with = out
+            if out == str(raw) + ".bndb":
+                return False          # BN's "wrote nothing" answer
+            Path(out).write_text("bndb")
+            return True
+
+    bv = _ROSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    assert result["fallback"] is True, result
+    cache_db = result["path"]
+    assert str(cache_root) in cache_db, cache_db
+    assert not (tmp_path / "ro" / "svc.bndb").exists()
+    # The live filename is back on the RO original, so the row is the only place
+    # the cache database is named -- which is what restart reads.
+    row = instance.targets.refresh()[0]
+    assert row["filename"] == str(raw)
+    assert row["database_path"] == cache_db
+
+
+def test_save_in_place_records_no_separate_database_857(monkeypatch, tmp_path):
+    """#857 review round 2 minor: `database_path` was set even when it WAS the
+    file `filename` names -- a target loaded from a `.bndb` and saved in place --
+    which contradicts the field's own contract and the runtime reference built on
+    it. Uses the RE-HOMING fake, because a fake that never re-homes makes the
+    filename assertions here vacuous (the other round-2 minor)."""
+    db = tmp_path / "svc.bndb"
+    db.write_text("bndb")
+    bv = _RehomingSaveBV(str(db))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    instance._save_database(None, None)
+
+    row = instance.targets.refresh()[0]
+    # The re-home really happened and was really undone -- which is what makes
+    # the filename assertion mean something.
+    assert bv.created_with == str(db)
+    assert row["filename"] == str(db)
+    assert row["database_path"] is None, (
+        "saving in place adds no SEPARATE backing database, so the field that "
+        "exists to name a divergence must stay null")
+
+
+def test_save_over_another_open_target_is_disclosed_not_silent_857(monkeypatch, tmp_path):
+    """#857 review round 2 MAJOR, scoped honestly. If a raw target's default save
+    lands on a file that is ITSELF open as a second target, the two targets now
+    share one database, and a restart reopens one file for both rows -- the
+    instance comes back with fewer targets than it had.
+
+    That is not fixable by choosing a different path: the two targets genuinely
+    ARE the same database once the save lands, and BN dedups views by file. What
+    must not happen is it being silent, so this pins that the bridge reports the
+    collision at save time. The residual is routed rather than claimed fixed."""
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sidecar = tmp_path / "svc.bndb"
+    sidecar.write_text("bndb")
+    raw_view = _RehomingSaveBV(str(raw))
+    sidecar_view = _SaveBV(str(sidecar), result=True, write=True)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: raw_view)
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state",
+        lambda strict=False: ([raw_view, sidecar_view], True))
+    instance.targets.refresh()
+
+    instance._save_database(None, None)
+
+    rows = {r["filename"]: r for r in instance.targets.refresh()}
+    # The raw target's database is the OTHER target's file: observable, so a
+    # reader (and a future fix) can detect the collision from the rows alone.
+    assert rows[str(raw)]["database_path"] == str(sidecar)
+    assert rows[str(sidecar)]["filename"] == str(sidecar)
+    assert rows[str(sidecar)]["database_path"] is None

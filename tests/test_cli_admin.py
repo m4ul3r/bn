@@ -3335,7 +3335,12 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
             # Saved: filename is the raw file, the analysis is in the sibling DB.
             {"filename": "/fw/svc_a", "analysis_state": "full",
              "database_path": "/fw/svc_a.bndb"},
-            # Saved on a read-only mount: the DB is the global cache copy.
+            # Saved on a read-only mount: the DB is the global cache copy. This
+            # row was a FICTION in round 1 -- the bridge's cache branch did not
+            # record the database, so no real payload ever looked like this and
+            # the blocker stayed invisible here. It is truthful now, and
+            # `test_save_records_the_CACHE_database_for_restart_857` in
+            # test_bridge_dispatch.py is what proves the bridge emits it.
             {"filename": "/ro/svc_b", "analysis_state": "full",
              "database_path": "/home/u/.cache/bn/bndb/svc_b.deadbeefdeadbeef.bndb"},
             # Deliberately raw and never saved: no database backs it, so it must
