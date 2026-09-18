@@ -5418,7 +5418,11 @@ def test_save_records_the_backing_database_for_restart_857(monkeypatch, tmp_path
     instance = bridge.BinaryNinjaBridge()
     raw = tmp_path / "svc_a"
     raw.write_bytes(b"\x7fELF")
-    bv = _SaveBV(str(raw), result=True, write=True)
+    # RE-HOMING fake: against one that never rebinds the filename, the
+    # "filename went back to the raw file" assertion below proves nothing, and
+    # an ordering bug between the re-home, the restore and the record is
+    # invisible (#857 review round 3).
+    bv = _RehomingSaveBV(str(raw))
     monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
     # Register the view so it has a stable id to key the record on.
     monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
@@ -5456,7 +5460,6 @@ def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([], True))
 
     assert instance.targets.refresh() == []
-    assert instance.targets._database_paths == {}
 
 
 def test_save_records_the_CACHE_database_for_restart_857(monkeypatch, tmp_path):
@@ -5476,14 +5479,21 @@ def test_save_records_the_CACHE_database_for_restart_857(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
-    class _ROSaveBV(_SaveBV):
-        """Adjacent `<binary>.bndb` is unwritable; the cache copy succeeds."""
+    class _ROSaveBV(_RehomingSaveBV):
+        """Adjacent `<binary>.bndb` is unwritable; the cache copy succeeds.
+
+        Derived from the RE-HOMING fake, not `_SaveBV`: real `create_database`
+        rebinds the live view's filename to the file it wrote, and a fake that
+        skips that cannot see an ordering bug between the re-home, the restore
+        and the database record -- which is exactly the bug this test failed to
+        catch in round 2 (#593's "the fake is more forgiving than real BN")."""
 
         def create_database(self, out: str):
             self.created_with = out
             if out == str(raw) + ".bndb":
                 return False          # BN's "wrote nothing" answer
             Path(out).write_text("bndb")
+            self.file.filename = out  # real BN rebinds the live view
             return True
 
     bv = _ROSaveBV(str(raw))

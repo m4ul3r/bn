@@ -2633,13 +2633,6 @@ class BinaryNinjaBridge:
                 # error -- that's the actionable message, not the fallback's.
                 raise exc
             self.targets.clear_dirty(bv)
-            # #857 review r2: the CACHE branch needs this exactly as much as the
-            # sibling one -- more, in fact, since a read-only mount can never grow
-            # an adjacent `.bndb`, so the cache copy is the ONLY place this
-            # target's analysis exists. Recording it here was missed in round 1
-            # and `database_path` came back null, so restart reopened the raw
-            # bytes and discarded the save at exit 0 with no note.
-            self.targets.note_database(bv, saved)
             result = {"ok": True, "saved": True, "path": saved, "fallback": True, "requested_path": out}
             # The cache write re-homed the live view to the copy; the RO original
             # is intact, so restore the original filename -- otherwise the
@@ -2653,6 +2646,16 @@ class BinaryNinjaBridge:
                     f"annotations are in the cache at {saved} -- load that to resume "
                     "(the original mount is read-only, so it has no adjacent .bndb)."
                 )
+            # AFTER the restore, not before. This is the CACHE branch, which a
+            # read-only mount makes the only home for the analysis -- but
+            # `create_database` has re-homed the live filename to the copy, so
+            # calling this first meant `note_database`'s own "only when it
+            # DIVERGES" guard saw filename == saved and recorded NOTHING. The
+            # row then reported `database_path: null` and restart reopened the
+            # raw bytes: the round-2 fix defeated by its companion guard, both
+            # added in one commit, and invisible because the test's fake did not
+            # re-home the way BN does (#857 review round 3).
+            self.targets.note_database(bv, saved)
             return result
 
         # `bv.create_database` re-homes the live view to whatever .bndb it wrote,
