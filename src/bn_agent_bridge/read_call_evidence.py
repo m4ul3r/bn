@@ -526,12 +526,13 @@ def _callee_body_arg_arity(callee_fn, arg_regs: list[str]) -> int | None:
     exactly where this witness and the #862 library cross-check are BOTH blind, so
     it must stay silent rather than guess.
 
-    The scan is a linear read-before-write walk in address order. A register read
-    counts only while no earlier instruction wrote that register: the argument
-    registers hold the incoming arguments at function entry, and a compiler that
-    reuses one as scratch writes it first. Higher argument indices are what matter,
-    so the return value is the highest such index plus one (``0`` for a body that
-    reads no argument register at all -- a genuinely argument-less callee).
+    The scan is a linear read-before-write walk in address order -- which is the
+    whole problem with it as a VERDICT: address order is not execution order, so a
+    register written on one path and read on another (a loop body laid out before
+    its initializer) counts as a read, and a register the compiler reuses as
+    scratch counts as an argument. The highest index read before any write, plus
+    one, is therefore an OBSERVATION about registers; callers must not treat it as
+    a recovered arity (see :func:`_callee_arg_read_arity`).
 
     Both sides of that comparison go through :func:`_arg_register_index`, so the
     width the code touched is irrelevant: `esi` and `rsi` are the same argument,
@@ -571,12 +572,17 @@ def _callee_body_arg_arity(callee_fn, arg_regs: list[str]) -> int | None:
 def _callee_arg_read_arity(bv, callee_fn, *, is_variadic: bool) -> int | None:
     """The argument arity the callee's own body DEMONSTRATES, or None for no claim.
 
-    The callee-side witness of #865, and the only one that needs no name, no
-    library and no import: a body that reads argument register N (before writing
-    it) takes at least N+1 arguments, whatever any prototype says. That is a
-    POSITIVE reason to distrust a recovered prototype declaring fewer -- which is
-    precisely the shape the #742 guard cannot see, because it compares the
-    rendered list against that same under-recovered prototype.
+    The callee-side OBSERVATION of #865, and the only one that needs no name, no
+    library and no import: how many argument registers the body appears to touch.
+    It is deliberately NOT a verdict (#865 review): the scan is layout-order and
+    CFG-blind, so a register written on one path and read on another -- or a
+    register a compiler reuses as scratch -- reads exactly like a consumed
+    argument, and an ABI POSITION is not a PARAMETER COUNT. Measured against
+    unmutated corpus binaries, every natural firing was a correct prototype
+    demoted on such an artifact, which spends the credibility `authoritative`
+    exists to carry. Callers therefore report the number (and the declared count)
+    as a note and leave the argument confidence alone until an SSA-shaped use
+    check can tell a use from a scratch touch.
 
     Refusals, each leaving the row untouched rather than guessing:
 
@@ -656,15 +662,15 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
     callee cannot be resolved -- ``callee_unresolved`` carries that case instead.
 
-    ``callee_under_recovered``/``callee_read_arity`` (#865) are the same kind of
-    positive reason as ``prototype_unverified``, sourced from inside the binary
-    instead of a library: the callee's OWN BODY reads ``callee_read_arity``
-    argument registers while its recovered prototype declares fewer, and the
-    rendered HLIL list agrees with that prototype -- so nothing else here can see
-    the shortfall. Set only on that agreement (where ``arity_mismatch`` is silent
-    by construction) and only for an HLIL-sourced list, for the #704 round 3
-    reason above. ``read_cache`` memoizes the per-CALLEE body scan across the call
-    sites of one function.
+    ``callee_read_arity``/``declared_arity``/``callee_arity_note`` (#865) DISCLOSE
+    the callee-side observation without acting on it: the body appears to touch
+    ``callee_read_arity`` argument registers against a prototype declaring
+    ``declared_count``, on an HLIL-sourced list whose length agrees with that
+    prototype (where ``arity_mismatch`` is silent by construction, so nothing else
+    here would report it). No confidence is changed -- see
+    :func:`_callee_arg_read_arity` for the measured reason the scan is not yet
+    sound enough to demote on. ``read_cache`` memoizes the per-CALLEE body scan
+    across the call sites of one function.
     """
     evidence: dict[str, Any] = {"arity_unknown": False}
     if dest_value is None:
@@ -758,9 +764,15 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
         and callee_read_arity > declared_count
         and len(arguments) == declared_count
     ):
-        evidence["callee_under_recovered"] = True
         evidence["callee_read_arity"] = callee_read_arity
         evidence["declared_arity"] = declared_count
+        evidence["callee_arity_note"] = (
+            f"the callee's body appears to touch {callee_read_arity} argument "
+            f"register(s) against a prototype declaring {declared_count}; a "
+            f"layout-order register scan cannot tell an argument the callee consumes "
+            f"from a register a path reuses as scratch, so this is NOT an arity claim "
+            f"and the argument list above keeps its own provenance"
+        )
     if declared_count is not None and (declared_count > 0 or has_user_type):
         # User prototypes also establish zero arity, but do not guarantee that
         # HLIL recovered that many arguments. Only compare an actual HLIL list;
@@ -965,10 +977,6 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
             # prototype is a positive reason to distrust it, so the row stops
             # claiming authority and carries `library_arity` saying why.
             or arity.get("prototype_unverified")
-            # #865: the same, from INSIDE the binary -- the callee's own body
-            # reads an argument register its recovered prototype omits, so the
-            # rendered list (which agrees with that prototype) is under-recovered.
-            or arity.get("callee_under_recovered")
         ) and argument_confidence == "authoritative":
             argument_confidence = "inferred"
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
@@ -1194,23 +1202,18 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("under_recovered") and variadic.get("warning"):
             warnings.append(f"{call.get('address', '?')}: {variadic['warning']}")
-        # #865: TEXT-mode disclosure for the callee-side witness. The row carries
-        # `callee_under_recovered`/`callee_read_arity`/`declared_arity`, but a
-        # demotion with no sentence next to it is the silent demotion this issue
-        # family exists to stop -- and the renderer cannot name a cause it has no
-        # wording for. Hoisted (like the variadic warning above, and for the same
-        # reason: computed from the full call set, before slicing) so it is visible
-        # on whichever page is requested.
-        if call.get("callee_under_recovered"):
+        # #865: TEXT-mode disclosure for the callee-side observation. It is a
+        # NOTE, not a demotion reason (see `_argument_arity_evidence`): hoisted --
+        # like the variadic warning above, and for the same reason, computed from
+        # the full call set before slicing -- so it is visible on whichever page is
+        # requested, and a reader of the card sees the same caveat the row carries.
+        if call.get("callee_arity_note"):
             target = call.get("target")
             fn_entry = target.get("function") if isinstance(target, dict) else None
             callee = str((fn_entry or {}).get("name") or "the callee")
             warnings.append(
-                f"{call.get('address', '?')}: {callee}'s own body reads "
-                f"{call.get('callee_read_arity')} argument register(s), but its recovered "
-                f"prototype declares {call.get('declared_arity')} -- the rendered argument "
-                f"list agrees with the prototype and is still under-recovered, so this "
-                f"row's arguments are not authoritative"
+                f"{call.get('address', '?')}: NOTE -- {callee}: "
+                f"{call['callee_arity_note']}"
             )
     if decompile_deferred:
         warnings.append(

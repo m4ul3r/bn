@@ -3919,7 +3919,7 @@ def _write_reg(address, dest):
     return insn
 
 
-def test_argument_confidence_demoted_when_the_callee_body_reads_past_its_prototype_865(
+def test_argument_confidence_reports_a_body_read_without_demoting_865(
     monkeypatch,
 ):
     """#865 AC1, the shape neither shipped witness settles: an ordinary-named
@@ -3927,8 +3927,12 @@ def test_argument_confidence_demoted_when_the_callee_body_reads_past_its_prototy
     2 parameters and which HLIL rendered exactly those 2 -- so the #742 guard has
     nothing to compare (#862's measured residual, `declared_count ==
     len(arguments)`) and #862 has no library to consult. Its own body reads x2, a
-    third argument register, which is a positive reason to distrust the recovery:
-    the row stops claiming authority and carries the two numbers that disagree."""
+    third argument register. #865 review: the DETECTION is reported, the demotion is
+    WITHHELD. The scan is layout-order and CFG-blind, and an ABI position is not a
+    parameter count, so on unmutated corpus binaries every natural firing was a
+    correct prototype demoted on an artifact (16 of 16) -- over-demoting spends the
+    credibility `authoritative` exists to carry. The row keeps its confidence and
+    carries the two numbers plus the note saying why they are not an arity claim."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
@@ -3942,17 +3946,18 @@ def test_argument_confidence_demoted_when_the_callee_body_reads_past_its_prototy
     call = card["calls"][0]
 
     assert call["argument_source"] == "hlil"
-    assert call["argument_confidence"] == "inferred"
-    assert call["callee_under_recovered"] is True
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
     assert call["callee_read_arity"] == 3
     assert call["declared_arity"] == 2
+    assert "NOT an arity claim" in call["callee_arity_note"]
     # No library named the callee, so the #862 witness stayed silent: this is the
     # residual itself being answered, not an override of a library verdict.
     assert "prototype_unverified" not in call
     assert "arity_mismatch" not in call
-    # The reason reaches TEXT mode too (hoisted into the function-level warnings),
-    # so the demotion is never silent on the card.
-    assert any("reads 3 argument register(s)" in w for w in card["warnings"])
+    # The observation reaches TEXT mode too (hoisted into the function-level
+    # warnings), so the caveat is never invisible on the card.
+    assert any("NOTE" in w and "NOT an arity claim" in w for w in card["warnings"])
 
 
 def test_argument_confidence_kept_when_the_callee_body_reads_only_its_declared_args_865(
@@ -3972,7 +3977,7 @@ def test_argument_confidence_kept_when_the_callee_body_reads_only_its_declared_a
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register_865(
@@ -3989,7 +3994,7 @@ def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_865(
@@ -4007,7 +4012,7 @@ def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_8
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(monkeypatch):
@@ -4028,7 +4033,7 @@ def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(m
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(monkeypatch):
@@ -4042,7 +4047,7 @@ def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(m
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_fires_on_a_sub_register_argument_read_865(monkeypatch):
@@ -4063,8 +4068,9 @@ def test_argument_confidence_fires_on_a_sub_register_argument_read_865(monkeypat
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "inferred"
+    assert call["argument_confidence"] == "authoritative"
     assert call["callee_read_arity"] == 3 and call["declared_arity"] == 2
+    assert "callee_arity_note" in call
 
 
 def test_argument_confidence_kept_when_a_sub_register_write_retires_the_argument_865(
@@ -4089,7 +4095,7 @@ def test_argument_confidence_kept_when_a_sub_register_write_retires_the_argument
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_fires_on_an_aarch64_w_register_argument_read_865(monkeypatch):
@@ -4105,7 +4111,8 @@ def test_argument_confidence_fires_on_an_aarch64_w_register_argument_read_865(mo
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["callee_read_arity"] == 3 and call["callee_under_recovered"] is True
+    assert call["callee_read_arity"] == 3 and "callee_arity_note" in call
+    assert call["argument_confidence"] == "authoritative"
 
 
 def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
@@ -4133,7 +4140,7 @@ def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    assert "callee_arity_note" not in call
 
 
 def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(monkeypatch):
@@ -4148,6 +4155,59 @@ def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(mon
     for decorated in ("", "_ZN4Impl7combineEii", "_Rfoo", "_Dbar", "_Tbaz",
                       "?name@@YAXXZ", "$s4main3fooyyF", "memcpy.cold", "sym@GLIBC_2.2.5"):
         assert mod._undecorated_name(decorated) is False, decorated
+
+
+def test_argument_confidence_not_demoted_when_a_read_precedes_its_write_in_layout_865(
+    monkeypatch,
+):
+    """The dogfood's first failure shape, and the reason the demotion is withheld.
+
+    Address order is not execution order: the block that READS x1 sits at a lower
+    address than the block that initializes it, so a layout-order scan sees a
+    read before any write and calls the register an argument the callee consumes.
+    Every natural firing measured on unmutated corpus binaries was a correct
+    prototype demoted on an artifact like this one (16 of 16 across two images),
+    which spends exactly the credibility `authoritative` exists to carry. The row
+    keeps its confidence and carries the observation plus the note."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    callee = bv.get_function_at(0x401100)
+    callee.low_level_il = [
+        [_read_into(0x401100, "sp_0", "x0"), _read_into(0x401104, "sp_8", "x1")],
+        [_write_reg(0x401200, "x1")],      # the initializer, laid out AFTER the read
+    ]
+
+    card = instance._function_evidence("active", "probe_device", context=0)
+    call = card["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
+    assert call["callee_read_arity"] == 2          # the observation is still reported
+    assert "NOT an arity claim" in call["callee_arity_note"]
+    assert any("NOTE" in w for w in card["warnings"])
+
+
+def test_argument_confidence_not_demoted_for_a_scratch_register_touch_865(monkeypatch):
+    """The dogfood's second failure shape: a genuinely 1-argument callee whose
+    body touches a register the ABI COULD pass a fourth argument in, purely as
+    scratch. An ABI position is not a parameter count, so the touch must not read
+    as a consumed argument -- the deterministic hand-asm repro the dogfood filed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "x0"),     # the one real argument
+        _read_into(0x401104, "sp_8", "x3"),     # x3 reused as scratch, not an argument
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
+    assert call["callee_read_arity"] == 4
+    assert "NOT an arity claim" in call["callee_arity_note"]
 
 
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
