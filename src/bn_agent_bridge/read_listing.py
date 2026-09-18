@@ -723,7 +723,14 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         # `placeholder_symbols` remains the exact number of excluded symbols;
         # this states how many of them the sample does not show, so a consumer
         # that reads the sample is never told it is the whole set.
-        "symbol_exclusions_dropped": placeholder_symbols - len(symbol_exclusions),
+        #
+        # Present only when rows were actually dropped, the convention both
+        # sibling disclosers follow (`callers_dropped` in this module,
+        # `duplicate_starts_collapsed` above): a clean view publishes NO key
+        # rather than a zero, so "the cap fired here" is readable from the key
+        # set alone (#793 review nit).
+        **({"symbol_exclusions_dropped": placeholder_symbols - len(symbol_exclusions)}
+           if placeholder_symbols > len(symbol_exclusions) else {}),
         "symbol_exclusion_limitations": (
             "name_shape is a heuristic, not provenance: analyst renames matching "
             "excluded name families may remain undetected. Internal symbol "

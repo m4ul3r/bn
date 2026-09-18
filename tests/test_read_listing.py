@@ -619,3 +619,17 @@ def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):
     assert listed["duplicate_starts_unresolved"] == 1
     assert summary["function_count"] == listed["count"] == 3
     assert "duplicate_starts_collapsed" not in summary
+
+
+def test_annotation_summary_omits_the_dropped_key_when_nothing_was_dropped_793(monkeypatch):
+    """`symbol_exclusions_dropped` follows the convention of its two siblings in
+    this module (`callers_dropped`, `duplicate_starts_collapsed`): the key exists
+    only when the cap actually dropped rows. A clean view used to publish a
+    `0`, which made "the cap fired here" unreadable from the key set (#793
+    review nit)."""
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "widget_init", total_bytes=28)])
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    assert "symbol_exclusions_dropped" not in summary
