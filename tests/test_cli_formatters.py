@@ -8,6 +8,9 @@ import json
 import re
 import types
 
+from decimal import Decimal
+from fractions import Fraction
+
 import bn.cli
 import pytest
 
@@ -7982,3 +7985,62 @@ def test_render_trace_text_states_a_readable_arg_index_755():
     # missing key must not manufacture a disclosure.
     assert "arg[0] of memcpy" in _render_trace_text(base)
     assert "malformed arg_index" not in _render_trace_text(base)
+
+
+# --- #866: a count is stated only when the value IS that integer -------------
+# `_count_field` read with a bare `int(raw)`, so every shape carrying a fraction
+# was TRUNCATED into a confident integer the payload never stated (`arg[1]` for
+# `1.5`) with no disclosure -- the undisclosed-raw-repr half of the same seam was
+# closed by routing `arg_index` through the choke point, this is the other half.
+# The values below are the shapes a forward-compat / hand-built / third-party
+# payload can spell; `_MALFORMED`-style junk is already covered elsewhere.
+_NON_INTEGRAL_COUNTS = [
+    (1.5, "1", "float"),
+    (Decimal("2.5"), "2", "decimal"),
+    (Fraction(7, 2), "3", "fraction"),
+    (b"1", "1", "bytes"),
+    (bytearray(b"2"), "2", "bytearray"),
+]
+
+
+@pytest.mark.parametrize("stated,truncated,label", _NON_INTEGRAL_COUNTS,
+                         ids=[c[2] for c in _NON_INTEGRAL_COUNTS])
+def test_count_field_refuses_a_value_that_is_not_that_integer_866(stated, truncated, label):
+    """#866: a count read must not REWRITE the number it was handed.
+
+    `1.5` -> `arg[1]` is worse than the `?` the same reader gives a dict: the
+    truncated value is a plausible index nobody stated, so an agent cannot tell
+    the payload disagreed with the header. `_count_field`'s own docstring calls
+    anything that is not a plain integer a skew, and the header must say so.
+    """
+    from bn.formatters import _count_field, _render_trace_text
+
+    reviewed = _count_field({"count": stated}, "count")
+    assert reviewed == 0, f"{label}: {stated!r} read as the count {reviewed}"
+
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": stated, "arg_label": {"index": 0, "callee": "memcpy"},
+        "trace": [],
+    })
+    assert "malformed arg_index field" in out, out
+    assert "backward trace of arg[?] of memcpy in f" in out, out
+    # Neither the truncated index nor the value itself reaches the header.
+    assert f"arg[{truncated}]" not in out, out
+    assert f"arg[{stated!r}]" not in out, out
+
+
+def test_count_field_reads_an_integral_number_866():
+    """The other direction, so the strictness cannot silently turn every number
+    into a skew: a value that IS the integer reads as it, and the wire formats
+    that state counts as strings keep working (`_count_field`'s contract)."""
+    from bn.formatters import _count_field, _render_trace_text
+
+    for stated in (2, 2.0, Decimal("2"), Fraction(4, 2), "2"):
+        assert _count_field({"count": stated}, "count") == 2, repr(stated)
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": Decimal("2"), "arg_label": {"index": 0, "callee": "memcpy"},
+        "trace": [],
+    })
+    assert "arg[2] of memcpy" in out and "malformed arg_index" not in out, out

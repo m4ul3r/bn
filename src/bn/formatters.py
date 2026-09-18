@@ -205,12 +205,28 @@ def _count_field(source: Any, key: str) -> int:
     and quietly answering ``0`` instead is the other half of the same bug: a
     fabricated zero is indistinguishable from a real one, and a zero on this op
     is exactly the "nothing changed, don't save" reading that #683 discarded a
-    rename batch to. A numeric string or float still reads, as it always did;
-    anything else is a skew for the enclosing boundary to disclose (#619) --
-    including a NON-FINITE number, which JSON can spell (``1e999`` decodes to
-    ``inf``, and ``json.dumps`` round-trips it as ``Infinity``) and ``int()``
-    answers with an ``ArithmeticError``. That is refused like any other
-    unreadable shape rather than costing the whole render."""
+    rename batch to. A numeric string or an INTEGRAL float still reads, as it
+    always did; anything else is a skew for the enclosing boundary to disclose
+    (#619) -- including a NON-FINITE number, which JSON can spell (``1e999``
+    decodes to ``inf``, and ``json.dumps`` round-trips it as ``Infinity``) and
+    ``int()`` answers with an ``ArithmeticError``. That is refused like any
+    other unreadable shape rather than costing the whole render.
+
+    And the value must STATE the integer it is read as (#866). A bare
+    ``int(raw)`` TRUNCATES every shape that carries a fraction -- ``1.5``,
+    ``Decimal("2.5")``, ``Fraction(7, 2)`` -- so a header rendered ``arg[1]``
+    for a payload that said ``1.5``: not a disclosure of a skew but a confident,
+    plausible number the producer never wrote, which is worse than the ``?``
+    the same reader gives a dict. Same rule the flag sibling applies to a
+    non-flag: read it only when the value IS the thing being read. The
+    comparison below says exactly that, in two halves -- the value IS the
+    integer (``2.0``, ``Decimal("2")``, ``Fraction(4, 2)``) or it SPELLS it
+    (``"2"``, the numeric-string contract the bridge has always been allowed,
+    padding included). ``bytes``/``bytearray`` do neither: ``int(b"1")`` is a
+    coercion Python hands out for the string-literal spelling, not a count a
+    wire format states, so it is refused with everything else that is present
+    but not the integer it looks like -- as is an ``__int__``-only object,
+    whose truncation nothing could detect."""
     src = _as_dict(source)
     if key not in src:
         return 0
@@ -222,11 +238,19 @@ def _count_field(source: Any, key: str) -> int:
         return 0
     if isinstance(raw, int):
         return raw
+    # Every other shape must BE the integer it is read as, or spell it. Inside
+    # ONE try: a hostile `__eq__`/`__format__`/`__int__` is a skew for the
+    # enclosing boundary, never an exception out of a renderer.
     try:
-        return int(raw)
+        exact = int(raw)
+        stated = raw == exact or f"{raw}".strip() == f"{exact}"
     except (ArithmeticError, TypeError, ValueError):
         _record_skew(key)
         return 0
+    if not stated:
+        _record_skew(key)
+        return 0
+    return exact
 
 
 def _stated_count(source: Any, key: str) -> str:
