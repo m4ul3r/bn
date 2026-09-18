@@ -7825,3 +7825,42 @@ def test_render_trace_text_discloses_a_wrong_shaped_callee_755(bad):
     # Never the value itself, and never a silent claim of a resolved name.
     assert "{'name'" not in out and "['x']" not in out
     assert "of <unresolved callee>" in out
+
+
+@pytest.mark.parametrize(
+    "bad", [{"reg": "rdi"}, 0, 7, True, ["rdi"]],
+    ids=["dict", "zero", "int", "bool", "list"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_register_755(bad):
+    """#858 review round 3 MAJOR: the `register` read one line below the repaired
+    `callee` read was still a bare `.get`, interpolating a wrong-shaped value
+    straight into the header (`arg[0] ({'reg': 'rdi'})`) with no disclosure. Same
+    reader, same rule -- and the PR body's claim that `arg_label` had exactly one
+    consumer, so there was no sibling to fix, was wrong: this was the sibling."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0, "callee": "memcpy", "register": bad},
+        "trace": [],
+    })
+    assert "malformed register field" in out
+    assert "{'reg'" not in out and "['rdi']" not in out
+    # The rest of the header still renders: one unusable field must not cost the
+    # callee name it sits beside.
+    assert "backward trace of arg[0] of memcpy in f @ 0x1010" in out
+
+
+def test_render_trace_text_records_a_skew_on_either_callee_key_755():
+    """#858 review round 3 minor: `_text_value(a) or _text_value(b)` short-circuits,
+    so a skew on the SECOND key went unrecorded whenever the first was truthy --
+    the alias trap `_field_list`'s docstring names. Both keys are read."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0, "callee": "memcpy"},
+        "callee": {"name": "shadow"},          # skewed, and second in precedence
+        "trace": [],
+    })
+    assert "malformed callee field" in out
+    # The usable name still wins, and the unusable one never reaches the header.
+    assert "of memcpy in f" in out and "shadow" not in out

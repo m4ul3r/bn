@@ -5368,13 +5368,24 @@ def _render_trace_text(value: Any) -> str:
     # instead of interpolating a raw Python repr into the header (a dict rendered
     # as `arg[0] of {'name': 'x'}`) or reading a number as "unresolved" in
     # silence (#858 review round 2 minor).
-    callee_name = _text_value(arg_lbl, "callee") or _text_value(value, "callee")
+    # Both keys go through the reader, and NOT with `or`: short-circuiting on a
+    # truthy first key would leave a skew on the second one unrecorded, which is
+    # the alias trap `_field_list`'s docstring names. Read both, then choose
+    # (#858 review round 3 minor).
+    label_callee = _text_value(arg_lbl, "callee")
+    top_callee = _text_value(value, "callee")
+    callee_name = label_callee or top_callee
     if callee_name:
         arg_desc += f" of {callee_name}"
     elif computed:
         arg_desc += " of <unresolved callee>"
-    if arg_lbl.get("register"):
-        arg_desc += f" ({arg_lbl['register']})"
+    # The register is the SIBLING read one line down, and it had the same bare
+    # `.get`: a wrong-shaped value was interpolated raw into the header with no
+    # disclosure -- `arg[0] ({'reg': 'rdi'})`. Same reader, same rule (#858
+    # review round 3 major).
+    register = _text_value(arg_lbl, "register")
+    if register:
+        arg_desc += f" ({register})"
     header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
