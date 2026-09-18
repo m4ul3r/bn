@@ -4345,7 +4345,14 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_function_list_text` in both its demangled and undemangled probe
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
-    assert swept == 4984, f"the raise sweep ran {swept} renders, not 4984"
+    # #693 items 1/2: + 16 -- TWO more discovered pairs, 8 bogus values each, both
+    # on `_render_go_rename_text`: it reads `rolled_back` and `success` BEFORE its
+    # branch, because the two rollback states are decided from those two fields
+    # rather than from the branch a payload happens to walk into.
+    # Both contributions are live on this rebased tree, so the total is their sum:
+    # 4936 + 48 (#883) + 16 (#693) = 5000. The assertion is what MEASURES it --
+    # neither branch's own number survives a merge (#693 rebase).
+    assert swept == 5000, f"the raise sweep ran {swept} renders, not 5000"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4512,7 +4519,10 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # `function list` / `--count` probe forms), x 2 benign payloads each. A
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
-    assert checked == 1449, f"the mirror ran {checked} renders, not 1449"
+    # #693 items 1/2: + 4 -- the same TWO pairs the raise sweep gained on
+    # `_render_go_rename_text`, x 2 benign payloads each: 1437 + 12 + 4 = 1453,
+    # measured the same way on the rebased tree.
+    assert checked == 1453, f"the mirror ran {checked} renders, not 1453"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

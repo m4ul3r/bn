@@ -362,9 +362,13 @@ def test_go_rename_preview_counts_match_the_detail_renderer():
 
 
 def test_mutation_summary_transforms_are_idempotent():
-    # `_call` evaluates spill_status against the ALREADY-transformed result, so a
-    # second pass must not re-zero the counts. Harmless today only because a
-    # ~200-byte summary never crosses the spill threshold.
+    # The shipped compact transforms are no-ops on their OWN output, so a caller
+    # that applies one twice cannot re-zero the counts. This property is no
+    # longer LOAD-BEARING for the CLI -- `_call` now evaluates `spill_status`
+    # against the raw result (#693 item 4, pinned by
+    # `test_a_non_idempotent_summary_transform_is_applied_once_per_call`), so a
+    # future transform is allowed to be non-idempotent -- but the guard it covers
+    # is still what makes a direct double application safe.
     from bn.formatters import _go_rename_summary, _mutation_summary
     go = {"kind": "go_rename", "success": True, "committed": True, "preview": False,
           "results": [], "go_renamed_candidates": 1783, "go_committed_count": 1783,
@@ -373,6 +377,140 @@ def test_mutation_summary_transforms_are_idempotent():
     plain = {"success": True, "committed": True, "results": [{"status": "verified"}]}
     assert _mutation_summary(_mutation_summary(plain)) == _mutation_summary(plain)
     assert _mutation_summary(_mutation_summary(plain))["changed_count"] == 1
+
+
+def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero():
+    """#693 item 1: `changed` is what is LIVE, and a failed revert leaves an
+    UNKNOWN nonzero subset of the renames live. Reporting `changed_count: 0`
+    there is a claim the state cannot support, and on this op a 0 is the "nothing
+    changed, do not save" verdict a control loop acts on -- the #683 harm
+    reached from the one state where the view is KNOWN to be modified.
+
+    The count is therefore `null` (unknown), beside `rolled_back: false` and the
+    fail-safe `dirty_after: true`; `measured` stays `true`, because the counters
+    and the failure row DID read -- what is unknown is the live delta, not the
+    measurement. Both FACES have to carry it: the JSON key and the default text
+    line, which drops `rolled_back` entirely and so has to name the state in its
+    word."""
+    from bn.formatters import (_go_rename_summary, _render_go_rename_text,
+                               _render_mutation_summary_text)
+
+    # The real live shape (bridge `_apply_go_renames_chunked`): the apply failed,
+    # the revert that followed did NOT complete, and one failure row explains it.
+    stuck = {
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": False,
+        "message": "Rollback failed; the view may be partially renamed",
+        "results": [{"op": "rename_symbol", "address": "0x401000", "new_name": "pkg.F",
+                     "status": "verification_failed", "message": "Live rename failed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4, "go_failed_count": 1,
+        "go_committed_count": 0, "skipped_user_named": 0,
+    }
+    summary = _go_rename_summary(dict(stuck))
+    assert summary["changed_count"] is None, summary          # UNKNOWN, not 0
+    assert summary["measured"] is True, summary               # the counters read
+    assert summary["dirty_after"] is True, summary
+    assert summary["rolled_back"] is False
+    # The counts that ARE known stay reported: nulling them would lose the one
+    # fact a remediation pass needs.
+    assert summary["verified_count"] == 4 and summary["failed_count"] == 1
+
+    compact = _render_mutation_summary_text(summary)
+    assert "changed=None" in compact and "changed=0" not in compact, compact
+    assert "mutation: rollback failed" in compact, compact
+    detail = _render_go_rename_text(dict(stuck))
+    assert "rollback failed" in detail, detail
+    assert "reverted" not in detail, detail
+
+    # Anti-vacuity, BOTH directions, on the same payload: the identical result
+    # whose revert COMPLETED is a measured zero that is not dirty -- so the null
+    # above is the state's answer and not a constant this summary always emits.
+    reverted = {**stuck, "rolled_back": True, "message": ""}
+    clean = _go_rename_summary(dict(reverted))
+    assert clean["changed_count"] == 0 and clean["measured"] is True, clean
+    assert clean["dirty_after"] is False, clean
+    assert "mutation: rolled back" in _render_mutation_summary_text(clean)
+
+    # ...and the PREVIEW variant of the same failed revert is the same live state:
+    # a preview that could not be reverted really renamed the view, so it may not
+    # report a plan either.
+    preview_stuck = _go_rename_summary({**stuck, "preview": True, "results": []})
+    assert preview_stuck["changed_count"] is None, preview_stuck
+    assert preview_stuck["dirty_after"] is True, preview_stuck
+
+
+def test_a_failed_preview_does_not_report_its_verified_rows_as_would_land():
+    """#693 item 2: `go rename` is all-or-nothing, so a FAILED preview's rows that
+    verified before the failure are not "what would land" -- running that same
+    state live commits zero. The compact summary reported them as `changed`, in
+    the PREVIEW state a caller reads as "this is the plan", and the detail view
+    stated them as `N would rename` on the one line that claims those counts.
+
+    Both faces must report 0 instead, with the verified rows named as what they
+    are: how far the apply got. A preview that SUCCEEDED is unaffected -- it is
+    the only one whose verified rows are the plan."""
+    from bn.formatters import (_go_rename_summary, _render_go_rename_text,
+                               _render_mutation_summary_text)
+
+    failed = {
+        "kind": "go_rename", "success": False, "committed": False, "preview": True,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "address": "0x401000", "new_name": "pkg.F",
+                     "status": "verification_failed", "message": "Live rename failed"}],
+        "go_renamed_candidates": 10, "go_verified_count": 7, "go_failed_count": 1,
+        "go_committed_count": 0, "skipped_user_named": 3,
+    }
+    summary = _go_rename_summary(dict(failed))
+    assert summary["changed_count"] == 0, summary      # nothing would land
+    assert summary["verified_count"] == 7, summary     # ...how far it got is kept
+    assert summary["measured"] is True and summary["dirty_after"] is False
+    detail = _render_go_rename_text(dict(failed))
+    assert "0 would rename" in detail, detail
+    assert "7 verified before the failure" in detail, detail
+    assert "7 would rename" not in detail, detail
+    assert "changed=7" not in _render_mutation_summary_text(summary)
+
+    # The anti-vacuity partner: a preview that reported no failure IS the plan.
+    clean = {**failed, "success": True, "results": [], "go_failed_count": 0}
+    exact = _go_rename_summary(dict(clean))
+    assert exact["changed_count"] == 7, exact
+    assert "7 would rename" in _render_go_rename_text(dict(clean))
+
+
+def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
+        fake_transport, capsys):
+    """The same two states end to end, because the default and `--verbose` views
+    are separate code paths and #693's harm is a CLIENT reading a summary key:
+    the live failed-revert run must print an unknown `changed`, and the failed
+    preview must not print a plan."""
+    stuck = {
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": False,
+        "message": "Rollback failed; the view may be partially renamed",
+        "results": [{"op": "rename_symbol", "address": "0x401000", "new_name": "pkg.F",
+                     "status": "verification_failed", "message": "Live rename failed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4, "go_failed_count": 1,
+        "go_committed_count": 0, "skipped_user_named": 0,
+    }
+    fake_transport({"go_rename": {"ok": True, "result": dict(stuck)}})
+    # Exit 3: a failed mutation's code is not reclassified by how its counts read.
+    assert bn.cli.main(["go", "rename", "--target", "active"]) == 3
+    out = capsys.readouterr().out
+    assert "changed=None" in out and "changed=0" not in out, out
+    assert "rollback failed" in out, out
+
+    fake_transport({"go_rename": {"ok": True, "result": dict(stuck)}})
+    assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
+    verbose = capsys.readouterr().out
+    assert "reverted" not in verbose, verbose
+    assert "0 renamed" in verbose, verbose
+
+    preview = {**stuck, "preview": True, "rolled_back": True}
+    fake_transport({"go_rename": {"ok": True, "result": dict(preview)}})
+    assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
+    failed_preview = capsys.readouterr().out
+    assert "0 would rename" in failed_preview, failed_preview
+    assert "4 would rename" not in failed_preview, failed_preview
 
 
 def test_go_rename_default_text_reports_real_counts(fake_transport, capsys):
