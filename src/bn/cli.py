@@ -23,7 +23,8 @@ from .formatters import (
     _render_mutation_text,
     _render_target_choices,
 )
-from .output import render_envelope, render_error, render_value, write_output_result
+from .output import (estimate_output_result, render_envelope, render_error, render_value,
+                     write_output_result)
 from .target_hint import SELECT_HINT_LINE
 
 # The names below are re-exported through this module on purpose: command
@@ -380,6 +381,22 @@ def _common_io_options(
              "infers --format unless one is given). Relative paths are resolved "
              "against the invoking shell's cwd, not the bridge's.",
     )
+    # #796: the preflight half of #409's "bound the next read". The read still
+    # runs -- only the bridge can know what a payload costs -- but only the SIZE
+    # reaches stdout, so an agent learns the cost of a large read without paying
+    # for it in context. It lives on the shared output-option group because that
+    # is where output SHAPE is chosen, and it is refused (not ignored) where it
+    # cannot apply: a `--out` write, or a mutation whose status line is the
+    # answer (#645). `default=False` rather than a SUPPRESS default, so the
+    # handler-side read is the same one on every command.
+    parser.add_argument(
+        "--estimate-output", action="store_true", default=False,
+        dest="estimate_output",
+        help="Report the estimated token/byte size of this command's output and "
+             "the flag that slices it, INSTEAD of printing the output (the read "
+             "still runs; nothing is written to disk and no spill artifact is "
+             "created). Not available for mutations or together with --out.",
+    )
 
 
 def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
@@ -673,12 +690,26 @@ def _render_result(
     spill_status: tuple[Any, Callable[[Any], str] | None] | None = None,
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
+    estimate_only: bool = False,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
     The spilled flag lets the caller decide whether to add a further note (e.g. a
     display-truncation warning): a spill already prints its own pipe-trap note, so
-    a caller-side note would be redundant when it fires."""
+    a caller-side note would be redundant when it fires.
+
+    *estimate_only* (#796) replaces the whole write/spill decision with the
+    preflight one: the payload is measured and only its size reaches stdout, so
+    nothing is written and there is nothing to spill. It sits ABOVE the
+    ``artifact_path`` passthrough because an already-materialized artifact
+    envelope is a payload like any other -- a caller asking what it costs gets
+    its size, not a re-render of a file it may not have."""
+    if estimate_only:
+        result = _apply_result_transform(
+            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+            value, f"estimate the {stem} output size as {fmt}")
+        sys.stdout.write(result.rendered)
+        return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
     # deeply nested response raises RecursionError, and a renderer meeting a
     # field shape it cannot read raises out of `main()`, which catches only
@@ -1565,6 +1596,25 @@ def _call(
         spill_status_renderer, f"render the {op} status line as text",
         advice="Rerun with --format json to see the raw status.")
     request_params = dict(params or {})
+    # #796: the preflight flag, resolved once here so every reader below agrees.
+    # It is REFUSED where it cannot apply -- before the request, so a
+    # contradictory invocation costs no bridge work (the same pre-send rule
+    # `_mutation_preflight` states for mutation refusals).
+    estimate_only = bool(getattr(args, "estimate_output", False))
+    if estimate_only:
+        out_path = getattr(args, "out", None)
+        if out_path is not None:
+            raise BridgeError(
+                f"--estimate-output reports a size instead of writing output, so it "
+                f"cannot be combined with --out ({out_path}). Drop one of the two: "
+                f"estimate first, then re-run with --out if the size is acceptable."
+            )
+        if spill_status is not None:
+            raise BridgeError(
+                f"--estimate-output is for reads; this command is a mutation whose "
+                f"status line is the answer (a mutation's outcome must be printed, "
+                f"#645). Drop --estimate-output."
+            )
     # A long one-time op (load/refresh full analysis) raises its no-env default
     # client timeout so it isn't abandoned at the 600s read-op default on a very
     # large binary; BN_REQUEST_TIMEOUT still overrides it (#321).
@@ -1714,6 +1764,9 @@ def _call(
         # commands (function list/search) that page bridge-side and so don't set
         # the client-side page_limit (#59).
         paged=(page_limit is not None) or paged_spill,
+        # #796: hand the preflight decision to the one place that would otherwise
+        # have written or spilled the payload.
+        estimate_only=estimate_only,
     )
     # A text renderer that display-truncates (e.g. xrefs capping caller groups)
     # produces output too small to spill, so the spill pipe-note never fires and a
@@ -1922,6 +1975,10 @@ def _fanout_call(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
         slice_hint=_slice_hint_for_args(args, fmt),
+        # #796: a fan-out is a survey of whole targets, so "how big is this going
+        # to be" is exactly the question it should be able to answer without
+        # dumping every instance's rows.
+        estimate_only=bool(getattr(args, "estimate_output", False)),
     )
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A

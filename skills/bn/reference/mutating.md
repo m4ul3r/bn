@@ -262,7 +262,10 @@ recovered from `.gopclntab` into the database. It renames **auto-named
 `sub_*`/`nullsub_*` functions only** — an already-named function is left alone
 and counted as a `noop` — so it is idempotent and safe to re-run. It takes the
 standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`,
-`--out`) and nothing else.
+`--out`, `--estimate-output`) and nothing else. `--estimate-output` is the shared
+READ preflight, so this mutation REFUSES it (`--estimate-output is for reads`)
+rather than replacing its status line with a size — a write whose outcome is a
+number is a write whose outcome is unknown.
 
 It is the one mutation whose bridge result reports the work through its **own
 counters** rather than a `results[]` row per rename (that array carries only the

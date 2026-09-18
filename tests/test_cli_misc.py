@@ -1618,3 +1618,95 @@ def test_strings_count_text_states_the_dropped_count_795(fake_transport, capsys)
     rc = bn.cli.main(["strings", "--target", "active", "--count", "--format", "text"])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "Total strings: 1359"
+
+
+def test_estimate_output_preflights_a_large_read_796(fake_transport, capsys):
+    """#796: `--estimate-output` on the reads whose cost you want to know FIRST.
+
+    The issue's own repro was `bn function list --limit 5 --estimate-output` ->
+    `error: unrecognized arguments` (rc 2), with no way to learn a read's size
+    before paying for it in context. The flag is accepted by every command that
+    renders a payload; under text it prints the size and this command's own
+    slicing knob, and it does NOT print the rows.
+    """
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"name": f"sub_{i:06d}", "address": hex(0x401000 + i * 0x10)}
+                  for i in range(200)],
+        "total": 200, "offset": 0, "limit": 5, "returned": 200, "has_more": True}}})
+
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "estimated: true" in out
+    assert "tokens: " in out and "tokenizer: estimate" in out
+    assert "--limit" in out                      # the slicing knob this command takes
+    assert "sub_000000" not in out               # ...and NOT the payload itself
+    assert calls[-1]["op"] == "list_functions"
+
+    # Under --format json the same run is machine-readable, so a caller can branch
+    # on the cost without parsing prose.
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--format", "json", "--target", "active"])
+    assert rc == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["estimated"] is True and envelope["tokens"] > 0
+    assert envelope["summary"]["total"] == 200
+    assert "items" not in envelope
+
+
+def test_estimate_output_covers_per_function_reads_796(fake_transport, capsys):
+    """The same preflight for the large PER-FUNCTION reads (`decompile`, `il`,
+    `strings`), whose cost is the one an agent most often misjudges: the flag
+    reports the size of the rendering the caller would have received, and names
+    that command's own slicing flag (`decompile`/`il` slice with --lines)."""
+    fake_transport({
+        "decompile": {"ok": True, "result": {"text": "int parse_hdr(char *p)\n{\n" + "  *p++;\n" * 500 + "}\n"}},
+        "strings": {"ok": True, "result": {
+            "items": [{"address": hex(0x402000 + i), "length": 5, "chars": 5,
+                       "type": "ascii", "value": f"str{i}"} for i in range(50)],
+            "total": 50, "offset": 0, "limit": 50, "returned": 50, "has_more": False,
+            "filtered": 0}},
+    })
+
+    assert bn.cli.main(["decompile", "parse_hdr", "--estimate-output",
+                        "--target", "active"]) == 0
+    decompile_out = capsys.readouterr().out
+    assert "estimated: true" in decompile_out
+    assert "--lines START:END" in decompile_out
+    assert "*p++" not in decompile_out            # the decompilation is NOT printed
+    assert "tokens: " in decompile_out
+
+    assert bn.cli.main(["strings", "--estimate-output", "--target", "active"]) == 0
+    strings_out = capsys.readouterr().out
+    assert "estimated: true" in strings_out
+    assert "--limit" in strings_out
+    assert '"str0"' not in strings_out            # the rows are NOT printed
+
+
+def test_estimate_output_refuses_what_it_cannot_preflight_796(fake_transport, capsys):
+    """The two combinations that cannot mean anything are REFUSED, not ignored.
+
+    A `--out` write asks for the payload on disk while the estimate asks for its
+    size instead, and a mutation's status line IS the answer (#645) -- a write
+    whose outcome is replaced by a number desyncs an agent's model of the
+    database. Both refuse before the request is sent, so a contradictory
+    invocation costs no bridge work.
+    """
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "items": [], "total": 0, "offset": 0, "limit": 5, "returned": 0,
+        "has_more": False}}})
+
+    rc = bn.cli.main(["function", "list", "--estimate-output", "--out", "/tmp/bn-est.json",
+                      "--target", "active"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--estimate-output" in err and "--out" in err
+    assert not calls                                  # refused before the request
+
+    rc = bn.cli.main(["comment", "set", "0x401000", "note", "--estimate-output",
+                      "--target", "active"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "mutation" in err and "--estimate-output" in err
