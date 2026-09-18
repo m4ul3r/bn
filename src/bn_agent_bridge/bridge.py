@@ -603,7 +603,11 @@ class TargetManager:
         for row in self.refresh():
             if row.get("view_id") == own:
                 continue
-            if row.get("filename") == path or row.get("database_path") == path:
+            # #869: identity, not spelling. A raw `==` missed a save landing
+            # on a file another target has open under a symlinked directory,
+            # while the reference states the disclosure unconditionally.
+            if _same_file(row.get("filename"), path) or \
+                    _same_file(row.get("database_path"), path):
                 return {
                     "target_id": row.get("target_id"),
                     "selector": row.get("selector"),
@@ -4786,6 +4790,42 @@ READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
+
+def _same_file(a: str | None, b: str | None) -> bool:
+    """Do *a* and *b* name the same FILE, rather than the same spelling?
+
+    Two decisions in this module used to be made on a path's spelling while
+    the question was about the file (#869), and each missed a different
+    aliasing form: the collision probe compared raw strings, so a symlinked
+    spelling of an already-open database was not disclosed; the own-database
+    gate resolved symlinks but not HARD links, so an explicit save through a
+    hard link of the target's own sibling recorded no `database_path` and the
+    next `session restart` reopened the raw bytes -- the silent-data-loss
+    shape #753 exists to stop, reached by a different spelling.
+
+    Identity first (`os.path.samefile`, which is inode+device and therefore
+    sees both forms), and the string compare kept ONLY as a fast path that
+    can add an answer and never remove one: a destination that does not exist
+    yet -- the normal case for a save -- has no inode to compare, and
+    `samefile` raises there rather than answering False. Degrading to the
+    spelling is the same "answer only what the evidence supports" rule
+    `socket_evidence` applies when `/proc` cannot see a socket.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        if Path(a).expanduser().resolve() == Path(b).expanduser().resolve():
+            return True
+    except Exception:  # noqa: BLE001 - an unresolvable path is not a match
+        pass
+    try:
+        return os.path.samefile(a, b)
+    except Exception:  # noqa: BLE001 - absent/unstattable: no identity evidence
+        return False
+
+
 def _is_own_database_destination(saved: str, filename: str) -> bool:
     """Is *saved* this target's OWN database, rather than an export elsewhere?
 
@@ -4806,12 +4846,14 @@ def _is_own_database_destination(saved: str, filename: str) -> bool:
     """
     if not saved or not filename:
         return False
+    # #869: identity, not spelling. `.resolve()` alone sees a symlink and not
+    # a HARD link, so a save through a hard link of the sibling looked like
+    # an export and recorded nothing.
+    if _same_file(saved, filename + ".bndb"):
+        return True
     try:
-        written = Path(saved).expanduser().resolve()
-        if written == Path(filename + ".bndb").expanduser().resolve():
-            return True
-        return written == _cache_bndb_path(filename).expanduser().resolve()
-    except Exception:  # noqa: BLE001 - an unresolvable path is simply not ours
+        return _same_file(saved, str(_cache_bndb_path(filename)))
+    except Exception:  # noqa: BLE001 - an unresolvable cache path is not ours
         return False
 
 

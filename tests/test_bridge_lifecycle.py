@@ -1289,3 +1289,72 @@ def test_close_binary_forgets_dirty_view_on_close(monkeypatch):
 
     assert instance.targets.is_dirty(bv) is False
     module._headless_views.clear()
+
+
+# --- #869: decide by file identity, not by path spelling --------------------
+#
+# Driven against the REAL filesystem rather than a mock, because the whole
+# defect is that `==` and `.resolve()` answer differently from the kernel:
+# a mock that returns whatever the test wants cannot show that.
+
+
+def test_own_database_gate_recognises_a_hard_link_to_its_own_sibling_869(
+        monkeypatch, tmp_path):
+    # #869 item 2: the gate resolved symlinks but NOT hard links, so an
+    # explicit `bn save` through a hard link of the target's own sibling
+    # recorded no `database_path` -- and the next `session restart` reopened
+    # the raw bytes even though that inode held the saved analysis. That is
+    # the silent-data-loss shape #753 exists to stop, reached by a spelling.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "target"
+    binary.write_bytes(b"\x7fELF")
+    sibling = tmp_path / "target.bndb"
+    sibling.write_bytes(b"BNDB")
+    hard = tmp_path / "hardlink.bndb"
+    os.link(sibling, hard)
+    assert os.path.samefile(sibling, hard)          # premise, from the kernel
+
+    assert module._is_own_database_destination(str(sibling), str(binary)) is True
+    assert module._is_own_database_destination(str(hard), str(binary)) is True
+
+
+def test_own_database_gate_still_refuses_a_genuine_export_869(
+        monkeypatch, tmp_path):
+    # Must-not-fire twin, and the reason the gate exists at all: recording an
+    # export would move the target's restart identity onto a copy. A distinct
+    # file with its own inode is NOT the target's database, however similarly
+    # it is named.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "target"
+    binary.write_bytes(b"\x7fELF")
+    (tmp_path / "target.bndb").write_bytes(b"BNDB")
+    export = tmp_path / "target.bndb.copy"
+    export.write_bytes(b"BNDB")
+    assert not os.path.samefile(tmp_path / "target.bndb", export)
+
+    assert module._is_own_database_destination(str(export), str(binary)) is False
+
+
+def test_own_database_gate_answers_for_a_destination_that_does_not_exist_869(
+        monkeypatch, tmp_path):
+    # The normal save case: the destination has no inode yet, so `samefile`
+    # RAISES rather than answering False. The spelling fast path has to carry
+    # it -- this is why the string compare is kept as something that can only
+    # ADD an answer, never remove one.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "fresh"
+    binary.write_bytes(b"\x7fELF")
+    assert not (tmp_path / "fresh.bndb").exists()
+
+    assert module._is_own_database_destination(
+        str(tmp_path / "fresh.bndb"), str(binary)) is True
+
+
+def test_same_file_degrades_to_false_without_identity_evidence_869(monkeypatch):
+    # Degrade-safely, the rule `socket_evidence` applies: two paths that
+    # neither match as strings nor exist to be stat'd yield no evidence of
+    # sameness, so the answer is False rather than a guess.
+    module = _load_bridge(monkeypatch)
+    assert module._same_file("/nope/a.bndb", "/nope/b.bndb") is False
+    assert module._same_file("", "/nope/b.bndb") is False
+    assert module._same_file(None, None) is False
