@@ -23,7 +23,8 @@ CATALOG_NOTE = (
 
 def _arg_phrase(indices: list[Any]) -> str | None:
     """"argument 2" / "arguments 0 or 1" for a sink's tainted-arg index list, or
-    None when the list is empty (an unconditional sink like ``gets``)."""
+    None when the list is empty (an unconditional sink like ``gets``). Entries may
+    be pre-formatted strings carrying a marker (``"1 (length)"``, #808)."""
     idxs = [str(i) for i in indices]
     if not idxs:
         return None
@@ -37,9 +38,17 @@ def _sink_model_description(cls: str, sink: dict[str, Any]) -> str:
     model flags and UNDER WHAT CONDITION, keeping the "... if argument N is
     tainted" framing so a constant-argument callsite is never implied to be a bug.
     """
-    phrase = _arg_phrase(sink.get("tainted_args", []) or [])
-    if phrase is None and sink.get("len_arg") is not None:
-        phrase = f"argument {sink.get('len_arg')} (length)"
+    _args: list[Any] = list(sink.get("tainted_args", []) or [])
+    # #808: one entry can arm BOTH explicit tainted args and a write LENGTH
+    # (`snprintf(dst, n, fmt, ...)`: the format is arg2, the write length into arg0
+    # is arg1, declared with the #443 `len_arg`/`buf_arg` pair). The condition must
+    # name every index the engine arms, or the catalog reads as though the length
+    # arg were unmodeled. The length goes first so the marker reads as a property
+    # of that one index.
+    _la = sink.get("len_arg")
+    if _la is not None and _la not in _args:
+        _args.insert(0, f"{_la} (length)")
+    phrase = _arg_phrase(_args)
     if phrase is None:
         # No tainted-arg condition (e.g. gets()): still a catalog entry, not a finding.
         return f"{cls} sink -- catalog entry (always-unsafe API); not a finding by itself"

@@ -382,3 +382,29 @@ def test_validate_bounded_write_sink_schema_443():
     ):
         with pytest.raises(TaintError):
             _coerce_model_map(bad, source="test")
+
+
+def test_builtin_snprintf_family_declares_size_arm_808():
+    # #808: snprintf/vsnprintf write AT MOST `size` bytes into the destination, so
+    # the write size (arg1) is an attacker-controlled write length into arg0 -- the
+    # model detail claimed size coverage while nothing armed it, so a tainted size
+    # returned reached_sinks=[] plus a false all-clear. It is declared with the
+    # bounded-write len_arg/buf_arg pair (the same fields the recv/read family
+    # uses), NOT as an extra `tainted_args` entry, which keeps meaning "the tainted
+    # FORMAT at arg2". The fortified forms shift only the format to arg4: maxlen
+    # (the write length) stays arg1.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    for name, fmt_idx in (("snprintf", 2), ("vsnprintf", 2),
+                          ("snprintf_chk", 4), ("vsnprintf_chk", 4)):
+        sink = models[name]["sink"]
+        assert sink["len_arg"] == 1, name          # the size / maxlen
+        assert sink["buf_arg"] == 0, name          # the destination
+        assert sink["tainted_args"] == [fmt_idx], name
+    # discoverable: `bn taint models` surfaces the bounded-write indices, and its
+    # condition names BOTH armed indices so the size arm is not invisible beside
+    # the format arg.
+    cat = build_catalog(models)
+    entry = {e["symbol"]: e for lst in cat["sinks_by_class"].values() for e in lst}["snprintf"]
+    assert entry["len_arg"] == 1 and entry["buf_arg"] == 0
+    assert "arguments 1 (length) or 2" in entry["model_description"], entry["model_description"]
