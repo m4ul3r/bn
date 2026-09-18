@@ -2077,7 +2077,12 @@ def test_function_evidence_slicing_471(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: the call scan moved into read_call_evidence WITH `_function_evidence`,
+    # so the seam is patched where the scan is looked up now -- resolved through
+    # the package the loaded bridge actually uses (`_load_bridge` imports it under
+    # an alias, so a bare `bn_agent_bridge...` import would patch a second copy).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
     monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
@@ -2135,7 +2140,9 @@ def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: patched where the scan is looked up now (see the slicing test above).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view",
                         lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
@@ -4134,7 +4141,8 @@ def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(mon
     about which names are trustworthy, or a name could be refused by one and
     trusted by the other."""
     bridge = _load_bridge(monkeypatch)
-    mod = bridge.read_evidence
+    # #592: the predicate moved with the witness it guards.
+    mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
     for plain in ("memcpy", "hw_get_version", "__popcountdi2", "sub_401199"):
         assert mod._undecorated_name(plain) is True, plain
     for decorated in ("", "_ZN4Impl7combineEii", "_Rfoo", "_Dbar", "_Tbaz",
