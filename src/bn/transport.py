@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError as exc:  # pragma: no cover - non-POSIX platforms only
+    # #824 entry gate. Without this the first symptom on Windows was
+    # `ModuleNotFoundError: No module named 'fcntl'` from `import bn.cli` --
+    # true, but it names a module the caller never asked for instead of the
+    # actual constraint. The lock and AF_UNIX transport below are POSIX-only;
+    # pyproject declares the classifiers and README states it.
+    raise RuntimeError(
+        "bn is POSIX-only: its transport is built on fcntl file locks and "
+        "AF_UNIX sockets, and there is no Windows implementation. Run it under "
+        "Linux or macOS."
+    ) from exc
 import json
 import math
 import os

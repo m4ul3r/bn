@@ -13,6 +13,12 @@
 
 Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled agent skills.
 
+`bn` is **POSIX-only** (#824): its transport is built on `fcntl` file locks and `AF_UNIX`
+sockets, and the bridge registry lives under POSIX cache paths. Linux is the primary
+target; macOS uses the same code paths. There is no Windows build — importing `bn.cli`
+there raises a named `RuntimeError` saying so, instead of a bare `ModuleNotFoundError`
+for `fcntl`.
+
 Install the CLI on your PATH:
 
 ```bash

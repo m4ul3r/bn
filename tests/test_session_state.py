@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -95,3 +96,18 @@ def test_update_writes_valid_json_atomically(project):
     # No leftover temp files from the atomic write.
     leftovers = [p for p in path.parent.iterdir() if p.name.startswith(".tmp-")]
     assert leftovers == []
+
+
+def test_atomic_write_fsyncs_the_pin_before_the_rename(project, monkeypatch):
+    """#824: close() flushes to the OS, not to the disk. The sticky pin is the one
+    piece of state a fresh process trusts without re-deriving it, so a torn write
+    is a wrong target rather than a missing one."""
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+
+    state = session_state.update(target="t.bndb")
+
+    assert synced, "the sticky pin must be fsynced before the atomic replace"
+    assert state["target"] == "t.bndb"
+    assert json.loads(session_state_path().read_text())["target"] == "t.bndb"

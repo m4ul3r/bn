@@ -95,3 +95,17 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
         if ".data/data/" in name
     }
     assert expected_data <= shipped_data, expected_data - shipped_data
+
+
+def test_pyproject_declares_the_posix_only_platform():
+    """#824: the package cannot run on Windows (fcntl locks, AF_UNIX transport)
+    and its metadata said nothing about it -- the first symptom was a bare
+    ModuleNotFoundError for fcntl out of `import bn.cli`."""
+    import tomllib
+
+    repo = Path(__file__).resolve().parents[1]
+    data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+
+    classifiers = data["project"]["classifiers"]
+    assert "Operating System :: POSIX" in classifiers
+    assert "Operating System :: POSIX :: Linux" in classifiers
