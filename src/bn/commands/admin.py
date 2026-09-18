@@ -865,7 +865,17 @@ def _session_restart(args: argparse.Namespace) -> int:
         for t in (unwrap_result(resp, "list_targets") or []):
             path = t.get("filename")
             if path:
-                captured.append({"path": path, "quick": t.get("analysis_state") == "quick"})
+                captured.append({
+                    "path": path,
+                    "quick": t.get("analysis_state") == "quick",
+                    # #753 review: the database that actually backs this target's
+                    # analysis, when it is not the file `filename` names. The
+                    # bridge restores `bv.file.filename` to the original path
+                    # after every save, so for a target loaded raw and then saved
+                    # the filename is the RAW file while the annotations live in
+                    # the sibling/cache database.
+                    "database_path": t.get("database_path"),
+                })
         # Commit only after the whole capture succeeds -- a mid-iteration
         # exception (a malformed row) must never leave a partially populated
         # reload_targets that gets reloaded and reported as a complete `loaded`.
@@ -913,17 +923,46 @@ def _session_restart(args: argparse.Namespace) -> int:
 
     instance = cli.spawn_instance(resolved_id)
     # Reload targets without associating the restart command's cwd.
+    #
+    # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
+    # `filename`, which is BN's own `bv.file.filename` -- the file each view
+    # already IS, sidecar or raw. Asking for the sidecar preference again
+    # therefore cannot help (a target already backed by a `.bndb` names that
+    # `.bndb`) and can only substitute a DIFFERENT file for a target that was
+    # deliberately opened raw, e.g. via `--no-bndb`. Worse, when that sidecar
+    # was itself open as a second target, both reloads resolved to one file and
+    # the instance came back with fewer targets than it had. `session restart`
+    # is the remedy `bn doctor` prints for a stale bridge; it must return the
+    # same targets, backed by the same files.
     reloaded: list[Any] = []
     for t in reload_targets:
         try:
             r = cli.send_request(
                 "load_binary",
-                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
+                params={
+                    # Reopen the DATABASE when one backs this target, else the
+                    # file itself. `prefer_bndb` stays off in both cases: naming
+                    # the database is exact, whereas re-enabling the sidecar
+                    # preference would GUESS -- which is #753 itself, silently
+                    # substituting a sibling for a target deliberately opened raw
+                    # and collapsing two targets onto one file.
+                    "path": t.get("database_path") or t["path"],
+                    "prefer_bndb": False,
+                    "quick": t["quick"],
+                },
                 instance_id=instance.instance_id,
             )
             reloaded.append(unwrap_result(r, "load_binary"))
         except BridgeError as exc:
-            reloaded.append({"path": t["path"], "error": str(exc)})
+            # Name the path actually attempted, not the target's filename: when a
+            # saved target's database is what failed to reopen, "could not load
+            # <raw file>" points at a file that was never tried and hides the
+            # missing database (#857 review round 2).
+            attempted = t.get("database_path") or t["path"]
+            entry = {"path": t["path"], "error": str(exc)}
+            if attempted != t["path"]:
+                entry["attempted_path"] = attempted
+            reloaded.append(entry)
 
     project_roots, association_error = _associate_project_roots(
         instance.instance_id, inherited_roots

@@ -5405,3 +5405,410 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
     assert result["items"] == []
     missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in result["row_fields"]]
     assert not missing, f"{kind}: empty-page row_fields missing {missing}"
+
+
+def test_save_records_the_backing_database_for_restart_857(monkeypatch, tmp_path):
+    """#857 review: after a save the live view's filename is restored to the
+    ORIGINAL path on purpose (#256/#285), so nothing in the view says where its
+    analysis now lives -- and `session restart` reopened the raw bytes, silently
+    discarding the save. The bridge records the written database against the
+    view and publishes it, which is the only thing that can tell a saved
+    raw-loaded target from one deliberately opened raw."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    raw = tmp_path / "svc_a"
+    raw.write_bytes(b"\x7fELF")
+    # RE-HOMING fake: against one that never rebinds the filename, the
+    # "filename went back to the raw file" assertion below proves nothing, and
+    # an ordering bug between the re-home, the restore and the record is
+    # invisible (#857 review round 3).
+    bv = _RehomingSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    # Register the view so it has a stable id to key the record on.
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    rows_before = instance.targets.refresh()
+    assert rows_before[0]["database_path"] is None, (
+        "a view with no saved database must report null, not a guessed path")
+
+    # DEFAULT save (no --path): the narrative is "load raw, annotate, bn save",
+    # which writes the adjacent sibling. An explicit --path here would be an
+    # EXPORT and is deliberately not recorded.
+    out = tmp_path / "svc_a.bndb"
+    result = instance._save_database(None, None)
+
+    assert result["saved"] is True
+    # The live filename is back to the RAW file -- which is exactly why the row
+    # needs the separate field.
+    assert str(bv.file.filename) == str(raw)
+    rows_after = instance.targets.refresh()
+    assert rows_after[0]["filename"] == str(raw)
+    assert rows_after[0]["database_path"] == str(out.resolve())
+
+
+def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
+    """The record is per-view state and must not outlive the view: a stale entry
+    would send a restart at a database belonging to a target nobody has open."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    raw = tmp_path / "svc_b"
+    raw.write_bytes(b"\x7fELF")
+    bv = _SaveBV(str(raw), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+    instance._save_database(None, None)          # default save -> the sibling
+    assert instance.targets.refresh()[0]["database_path"] is not None
+
+    # A SECOND view stays open so the row list is non-empty, and what this half
+    # asserts is the OBSERVABLE property: no stale database leaks onto a
+    # surviving row.
+    #
+    # It does NOT cover the `_database_paths.pop` in `forget()`, and the round-5
+    # comment claiming it did was false -- replacing that pop with `pass` leaves
+    # this and every neighbouring module green. That is not a weak assertion, it
+    # is an unobservable one: stable view ids are monotonic, so an entry left
+    # behind can never be reissued to a future row, and the next complete
+    # `refresh()` prunes it anyway. The pop is memory hygiene, and hygiene is
+    # asserted as hygiene in `test_the_database_map_does_not_grow...` below
+    # rather than pretended to be behaviour here (#857 r6).
+    other = _SaveBV(str(tmp_path / "other"), result=True, write=True)
+    instance.targets.forget(bv)
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state", lambda strict=False: ([other], True))
+
+    rows = instance.targets.refresh()
+    assert [r["filename"] for r in rows] == [str(tmp_path / "other")]
+    assert all(r["database_path"] is None for r in rows), (
+        "the closed view's recorded database must not survive onto anyone else")
+
+
+def test_save_records_the_CACHE_database_for_restart_857(monkeypatch, tmp_path):
+    """#857 review round 2 BLOCKER: the cache-fallback branch returned WITHOUT
+    recording the database, so a read-only-mount save reported
+    `database_path: null` and restart reopened the raw bytes -- discarding the
+    only copy of that analysis, since an RO mount can never grow an adjacent
+    `.bndb`. Round 1 named both save shapes and fixed only the sibling one.
+
+    The adjacent write is failed at the BN seam rather than by chmod, so the test
+    means the same thing when the suite runs as root."""
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache_root))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _ROSaveBV(_RehomingSaveBV):
+        """Adjacent `<binary>.bndb` is unwritable; the cache copy succeeds.
+
+        Derived from the RE-HOMING fake, not `_SaveBV`: real `create_database`
+        rebinds the live view's filename to the file it wrote, and a fake that
+        skips that cannot see an ordering bug between the re-home, the restore
+        and the database record -- which is exactly the bug this test failed to
+        catch in round 2 (#593's "the fake is more forgiving than real BN")."""
+
+        def create_database(self, out: str):
+            self.created_with = out
+            if out == str(raw) + ".bndb":
+                return False          # BN's "wrote nothing" answer
+            Path(out).write_text("bndb")
+            self.file.filename = out  # real BN rebinds the live view
+            return True
+
+    bv = _ROSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    assert result["fallback"] is True, result
+    cache_db = result["path"]
+    assert str(cache_root) in cache_db, cache_db
+    assert not (tmp_path / "ro" / "svc.bndb").exists()
+    # The live filename is back on the RO original, so the row is the only place
+    # the cache database is named -- which is what restart reads.
+    row = instance.targets.refresh()[0]
+    assert row["filename"] == str(raw)
+    assert row["database_path"] == cache_db
+
+
+def test_save_in_place_records_no_separate_database_857(monkeypatch, tmp_path):
+    """#857 review round 2 minor: `database_path` was set even when it WAS the
+    file `filename` names -- a target loaded from a `.bndb` and saved in place --
+    which contradicts the field's own contract and the runtime reference built on
+    it. Uses the RE-HOMING fake, because a fake that never re-homes makes the
+    filename assertions here vacuous (the other round-2 minor)."""
+    db = tmp_path / "svc.bndb"
+    db.write_text("bndb")
+    bv = _RehomingSaveBV(str(db))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    instance._save_database(None, None)
+
+    row = instance.targets.refresh()[0]
+    # The re-home really happened and was really undone -- which is what makes
+    # the filename assertion mean something.
+    assert bv.created_with == str(db)
+    assert row["filename"] == str(db)
+    assert row["database_path"] is None, (
+        "saving in place adds no SEPARATE backing database, so the field that "
+        "exists to name a divergence must stay null")
+
+
+def test_save_onto_an_open_target_is_disclosed_at_save_time_857(monkeypatch, tmp_path):
+    """#857 round-4 MAJOR. If a raw target's default save lands on a file that is
+    ITSELF open as a second target, the two targets are one database from that
+    moment: BN dedups views by file, so a later `session restart` reloads one
+    file for both rows and the instance comes back with fewer targets.
+
+    That is NOT fixable by choosing a different path, so the fix is that it stops
+    being silent. Round 4's version of this test asserted only the pre-existing
+    row state and pinned field existence, not a disclosure -- it was named for a
+    disclosure the bridge did not emit. It now asserts the real one: a structured
+    key naming the other target, and a rendered line."""
+    from bn import formatters
+
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sidecar = tmp_path / "svc.bndb"
+    sidecar.write_text("bndb")
+    raw_view = _RehomingSaveBV(str(raw))
+    sidecar_view = _SaveBV(str(sidecar), result=True, write=True)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: raw_view)
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state",
+        lambda strict=False: ([raw_view, sidecar_view], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    collision = result["collides_with_open_target"]
+    assert collision["filename"] == str(sidecar)
+    assert collision["target_id"]
+    assert "session restart" in result["note"]
+    # And it reaches the surface an operator actually reads.
+    rendered = formatters._render_save_text(result)
+    assert "also open as target" in rendered
+    assert "one database" in rendered
+
+    # The row state that made this reachable is still observable.
+    rows = {r["filename"]: r for r in instance.targets.refresh()}
+    assert rows[str(raw)]["database_path"] == str(sidecar)
+    assert rows[str(sidecar)]["database_path"] is None
+
+
+def test_a_save_with_no_other_target_on_that_file_discloses_nothing_857(monkeypatch, tmp_path):
+    """The control: the collision key must not appear on an ordinary save, or the
+    disclosure becomes noise an operator learns to skip."""
+    from bn import formatters
+
+    raw = tmp_path / "solo"
+    raw.write_bytes(b"\x7fELF")
+    bv = _RehomingSaveBV(str(raw))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    assert "collides_with_open_target" not in result
+    assert "note" not in result
+    assert "also open as target" not in formatters._render_save_text(result)
+
+
+def test_an_explicit_path_save_is_an_export_not_a_new_home_857(monkeypatch, tmp_path):
+    """#857 round-4 REGRESSION introduced by this PR. `bn save --path <export>`
+    is a copy-save: an export, not the target's new home. Recording it as the
+    backing database re-pointed the target's restart identity at the copy, so a
+    following `session restart` reopened the export instead of the database the
+    target IS -- and if the export was a scratch file since deleted, that target
+    failed to reload and was dropped.
+
+    That is precisely the identity move `_restore_filename` exists to prevent
+    (#256/#285), deferred one step to restart. At base the same restart reopened
+    the target's own database.
+
+    Uses the RE-HOMING fake, because `create_database` rebinds the live filename
+    to the export and the restore is what puts it back -- the interaction this
+    test is about."""
+    own_db = tmp_path / "svc.bndb"
+    own_db.write_text("bndb")
+    export = tmp_path / "exports" / "svc-copy.bndb"
+    export.parent.mkdir()
+    bv = _RehomingSaveBV(str(own_db))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, str(export))
+
+    assert result["saved"] is True
+    assert bv.created_with == str(export.resolve())
+    # Identity did not move: the live view is still its own database...
+    assert str(bv.file.filename) == str(own_db)
+    row = instance.targets.refresh()[0]
+    assert row["filename"] == str(own_db)
+    # ...and nothing points restart at the export.
+    assert row["database_path"] is None, (
+        "an explicit --path save is an export; recording it would make restart "
+        "reopen the copy instead of the target's own database")
+
+
+def test_an_explicit_save_to_its_OWN_sibling_is_still_recorded_857(monkeypatch, tmp_path):
+    """#857 round-5 BLOCKER: the record was gated on the save's SPELLING, not its
+    DESTINATION. `bn save <target>.bndb` -- an explicit path aimed at exactly the
+    file a DEFAULT save would have chosen -- recorded nothing, so the row read
+    `database_path: null`, restart reopened the raw bytes, and the saved analysis
+    was discarded at rc 0 with no note, even though the sibling existed on disk.
+    A regression against both the round-4 head and base (whose sidecar
+    preference resolved the sibling).
+
+    Same destination, two spellings, one outcome: that is the property."""
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sibling = str(raw) + ".bndb"
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def row_after(save_arg):
+        bv = _RehomingSaveBV(str(raw))
+        monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+        monkeypatch.setattr(
+            bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+        instance.targets.refresh()
+        instance._save_database(None, save_arg)
+        row = instance.targets.refresh()[0]
+        instance.targets.forget(bv)
+        return row
+
+    explicit = row_after(sibling)     # `bn save <target>.bndb`
+    default = row_after(None)         # `bn save`
+
+    assert explicit["database_path"] == sibling, (
+        "an explicit path aimed at the target's own sibling is not an export")
+    assert default["database_path"] == sibling
+    assert explicit["database_path"] == default["database_path"], (
+        "the same destination must record the same way whichever spelling asked "
+        "for it -- the round-5 regression was exactly this asymmetry")
+
+
+def test_an_explicit_save_to_the_cache_path_is_also_its_own_database_857(monkeypatch, tmp_path):
+    """The other own-database destination: a caller naming the cache copy
+    explicitly is still naming this target's database, not an export."""
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    cache_db = bridge._cache_bndb_path(str(raw))
+    cache_db.parent.mkdir(parents=True, exist_ok=True)
+    bv = _RehomingSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(bridge, "_collect_open_views_state", lambda strict=False: ([bv], True))
+    instance.targets.refresh()
+
+    instance._save_database(None, str(cache_db))
+
+    assert instance.targets.refresh()[0]["database_path"] == str(cache_db)
+
+
+def test_the_database_map_does_not_grow_across_open_close_cycles_857(monkeypatch, tmp_path):
+    """The hygiene invariant `forget()`'s pop actually provides, asserted as
+    hygiene rather than disguised as behaviour.
+
+    It reads the private map deliberately: stable view ids are monotonic, so a
+    leaked entry can never be reissued to a row, which means the PUBLIC surface
+    cannot distinguish a bridge that cleans up from one that accumulates an entry
+    per save for its whole lifetime. A long-lived bridge doing many open/save/
+    close cycles is exactly the shape that matters, and it is the one case where
+    the private state IS the contract."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for i in range(5):
+        raw = tmp_path / f"svc{i}"
+        raw.write_bytes(b"\x7fELF")
+        bv = _RehomingSaveBV(str(raw))
+        monkeypatch.setattr(instance.targets, "resolve", lambda target, _b=bv: _b)
+        monkeypatch.setattr(
+            bridge, "_collect_open_views_state", lambda strict=False, _b=bv: ([_b], True))
+        instance.targets.refresh()
+        instance._save_database(None, None)
+        assert instance.targets._database_paths, "the save must have recorded one"
+        instance.targets.forget(bv)
+
+    assert instance.targets._database_paths == {}, (
+        "every closed view's entry must be released: monotonic view ids mean a "
+        "leak is invisible on the read path and simply accumulates"
+    )
+
+
+def test_a_reload_failure_names_the_database_it_tried_857(capsys):
+    """#857 r6 minor: the `(tried <path>)` rendering had no test -- replacing the
+    line with a no-op left 374 passing. A restart reloads a saved target from its
+    backing database, so naming only the target's filename points the reader at a
+    file that was never opened and hides the missing database."""
+    from bn import formatters
+
+    rendered = formatters._render_session_start_text({
+        "instance_id": "core1", "pid": 4242, "socket_path": "/tmp/core1.sock",
+        "restarted": True,
+        "loaded": [
+            {"path": "/fw/svc_a", "attempted_path": "/fw/svc_a.bndb",
+             "error": "no such file or directory"},
+            # No divergence: nothing extra to say, and no bare "(tried ...)".
+            {"path": "/fw/svc_b", "attempted_path": "/fw/svc_b",
+             "error": "permission denied"},
+        ],
+    })
+
+    assert "/fw/svc_a (tried /fw/svc_a.bndb) [error: no such file or directory]" in rendered
+    assert "/fw/svc_b [error: permission denied]" in rendered
+    assert "svc_b (tried" not in rendered
+
+
+def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, tmp_path):
+    """#857 r6 minor: the degraded `rehomed` return got its collision probe in the
+    round-5 pass but was pinned only by a throwaway probe. It writes a real file
+    and can land on another open target exactly like the clean path, and
+    runtime.md states the disclosure unconditionally, so it is asserted here.
+
+    `_RestoreFailSaveBV` is the repo's fake for this shape: `create_database`
+    succeeds and re-homes, and the restore afterwards raises."""
+    from bn import formatters
+
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sidecar = tmp_path / "svc.bndb"
+    sidecar.write_text("bndb")
+    raw_view = _RestoreFailSaveBV(str(raw))
+    sidecar_view = _SaveBV(str(sidecar), result=True, write=True)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: raw_view)
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state",
+        lambda strict=False: ([raw_view, sidecar_view], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    # Degraded, and still disclosed on both halves.
+    assert result["rehomed"] is True
+    assert result["collides_with_open_target"]["filename"] == str(sidecar)
+    assert "session restart" in result["note"]
+    assert "could not restore" in result["note"]
+    assert "also open as target" in formatters._render_save_text(result)
