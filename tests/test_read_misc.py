@@ -1446,26 +1446,26 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
 
     assert result["kind"] == "data_vars"
     assert result["has_more"] is False
-    rows = {row["a"]: row for row in result["items"]}
+    rows = {row["address"]: row for row in result["items"]}
     # Half-open window: 0x1000 (before) and 0x3000 (== end) excluded, lo included.
     assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
 
     scalar = rows["0x2000"]
-    assert scalar["t"] == "int32_t" and scalar["w"] == 4 and scalar["v"] == 42
-    assert scalar["sec"] == ".data"
+    assert scalar["type"] == "int32_t" and scalar["width"] == 4 and scalar["value"] == 42
+    assert scalar["section"] == ".data"
 
     to_sym = rows["0x2004"]
-    assert to_sym["n"] == "g_handler"
-    assert to_sym["p"] == "0x5000" and to_sym["ps"] == "on_message"
+    assert to_sym["name"] == "g_handler"
+    assert to_sym["pointer"] == "0x5000" and to_sym["pointer_symbol"] == "on_message"
 
     to_str = rows["0x2008"]
-    assert to_str["p"] == "0x6000" and to_str["pstr"] == "hello"
-    assert "ps" not in to_str
+    assert to_str["pointer"] == "0x6000" and to_str["pointer_string"] == "hello"
+    assert "pointer_symbol" not in to_str
 
     # A pointer ARRAY contains '*' but is not a pointer: it must keep all
-    # elements visible (no p/ps/v collapse to the first slot).
+    # elements visible (no pointer/pointer_symbol/value collapse to the first slot).
     arr = rows["0x2010"]
-    assert arr["w"] == 16 and "p" not in arr and "v" not in arr
+    assert arr["width"] == 16 and "pointer" not in arr and "value" not in arr
 
     # The sharp case: a ONE-element pointer array is pointer-WIDE and its text
     # carries a '*', so a width+text heuristic collapses it to its first
@@ -1473,10 +1473,11 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
     # them. Its slot is mapped and would decode to 0x5000/on_message if the
     # decode were still text-driven.
     arr1 = rows["0x2018"]
-    assert arr1["w"] == 4 and "p" not in arr1 and "ps" not in arr1 and "v" not in arr1
+    assert (arr1["width"] == 4 and "pointer" not in arr1
+            and "pointer_symbol" not in arr1 and "value" not in arr1)
 
     wide = rows["0x2020"]
-    assert "v" not in wide
+    assert "value" not in wide
 
 
 def test_data_vars_row_survives_a_throwing_symbol_or_section_accessor(monkeypatch):
@@ -1498,11 +1499,11 @@ def test_data_vars_row_survives_a_throwing_symbol_or_section_accessor(monkeypatc
 
     result = instance._data_vars(None, start="0x2000", end="0x3000")
 
-    rows = {row["a"]: row for row in result["items"]}
+    rows = {row["address"]: row for row in result["items"]}
     # Every var is still listed, and still typed -- only the decoration is gone.
     assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
-    assert rows["0x2000"]["t"] == "int32_t" and rows["0x2000"]["w"] == 4
-    assert rows["0x2000"]["n"] == "" and "sec" not in rows["0x2000"]
+    assert rows["0x2000"]["type"] == "int32_t" and rows["0x2000"]["width"] == 4
+    assert rows["0x2000"]["name"] == "" and "section" not in rows["0x2000"]
 
 
 def test_data_vars_seeks_window_instead_of_scanning_all_vars(monkeypatch):
@@ -1536,7 +1537,7 @@ def test_data_vars_has_more_is_honest_at_the_cap(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     capped = instance._data_vars(None, start="0x2000", end="0x3000", limit=2)
-    assert [r["a"] for r in capped["items"]] == ["0x2000", "0x2004"]
+    assert [r["address"] for r in capped["items"]] == ["0x2000", "0x2004"]
     assert capped["has_more"] is True
 
     # Exactly limit rows left in the window: nothing was truncated.
@@ -1559,7 +1560,7 @@ def test_data_vars_rejects_empty_window_and_bad_limit(monkeypatch):
 
 def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
     # A pointer var whose slot bytes are unmapped must still produce a row
-    # (address/type/width), just without the p/ps/pstr decoration.
+    # (address/type/width), just without the pointer/pointer_symbol/pointer_string decoration.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     ptr_t = _FakeType("char*", width=4, type_class="PointerTypeClass")
@@ -1570,8 +1571,8 @@ def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
 
     result = instance._data_vars(None, start="0x2000", end="0x2100")
 
-    assert [r["a"] for r in result["items"]] == ["0x2000"]
-    assert "p" not in result["items"][0]
+    assert [r["address"] for r in result["items"]] == ["0x2000"]
+    assert "pointer" not in result["items"][0]
 
 
 def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
@@ -1597,11 +1598,11 @@ def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = {row["a"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["items"]}
+    rows = {row["address"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["items"]}
 
-    assert rows["0x2000"]["v"] == 0xF0000000   # NOT -268435456
-    assert rows["0x2004"]["v"] == -1           # genuinely signed: -1, not 0xffffffff
-    assert rows["0x2008"]["v"] == 0xF0000000
+    assert rows["0x2000"]["value"] == 0xF0000000   # NOT -268435456
+    assert rows["0x2004"]["value"] == -1          # genuinely signed: -1, not 0xffffffff
+    assert rows["0x2008"]["value"] == 0xF0000000
 
 
 # --- data_symbols: named DataSymbol listing (promoted out of py_exec) --------

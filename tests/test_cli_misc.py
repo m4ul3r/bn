@@ -1646,11 +1646,12 @@ def test_data_vars_builds_request_and_renders_rows(fake_transport, capsys):
         "data_vars": {
             "ok": True,
             "result": {"kind": "data_vars", "has_more": False, "items": [
-                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 42, "sec": ".data"},
-                {"a": "0x2004", "n": "g_handler", "t": "char*", "w": 4,
-                 "p": "0x5000", "ps": "on_message", "sec": ".data"},
-                {"a": "0x2008", "n": "", "t": "char*", "w": 4,
-                 "p": "0x6000", "pstr": "hello", "sec": ".data"},
+                {"address": "0x2000", "name": "", "type": "int32_t", "width": 4,
+                 "value": 42, "section": ".data"},
+                {"address": "0x2004", "name": "g_handler", "type": "char*", "width": 4,
+                 "pointer": "0x5000", "pointer_symbol": "on_message", "section": ".data"},
+                {"address": "0x2008", "name": "", "type": "char*", "width": 4,
+                 "pointer": "0x6000", "pointer_string": "hello", "section": ".data"},
             ]},
         },
     })
@@ -1672,7 +1673,8 @@ def test_data_vars_forwards_limit_and_notes_truncation(fake_transport, capsys):
         "data_vars": {
             "ok": True,
             "result": {"kind": "data_vars", "has_more": True, "items": [
-                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 1},
+                {"address": "0x2000", "name": "", "type": "int32_t", "width": 4,
+                 "value": 1},
             ]},
         },
     })

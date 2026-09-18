@@ -892,10 +892,16 @@ def _type_is_signed(type_) -> bool:
 
 
 def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
-    """One typed data variable as a compact row: `a`ddress, symbol `n`ame,
-    `t`ype, `w`idth, plus a decoded scalar `v`alue or -- for a single
-    pointer-sized pointer -- the target `p` (with `ps` symbol or `pstr` ASCII
-    preview) and the containing `sec`tion."""
+    """One typed data variable as a row: `address`, `name` (symbol), `type`,
+    `width`, plus a decoded scalar `value` or -- for a single pointer-sized
+    pointer -- the `pointer` target (with `pointer_symbol`, or the
+    `pointer_string` ASCII preview when the target has no symbol) and the
+    containing `section`.
+
+    Key spelling (#682 item 2): spelled out rather than the old one- and
+    two-letter wire form (`a`/`n`/`t`/`w`/`v`/`p`/`ps`/`pstr`/`sec`), which is
+    opaque to the models that read this JSON without the reference open.
+    """
     addr = int(dv.address)
     type_ = dv.type
     try:
@@ -913,32 +919,32 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
         sym = None
     type_text = str(type_)
     row: dict[str, Any] = {
-        "a": hex(addr),
-        "n": sym.name if sym else "",
-        "t": type_text,
-        "w": width,
+        "address": hex(addr),
+        "name": sym.name if sym else "",
+        "type": type_text,
+        "width": width,
     }
     try:
         secs = bv.get_sections_at(addr)
     except Exception:  # noqa: BLE001 - same: the section is decoration
         secs = None
     if secs:
-        row["sec"] = secs[0].name
+        row["section"] = secs[0].name
     is_pointer = _is_pointer_type(type_, type_text)
     try:
         # Every read below is explicitly signed/unsigned: bv.read_int defaults to
         # sign=True, so leaving it implicit renders unsigned data as negative.
         if is_pointer and width == psz:
-            row["p"] = hex(bv.read_int(addr, psz, sign=False))
-            tsym = bv.get_symbol_at(int(row["p"], 16))
+            row["pointer"] = hex(bv.read_int(addr, psz, sign=False))
+            tsym = bv.get_symbol_at(int(row["pointer"], 16))
             if tsym:
-                row["ps"] = tsym.name
+                row["pointer_symbol"] = tsym.name
             else:
-                preview = bv.get_ascii_string_at(int(row["p"], 16), 4)
+                preview = bv.get_ascii_string_at(int(row["pointer"], 16), 4)
                 if preview:
-                    row["pstr"] = preview.value[:48]
+                    row["pointer_string"] = preview.value[:48]
         elif not is_pointer and 0 < width <= 8 and _is_scalar_type(type_, type_text):
-            row["v"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
+            row["value"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
     except Exception:
         pass  # unmapped slot: the row still lists the var, just undecorated
     return row
