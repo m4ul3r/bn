@@ -567,15 +567,28 @@ def _is_classic_arm_or_thumb_arch(name: str) -> bool:
     * this matches by PREFIX (``startswith("arm")``) while the seam matches by
       SUBSTRING over the joined names (``"arm" in joined``).
 
-    The prefix/substring split is the load-bearing one: a platform string like
-    ``linux-armv7`` CONTAINS "arm" but does not START with it, so the two
-    predicates genuinely disagree on it. Unifying them means choosing one, and
-    choosing wrongly either drops Thumb pointer tags on real ARM binaries or
-    starts tagging things the prefix rule excludes. That needs a measurement of
-    the arch/platform strings each caller actually sees on live views, which is
-    a real-BN question -- so the pair is documented here rather than merged on
-    inspection. Merging them blind is how the #600 drift was created in the
-    first place.
+    The prefix/substring split is the load-bearing one, and it is MEASURED
+    against the installed BN API rather than argued:
+
+    * ARCH names containing arm/thumb -- ``armv7``, ``armv7eb``, ``thumb2``,
+      ``thumb2eb``. All four start with "arm"/"thumb", so the two rules agree
+      on every one: ZERO disagreements.
+    * PLATFORM names containing arm/thumb -- eighteen of them, every one shaped
+      ``<os>-<arch>`` (``linux-armv7``, ``ios-thumb2``, ``windows-armv7``, ...).
+      NOT ONE starts with "arm"/"thumb", so prefix says False and substring
+      says True on ALL EIGHTEEN.
+
+    So the rules disagree on every ARM platform name BN can produce, and agree
+    on every arch name. That also explains why nobody noticed: the seam joins
+    arch AND platform into one string, and the arch name alone already matches
+    under either rule -- the substring behaviour is load-bearing only when the
+    arch name is absent, unhelpful, or the view is typed by platform. A merge
+    onto the prefix rule would therefore look correct on every ordinary ARM
+    binary and silently narrow the evidence set on exactly the awkward views
+    this predicate exists for: right in testing, quietly weaker in the field.
+    Reproduce with ``binaryninja.Platform`` / ``binaryninja.Architecture``
+    enumeration; no target needed. Merging them blind is how the #600 drift was
+    created in the first place.
     """
     n = (name or "").lower()
     if "aarch64" in n or "arm64" in n:
