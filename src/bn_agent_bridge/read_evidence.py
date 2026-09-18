@@ -2527,12 +2527,32 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
     return off, factory
 
 
+# #813: class-axis budget for `_resolve_virtual_call`'s provider sweep. Each RTTI
+# class with a vtable costs one `_vtable_layout` decode (up to 64 slots), so a
+# sweep over a large C++ provider -- the unknown-factory case, where no class name
+# narrows the search -- was unbounded, and a result that stopped early (e.g. on a
+# timeout) was indistinguishable from one that consulted every class. The sweep
+# consults at most this many classes, in `_rtti_symbol_maps` order (deterministic)
+# and across ALL provider views; when the budget stops it the result carries
+# `classes_truncated` plus the `classes_scanned`/`classes_total` counts and a
+# prose note. This is a DIFFERENT axis from the per-table 64-slot window (#584),
+# which is signalled independently; neither hides the other.
+_VC_MAX_CLASSES = 64
+
+
 def _resolve_virtual_call(ctx, selector, at, providers=None):
     """#466: resolve an imported abstract/interface virtual call in the CONSUMER at
     address *at* to the concrete method(s) in a PROVIDER's vtable. Reports the
     consumer callsite, the factory/singleton the object came from, the vtable slot
     offset, and each candidate (provider class, vtable entry, target method). Marks
-    ambiguity when multiple provider classes implement the slot. No BNDB mutation."""
+    ambiguity when multiple provider classes implement the slot. No BNDB mutation.
+
+    #813: the provider-class sweep is bounded by `_VC_MAX_CLASSES`. A sweep cut
+    short by that budget reports `classes_truncated: true` with the
+    `classes_scanned`/`classes_total` counts, and the uncertainty is stated in
+    `unresolved_reason` (no candidate found) or `warnings` (a candidate found in
+    the scanned prefix could still be joined by one from an unscanned class) -- so
+    `resolved`/`ambiguous` never read as a full-sweep answer when they are not."""
     from . import read_class
     bv = ctx._resolve_view(selector)
     at_addr = _parse_address(at)
@@ -2590,6 +2610,12 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
         provider_views = [(bv, str(selector) if selector else "self")]
     candidates: list[dict[str, Any]] = []
     truncated_cap: int | None = None
+    # #813: `classes_total` counts every RTTI class that has a vtable to decode,
+    # across all provider views (cheap -- `_rtti_symbol_maps` is one call per view);
+    # `classes_scanned` counts the ones actually decoded. They differ only when the
+    # class budget cut the sweep short.
+    classes_scanned = 0
+    classes_total = 0
     for pv, pname in provider_views:
         try:
             maps = read_class._rtti_symbol_maps(pv)
@@ -2600,6 +2626,12 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
             vt_addr = getattr(vt, "address", None) if vt is not None else None
             if vt_addr is None:
                 continue
+            classes_total += 1
+            if classes_scanned >= _VC_MAX_CLASSES:
+                # #813: over budget -- keep counting so `classes_total` names how
+                # many classes exist, but never decode another vtable.
+                continue
+            classes_scanned += 1
             try:
                 layout = read_class._vtable_layout(ctx, pv, int(vt_addr))
             except Exception:
@@ -2661,4 +2693,22 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
                 f"at least one OTHER provider that was not fully scanned for this "
                 f"slot -- it could supply an additional candidate not reflected in "
                 f"`resolved`/`ambiguous`"]
+    if classes_total > classes_scanned:
+        # #813: the class sweep stopped at `_VC_MAX_CLASSES`, so classes past the
+        # budget were counted but never consulted -- one of them could implement
+        # `slot_index`. Signal that on its own axis (machine-readable counts plus a
+        # prose note) instead of letting `resolved`/`ambiguous` imply a full sweep.
+        result["classes_truncated"] = True
+        result["classes_scanned"] = classes_scanned
+        result["classes_total"] = classes_total
+        note = (f"provider-class sweep truncated: only {classes_scanned} of "
+                f"{classes_total} classes with a vtable were consulted (class budget "
+                f"{_VC_MAX_CLASSES}); a class past the budget could implement slot "
+                f"{slot_index} and is not reflected in `resolved`/`ambiguous`")
+        if not candidates:
+            # Never clobber a per-table reason -- the two axes compound.
+            prior = result.get("unresolved_reason")
+            result["unresolved_reason"] = f"{prior}; {note}" if prior else note
+        else:
+            result.setdefault("warnings", []).append(note)
     return result

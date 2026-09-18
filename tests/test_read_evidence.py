@@ -2849,6 +2849,121 @@ def test_virtual_call_resolved_omits_warnings_when_no_provider_truncated(monkeyp
     assert "warnings" not in out
 
 
+# --- #813: class-axis budget for the provider-class sweep --------------------
+
+def _vc_budget(re):
+    """#813 class budget, read from the module so the test tracks the documented
+    constant instead of hardcoding 64. `getattr` keeps the BASE tree (no constant)
+    on the same scenario: there it must fail on the missing truncation signal, not
+    on a missing attribute name."""
+    return getattr(re, "_VC_MAX_CLASSES", 64)
+
+
+def _vc_class_maps(n_classes, first_addr=0x9000):
+    """`n_classes` provider classes, each with a vtable address."""
+    return {f"Provider{i}": {"vtable": types.SimpleNamespace(address=first_addr + i * 0x100)}
+            for i in range(n_classes)}
+
+
+def test_virtual_call_class_sweep_budget_reports_truncation_813(monkeypatch):
+    # #813: the sweep over provider RTTI classes was unbounded, and a result that
+    # stopped early looked identical to one that consulted every class. With more
+    # classes than the budget, a candidate found INSIDE the scanned prefix must
+    # still carry the class-axis uncertainty -- `resolved: true` must not imply
+    # every class was consulted.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 2, None))
+    budget = _vc_budget(re)
+    maps = _vc_class_maps(budget + 1)          # exactly one class past the budget
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", lambda pv: maps)
+    decoded: list[int] = []
+
+    def _fake_layout(ctx, pv, addr):
+        decoded.append(addr)
+        if addr == 0x9000:                     # the first class implements slot 2
+            return {"slots": [{"index": 2, "method": {"name": "doWork", "address": "0x4100"}}],
+                    "truncated": False, "max_slots": 64}
+        return {"slots": [], "truncated": False, "max_slots": 64}
+
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout", _fake_layout)
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    # The candidate inside the scanned prefix is still resolved ...
+    assert out["resolved"] is True
+    assert out["candidates"][0]["class"] == "Provider0"
+    # ... but the class axis reports the cut sweep machine-readably, with counts.
+    assert out["classes_truncated"] is True
+    assert out["classes_scanned"] == budget
+    assert out["classes_total"] == budget + 1
+    assert len(out["warnings"]) == 1
+    assert f"{budget} of {budget + 1}" in out["warnings"][0]
+    # ... and the budget really stopped the sweep: no class past it was decoded.
+    assert len(decoded) == budget
+    # Text mode must disclose it too: the note has to live in a field the text
+    # renderer actually prints (not only in the machine-readable counts).
+    from bn.formatters import _render_virtual_call_text
+    text = _render_virtual_call_text(out)
+    assert f"{budget} of {budget + 1}" in text and "class budget" in text
+
+
+def test_virtual_call_under_class_budget_reports_no_class_signal_813(monkeypatch):
+    # Guard: a provider view with fewer classes than the budget reports nothing
+    # new -- no spurious class-axis truncation, and no reason invented from it.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 2, None))
+    maps = _vc_class_maps(_vc_budget(re) - 1)   # one class short of the budget
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", lambda pv: maps)
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {
+                            "slots": [{"index": 2, "method": {"name": "doWork", "address": "0x4100"}}],
+                            "truncated": False, "max_slots": 64,
+                        })
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    # every class was swept: each implements slot 2, so the result is ambiguous
+    assert out["ambiguous"] is True
+    assert len(out["candidates"]) == _vc_budget(re) - 1
+    assert "classes_truncated" not in out
+    assert "classes_scanned" not in out and "classes_total" not in out
+    assert "warnings" not in out
+    assert "unresolved_reason" not in out
+
+
+def test_virtual_call_class_budget_unresolved_reason_joins_table_reason_813(monkeypatch):
+    # Either axis can truncate alone; when BOTH do and no candidate is found, the
+    # reason must name both -- the class-axis note must not clobber the #584
+    # per-table reason, and the counts stay machine-readable.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 70, None))
+    budget = _vc_budget(re)
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: _vc_class_maps(budget + 1))
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {
+                            "slots": [{"index": i, "method": {"name": f"m{i}"}} for i in range(64)],
+                            "truncated": True, "max_slots": 64,
+                        })
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    assert out["candidates"] == []
+    reason = out["unresolved_reason"]
+    assert "70" in reason and "64 slots" in reason           # #584 table axis kept
+    assert f"{budget} of {budget + 1}" in reason             # #813 class axis added
+    assert out["classes_truncated"] is True
+    assert out["classes_scanned"] == budget
+    assert out["classes_total"] == budget + 1
+    # Both axes reach text mode on the empty-candidate path.
+    from bn.formatters import _render_virtual_call_text
+    text = _render_virtual_call_text(out)
+    assert "64 slots" in text and f"{budget} of {budget + 1}" in text
+
+
 # --- #557: machine-readable reason codes for a null hlil_statement ---------
 
 
