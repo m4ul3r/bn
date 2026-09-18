@@ -1457,10 +1457,15 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
         if flag != mode and getattr(args, attr, unset) != unset
     ]
     if offenders:
+        # The noun follows the MODE rather than being hard-coded to "count":
+        # with `mode='--summary'` the old tail read "drop the flags for the
+        # count", which names a mode the caller did not ask for (#899 review).
+        # Derived from the flag so a future aggregate inherits it.
+        noun = mode.lstrip("-")
         raise BridgeError(
-            f"{command} {mode} reports the whole-target total, so "
+            f"{command} {mode} reports one answer for the whole target, so "
             f"{', '.join(offenders)} would be silently ignored. Drop {mode} for "
-            "the paged list, or drop the flags for the count."
+            f"the paged list, or drop the flags for the {noun}."
         )
 
 

@@ -330,6 +330,12 @@ def _go_functions(args: argparse.Namespace) -> int:
             stem="go-functions-count",
         )
     if args.summary:
+        # #899 review: the sibling one MODE over, missed by a table keyed on
+        # COMMANDS -- `go functions` was already listed for `--count`, so a
+        # second aggregate on the same command was structurally invisible to
+        # the coverage. Same shape as `imports --summary`: one object, so the
+        # paging flags cannot apply.
+        _refuse_count_only_slices(args, command="go functions", mode="--summary")
         return _call(
             args, "go_functions", {"summary": True},
             require_target=True,
