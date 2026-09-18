@@ -4755,6 +4755,32 @@ class TaintEngine:
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx} value (call: preset)", []):
                                         seeded = True
+                    # #851: when the model is `arity_capped`, the unrolled
+                    # *arg:N destination run may be shorter than the actual
+                    # call's destination count. If the call has more params than
+                    # max(modeled *arg:N) + 1, the residual destinations are
+                    # not seeded and the all-clear is not safe to report.
+                    if (model or {}).get("arity_capped"):
+                        _modeled_idxs = [
+                            _try_arg_index(str(sd.get("to") or ""))
+                            for sd in src_defs
+                            if str(sd.get("to", "")).startswith("*arg:")
+                        ]
+                        _modeled_idxs = [i for i in _modeled_idxs if i is not None]
+                        if _modeled_idxs and len(params) > max(_modeled_idxs) + 1:
+                            _ca = hex(int(getattr(c, "address", 0)))
+                            _mx = max(_modeled_idxs)
+                            _mn = min(_modeled_idxs)
+                            _n_extra = len(params) - (_mx + 1)
+                            add_assumption(
+                                f"scanf_arity_residual @ {_ca}: {callee} model "
+                                f"covers *arg:{_mn}..{_mx} "
+                                f"({len(_modeled_idxs)} destination(s)); "
+                                f"call has {len(params)} param(s) -- "
+                                f"{_n_extra} potential destination(s) beyond "
+                                f"the modeled run (arg:{_mx + 1}+) are not "
+                                f"seeded. scanf_arity_residual"
+                            )
             else:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded

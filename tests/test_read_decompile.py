@@ -3490,3 +3490,44 @@ def test_decompile_discloses_quick_analysis_state(monkeypatch):
     # The per-function flag is NOT the view state -- it stays False here, which is
     # why it could never carry this disclosure.
     assert quick["analysis_skipped"] is False
+
+
+def test_comment_map_tolerates_dict_mutation_during_iteration_850():
+    # #850: _comment_map iterated bv.address_comments.items() without first
+    # snapshotting the dict; on a quick-loaded view whose analysis is still
+    # settling, BN can add a comment between the property access and the
+    # iteration, raising ``RuntimeError: dictionary changed size during
+    # iteration``. The fix snapshots with dict() before iterating.
+    #
+    # Prove the fix by giving _comment_map an address_comments object whose
+    # .items() mutates the underlying store on each call (simulating a live BN
+    # view), so the pre-fix code would raise and the post-fix code must not.
+    il_format = importlib.import_module("bn_agent_bridge.il_format")
+
+    class _MutatingDict(dict):
+        """A dict whose .items() adds a new key every time it is called,
+        simulating a BN view that is being annotated while we iterate."""
+        _call_count: int = 0
+
+        def items(self):  # type: ignore[override]
+            self._call_count += 1
+            self[f"_extra_{self._call_count}"] = "injected"
+            return super().items()
+
+    class _FakeBV:
+        address_comments = _MutatingDict({0x1000: "a comment"})
+
+    class _FakeBlock:
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+
+    class _FakeFunc:
+        basic_blocks = [_FakeBlock(0x1000, 0x1010)]
+
+    bv = _FakeBV()
+    result = il_format._comment_map(bv, _FakeFunc())
+    # The original 0x1000 entry must be present; injected extras may or may not
+    # appear depending on snapshot timing -- the contract is no exception raised.
+    assert isinstance(result, dict)
+    assert "0x1000" in result

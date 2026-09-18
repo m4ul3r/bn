@@ -2289,7 +2289,31 @@ def test_send_request_to_instance_does_not_re_resolve_a_preresolved_budget(
         instance, "ping", timeout=0.25, resolved=True, connect_retries=1
     )
 
-    assert fake_socket.timeouts == pytest.approx([0.25], rel=1e-5)
+    # #852: the socket timeout is the deadline REMAINDER (`deadline -
+    # time.monotonic()`), so an exact-value assertion measures the jitter between
+    # two monotonic reads and a loaded box can flip it. What this test is about is
+    # that the pre-resolved 0.25 budget was not re-resolved from
+    # BN_REQUEST_TIMEOUT=600: bound it instead of pinning it.
+    assert len(fake_socket.timeouts) == 1
+    assert 0.2 < fake_socket.timeouts[0] <= 0.25
+
+
+
+def test_send_request_to_instance_refuses_non_dict_params_853(tmp_path, monkeypatch):
+    # #853: a non-None, non-dict `params` must be refused at the client side
+    # rather than silently coerced to {}, mirroring the bridge-side guard added
+    # in #773. No shipped caller passes a non-dict today, but the refusal must
+    # fire so the contract is enforced rather than silently corrected.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "S")
+
+    for bad_params in ([], "x", 42, True):
+        with pytest.raises(BridgeError, match="params must be a JSON object"):
+            transport._send_request_to_instance(
+                instance, "ping", params=bad_params, connect_retries=1
+            )
 
 
 # --------------------------------------------------------------------------
