@@ -486,6 +486,47 @@ def test_target_info_and_orient_digest_agree_on_existing_annotations_793(monkeyp
     assert digest["existing_annotations"] == info["existing_annotations"]
 
 
+def test_orient_digest_emits_the_annotation_block_once_883(monkeypatch):
+    """#883 item 2: agreement is not enough -- the block must be emitted ONCE.
+
+    `_target_info` publishes the block and the digest used to republish the SAME
+    dict under `target`, so `evidence orient --format json` carried two
+    byte-identical copies: on the view this was measured on, 2469 + 2469 compact
+    bytes of an 11398-byte payload (43%), and the reviewer's denser view hit 63%
+    of 15152. Trunk carried only the top-level copy. Asserting the two surfaces
+    AGREE (the #793 test above) passes under the duplication, so this pins the
+    shape itself: the block is BUILT once, so the nested copy is pure waste, and
+    the digest is the only surface that has a second place to put it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note", 0x401020: "second note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    digest = instance._orient_digest("active")
+
+    # The block is still there, at the path the digest has always documented...
+    assert digest["existing_annotations"]["comments"] == 2
+    # ...and NOT a second time under `target`, which is where the duplicate sat.
+    assert "existing_annotations" not in digest["target"]
+    # ...while `target info` -- where the block is that op's OWN answer, not a
+    # repeated one -- keeps publishing it.
+    assert instance._target_info("active")["existing_annotations"]["comments"] == 2
+    # The payload carries the block once, stated over the encoded digest: a
+    # `target` copy could only come back through that key name.
+    assert json.dumps(digest).count('"existing_annotations"') == 1
+
+
 def test_target_info_annotation_counts_degrade_but_stay_present_793(monkeypatch):
     """The other half of #793's contract: the key is never silently ABSENT. A view
     whose annotation counts cannot be read publishes the `unavailable` marker (the

@@ -3810,11 +3810,22 @@ class BinaryNinjaBridge:
         # #793: the block is built by `read_listing._existing_annotations` -- the ONE
         # builder, shared with `target info`, which is why the two surfaces can no
         # longer disagree. `_target_info` (called at the top of this digest) has
-        # already published it, so reuse that rather than pay the function/symbol
+        # already built it, so reuse that rather than pay the function/symbol
         # walk a second time; the fallback keeps the field a dict for a double that
         # answers `_target_info` without the key.
+        #
+        # #883 item 2: reuse it by TAKING it, not by leaving a second copy in
+        # place. `_target_info` publishes the block at its own top level and the
+        # digest republished the byte-identical dict again under `target` --
+        # 2629 + 2629 of an 11399-byte payload (46%) on the view this was
+        # measured on, and the same shape at 63% on a denser one. Built once
+        # (#793) and now emitted once: at the digest's top level, which is where
+        # trunk carried it, where `_render_orient_text` reads it, and where the
+        # bn-kernel `assert_unannotated` contract looks for it. Nothing reads the
+        # nested path; `target info` still publishes it, because there the block
+        # is that op's own answer rather than this digest's.
         filename = str(target.get("filename", "") or "")
-        existing_annotations = target.get("existing_annotations")
+        existing_annotations = target.pop("existing_annotations", None)
         if not isinstance(existing_annotations, dict):
             # A `_target_info` answered without the block (a double, or a bridge
             # predating #793): build it here through the same builder, resolving
