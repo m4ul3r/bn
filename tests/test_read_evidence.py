@@ -3702,6 +3702,115 @@ def test_argument_confidence_kept_for_known_prototype_648(monkeypatch):
     assert "abi_register_saturated" not in call
 
 
+def _with_type_library(bv, *, symbol, params, variadic=False,
+                       lib_name="libc_x86_64.so.6"):
+    """Attach a type library that declares *symbol* with *params* parameters.
+
+    Mirrors BN's real surface: `bv.type_libraries` of objects answering
+    `get_named_object(name)` with a function type (or None). A `_FakeBV` has no
+    `type_libraries` at all, which is why every other test in this file keeps its
+    pre-#759 behaviour -- no library, no claim.
+    """
+    proto = types.SimpleNamespace(
+        parameters=[types.SimpleNamespace(name=f"p{i}") for i in range(params)],
+        has_variable_arguments=variadic,
+    )
+    bv.type_libraries = [types.SimpleNamespace(
+        name=lib_name,
+        get_named_object=lambda n, _s=symbol, _p=proto: _p if str(n) == _s else None,
+    )]
+    return bv
+
+
+def _as_import(bv, name="hw_get_version"):
+    """Give the callee an IMPORTED function symbol, the provenance that makes a
+    library signature evidence about it. Measured shape: 174 of 175
+    library-name-matched callees on a dynamically linked target were imports."""
+    callee = next(f for f in bv.functions if f.name == name)
+    # `_FakeSymbol` is the shared stand-in whose `.type.name` is what
+    # `is_imported_function` reads -- the fake `SymbolType` members are plain
+    # strings with no `.name`, which is #593's divergence and would silently
+    # report "not an import" here.
+    callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    return bv
+
+
+
+def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_759(
+    monkeypatch,
+):
+    """#759: the #742 guard compares the rendered list against the callee's own
+    RECOVERED prototype, so an under-recovered callee agrees with itself and keeps
+    `authoritative` -- vacuous by construction.
+
+    Measured on a real target: `__popcountdi2()` rendered ZERO arguments with
+    `argument_confidence: authoritative` and `arity_mismatch` absent, while the
+    attached type library declares one parameter. The library is an INDEPENDENT
+    witness, so the row must stop asserting authority and say why."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["library_arity"] == 3
+    assert call["library_source"] == "libc_x86_64.so.6"
+
+
+def test_argument_confidence_kept_when_the_library_agrees_759(monkeypatch):
+    """Negative control: an agreeing library must not disturb an earned
+    `authoritative` (the #648 `memset` precedent)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["&buf", "0", "0x100"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "prototype_unverified" not in call
+
+
+def test_library_cross_check_skips_mangled_cxx_names_759(monkeypatch):
+    """The measured false-positive class. A mangled C++ name carries IMPLICIT
+    parameters a count comparison cannot see -- `this` on a method, an sret
+    return-slot pointer on a by-value class return -- so either side can differ by
+    one with nothing wrong. On a C++-heavy target 3 of 4 raw firings were exactly
+    that shape; restricting to unmangled names took the rate to 0."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    bv.functions[0].name = "_ZNSt6vectorIiSaIiEE9push_backERKi"
+    _with_type_library(bv, symbol="_ZNSt6vectorIiSaIiEE9push_backERKi", params=3)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeypatch):
+    """A variadic library signature states only its FIXED count, so a count
+    comparison against it is not evidence of under-recovery."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["fmt", "a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=1, variadic=True)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
     """#648: a genuinely void callee rendering NO arguments agrees with its recovered
     prototype -- nothing was invented, so it keeps `authoritative`. Demoting here
@@ -5090,3 +5199,243 @@ def test_render_function_evidence_text_warns_when_quick_loaded():
     full = _render_function_evidence_text({**value, "analysis_state": "full", "partial": False})
     assert "WARNING" not in full
     assert full.splitlines()[0] == "build_response @ 0x412470"
+
+
+def test_library_cross_check_refuses_a_locally_defined_name_collision_759(monkeypatch):
+    """#862 review blocker: the lookup keyed on the callee's NAME alone, so a
+    statically linked image defining its OWN ordinary-named function under a name
+    an attached library also carries got EVERY call row to it demoted -- a false
+    demotion on a collision that says nothing about the recovery.
+
+    No import symbol and an ordinary identifier means the library is describing
+    something else, so it is not evidence here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)   # no _as_import
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_library_cross_check_applies_to_a_reserved_identifier_759(monkeypatch):
+    """The other side of that gate, and the shape the whole change rests on.
+    `__popcountdi2` is statically linked from libgcc, so it is NOT an import --
+    an import-only gate would have thrown away the only true positive measured.
+    C11 7.1.3 reserves a leading `__` to the implementation, so a conforming
+    program cannot define it and the library still describes this callee."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = "__popcountdi2"
+    _with_type_library(bv, symbol="__popcountdi2", params=1,
+                       lib_name="libgcc_s_x86_64.so.1")
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["library_arity"] == 1
+    assert call["library_source"] == "libgcc_s_x86_64.so.1"
+
+
+def test_a_library_contradiction_demotes_even_with_a_user_prototype_759(monkeypatch):
+    """#862 DOGFOOD finding, and a deliberate reversal of the round-1 precedence
+    fix. Suppressing the cross-check on `has_user_type` turned the whole feature
+    off wherever it matters: BN sets that flag on almost every function and never
+    clears it (`proto set --preview` is refused precisely because there is no API
+    to clear it), so after a `bn save` + reopen it reads True for essentially
+    everything -- measured 104/104 imports and 853/853 locals on a reopened view,
+    957/959 on a corpus database. Against a saved `.bndb` -- the normal case --
+    the gate was a no-op versus base, including for the `__popcountdi2` callee it
+    was built for.
+
+    So the demotion is no longer suppressed. The round-1 concern was that it must
+    not SILENTLY overrule an analyst's own statement, and that is met by
+    disclosure rather than by privilege: a pinned prototype is demoted like any
+    other, while the row names both counts and the library and the text line
+    states that the contradiction is REPORTED, not judged -- so an analyst who
+    pinned one sees the claim, confirms with `bn proto get`, and can conclude the
+    library is wrong for this binary.
+
+    This is the shape the pre-dogfood tests never exercised: a callee whose type
+    reads as user-set, which is what every function on a reopened database looks
+    like."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2,
+                   arg_texts=["a", "b"], user_type=True)
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["declared_arity"] == 2
+    assert call["library_arity"] == 3
+    # The analyst-facing half of the trade: the contradiction is fully attributed,
+    # so a pinned prototype is checkable rather than quietly overruled.
+    assert call["library_source"] == "libc_x86_64.so.6"
+
+
+def test_an_agreeing_library_leaves_a_user_prototype_alone_759(monkeypatch):
+    """The control for the reversal: dropping the suppression must not demote a
+    user prototype the library AGREES with -- the demotion follows a real
+    contradiction, not the mere presence of a library entry."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["a", "b", "c"], user_type=True)
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "prototype_unverified" not in call
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    ["_ZNSt6vectorIiSaIiEE9push_backERKi",
+     "_RNvCs1234_4core3fmt5write",
+     "_D3std5stdio6writeln",
+     "_TtC4main6Widget"],
+    ids=["itanium", "rust-v0", "dlang", "swift-old"],
+)
+def test_library_cross_check_refuses_every_decorated_scheme_759(monkeypatch, mangled):
+    """#862 review round 2 MAJOR: the reserved-identifier arm was `_` plus an
+    uppercase letter, which is exactly where the mangling prefixes live -- every
+    Rust-v0 `_R...` symbol satisfied it, so a LOCAL Rust-mangled function
+    colliding with a library entry was still demoted. That is the round-1
+    collision class, narrowed to the one scheme the `_Z` refusal did not name.
+
+    A decorated name's implicit parameters (`this`, an sret return slot) make the
+    count comparison meaningless whatever its provenance, so every such scheme is
+    refused -- here even WITH import provenance, which is the stronger claim.
+
+    RESTORED after round 5 found it deleted: a bad end-boundary in an edit that
+    replaced the neighbouring test swallowed these four cases, leaving the
+    mangling-prefix refusal -- the fix this very finding produced -- with no
+    coverage at all. A repair must not remove its own coverage.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = mangled
+    _with_type_library(bv, symbol=mangled, params=3)
+    _as_import(bv, name=mangled)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
+    """The reserved arm's own test, which round 1 lacked. `__`-prefixed is the
+    implementation namespace a statically linked library function lives in; a
+    single underscore plus an uppercase letter is NOT admitted, because that is
+    the mangling-prefix space."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def confidence(local_name):
+        bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+        next(f for f in bv.functions if f.name == "hw_get_version").name = local_name
+        _with_type_library(bv, symbol=local_name, params=1)
+        return instance._function_evidence(
+            "active", "probe_device", context=0)["calls"][0]["argument_confidence"]
+
+    # A local `__`-reserved name IS described by the library (the `__popcountdi2`
+    # shape, statically linked from libgcc and not an import).
+    assert confidence("__popcountdi2") == "inferred"
+    # A local `_X` name is not, so no demotion.
+    assert confidence("_Exit") == "authoritative"
+
+
+def test_library_cross_check_refuses_when_two_libraries_disagree_759(monkeypatch):
+    """#862 review round 2 minor (a): first-library-wins made both the verdict and
+    the reported `library_source` depend on `bv.type_libraries` order, and a
+    later library that AGREED with the recovery was never consulted. Libraries
+    that contradict each other cannot settle anything."""
+    import types as _t
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["a", "b", "c"])
+    _as_import(bv)
+
+    def lib(name, params):
+        proto = _t.SimpleNamespace(
+            parameters=[_t.SimpleNamespace(name=f"p{i}") for i in range(params)],
+            has_variable_arguments=False)
+        return _t.SimpleNamespace(
+            name=name,
+            get_named_object=lambda n, _p=proto: _p if str(n) == "hw_get_version" else None)
+
+    # One says 1, the other agrees with the recovered 3: no usable claim either
+    # way, and in particular no demotion decided by ordering.
+    bv.type_libraries = [lib("libfirst.so", 1), lib("libsecond.so", 3)]
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+    # Reversed order, same answer -- the point of the fix.
+    bv.type_libraries = [lib("libsecond.so", 3), lib("libfirst.so", 1)]
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert "prototype_unverified" not in call
+
+
+@pytest.mark.parametrize(
+    "decorated",
+    ["?hw_get_version@@YAHXZ",
+     "$s4main13hwGetVersionSiyF",
+     "hw_get_version.part.0",
+     "hw_get_version@GLIBC_2.14"],
+    ids=["msvc", "swift-current", "gcc-clone-suffix", "versioned-symbol"],
+)
+def test_library_cross_check_refuses_punctuation_decorated_names_759(monkeypatch, decorated):
+    """#862 review round 6 MAJOR: the IDENTIFIER half of the refusal had no test
+    anywhere. Deleting `or not _C_IDENTIFIER_RE.match(name)` left every changed
+    test file green while IMPORTED punctuation-decorated callees flipped from
+    `authoritative` to `inferred` + `prototype_unverified` -- the measured
+    false-demotion class the agent-facing paragraph claims that rule excludes.
+
+    These are the schemes the prefix tuple does NOT catch, because they are not
+    valid C identifiers at all: MSVC `?name@@...`, current Swift `$s...`, a GCC
+    clone suffix, and a versioned symbol. Import provenance is deliberately
+    granted here, so the row can only stay authoritative because the NAME was
+    refused -- which is what makes this fail when the identifier clause goes."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = decorated
+    _with_type_library(bv, symbol=decorated, params=3)
+    _as_import(bv, name=decorated)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):
+    """The control that keeps the identifier rule from becoming a blanket refusal:
+    an ordinary C name with import provenance and a contradicting library MUST
+    still demote, or the rule above would be "refuse everything" and the two
+    tests would pass together while the feature did nothing."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["prototype_unverified"] is True
+    assert call["argument_confidence"] == "inferred"

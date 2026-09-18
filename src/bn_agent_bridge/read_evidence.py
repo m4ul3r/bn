@@ -283,6 +283,127 @@ def _abi_arg_register_count(bv, callee_fn) -> int | None:
     return len(regs) or None
 
 
+_C_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Mangling prefixes that are still valid C identifiers, so `_C_IDENTIFIER_RE`
+# cannot exclude them: Itanium C++ and Rust's legacy scheme (`_Z`), Rust v0
+# (`_R`), D (`_D`), older Swift (`_T`). A decorated name carries implicit
+# parameters a count comparison cannot see (`this`, an sret return slot), so it
+# is refused whatever its provenance -- unlike the schemes that use punctuation
+# (MSVC `?name@@...`, current Swift `$s...`), which the identifier rule already
+# rejects.
+_MANGLED_PREFIXES = ("_Z", "_R", "_D", "_T")
+
+
+def _library_signature_applies(callee_fn, name: str) -> bool:
+    """Is an attached library's signature evidence about THIS callee, or merely
+    about something that shares its name?
+
+    The gate the first cut of #759 lacked: it keyed on the name alone, so a
+    statically linked image defining its OWN function under a name a bundled
+    library also carries got every call row to it demoted on a name collision
+    that says nothing about the recovery (#862 review).
+
+    Two ways a library signature does apply, and both are needed -- measured on
+    a dynamically linked C++ target, where 174 of 175 library-name matches were
+    imports and the ONE local match was `__popcountdi2`, statically linked from
+    libgcc and genuinely under-recovered (the true positive this whole change
+    rests on, which an import-only gate would have thrown away):
+
+    * an **imported** callee resolves to the library's symbol by definition;
+    * a **reserved identifier** -- C11 7.1.3 reserves a leading ``__`` to the
+      implementation -- cannot be a conforming program's own function, so a
+      statically linked copy is still the library's function. The ``_`` plus an
+      uppercase letter half of that rule was REMOVED: it is where the mangling
+      prefixes live (``_Z``, ``_R``, ``_D``, ``_T``), so it readmitted the
+      collision class it was meant to exclude.
+
+    An ordinary-named local definition is therefore refused, which is exactly
+    the collision shape. Two costs, stated plainly rather than discovered later:
+    a statically linked ordinary-named library function (a static ``memcpy``) is
+    out of reach here, and so is any callee whose name carries a mangling prefix,
+    since ``_library_param_count`` refuses those outright whatever their
+    provenance. Both are part of the residual tracked in #865.
+    """
+    # `is_imported_function` is the module's existing predicate for this, already
+    # imported here: it reads the symbol kind by NAME, so it works against BN's
+    # enum and the test fake alike (#593's class of divergence) and there is one
+    # answer to "is this callee an import" rather than two.
+    if is_imported_function(callee_fn):
+        return True
+    # A LEADING DOUBLE UNDERSCORE only. The first cut also admitted `_` plus an
+    # uppercase letter, which is where every mangling prefix lives -- `_Z`
+    # (Itanium, and Rust's legacy scheme), `_R` (Rust v0), `_D` (D), `_T` (older
+    # Swift) -- so a LOCAL Rust-mangled function colliding with a library entry
+    # was still demoted: the round-1 collision class, narrowed to the one
+    # decorated scheme the `_Z` refusal did not name (#862 review round 2).
+    #
+    # It also justified itself with C11 7.1.3 while being applied to every
+    # language. Restricting it to `__` keeps the shape it was written for (a
+    # statically linked `__popcountdi2`, `__memcpy_chk`, `__errno_location`) and
+    # leaves every decorated name to prove real import provenance instead. The
+    # cost is a reserved single-underscore C name such as `_Exit` defined
+    # locally, which is covered whenever it is an import and is not worth
+    # readmitting an entire mangling scheme for.
+    return name.startswith("__")
+
+
+def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
+    """The parameter count an attached type library declares for *name*, with the
+    library that declared it -- or None when no library makes a usable claim.
+
+    This is the INDEPENDENT witness #742 lacked. That guard compares the rendered
+    argument list against the callee's own recovered prototype, so a callee whose
+    type was itself mis-recovered agrees with itself and keeps `authoritative`
+    (#759). A bundled library signature is not derived from this binary's
+    analysis, so it can contradict the recovery.
+
+    Two refusals, both measured rather than assumed:
+
+    * **Mangled C++ names.** `this` on a method and an sret return-slot pointer on
+      a by-value class return are implicit parameters a count comparison cannot
+      see, so either side can differ by one with nothing wrong. On a C++-heavy
+      target 3 of 4 raw firings were exactly that; excluding mangled names took
+      the false-positive rate to 0 over 13,009 comparable call rows.
+    * **A variadic library signature**, which states only its fixed count.
+    """
+    # `_Z` FIRST, and not merely as one decoration among many: an Itanium mangled
+    # name IS a valid C identifier, so the identifier rule cannot exclude it --
+    # and every such name begins `_Z`, which the reserved-identifier arm of
+    # `_library_signature_applies` would otherwise ADMIT, re-opening exactly the
+    # implicit-parameter false positives this refusal exists to stop. The
+    # identifier rule then covers the schemes that use punctuation (MSVC
+    # `?name@@...`, Swift `$s...`) plus clone suffixes and versioned symbols.
+    if not name or name.startswith(_MANGLED_PREFIXES) or not _C_IDENTIFIER_RE.match(name):
+        return None
+    if not _library_signature_applies(callee_fn, name):
+        return None
+    # EVERY attached library, not the first that happens to name the symbol
+    # (#862 review round 2 minor a): with two libraries stating different counts,
+    # first-wins made both the verdict and the reported `library_source` depend on
+    # `bv.type_libraries` order, and a later library that AGREED with the recovery
+    # was never consulted. Libraries that disagree with each other cannot settle
+    # anything, so that is a refusal rather than a coin toss.
+    claims: list[tuple[int, str]] = []
+    for lib in (getattr(bv, "type_libraries", None) or []):
+        try:
+            obj = lib.get_named_object(name)
+            if obj is None:
+                continue
+            if bool(getattr(obj, "has_variable_arguments", False)):
+                return None
+            params = getattr(obj, "parameters", None)
+            if params is None:
+                continue
+            claims.append(
+                (len(list(params)), str(getattr(lib, "name", "") or "type library")))
+        except Exception:  # noqa: BLE001 - a malformed library must not fail the read
+            continue
+    if not claims or len({count for count, _ in claims}) != 1:
+        return None
+    return claims[0]
+
+
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
                              arguments: list[dict[str, Any]]) -> dict[str, Any]:
     """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
@@ -344,6 +465,44 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     except TypeError:
         declared_count = None
     is_variadic = il_format._function_is_variadic(callee_fn)
+    # #759: cross-check the RECOVERED prototype against a bundled library
+    # signature before either branch below trusts it. Both of them compare the
+    # rendered list against `declared_count`, so an under-recovered callee agrees
+    # with itself -- measured on a real target as `__popcountdi2()` rendering zero
+    # arguments with `authoritative` and no mismatch, against a library that
+    # declares one parameter. Recorded whenever the two disagree, including the
+    # zero-vs-N case the "genuinely void callee" branch below would wave through.
+    # Deliberately NOT suppressed for a user prototype. Round 1 of this review
+    # asked for that precedence and it was implemented as
+    # `None if has_user_type else ...`, which the dogfood then measured as
+    # turning the whole cross-check OFF wherever it matters: BN sets
+    # `has_user_type` on almost every function and exposes no API to clear it
+    # (which is why `proto set --preview` is refused), so after a `bn save` and
+    # reopen it reads True for essentially everything -- 104/104 imports and
+    # 853/853 locals on a reopened view, 957/959 on a corpus database. Against a
+    # saved `.bndb`, the normal case, the gate became a no-op versus base.
+    #
+    # The round-1 concern was that a demotion must not SILENTLY overrule an
+    # analyst's statement. That is met by DISCLOSURE, not by privilege: a pinned
+    # prototype IS demoted like any other, and the row carries `declared_arity`,
+    # `library_arity` and `library_source`, and the text line names the
+    # disagreement as the reason it withheld `authoritative` and warns that the
+    # row may be contradicting a prototype the analyst pinned -- so the claim is
+    # visible, checkable with `bn proto get`, and can be judged wrong for this
+    # binary. The renderer owns that wording; this comment does not quote it. Suppression bought the nuance
+    # at the price of the feature everywhere it matters.
+    library = _library_param_count(
+        bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
+    if (
+        library is not None
+        and declared_count is not None
+        and not is_variadic
+        and library[0] != declared_count
+    ):
+        evidence["prototype_unverified"] = True
+        evidence["declared_arity"] = declared_count
+        evidence["library_arity"] = library[0]
+        evidence["library_source"] = library[1]
     if declared_count is not None and (declared_count > 0 or has_user_type):
         # User prototypes also establish zero arity, but do not guarantee that
         # HLIL recovered that many arguments. Only compare an actual HLIL list;
@@ -538,7 +697,14 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
-        elif (arity["arity_unknown"] or arity.get("arity_mismatch")) and argument_confidence == "authoritative":
+        elif (
+            arity["arity_unknown"]
+            or arity.get("arity_mismatch")
+            # #759: a bundled library signature contradicting the recovered
+            # prototype is a positive reason to distrust it, so the row stops
+            # claiming authority and carries `library_arity` saying why.
+            or arity.get("prototype_unverified")
+        ) and argument_confidence == "authoritative":
             argument_confidence = "inferred"
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)

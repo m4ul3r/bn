@@ -4885,6 +4885,74 @@ def test_render_evidence_function_notes_callee_unresolved_704():
     assert "arity: UNKNOWN — call target could not be resolved" in out
 
 
+def test_render_evidence_function_states_the_library_contradiction_759():
+    """#862 review: `prototype_unverified` is the THIRD demotion cause, and the
+    only one that rendered no reason -- the row showed a bare
+    `arguments: (hlil inferred)` on the very surface the issue quotes, which is
+    the silent demotion this issue family exists to stop. Its siblings
+    (`arity_unknown`, `arity_mismatch`, `callee_unresolved`) each explain
+    themselves here."""
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "decode_block", "address": "0x401800"},
+        "prototype": "void decode_block()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [{
+            "address": "0x401800", "operation": "LLIL_CALL", "direct": True,
+            "argument_source": "hlil", "argument_confidence": "inferred",
+            "arguments": [], "argument_candidates": [],
+            "arity_unknown": False, "prototype_unverified": True,
+            "declared_arity": 0, "library_arity": 1,
+            "library_source": "libgcc_s_x86_64.so.1",
+        }],
+    }
+    out = _render_function_evidence_text(value)
+    assert "arity: UNVERIFIED" in out
+    # The two counts and the library that supplied the contradiction, so the
+    # reader can check it rather than take the demotion on trust.
+    assert "declares 0 but libgcc_s_x86_64.so.1 declares 1" in out
+    # The precedence PROMISE is gone (the dogfood showed suppressing on
+    # has_user_type disabled the check on every saved database), so the line now
+    # states what it can defend: the contradiction is reported, not judged.
+    # The card must not tell the reader the disagreement is harmless when it IS
+    # a demotion trigger (#862 review round 6), nor claim it is the ONLY one:
+    # `prototype_unverified` can co-occur with `arity_mismatch`/`arity_unknown`,
+    # whose own `arity:` line prints directly above (round 7).
+    assert "one reason this row is not fully corroborated" in out
+    assert "any other `arity:` line above names another" in out
+    # Neither overclaim may come back: not "the whole basis", and not a named
+    # confidence the row may not even have -- an MLIL/LLIL-sourced list is
+    # `heuristic`, never `inferred` (round 7).
+    assert "the whole basis" not in out
+    assert "this row's `inferred` confidence" not in out
+    assert "this row disagrees with your statement" in out
+    assert "takes precedence" not in out
+    assert "is not evidence against it" not in out
+
+
+def test_render_evidence_function_library_contradiction_without_counts():
+    """The same row with unusable counts still states the cause: a disclosure
+    that can only be rendered when every field is well formed is a disclosure
+    that vanishes exactly when the payload is degraded."""
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "decode_block", "address": "0x401800"},
+        "prototype": "void decode_block()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [{
+            "address": "0x401800", "operation": "LLIL_CALL", "direct": True,
+            "argument_source": "hlil", "argument_confidence": "inferred",
+            "arguments": [], "argument_candidates": [],
+            "prototype_unverified": True, "declared_arity": "bad",
+        }],
+    }
+    out = _render_function_evidence_text(value)
+    assert "arity: UNVERIFIED" in out
+    assert "disagrees with an attached type library" in out
+
+
 def test_render_orient_shows_existing_annotations():
     # #561: the orient card surfaces inherited-annotation counts + provenance hint.
     from bn.formatters import _render_orient_text
