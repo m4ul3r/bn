@@ -821,80 +821,58 @@ def test_load_text_renders_notes(fake_transport, tmp_path, capsys):
     assert "--no-bndb" in stdout
 
 
-def test_load_opts_into_spawn_missing_named(monkeypatch, tmp_path):
+def test_load_opts_into_spawn_missing_named(fake_transport, tmp_path):
     # `bn load --instance <new-id>` should auto-spawn that named bridge, so the
-    # load handler is the one command that opts into spawn_missing_named.
+    # load handler is the one command that opts into spawn_missing_named. Read
+    # off the SHARED recorder (#787): the routing kwarg is part of the recorded
+    # request, so a regression that dropped it fails here instead of passing.
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        captured["op"] = op
-        captured["instance_id"] = instance_id
-        captured["spawn_missing_named"] = spawn_missing_named
-        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"load_binary": {"ok": True, "result": {
+        "loaded": True, "path": str(raw), "notes": [], "targets": []}}})
     rc = bn.cli.main(["load", str(raw), "--instance", "brandnew"])
 
     assert rc == 0
-    assert captured["op"] == "load_binary"
-    assert captured["instance_id"] == "brandnew"
-    assert captured["spawn_missing_named"] is True
+    assert calls[-1]["op"] == "load_binary"
+    assert calls[-1]["instance_id"] == "brandnew"
+    assert calls[-1]["spawn_missing_named"] is True
 
 
-def test_non_load_command_does_not_spawn_missing_named(monkeypatch):
+def test_non_load_command_does_not_spawn_missing_named(fake_transport):
     # Read commands must not silently spawn a process for a typo'd --instance.
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        captured["spawn_missing_named"] = spawn_missing_named
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"sections": {"ok": True, "result": []}})
     rc = bn.cli.main(["sections", "--target", "active"])
 
     assert rc == 0
-    assert captured["spawn_missing_named"] is False
+    assert calls[-1]["op"] == "sections"
+    assert calls[-1]["spawn_missing_named"] is False
 
 
-def test_load_accepts_instance_id_alias_for_spawn_name(monkeypatch, tmp_path):
+def test_load_accepts_instance_id_alias_for_spawn_name(fake_transport, tmp_path):
     # #258: `bn load --instance-id <new-id>` is an alias for `--instance <new-id>`,
     # so the spawn-name flag is consistent with `bn session start --instance-id`.
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        captured["op"] = op
-        captured["instance_id"] = instance_id
-        captured["spawn_missing_named"] = spawn_missing_named
-        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"load_binary": {"ok": True, "result": {
+        "loaded": True, "path": str(raw), "notes": [], "targets": []}}})
     rc = bn.cli.main(["load", str(raw), "--instance-id", "brandnew"])
 
     assert rc == 0
-    assert captured["op"] == "load_binary"
-    assert captured["instance_id"] == "brandnew"
-    assert captured["spawn_missing_named"] is True
+    assert calls[-1]["op"] == "load_binary"
+    assert calls[-1]["instance_id"] == "brandnew"
+    assert calls[-1]["spawn_missing_named"] is True
 
-def test_load_instance_id_does_not_clobber_env_instance(monkeypatch, tmp_path):
+def test_load_instance_id_does_not_clobber_env_instance(fake_transport, tmp_path):
     # The --instance-id alias defaults to SUPPRESS, so when it is NOT passed it
     # must not overwrite a root-level --instance / BN_INSTANCE selection.
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        captured["instance_id"] = instance_id
-        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"load_binary": {"ok": True, "result": {
+        "loaded": True, "path": str(raw), "notes": [], "targets": []}}})
     rc = bn.cli.main(["--instance", "fromroot", "load", str(raw)])
 
     assert rc == 0
-    assert captured["instance_id"] == "fromroot"
+    assert calls[-1]["instance_id"] == "fromroot"
 
 
 def test_load_forwards_workdir_for_private_project_association(
