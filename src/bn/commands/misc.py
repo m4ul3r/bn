@@ -28,6 +28,21 @@ from ..formatters import (
 from ..transport import BridgeError, unwrap_result
 
 
+def _strings_count_text(value: Any) -> str:
+    """The `strings --count` line, with the filter's denominator (#795).
+
+    `Total strings: 30` from a `--probable-format-strings` run said nothing about
+    the 1329 strings the filter dropped, so the denominator cost a SECOND
+    unfiltered invocation. Mirrors `_imports_count_text`'s excluded-count tail:
+    the bridge's own `filtered` count is disclosed parenthetically when it is
+    non-zero, and the line is unchanged on an unfiltered dump."""
+    line = f"Total strings: {value.get('count', 0)}"
+    filtered = value.get("filtered")
+    if isinstance(filtered, int) and filtered > 0:
+        line += f" ({filtered} filtered out by the active filters)"
+    return line
+
+
 @command("strings", help="List or search strings", target=True, paged=True,
          fanout=True,
          args=[
@@ -67,7 +82,7 @@ def _strings(args: argparse.Namespace) -> int:
             "strings",
             {**common, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total strings: {value.get('count', 0)}",
+            text_renderer=_strings_count_text,
             stem="strings-count",
             regex_hint_query=args.query,
         )

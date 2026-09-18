@@ -3843,9 +3843,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    assert len(sites) == 19, (
+    # 19 -> 20 (#795): `_render_strings_text` now reads `filtered` through
+    # `_count_field` to state how many strings the active filters dropped.
+    assert len(sites) == 20, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 19. The number is the size of the covered set: a "
+        "count helper, not 20. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3913,6 +3915,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # #795: this pair DOES state the count -- the recorded context makes the
+        # inner `_render_paged_list_text` boundary disclose first, and the
+        # differential's body split cuts at that note, so the pair is skipped by
+        # the HARNESS rather than by the renderer. Covered by name in
+        # `test_strings_discloses_the_dropped_count_795` (page + count line) and
+        # `test_strings_count_text_states_the_dropped_count_795`.
+        "_render_strings_text(filtered) [count not stated in this context]",
     ], sorted(not_stated)
 
 
@@ -4287,12 +4296,14 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
+    # 4920 -> 4928 (#795): `filtered` is a read `_render_strings_text` did not
+    # make (1 pair x 8 bogus values), measured the same way.
     # 4896 -> 4920 (#770): `_render_class_list_text` now delegates its paging to
     # the SHARED `_paging_footer`, which reads `returned`, `offset` and
     # `has_more` -- three keys that renderer did not ask for while it built its
     # own footer (it already read `total`). 3 pairs x 8 bogus values = 24,
     # MEASURED by diffing `_runtime_population()` rather than carried over.
-    assert swept == 4920, f"the raise sweep ran {swept} renders, not 4920"
+    assert swept == 4928, f"the raise sweep ran {swept} renders, not 4928"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4450,7 +4461,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
     # 1426 -> 1432 (#770): the same three `_render_class_list_text` pairs above,
     # x 2 benign payloads each. Measured, not carried over.
-    assert checked == 1432, f"the mirror ran {checked} renders, not 1432"
+    # 1432 -> 1434 (#795): the one `_render_strings_text`/`filtered` pair, x 2.
+    assert checked == 1434, f"the mirror ran {checked} renders, not 1434"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

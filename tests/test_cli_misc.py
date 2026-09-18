@@ -1558,3 +1558,63 @@ def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--target is empty" in capsys.readouterr().err
+
+
+def test_strings_discloses_the_dropped_count_795(fake_transport, capsys):
+    """#795: the filter's denominator cost a SECOND invocation.
+
+    `strings --count --format json` reported 1359 and the same command with
+    `--probable-format-strings` reported 30, and NOTHING in either answer said
+    what happened to the 1329 in between -- so an agent had to spend a second
+    unfiltered call to learn the filter's denominator. The bridge now reports the
+    dropped count on both the count result and the list envelope, and text mode
+    states it next to the page (the same shape `imports` uses for the exports its
+    own filter excludes, #202).
+    """
+    envelope = {"items": [{"address": "0x401000", "length": 6, "chars": 6,
+                           "type": "ascii", "value": "%s%s"}],
+                "total": 30, "offset": 0, "limit": 1, "returned": 1,
+                "has_more": True, "filtered": 1329}
+    calls = fake_transport({"strings": {"ok": True, "result": envelope}})
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--limit", "1", "--format", "text"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert "%s%s" in stdout
+    assert "// showing 1 of 30 (29 more)" in stdout
+    assert "// 1329 string(s) filtered out by the active filters" in stdout
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    assert calls[-1]["params"]["count_only"] is True
+    capsys.readouterr()          # the list envelope this fake still answers with
+    # The count result carries the same denominator (`filtered`), so the JSON
+    # consumer reads 30 and 1329 from ONE invocation.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    counted = json.loads(capsys.readouterr().out)
+    assert counted["count"] == 30 and counted["filtered"] == 1329
+
+
+def test_strings_count_text_states_the_dropped_count_795(fake_transport, capsys):
+    """The `--count` line is the one an agent stops on, so it carries the
+    denominator itself: `Total strings: 30 (1329 filtered out ...)`. An
+    unfiltered dump is unchanged (nothing was dropped, nothing to disclose)."""
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total strings: 30 (1329 filtered out by the active filters)")
+
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 1359, "total": 1359, "filtered": 0}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "Total strings: 1359"

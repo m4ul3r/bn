@@ -4096,7 +4096,28 @@ def _render_strings_rows(value: Any) -> str:
 def _render_strings_text(value: Any) -> str:
     """Render strings: the paged {items, total, ...} envelope (with a footer),
     or a bare list for back-compat / internal callers (#122)."""
-    return _render_paged_list_text(value, "items", _render_strings_rows)
+    body = _render_paged_list_text(value, "items", _render_strings_rows)
+    # #795: state how many strings the ACTIVE filter chain dropped, so the
+    # denominator does not need a second unfiltered invocation (`strings --count`
+    # reported 1359 where `--probable-format-strings --count` reported 30, and
+    # nothing named the 1329 in between). Same shape as `imports`' note for the
+    # exports its own filter excludes (#202).
+    if isinstance(value, dict):
+        # ONE read, through the count choke point: absent/null answer 0 (nothing
+        # claimed, so nothing to say), a readable count states the filter's
+        # denominator, and an unreadable one is disclosed as unreadable rather
+        # than rendered as an unfiltered page (#619).
+        dropped = _count_field(value, "filtered")
+        if dropped:
+            note = (f"// {dropped} string(s) filtered out by the active filters "
+                    f"(--query/--regex, --min-length/--max-length, --section, "
+                    f"--no-crt, --probable-format-strings)")
+            body = note if body == "none" else f"{body}\n{note}"
+        elif _field_skewed("filtered"):
+            note = ("// the payload's filtered-string count is not a number that "
+                    "can be read (use --format json)")
+            body = note if body == "none" else f"{body}\n{note}"
+    return body
 
 
 def _render_sections_rows(value: Any) -> str:
