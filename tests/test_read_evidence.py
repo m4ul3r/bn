@@ -3511,7 +3511,18 @@ def test_virtual_call_class_budget_unresolved_reason_joins_table_reason_813(monk
     monkeypatch.setattr(bridge.read_class, "_vtable_layout",
                         lambda ctx, pv, addr: {
                             "slots": [{"index": i, "method": {"name": f"m{i}"}} for i in range(64)],
-                            "truncated": True, "max_slots": 64,
+                            # #822 split the two questions this fixture used to
+                            # answer with one flag: `truncated` is "the LISTING is
+                            # a prefix", `scan_truncated` is "the total is not
+                            # exact". The read consults `scan_truncated` to decide
+                            # the slot is undecided, so a stub carrying only
+                            # `truncated` describes a layout the real
+                            # `_vtable_layout` never returns for a capped scan --
+                            # and silently loses the #584 table axis this test
+                            # exists to check survives alongside #813's.
+                            "truncated": True, "slots_truncated": True,
+                            "scan_truncated": True,
+                            "truncated_reason": "scan_capped", "max_slots": 64,
                         })
 
     out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
