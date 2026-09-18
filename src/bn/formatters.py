@@ -2516,6 +2516,28 @@ def _render_function_evidence_text(value: Any) -> str:
                 "  arity: UNKNOWN — call target could not be resolved to a callee "
                 "function, so no signature exists to check arguments against."
             )
+        if call.get("prototype_unverified"):
+            # #759/#862: the third demotion cause. `arity_unknown`,
+            # `arity_mismatch` and `callee_unresolved` each explain themselves on
+            # this surface; a row demoted because a bundled library CONTRADICTS
+            # the callee's recovered prototype rendered a bare
+            # `arguments: (hlil inferred)` with no reason, which is the silent
+            # demotion this issue family exists to stop.
+            declared_n = call.get("declared_arity")
+            library_n = call.get("library_arity")
+            source_lib = call.get("library_source")
+            counts = (
+                f"declares {declared_n} but {source_lib or 'an attached type library'} "
+                f"declares {library_n}"
+                if isinstance(declared_n, int) and isinstance(library_n, int)
+                else "disagrees with an attached type library"
+            )
+            lines.append(
+                f"  arity: UNVERIFIED — the callee's recovered prototype {counts}, "
+                "so the recovered signature is not corroborated and these arguments "
+                "may be under-recovered. Confirm with `bn proto get <callee>`; a user "
+                "prototype takes precedence over the library."
+            )
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
