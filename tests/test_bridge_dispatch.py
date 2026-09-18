@@ -3856,6 +3856,54 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
     assert json.loads(handler.wfile.data.decode("utf-8"))["ok"] is True
 
 
+def test_bridge_response_echoes_the_request_id(monkeypatch):
+    """#825 item 2: the request's `id` was threaded to `_encode_response` for
+    cancel tracking but never emitted, so a client could not correlate a
+    response with its request from the body alone."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps(
+            {"op": "noop", "id": "req-7f3a", "_bridge_identity": inst.bridge_identity}
+        ).encode("utf-8")
+        + b"\n"
+    )
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert json.loads(handler.wfile.data.decode("utf-8"))["id"] == "req-7f3a"
+
+
+def test_bridge_response_omits_id_when_the_request_had_none(monkeypatch):
+    """Must-not-fire twin for #825 item 2: the echo is additive. A request with
+    no `id` must not grow a null one -- a client checking `"id" in response`
+    would otherwise see it on every reply."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps({"op": "noop", "_bridge_identity": inst.bridge_identity}).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )  # NO id
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert "id" not in json.loads(handler.wfile.data.decode("utf-8"))
+
+
 def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
     """#637 review (F3): a request without an `id` is still tracked -- the reaper's
     counter is server-generated, independent of the client's (cancellation) id -- so

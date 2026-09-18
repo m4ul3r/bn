@@ -3276,7 +3276,7 @@ def _cfg_asm_bv():
         lines=[_FakeCFGLine(0x401000, "cmp eax, 0x0"),
                _FakeCFGLine(0x401004, "je 0x401010")],
         edges=[_FakeCFGEdge(b2, "TrueBranch"),
-               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: must be dropped
+               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: disclosed (#682)
     )
     fn.basic_blocks = [b1, b2]
     return _FakeBV(functions=[fn]), fn
@@ -3299,9 +3299,53 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
         {"a": "0x401000", "t": "cmp eax, 0x0"},
         {"a": "0x401004", "t": "je 0x401010"},
     ]
-    # The edge whose target is None (indirect/unresolved) is dropped, not rendered.
-    assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    # #682 item 3: the edge whose target is None (indirect/unresolved) is
+    # DISCLOSED, not dropped. This assertion previously read "is dropped, not
+    # rendered" and was the test pinning the defect: dropping it renders an
+    # indirect branch identical to a block with no outgoing edge at all.
+    assert blocks[0]["edges"] == [
+        {"to": "0x401010", "k": "TrueBranch"},
+        {"to": None, "k": "IndirectBranch", "unresolved": True},
+    ]
     assert blocks[1]["edges"] == []
+
+
+def test_cfg_resolved_edges_carry_no_unresolved_key(monkeypatch):
+    # Must-not-fire twin for #682 item 3: the disclosure is additive, so a
+    # normally-resolved edge keeps its exact previous shape. A consumer that
+    # does `"unresolved" in edge` must not see it on every edge.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_asm_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "process_packet", view="asm")
+
+    resolved = result["blocks"][0]["edges"][0]
+    assert resolved == {"to": "0x401010", "k": "TrueBranch"}
+    assert "unresolved" not in resolved
+
+
+def test_cfg_asm_blocks_are_sorted_by_start_not_bn_iteration_order(monkeypatch):
+    # #682 item 4: BN yields asm basic blocks in its own order, which is not
+    # address order. Feed them deliberately interleaved -- the shape observed
+    # on a real target -- and require address order out.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401090, "handler", "void handler(void)")
+    b_90 = _FakeCFGBlock(0x401090, lines=[_FakeCFGLine(0x401090, "push rbp")])
+    b_b0 = _FakeCFGBlock(0x4010B0, lines=[_FakeCFGLine(0x4010B0, "ret")])
+    b_9d = _FakeCFGBlock(0x40109D, lines=[_FakeCFGLine(0x40109D, "test eax, eax")])
+    b_a7 = _FakeCFGBlock(0x4010A7, lines=[_FakeCFGLine(0x4010A7, "jmp 0x4010b0")])
+    fn.basic_blocks = [b_90, b_b0, b_9d, b_a7]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "handler", view="asm")
+
+    assert [b["start"] for b in result["blocks"]] == [
+        "0x401090", "0x40109d", "0x4010a7", "0x4010b0",
+    ]
 
 
 def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):

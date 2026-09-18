@@ -1019,6 +1019,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         )
         if identity is not None:
             response = {**response, "bridge_identity": dict(identity)}
+        # #825 item 2: echo the request's `id` (forward-compat). It was already
+        # threaded to this method for cancel tracking and disconnect logging but
+        # never emitted, so a client could not correlate a response with the
+        # request that produced it from the body alone. The current transport is
+        # one request per connection, so nothing NEEDS it today -- which is
+        # exactly why it is cheap to add now and expensive to retrofit once a
+        # multiplexing client exists. Emitted only when the request supplied
+        # one, so a request without an `id` keeps its byte-identical response.
+        if request_id is not None:
+            response = {**response, "id": request_id}
         for attempt in (1, 2):
             try:
                 return json.dumps(response, sort_keys=True, default=str).encode("utf-8")

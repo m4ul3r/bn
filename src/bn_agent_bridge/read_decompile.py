@@ -420,7 +420,14 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             )
     blocks = []
     if fn is not None:
-        for bb in fn.basic_blocks:
+        # #682 item 4: BN hands back basic blocks in its own iteration order,
+        # which at the asm level is not address order (observed interleaving
+        # such as 0x401090, 0x4010b0, 0x40109d). IL levels happen to come out
+        # sorted, so this is a no-op there and makes the asm render readable.
+        # Sorting on `bb.start` matches the documented identity contract at
+        # every level: an address at asm, an IL index at MLIL/HLIL.
+        ordered = sorted(fn.basic_blocks, key=lambda bb: int(bb.start))
+        for bb in ordered:
             insns = [
                 {"a": hex(line.address), "t": "".join(str(t) for t in line.tokens)}
                 for line in bb.disassembly_text
@@ -429,12 +436,21 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             # kind -- but fall back to str() rather than raising the whole op if
             # a core ever hands back a bare int (the same class of surprise as
             # a relocation/symbol enum arriving unwrapped).
-            edges = [
-                {"to": hex(edge.target.start),
-                 "k": getattr(edge.type, "name", None) or str(edge.type)}
-                for edge in bb.outgoing_edges
-                if edge.target is not None
-            ]
+            #
+            # #682 item 3: an edge with no target used to be DROPPED, which
+            # renders an indirect or unresolved branch identical to a block
+            # with no outgoing edge at all -- the one distinction a
+            # control-flow view must not lose. Emit it with `to: null` and
+            # `unresolved: true` so a consumer can tell "goes nowhere" from
+            # "goes somewhere analysis could not name". The key is present
+            # only on such an edge, so resolved edges keep their exact shape.
+            edges = []
+            for edge in bb.outgoing_edges:
+                kind = getattr(edge.type, "name", None) or str(edge.type)
+                if edge.target is None:
+                    edges.append({"to": None, "k": kind, "unresolved": True})
+                else:
+                    edges.append({"to": hex(edge.target.start), "k": kind})
             blocks.append({"start": hex(bb.start), "insns": insns, "edges": edges})
     result = {
         "kind": "cfg",

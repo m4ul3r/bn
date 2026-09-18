@@ -1148,6 +1148,40 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_render_data_symbols_empty_page_past_the_end_discloses_the_total():
+    # #682 item 4: a bare "none" reads as "this view has no data symbols".
+    # The case that actually produces it -- an --offset past the end -- then
+    # hides the real total and gives the reader nothing to re-page from.
+    from bn.formatters import _render_data_symbols_text
+    out = _render_data_symbols_text({"items": [], "total": 1284, "offset": 2000})
+    assert "1284" in out and "2000" in out
+    assert "past the end" in out
+
+
+def test_render_data_symbols_genuinely_empty_view_stays_bare_none():
+    # Must-not-fire twin: a view with NO data symbols is not an over-shot page,
+    # so it must not grow a spurious "past the end" note.
+    from bn.formatters import _render_data_symbols_text
+    assert _render_data_symbols_text({"items": [], "total": 0, "offset": 0}) == "none"
+
+
+def test_render_cfg_unresolved_edge_is_named_not_rendered_as_none():
+    # #682 item 3: an unresolved edge carries `to: null`. Rendering the raw
+    # value prints the bare word "None", which reads like a block named None.
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({
+        "function": {"name": "handler", "address": "0x401090"},
+        "view": "asm",
+        "blocks": [{
+            "start": "0x401090",
+            "insns": [{"a": "0x401090", "t": "jmp rax"}],
+            "edges": [{"to": None, "k": "IndirectBranch", "unresolved": True}],
+        }],
+    })
+    assert "<unresolved>" in out and "IndirectBranch" in out
+    assert "-> None" not in out
+
+
 def test_the_disclosure_reaches_an_early_return_path():
     # The whole point of declaring the coerced keys per renderer instead of
     # appending a line per branch: several renderers bail out BEFORE their
@@ -3832,9 +3866,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    assert len(sites) == 19, (
+    # 19 -> 20 (#682 item 4): `_render_data_symbols_text` now reads `total`
+    # through `_count_field` on the empty-page path, to tell a genuinely empty
+    # view from an `--offset` past the end. Its `offset` read was already
+    # covered by the has_more footer, so this is one new pair, not two.
+    assert len(sites) == 20, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 19. The number is the size of the covered set: a "
+        "count helper, not 20. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 

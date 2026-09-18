@@ -4115,6 +4115,13 @@ def _render_cfg_text(value: Any) -> str:
             if not isinstance(edge, dict):
                 parts.append(f"  -> {edge!r}")
                 continue
+            # #682 item 3: an unresolved edge carries `to: null`, which would
+            # otherwise render as the bare word "None" and read like a target
+            # named None. Name the condition instead -- this row is the whole
+            # reason the edge is emitted rather than dropped.
+            if edge.get("unresolved"):
+                parts.append(f"  -> <unresolved> [{edge.get('k', '?')}]")
+                continue
             parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
     return "\n".join(parts)
 
@@ -4173,6 +4180,15 @@ def _render_data_symbols_text(value: Any) -> str:
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `syms`
     if not syms:
+        # #682 item 4: a bare "none" reads as "this view has no data symbols",
+        # which is wrong -- and most misleading in the case that produces it,
+        # an `--offset` past the end. Disclose the real total so the reader can
+        # tell an empty view from an over-shot page and re-page. Both counts go
+        # through the count choke point (#619) rather than a silent default.
+        total = _count_field(value, "total")
+        offset = _count_field(value, "offset")
+        if total and offset >= total:
+            return f"none (offset {offset} is past the end; {total} total)"
         return "none"
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
