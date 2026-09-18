@@ -3706,36 +3706,76 @@ def test_function_evidence_marks_argument_confidence(monkeypatch):
         assert cand["source"] in ("llil", "mlil", "hlil")
 
 
+def _arity_arch(arg_regs):
+    """A fake architecture whose register table knows *arg_regs*, as BN's does.
+
+    The witness resolves a callee VARIABLE to an ABI position through the view's
+    register table (`_arg_register_storage_positions`): `Variable.storage` is the
+    register's index in the architecture's register list while the variable's NAME
+    is whatever analysis assigned to it (`p`, `result`, `rcx_1`), so the table --
+    never the name -- is what maps a variable back to an argument. A fake with no
+    register table can only ever exercise the refusal path."""
+    arch = _FakeArch()
+    arch.regs = {reg: types.SimpleNamespace(index=i, full_width_reg=reg)
+                 for i, reg in enumerate(arg_regs)}
+    return arch
+
+
 def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
-              user_type=False):
-    """A direct call with a structured prototype and independently rendered args."""
-    callee = _FakeFunction(0x401100, "hw_get_version")
-    callee.parameter_vars = [
-        _FakeVariable(name=f"a{i}", storage=i, var_type="int64_t", identifier=i + 1)
-        for i in range(callee_params)
-    ]
-    prototype = types.SimpleNamespace(
-        parameters=list(callee.parameter_vars), has_variable_arguments=False)
-    if user_type:
-        callee.set_user_type(prototype)
-    else:
-        callee.set_auto_type(prototype)
-    callee.calling_convention = types.SimpleNamespace(
-        int_arg_regs=[f"x{i}" for i in range(arg_regs)])
+              user_type=False, arg_reg_names=None, second=None):
+    """A direct call with a structured prototype and independently rendered args.
+
+    `second=(name, params, arg_texts)` appends a SECOND callee and a second call
+    site to the same caller: two rows whose fates differ, which is what the paging
+    test needs to show a row's caveat surviving a slice that excludes that row."""
+    names = list(arg_reg_names) if arg_reg_names else [f"x{i}" for i in range(arg_regs)]
+
+    def _make_callee(address, name, params):
+        fn = _FakeFunction(address, name)
+        fn.parameter_vars = [
+            _FakeVariable(name=f"a{i}", storage=i, var_type="int64_t", identifier=i + 1)
+            for i in range(params)
+        ]
+        prototype = types.SimpleNamespace(
+            parameters=list(fn.parameter_vars), has_variable_arguments=False)
+        if user_type:
+            fn.set_user_type(prototype)
+        else:
+            fn.set_auto_type(prototype)
+        fn.calling_convention = types.SimpleNamespace(int_arg_regs=names)
+        return fn
+
+    callee = _make_callee(0x401100, "hw_get_version", callee_params)
     caller = _FakeFunction(0x401400, "probe_device")
-    rendered = f"int32_t r = hw_get_version({', '.join(arg_texts)})"
-    stmt = _FakeHLILInstruction(rendered, class_name="HighLevelILVarInit",
-                                address=0x401400, expr_index=10, instr_index=10)
-    call_expr = _FakeHLILInstruction(f"hw_get_version({', '.join(arg_texts)})",
-                                     class_name="HighLevelILCall", parent=stmt,
-                                     address=0x401400, expr_index=11, instr_index=11)
-    call_expr.params = list(arg_texts)
-    call_insn = _FakeLLILInstruction(0x401400, _FakeConstPtr(0x401100), hlils=[call_expr])
-    call_insn.params = [_FakeReg("x0")]
-    caller.basic_blocks = [_FakeBasicBlock(0x401400, 0x401404)]
-    caller.low_level_il = [[call_insn]]
-    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x401400: 4},
-                 disassembly={0x401400: "bl hw_get_version"})
+    functions = [callee, caller]
+    sites = [(0x401400, callee, list(arg_texts))]
+    if second is not None:
+        other_name, other_params, other_texts = second
+        other = _make_callee(0x401500, other_name, other_params)
+        functions.insert(1, other)
+        sites.append((0x401404, other, list(other_texts)))
+    blocks = []
+    lengths = {}
+    disassembly = {}
+    for address, target, texts in sites:
+        args = ", ".join(texts)
+        stmt = _FakeHLILInstruction(f"int32_t r = {target.name}({args})",
+                                    class_name="HighLevelILVarInit", address=address,
+                                    expr_index=10, instr_index=10)
+        call_expr = _FakeHLILInstruction(f"{target.name}({args})",
+                                         class_name="HighLevelILCall", parent=stmt,
+                                         address=address, expr_index=11, instr_index=11)
+        call_expr.params = list(texts)
+        call_insn = _FakeLLILInstruction(address, _FakeConstPtr(target.start),
+                                         hlils=[call_expr])
+        call_insn.params = [_FakeReg(names[0])]
+        blocks.append(call_insn)
+        lengths[address] = 4
+        disassembly[address] = f"bl {target.name}"
+    caller.low_level_il = [blocks]
+    caller.basic_blocks = [_FakeBasicBlock(0x401400, 0x401400 + 4 * len(sites))]
+    bv = _FakeBV(functions=functions, arch=_arity_arch(names),
+                 instruction_lengths=lengths, disassembly=disassembly)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     return bv
 
@@ -3886,21 +3926,89 @@ def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeyp
     assert call["argument_confidence"] == "authoritative"
 
 
-# --- #865: the callee-side read witness -----------------------------------
+# --- #865/#882: the callee-side argument-use witness ------------------------
 #
 # Where no library names the callee, `_library_param_count` refuses (#862) and
 # `arity_mismatch` is silent -- the rendered list and the recovered prototype are
 # the SAME under-recovery, so `declared_count == len(arguments)` compares the
 # recovery against itself. The witness these tests drive settles that shape from
-# inside the binary: a body that reads an argument register its recovered
-# prototype does not declare takes more arguments than the recovery admits.
+# inside the binary: a body that USES an argument register its recovered prototype
+# does not declare takes more arguments than the recovery admits.
+#
+# #882 replaced the body's layout-order read scan with a def-use question over the
+# callee's own variables, answered in SSA: the incoming value of an argument
+# register is version 0 of the variable BN materialized for it, so a register the
+# body writes before reading it (a compiler's scratch reuse) and a write-then-read
+# on another path both read a LATER version and are not uses. The two shapes whose
+# layout-order reading falsified the demotion are pinned below
+# (`..._read_precedes_its_write_in_layout_865`, `..._scratch_register_touch_865`);
+# each still carries the LLIL body the address-order scan walked, so an
+# implementation that walks instructions again fires on them and the test is red.
+
+
+def _ssa_var(storage, version=0, name="v"):
+    """An SSA variable at register-storage *storage*, version *version*.
+
+    `storage` is the register's index in the view's register table (what BN puts
+    on `Variable.storage`) and `source_type == 1` is BN's
+    `RegisterVariableSourceType`."""
+    return types.SimpleNamespace(
+        var=types.SimpleNamespace(storage=storage, source_type=1, name=name),
+        version=version,
+    )
+
+
+class _SSARead:
+    """`MLIL_VAR_SSA`: a READ of one variable at one version."""
+
+    def __init__(self, address, ssa_var):
+        self.address = address
+        self.operation = _FakeOperation("MLIL_VAR_SSA")
+        self.src = ssa_var
+
+
+class _SSAPhi:
+    """`MLIL_VAR_PHI`: its operands are MERGE INPUTS, not uses.
+
+    This is what stops a register written on one path and read on another from
+    looking like a consumed argument: the incoming version IS one of the phi's
+    inputs -- that is what a merge is -- while the read is of the merged version."""
+
+    def __init__(self, address, *inputs):
+        self.address = address
+        self.operation = _FakeOperation("MLIL_VAR_PHI")
+        self.operands = list(inputs)
+
+
+class _SSASet:
+    """`MLIL_SET_VAR_SSA`: *dest* (a raw variable, no operation) = *source*."""
+
+    def __init__(self, address, dest, source):
+        self.address = address
+        self.operation = _FakeOperation("MLIL_SET_VAR_SSA")
+        self.operands = [dest, source]
 
 
 def _with_llil(bv, *instructions):
-    """Give the callee at 0x401100 a body: one block, in address order."""
+    """Give the callee at 0x401100 a body: one block, in address order.
+
+    Kept for the two falsified shapes, whose whole point is that the ADDRESS
+    ORDER of this body is what the withdrawn scan read as a use."""
     callee = bv.get_function_at(0x401100)
     callee.low_level_il = [list(instructions)]
     return callee
+
+
+def _set_ssa(callee, *instructions):
+    """Give *callee* the MLIL SSA body the witness actually reads."""
+    callee.mlil = types.SimpleNamespace(
+        ssa_form=types.SimpleNamespace(instructions=list(instructions)))
+    return callee
+
+
+def _with_ssa(bv, *instructions):
+    """Give the callee at 0x401100 an MLIL SSA body."""
+    return _set_ssa(bv.get_function_at(0x401100), *instructions)
 
 
 def _read_into(address, dest, source_reg):
@@ -3919,81 +4027,100 @@ def _write_reg(address, dest):
     return insn
 
 
-def test_argument_confidence_reports_a_body_read_without_demoting_865(
+def test_argument_confidence_demoted_when_the_callee_body_uses_past_its_prototype_882(
     monkeypatch,
 ):
-    """#865 AC1, the shape neither shipped witness settles: an ordinary-named
-    local function no attached library names, whose recovered prototype declares
-    2 parameters and which HLIL rendered exactly those 2 -- so the #742 guard has
-    nothing to compare (#862's measured residual, `declared_count ==
-    len(arguments)`) and #862 has no library to consult. Its own body reads x2, a
-    third argument register. #865 review: the DETECTION is reported, the demotion is
-    WITHHELD. The scan is layout-order and CFG-blind, and an ABI position is not a
-    parameter count, so on unmutated corpus binaries every natural firing was a
-    correct prototype demoted on an artifact (16 of 16) -- over-demoting spends the
-    credibility `authoritative` exists to carry. The row keeps its confidence and
-    carries the two numbers plus the note saying why they are not an arity claim."""
+    """#882 AC2, the shape neither shipped cross-check settles: an ordinary-named
+    local function no attached library names, whose recovered prototype declares 2
+    parameters and which HLIL rendered exactly those 2 -- so the #742 guard has
+    nothing to compare (`declared_count == len(arguments)`, #862's measured
+    residual) and #862 has no library to consult. Its own body USES x2, a third
+    argument register, as an incoming value (version 0). That is a def-use fact,
+    so the demotion the withdrawn layout-order scan could not be trusted with is
+    restored: the row drops to `inferred` AND keeps the observation."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    # Both readings of the same body, as a real function has both: the SSA form is
+    # what the witness reads, and the address-ordered LLIL is here so the fixture
+    # does not hide the use from the implementation this replaced.
     _with_llil(
         bv,
         _read_into(0x401100, "sp_0", "x0"),
-        _read_into(0x401104, "sp_8", "x2"),   # a THIRD argument register
+        _read_into(0x401104, "sp_8", "x2"),
+    )
+    _with_ssa(
+        bv,
+        _SSARead(0x401100, _ssa_var(0)),
+        _SSARead(0x401104, _ssa_var(2)),      # a THIRD argument register
     )
 
     card = instance._function_evidence("active", "probe_device", context=0)
     call = card["calls"][0]
 
     assert call["argument_source"] == "hlil"
-    assert call["argument_confidence"] == "authoritative"
-    assert "callee_under_recovered" not in call
+    # The demotion is the direction the evidence supports, and only one step: the
+    # list is not `authoritative`, it is not thrown away either.
+    assert call["argument_confidence"] == "inferred"
+    assert call["callee_under_recovered"] is True
     assert call["callee_read_arity"] == 3
     assert call["declared_arity"] == 2
-    assert "NOT an arity claim" in call["callee_arity_note"]
+    assert "x2" in call["callee_arity_note"] and "withheld" in call["callee_arity_note"]
     # No library named the callee, so the #862 witness stayed silent: this is the
     # residual itself being answered, not an override of a library verdict.
     assert "prototype_unverified" not in call
     assert "arity_mismatch" not in call
+    # A demotion that drops the row would be a deletion, not a demotion: the row
+    # is still returned, at the same address, still the only call of this caller.
+    assert len(card["calls"]) == 1 and card["returned"] == 1
+    assert call["address"] == "0x401400"
     # The observation reaches TEXT mode too (hoisted into the function-level
-    # warnings), so the caveat is never invisible on the card.
-    assert any("NOTE" in w and "NOT an arity claim" in w for w in card["warnings"])
+    # warnings), so the reason for the demotion is never JSON-only.
+    assert any("NOTE" in w and "hw_get_version" in w and "x2" in w
+               for w in card["warnings"])
 
 
-def test_argument_confidence_kept_when_the_callee_body_reads_only_its_declared_args_865(
+def test_argument_confidence_kept_when_the_callee_body_uses_only_its_declared_args_865(
     monkeypatch,
 ):
-    """#865 AC4, matching arity: reading exactly the registers the prototype
+    """#865 AC4, matching arity: using exactly the argument registers the prototype
     declares is what a CORRECT recovery looks like and must stay authoritative."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["a", "b", "c"])
-    _with_llil(
+    _with_ssa(
         bv,
-        _read_into(0x401100, "sp_0", "x0"),
-        _read_into(0x401104, "sp_8", "x1"),
-        _read_into(0x401108, "sp_16", "x2"),
+        _SSARead(0x401100, _ssa_var(0)),
+        _SSARead(0x401104, _ssa_var(1)),
+        _SSARead(0x401108, _ssa_var(2)),
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
     assert "callee_arity_note" not in call
 
 
 def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register_865(
     monkeypatch,
 ):
-    """#865 AC4, the genuinely-void callee: a body that reads no argument register
-    agrees with its recovered 0-parameter prototype, so it keeps `authoritative`
-    -- demoting here would flag every `f()` call in a stripped binary for nothing.
-    A body that WRITES an argument register as scratch is not a read."""
+    """#865 AC4, the genuinely-void callee: a body that reads no incoming argument
+    register agrees with its recovered 0-parameter prototype, so it keeps
+    `authoritative` -- demoting here would flag every `f()` call in a stripped
+    binary for nothing. A register the body WRITES (its own defined version) and
+    then reads is not an incoming argument."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
-    _with_llil(bv, _write_reg(0x401100, "x0"))
+    _with_ssa(
+        bv,
+        _SSASet(0x401100, _ssa_var(0).var, _FakeConstPtr(0x4000)),
+        _SSARead(0x401104, _ssa_var(0, 1)),   # reads the version it defined
+    )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
     assert "callee_arity_note" not in call
 
 
@@ -4008,7 +4135,7 @@ def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_8
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["fmt"], user_type=True)
     bv.get_function_at(0x401100).type.has_variable_arguments = True
-    _with_llil(bv, *[_read_into(0x401100 + i * 4, f"sp_{i * 8}", f"x{i}") for i in range(6)])
+    _with_ssa(bv, *[_SSARead(0x401100 + i * 4, _ssa_var(i)) for i in range(6)])
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_confidence"] == "authoritative"
@@ -4017,18 +4144,18 @@ def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_8
 
 def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(monkeypatch):
     """The witness's own false-positive guard. A compiler routinely reuses a
-    caller-saved argument register as scratch, and a CALL clobbers all of them --
-    only a read of a register the body has not already written says anything about
-    the INCOMING arguments."""
+    caller-saved argument register as scratch, and a CALL gives it a new value --
+    only a read of the INCOMING version (0) says anything about the arguments the
+    callee was passed."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
-    _with_llil(
+    _with_ssa(
         bv,
-        _write_reg(0x401100, "x2"),           # x2 reused as scratch...
-        _read_into(0x401104, "sp_8", "x2"),   # ...then read: not an argument
-        _FakeLLILInstruction(0x401108, None, operation="LLIL_CALL"),
-        _read_into(0x40110C, "sp_16", "x3"),  # read after a call: a result, not setup
+        _SSASet(0x401100, _ssa_var(2).var, _FakeConstPtr(0x4000)),   # x2 as scratch
+        _SSARead(0x401104, _ssa_var(2, 1)),                          # its own value
+        _SSARead(0x40110C, _ssa_var(3, 2)),                          # a call's result
+        _SSARead(0x401110, _ssa_var(0)),
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
@@ -4038,8 +4165,9 @@ def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(m
 
 def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(monkeypatch):
     """#865's stated intersection, pinned as a KNOWN gap rather than papered over:
-    both witnesses are blind to an import whose body is not in the image, so the
-    row keeps its claim and no witness field is invented for it."""
+    both witnesses are blind to an import whose body is not in the image (no MLIL
+    to build an SSA form from), so the row keeps its claim and no witness field is
+    invented for it."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
@@ -4050,92 +4178,57 @@ def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(m
     assert "callee_arity_note" not in call
 
 
-def test_argument_confidence_fires_on_a_sub_register_argument_read_865(monkeypatch):
-    """The REAL-IL shape, which a name-only match missed entirely: BN names a
-    register by the WIDTH the code touched, so a SysV argument read renders as
-    `esi` while `int_arg_regs` lists `rsi`. Measured on a compiled probe, a
-    3-parameter body reported zero argument-register reads and the witness never
-    fired outside the fakes. The scan canonicalizes both sides now."""
+def test_arg_register_storage_positions_folds_every_width_of_one_register_882(monkeypatch):
+    """The register -> ABI-index map stays `_arg_register_index`; what #882 adds is
+    the resolution of each of its names to the STORAGE id BN gives that register
+    (`Variable.storage`), which is what an MLIL variable carries. BN names a
+    register by the width the code touched and its register table holds the x-form
+    and the w-form as separate registers, so the folding is what keeps either id on
+    the same argument position. Measured on a corpus image: 0 of 17768 register
+    variables carried a non-full-width storage id on x86-64, so this is the
+    AArch64 x/w shape (and any view that exposes widths as separate registers)
+    rather than a routine one -- it is pinned because the map, not the name, is
+    what the witness trusts."""
     bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
-    bv.get_function_at(0x401100).calling_convention = types.SimpleNamespace(
-        int_arg_regs=["rdi", "rsi", "rdx", "rcx", "r8", "r9"])
-    _with_llil(
-        bv,
-        _read_into(0x401100, "sp_0", "esi"),      # the 32-bit form of rsi...
-        _read_into(0x401104, "sp_8", "edx"),      # ...and of rdx: a THIRD argument
-    )
+    mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    arch = types.SimpleNamespace(regs={
+        "x0": types.SimpleNamespace(index=10),
+        "w0": types.SimpleNamespace(index=110),
+        "x2": types.SimpleNamespace(index=12),
+        "w2": types.SimpleNamespace(index=112),
+    })
+    bv = types.SimpleNamespace(arch=arch)
 
-    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
-    assert call["callee_read_arity"] == 3 and call["declared_arity"] == 2
-    assert "callee_arity_note" in call
+    positions = mod._arg_register_storage_positions(bv, ["x0", "x1", "x2"])
 
-
-def test_argument_confidence_kept_when_a_sub_register_write_retires_the_argument_865(
-    monkeypatch,
-):
-    """The same canonicalization on the WRITE side: a compiler that reuses the
-    32-bit half of an argument register as scratch (`esi = eax`) retires the whole
-    register, so a later read of either half is not evidence about the incoming
-    argument. x86-64 and AArch64's w-form are both covered."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
-    bv.get_function_at(0x401100).calling_convention = types.SimpleNamespace(
-        int_arg_regs=["rdi", "rsi", "rdx", "rcx", "r8", "r9"])
-    _with_llil(
-        bv,
-        _read_into(0x401100, "sp_0", "edi"),      # arg 0: legitimate, index 0
-        _write_reg(0x401104, "esi"),              # rsi (arg 1) reused as scratch...
-        _read_into(0x401108, "sp_8", "rsi"),      # ...so neither the 64-bit form...
-        _read_into(0x40110c, "sp_16", "esi"),     # ...nor the 32-bit half is an argument
-    )
-
-    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
-    assert "callee_arity_note" not in call
-
-
-def test_argument_confidence_fires_on_an_aarch64_w_register_argument_read_865(monkeypatch):
-    """AArch64's other half of the same rule: `w2` IS `x2`, so a body reading it
-    demonstrates a third argument register (`_arity_bv`'s default ABI list)."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
-    _with_llil(
-        bv,
-        _read_into(0x401100, "sp_0", "w0"),
-        _read_into(0x401104, "sp_8", "w2"),
-    )
-
-    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["callee_read_arity"] == 3 and "callee_arity_note" in call
-    assert call["argument_confidence"] == "authoritative"
+    assert positions == {10: 0, 110: 0, 12: 2, 112: 2}
+    # A register the view does not know contributes nothing: the map can never
+    # invent a position the platform does not have.
+    assert mod._arg_register_storage_positions(bv, ["x3"]) == {}
+    assert mod._arg_register_storage_positions(bv, []) == {}
 
 
 def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
     """#865's second shape, refused rather than guessed at. A decorated name can
     carry IMPLICIT parameters -- a method's `this`, a by-value class return's sret
     slot -- which are argument REGISTERS the body legitimately reads and the
-    parameter count never mentions, so a body-reads-more-than-declared comparison
-    is meaningless there. Same refusal `_library_param_count` makes, same
-    measured reason (3 of 4 raw #862 firings on a C++-heavy target were exactly
-    this). Here the callee's body reads three registers against a 2-parameter
-    prototype -- indistinguishable from the true positive above except for the
-    name, which is the whole point."""
+    parameter count never mentions, so a body-vs-count comparison is meaningless
+    there. Same refusal `_library_param_count` makes, same measured reason (3 of 4
+    raw #862 firings on a C++-heavy target were exactly this). Here the callee's
+    body uses three registers against a 2-parameter prototype --
+    indistinguishable from the true positive above except for the name, which is
+    the whole point."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
     callee = bv.get_function_at(0x401100)
     callee.name = "_ZN4Impl7combineEii"          # an Itanium-mangled method
     callee.raw_name = callee.name
-    _with_llil(
+    _with_ssa(
         bv,
-        _read_into(0x401100, "sp_0", "x0"),      # `this`
-        _read_into(0x401104, "sp_8", "x1"),
-        _read_into(0x401108, "sp_16", "x2"),
+        _SSARead(0x401100, _ssa_var(0)),         # `this`
+        _SSARead(0x401104, _ssa_var(1)),
+        _SSARead(0x401108, _ssa_var(2)),
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
@@ -4160,55 +4253,100 @@ def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(mon
 def test_argument_confidence_not_demoted_when_a_read_precedes_its_write_in_layout_865(
     monkeypatch,
 ):
-    """The dogfood's first failure shape, and the reason the demotion is withheld.
+    """The dogfood's first failure shape: a register written on one path and read
+    on another reads as a consumed argument when instructions are walked in
+    ADDRESS order.
 
-    Address order is not execution order: the block that READS x1 sits at a lower
-    address than the block that initializes it, so a layout-order scan sees a
-    read before any write and calls the register an argument the callee consumes.
-    Every natural firing measured on unmutated corpus binaries was a correct
-    prototype demoted on an artifact like this one (16 of 16 across two images),
-    which spends exactly the credibility `authoritative` exists to carry. The row
-    keeps its confidence and carries the observation plus the note."""
+    This body is `loopprobe`'s: the read of the second register sits at a LOWER
+    address than the assignment that precedes it at run time (the loop's definer
+    block is laid out after its body), so the withdrawn scan saw a read-before-write
+    and called it an argument (every natural firing on an unmutated corpus image was
+    an artifact of this shape -- 16 of 16). In SSA the read is of the version the
+    loop defined, and the incoming value appears only as a phi INPUT: a merge, not a
+    use. The row keeps `authoritative` and carries no caveat, because there is
+    nothing to caveat."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
     callee = bv.get_function_at(0x401100)
     callee.low_level_il = [
         [_read_into(0x401100, "sp_0", "x0"), _read_into(0x401104, "sp_8", "x1")],
-        [_write_reg(0x401200, "x1")],      # the initializer, laid out AFTER the read
+        [_write_reg(0x401200, "x1")],      # the assignment, laid out AFTER the read
     ]
+    _with_ssa(
+        bv,
+        _SSARead(0x401100, _ssa_var(0)),
+        _SSAPhi(0x401200, _ssa_var(1, 0), _ssa_var(1, 2)),   # merge: x1#0 is an input
+        _SSARead(0x401104, _ssa_var(1, 3)),                  # read of the merged value
+    )
 
     card = instance._function_evidence("active", "probe_device", context=0)
     call = card["calls"][0]
 
     assert call["argument_confidence"] == "authoritative"
     assert "callee_under_recovered" not in call
-    assert call["callee_read_arity"] == 2          # the observation is still reported
-    assert "NOT an arity claim" in call["callee_arity_note"]
-    assert any("NOTE" in w for w in card["warnings"])
+    assert "callee_read_arity" not in call
+    assert "callee_arity_note" not in call
+    assert not any("NOTE" in w for w in card["warnings"])
 
 
 def test_argument_confidence_not_demoted_for_a_scratch_register_touch_865(monkeypatch):
-    """The dogfood's second failure shape: a genuinely 1-argument callee whose
-    body touches a register the ABI COULD pass a fourth argument in, purely as
-    scratch. An ABI position is not a parameter count, so the touch must not read
-    as a consumed argument -- the deterministic hand-asm repro the dogfood filed."""
+    """The dogfood's second failure shape: a genuinely 1-argument callee whose body
+    touches a register the ABI COULD pass a fourth argument in, purely as scratch
+    (the deterministic hand-asm repro). An ABI POSITION is not a PARAMETER COUNT, so
+    the touch must not read as a consumed argument -- and in SSA it cannot: the body
+    assigns x3 first, so the read is of that assignment's version, not of the value
+    the caller passed. The layout-order body is still here, and still reads x3 before
+    writing it, which is exactly what made the withdrawn scan fire."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
     _with_llil(
         bv,
         _read_into(0x401100, "sp_0", "x0"),     # the one real argument
-        _read_into(0x401104, "sp_8", "x3"),     # x3 reused as scratch, not an argument
+        _read_into(0x401104, "sp_8", "x3"),     # x3 touched as scratch
+    )
+    _with_ssa(
+        bv,
+        _SSASet(0x4010f8, _ssa_var(3).var, _FakeConstPtr(0x4000)),  # x3 = const
+        _SSARead(0x401100, _ssa_var(0)),
+        _SSARead(0x401104, _ssa_var(3, 1)),     # the scratch value, not an argument
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert call["argument_confidence"] == "authoritative"
     assert "callee_under_recovered" not in call
-    assert call["callee_read_arity"] == 4
-    assert "NOT an arity claim" in call["callee_arity_note"]
+    assert "callee_arity_note" not in call
 
+
+def test_callee_arity_note_survives_a_sliced_read_882(monkeypatch):
+    """#882: the caveat has to reach a reader who paged the card, not only the one
+    who read it whole. The demoting row is the SECOND call site, so a `limit=1`
+    page does not contain it -- the hoisted warning still does, because it is
+    computed from the full call set before slicing, and the row that IS in the page
+    shows its own confidence."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"],
+                   arg_reg_names=["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+                   second=("hw_set_mode", 1, ["b"]))
+    _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))          # first callee: clean
+    second = bv.get_function_at(0x401500)
+    _set_ssa(second, _SSARead(0x401500, _ssa_var(0)),
+             _SSARead(0x401504, _ssa_var(3)))               # rcx: the fourth argument
+
+    full = instance._function_evidence("active", "probe_device", context=0)
+    assert [c["argument_confidence"] for c in full["calls"]] == ["authoritative", "inferred"]
+    assert full["calls"][1]["callee_read_arity"] == 4
+    assert any("hw_set_mode" in w and "rcx" in w for w in full["warnings"])
+
+    page = instance._function_evidence("active", "probe_device", context=1, limit=1)
+    assert [c["address"] for c in page["calls"]] == ["0x401400"]
+    assert page["calls"][0]["argument_confidence"] == "authoritative"
+    assert page["returned"] == 1 and page["matched_calls"] == 2
+    # The demoted row is not on this page; its reason still is.
+    assert any("NOTE" in w and "hw_set_mode" in w and "rcx" in w for w in page["warnings"])
 
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
     """#648: a genuinely void callee rendering NO arguments agrees with its recovered
