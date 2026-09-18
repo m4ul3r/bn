@@ -1533,20 +1533,24 @@ def _render_target_info_annotations_text(value: Any) -> str:
     annotations = _field_dict(value, "existing_annotations")
     if annotations.get("unavailable"):
         return f"\texisting annotations: unavailable — {annotations['unavailable']}"
-    # #733 F2: the analyst/placeholder split prints only when the bridge reports
-    # it, each fragment through the count choke point -- an absent key omits its
-    # fragment, an unreadable one prints `?` rather than a fabricated 0. Same
-    # rule, same helpers, as the orient card's block.
+    # #619/#733 F2: every count goes through the choke point, so a counter the
+    # bridge sent in a shape no count reads prints `?` ON THE LINE a caller acts
+    # on, instead of a confident `0` that would read as "this view is pristine".
+    # #733 F2's analyst/placeholder split prints only when the bridge reports it:
+    # an absent key omits its fragment rather than fabricating a zero.
     row = (
-        f"\texisting annotations: comments={annotations.get('comments', 0)}, "
-        f"function-docs={annotations.get('function_comments', 0)}, "
-        f"user-symbols={annotations.get('user_symbols', 0)}"
+        f"\texisting annotations: comments={_stated_count(annotations, 'comments')}, "
+        f"function-docs={_stated_count(annotations, 'function_comments')}, "
+        f"user-symbols={_stated_count(annotations, 'user_symbols')}"
     )
     if _field_present(annotations, "analyst_symbols"):
         row += f", analyst-symbols={_stated_count(annotations, 'analyst_symbols')}"
         if _field_present(annotations, "placeholder_symbols"):
             row += f", placeholders={_stated_count(annotations, 'placeholder_symbols')}"
-    row += f", cache-restored={annotations.get('analysis_cache_restored', False)}"
+    # A flag, not a count: through the flag choke point for the one shape a raw
+    # truthiness test gets exactly backwards ("false" is True to Python).
+    restored = _flag_field(annotations, "analysis_cache_restored")
+    row += f", cache-restored={bool(restored)}"
     lines = [row]
     hint = annotations.get("provenance_hint")
     if hint:

@@ -3832,9 +3832,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    assert len(sites) == 19, (
+    # 19 -> 24 (#793): `_render_target_info_annotations_text` reads five counts
+    # (`comments`, `function_comments`, `user_symbols`, `analyst_symbols`,
+    # `placeholder_symbols`) through `_stated_count`, so an unreadable counter
+    # prints `?` on the line rather than a confident `0`.
+    assert len(sites) == 24, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 19. The number is the size of the covered set: a "
+        "count helper, not 24. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3902,6 +3906,22 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # The same nested reason for the #793 renderer: its five counts also live
+        # under `existing_annotations`, so a top-level probe cannot open the gate
+        # that states them. Covered by name in
+        # `test_target_info_text_renders_existing_annotations`, which drives the
+        # real nested payload and asserts the `?` refusal for a count no value
+        # reads out of.
+        "_render_target_info_annotations_text(analyst_symbols) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(comments) [count not stated in "
+        "this context]",
+        "_render_target_info_annotations_text(function_comments) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(placeholder_symbols) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(user_symbols) [count not stated "
+        "in this context]",
     ], sorted(not_stated)
 
 
@@ -4226,7 +4246,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    assert checked == 1212, f"the differential ran {checked} cases, not 1212"
+    # #793: `_render_target_info_annotations_text` adds the
+    # `existing_annotations` container (6 malformed shapes probed on it) to the
+    # same discovered population. Measured.
+    assert checked == 1218, f"the differential ran {checked} cases, not 1218"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4272,7 +4295,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
+    # #793: 4896 + 8 -- `_render_target_info_annotations_text` reads the
+    # `existing_annotations` container (8 bogus values x 1 render). Measured.
+    assert swept == 4904, f"the raise sweep ran {swept} renders, not 4904"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4428,7 +4453,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
+    # #793: 1426 + 3 -- the new target-info annotation renderer reads
+    # `existing_annotations` in three probed contexts. Measured.
+    assert checked == 1429, f"the mirror ran {checked} renders, not 1429"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

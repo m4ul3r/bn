@@ -277,7 +277,17 @@ def test_target_info_text_renders_existing_annotations():
     assert "predate this run" in annotated
 
     # An unreadable count keeps the line and says so, rather than rendering a
-    # confident "0 comments" for a view whose annotations nobody could read.
+    # confident "0 comments" for a view whose annotations nobody could read
+    # (#619/#733 F2) -- the shape the orient card is pinned on too.
+    unreadable = _render_target_info_text_with_annotations({
+        "selector": "shared.bndb", "existing_annotations": {
+            "comments": "many", "function_comments": 3, "user_symbols": 12,
+            "analysis_cache_restored": True,
+        },
+    })
+    assert "comments=?, function-docs=3, user-symbols=12" in unreadable
+
+    # An unavailable block prints its own marker, not counts.
     unavailable = _render_target_info_text_with_annotations({
         "selector": "shared.bndb", "existing_annotations": {
             "unavailable": "annotation counts unavailable: view is dead",

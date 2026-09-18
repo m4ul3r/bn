@@ -2849,7 +2849,7 @@ class BinaryNinjaBridge:
             # had no annotation key at all, so a cached .bndb read as a pristine
             # view until a separate `bn comment list` pass contradicted it.
             "existing_annotations": read_listing._existing_annotations(
-                self.ctx, selector, filename=filename
+                self.ctx, bv, filename=filename
             ),
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
@@ -3718,9 +3718,20 @@ class BinaryNinjaBridge:
         filename = str(target.get("filename", "") or "")
         existing_annotations = target.get("existing_annotations")
         if not isinstance(existing_annotations, dict):
-            existing_annotations = read_listing._existing_annotations(
-                self.ctx, selector, filename=filename
-            )
+            # A `_target_info` answered without the block (a double, or a bridge
+            # predating #793): build it here through the same builder, resolving
+            # the view through this bridge's own shim -- the path the digest has
+            # always used, and the one the unit doubles patch -- then degrade to
+            # the marker exactly as before if even that fails.
+            try:
+                bv = self._resolve_view(selector)
+                existing_annotations = read_listing._existing_annotations(
+                    self.ctx, bv, filename=filename
+                )
+            except Exception as exc:
+                existing_annotations = read_listing._annotations_unavailable(
+                    exc, filename=filename
+                )
         return {
             "kind": "orient_digest",
             "target": target,

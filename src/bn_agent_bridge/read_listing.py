@@ -697,8 +697,24 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     }
 
 
-def _existing_annotations(ctx, selector: str | None, *, filename: str = "") -> dict[str, Any]:
-    """Counts + provenance hint for annotations ALREADY present in the view (#561).
+def _annotations_unavailable(exc: BaseException, *, filename: str = "") -> dict[str, Any]:
+    """The degrade marker for annotation counts nobody could read (#733 F2/#793).
+
+    ONE spelling, used both when the counts themselves fail and when the view
+    cannot be resolved at all: an unreadable summary published as
+    ``comments: 0`` certifies a contaminated view clean, and this marker is what
+    the kernel's ``assert_unannotated`` refuses instead. No counts are claimed --
+    a reader of this marker must not find an absent ``analyst_symbols`` and
+    assume zero.
+    """
+    return {
+        "unavailable": f"annotation counts unavailable: {exc}",
+        "analysis_cache_restored": str(filename or "").endswith(".bndb"),
+    }
+
+
+def _existing_annotations(ctx, bv, *, filename: str = "") -> dict[str, Any]:
+    """Counts + provenance hint for annotations ALREADY present in *bv* (#561).
 
     ONE builder for the two surfaces that answer "can I trust this view as
     pristine?" -- `target info` (#793) and the orient digest. #793 was filed on
@@ -708,25 +724,21 @@ def _existing_annotations(ctx, selector: str | None, *, filename: str = "") -> d
     so the same cached target read annotated on one surface and clean on the
     other. Both now publish this block under the same key, from here.
 
-    Resolving the view is INSIDE the guard: an unresolvable selector degrades to
-    the ``unavailable`` marker the digest has always published for it, rather
-    than failing a read whose whole job here is best-effort. ``analysis_cache_
-    restored`` is derived from *filename*: a ``.bndb`` carries the analysis
-    cache, which is where inherited comments/names come from. ``provenance_hint``
-    is keyed on ANALYST work, not the raw non-auto count -- the loader's own
-    placeholders made a pristine view hint that its entirely-current-run analysis
-    may predate the run (#733 F2). The marker is the contract the kernel's
-    ``_require_orient_digest`` refuses as a violation, so it must never be
-    swallowed into a clean-looking digest.
+    The caller resolves *bv* itself, the way its own read path resolves it (the
+    digest through the bridge shim its unit doubles patch, `target info` from the
+    view it already holds); a resolution failure degrades to
+    ``_annotations_unavailable`` in the caller. ``analysis_cache_restored`` is
+    derived from *filename*: a ``.bndb`` carries the analysis cache, which is
+    where inherited comments/names come from. ``provenance_hint`` is keyed on
+    ANALYST work, not the raw non-auto count -- the loader's own placeholders
+    made a pristine view hint that its entirely-current-run analysis may predate
+    the run (#733 F2).
     """
     analysis_cache_restored = str(filename or "").endswith(".bndb")
     try:
-        annotations = _annotation_summary(ctx, ctx._resolve_view(selector))
+        annotations = _annotation_summary(ctx, bv)
     except Exception as exc:
-        return {
-            "unavailable": f"annotation counts unavailable: {exc}",
-            "analysis_cache_restored": analysis_cache_restored,
-        }
+        return _annotations_unavailable(exc, filename=filename)
     total_annotations = (
         annotations["comments"] + annotations["function_comments"]
         + annotations["analyst_symbols"]
