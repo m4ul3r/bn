@@ -4115,13 +4115,6 @@ def _render_cfg_text(value: Any) -> str:
             if not isinstance(edge, dict):
                 parts.append(f"  -> {edge!r}")
                 continue
-            # #682 item 3: an unresolved edge carries `to: null`, which would
-            # otherwise render as the bare word "None" and read like a target
-            # named None. Name the condition instead -- this row is the whole
-            # reason the edge is emitted rather than dropped.
-            if edge.get("unresolved"):
-                parts.append(f"  -> <unresolved> [{edge.get('k', '?')}]")
-                continue
             parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
         # #682 item 3, live half: a block BN could not resolve the successors
         # of emits no edges at all, so without this line it renders exactly
@@ -4419,8 +4412,15 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # internal noise and moves out of the default line.
         declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
+        # #825 item 3: name the implicit include root when the declaration
+        # came from a file. It is the reason a `#include "sibling.h"`
+        # resolved, so a reader chasing a type that resolved to the wrong
+        # sibling has the directory in front of them. Absent for an inline
+        # declare, so the ordinary row is unchanged.
+        root = item.get("include_root")
+        suffix = f"  (include root: {root})" if root else ""
         if names:
-            return f"types_declare {', '.join(names)}"
+            return f"types_declare {', '.join(names)}{suffix}"
         # No names, so the COUNT is the whole claim -- and it may only be stated
         # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
         # listing printed "types_declare 0 types", which reads as a declare that

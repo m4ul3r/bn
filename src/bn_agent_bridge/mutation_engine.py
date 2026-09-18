@@ -170,6 +170,23 @@ def _guess_type_affected_functions(ctx, bv, type_name: str, limit: int | None = 
 
 
 
+def _declaration_include_root(source_path: str | None) -> str | None:
+    """The implicit include root a `--file` declaration parses under.
+
+    `parse_types_from_source` is handed the header's PARENT DIRECTORY as an
+    include root, which is what lets `#include "sibling.h"` resolve. That is
+    deliberate and load-bearing -- but it means a declare can succeed because
+    of a directory the user never named, and if a sibling header shadows
+    another of the same name, which one was used is invisible (#825 item 3).
+
+    One function so the disclosure cannot state a different root than the
+    parse used: the value reported and the value passed come from one call.
+    """
+    if not source_path:
+        return None
+    return str(Path(source_path).expanduser().resolve().parent)
+
+
 def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | None = None):
     parse_result = None
     source_error: Exception | None = None
@@ -178,7 +195,7 @@ def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | N
         kwargs: dict[str, Any] = {}
         if source_path:
             kwargs["filename"] = source_path
-            kwargs["include_dirs"] = [str(Path(source_path).expanduser().resolve().parent)]
+            kwargs["include_dirs"] = [_declaration_include_root(source_path)]
         try:
             parse_result = platform.parse_types_from_source(declaration, **kwargs)
         except Exception as exc:
@@ -3874,6 +3891,17 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "parsed_type_count": len(named_types),
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
+        # #825 item 3: a `--file` declaration parses with the header's PARENT
+        # DIRECTORY as an implicit include root, so `#include "sibling.h"`
+        # resolves. The root was derivable from `requested.source_path` but
+        # never stated, which makes the interesting case invisible: a declare
+        # that only succeeded because a sibling header was found, or that
+        # picked a shadowing sibling over the header the user expected.
+        # Absent for an inline declaration, so an ordinary declare grows no
+        # key -- and it comes from the same helper the parse used, so the
+        # reported root cannot differ from the one actually searched.
+        **({"include_root": _declaration_include_root(op.get("source_path"))}
+           if op.get("source_path") else {}),
         "requested": _operation_requested(ctx, op),
     }
 

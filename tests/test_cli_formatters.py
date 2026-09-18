@@ -1148,6 +1148,33 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_types_declare_row_names_the_implicit_include_root_825():
+    # #825 item 3: a `--file` declaration parses with the header's PARENT
+    # DIRECTORY as an implicit include root. It was derivable from
+    # requested.source_path but never stated, so the interesting case was
+    # invisible: a declare that only succeeded because a sibling header was
+    # found, or that picked a shadowing sibling over the expected one.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "include_root": "/proj/include",
+    })
+    assert "packet_header" in out
+    assert "/proj/include" in out
+
+
+def test_types_declare_row_for_an_inline_declare_names_no_root_825():
+    # Must-not-fire twin: an inline declaration has no file and therefore no
+    # implicit root, so the ordinary row must be byte-identical to before.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+    })
+    assert out == "types_declare packet_header"
+
+
 def test_render_cfg_undetermined_block_is_named_not_a_silent_dead_end_682():
     # #682 item 3, live half: a block whose successors BN could not resolve
     # has NO edges, so without a line of its own it renders exactly like a
@@ -1193,23 +1220,6 @@ def test_render_data_symbols_genuinely_empty_view_stays_bare_none():
     # so it must not grow a spurious "past the end" note.
     from bn.formatters import _render_data_symbols_text
     assert _render_data_symbols_text({"items": [], "total": 0, "offset": 0}) == "none"
-
-
-def test_render_cfg_unresolved_edge_is_named_not_rendered_as_none():
-    # #682 item 3: an unresolved edge carries `to: null`. Rendering the raw
-    # value prints the bare word "None", which reads like a block named None.
-    from bn.formatters import _render_cfg_text
-    out = _render_cfg_text({
-        "function": {"name": "handler", "address": "0x401090"},
-        "view": "asm",
-        "blocks": [{
-            "start": "0x401090",
-            "insns": [{"a": "0x401090", "t": "jmp rax"}],
-            "edges": [{"to": None, "k": "IndirectBranch", "unresolved": True}],
-        }],
-    })
-    assert "<unresolved>" in out and "IndirectBranch" in out
-    assert "-> None" not in out
 
 
 def test_the_disclosure_reaches_an_early_return_path():
@@ -4340,7 +4350,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
+    # #825 item 3: `_operation_row_text` now reads `include_root` on a types_declare row, so these derived populations grow with the one new discovered read. 4896 + 8 = 4904.
+    assert swept == 4904, f"the raise sweep ran {swept} renders, not 4904"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4496,7 +4507,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
+    # #825 item 3: `_operation_row_text` now reads `include_root` on a types_declare row, so these derived populations grow with the one new discovered read. 1426 + 2 = 1428.
+    assert checked == 1428, f"the mirror ran {checked} renders, not 1428"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7121,7 +7133,8 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
+    # #825 item 3: `_operation_row_text` now reads `include_root` on a types_declare row, so these derived populations grow with the one new discovered read. The row reads one more top-level key than before.
+    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7148,9 +7161,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert (rendered, checked) == (1980, 1188), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
-        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
+    # #825 item 3: the row now reads `include_root`, so both sizes grow with
+    # the new key: the rendered population 1980 -> 2178 and the checked
+    # subset 1188 -> 1298.
+    assert (rendered, checked) == (2178, 1298), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
+        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
         "different claims: the carve-out for a readable container skips 792 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")

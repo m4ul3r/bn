@@ -47,6 +47,62 @@ def test_parse_declaration_source_uses_platform_parser_with_source_path(monkeypa
     assert recorded["kwargs"]["include_dirs"] == [str(header_path.parent.resolve())]
 
 
+def test_types_declare_discloses_the_include_root_it_actually_searched_825(
+        monkeypatch, tmp_path):
+    # #825 item 3: the header's parent directory becomes an implicit include
+    # root, and the result never said so. The assertion that matters is not
+    # that a key exists but that the DISCLOSED root is the SEARCHED one --
+    # a disclosure computed independently could drift from the parse and
+    # confidently name a directory that was never on the path.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    recorded = {}
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            recorded["kwargs"] = kwargs
+            return _ParseResult(types={"Player": "struct Player"})
+
+    class _SourceBV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.platform = _Platform()
+
+    nested = tmp_path / "inc"
+    nested.mkdir()
+    header_path = nested / "outer.h"
+    header_path.write_text("typedef struct Player { int hp; } Player;", encoding="utf-8")
+    bv = _SourceBV()
+
+    result = instance._op_types_declare(bv, {
+        "op": "types_declare",
+        "declaration": header_path.read_text(encoding="utf-8"),
+        "source_path": str(header_path),
+    })
+
+    assert result["include_root"] == recorded["kwargs"]["include_dirs"][0]
+    assert result["include_root"] == str(nested.resolve())
+
+
+def test_types_declare_inline_declaration_discloses_no_include_root_825(monkeypatch):
+    # Must-not-fire twin: an inline declaration has no file, so there is no
+    # implicit root and the result must not grow the key at all. A reader
+    # checking `"include_root" in result` must not see it on every declare.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _SourceBV(_FakeBV):
+        def parse_types_from_string(self, declaration):
+            return _ParseResult(types={"Player": "struct Player"})
+
+    result = instance._op_types_declare(_SourceBV(), {
+        "op": "types_declare",
+        "declaration": "typedef struct Player { int hp; } Player;",
+    })
+
+    assert "include_root" not in result
+
+
 def test_types_declare_refuses_source_without_named_types(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

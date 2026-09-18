@@ -437,36 +437,57 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             # a core ever hands back a bare int (the same class of surprise as
             # a relocation/symbol enum arriving unwrapped).
             #
-            # #682 item 3, DEFENSIVE half: an edge whose target is None is
-            # emitted rather than dropped. Measured against BN 6.1 this shape
-            # is UNREACHABLE through the Python API -- `BasicBlock._make_edges`
-            # asserts `BNNewBasicBlockReference` is non-None and wraps it with
-            # `_create_instance`, which cannot return None -- and a sweep of
-            # 12,191 functions x 3 IL levels over four targets found zero. It
-            # stays because it is correct if a future core returns one, but it
-            # is NOT the live indirect-branch case; see below for that.
+            # #682 item 3. A null-target edge is NOT emitted, and that is a
+            # deliberate reversal of this PR's first cut. Two measurements
+            # decided it. (a) The shape is unreachable on BN 6.1:
+            # `BasicBlock._make_edges` asserts `BNNewBasicBlockReference` is
+            # non-None and wraps it through `_create_instance`, which cannot
+            # return None, and a sweep of 12,191 functions x 3 IL levels over
+            # four targets found zero. (b) Emitting `to: null` would silently
+            # BREAK a known consumer: bn-tui types the field `pub to: String`
+            # (not Option, no serde default), so a null fails the decode --
+            # and because the failure is inside `Vec<CfgEdge>`, the whole
+            # `CfgJson` parse fails and the TUI shows an EMPTY CFG with no
+            # error. Speculative code whose only effect, on the day it fires,
+            # is to blank a consumer's view is worse than no code.
+            #
+            # An unresolved target is therefore reported the same way the
+            # LIVE case is, on the block, where the disclosure is additive
+            # and breaks nothing (bn-tui sets no `deny_unknown_fields`, so an
+            # unknown block key is ignored).
             edges = []
+            unresolved_target = False
             for edge in bb.outgoing_edges:
                 kind = getattr(edge.type, "name", None) or str(edge.type)
                 if edge.target is None:
-                    edges.append({"to": None, "k": kind, "unresolved": True})
-                else:
-                    edges.append({"to": hex(edge.target.start), "k": kind})
+                    unresolved_target = True
+                    continue
+                edges.append({"to": hex(edge.target.start), "k": kind})
             block = {"start": hex(bb.start), "insns": insns, "edges": edges}
             # #682 item 3, LIVE half. A real unresolvable indirect jump
-            # (`jmp rax`) does not produce a null-target edge -- it produces
-            # NO EDGES AT ALL, so it rendered byte-identically to a block that
-            # simply has no successor. That is the same lost distinction, and
-            # it is the one that actually occurs. BN answers it directly:
-            # `has_undetermined_outgoing_edges` is the core's own "I could not
-            # determine where this goes". Read defensively because reduced
-            # views and IL block objects need not implement it, and an absent
-            # or throwing probe is indeterminate -- not a claim of either kind.
+            # (`jmp rax`) produces NO EDGES AT ALL, so it rendered
+            # byte-identically to a block that simply has no successor -- the
+            # one distinction a control-flow view must not lose. BN answers
+            # it directly: `has_undetermined_outgoing_edges` is the core's
+            # own "I could not determine where this goes". Read defensively
+            # because reduced views and IL block objects need not implement
+            # it, and an absent or throwing probe is indeterminate -- not a
+            # claim of either kind.
+            #
+            # What the marker claims, exactly: it reports BN's VERDICT, it
+            # does not exhaustively classify lost successors. Measured live,
+            # 383 of 48,528 asm blocks carry it and none of the 42,034 blocks
+            # WITH resolved successors do -- but 368 jmp-terminated tail-call
+            # stubs have zero edges with the flag FALSE, so an unmarked
+            # edgeless block is not proof of a genuine dead end. It is also
+            # asm-level on this build: at MLIL/HLIL the same block reports
+            # False because BN models the jump as a `__tailcall` return. Both
+            # are BN's answer being relayed faithfully, not a bridge drop.
             try:
                 undetermined = bool(bb.has_undetermined_outgoing_edges)
             except Exception:  # noqa: BLE001 - absent/raising probe says nothing
                 undetermined = False
-            if undetermined:
+            if undetermined or unresolved_target:
                 block["undetermined_edges"] = True
             blocks.append(block)
     result = {

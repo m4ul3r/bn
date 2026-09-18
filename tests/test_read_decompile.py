@@ -3299,21 +3299,26 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
         {"a": "0x401000", "t": "cmp eax, 0x0"},
         {"a": "0x401004", "t": "je 0x401010"},
     ]
-    # #682 item 3: the edge whose target is None (indirect/unresolved) is
-    # DISCLOSED, not dropped. This assertion previously read "is dropped, not
-    # rendered" and was the test pinning the defect: dropping it renders an
-    # indirect branch identical to a block with no outgoing edge at all.
-    assert blocks[0]["edges"] == [
-        {"to": "0x401010", "k": "TrueBranch"},
-        {"to": None, "k": "IndirectBranch", "unresolved": True},
-    ]
+    # #682 item 3: a null-target edge is NOT emitted as a row. It would have
+    # to carry `to: null`, and bn-tui types that field `pub to: String` with
+    # no serde default -- so a null fails the decode, and because the failure
+    # is inside `Vec<CfgEdge>` the whole CFG parse fails and the TUI shows an
+    # EMPTY view with no error. The shape is also unreachable on BN 6.1.
+    # The unresolved target is reported on the BLOCK instead, where the
+    # disclosure is additive and no consumer breaks.
+    assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    assert blocks[0]["undetermined_edges"] is True
     assert blocks[1]["edges"] == []
+    assert "undetermined_edges" not in blocks[1]
 
 
-def test_cfg_resolved_edges_carry_no_unresolved_key(monkeypatch):
-    # Must-not-fire twin for #682 item 3: the disclosure is additive, so a
-    # normally-resolved edge keeps its exact previous shape. A consumer that
-    # does `"unresolved" in edge` must not see it on every edge.
+def test_cfg_edge_rows_stay_exactly_two_keys_for_a_strict_consumer_682(monkeypatch):
+    # Must-not-fire twin for #682 item 3, repointed at the contract that
+    # actually matters. bn-tui decodes an edge as `{to: String, k: String}`
+    # with `to` non-optional, so the edge row must never grow a key that
+    # changes its shape and must never carry a non-string `to` -- the whole
+    # reason the unresolved case moved to the block. Assert the row's exact
+    # key set rather than the absence of one name a later change could rename.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, _fn = _cfg_asm_bv()
@@ -3321,9 +3326,10 @@ def test_cfg_resolved_edges_carry_no_unresolved_key(monkeypatch):
 
     result = instance._cfg(None, "process_packet", view="asm")
 
-    resolved = result["blocks"][0]["edges"][0]
-    assert resolved == {"to": "0x401010", "k": "TrueBranch"}
-    assert "unresolved" not in resolved
+    for block in result["blocks"]:
+        for edge in block["edges"]:
+            assert set(edge) == {"to", "k"}, edge
+            assert isinstance(edge["to"], str), edge
 
 
 def test_cfg_asm_blocks_are_sorted_by_start_not_bn_iteration_order(monkeypatch):
