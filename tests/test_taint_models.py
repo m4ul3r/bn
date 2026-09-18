@@ -306,6 +306,37 @@ def test_present_callsites_label_import_thunk_560():
     assert system["audit_callsite_count"] == 1
 
 
+def test_present_callsites_carry_one_line_of_context_794():
+    # #794: the row answered {address, function, kind}, which says WHERE a
+    # modeled sink is called but nothing about WHAT the call looks like, so
+    # triaging a callsite queue cost a `bn disasm` round-trip per row. The key
+    # is `disasm`, matching the sibling address-row emitters (read_xrefs /
+    # read_evidence) rather than inventing a second spelling for one field.
+    class _BVDisasm(_BVTriage):
+        def get_disassembly(self, a):
+            return {0x5010: "call    system", 0x2000: "jmp     qword [rip+0x2f1a]"}.get(a, "")
+
+    res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
+                               {"present": True, "callsites": True})
+    rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
+    assert rows["0x5010"]["disasm"] == "call    system"
+    assert rows["0x2000"]["disasm"] == "jmp     qword [rip+0x2f1a]"
+    # The pre-existing fields are untouched -- this is additive.
+    assert rows["0x5010"]["function"] == "parse_record"
+    assert rows["0x5010"]["kind"] == "app_caller"
+
+
+def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
+    # A BN shape with no `get_disassembly` (and a read that raises) must still
+    # produce the row -- an unavailable context is an empty string, never a
+    # failed listing. `_BVTriage` has no such method at all.
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True})
+    rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
+    assert rows["0x5010"]["disasm"] == ""
+    assert rows["0x5010"]["function"] == "parse_record"
+
+
 def test_present_self_stub_labeled_non_audit_560():
     # A code ref located inside the modeled symbol's OWN body (a self-tailcall
     # stub) is non-audit, distinct from an import thunk.

@@ -53,6 +53,8 @@ from .taint_locators import (  # noqa: F401
     derive_flow_facts,
 )
 from .taint_result import (  # noqa: F401
+    BLOCKING_LEAF_KINDS,
+    backward_diagnostics,
     forward_zero_diagnostics,
     indirect_pointer_slot_leaf,
     misanchored_recv_leaf,
@@ -1853,6 +1855,14 @@ class TaintEngine:
         # renders a different remediation, so the cause is tracked separately and
         # carried through to stats/diagnostics/text.
         self._truncation_causes: set[str] = set()
+        # #811: callees whose body this run could NOT analyse (MLIL unavailable
+        # -- a partially analysed view, or a function BN had not finished
+        # lifting). `_summarize` already degrades conservatively, but it did so
+        # with a prose assumption only, so a result built over an unread callee
+        # was indistinguishable from one built over a fully analysed program and
+        # could still answer safe_to_report_all_clear. Tracked structurally, the
+        # same way `_truncated`/`_truncation_causes` are, so a consumer can gate.
+        self._analysis_incomplete: set[str] = set()
         self._only_callsite_addr = only_callsite_addr
         # #559: count the source callsites the seed actually matched, so a
         # zero-result query can report "matched N source callsites" instead of an
@@ -1917,6 +1927,21 @@ class TaintEngine:
                 # Additive, distinguishes the truncation cause (fixpoint vs depth
                 # vs recursion) so a consumer reports the right one (#579/#576).
                 "truncation_cause": sorted(self._truncation_causes),
+                # #811: a body the run could not read is a coverage hole distinct
+                # from truncation -- nothing was cut short, a region was never
+                # legible. Named so the two are not conflated.
+                "analysis_incomplete": bool(self._analysis_incomplete),
+                "analysis_incomplete_functions": sorted(self._analysis_incomplete),
+            },
+            # #812: the CONFIGURED knobs this run used. `stats.max_depth` is the
+            # deepest depth actually REACHED, so a result carrying only that
+            # could not answer "was I bounded by the cap, or did the flow simply
+            # end?" -- the two look identical when the walk happens to stop at
+            # the cap. Echoed alongside the measurement, never merged into it.
+            "run_params": {
+                "max_depth": int(max_depth),
+                "max_iters": int(self.max_iters),
+                "unknown_call": str(self.unknown_call_policy),
             },
             "soundness": SOUNDNESS,
         }
@@ -1944,7 +1969,8 @@ class TaintEngine:
         return forward_zero_diagnostics(
             sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
             truncated=bool(getattr(self, "_truncated", False)),
-            truncation_cause=sorted(getattr(self, "_truncation_causes", set())))
+            truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
+            analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -1987,6 +2013,8 @@ class TaintEngine:
         max_depth_seen = 0
         truncated = False
         truncation_causes: set[str] = set()
+        per_source_diag: dict[str, dict[str, Any]] = {}
+        incomplete_funcs: set[str] = set()
 
         for addr in callsite_addrs:
             res = self._forward_run(func, sources, max_depth=max_depth, only_callsite_addr=addr)
@@ -1996,13 +2024,30 @@ class TaintEngine:
             by_source[hex(addr)] = {
                 "reached_sinks": res["reached_sinks"],
                 "leaves": res["leaves"],
+                # #812: this callsite's BLOCKING frontier-leaf count, derived
+                # from the canonical BLOCKING_LEAF_KINDS. The text renderer used
+                # to compute its own "(N frontier)" marker by counting a single
+                # hard-coded kind (`unmodeled_callee`) out of the eleven that
+                # block a claim, so every other frontier -- an under-recovered
+                # arg, a coarse store, a pointer escape, an unresolved indirect
+                # call, an unlifted instruction -- displayed as zero and the
+                # marker vanished entirely. Counting it HERE keeps one owner for
+                # the vocabulary: the CLI has no access to this set (no bridge
+                # import) and must not grow a second copy of it (#827 item 3 is
+                # the same defect elsewhere).
+                "frontier": sum(1 for lf in res["leaves"]
+                                if isinstance(lf, dict)
+                                and lf.get("kind") in BLOCKING_LEAF_KINDS),
             }
+            per_source_diag[hex(addr)] = res.get("diagnostics") or {}
             union_findings.extend(res["reached_sinks"])
             union_leaves.extend(res["leaves"])
             union_assumptions.extend(res["assumptions"])
             max_depth_seen = max(max_depth_seen, res["stats"]["max_depth"])
             truncated = truncated or res["stats"]["truncated"]
             truncation_causes |= set(res["stats"].get("truncation_cause") or [])
+            incomplete_funcs |= set(
+                res["stats"].get("analysis_incomplete_functions") or [])
 
         # Union the per-callsite results back into the historical top-level shape.
         # Stats follow the pinned rule: max_depth = max across runs; functions_visited
@@ -2049,6 +2094,15 @@ class TaintEngine:
                 "frontier_total": len(union_leaves),
                 "truncated": truncated,
                 "truncation_cause": sorted(truncation_causes),
+                # #811: union of the callee bodies no per-callsite run could read.
+                "analysis_incomplete": bool(incomplete_funcs),
+                "analysis_incomplete_functions": sorted(incomplete_funcs),
+            },
+            # #812: same configured-knob echo as the single-run envelope.
+            "run_params": {
+                "max_depth": int(max_depth),
+                "max_iters": int(self.max_iters),
+                "unknown_call": str(self.unknown_call_policy),
             },
             "soundness": SOUNDNESS,
         }
@@ -2058,14 +2112,31 @@ class TaintEngine:
         # base["diagnostics"] let a blocking frontier leaf emitted by callsite #2+
         # coexist with safe_to_report_all_clear=True from callsite #1 -- a false
         # all-clear on the default multi-callsite path that contradicts the same
-        # result's own leaves array. The descriptive tainted_values/last_use stay
-        # from the representative (first) run; the gate/frontier reflect the union.
+        # result's own leaves array.
+        #
+        # #805: the DESCRIPTIVE half was still copied from the representative
+        # (first) run, which made it an artifact of callsite ITERATION ORDER --
+        # reversing `callsite_addrs` moved `last_use` while the gate stayed put,
+        # so two runs over one binary disagreed about where taint was last seen.
+        # Both fields are now defined over the whole union:
+        #   tainted_values -- the SUM across per-callsite runs. They are
+        #     independent propagations, so the sum is the total work the union
+        #     represents; a value reached from two callsites counts once per run
+        #     and the split stays in by_source.
+        #   last_use -- kept ONLY when every run that has one agrees. N
+        #     independent runs have no single last use, and electing a
+        #     representative is exactly what made this order-dependent, so the
+        #     scalar goes null and `last_use_by_source` carries the real answer
+        #     per callsite. The ambiguity is disclosed, not resolved by accident.
         if not findings:
-            base_diag = base.get("diagnostics") or {}
+            _diags = list(per_source_diag.values())
+            _tainted_values = sum(int(d.get("tainted_values") or 0) for d in _diags)
+            _uses = [d.get("last_use") for d in _diags if d.get("last_use")]
+            _agreed = _uses[0] if _uses and all(u == _uses[0] for u in _uses) else None
             union_sub = {
                 "diag": {
-                    "tainted_values": base_diag.get("tainted_values", 0),
-                    "last_use": base_diag.get("last_use"),
+                    "tainted_values": _tainted_values,
+                    "last_use": _agreed,
                 },
                 "leaves": leaves,
                 "assumptions": assumptions,
@@ -2074,7 +2145,11 @@ class TaintEngine:
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
                 seed_callsites=len(callsite_addrs),
-                truncated=truncated, truncation_cause=sorted(truncation_causes))
+                truncated=truncated, truncation_cause=sorted(truncation_causes),
+                analysis_incomplete=bool(incomplete_funcs))
+            out["diagnostics"]["last_use_by_source"] = {
+                a: d.get("last_use") for a, d in per_source_diag.items()
+            }
         return out
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
@@ -2677,6 +2752,82 @@ class TaintEngine:
         """Backward-compatible bool wrapper over :meth:`_bounded_copy_reason`."""
         return self._bounded_copy_reason(ssaf, params, length_idx, dest_idx) is not None
 
+    def _residual_chunk_length(self, ssaf: Any, params: list[Any], length_idx: int,
+                               dest_idx: int) -> tuple[str, str] | None:
+        """``(total_expr, cursor_expr)`` when the copy is the chunked-read
+        residual idiom -- ``n = total - cursor; op(buf + cursor, n)`` -- else None.
+
+        This is the shape #499's closing note wanted suppressed to make
+        ``--sink-class recv_overflow`` usable by default::
+
+            while (progress < cap) {
+                n = cap - progress;
+                got = read(fd, staging + progress, n);
+                progress += got;
+            }
+
+        It recognises the shape; it deliberately does NOT downgrade the class.
+        The loop invariant bounds the length by ``total`` and the cumulative
+        write extent by ``cursor + (total - cursor) == total`` -- but "bounded by
+        total" is only safety when ``total <= sizeof(dest)``, and this engine
+        cannot decide that here:
+
+        * ``_dest_alloc`` sizes a buffer only from an allocating CALL, so a fixed
+          stack array (the exact destination in #791's own repro) resolves to
+          nothing -- there is no declared-size lookup anywhere in this module.
+        * The extent identity needs ``cursor <= total``. That is the loop guard,
+          and nothing here does control-dependence or dominance, so it cannot be
+          established. Unsigned wrap makes the failure mode concrete rather than
+          theoretical: with ``cursor > total`` the subtraction underflows to a
+          huge length.
+
+        So downgrading on the SHAPE alone would silently clear a genuine
+        attacker-controlled write into an undersized buffer -- a false negative,
+        which this engine treats as its worst outcome. What the shape can
+        honestly do is tell the reader exactly which question is open, which is
+        what the caller attaches to the finding.
+        """
+        if length_idx >= len(params) or dest_idx >= len(params):
+            return None
+        # The length operand is usually a VARIABLE whose definition is the
+        # subtraction (`n = cap - progress; read(..., n)`) rather than an inline
+        # expression -- that is the shape #791's own evidence shows. Resolve
+        # through the def chain the way `_syscall_bound_for_length` does, then
+        # fall back to an inline subtraction.
+        len_expr = params[length_idx]
+        if op_name(len_expr) != "MLIL_SUB":
+            var = self._as_single_ssa_var(len_expr)
+            if var is None:
+                return None
+            try:
+                d = ssaf.get_ssa_var_definition(var)
+            except Exception:
+                d = None
+            len_expr = getattr(d, "src", None) if d is not None else None
+            if len_expr is None or op_name(len_expr) != "MLIL_SUB":
+                return None
+        left, right = getattr(len_expr, "left", None), getattr(len_expr, "right", None)
+        # Both operands must be variables: a constant subtrahend is `v - C`,
+        # which `_linear_in_var` already models and `_bounded_copy_reason`
+        # already reasons about. This idiom is var-minus-var.
+        total_v = self._as_single_ssa_var(left)
+        cursor_v = self._as_single_ssa_var(right)
+        if total_v is None or cursor_v is None:
+            return None
+        if self._int_const(left) is not None or self._int_const(right) is not None:
+            return None
+        cursor_c = self._canonical_ssa_var(ssaf, cursor_v)
+        # The SAME cursor must index the destination -- that is what makes this
+        # a residual chunk rather than an unrelated subtraction. Comparing
+        # canonical roots follows pure SSA copies, so `buf + progress` still
+        # matches when the address was materialised through a temporary.
+        for r in expr_reads(params[dest_idx]):
+            rc = self._canonical_ssa_var(ssaf, r)
+            if (var_key(rc) == var_key(cursor_c)
+                    and getattr(rc, "version", None) == getattr(cursor_c, "version", None)):
+                return str(left), str(right)
+        return None
+
     def _const_value(self, expr: Any) -> int | None:
         """The integer constant of a CONST/CONST_PTR expression, else None."""
         if op_name(expr) in ("MLIL_CONST", "MLIL_CONST_PTR"):
@@ -2780,6 +2931,10 @@ class TaintEngine:
         try:
             sub = self._run_forward(callee, locators, depth, max_depth, top=False)
         except TaintError as exc:
+            # #811: record the unread body structurally as well as in prose. The
+            # conservative degrade below (reached_return=True) is unchanged --
+            # only the disclosure is added, never the propagation polarity.
+            self._analysis_incomplete.add(str(getattr(callee, "name", "?")))
             sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                    "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"],
                    "frontier": f"body could not be analyzed ({exc})"}
@@ -3137,17 +3292,28 @@ class TaintEngine:
         def _rooted_at_unconditional(node: tuple) -> bool:
             if not unconditional_roots:
                 return False
-            cur = node
+            # #827: this is a pure REACHABILITY question -- "is any ancestor of
+            # `node` an unconditionally-injected root?" -- so unlike
+            # `_reconstruct_path` (which must render one chain) it has no reason
+            # to prefer parents[0]. Following only the first parent answered
+            # False whenever the injected root sat behind a PHI's second parent,
+            # UNDER-tagging the finding and letting a sink reached through
+            # always-unsafe injected taint be rendered as though the run's
+            # declared --source causally reached it. Walk every parent; `seen`
+            # bounds the traversal on cyclic `why` chains exactly as before.
+            stack = [node]
             seen: set = set()
-            while cur is not None and cur not in seen:
+            while stack:
+                cur = stack.pop()
+                if cur is None or cur in seen:
+                    continue
                 if cur in unconditional_roots:
                     return True
                 seen.add(cur)
                 entry = why.get(cur)
                 if entry is None:
-                    return False
-                parents = entry.get("parents") or []
-                cur = parents[0] if parents else None
+                    continue
+                stack.extend(entry.get("parents") or [])
             return False
 
         def _tag_unconditional_flow(finding: dict[str, Any], hit_nodes: list[tuple]) -> dict[str, Any]:
@@ -3594,6 +3760,51 @@ class TaintEngine:
                                         "is path-ambiguous, so overflow-vs-bounded is deferred -- "
                                         "corroborate with `taint backward`",
                                     }
+                                # #791 (residual of #499): the chunked-read
+                                # residual idiom `n = total - cursor;
+                                # read(buf + cursor, n)`. #499's closing note
+                                # asked for this to be SUPPRESSED so
+                                # recv_overflow became usable by default. It is
+                                # deliberately NOT suppressed and NOT downgraded
+                                # -- see `_residual_chunk_length` for why the
+                                # shape cannot carry that conclusion: the
+                                # invariant bounds the write by `total`, while
+                                # safety needs `total <= sizeof(dest)`, and this
+                                # engine can size neither a stack array nor the
+                                # loop guard. #791's own repro is precisely the
+                                # unsafe case (an attacker-controlled `cap` into
+                                # a fixed stack buffer), so suppressing on shape
+                                # would have cleared a real overflow.
+                                #
+                                # What IS honest is naming the open question, so
+                                # a reader triaging an opt-in recv_overflow queue
+                                # can see in the row itself that the length is a
+                                # residual chunk and that the single thing to
+                                # check is the destination's capacity against
+                                # `total`. The class is untouched.
+                                if eff_sink.get("class") == "overflow_len":
+                                    _resid = self._residual_chunk_length(
+                                        ssaf, params, argidx,
+                                        int(eff_sink.get("buf_arg") or 0))
+                                    if _resid is not None:
+                                        _total, _cursor = _resid
+                                        eff_sink = {
+                                            **eff_sink,
+                                            "length_shape": "residual_chunk",
+                                            "residual_total": _total,
+                                            "residual_cursor": _cursor,
+                                            "detail": (eff_sink.get("detail") or "")
+                                            + f" (length is the residual chunk "
+                                            f"`{_total} - {_cursor}` written at offset "
+                                            f"`{_cursor}`, so the loop's cumulative extent "
+                                            f"is bounded by `{_total}` -- NOT downgraded: "
+                                            "bounded-by-total is only safe when the "
+                                            "destination holds `total` bytes, which this "
+                                            "engine cannot establish here (it sizes a buffer "
+                                            "only from an allocating call, and proving "
+                                            "cursor <= total needs the loop guard). Check "
+                                            "the destination's capacity against the total)",
+                                        }
                                 findings.append(_tag_unconditional_flow(
                                     self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
                     else:
@@ -3614,6 +3825,27 @@ class TaintEngine:
                         changed = True
                     else:
                         _note_unkeyed_store(to)
+                    # #804 asked to gate this bookkeeping on the destination being
+                    # KEYABLE (_buffer_target non-None), reading an unkeyable
+                    # *arg:N as "no write happened". Deliberately NOT done: the
+                    # premise does not hold, and the change is a false negative.
+                    # `propagated` does not become an out-param on its own -- the
+                    # two consumers below both pass it through
+                    # `_resolve_to_param_index`, so the ONLY unkeyable stores that
+                    # survive are the ones whose destination is this function's own
+                    # pointer PARAMETER. A bare pointer parameter has no
+                    # intra-function buffer identity by construction (that is
+                    # exactly why _buffer_target returns None for it), yet the
+                    # model states the callee writes through it, and "a write
+                    # through my pointer parameter" is the definition of an
+                    # out-param -- the interprocedural keying is
+                    # `_resolve_to_param_index`, not `_buffer_target`. Gating here
+                    # silently deleted the `fill_len(&slot, buf); memcpy(_,_, slot)`
+                    # chain (test_forward_reused_aliased_length_neutralized_to_
+                    # tainted_len, a reduced real receive-handler shape): the sink
+                    # vanished from reached_sinks entirely. Over-tainting a
+                    # caller's buffer costs a reviewable finding; under-tainting
+                    # loses the bug.
                     if to and to.startswith("*arg:"):
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
@@ -3656,6 +3888,33 @@ class TaintEngine:
                                 f"{name or '?'} at {hex(int(getattr(ins, 'address', 0)))} "
                                 f"(arg{src_i} -> arg0); propagated to the destination, "
                                 f"not itself flagged as a sink")
+            # #863: a model may decline to claim its callee's real destinations
+            # for a STRUCTURAL reason rather than an arity one -- vsscanf writes
+            # through the va_list in arg2, which this engine has no resolver for,
+            # so its entry deliberately models only the `*arg:0 -> ret` edge. The
+            # #851 residual above cannot see that: it compares the call's arity
+            # against a modeled `*arg:N` run, and such a model declares no
+            # destination run at all. The result was an all-clear that read as "no
+            # flow" when the truth was "the model never claimed those
+            # destinations". Disclose it with a weak-seed marker so the gate
+            # withholds the all-clear, exactly as the arity residual does.
+            #
+            # MUST-NOT-FIRE: gated on taint actually reaching this call's
+            # arguments. `apply_model` runs for EVERY call to a modeled callee in
+            # a walked function, so an ordinary vsscanf sitting in an otherwise
+            # untainted body has no tainted param here and stays silent -- the
+            # disclosure marks runs whose data could have landed in the unclaimed
+            # destinations, not the mere presence of the callee.
+            if (model or {}).get("destinations_unmodeled") and any(
+                    arg_taint(p) for p in params):
+                add_assumption(
+                    f"destinations_unmodeled @ {hex(int(getattr(ins, 'address', 0)))}: "
+                    f"tainted input reaches {name or '?'}, whose destination "
+                    "operands this model deliberately does not claim (they are "
+                    "reached through a va_list the engine cannot resolve). Writes "
+                    "into those destinations are not followed, so a 'no sinks "
+                    "reached' result past this call is not proof of safety"
+                )
             # #851, the sscanf half: the propagator run is unrolled exactly like the
             # source run, so an arity_capped model whose call carries more params
             # than its longest `*arg:N` destination leaves the residual destinations
@@ -3726,6 +3985,8 @@ class TaintEngine:
                             changed = True
                         else:
                             _note_unkeyed_store(vto)
+                        # #804: left ungated for the same reason as the static
+                        # propagates loop above -- see the rationale there.
                         if vto.startswith("*arg:"):
                             k = int(vto.split("arg:", 1)[1])
                             if k < len(params):
@@ -4377,9 +4638,6 @@ class TaintEngine:
                 return (var_key(r), None)
         return None
 
-    def _token_tainted(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None, tainted: set) -> bool:
-        return self._token_hit_node(ssaf, params, tok, tainted) is not None
-
     def _apply_to_token(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None,
                         taint_node, callee: str, parents: list | None = None) -> bool:
         parents = parents or []
@@ -4877,6 +5135,13 @@ class TaintEngine:
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
+                # #791: the residual-chunk disclosure. This dict is an explicit
+                # allow-list, not a spread of `sink`, so a classifier field that
+                # is not named here never reaches the caller -- the reason the
+                # shape had to be listed rather than just set upstream.
+                **({"length_shape": sink["length_shape"]} if sink.get("length_shape") else {}),
+                **({"residual_total": sink["residual_total"]} if sink.get("residual_total") else {}),
+                **({"residual_cursor": sink["residual_cursor"]} if sink.get("residual_cursor") else {}),
             },
             "path": path,
         }
@@ -4889,10 +5154,22 @@ class TaintEngine:
             seen.add(cur)
             entry = why[cur]
             ins = entry.get("instr")
-            if ins is not None:
-                chain.append(_instr_dict(ins, reason=entry.get("reason"),
-                                        tainted=[entry.get("label", "?")]))
             parents = entry.get("parents") or []
+            if ins is not None:
+                step = _instr_dict(ins, reason=entry.get("reason"),
+                                   tainted=[entry.get("label", "?")])
+                # #827: this walk follows ONE predecessor per step, but a value
+                # defined at a branch join (a PHI of two tainted parents, e.g.
+                # `x = cond ? a : b`) has several. Rendering parents[0] alone
+                # dropped the alternates SILENTLY, so a reader took the single
+                # rendered chain for the value's whole provenance -- and the
+                # signature derived from this path inherited the same blind spot.
+                # Disclose the join by naming how many parents were not followed;
+                # the rendered chain stays one real path, but it can no longer be
+                # mistaken for the only one.
+                if len(parents) > 1:
+                    step["alternate_parents"] = len(parents) - 1
+                chain.append(step)
             cur = parents[0] if parents else None
         chain.reverse()
         return chain
@@ -5021,6 +5298,27 @@ class TaintEngine:
             "stats": {"leaves": len(self._bw_leaves), "slices": len(slices),
                       "truncated": self._bw_truncated,
                       "truncation_cause": sorted(self._bw_truncation_causes)},
+            # #812: backward had no diagnostics block at all while forward did,
+            # so a curtailed slice (callers dropped at the ascent cap, a def
+            # chain bottomed out at an unresolved field load) was shaped exactly
+            # like an exhaustive one. Attached unconditionally -- backward's
+            # slices ARE its result, so their completeness is a live question at
+            # every count, unlike forward's zero-sink-only gate.
+            "diagnostics": backward_diagnostics(
+                self._bw_leaves, self._bw_assumptions,
+                sinks_seeded=sum(1 for s in sink_status if s.get("seeded")),
+                slices=len(slices),
+                truncated=self._bw_truncated,
+                truncation_cause=sorted(self._bw_truncation_causes)),
+            # #812: configured knobs, echoed as forward does. `max_iters` is
+            # deliberately absent: it bounds the forward intra-function fixpoint,
+            # which backward has no equivalent of, and echoing an irrelevant knob
+            # is how the "raise --max-iters" advice ended up on runs that could
+            # never be fixed by it.
+            "run_params": {
+                "max_depth": int(max_depth),
+                "unknown_call": str(self.unknown_call_policy),
+            },
             "soundness": SOUNDNESS,
         }
 

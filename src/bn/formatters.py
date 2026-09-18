@@ -3658,9 +3658,26 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     out.append(
         f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
         f"produced {diag.get('tainted_values', 0)} tainted value(s)")
+    # #805/#812: a per-callsite attributed union has no single last use, so the
+    # scalar is deliberately null there and `last_use_by_source` carries the
+    # real answer per callsite. Rendering only the scalar would print "seed did
+    # not propagate" for a run where it propagated from every callsite -- the
+    # union's null means AMBIGUOUS, not ABSENT, and the two must not share a
+    # line. Fall through to the genuine "<none>" only when neither is present.
+    _lu_by_src = _field_dict(diag, "last_use_by_source")
     if lu:
         _reason = f" ({lu['reason']})" if lu.get("reason") else ""
         out.append(f"  last propagated use: {lu.get('label', '?')} @ {lu.get('address', '?')}{_reason}")
+    elif any(_lu_by_src.values()):
+        out.append("  last propagated use: differs per source callsite --")
+        for _addr, _u in _lu_by_src.items():
+            _ud = _as_dict(_u)
+            if _ud:
+                _r = f" ({_ud['reason']})" if _ud.get("reason") else ""
+                out.append(
+                    f"    {_addr}: {_ud.get('label', '?')} @ {_ud.get('address', '?')}{_r}")
+            else:
+                out.append(f"    {_addr}: <none — this callsite did not propagate>")
     else:
         out.append("  last propagated use: <none — seed did not propagate>")
     out.append(
@@ -3684,6 +3701,45 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     return out
 
 
+def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
+    """Compact completeness diagnostic for a backward taint slice (#812).
+
+    The backward sibling of :func:`_render_forward_diagnostics`. Its gate is
+    ``safe_to_report_complete_slice``, NOT ``safe_to_report_all_clear``: backward
+    starts at a sink and walks toward origins, so it never answers forward's
+    "no sink was reached" question, and rendering it under that name would put
+    forward's meaning on a different claim."""
+    if not isinstance(diag, dict):
+        return []
+    fr = _field_dict(diag, "frontier")
+    out = ["diagnostics:"]
+    # Counts go through the count helpers, not a raw `.get(k, 0)`: a key that is
+    # PRESENT but holds an unreadable shape must be disclosed, never rendered as
+    # a fabricated zero (#619/#866). That matters more here than almost anywhere
+    # -- a zero in this block reads as "nothing dropped, nothing unresolved",
+    # which is exactly the reassurance the block exists to withhold. The two
+    # headline counters a caller acts on use `_stated_count`, so an unreadable
+    # one renders `?` inline rather than a number the reader would trust.
+    out.append(
+        f"  walked: {_stated_count(diag, 'sinks_seeded')} seeded sink(s), "
+        f"{_stated_count(diag, 'slices')} slice(s)")
+    _fr = (f"  frontier: {_stated_count(fr, 'unresolved')} unresolved, "
+           f"{_stated_count(fr, 'coarse_memory')} coarse-memory")
+    _dropped = _count_field(fr, "dropped_callers")
+    if _dropped:
+        _fr += f", {_dropped} dropped-caller-site(s)"
+    out.append(_fr)
+    if "safe_to_report_complete_slice" in diag:
+        gate = diag.get("safe_to_report_complete_slice")
+        out.append(f"  safe_to_report_complete_slice: {'true' if gate else 'false'}"
+                   + (" (may-analysis, not a proof)" if gate else ""))
+        if diag.get("complete_slice_reason"):
+            out.append(f"    reason: {diag['complete_slice_reason']}")
+    if diag.get("next_action"):
+        out.append(f"  next: {diag['next_action']}")
+    return out
+
+
 @_discloses
 def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
@@ -3697,6 +3753,21 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = _field_list(value, "reached_sinks")
         lines.append(_taint_forward_verdict(value))
+        # #811: a callee whose body could not be read is a coverage hole that
+        # survives INTO a run with findings, where no diagnostics block is
+        # attached at all -- so leaving it JSON-only would hide it in exactly
+        # the case a reader is most likely to stop reading early. Printed right
+        # under the verdict it qualifies, naming the functions so the reader
+        # knows which region the result does not speak for.
+        _stats = _field_dict(value, "stats")
+        if _stats.get("analysis_incomplete"):
+            _incomplete = [str(f) for f in _field_list(_stats, "analysis_incomplete_functions")]
+            lines.append(
+                "  NOTE: analysis incomplete -- "
+                + (f"{len(_incomplete)} callee body/bodies could not be read "
+                   f"({', '.join(_incomplete)})" if _incomplete
+                   else "a callee body could not be read")
+                + "; their contents were never examined")
         diagnostics = _field_dict(value, "diagnostics")
         if not findings and diagnostics:
             lines.extend(_render_forward_diagnostics(diagnostics))
@@ -3788,6 +3859,15 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
             for s in unseeded:
                 lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
+        # #812: backward's completeness gate, rendered for every backward run
+        # that carries one. Leaving it JSON-only would repeat the asymmetry #810
+        # fixed for the truncation verdict -- a text reader could not tell a
+        # slice that reached every origin from one that abandoned caller sites
+        # at the cap or bottomed out at an unresolved field load.
+        bdiag = _field_dict(value, "diagnostics")
+        if bdiag:
+            lines.append("")
+            lines.extend(_render_backward_diagnostics(bdiag))
 
     by_source = _field_dict(value, "by_source")
     if direction == "forward" and by_source:
@@ -3805,9 +3885,17 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     for s in bsinks)
             else:
                 desc = "no sinks"
-            nfront = sum(1 for l in bleaves if isinstance(l, dict) and l.get("kind") == "unmodeled_callee")
+            # #812: the frontier count is computed by the bridge against the
+            # canonical blocking-leaf vocabulary and carried on the row. It used
+            # to be recomputed here against one hard-coded kind, which reported
+            # zero for the other ten and dropped the marker. Absent (a bridge
+            # older than this CLI) -> show no marker rather than a number this
+            # side cannot derive correctly.
+            nfront = br.get("frontier")
             if bleaves:
-                desc += f"; {len(bleaves)} leaf(s)" + (f" ({nfront} frontier)" if nfront else "")
+                desc += f"; {len(bleaves)} leaf(s)"
+                if isinstance(nfront, int) and nfront:
+                    desc += f" ({nfront} frontier)"
             lines.append(f"  {addr}: {desc}")
 
     leaves = _field_list(value, "leaves")
@@ -3912,7 +4000,13 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
         fn = c.get("function") or "?"
         kind = c.get("kind")
         tag = f" [{kind}]" if kind and kind != "app_caller" else ""
-        out.append(f"      {c.get('address')}  {fn}{tag}")
+        # #794: append the one-line disassembly the bridge now carries per row.
+        # Address + function says WHERE the modeled sink is called; without the
+        # instruction a reader still had to `bn disasm` every row to triage the
+        # queue. Omitted when empty so a view that cannot disassemble (or a
+        # bridge older than this CLI) renders exactly the previous row.
+        dis = str(c.get("disasm") or "").strip()
+        out.append(f"      {c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
     return out
 
 
