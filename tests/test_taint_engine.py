@@ -8383,3 +8383,349 @@ def test_new_809_model_keys_resolve_by_their_real_names_only(models):
         assert te.lookup_model(models, f"{name}64")[0] is None, name
         assert te.lookup_model(models, f"user_{name}")[0] is None, name
         assert te.lookup_model(models, f"{name}_ex")[0] is None, name
+
+
+def _two_recv_callsites():
+    """recv_both(fd): read(fd,&bufa,0x40); ta = bufa; read(fd,&bufb,0x40); tb = bufb.
+
+    Two attributable `read` callsites whose taint dies in two DIFFERENT local
+    values, so the per-callsite runs report different last uses and a union that
+    elects a representative is order-dependent. Neither buffer reaches a sink,
+    so the zero-sink diagnostics block (and its gate) is attached."""
+    fd = FVar("fd")
+    bufa, bufb = FVar("bufa", typ="char[0x40]"), FVar("bufb", typ="char[0x40]")
+    ta1, tb1 = FSSA(FVar("ta"), 1), FSSA(FVar("tb"), 1)
+    abuf, bbuf = FSSA(bufa, 0), FSSA(bufb, 0)
+    instrs = [
+        _ext_call(0, 0x20, "read(fd, &bufa, 0x40)", 0x910,
+                  [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                   FExpr("MLIL_ADDRESS_OF", "&bufa", src=bufa),
+                   FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x24, "MLIL_SET_VAR_SSA", "ta#1 = bufa", reads=[abuf], writes=[ta1],
+               src=FExpr("MLIL_VAR_SSA", "bufa", reads=[abuf])),
+        _ext_call(2, 0x30, "read(fd, &bufb, 0x40)", 0x910,
+                  [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                   FExpr("MLIL_ADDRESS_OF", "&bufb", src=bufb),
+                   FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(3, 0x34, "MLIL_SET_VAR_SSA", "tb#1 = bufb", reads=[bbuf], writes=[tb1],
+               src=FExpr("MLIL_VAR_SSA", "bufb", reads=[bbuf])),
+    ]
+    return FFunc("recv_both", 0x10, FSSAFunc(instrs), params=[fd])
+
+
+def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
+                         copy_hops: int = 0):
+    """fill(fd, cap): dst = &staging + progress; n = cap - progress;
+    read(fd, dst, n).
+
+    #791's shape reduced, in the spellings a real lifter actually emits. Each
+    knob corresponds to a variant measured against a live bridge during
+    cross-dogfood, because every one of them defeated an earlier version of the
+    matcher:
+
+    * default -- both call operands are plain SSA VARIABLES whose definitions
+      hold the ADD and the SUB. The first implementation read the operands
+      directly and was dead on every real binary while passing a fixture that
+      inlined the ADD into the call.
+    * ``inline_dest`` -- the ADD inlined into the parameter list. Not a shape
+      the lifter produces, kept because the matcher checks the operand before
+      walking its chain.
+    * ``widen_len`` -- an ``MLIL_SX`` between the length operand and the SUB.
+      This is the ordinary ``int n = cap - progress`` spelling: ``read`` takes
+      ``size_t``, so the widening is ALWAYS there, and a matcher that stops at
+      the extension sees no subtraction.
+    * ``copy_hops`` -- extra copy indirections on both operands, the -O0 shape
+      (measured: ``rsi#2 -> rcx_1#2 -> ADD`` and ``rdx_1#2 -> n#2 -> SUB``).
+      A one-hop resolver finds neither.
+
+    The destination is a FIXED stack array -- precisely what this engine cannot
+    size, which is why the finding must survive rather than be downgraded."""
+    fd, cap = FVar("fd"), FVar("cap")
+    staging = FVar("staging", typ="uint8_t[0x1000]")
+    cap0 = FSSA(cap, 0)
+    prog1 = FSSA(FVar("progress"), 1)
+    sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
+                left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
+                right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                      left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                      right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    instrs: list = []
+    addr = 0x18
+
+    def _bind(name, src_expr, reads):
+        """Emit `name#1 = <src>` and return the operand that reads it."""
+        nonlocal addr
+        ssa = FSSA(FVar(name), 1)
+        instrs.append(FInstr(len(instrs), addr, "MLIL_SET_VAR_SSA",
+                             f"{name}#1 = {src_expr}", reads=list(reads),
+                             writes=[ssa], src=src_expr))
+        addr += 4
+        return FExpr("MLIL_VAR_SSA", f"{name}#1", reads=[ssa]), ssa
+
+    if inline_dest:
+        dest_param, dest_ssa = addr_expr, None
+    else:
+        dest_param, dest_ssa = _bind("dst", addr_expr, [prog1])
+        for i in range(copy_hops):
+            dest_param, dest_ssa = _bind(f"dstc{i}", dest_param, [dest_ssa])
+
+    len_src = sub
+    len_reads = [cap0, prog1]
+    if widen_len:
+        narrow, narrow_ssa = _bind("ni", sub, len_reads)
+        len_src = FExpr("MLIL_SX", f"sx.q({narrow})", reads=[narrow_ssa], src=narrow)
+        len_reads = [narrow_ssa]
+    len_param, len_ssa = _bind("n", len_src, len_reads)
+    for i in range(copy_hops):
+        len_param, len_ssa = _bind(f"nc{i}", len_param, [len_ssa])
+
+    call_reads = [len_ssa] + ([dest_ssa] if dest_ssa is not None else [])
+    instrs.append(_ext_call(len(instrs), 0x40, "read(fd, dst, n)", 0x910,
+                            [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest_param, len_param],
+                            reads=call_reads))
+    return FFunc("fill", 0x10, FSSAFunc(instrs), params=[fd, cap])
+
+
+def _vsscanf_func(*, taint_reaches: bool):
+    """parse(buf): vsscanf(&buf, fmt, ap) -- the va_list destinations the model
+    deliberately does not claim.
+
+    ``taint_reaches`` selects the two cases the #863 gate must tell apart: the
+    run's seed lands on the call's arg0 (the string vsscanf parses FROM), or the
+    call merely SITS in a walked body with an untainted, unrelated argument.
+    """
+    buf = FVar("buf", typ="char[0x40]")
+    other = FVar("other", typ="char[0x40]")
+    src = buf if taint_reaches else other
+    args = [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+            FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+            FExpr("MLIL_VAR_SSA", "ap", reads=[])]
+    return FFunc("parse", 0x10,
+                 FSSAFunc([_ext_call(0, 0x10, "vsscanf(&src, fmt, ap)", 0x902, args)]),
+                 params=[buf])
+
+
+def test_vsscanf_unmodeled_destinations_withhold_the_all_clear_863(models):
+    # #863: vsscanf's real destinations sit behind the va_list in arg2, which the
+    # engine cannot resolve, so the model claims only `*arg:0 -> ret`. That kept
+    # SEEDING honest (`--source call:vsscanf` fails loudly) but not the claim
+    # gate: a run whose taint reached the call still answered
+    # safe_to_report_all_clear, which reads as "no flow" when the truth is "the
+    # model never claimed those destinations". The #851 arity residual cannot
+    # cover it -- there is no modeled `*arg:N` run to out-length -- so this needs
+    # its own marker. Deleting the disclosure, or failing to register the marker
+    # in _WEAK_SEED_ASSUMPTION_MARKERS, is caught here.
+    func = _vsscanf_func(taint_reaches=True)
+    result = te.TaintEngine(FBV({0x902: "vsscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert any("destinations_unmodeled" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_vsscanf_untouched_by_taint_does_not_fire_863(models):
+    # The must-not-fire twin, and the reason the gate keys on reached taint
+    # rather than on the callee's presence: `apply_model` runs for EVERY call to
+    # a modeled callee inside a walked function, so an unconditional disclosure
+    # would brand every body that merely CONTAINS a vsscanf. Here the seed never
+    # reaches the call's arguments, so nothing may be disclosed.
+    func = _vsscanf_func(taint_reaches=False)
+    result = te.TaintEngine(FBV({0x902: "vsscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert not any("destinations_unmodeled" in s for s in result["assumptions"]), result["assumptions"]
+
+
+def test_attributed_union_last_use_does_not_depend_on_callsite_order_805(models):
+    # #805: the union's descriptive diagnostics were copied from the FIRST
+    # per-callsite run, so `last_use` was an artifact of iteration order --
+    # [A,B] and [B,A] over one binary disagreed about where taint was last seen
+    # while the gate stayed identical. Reversing the callsite order must not
+    # change the rendered answer.
+    # Driven through `_forward_attributed` with the callsite list in both
+    # orders: that list IS the variable the bug rode on, so passing it
+    # explicitly tests the union directly instead of hoping a fixture rewrite
+    # changes discovery order. `forward()` is what normally installs the
+    # enabled-sink-class set, so establish it the same way here.
+    def _run(addrs):
+        engine = te.TaintEngine(FBV({0x910: "read"}), models)
+        engine._enabled_sink_classes = set()
+        return engine._forward_attributed(
+            _two_recv_callsites(), [te.parse_locator("call:read")],
+            list(addrs), max_depth=8)
+
+    fwd, rev = _run([0x20, 0x30]), _run([0x30, 0x20])
+    d1 = fwd.get("diagnostics") or {}
+    d2 = rev.get("diagnostics") or {}
+    assert d1.get("last_use") == d2.get("last_use"), (d1.get("last_use"), d2.get("last_use"))
+    # ...and the per-callsite answers are still all there -- the scalar going
+    # null for an ambiguous union must not DELETE the information, only stop
+    # electing an arbitrary representative for it.
+    assert set(d1.get("last_use_by_source") or {}) == {"0x20", "0x30"}, d1
+    assert (d1.get("last_use_by_source") or {}) == (d2.get("last_use_by_source") or {})
+    assert d1.get("tainted_values") == d2.get("tainted_values")
+
+
+def test_forward_run_params_echo_the_configured_knobs_812(models):
+    # #812: `stats.max_depth` is the deepest depth REACHED, so a result carrying
+    # only that cannot answer "was I bounded by the cap, or did the flow simply
+    # end?" -- the two are identical when a walk happens to stop at the cap. The
+    # configured knobs are echoed alongside, never merged into the measurement.
+    func = _scanf_arity_func(4)
+    engine = te.TaintEngine(FBV({0x900: "scanf"}), models, max_iters=64)
+    result = engine.forward(func, [te.parse_locator("call:scanf")], max_depth=3)
+    rp = result.get("run_params") or {}
+    assert rp.get("max_depth") == 3, rp
+    assert rp.get("max_iters") == 64, rp
+    assert rp.get("unknown_call") == "conservative", rp
+    # The echo is NOT the measurement: stats still reports what was reached.
+    assert result["stats"]["max_depth"] <= 3
+
+
+@pytest.mark.parametrize("shape", [
+    {},                                  # dst/len each one def hop behind the call
+    {"inline_dest": True},               # ADD inlined into the parameter list
+    {"widen_len": True},                 # `int n = cap - progress` -> SX before the SUB
+    {"copy_hops": 2},                    # -O0: several copies on both operands
+    {"widen_len": True, "copy_hops": 2},  # both at once
+], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied"])
+def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape):
+    # #791 asked for the chunked-read residual (`n = cap - progress;
+    # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
+    # by default. It is deliberately recognised and NOT downgraded: the loop
+    # invariant bounds the write by `cap`, but safety needs `cap <=
+    # sizeof(dest)`, and this engine can size neither a fixed stack array nor
+    # the loop guard. #791's own repro is the UNSAFE case -- an attacker
+    # controlled `cap` into a fixed stack buffer -- so suppressing on the shape
+    # would clear a real overflow. The class must survive; only the open
+    # question is named.
+    #
+    # Every shape here is one a live bridge actually produced, and each defeated
+    # an earlier matcher: reading the call operand directly missed all of them;
+    # a single def hop still missed the widened `int n` spelling and every -O0
+    # variant (4 of 6 real variants), because the SUB sits behind an MLIL_SX or
+    # two copies. Disclosure has to hold across the spellings the compiler
+    # chooses, or it is advice that only appears when it is least needed.
+    func = _residual_chunk_func(**shape)
+    result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
+        func, [te.parse_locator("param:1")],
+        enabled_sink_classes={"recv_overflow"})
+    reads = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "read"]
+    assert len(reads) == 1, result["reached_sinks"]
+    sink = reads[0]["sink"]
+    # THE soundness assertion: still an overflow, never relabelled to bounded.
+    assert sink["class"] == "overflow_len", sink
+    # ...and the shape is disclosed so the reader knows the one thing to check.
+    assert sink.get("length_shape") == "residual_chunk", sink
+    assert "capacity" in (sink.get("detail") or "")
+
+
+def test_reconstruct_path_discloses_a_dropped_phi_parent_827(models):
+    # #827 item 1: the walk renders ONE chain, following parents[0]. A value
+    # defined at a branch join has several tainted parents, and dropping the
+    # rest silently let the single rendered chain read as the value's whole
+    # provenance -- the signature derived from it inherited the same blind spot.
+    # The chain stays one real path; the join is now named.
+    engine = te.TaintEngine(FBV({}), models)
+    join, alt, root = ("x", 1), ("b", 1), ("a", 1)
+    why = {
+        join: {"instr": FInstr(2, 0x30, "MLIL_SET_VAR_SSA", "x#1 = phi(a#1, b#1)"),
+               "label": "x#1", "reason": "phi join", "parents": [root, alt]},
+        root: {"instr": FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "a#1 = src"),
+               "label": "a#1", "reason": "seed", "parents": []},
+    }
+    chain = engine._reconstruct_path(join, why)
+    step = next(s for s in chain if s.get("address") == "0x30")
+    assert step["alternate_parents"] == 1, step
+    # The linear step must NOT be annotated -- an unconditional marker would be
+    # a permanent false alarm on every ordinary chain.
+    linear = next(s for s in chain if s.get("address") == "0x10")
+    assert "alternate_parents" not in linear, linear
+
+
+def _unreadable_callee_func():
+    """caller(p): helper(p#0) -- `helper` is an in-binary callee the run DESCENDS
+    into and then cannot read.
+
+    The faithful mid-refresh shape, and the reason it is not simply "mlil is
+    None": `_is_internal` already rejects a null-MLIL callee as external, and
+    the external path discloses "has no model" which blocks the gate on its own.
+    The gap #811 names needs a callee that passes the descend test -- MLIL with
+    instructions -- and then fails INSIDE the walk, which is what a view whose
+    SSA form has not been built yet produces. The argument is a bare tainted VAR
+    so the descent actually fires."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    body = FInstr(0, 0xB04, "MLIL_SET_VAR_SSA", "q#1 = q#0")
+    helper = FFunc("helper", 0xB00, FSSAFunc([body]), params=[FVar("q", ident=41)])
+    helper.mlil.ssa_form = None             # lifted, but SSA not built yet
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
+    return FFunc("caller", 0x10, FSSAFunc([call]), params=[p]), helper
+
+
+def test_unreadable_callee_body_is_named_in_the_result_811(models):
+    # #811: `_summarize` already degraded conservatively when a callee's body
+    # could not be read, but disclosed it as PROSE only -- "nothing in the
+    # result distinguishes it from a fully analysed run". The condition is now
+    # STRUCTURAL and names the function, which is the marker the issue asks for;
+    # a consumer no longer has to substring-match an assumption to learn that
+    # part of the program was never examined.
+    func, helper = _unreadable_callee_func()
+    result = te.TaintEngine(FBV({}, funcs={0xB00: helper}), models).forward(
+        func, [te.parse_locator("param:0")])
+    stats = result["stats"]
+    assert stats["analysis_incomplete"] is True, stats
+    assert "helper" in stats["analysis_incomplete_functions"], stats
+    diag = result.get("diagnostics") or {}
+    assert diag.get("analysis_incomplete") is True, diag
+    assert diag.get("safe_to_report_all_clear") is False, diag
+    # The conservative degrade is unchanged -- only the disclosure was added.
+    assert any("could not analyze helper" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_analysis_incomplete_alone_withholds_the_all_clear_811():
+    # The gate branch on its own. In the integration case above a frontier leaf
+    # happens to be emitted too and takes priority in the reason, so that test
+    # cannot prove this branch exists. Here nothing else is wrong: no leaves, no
+    # assumptions, not truncated -- an unread body is the ONLY defect, and it
+    # must still withhold the claim, because "no sink in a body I never read" is
+    # an absence of evidence.
+    from bn_agent_bridge import taint_result as tr
+
+    safe, reason = tr._derive_all_clear([], [], truncated=False)
+    assert safe is True, reason
+    safe, reason = tr._derive_all_clear([], [], truncated=False, analysis_incomplete=True)
+    assert safe is False
+    assert "could not be analysed" in reason, reason
+
+
+def test_fully_analysed_run_stays_complete_811(models):
+    # The must-not-fire twin: an ordinary run must not pay the disclosure, or
+    # every clean result would carry a permanent incompleteness warning.
+    func = _scanf_arity_func(4)
+    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
+        func, [te.parse_locator("call:scanf")])
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
+    assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is True
+
+
+def test_backward_result_carries_a_completeness_gate_812(process_func, models):
+    # #812: forward attached a diagnostics block and backward attached none, so
+    # a curtailed slice was shaped exactly like an exhaustive one. The gate is
+    # deliberately `safe_to_report_complete_slice`, NOT the forward key: backward
+    # starts AT a sink and never answers "no sink was reached".
+    engine = te.TaintEngine(FBV({0x401070: "read", 0x401080: "memcpy"}), models)
+    result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
+    diag = result.get("diagnostics") or {}
+    assert diag, result.keys()
+    assert "safe_to_report_complete_slice" in diag, diag
+    # Forward's key must NOT appear on a backward result -- that was the whole
+    # reason for a separate name.
+    assert "safe_to_report_all_clear" not in diag, diag
+    assert "frontier" in diag and "next_action" in diag, diag
+    assert result["run_params"]["max_depth"] == 8
+    # `max_iters` bounds the forward fixpoint only; echoing it on a backward run
+    # is how the "raise --max-iters" advice reached runs it could never fix.
+    assert "max_iters" not in result["run_params"], result["run_params"]

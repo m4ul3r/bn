@@ -3832,9 +3832,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    assert len(sites) == 19, (
+    # 19 -> 24 (#812): `_render_backward_diagnostics` is new and reads five
+    # counters through `_count_field` -- `sinks_seeded`/`slices` off the
+    # diagnostics block and `unresolved`/`coarse_memory`/`dropped_callers` off
+    # its frontier. They are counts in a block whose entire purpose is to
+    # withhold a completeness claim, so a fabricated zero there reads as
+    # "nothing was dropped" -- exactly the reassurance the block exists to
+    # refuse. Routed through the helper rather than `get(k, 0)` so the residue
+    # census stays put and these five join the covered set instead.
+    assert len(sites) == 24, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 19. The number is the size of the covered set: a "
+        "count helper, not 24. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3892,6 +3900,20 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",
+        # #812: all three live NESTED under the diagnostics block's `frontier`
+        # container, so a top-level probe never reaches the read that states
+        # them -- the same shape as the `existing_annotations` pair below, not a
+        # renderer that stopped stating a count. `unresolved`/`coarse_memory` DO
+        # go through `_stated_count` and render `?` on an unreadable value when
+        # the nested payload is real; `dropped_callers` is gated behind a
+        # truthiness check (a zero drops the clause entirely), so it stays a
+        # plain `_count_field` read.
+        "_render_backward_diagnostics(coarse_memory) [count not stated in this "
+        "context]",
+        "_render_backward_diagnostics(dropped_callers) [count not stated in "
+        "this context]",
+        "_render_backward_diagnostics(unresolved) [count not stated in this "
+        "context]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
@@ -4226,7 +4248,14 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    assert checked == 1212, f"the differential ran {checked} cases, not 1212"
+    # 1212 -> 1218 (#812): `_render_backward_diagnostics` adds six discovered
+    # reads -- the `frontier` container plus the five counters/strings the block
+    # renders -- so the derived population grows with it. Measured.
+    # 1218 -> 1224 (#805/#811 text half): `_render_forward_diagnostics` now
+    # reads `last_use_by_source` (the union's per-callsite answer) and
+    # `_render_taint_text` reads `stats.analysis_incomplete_functions`, both
+    # discovered reads with their nested rows.
+    assert checked == 1224, f"the differential ran {checked} cases, not 1224"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4272,7 +4301,13 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
+    #
+    # #812: `_render_backward_diagnostics` adds 6 discovered read keys, each
+    # swept against the 8 bogus values this population uses, so the sweep grows
+    # by 6 x 8 = 48. 4896 + 48 (#812) = 4944.
+    # 4944 -> 4952 (#805/#811 text half): 1 further discovered read key swept
+    # against this population's 8 bogus values.
+    assert swept == 4952, f"the raise sweep ran {swept} renders, not 4952"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4428,7 +4463,12 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
+    #
+    # #812: the 6 read keys `_render_backward_diagnostics` adds, each mirrored
+    # against this population's benign payloads. 1426 + 13 (#812) = 1439.
+    # 1439 -> 1442 (#805/#811 text half): the same newly discovered reads,
+    # mirrored against the benign payloads.
+    assert checked == 1442, f"the mirror ran {checked} renders, not 1442"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

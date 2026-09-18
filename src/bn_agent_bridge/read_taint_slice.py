@@ -18,11 +18,17 @@ Outbound calls resolve through:
     taint model loader + engine + locator/call-target/thunk resolution
     (``load_models``, ``TaintEngine``, ``parse_locator``, ``resolve_call_target``,
     ``follow_thunk``, ``extract_dest_address``, ``TaintError``);
-  * ``_shared`` -- module-free helpers (``_parse_address``, ``OperationFailure``).
+  * ``_shared`` -- module-free helpers (``_parse_address``, ``OperationFailure``);
+  * ``read_listing`` -- ``_analysis_state_fields``, the ONE definition of the
+    ``{analysis_state, partial}`` disclosure every read op attaches (#820/#811).
+    Imported, never re-derived, so the taint surface cannot drift into a second
+    spelling of "this answer may be incomplete".
 
 Import direction is one-way: this module imports ``il_format``, ``vars``,
-``taint_engine``, and ``_shared`` (plus stdlib + binaryninja). It NEVER imports
-``bridge`` or ``seam`` -- those import THIS module one-way (design spec §3.2).
+``taint_engine``, ``_shared`` and ``read_listing`` (plus stdlib + binaryninja).
+It NEVER imports ``bridge`` or ``seam`` -- those import THIS module one-way
+(design spec §3.2); ``read_listing`` does not import this module either, so the
+added edge stays acyclic.
 """
 from __future__ import annotations
 
@@ -45,6 +51,7 @@ from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address
 from .bridge_state import require_analysis
 from .read_taint_models import build_catalog
+from .read_listing import _analysis_state_fields
 
 
 def _taint_op(ctx, selector, params: dict[str, Any]):
@@ -71,12 +78,21 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         var, _is_param = vars_mod._find_variable_selector(fn, sel)
         return var
 
+    # #812: `max_iters` is an engine ctor knob, now reachable from the CLI
+    # (`taint forward --max-iters`) so the "raise --max-iters" remediation a
+    # fixpoint-truncated run prints is something the user can actually do.
+    # Absent from the request -> the engine's own default, so every existing
+    # caller and the backward path are unaffected.
+    _engine_kwargs: dict[str, Any] = {}
+    if params.get("max_iters") is not None:
+        _engine_kwargs["max_iters"] = int(params["max_iters"])
     engine = _taint.TaintEngine(
         bv,
         models,
         find_variable=_find_variable,
         unknown_call_policy=str(params.get("unknown_call", "conservative")),
         resolve_map=params.get("resolve_map") or {},
+        **_engine_kwargs,
     )
     try:
         if direction == "forward":
@@ -103,6 +119,15 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     # value captured at load time above so it reflects what was actually merged.
     if isinstance(result, dict):
         result["model_sources"] = model_sources
+        # #811: disclose whether this answer was computed over a quick-loaded
+        # (partial) view, using the SAME {analysis_state, partial} shape every
+        # other read op attaches. `require_analysis` above refuses a quick view
+        # outright, so today this always reports "full" from the taint path --
+        # it is here so the contract is uniform and a future quick-tolerant
+        # taint mode cannot ship a silent partial answer. The per-callee
+        # "body could not be read" hole is a DIFFERENT and narrower condition
+        # and is reported separately in stats.analysis_incomplete.
+        result.update(_analysis_state_fields(bv))
     return result
 
 
@@ -133,6 +158,13 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
         bv = ctx._resolve_view(selector)
         present_keys, info = _present_models(bv, models, want_callsites)
         _annotate_presence(catalog, present_keys, info, present_only)
+        # #811: presence is computed by walking this view's functions/symbols, so
+        # on a quick-loaded view a modeled sink can be reported ABSENT merely
+        # because its caller was never analysed -- a false all-clear in catalog
+        # form. Unlike `_taint_op` this handler has no `require_analysis` gate
+        # (adding one would break `taint models --present` on every quick view),
+        # so disclose the state instead and let the caller judge.
+        catalog.update(_analysis_state_fields(bv))
     return catalog
 
 
@@ -197,6 +229,21 @@ def _pick_resolved(key: str, raws: list[str]) -> str | None:
     return min(plain or raws, key=lambda s: (len(s), s))
 
 
+def _disasm_at(bv, addr: int) -> str:
+    """One line of disassembly at *addr*, or ``""`` when the view cannot answer.
+
+    Guarded exactly like the sibling row emitters in ``read_xrefs`` so a BN shape
+    without ``get_disassembly`` (or a failing read at an unmapped address)
+    degrades to an empty string instead of failing the whole listing."""
+    fn = getattr(bv, "get_disassembly", None)
+    if not callable(fn):
+        return ""
+    try:
+        return fn(int(addr)) or ""
+    except Exception:
+        return ""
+
+
 def _present_models(bv, models, want_callsites):
     """Map the binary's symbols to model keys via the engine's own normalization;
     return ``(present model-key set, {model-key: info})`` where ``info`` carries
@@ -235,8 +282,17 @@ def _present_models(bv, models, want_callsites):
                         continue
                     seen.add(a)
                     fname, kind = _classify_callsite(bv, ai, key, models)
+                    # #794: carry one line of context per row. The row answered
+                    # {address, function, kind}, which says WHERE a modeled sink
+                    # is called but nothing about WHAT the call looks like, so
+                    # triaging a callsite queue cost a `bn disasm` round-trip per
+                    # row. `disasm` is the key the sibling address-row emitters
+                    # already use (read_xrefs, read_evidence) -- reusing the name
+                    # and the guarded call keeps one contract, not a second
+                    # spelling of the same field.
                     slot["callsites"].append(
-                        {"address": a, "function": fname, "kind": kind})
+                        {"address": a, "function": fname, "kind": kind,
+                         "disasm": _disasm_at(bv, ai)})
         else:
             info.setdefault(key, {})
     for key, rn in raw_names.items():
