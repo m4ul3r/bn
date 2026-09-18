@@ -96,7 +96,18 @@ def _types_declare(args: argparse.Namespace) -> int:
     if args.file is not None:
         if not args.file.exists():
             raise BridgeError(f"Declaration file not found: {args.file}")
-        declaration = args.file.read_text(encoding="utf-8")
+        # `exists()` is true for a directory, so the read below used to die with a
+        # raw IsADirectoryError -- exit 1, no envelope, the only shape in this
+        # command family that was not a structured refusal (#754). Reject the
+        # directory by name rather than everything non-regular: /dev/null is a
+        # character device that reads as an empty declaration, and that path is a
+        # working refusal the sibling cases already cover.
+        if args.file.is_dir():
+            raise BridgeError(f"Declaration file is a directory: {args.file}")
+        try:
+            declaration = args.file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise BridgeError(f"Declaration file could not be read: {args.file}: {exc}") from exc
         source_path = str(args.file)
     elif args.stdin:
         declaration = sys.stdin.read()

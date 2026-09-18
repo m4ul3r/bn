@@ -133,3 +133,29 @@ def test_struct_field_rename_rejects_empty_new_name(fake_transport, capsys, bad_
     assert rc == 3
     assert "new name must be non-empty" in capsys.readouterr().err
     assert [call["op"] for call in calls] == []
+
+
+@pytest.mark.parametrize("mode", ["directory", "undecodable"])
+def test_types_declare_file_failures_are_structured_refusals_754(
+    fake_transport, capsys, tmp_path, mode
+):
+    """#754: `--file` guarded only `exists()`, so a directory (true for `exists()`)
+    reached `read_text` and died with a raw IsADirectoryError -- exit 1 and 0 bytes
+    of stdout, the one shape in this family that was not a structured refusal. A
+    non-UTF-8 file failed the same way through UnicodeDecodeError. Both must refuse
+    like the missing-file case: exit 2, a JSON envelope, no traceback, no op sent."""
+    if mode == "directory":
+        target = tmp_path
+    else:
+        target = tmp_path / "decls.h"
+        target.write_bytes(b"struct S { int a; };\n\xff\xfe")
+    calls = fake_transport()  # empty results -> any bridge call raises
+
+    rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(target)])
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    assert '"ok":false' in captured.out.replace(" ", "")
+    assert str(target) in captured.out

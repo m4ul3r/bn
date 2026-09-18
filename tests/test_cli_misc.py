@@ -691,6 +691,37 @@ def test_batch_apply_file_clean_error(fake_transport, capsys, tmp_path, manifest
     assert calls == []
 
 
+@pytest.mark.parametrize("mode", ["directory", "undecodable"])
+@pytest.mark.parametrize("command", ["batch-apply", "py-exec"])
+def test_file_argument_failures_never_traceback_754(
+    fake_transport, capsys, tmp_path, command, mode
+):
+    """#754 consistency: `types declare --file` was not the only unguarded
+    `exists()`-then-`read_text` in this family. `py exec --script` tracebacked at
+    exit 1 on BOTH a directory and a non-UTF-8 file; `batch apply`'s manifest read
+    caught OSError only, so a non-UTF-8 manifest tracebacked while its directory
+    case was already wrapped (that row is the negative control). Every --file
+    shape must be a structured refusal at exit 2 naming the path."""
+    if mode == "directory":
+        path = tmp_path
+    else:
+        path = tmp_path / "payload"
+        path.write_bytes(b"{}\xff\xfe")
+    calls = fake_transport()
+
+    argv = (
+        ["batch", "apply", str(path)] if command == "batch-apply"
+        else ["py", "exec", "--target", "active", "--script", str(path)]
+    )
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    assert calls == []
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    assert str(path) in captured.err
+
+
 @pytest.mark.parametrize("stdin, expected", [
     pytest.param("   \n", "No manifest on stdin", id="empty"),
     pytest.param("{not valid json", "Invalid JSON in manifest (<stdin>)", id="invalid-json"),
