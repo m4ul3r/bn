@@ -5459,9 +5459,18 @@ def test_closing_a_view_drops_its_recorded_database_857(monkeypatch, tmp_path):
     instance._save_database(None, None)          # default save -> the sibling
     assert instance.targets.refresh()[0]["database_path"] is not None
 
-    # A SECOND view stays open, so `refresh()` is non-empty and the assertion can
-    # actually fail: asserting `refresh() == []` after closing the only view held
-    # for any implementation, including one that never dropped the entry (#857 r5).
+    # A SECOND view stays open so the row list is non-empty, and what this half
+    # asserts is the OBSERVABLE property: no stale database leaks onto a
+    # surviving row.
+    #
+    # It does NOT cover the `_database_paths.pop` in `forget()`, and the round-5
+    # comment claiming it did was false -- replacing that pop with `pass` leaves
+    # this and every neighbouring module green. That is not a weak assertion, it
+    # is an unobservable one: stable view ids are monotonic, so an entry left
+    # behind can never be reissued to a future row, and the next complete
+    # `refresh()` prunes it anyway. The pop is memory hygiene, and hygiene is
+    # asserted as hygiene in `test_the_database_map_does_not_grow...` below
+    # rather than pretended to be behaviour here (#857 r6).
     other = _SaveBV(str(tmp_path / "other"), result=True, write=True)
     instance.targets.forget(bv)
     monkeypatch.setattr(
@@ -5714,3 +5723,92 @@ def test_an_explicit_save_to_the_cache_path_is_also_its_own_database_857(monkeyp
     instance._save_database(None, str(cache_db))
 
     assert instance.targets.refresh()[0]["database_path"] == str(cache_db)
+
+
+def test_the_database_map_does_not_grow_across_open_close_cycles_857(monkeypatch, tmp_path):
+    """The hygiene invariant `forget()`'s pop actually provides, asserted as
+    hygiene rather than disguised as behaviour.
+
+    It reads the private map deliberately: stable view ids are monotonic, so a
+    leaked entry can never be reissued to a row, which means the PUBLIC surface
+    cannot distinguish a bridge that cleans up from one that accumulates an entry
+    per save for its whole lifetime. A long-lived bridge doing many open/save/
+    close cycles is exactly the shape that matters, and it is the one case where
+    the private state IS the contract."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for i in range(5):
+        raw = tmp_path / f"svc{i}"
+        raw.write_bytes(b"\x7fELF")
+        bv = _RehomingSaveBV(str(raw))
+        monkeypatch.setattr(instance.targets, "resolve", lambda target, _b=bv: _b)
+        monkeypatch.setattr(
+            bridge, "_collect_open_views_state", lambda strict=False, _b=bv: ([_b], True))
+        instance.targets.refresh()
+        instance._save_database(None, None)
+        assert instance.targets._database_paths, "the save must have recorded one"
+        instance.targets.forget(bv)
+
+    assert instance.targets._database_paths == {}, (
+        "every closed view's entry must be released: monotonic view ids mean a "
+        "leak is invisible on the read path and simply accumulates"
+    )
+
+
+def test_a_reload_failure_names_the_database_it_tried_857(capsys):
+    """#857 r6 minor: the `(tried <path>)` rendering had no test -- replacing the
+    line with a no-op left 374 passing. A restart reloads a saved target from its
+    backing database, so naming only the target's filename points the reader at a
+    file that was never opened and hides the missing database."""
+    from bn import formatters
+
+    rendered = formatters._render_session_start_text({
+        "instance_id": "core1", "pid": 4242, "socket_path": "/tmp/core1.sock",
+        "restarted": True,
+        "loaded": [
+            {"path": "/fw/svc_a", "attempted_path": "/fw/svc_a.bndb",
+             "error": "no such file or directory"},
+            # No divergence: nothing extra to say, and no bare "(tried ...)".
+            {"path": "/fw/svc_b", "attempted_path": "/fw/svc_b",
+             "error": "permission denied"},
+        ],
+    })
+
+    assert "/fw/svc_a (tried /fw/svc_a.bndb) [error: no such file or directory]" in rendered
+    assert "/fw/svc_b [error: permission denied]" in rendered
+    assert "svc_b (tried" not in rendered
+
+
+def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, tmp_path):
+    """#857 r6 minor: the degraded `rehomed` return got its collision probe in the
+    round-5 pass but was pinned only by a throwaway probe. It writes a real file
+    and can land on another open target exactly like the clean path, and
+    runtime.md states the disclosure unconditionally, so it is asserted here.
+
+    `_RestoreFailSaveBV` is the repo's fake for this shape: `create_database`
+    succeeds and re-homes, and the restore afterwards raises."""
+    from bn import formatters
+
+    raw = tmp_path / "svc"
+    raw.write_bytes(b"\x7fELF")
+    sidecar = tmp_path / "svc.bndb"
+    sidecar.write_text("bndb")
+    raw_view = _RestoreFailSaveBV(str(raw))
+    sidecar_view = _SaveBV(str(sidecar), result=True, write=True)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: raw_view)
+    monkeypatch.setattr(
+        bridge, "_collect_open_views_state",
+        lambda strict=False: ([raw_view, sidecar_view], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    # Degraded, and still disclosed on both halves.
+    assert result["rehomed"] is True
+    assert result["collides_with_open_target"]["filename"] == str(sidecar)
+    assert "session restart" in result["note"]
+    assert "could not restore" in result["note"]
+    assert "also open as target" in formatters._render_save_text(result)
