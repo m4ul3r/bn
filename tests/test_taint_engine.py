@@ -3928,6 +3928,35 @@ def test_backward_under_caller_cap_stays_complete(models):
     assert len(result["slices"]) == 3
 
 
+def test_backward_recursion_limited_slice_is_not_a_complete_result(models, monkeypatch):
+    # #810: the recursion guard is the OTHER way a backward run loses slices, and
+    # a kept-partial slice with no flag would read as a finished answer -- the same
+    # silent-complete shape the caller cap had. Forced here rather than provoked:
+    # the guard fires on Python's own stack limit, which a fixture cannot reach
+    # portably, and the contract under test is the envelope's, not the guard's.
+    use_len, bv = _caller_fan_in_program(3)
+    engine = te.TaintEngine(bv, models)
+
+    def _recursion_guard(*_args, **_kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(engine, "_backward_slice", _recursion_guard)
+    result = engine.backward(use_len, [te.parse_locator("arg:memcpy:2")])
+
+    # Machine-readable: the run-level pair says truncated, with THIS cause (not the
+    # caller cap, which this run never reaches).
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["recursion"]
+    # ... the per-sink row says why the kept partial is partial ...
+    assert [s.get("truncated") for s in result["sink_status"]] == [True], result["sink_status"]
+    assert any("recursion limit reached" in a for a in result["assumptions"])
+    # ... and the human-readable half cannot contradict either.
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text(result)
+    assert "verdict: INCOMPLETE" in text
+    assert "recursion limit (possible unresolved cycle)" in text
+
+
 def test_backward_slices_from_memcpy_length(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
