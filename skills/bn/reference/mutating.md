@@ -391,3 +391,6 @@ bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
 
 With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the bundle to stdout.
 
+The bundle's `decompile` field is annotation-redacted by default, exactly as `bn decompile` renders it — the artifact is meant to be shareable, so inherited comment bodies are not inlined into the code it carries. Pass `--include-annotations` to keep them, mirroring the same flag on `bn decompile`.
+
+The `comments` map is a separate, labelled section and is **not** gated: it is the bundle's documented place for annotations. If you are handing the artifact to someone who should not see analyst notes, drop that key (`jq 'del(.comments)'`) — the rendered code carries none.

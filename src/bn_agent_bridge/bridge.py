@@ -3436,10 +3436,28 @@ class BinaryNinjaBridge:
     def _list_tags(self, *a, **k):
         return read_tags._list_tags(self.ctx, *a, **k)
 
-    def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
+    def _bundle_function(self, selector: str | None, identifier, out_path: str | None,
+                         *, include_annotations: bool = False):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
+        comments = self._comment_map(bv, func)
         decompile = self._decompile_text(bv, func)
+        if not include_annotations:
+            # #752: the bundle renders its own text, so it must apply the same
+            # #740 redaction the `decompile` op applies by default -- otherwise
+            # this artifact ships annotation bodies in full while the
+            # identically-rendered `decompile` output strips them, and a reader
+            # who checked `decompile` would conclude the artifact is clean.
+            #
+            # The `comments` map below is deliberately NOT gated: a labelled
+            # annotation section is the bundle's documented payload, unlike
+            # bodies silently inlined into the code a reader is about to read.
+            # For the same reason the op's `annotation_summary` is not copied
+            # here -- `redacted: true` beside a populated `comments` map would
+            # be a false claim about the artifact.
+            decompile = read_decompile._redact_rendered_annotations(
+                decompile, read_decompile._annotation_bodies(func, comments)
+            )
         bundle_warnings = self._render_warnings(decompile)
         stub = self._analysis_stub_warning(func, decompile)
         if stub:
@@ -3460,7 +3478,7 @@ class BinaryNinjaBridge:
             },
             "disassembly": self._disasm_text(bv, func),
             "locals": self._list_locals(func),
-            "comments": dict(sorted(self._comment_map(bv, func).items())),
+            "comments": dict(sorted(comments.items())),
             "xrefs": self._xrefs_to_address(bv, func.start),
         }
         artifact = _write_json_artifact(out_path, bundle)
@@ -4403,7 +4421,16 @@ def _bind_function_create(bridge, params, target):
 
 @op("bundle_function", lock="read")
 def _bind_bundle_function(bridge, params, target):
-    return bridge._bundle_function(target, params["identifier"], params.get("out_path"))
+    return bridge._bundle_function(
+        target,
+        params["identifier"],
+        params.get("out_path"),
+        include_annotations=_validate_bool(
+            params.get("include_annotations"),
+            label="include_annotations",
+            default=False,
+        ),
+    )
 
 
 @op("orient_digest", lock="read")

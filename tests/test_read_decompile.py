@@ -933,6 +933,56 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     assert included["comments"] == {"0x401002": "inherited address note"}
 
 
+def test_bundle_function_redacts_annotations_like_decompile_752(monkeypatch):
+    """#752: `bundle function` rendered its text through a second call path
+    (`il_format._decompile_text` directly), bypassing the #740 redaction that
+    `decompile` applies by default -- so the artifact carried annotation bodies in
+    full while the identically-rendered `decompile` output stripped them. The
+    bundle is presented as a shareable artifact, so its decompilation must agree
+    with what `decompile` shows, and the same flag must open both."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401004)]
+    function.comment = "inherited function note"
+    function.comments = {0x401002: "function-local address note"}
+    bv = _FakeBV(
+        functions=[function],
+        instruction_lengths={0x401000: 4},
+        comments={0x401002: "inherited address note"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {  // inherited function note\n"
+        "    // inherited address note\n"
+        "    return; // function-local address note\n"
+        "}"
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
+    )
+    # Not under test here: the bundle's other sections.
+    monkeypatch.setattr(instance, "_target_info", lambda selector, **k: {})
+    monkeypatch.setattr(instance, "_function_text", lambda *a, **k: "")
+    monkeypatch.setattr(instance, "_disasm_text", lambda *a, **k: "")
+    monkeypatch.setattr(instance, "_list_locals", lambda *a, **k: [])
+    monkeypatch.setattr(instance, "_xrefs_to_address", lambda *a, **k: [])
+
+    bundle = instance._bundle_function("active", "parse_record", None)
+    expected = instance._decompile("active", "parse_record")["text"]
+
+    assert "inherited function note" not in bundle["decompile"]
+    assert "inherited address note" not in bundle["decompile"]
+    assert "function-local address note" not in bundle["decompile"]
+    assert bundle["decompile"].count("// <annotation redacted>") == 3
+    assert bundle["decompile"] == expected
+
+    included = instance._bundle_function(
+        "active", "parse_record", None, include_annotations=True
+    )
+    assert included["decompile"] == text
+
+
 @pytest.mark.parametrize("store", ["global", "local"])
 def test_decompile_does_not_hide_an_unreadable_comment_store(monkeypatch, store):
     bridge = _load_bridge(monkeypatch)
