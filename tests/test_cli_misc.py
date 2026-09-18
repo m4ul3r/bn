@@ -700,8 +700,16 @@ def test_file_argument_failures_never_traceback_754(
     `exists()`-then-`read_text` in this family. `py exec --script` tracebacked at
     exit 1 on BOTH a directory and a non-UTF-8 file; `batch apply`'s manifest read
     caught OSError only, so a non-UTF-8 manifest tracebacked while its directory
-    case was already wrapped (that row is the negative control). Every --file
-    shape must be a structured refusal at exit 2 naming the path."""
+    case was already wrapped (that row is the negative control).
+
+    The property the issue names is that every --file failure mode returns a JSON
+    ENVELOPE, so that is what this asserts. Checking only rc/stderr does not
+    discriminate it: a refusal rewritten as `print(msg, file=sys.stderr); return 2`
+    satisfies rc == 2, leaves no traceback and names the path, while stdout is
+    empty and a JSON consumer gets nothing (review of #855).
+
+    `batch apply` is `fmt="json"`, so its envelope is the default; `py exec`
+    renders text by default and is asked for JSON explicitly."""
     if mode == "directory":
         path = tmp_path
     else:
@@ -711,7 +719,8 @@ def test_file_argument_failures_never_traceback_754(
 
     argv = (
         ["batch", "apply", str(path)] if command == "batch-apply"
-        else ["py", "exec", "--target", "active", "--script", str(path)]
+        else ["py", "exec", "--target", "active", "--script", str(path),
+              "--format", "json"]
     )
     rc = bn.cli.main(argv)
 
@@ -719,7 +728,11 @@ def test_file_argument_failures_never_traceback_754(
     assert calls == []
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err and "Traceback" not in captured.out
-    assert str(path) in captured.err
+    # The envelope, parsed -- not a substring match, so a truncated or
+    # double-encoded payload cannot pass.
+    envelope = json.loads(captured.out)
+    assert envelope["ok"] is False
+    assert str(path) in envelope["error"]
 
 
 @pytest.mark.parametrize("stdin, expected", [
