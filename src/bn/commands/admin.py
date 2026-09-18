@@ -913,12 +913,23 @@ def _session_restart(args: argparse.Namespace) -> int:
 
     instance = cli.spawn_instance(resolved_id)
     # Reload targets without associating the restart command's cwd.
+    #
+    # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
+    # `filename`, which is BN's own `bv.file.filename` -- the file each view
+    # already IS, sidecar or raw. Asking for the sidecar preference again
+    # therefore cannot help (a target already backed by a `.bndb` names that
+    # `.bndb`) and can only substitute a DIFFERENT file for a target that was
+    # deliberately opened raw, e.g. via `--no-bndb`. Worse, when that sidecar
+    # was itself open as a second target, both reloads resolved to one file and
+    # the instance came back with fewer targets than it had. `session restart`
+    # is the remedy `bn doctor` prints for a stale bridge; it must return the
+    # same targets, backed by the same files.
     reloaded: list[Any] = []
     for t in reload_targets:
         try:
             r = cli.send_request(
                 "load_binary",
-                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
+                params={"path": t["path"], "prefer_bndb": False, "quick": t["quick"]},
                 instance_id=instance.instance_id,
             )
             reloaded.append(unwrap_result(r, "load_binary"))

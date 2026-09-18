@@ -894,6 +894,60 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     assert any(c[0] == "load_binary" and (c[2] or {}).get("path") == "/fw/svc_a" for c in calls)
 
 
+def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, capsys):
+    """#753: restart hardcoded `prefer_bndb: True`, so a target opened from a raw
+    file that has a `.bndb` sidecar came back as the SIDECAR -- silently changing
+    which file the target IS. When that sidecar was itself open as a second
+    target, both reloads resolved to the same file and the instance came back
+    with fewer targets than it had (measured live: 2 -> 1, the raw selector no
+    longer resolvable, every read then about a different database).
+
+    `filename` is BN's own answer for the file each view already is, so restart
+    must reopen exactly that and never re-apply the sidecar preference."""
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        "meta": {},
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, instance_id, params))
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    # The reported shape: a raw target AND its own sidecar, both open.
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None: {"ok": True, "result": [
+            {"filename": "/fw/svc_a", "analysis_state": "full"},
+            {"filename": "/fw/svc_a.bndb", "analysis_state": "full"},
+        ]},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    loads = [params for op, _, params in calls if op == "load_binary"]
+    # Both targets are reloaded, each as its own file: no substitution, so the
+    # two cannot collapse onto one view.
+    assert [p["path"] for p in loads] == ["/fw/svc_a", "/fw/svc_a.bndb"]
+    assert [p["prefer_bndb"] for p in loads] == [False, False]
+    assert len(json.loads(capsys.readouterr().out)["loaded"]) == 2
+
+
 def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch, capsys):
     # #620(a): a `list_targets` failure while capturing the pre-restart state
     # must not be silently swallowed. Round 2: raising BridgeError here would
