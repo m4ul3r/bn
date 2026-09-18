@@ -2671,6 +2671,30 @@ class BinaryNinjaBridge:
                           "request_sent": True, "written": False},
             )
 
+        # #889c finding 1: decide OWNERSHIP BEFORE THE WRITE.
+        #
+        # `_is_own_database_destination` asks "is this destination the
+        # target's own database", and #869 made it answer by file identity so
+        # a hard-linked spelling of the sibling is recognised. But it was
+        # evaluated AFTER `create_database`, and that write REPLACES the
+        # destination's inode (measured: sibling 2 links -> destination 1 new
+        # link) -- so by the time the gate ran, the hard link no longer shared
+        # an inode with anything and the gate answered False. `database_path`
+        # went unrecorded and the next `session restart` reopened the STALE
+        # database: the #753 silent-drop shape, reached through a spelling and
+        # surviving the identity fix because the identity was gone by then.
+        #
+        # The pre-write moment is the only one where the question is
+        # answerable, so the answer is captured here and consumed after. Both
+        # candidate destinations are decided now: the primary, and the cache
+        # path the read-only fallback may write instead.
+        own_primary = _is_own_database_destination(out, filename)
+        try:
+            own_cache = _is_own_database_destination(
+                str(_cache_bndb_path(filename)), filename)
+        except Exception:  # noqa: BLE001 - no cache path is not ownership
+            own_cache = False
+
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
             if make_parent:
@@ -2762,7 +2786,9 @@ class BinaryNinjaBridge:
             # raw bytes: the round-2 fix defeated by its companion guard, both
             # added in one commit, and invisible because the test's fake did not
             # re-home the way BN does (#857 review round 3).
-            if _is_own_database_destination(saved, filename):
+            # The CACHE branch: consume the decision taken before the write
+            # (#889c finding 1), because the write replaced the inode.
+            if own_cache:
                 self.targets.note_database(bv, saved)
             _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
@@ -2815,7 +2841,7 @@ class BinaryNinjaBridge:
         # that target fail to reload and vanish. That is the identity move
         # `_restore_filename` exists to prevent, deferred one step to restart
         # (#857 round-4 regression, introduced by this change).
-        if _is_own_database_destination(saved, filename):
+        if own_primary:
             self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
         _disclose_open_target_collision(self.targets, bv, saved, result)

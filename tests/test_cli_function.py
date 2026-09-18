@@ -1982,6 +1982,36 @@ def test_xrefs_text_mode_without_offset_is_unaffected_738(fake_transport, capsys
     assert "limit" not in calls[-1]["params"]
 
 
+def test_the_slicing_hint_stops_advising_an_offset_that_text_mode_refuses_889c():
+    # #889c finding 3: the hint is derived from the flags a parser ACCEPTS,
+    # and `--offset` is still accepted on these stems -- merely refused at
+    # runtime. So after #738 the hint advised the one thing that now exits 2,
+    # and before #738 it advised the thing that silently returned page 1.
+    # Right about acceptance, wrong about effect, in both directions.
+    from bn.cli import _slice_hint_for_command
+
+    for path in (("xrefs",), ("evidence", "xrefs")):
+        text = _slice_hint_for_command(path, True)
+        assert "--offset" not in text, path
+        # It must still advise the flag that DOES bound a text read.
+        assert "--limit" in text, path
+        # JSON pages correctly, so the advice is unchanged there -- this is
+        # the mode the refusal redirects to, and breaking it would make the
+        # refusal's own remedy a dead end.
+        assert "--offset" in _slice_hint_for_command(path, False), path
+
+
+def test_the_slicing_hint_is_unchanged_where_offset_works_889c():
+    # Must-not-fire twin, using #738's own control: `callsites` honours
+    # `--offset` in text mode, so its hint must keep naming it. A filter that
+    # dropped the flag everywhere would remove correct advice.
+    from bn.cli import _slice_hint_for_command
+
+    for path in (("callsites",), ("function", "list")):
+        assert "--offset" in _slice_hint_for_command(path, True), path
+        assert "--offset" in _slice_hint_for_command(path, False), path
+
+
 def test_trace_render_step_grammar_singular_and_plural():
     from bn import formatters
     base = {

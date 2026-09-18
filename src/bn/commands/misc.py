@@ -656,7 +656,15 @@ def _batch_apply(args: argparse.Namespace) -> int:
         # and died at the bridge with the bare `request too large` this
         # guard exists to pre-empt. One quantity, measured the way the
         # transport serializes it.
-        request_bytes = request_bytes_for_params(manifest)
+        # #889c finding 2: `-t` and `--preview` are folded into BOTH the
+        # params and the envelope AFTER this check, so a flat reserve let a
+        # long selector carry the request over the cap and into the bridge's
+        # bare `request too large`. Count them where they are known.
+        request_bytes = request_bytes_for_params(
+            manifest,
+            selector=getattr(args, "target", None) or manifest.get("target"),
+            preview=bool(getattr(args, "preview", False)),
+        )
         if max_bytes is not None and request_bytes > max_bytes:
             raise BridgeError(
                 f"Manifest ({source}) produces a {request_bytes}-byte request, "

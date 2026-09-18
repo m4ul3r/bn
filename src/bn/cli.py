@@ -1068,9 +1068,23 @@ _SLICE_VOCABULARY_SET = frozenset(_SLICE_VOCABULARY)
 # group refuses).
 _TEXT_ONLY_SLICE_FLAGS = frozenset({"--lines"})
 
+# The inverse of `_TEXT_ONLY_SLICE_FLAGS`, per command: a flag the parser
+# ACCEPTS but which the handler refuses under `--format text`. #738 made
+# `xrefs`/`evidence xrefs` refuse a text-mode `--offset` -- text groups the
+# FULL result set by caller and `--limit` only caps how many groups print,
+# so an offset cannot move the page. The hint is derived from acceptance,
+# so without this it went on advising `--offset` and, after #738, advised
+# the one thing that now exits 2 (#889c finding 3). Right about acceptance,
+# wrong about effect -- in both directions, before and after the refusal.
+_JSON_ONLY_SLICE_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
+    ("xrefs",): frozenset({"--offset"}),
+    ("evidence", "xrefs"): frozenset({"--offset"}),
+}
+
 
 def _derive_slice_hint(
-    accepted: Iterable[str], text_format: bool, used: Iterable[str] = ()
+    accepted: Iterable[str], text_format: bool, used: Iterable[str] = (),
+    path: tuple[str, ...] = (),
 ) -> str | None:
     """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
 
@@ -1088,6 +1102,10 @@ def _derive_slice_hint(
     a flag-free hint rather than inventing one.
     """
     accepted = set(accepted)
+    # #889c finding 3: drop the flags this command refuses in text mode, so
+    # the hint cannot advise the thing that exits 2.
+    if text_format:
+        accepted -= _JSON_ONLY_SLICE_FLAGS.get(tuple(path), frozenset())
     used = set(used)
 
     def in_order(vocabulary: Iterable[str]) -> list[str]:
@@ -1158,7 +1176,8 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
         # vocabulary order picks which one to name.
         if getattr(args, dest, None) not in (None, False)
     }
-    return _derive_slice_hint(accepted, fmt == "text", used)
+    return _derive_slice_hint(accepted, fmt == "text", used,
+                              tuple(getattr(args, "_command_path", ()) or ()))
 
 
 @lru_cache(maxsize=None)
@@ -1170,7 +1189,7 @@ def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | N
     the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    return _derive_slice_hint(_known_option_strings(sub), text_format)
+    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path)
 
 
 def _spill_next_step_hint(

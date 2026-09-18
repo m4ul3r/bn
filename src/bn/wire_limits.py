@@ -40,20 +40,36 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 #     produces an OVER-cap request and dies at the bridge with the bare
 #     `request too large` this guard exists to pre-empt.
 #
-# `REQUEST_ENVELOPE_BYTES` is the non-params part, derived from the real
-# payload shape rather than guessed, and deliberately rounded UP: over-
-# reserving costs a few hundred bytes of a 32 MiB budget, while
-# under-reserving reopens the second bullet.
-REQUEST_ENVELOPE_BYTES = 512
+# `REQUEST_ENVELOPE_BYTES` is the FIXED non-params part -- id, op, bridge
+# identity, braces -- measured at 198 and rounded up. The selector is NOT
+# fixed and is not covered by it: `-t` is injected into params AND into the
+# envelope after the guard runs, so both copies used to escape a flat
+# reserve. Measured, the real non-params size is
+# `198 + 2*(len(selector)+14) + 17 if --preview`, and with a constant
+# reserve the guard let a request through at a 144-char selector -- the bare
+# `request too large` this guard exists to pre-empt, reached through the
+# selector instead of the file (#889c finding 2).
+REQUEST_ENVELOPE_BYTES = 256
+_SELECTOR_KEY_BYTES = 14          # `"target":"…"` framing, per copy
+_PREVIEW_BYTES = 17               # `"preview":true,`
 
 
-def request_bytes_for_params(params: Any) -> int:
+def request_bytes_for_params(params: Any, *, selector: str | None = None,
+                             preview: bool = False) -> int:
     """Bytes the request carrying *params* will occupy on the wire.
 
     Serialized the same way `transport` serializes it, so the guard and the
-    sender measure one quantity rather than two.
+    sender measure one quantity rather than two. *selector* and *preview*
+    are the parts folded in AFTER this check runs, and are counted here
+    because a caller cannot be refused for bytes and then silently grow.
     """
-    return len(json.dumps(params).encode("utf-8")) + REQUEST_ENVELOPE_BYTES
+    total = len(json.dumps(params).encode("utf-8")) + REQUEST_ENVELOPE_BYTES
+    if selector:
+        total += 2 * (len(str(selector)) + _SELECTOR_KEY_BYTES)
+    if preview:
+        total += _PREVIEW_BYTES
+    return total
+
 
 # Op-count ceiling for one `batch apply` manifest. Not a wire limit -- a
 # manifest well under the byte cap can still hold enough operations to hold

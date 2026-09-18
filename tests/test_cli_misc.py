@@ -892,7 +892,10 @@ def test_batch_apply_byte_ceiling_is_strict_at_both_sides_of_the_boundary_769(
     monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")     # isolate the byte check
     path = tmp_path / "m.json"
     path.write_text(_op_manifest(20))
-    exact = request_bytes_for_params(_json.loads(path.read_text()))
+    # Same arguments the handler passes: --preview is folded in after the
+    # check, so the boundary is only meaningful when it is counted (#889c f2).
+    _m = _json.loads(path.read_text())
+    exact = request_bytes_for_params(_m, selector=_m.get("target"), preview=True)
 
     monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(exact))
     calls = fake_transport({"batch_apply": {"ok": True, "result": {
@@ -925,7 +928,9 @@ def test_batch_apply_byte_guard_ignores_manifest_whitespace_769(
     # A ceiling that admits the compact file must admit the pretty one too:
     # they produce the same request.
     from bn.wire_limits import request_bytes_for_params
-    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(request_bytes_for_params(ops)))
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES",
+                       str(request_bytes_for_params(
+                           ops, selector=ops.get("target"), preview=True)))
     for path in (compact, pretty):
         calls = fake_transport({"batch_apply": {"ok": True, "result": {
             "preview": True, "success": True, "results": [{"status": "verified"}]}}})
@@ -951,6 +956,43 @@ def test_batch_apply_byte_ceiling_refuses_without_sending_769(
     assert calls == []
     out = capsys.readouterr().out
     assert "BN_BATCH_APPLY_MAX_BYTES" in out and "2048" in out
+
+
+def test_batch_apply_byte_guard_counts_the_selector_it_has_not_folded_yet_889c(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #889c finding 2: `-t` is injected into the params AND the envelope
+    # AFTER this guard runs, so both copies escaped a flat reserve. Measured
+    # live, a manifest sized exactly at the cap was ACCEPTED with an 11-char
+    # selector and died at the bridge's bare `request too large` at 144 --
+    # the failure this guard exists to pre-empt, reached through the selector
+    # instead of the file.
+    #
+    # Pinned as a PROPERTY rather than at the measured crossover: a request
+    # sized at the cap for a short selector must be refused once the selector
+    # grows, because the bytes it adds are real.
+    import json as _json
+    from bn.wire_limits import request_bytes_for_params
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")       # isolate bytes
+    path = tmp_path / "m.json"
+    path.write_text(_op_manifest(20))
+    manifest = _json.loads(path.read_text())
+
+    short = "t.bndb"
+    cap = request_bytes_for_params(manifest, selector=short, preview=True)
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(cap))
+
+    # At the cap with the short selector: allowed.
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", str(path), "-t", short, "--preview"]) == 0
+    assert calls and calls[-1]["op"] == "batch_apply"
+
+    # A longer selector adds real bytes to the request, so the SAME manifest
+    # at the SAME cap must now be refused rather than sent to fail on arrival.
+    calls2 = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+    rc = bn.cli.main(["batch", "apply", str(path), "-t", "x" * 200, "--preview"])
+    assert rc == 3
+    assert calls2 == []
 
 
 def test_batch_apply_malformed_limit_env_falls_back_not_crashes_769(

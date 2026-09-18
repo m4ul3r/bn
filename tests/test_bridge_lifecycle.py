@@ -1433,3 +1433,62 @@ def test_save_proceeds_when_the_collision_probe_cannot_answer_867(
 
     assert result["saved"] is True
     assert dest.exists()
+
+
+def test_save_through_a_hard_link_records_the_database_despite_inode_replacement_869(
+        monkeypatch, tmp_path):
+    """#889c finding 1: the identity fix was evaluated at the wrong MOMENT.
+
+    `create_database` REPLACES the destination's inode, so a gate that runs
+    after the write compares a brand-new file against the sibling and answers
+    False -- `database_path` goes unrecorded and the next `session restart`
+    reopens the STALE database. That is the #753 silent-drop shape surviving
+    the #869 identity fix, because the identity was gone by the time it was
+    asked about.
+
+    The double REPLACES the inode the way BN does, rather than truncating in
+    place: a `write_bytes` double preserves the link and would make this test
+    pass against the broken code. The producer's behaviour is the test.
+    """
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+
+    binary = tmp_path / "svc"
+    binary.write_bytes(b"\x7fELF")
+    sibling = tmp_path / "svc.bndb"
+    sibling.write_bytes(b"OLD")
+    hard = tmp_path / "hard.bndb"
+    os.link(sibling, hard)
+    assert os.path.samefile(sibling, hard)
+    before = os.stat(hard).st_ino
+
+    from pathlib import Path as _P
+
+    class _InodeReplacingBV(_SaveBV):
+        def create_database(self, out: str):
+            self.created_with = out
+            # unlink-then-create: a NEW inode, exactly what was measured live
+            _P(out).unlink(missing_ok=True)
+            _P(out).write_bytes(b"NEW")
+            return True
+
+    bv = _InodeReplacingBV(str(binary), result=True, write=True)
+    noted = {}
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: None)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+    monkeypatch.setattr(instance.targets, "note_database",
+                        lambda _bv, path: noted.__setitem__("path", path))
+
+    result = instance._save_database(None, str(hard))
+
+    assert result["saved"] is True
+    # The premise of the finding: the write really did replace the inode, so a
+    # post-write identity check could not have recognised this destination.
+    assert os.stat(hard).st_ino != before
+    assert not os.path.samefile(hard, sibling)
+    # And the database is recorded anyway, because the decision was taken
+    # while the identity still existed.
+    assert noted.get("path") == str(hard)
