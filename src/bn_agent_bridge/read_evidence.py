@@ -285,6 +285,15 @@ def _abi_arg_register_count(bv, callee_fn) -> int | None:
 
 _C_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Mangling prefixes that are still valid C identifiers, so `_C_IDENTIFIER_RE`
+# cannot exclude them: Itanium C++ and Rust's legacy scheme (`_Z`), Rust v0
+# (`_R`), D (`_D`), older Swift (`_T`). A decorated name carries implicit
+# parameters a count comparison cannot see (`this`, an sret return slot), so it
+# is refused whatever its provenance -- unlike the schemes that use punctuation
+# (MSVC `?name@@...`, current Swift `$s...`), which the identifier rule already
+# rejects.
+_MANGLED_PREFIXES = ("_Z", "_R", "_D", "_T")
+
 
 def _library_signature_applies(callee_fn, name: str) -> bool:
     """Is an attached library's signature evidence about THIS callee, or merely
@@ -318,8 +327,21 @@ def _library_signature_applies(callee_fn, name: str) -> bool:
     # answer to "is this callee an import" rather than two.
     if is_imported_function(callee_fn):
         return True
-    return name.startswith("__") or (
-        len(name) > 1 and name[0] == "_" and name[1].isupper())
+    # A LEADING DOUBLE UNDERSCORE only. The first cut also admitted `_` plus an
+    # uppercase letter, which is where every mangling prefix lives -- `_Z`
+    # (Itanium, and Rust's legacy scheme), `_R` (Rust v0), `_D` (D), `_T` (older
+    # Swift) -- so a LOCAL Rust-mangled function colliding with a library entry
+    # was still demoted: the round-1 collision class, narrowed to the one
+    # decorated scheme the `_Z` refusal did not name (#862 review round 2).
+    #
+    # It also justified itself with C11 7.1.3 while being applied to every
+    # language. Restricting it to `__` keeps the shape it was written for (a
+    # statically linked `__popcountdi2`, `__memcpy_chk`, `__errno_location`) and
+    # leaves every decorated name to prove real import provenance instead. The
+    # cost is a reserved single-underscore C name such as `_Exit` defined
+    # locally, which is covered whenever it is an import and is not worth
+    # readmitting an entire mangling scheme for.
+    return name.startswith("__")
 
 
 def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
@@ -348,10 +370,17 @@ def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     # implicit-parameter false positives this refusal exists to stop. The
     # identifier rule then covers the schemes that use punctuation (MSVC
     # `?name@@...`, Swift `$s...`) plus clone suffixes and versioned symbols.
-    if not name or name.startswith("_Z") or not _C_IDENTIFIER_RE.match(name):
+    if not name or name.startswith(_MANGLED_PREFIXES) or not _C_IDENTIFIER_RE.match(name):
         return None
     if not _library_signature_applies(callee_fn, name):
         return None
+    # EVERY attached library, not the first that happens to name the symbol
+    # (#862 review round 2 minor a): with two libraries stating different counts,
+    # first-wins made both the verdict and the reported `library_source` depend on
+    # `bv.type_libraries` order, and a later library that AGREED with the recovery
+    # was never consulted. Libraries that disagree with each other cannot settle
+    # anything, so that is a refusal rather than a coin toss.
+    claims: list[tuple[int, str]] = []
     for lib in (getattr(bv, "type_libraries", None) or []):
         try:
             obj = lib.get_named_object(name)
@@ -362,10 +391,13 @@ def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
             params = getattr(obj, "parameters", None)
             if params is None:
                 continue
-            return len(list(params)), str(getattr(lib, "name", "") or "type library")
+            claims.append(
+                (len(list(params)), str(getattr(lib, "name", "") or "type library")))
         except Exception:  # noqa: BLE001 - a malformed library must not fail the read
             continue
-    return None
+    if not claims or len({count for count, _ in claims}) != 1:
+        return None
+    return claims[0]
 
 
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,

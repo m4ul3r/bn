@@ -5260,3 +5260,90 @@ def test_user_prototype_outranks_a_disagreeing_library_759(monkeypatch):
 
     assert call["argument_confidence"] == "authoritative"
     assert "prototype_unverified" not in call
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    ["_ZNSt6vectorIiSaIiEE9push_backERKi",
+     "_RNvCs1234_4core3fmt5write",
+     "_D3std5stdio6writeln",
+     "_TtC4main6Widget"],
+    ids=["itanium", "rust-v0", "dlang", "swift-old"],
+)
+def test_library_cross_check_refuses_every_decorated_scheme_759(monkeypatch, mangled):
+    """#862 review round 2 MAJOR: the reserved-identifier arm was `_` plus an
+    uppercase letter, which is exactly where the mangling prefixes live -- every
+    Rust-v0 `_R...` symbol satisfied it, so a LOCAL Rust-mangled function
+    colliding with a library entry was still demoted. That is the round-1
+    collision class, narrowed to the one scheme the `_Z` refusal did not name.
+
+    A decorated name's implicit parameters (`this`, an sret return slot) make the
+    count comparison meaningless whatever its provenance, so every such scheme is
+    refused -- here even WITH import provenance, which is the stronger claim."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = mangled
+    _with_type_library(bv, symbol=mangled, params=3)
+    _as_import(bv, name=mangled)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
+    """The reserved arm's own test, which round 1 lacked. `__`-prefixed is the
+    implementation namespace a statically linked library function lives in; a
+    single underscore plus an uppercase letter is NOT admitted, because that is
+    the mangling-prefix space."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def confidence(local_name):
+        bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+        next(f for f in bv.functions if f.name == "hw_get_version").name = local_name
+        _with_type_library(bv, symbol=local_name, params=1)
+        return instance._function_evidence(
+            "active", "probe_device", context=0)["calls"][0]["argument_confidence"]
+
+    # A local `__`-reserved name IS described by the library (the `__popcountdi2`
+    # shape, statically linked from libgcc and not an import).
+    assert confidence("__popcountdi2") == "inferred"
+    # A local `_X` name is not, so no demotion.
+    assert confidence("_Exit") == "authoritative"
+
+
+def test_library_cross_check_refuses_when_two_libraries_disagree_759(monkeypatch):
+    """#862 review round 2 minor (a): first-library-wins made both the verdict and
+    the reported `library_source` depend on `bv.type_libraries` order, and a
+    later library that AGREED with the recovery was never consulted. Libraries
+    that contradict each other cannot settle anything."""
+    import types as _t
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["a", "b", "c"])
+    _as_import(bv)
+
+    def lib(name, params):
+        proto = _t.SimpleNamespace(
+            parameters=[_t.SimpleNamespace(name=f"p{i}") for i in range(params)],
+            has_variable_arguments=False)
+        return _t.SimpleNamespace(
+            name=name,
+            get_named_object=lambda n, _p=proto: _p if str(n) == "hw_get_version" else None)
+
+    # One says 1, the other agrees with the recovered 3: no usable claim either
+    # way, and in particular no demotion decided by ordering.
+    bv.type_libraries = [lib("libfirst.so", 1), lib("libsecond.so", 3)]
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+    # Reversed order, same answer -- the point of the fix.
+    bv.type_libraries = [lib("libsecond.so", 3), lib("libfirst.so", 1)]
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert "prototype_unverified" not in call
