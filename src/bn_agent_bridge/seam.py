@@ -1524,12 +1524,17 @@ class BridgeContext:
             })
         return out
 
-    def _ctor_construction_sites(self, bv, record, *, cap=128):
+    def _ctor_construction_sites(self, bv, record, *, cap=None):
         """Where this class is constructed: each ctor's inbound call sites, from
         code xrefs. This is sound (no arg recovery needed). Classifying the
         `this` storage (new/stack/global) and recovering the operator-new size
         needs MLIL arg recovery that BN often does not expose at these sites, so
-        it is left as a best-effort gap: kind is "ctor-call" and size is None."""
+        it is left as a best-effort gap: kind is "ctor-call" and size is None.
+
+        ``cap`` is OPTIONAL and no longer used by `_instances` (#822): a reader
+        that caps its own scan cannot report the exact total of what it hid, so
+        the cap now lives at the LISTING site (`read_class._instances`, which
+        slices and discloses `construction_sites_total`/`_truncated`)."""
         get_refs = getattr(bv, "get_code_refs", None)
         if not callable(get_refs):
             return []
@@ -1557,7 +1562,7 @@ class BridgeContext:
                     "kind": "ctor-call",
                     "size": None,
                 })
-                if len(sites) >= cap:
+                if cap is not None and len(sites) >= cap:
                     return sites
         return sites
 
