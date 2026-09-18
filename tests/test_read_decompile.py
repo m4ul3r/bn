@@ -3348,6 +3348,69 @@ def test_cfg_asm_blocks_are_sorted_by_start_not_bn_iteration_order(monkeypatch):
     ]
 
 
+def test_cfg_discloses_a_block_whose_successors_bn_could_not_resolve_682(monkeypatch):
+    # #682 item 3, the LIVE half. A cross-dogfood sweep of 12,191 functions x
+    # 3 IL levels over four targets found ZERO edges with `target is None`:
+    # `BasicBlock._make_edges` asserts the reference is non-None and wraps it
+    # through `_create_instance`, which cannot return None. What a real
+    # unresolvable indirect jump (`jmp rax`) produces instead is NO EDGES AT
+    # ALL -- so it rendered byte-identically to a block with no successor,
+    # the same lost distinction, in the shape that actually occurs.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "dispatch", "void dispatch(void)")
+    blk = _FakeCFGBlock(0x401000,
+                        lines=[_FakeCFGLine(0x401000, "jmp rax")],
+                        edges=[], undetermined=True)
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert block["undetermined_edges"] is True
+
+
+def test_cfg_a_genuine_dead_end_block_is_not_marked_undetermined_682(monkeypatch):
+    # Must-not-fire twin, and the whole point of the disclosure: a `ret`
+    # block really has no successors. If both shapes carried the marker the
+    # distinction would be lost in the other direction.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "leaf", "void leaf(void)")
+    fn.basic_blocks = [_FakeCFGBlock(0x401000,
+                                     lines=[_FakeCFGLine(0x401000, "ret")],
+                                     edges=[])]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "leaf", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert "undetermined_edges" not in block
+
+
+def test_cfg_a_block_that_cannot_answer_the_probe_claims_neither_682(monkeypatch):
+    # An IL block object or a reduced view need not implement the property.
+    # Absent -- or raising -- is INDETERMINATE: it must not be reported as
+    # undetermined (a fabricated claim) and must not raise out of the op.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "reduced", "void reduced(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+    del blk.has_undetermined_outgoing_edges
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "reduced", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
+
+
 def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
     # THE load-bearing contract for bn-lens: one assembly instruction can expand
     # to several IL blocks whose first lines share the SAME address, so block

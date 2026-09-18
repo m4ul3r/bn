@@ -437,13 +437,14 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             # a core ever hands back a bare int (the same class of surprise as
             # a relocation/symbol enum arriving unwrapped).
             #
-            # #682 item 3: an edge with no target used to be DROPPED, which
-            # renders an indirect or unresolved branch identical to a block
-            # with no outgoing edge at all -- the one distinction a
-            # control-flow view must not lose. Emit it with `to: null` and
-            # `unresolved: true` so a consumer can tell "goes nowhere" from
-            # "goes somewhere analysis could not name". The key is present
-            # only on such an edge, so resolved edges keep their exact shape.
+            # #682 item 3, DEFENSIVE half: an edge whose target is None is
+            # emitted rather than dropped. Measured against BN 6.1 this shape
+            # is UNREACHABLE through the Python API -- `BasicBlock._make_edges`
+            # asserts `BNNewBasicBlockReference` is non-None and wraps it with
+            # `_create_instance`, which cannot return None -- and a sweep of
+            # 12,191 functions x 3 IL levels over four targets found zero. It
+            # stays because it is correct if a future core returns one, but it
+            # is NOT the live indirect-branch case; see below for that.
             edges = []
             for edge in bb.outgoing_edges:
                 kind = getattr(edge.type, "name", None) or str(edge.type)
@@ -451,7 +452,23 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
                     edges.append({"to": None, "k": kind, "unresolved": True})
                 else:
                     edges.append({"to": hex(edge.target.start), "k": kind})
-            blocks.append({"start": hex(bb.start), "insns": insns, "edges": edges})
+            block = {"start": hex(bb.start), "insns": insns, "edges": edges}
+            # #682 item 3, LIVE half. A real unresolvable indirect jump
+            # (`jmp rax`) does not produce a null-target edge -- it produces
+            # NO EDGES AT ALL, so it rendered byte-identically to a block that
+            # simply has no successor. That is the same lost distinction, and
+            # it is the one that actually occurs. BN answers it directly:
+            # `has_undetermined_outgoing_edges` is the core's own "I could not
+            # determine where this goes". Read defensively because reduced
+            # views and IL block objects need not implement it, and an absent
+            # or throwing probe is indeterminate -- not a claim of either kind.
+            try:
+                undetermined = bool(bb.has_undetermined_outgoing_edges)
+            except Exception:  # noqa: BLE001 - absent/raising probe says nothing
+                undetermined = False
+            if undetermined:
+                block["undetermined_edges"] = True
+            blocks.append(block)
     result = {
         "kind": "cfg",
         "function": {"name": func.name, "address": hex(func.start)},

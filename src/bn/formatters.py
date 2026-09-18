@@ -4123,6 +4123,13 @@ def _render_cfg_text(value: Any) -> str:
                 parts.append(f"  -> <unresolved> [{edge.get('k', '?')}]")
                 continue
             parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
+        # #682 item 3, live half: a block BN could not resolve the successors
+        # of emits no edges at all, so without this line it renders exactly
+        # like a block that genuinely has none -- e.g. a `jmp rax` reading as
+        # a dead end. Printed after the edges because a block can have both
+        # known successors and undetermined ones.
+        if block.get("undetermined_edges"):
+            parts.append("  -> <undetermined> (analysis could not resolve the successors)")
     return "\n".join(parts)
 
 

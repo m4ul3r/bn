@@ -1148,6 +1148,36 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_render_cfg_undetermined_block_is_named_not_a_silent_dead_end_682():
+    # #682 item 3, live half: a block whose successors BN could not resolve
+    # has NO edges, so without a line of its own it renders exactly like a
+    # genuine dead end -- a `jmp rax` reading as "returns here".
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({
+        "function": {"name": "dispatch", "address": "0x401000"},
+        "view": "asm",
+        "blocks": [{
+            "start": "0x401000",
+            "insns": [{"a": "0x401000", "t": "jmp rax"}],
+            "edges": [],
+            "undetermined_edges": True,
+        }],
+    })
+    assert "<undetermined>" in out
+
+
+def test_render_cfg_real_dead_end_block_gets_no_undetermined_line_682():
+    # Must-not-fire twin: a `ret` block genuinely has no successors.
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({
+        "function": {"name": "leaf", "address": "0x401000"},
+        "view": "asm",
+        "blocks": [{"start": "0x401000",
+                    "insns": [{"a": "0x401000", "t": "ret"}], "edges": []}],
+    })
+    assert "undetermined" not in out
+
+
 def test_render_data_symbols_empty_page_past_the_end_discloses_the_total():
     # #682 item 4: a bare "none" reads as "this view has no data symbols".
     # The case that actually produces it -- an --offset past the end -- then

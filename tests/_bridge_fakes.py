@@ -675,10 +675,15 @@ class _FakeCFGBlock:
     matching live BN, where `MediumLevelILBasicBlock.start` is an instruction
     index, not an address."""
 
-    def __init__(self, start: int, lines=None, edges=None):
+    def __init__(self, start: int, lines=None, edges=None, undetermined=False):
         self.start = start
         self.disassembly_text = list(lines or [])
         self.outgoing_edges = list(edges or [])
+        # Real BN blocks ALWAYS carry this property (BasicBlock.
+        # has_undetermined_outgoing_edges), so the double does too -- a fake
+        # that omits it would only ever exercise the absent-probe path and
+        # could never reproduce the live indirect-jump shape (#682 item 3).
+        self.has_undetermined_outgoing_edges = undetermined
 
 
 class _FakeILCFGFunction:
