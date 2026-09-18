@@ -691,6 +691,50 @@ def test_batch_apply_file_clean_error(fake_transport, capsys, tmp_path, manifest
     assert calls == []
 
 
+@pytest.mark.parametrize("mode", ["directory", "undecodable"])
+@pytest.mark.parametrize("command", ["batch-apply", "py-exec"])
+def test_file_argument_failures_never_traceback_754(
+    fake_transport, capsys, tmp_path, command, mode
+):
+    """#754 consistency: `types declare --file` was not the only unguarded
+    `exists()`-then-`read_text` in this family. `py exec --script` tracebacked at
+    exit 1 on BOTH a directory and a non-UTF-8 file; `batch apply`'s manifest read
+    caught OSError only, so a non-UTF-8 manifest tracebacked while its directory
+    case was already wrapped (that row is the negative control).
+
+    The property the issue names is that every --file failure mode returns a JSON
+    ENVELOPE, so that is what this asserts. Checking only rc/stderr does not
+    discriminate it: a refusal rewritten as `print(msg, file=sys.stderr); return 2`
+    satisfies rc == 2, leaves no traceback and names the path, while stdout is
+    empty and a JSON consumer gets nothing (review of #855).
+
+    `batch apply` is `fmt="json"`, so its envelope is the default; `py exec`
+    renders text by default and is asked for JSON explicitly."""
+    if mode == "directory":
+        path = tmp_path
+    else:
+        path = tmp_path / "payload"
+        path.write_bytes(b"{}\xff\xfe")
+    calls = fake_transport()
+
+    argv = (
+        ["batch", "apply", str(path)] if command == "batch-apply"
+        else ["py", "exec", "--target", "active", "--script", str(path),
+              "--format", "json"]
+    )
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    assert calls == []
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    # The envelope, parsed -- not a substring match, so a truncated or
+    # double-encoded payload cannot pass.
+    envelope = json.loads(captured.out)
+    assert envelope["ok"] is False
+    assert str(path) in envelope["error"]
+
+
 @pytest.mark.parametrize("stdin, expected", [
     pytest.param("   \n", "No manifest on stdin", id="empty"),
     pytest.param("{not valid json", "Invalid JSON in manifest (<stdin>)", id="invalid-json"),
