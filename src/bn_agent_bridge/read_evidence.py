@@ -483,11 +483,13 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # saved `.bndb`, the normal case, the gate became a no-op versus base.
     #
     # The round-1 concern was that a demotion must not SILENTLY overrule an
-    # analyst's statement. That is met by DISCLOSURE instead: the row carries
-    # `declared_arity`, `library_arity` and `library_source`, and the text line
-    # says a user prototype takes precedence, so a pinned prototype is visible
-    # and checkable with `bn proto get` rather than quietly demoted. Suppression
-    # bought the nuance at the price of the feature.
+    # analyst's statement. That is met by DISCLOSURE, not by privilege: a pinned
+    # prototype IS demoted like any other, and the row carries `declared_arity`,
+    # `library_arity` and `library_source` while the text line states that the
+    # contradiction is reported rather than judged -- so an analyst who pinned
+    # the prototype can see the claim, confirm with `bn proto get`, and conclude
+    # the library is simply wrong for this binary. Suppression bought the nuance
+    # at the price of the feature everywhere it matters.
     library = _library_param_count(
         bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
     if (

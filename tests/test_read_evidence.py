@@ -5254,9 +5254,11 @@ def test_a_library_contradiction_demotes_even_with_a_user_prototype_759(monkeypa
 
     So the demotion is no longer suppressed. The round-1 concern was that it must
     not SILENTLY overrule an analyst's own statement, and that is met by
-    disclosure rather than by suppression: the row names both counts and the
-    library, and the text line states that a user prototype takes precedence, so
-    an analyst who pinned one can see the claim and check `bn proto get`.
+    disclosure rather than by privilege: a pinned prototype is demoted like any
+    other, while the row names both counts and the library and the text line
+    states that the contradiction is REPORTED, not judged -- so an analyst who
+    pinned one sees the claim, confirms with `bn proto get`, and can conclude the
+    library is wrong for this binary.
 
     This is the shape the pre-dogfood tests never exercised: a callee whose type
     reads as user-set, which is what every function on a reopened database looks
@@ -5294,6 +5296,43 @@ def test_an_agreeing_library_leaves_a_user_prototype_alone_759(monkeypatch):
 
     assert call["argument_confidence"] == "authoritative"
     assert "prototype_unverified" not in call
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    ["_ZNSt6vectorIiSaIiEE9push_backERKi",
+     "_RNvCs1234_4core3fmt5write",
+     "_D3std5stdio6writeln",
+     "_TtC4main6Widget"],
+    ids=["itanium", "rust-v0", "dlang", "swift-old"],
+)
+def test_library_cross_check_refuses_every_decorated_scheme_759(monkeypatch, mangled):
+    """#862 review round 2 MAJOR: the reserved-identifier arm was `_` plus an
+    uppercase letter, which is exactly where the mangling prefixes live -- every
+    Rust-v0 `_R...` symbol satisfied it, so a LOCAL Rust-mangled function
+    colliding with a library entry was still demoted. That is the round-1
+    collision class, narrowed to the one scheme the `_Z` refusal did not name.
+
+    A decorated name's implicit parameters (`this`, an sret return slot) make the
+    count comparison meaningless whatever its provenance, so every such scheme is
+    refused -- here even WITH import provenance, which is the stronger claim.
+
+    RESTORED after round 5 found it deleted: a bad end-boundary in an edit that
+    replaced the neighbouring test swallowed these four cases, leaving the
+    mangling-prefix refusal -- the fix this very finding produced -- with no
+    coverage at all. A repair must not remove its own coverage.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = mangled
+    _with_type_library(bv, symbol=mangled, params=3)
+    _as_import(bv, name=mangled)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
 
 
 def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
