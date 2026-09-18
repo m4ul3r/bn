@@ -10,12 +10,14 @@ from typing import Any, Callable, Iterator, Sequence
 from .target_hint import open_target_lines, target_row
 from .transport import BridgeError
 
-# "rollback_failed" = an op succeeded but the batch revert that should have
-# undone it failed, so the view may be left modified -- a real failure. A
-# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
-# "internal_error" = an unexpected engine bug (distinct from an unsupported
-# request); still a failure, so exit codes/rendering flag it (#122).
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed", "internal_error"}
+# FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
+# module symlinked into the bridge package, and re-exported here. Two owners is
+# how #777 happened: this module classified the statuses while the BRIDGE
+# produced them from its own narrower inline copy, so a `_verify_*` raising
+# anything outside that copy would silently skip the revert-on-failure path.
+# Re-exported under this name because CLAUDE.md documents it here and tests pin
+# `bn.formatters.FAILED_MUTATION_STATUSES`.
+from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so

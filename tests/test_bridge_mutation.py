@@ -793,20 +793,24 @@ def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     me = bridge.mutation_engine
 
-    # the alias is normalized in place for every struct_field_* kind
+    # The alias is normalized for every struct_field_* kind. #825: the helper
+    # returns a normalized COPY, so the contract is read off the RETURN value --
+    # asserting it on the input dict was asserting the in-place mechanism, which
+    # is the externally-observable side effect #825 removes.
     for kind in ("struct_field_set", "struct_field_rename", "struct_field_delete"):
         op = {"op": kind, "type_name": "Elf64_Sym"}
-        me._normalize_struct_alias(op)
-        assert op["struct_name"] == "Elf64_Sym", kind
+        assert me._normalize_struct_alias(op)["struct_name"] == "Elf64_Sym", kind
+        # ...and the caller's own dict is left exactly as it was sent.
+        assert "struct_name" not in op, kind
 
     # an explicit struct_name always wins (alias never clobbers it)
     op = {"op": "struct_field_rename", "struct_name": "A", "type_name": "B"}
-    me._normalize_struct_alias(op)
-    assert op["struct_name"] == "A"
+    assert me._normalize_struct_alias(op)["struct_name"] == "A"
 
-    # non-struct ops are left untouched
+    # non-struct ops are left untouched, and returned as the same object since
+    # there is nothing to normalize (no needless copy on the common path)
     op = {"op": "rename_symbol", "type_name": "X"}
-    me._normalize_struct_alias(op)
+    assert me._normalize_struct_alias(op) is op
     assert "struct_name" not in op
 
     # end-to-end through _apply_operation: validation no longer rejects a
@@ -4797,3 +4801,105 @@ def test_preview_data_tag_and_tag_type_revert_restore_view_state_782(monkeypatch
     assert result["rolled_back"] is True
     assert sorted(bv.tag_types) == ["Bug", "Scratch"]
 
+
+def _commit_mutation(monkeypatch, instance, bv, ops):
+    """The committing sibling of `_preview_mutation` (preview=False)."""
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance._mutation("active", False, ops)
+
+
+def test_idempotent_tag_add_reports_noop_and_does_not_duplicate_779(monkeypatch):
+    # #779: BN's add_tag does not dedupe -- `_find_new_tag` exists precisely
+    # because every call mints a fresh Tag id -- so running the same add twice
+    # genuinely produced two identical tags and reported `verified` both times.
+    # The second add must now write nothing and report `noop`.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _tag_comment_bv()
+
+    op = {"op": "tag_add", "function": "handle_request", "type": "Bug", "data": "look here"}
+    first = _commit_mutation(monkeypatch, instance, bv, [dict(op)])
+    assert first["results"][0]["status"] == "verified", first["results"][0]
+    assert _fn_tags(fn) == [("Bug", "look here")]
+
+    second = _commit_mutation(monkeypatch, instance, bv, [dict(op)])
+    assert second["results"][0]["status"] == "noop", second["results"][0]
+    # THE defect: the tag list must not have grown.
+    assert _fn_tags(fn) == [("Bug", "look here")]
+
+
+def test_tag_add_with_different_data_is_still_a_real_add_779(monkeypatch):
+    # The must-not-fire twin: only an exact (type, data) match is a noop. A
+    # second tag of the same TYPE carrying different data is a genuine add, or
+    # the dedupe would swallow real annotations.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _tag_comment_bv()
+    fn.add_tag("Bug", "pre-existing", None)
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "tag_add", "function": "handle_request", "type": "Bug", "data": "look here"}])
+    assert result["results"][0]["status"] == "verified", result["results"][0]
+    assert sorted(_fn_tags(fn)) == [("Bug", "look here"), ("Bug", "pre-existing")]
+
+
+def test_set_comment_refuses_an_unmapped_address_781(monkeypatch):
+    # #781: an unmapped address used to be accepted here -- the comment was
+    # written into nowhere and then reported `verified` against its own
+    # readback -- while `comment get` and `data retype` both reject the
+    # identical address. `invalid_request` matches data_retype's precedent for
+    # the same condition: a bad request, not an unsupported operation.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _tag_comment_bv()
+    bv.is_valid_offset = lambda addr: False
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "address": "0xdead0000", "comment": "note"}])
+    row = result["results"][0]
+    assert row["status"] == "invalid_request", row
+    assert "not mapped" in row.get("message", "")
+
+
+def test_set_comment_on_an_indeterminate_view_still_works_781(monkeypatch):
+    # Only an AFFIRMATIVE "unmapped" is refused. A view that cannot answer --
+    # no `is_valid_offset` at all -- is indeterminate, not invalid, and must
+    # keep working; otherwise the guard breaks every reduced/fake shape.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _tag_comment_bv()
+    assert not hasattr(bv, "is_valid_offset")
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "address": "0x1000", "comment": "note"}])
+    assert result["results"][0]["status"] == "verified", result["results"][0]
+
+
+def test_batch_revert_gate_reads_the_shared_failure_status_set_777():
+    # #777: `_has_failed_results` carried its own inline
+    # {"unsupported", "verification_failed"} literal -- a strict subset of the
+    # canonical five -- so a verifier raising `invalid_request`,
+    # `rollback_failed` or `internal_error` would have left a FAILED batch
+    # un-reverted while the CLI still reported exit 3. Both sides now read one
+    # definition, so the drift cannot reopen.
+    from pathlib import Path
+
+    from bn import mutation_statuses as cli_mod
+    from bn_agent_bridge import mutation_engine as me
+    from bn_agent_bridge import mutation_statuses as bridge_mod
+    from bn_agent_bridge.mutation_statuses import FAILED_MUTATION_STATUSES
+    from bn.formatters import FAILED_MUTATION_STATUSES as cli_set
+
+    # ONE source file, reached from both packages. Not an `is` check: the
+    # symlink shares the SOURCE, so each package imports its own module object
+    # (exactly as paths.py/version.py already do) -- resolving __file__ is what
+    # actually proves there is no second copy to drift.
+    assert Path(cli_mod.__file__).resolve() == Path(bridge_mod.__file__).resolve()
+    assert cli_set == FAILED_MUTATION_STATUSES
+    # ...and `formatters` re-exports rather than redeclaring, so the documented
+    # public name cannot fall behind the definition.
+    assert cli_set is cli_mod.FAILED_MUTATION_STATUSES
+    for status in sorted(FAILED_MUTATION_STATUSES):
+        assert me._has_failed_results(None, [{"status": status}]) is True, status
+    for status in ("verified", "noop", "reverted"):
+        assert me._has_failed_results(None, [{"status": status}]) is False, status
