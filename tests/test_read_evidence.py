@@ -5389,3 +5389,53 @@ def test_library_cross_check_refuses_when_two_libraries_disagree_759(monkeypatch
     bv.type_libraries = [lib("libsecond.so", 3), lib("libfirst.so", 1)]
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert "prototype_unverified" not in call
+
+
+@pytest.mark.parametrize(
+    "decorated",
+    ["?hw_get_version@@YAHXZ",
+     "$s4main13hwGetVersionSiyF",
+     "hw_get_version.part.0",
+     "hw_get_version@GLIBC_2.14"],
+    ids=["msvc", "swift-current", "gcc-clone-suffix", "versioned-symbol"],
+)
+def test_library_cross_check_refuses_punctuation_decorated_names_759(monkeypatch, decorated):
+    """#862 review round 6 MAJOR: the IDENTIFIER half of the refusal had no test
+    anywhere. Deleting `or not _C_IDENTIFIER_RE.match(name)` left every changed
+    test file green while IMPORTED punctuation-decorated callees flipped from
+    `authoritative` to `inferred` + `prototype_unverified` -- the measured
+    false-demotion class the agent-facing paragraph claims that rule excludes.
+
+    These are the schemes the prefix tuple does NOT catch, because they are not
+    valid C identifiers at all: MSVC `?name@@...`, current Swift `$s...`, a GCC
+    clone suffix, and a versioned symbol. Import provenance is deliberately
+    granted here, so the row can only stay authoritative because the NAME was
+    refused -- which is what makes this fail when the identifier clause goes."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = decorated
+    _with_type_library(bv, symbol=decorated, params=3)
+    _as_import(bv, name=decorated)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):
+    """The control that keeps the identifier rule from becoming a blanket refusal:
+    an ordinary C name with import provenance and a contradicting library MUST
+    still demote, or the rule above would be "refuse everything" and the two
+    tests would pass together while the feature did nothing."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["prototype_unverified"] is True
+    assert call["argument_confidence"] == "inferred"

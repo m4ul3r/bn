@@ -4915,9 +4915,13 @@ def test_render_evidence_function_states_the_library_contradiction_759():
     # The precedence PROMISE is gone (the dogfood showed suppressing on
     # has_user_type disabled the check on every saved database), so the line now
     # states what it can defend: the contradiction is reported, not judged.
-    assert "if you pinned that prototype yourself" in out
-    assert "reports the contradiction rather than judging it" in out
+    # The card must not tell the reader the disagreement is harmless when it IS
+    # the demotion trigger (#862 review round 6): it names the disagreement as
+    # the basis, and says the row may disagree with a prototype they pinned.
+    assert "the whole basis for this row's `inferred` confidence" in out
+    assert "this row disagrees with your statement" in out
     assert "takes precedence" not in out
+    assert "is not evidence against it" not in out
 
 
 def test_render_evidence_function_library_contradiction_without_counts():
