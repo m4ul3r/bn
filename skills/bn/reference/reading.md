@@ -34,6 +34,9 @@ bn evidence surface                                  # hidden code surface: init
 bn evidence virtual-call --at <addr> [--providers <selector>]   # resolve an imported abstract/interface virtual call to the provider's vtable method
 bn trace <fn> <addr> [--arg N] [--interprocedural]   # backward SSA slice: trace where a call argument originates
 bn dataflow defuse <fn> --var <name|local_id|name#version>   # SSA def site + use sites of one variable
+                                                    # a use that is argument set-up for a call whose
+                                                    # recovered model dropped its stack-passed args is
+                                                    # reported as a `hint: call ... call-model truncation`
 bn dataflow callgraph <fn> [--direction {callees|callers|both}]   # resolved edges; indirect targets via value-set
 bn dataflow values <fn> --at 0x401234                # value-set (possible values) at an instruction
 bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present]   # known sources/sinks; --present needs a target

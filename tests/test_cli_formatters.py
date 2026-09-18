@@ -4250,7 +4250,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    assert checked == 1212, f"the differential ran {checked} cases, not 1212"
+    # 1212 -> 1218 (#797): `_render_defuse_text` now reads the `hints` list (the
+    # #489 call-model-truncation disclosure), 1 list position x 6 malformed
+    # container shapes, measured.
+    assert checked == 1218, f"the differential ran {checked} cases, not 1218"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4303,7 +4306,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `has_more` -- three keys that renderer did not ask for while it built its
     # own footer (it already read `total`). 3 pairs x 8 bogus values = 24,
     # MEASURED by diffing `_runtime_population()` rather than carried over.
-    assert swept == 4928, f"the raise sweep ran {swept} renders, not 4928"
+    # 4928 -> 4936 (#797): `hints` is one more discovered read on
+    # `_render_defuse_text` (1 pair x 8 bogus values), measured.
+    assert swept == 4936, f"the raise sweep ran {swept} renders, not 4936"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4462,7 +4467,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1426 -> 1432 (#770): the same three `_render_class_list_text` pairs above,
     # x 2 benign payloads each. Measured, not carried over.
     # 1432 -> 1434 (#795): the one `_render_strings_text`/`filtered` pair, x 2.
-    assert checked == 1434, f"the mirror ran {checked} renders, not 1434"
+    # 1434 -> 1437 (#797): the one `_render_defuse_text`/`hints` pair -- a LIST,
+    # so its benign half is 3 payloads (None/[]/{}), measured.
+    assert checked == 1437, f"the mirror ran {checked} renders, not 1437"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7214,8 +7221,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # 4572 -> 4608 (#797): `_render_defuse_text` now reads the `hints` list, so
+    # the element sweep gained one position (1 x 9 junk elements x 4 shapes = 36),
+    # measured. The sweep is what proves a wrong-shaped hint element cannot cost
+    # the whole def-use card.
+    assert swept == 4608, (
+        f"the element sweep ran {swept} renders, not 4608 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

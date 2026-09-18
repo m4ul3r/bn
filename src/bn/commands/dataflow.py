@@ -66,7 +66,10 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     params["user_models_via"] = source
 
 
-@command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
+@command("dataflow", "defuse",
+         help="Show the SSA definition site and use sites of a variable "
+              "(argument set-up for a call whose under-recovered callee dropped "
+              "its stack-passed args is disclosed as a call-model truncation)",
          target=True,
          prefer_when="per-function SSA def/use of one variable; "
                      "use taint to follow a value across calls source->sink",
@@ -74,7 +77,13 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--var", dest="var", required=True,
-                 help="Variable selector: name, local_id, or name#version (SSA)"),
+                 help="Variable selector: name, local_id, or name#version (SSA). NOTE: "
+                      "BN clamps a call's MLIL parameters to the callee's recovered "
+                      "arity, so a callee auto-typed fixed-arity (a variadic declared "
+                      "without `...`, a thunk with too narrow a prototype) drops its "
+                      "stack-passed arguments from the call model; `uses` still lists "
+                      "the argument stores, and the result carries the same "
+                      "`hints` disclosure `trace` prints (`bn proto set` fixes it)"),
          ])
 def _dataflow_defuse(args: argparse.Namespace) -> int:
     return _call(

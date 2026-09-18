@@ -3372,6 +3372,12 @@ def _render_defuse_text(value: Any) -> str:
             (str(s.get("ssa", s.get("name", "?"))) if isinstance(s, dict) else repr(s))
             for s in _field_list(value, "phi_sources"))
         lines.append(f"phi sources: {srcs}")
+    # #797 (the defuse half of #489): a use that is argument set-up for a call
+    # whose recovered model DROPS its stack-passed arguments reads like any other
+    # use -- and `trace` already says so in its frontier, so the same prose is
+    # stated here, right above the listing it explains.
+    for hint in _field_list(value, "hints"):
+        lines.append(f"hint: {hint}")
     uses = _field_list(value, "uses")
     lines.append(f"uses ({len(uses)}):")
     for u in uses:
