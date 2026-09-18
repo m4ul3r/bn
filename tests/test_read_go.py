@@ -79,6 +79,39 @@ def test_go_functions_recovers_names_and_addresses(monkeypatch):
     assert out["total"] == 2 and out["defined_count"] == 1
 
 
+def test_go_functions_defined_via_containment_for_an_interior_pc_818(monkeypatch):
+    # #818: `defined` was read off `get_function_at` alone, which is START-only.
+    # A pcln entry whose prolog is a few bytes off -- or whose `_func` entryoff is
+    # an interior PC -- therefore read `defined: false`, and on a table where EVERY
+    # row missed that way the 0-match NOTE fired (PIE rebase / incomplete analysis)
+    # on a view that had in fact resolved each address to a function. Containment
+    # is the relation the row is asking about; the fallback is the same
+    # first-containing-function lookup the sibling reads use.
+    class _InteriorGoBV(_GoBV):
+        """BN recovers both pcln addresses as interior PCs of a function, so the
+        START-only accessor misses them and only containment finds them."""
+
+        _CONTAINERS = {0x401000: "sub_401000", 0x402000: "sub_402000"}
+
+        def get_function_at(self, addr):
+            return None
+
+        def get_functions_containing(self, addr):
+            name = self._CONTAINERS.get(int(addr))
+            return [type("F", (), {"name": name})()] if name else []
+
+    bridge, inst = _ctx(monkeypatch, _InteriorGoBV(_build_pclntab()))
+    out = inst._go_functions(None)
+    by_name = {i["name"]: i for i in out["items"]}
+
+    assert by_name["main.foo"]["defined"] is True
+    assert by_name["main.bar"]["defined"] is True
+    assert out["defined_count"] == 2
+    # The 0-match note is gated on defined_count == 0; it must not fire for a view
+    # whose addresses resolved, or it sends the reader off rebasing good addresses.
+    assert "note" not in out
+
+
 def test_go_functions_count_only_skips_the_list(monkeypatch):
     # #414: --count returns the recovered count without the full items list.
     bv = _GoBV(_build_pclntab(), defined={0x401000})

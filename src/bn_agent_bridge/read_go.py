@@ -127,6 +127,31 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
         )
 
     get_fn = getattr(bv, "get_function_at", None)
+    get_containing = getattr(bv, "get_functions_containing", None)
+    # #818: `get_function_at` is START-only, so a pcln entry whose prolog is a few
+    # bytes off -- or a `_func` entryoff that is an interior PC -- missed and the
+    # row read `defined: false`, and on a table where EVERY row missed that way
+    # the 0-match note fired (PIE rebase / incomplete analysis) on a view that had
+    # resolved all of them. Containment is the relation the row is really asking
+    # about, so fall back to `get_functions_containing` -- the same
+    # first-containing-function lookup the sibling reads use for an interior
+    # address. `defined` stays None only when the view exposes NEITHER accessor
+    # (a unit fake): "unknown", never a confident false.
+    can_resolve = callable(get_fn) or callable(get_containing)
+
+    def resolve_function(addr: int):
+        if callable(get_fn):
+            fn = get_fn(addr)
+            if fn is not None:
+                return fn
+        if callable(get_containing):
+            try:
+                containers = list(get_containing(addr) or [])
+            except Exception:
+                containers = []
+            if containers:
+                return containers[0]
+        return None
 
     def cstr(o: int) -> str:
         end = raw.find(b"\x00", o)
@@ -161,8 +186,8 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
             skipped_count += 1
             continue
         addr = text_start + entryoff
-        fn_obj = get_fn(addr) if callable(get_fn) else None
-        defined = bool(fn_obj) if callable(get_fn) else None
+        fn_obj = resolve_function(addr) if can_resolve else None
+        defined = bool(fn_obj) if can_resolve else None
         if defined:
             defined_count += 1
             cur = str(getattr(fn_obj, "name", "") or "")
