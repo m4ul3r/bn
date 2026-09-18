@@ -53,6 +53,7 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
     require_analysis(bv, "Cross-references")
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    literal_address = False
     try:
         address = _parse_address(identifier)
     except Exception:
@@ -100,23 +101,25 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
                 _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
             )
     else:
-        # Raw-address path (parse succeeded): reject an unmapped address rather
-        # than returning a false-negative empty xref set (#374). A function start
-        # (the name path above) is always mapped, so only the literal-address
-        # case needs the guard. But NEVER reject an address BN actually holds refs
-        # FOR -- 0x0 is the placeholder for unresolved indirect-call sites (many
-        # real code refs, is_valid_offset False), and a tail-call can target an
-        # out-of-image address; rejecting those would discard a real answer. Only
-        # an address that is BOTH unmapped AND ref-less is the typo case (#374
-        # follow-up).
-        has_refs = bool(
-            list(bv.get_code_refs(int(address))) or list(bv.get_data_refs(int(address)))
-        )
-        if not has_refs:
-            _require_mapped_address(bv, int(address))
+        # Raw-address path (parse succeeded) -- see the guard note below.
+        literal_address = True
+    # A literal address must be rejected when it is unmapped, rather than answered
+    # with a false-negative empty xref set (#374). A function start (the name path
+    # above) is always mapped, so only the literal-address case needs the guard.
+    # But NEVER reject an address BN actually holds refs FOR -- 0x0 is the
+    # placeholder for unresolved indirect-call sites (many real code refs,
+    # is_valid_offset False), and a tail-call can target an out-of-image address;
+    # rejecting those would discard a real answer. Only an address that is BOTH
+    # unmapped AND ref-less is the typo case (#374 follow-up).
+    #
+    # #815: the guard runs INSIDE the builder, on the ref lists it already read
+    # for the response. Probing here first (`bool(list(get_code_refs(...)) or
+    # list(get_data_refs(...)))`) materialised both lists a second time -- a
+    # high-fan-in symbol paid for its whole ref set twice per call.
     return _drop_legacy_ref_arrays(
         _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit,
-                          fn_pointer_scan=fn_pointer_scan)
+                          fn_pointer_scan=fn_pointer_scan,
+                          require_refs_or_mapped=literal_address)
     )
 
 
@@ -537,7 +540,8 @@ def _function_pointer_data_refs(ctx, bv, address: int, existing_addrs: set[int])
 
 
 def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None,
-                      fn_pointer_scan: bool = False) -> dict[str, Any]:
+                      fn_pointer_scan: bool = False,
+                      require_refs_or_mapped: bool = False) -> dict[str, Any]:
     code_refs = []
     data_refs = []
     # Drop spurious adrp page-base materializations for a page-aligned target
@@ -569,6 +573,11 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         )
     get_data_refs = getattr(bv, "get_data_refs", None)
     raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
+    if require_refs_or_mapped and not raw_code_refs and not raw_data_refs:
+        # #374 / #815: an address with NO refs at all must still be mapped to be a
+        # legitimate "0 callers" answer. The check lives here, after the two ref
+        # lists the response is built from, so those lists are read once.
+        _require_mapped_address(bv, int(address))
     for ref_addr in sorted(raw_data_refs):
         ref_addr = int(ref_addr)
         functions = ctx._functions_containing(bv, ref_addr)
