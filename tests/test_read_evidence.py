@@ -3702,6 +3702,98 @@ def test_argument_confidence_kept_for_known_prototype_648(monkeypatch):
     assert "abi_register_saturated" not in call
 
 
+def _with_type_library(bv, *, symbol, params, variadic=False,
+                       lib_name="libc_x86_64.so.6"):
+    """Attach a type library that declares *symbol* with *params* parameters.
+
+    Mirrors BN's real surface: `bv.type_libraries` of objects answering
+    `get_named_object(name)` with a function type (or None). A `_FakeBV` has no
+    `type_libraries` at all, which is why every other test in this file keeps its
+    pre-#759 behaviour -- no library, no claim.
+    """
+    proto = types.SimpleNamespace(
+        parameters=[types.SimpleNamespace(name=f"p{i}") for i in range(params)],
+        has_variable_arguments=variadic,
+    )
+    bv.type_libraries = [types.SimpleNamespace(
+        name=lib_name,
+        get_named_object=lambda n, _s=symbol, _p=proto: _p if str(n) == _s else None,
+    )]
+    return bv
+
+
+def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_759(
+    monkeypatch,
+):
+    """#759: the #742 guard compares the rendered list against the callee's own
+    RECOVERED prototype, so an under-recovered callee agrees with itself and keeps
+    `authoritative` -- vacuous by construction.
+
+    Measured on a real target: `__popcountdi2()` rendered ZERO arguments with
+    `argument_confidence: authoritative` and `arity_mismatch` absent, while the
+    attached type library declares one parameter. The library is an INDEPENDENT
+    witness, so the row must stop asserting authority and say why."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["library_arity"] == 3
+    assert call["library_source"] == "libc_x86_64.so.6"
+
+
+def test_argument_confidence_kept_when_the_library_agrees_759(monkeypatch):
+    """Negative control: an agreeing library must not disturb an earned
+    `authoritative` (the #648 `memset` precedent)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["&buf", "0", "0x100"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "prototype_unverified" not in call
+
+
+def test_library_cross_check_skips_mangled_cxx_names_759(monkeypatch):
+    """The measured false-positive class. A mangled C++ name carries IMPLICIT
+    parameters a count comparison cannot see -- `this` on a method, an sret
+    return-slot pointer on a by-value class return -- so either side can differ by
+    one with nothing wrong. On a C++-heavy target 3 of 4 raw firings were exactly
+    that shape; restricting to unmangled names took the rate to 0."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    bv.functions[0].name = "_ZNSt6vectorIiSaIiEE9push_backERKi"
+    _with_type_library(bv, symbol="_ZNSt6vectorIiSaIiEE9push_backERKi", params=3)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeypatch):
+    """A variadic library signature states only its FIXED count, so a count
+    comparison against it is not evidence of under-recovery."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["fmt", "a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=1, variadic=True)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
     """#648: a genuinely void callee rendering NO arguments agrees with its recovered
     prototype -- nothing was invented, so it keeps `authoritative`. Demoting here

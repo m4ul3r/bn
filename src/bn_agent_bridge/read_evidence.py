@@ -283,6 +283,43 @@ def _abi_arg_register_count(bv, callee_fn) -> int | None:
     return len(regs) or None
 
 
+def _library_param_count(bv, name: str) -> tuple[int, str] | None:
+    """The parameter count an attached type library declares for *name*, with the
+    library that declared it -- or None when no library makes a usable claim.
+
+    This is the INDEPENDENT witness #742 lacked. That guard compares the rendered
+    argument list against the callee's own recovered prototype, so a callee whose
+    type was itself mis-recovered agrees with itself and keeps `authoritative`
+    (#759). A bundled library signature is not derived from this binary's
+    analysis, so it can contradict the recovery.
+
+    Two refusals, both measured rather than assumed:
+
+    * **Mangled C++ names.** `this` on a method and an sret return-slot pointer on
+      a by-value class return are implicit parameters a count comparison cannot
+      see, so either side can differ by one with nothing wrong. On a C++-heavy
+      target 3 of 4 raw firings were exactly that; excluding mangled names took
+      the false-positive rate to 0 over 13,009 comparable call rows.
+    * **A variadic library signature**, which states only its fixed count.
+    """
+    if not name or name.startswith("_Z"):
+        return None
+    for lib in (getattr(bv, "type_libraries", None) or []):
+        try:
+            obj = lib.get_named_object(name)
+            if obj is None:
+                continue
+            if bool(getattr(obj, "has_variable_arguments", False)):
+                return None
+            params = getattr(obj, "parameters", None)
+            if params is None:
+                continue
+            return len(list(params)), str(getattr(lib, "name", "") or "type library")
+        except Exception:  # noqa: BLE001 - a malformed library must not fail the read
+            continue
+    return None
+
+
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
                              arguments: list[dict[str, Any]]) -> dict[str, Any]:
     """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
@@ -344,6 +381,24 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     except TypeError:
         declared_count = None
     is_variadic = il_format._function_is_variadic(callee_fn)
+    # #759: cross-check the RECOVERED prototype against a bundled library
+    # signature before either branch below trusts it. Both of them compare the
+    # rendered list against `declared_count`, so an under-recovered callee agrees
+    # with itself -- measured on a real target as `__popcountdi2()` rendering zero
+    # arguments with `authoritative` and no mismatch, against a library that
+    # declares one parameter. Recorded whenever the two disagree, including the
+    # zero-vs-N case the "genuinely void callee" branch below would wave through.
+    library = _library_param_count(bv, str(getattr(callee_fn, "name", "") or ""))
+    if (
+        library is not None
+        and declared_count is not None
+        and not is_variadic
+        and library[0] != declared_count
+    ):
+        evidence["prototype_unverified"] = True
+        evidence["declared_arity"] = declared_count
+        evidence["library_arity"] = library[0]
+        evidence["library_source"] = library[1]
     if declared_count is not None and (declared_count > 0 or has_user_type):
         # User prototypes also establish zero arity, but do not guarantee that
         # HLIL recovered that many arguments. Only compare an actual HLIL list;
@@ -538,7 +593,14 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
-        elif (arity["arity_unknown"] or arity.get("arity_mismatch")) and argument_confidence == "authoritative":
+        elif (
+            arity["arity_unknown"]
+            or arity.get("arity_mismatch")
+            # #759: a bundled library signature contradicting the recovered
+            # prototype is a positive reason to distrust it, so the row stops
+            # claiming authority and carries `library_arity` saying why.
+            or arity.get("prototype_unverified")
+        ) and argument_confidence == "authoritative":
             argument_confidence = "inferred"
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
