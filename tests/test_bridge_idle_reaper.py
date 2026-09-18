@@ -41,18 +41,22 @@ def _same_uid_conn():
     return _Conn()
 
 
-def _serve_one(bridge, inst, payload) -> float:
+def _serve_one(bridge, inst, payload, *, dispatched: bool = False) -> float:
     """Drive ONE real request through ``BridgeHandler.handle()`` against a real
     bridge instance and return the resulting ``_last_activity``.
 
     The whole point is to exercise the shipped path -- the envelope field and the
     handler's read of it -- rather than the private ``stamp_activity`` kwarg.
-    Identity is deliberately left mismatched so the request is REFUSED without
-    dispatch: the idle accounting must cover a refused request too (that is why
-    the flag is read before the identity check), and it keeps the test free of
-    op side effects.
+    With ``dispatched=False`` identity is left mismatched, so the request is
+    REFUSED without dispatch: the accounting must cover a refused request too,
+    which is why the flag is read before the identity check. With
+    ``dispatched=True`` the envelope carries this bridge's own identity so the
+    request really is dispatched -- otherwise a refactor moving the flag read
+    into the dispatch branch would pass every test here (#859 review round 2).
     """
     inst._last_activity = 100.0
+    if dispatched:
+        payload = {**payload, "_bridge_identity": inst.bridge_identity}
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
     handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO((json.dumps(payload) + "\n").encode("utf-8"))
@@ -162,6 +166,15 @@ def test_the_idle_probe_ENVELOPE_FIELD_is_what_exempts_a_request_756(monkeypatch
 
     assert ordinary > 100.0, "an ordinary request must restart the idle window"
     assert probe == 100.0, "a declared probe must not restart the idle window"
+
+    # And again on the DISPATCHED path, so the rule cannot come to depend on the
+    # request having been refused before it reached an op.
+    dispatched_ordinary = _serve_one(bridge, inst, base, dispatched=True)
+    dispatched_probe = _serve_one(
+        bridge, inst, {**base, "idle_probe": True}, dispatched=True)
+
+    assert dispatched_ordinary > 100.0
+    assert dispatched_probe == 100.0
 
 
 @pytest.mark.parametrize(

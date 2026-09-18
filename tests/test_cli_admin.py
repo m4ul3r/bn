@@ -3423,3 +3423,81 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
     assert [p["prefer_bndb"] for p in loads] == [False, False, False]
     assert [p["quick"] for p in loads] == [False, False, True]
     assert len(json.loads(capsys.readouterr().out)["loaded"]) == 3
+
+
+def test_the_probe_flag_reaches_the_WIRE_envelope_756(monkeypatch, tmp_path, capsys):
+    """#859 review round 2: the transport half was the one link nothing
+    exercised. Deleting the emission (`payload["idle_probe"] = True`) or the
+    forwarding (`idle_probe=idle_probe` into `_send_request_to_instance`) left
+    711 tests green while a real wire probe showed the field never reaching the
+    envelope -- so the declaration could be honoured nowhere and nothing failed.
+
+    This drives the real transport against a real Unix socket and asserts the
+    bytes: `session list`'s probe carries `idle_probe: true` in the ENVELOPE,
+    and an ordinary command over the same path does not. Both mutations die
+    here, because both sit on the path from the declaring site to the wire."""
+    import socketserver
+    import threading
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    received: list[dict] = []
+
+    class _H(socketserver.StreamRequestHandler):
+        def handle(self):
+            raw = self.rfile.readline()
+            if not raw:
+                return
+            payload = json.loads(raw.decode("utf-8"))
+            received.append(payload)
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "result": [{"selector": "netsvcd", "unsaved": True}],
+                "bridge_identity": payload.get("_bridge_identity"),
+            }).encode("utf-8"))
+
+    class _S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    sock_path = tmp_path / "wire.sock"
+    server = _S(str(sock_path), _H)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                              daemon=True)
+    thread.start()
+    try:
+        # pid is THIS process so the SO_PEERCRED peer-pid check passes: the
+        # server above really is the peer on the other end of the socket.
+        inst = BridgeInstance(
+            pid=os.getpid(), socket_path=_P(str(sock_path)),
+            registry_path=tmp_path / "wire.json", plugin_name="bn_agent_bridge",
+            plugin_version=bn.cli.VERSION, started_at="2026-01-01T00:00:00Z",
+            meta={}, instance_id="wire-probe",
+            # Without a token `_instance_identity` refuses before the socket is
+            # touched -- and `session list` swallows that into
+            # `unsaved_targets_unavailable` at rc 0, so the test would have
+            # asserted nothing while looking green.
+            instance_token="wire-probe-token")
+        # Both namespaces: `session list` reads `cli.list_instances`, while
+        # `choose_instance` (which `-i` resolution goes through) reads the one in
+        # `bn.transport`'s own module globals.
+        import bn.transport as _t
+        monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [inst])
+        monkeypatch.setattr(_t, "list_instances", lambda **kw: [inst])
+        monkeypatch.setattr(bn.cli, "session_state", types.SimpleNamespace(
+            read=lambda: {}, write=lambda **kw: None))
+
+        assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+        assert bn.cli.main(["target", "list", "--format", "json", "-i", "wire-probe"]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    capsys.readouterr()
+
+    probes = [p for p in received if (p.get("params") or {}).get("strict")]
+    ordinary = [p for p in received if p not in probes]
+    assert probes, f"session list sent no strict probe: {received}"
+    assert all(p.get("idle_probe") is True for p in probes), probes
+    assert ordinary, f"target list sent nothing: {received}"
+    # Absent, not false: the envelope is byte-identical to before for real work.
+    assert all("idle_probe" not in p for p in ordinary), ordinary
