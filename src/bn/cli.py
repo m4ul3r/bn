@@ -615,10 +615,31 @@ def command(
     return decorator
 
 
+def _group_paths() -> frozenset[tuple[str, ...]]:
+    """Every registered path that is a proper PREFIX of another one (#796 r2).
+
+    Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
+    path like ``types``/``exports``, the very same parser object also serves as
+    the node's own leaf. A flag attached there is therefore accepted BEFORE the
+    subcommand is dispatched, which is why the estimate flag cannot be advertised
+    on such a node: `bn types --estimate-output declare ...` ran the declaration
+    and printed a byte count over it, and `bn types --estimate-output show X` had
+    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
+    (a real default on an intermediate-level parser) landing on the one node
+    class where "intermediate" and "leaf" are the same object.
+
+    Derived from the registry rather than a second hand-kept list, so a new
+    command or subcommand cannot reopen the hole silently.
+    """
+    return frozenset(spec["path"][:i] for spec in _COMMANDS
+                     for i in range(1, len(spec["path"])))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
+    group_paths = _group_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -664,8 +685,12 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             cmd = _get_subparsers(parent).add_parser(path[-1], help=spec["help"])
             node_parsers[path] = cmd
 
+        # A group node never carries the estimate flag, even when the node is also
+        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
+        # for the two live failure shapes that buys.
         _common_io_options(cmd, default_format=spec["fmt"],
-                           estimable=bool(spec.get("estimable")))
+                           estimable=(bool(spec.get("estimable"))
+                                      and path not in group_paths))
         _instance_option(cmd)
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting

@@ -1743,18 +1743,41 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
                   if "--estimate-output" in bn.cli._known_option_strings(leaf(spec["path"]))}
     marked = {tuple(spec["path"]) for spec in bn.cli._COMMANDS if spec.get("estimable")}
 
+    # A DUAL-ROLE node (`types`, `exports`) is a leaf AND a group: argparse builds
+    # ONE parser for both roles, so a flag attached there is accepted BEFORE the
+    # subcommand is dispatched -- `bn types --estimate-output declare ...` ran the
+    # declaration and printed a byte count over it, and `bn types --estimate-output
+    # show X` had the flag clobbered back to False by the leaf default (#251's
+    # hazard, on the one node class where an "intermediate" parser and a leaf are
+    # the same object). The builder therefore declines to advertise it on any
+    # group node, derived from the registry rather than a second hand-kept list --
+    # and that derivation is what the two assertions below check in both
+    # directions, so neither a new command nor a new subcommand can reopen it.
+    groups = {tuple(spec["path"])[:i] for spec in bn.cli._COMMANDS
+              for i in range(1, len(tuple(spec["path"])))}
+    assert groups, "no group paths at all -- the derivation is broken"
+    assert all("--estimate-output" not in bn.cli._known_option_strings(leaf(path))
+               for path in groups), (
+        "a GROUP parser carries --estimate-output, so it is accepted before the "
+        "subcommand is dispatched: a mutation behind it runs while its outcome is "
+        f"replaced by a size ({sorted(p for p in groups if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
+
     asserted = derived_estimable()
     assert marked == asserted, (
         f"the registry marks {sorted(marked - asserted)} estimable and misses "
         f"{sorted(asserted - marked)}; `estimable=True` is the allow-list for the "
         "flag, so it must agree with the handlers that implement it")
-    assert advertised == marked, (
-        f"advertised {sorted(advertised - marked)} without being marked, or marked "
-        f"and not advertised {sorted(marked - advertised)}")
+    assert advertised == marked - groups, (
+        f"advertised {sorted(advertised - (marked - groups))} without being marked, "
+        f"or marked-and-advertisable but not advertised "
+        f"{sorted((marked - groups) - advertised)}")
     assert len(marked) == 49, (
-        f"the flag is implemented on {len(marked)} commands, not 49 -- a command "
-        "that joins or leaves this set is a deliberate change to the coverage "
-        "claim, so move the number in the same commit")
+        f"{len(marked)} commands are marked estimable, not 49 -- a command that "
+        "joins or leaves this set is a deliberate change to the coverage claim, so "
+        "move the number in the same commit")
+    # ...of which the two dual-role leaves cannot carry the flag (see above), so
+    # 47 advertise it and 45 refuse it by absence.
+    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 45
     # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
     # stronger than a bespoke refusal: there is no path on which the flag is
     # accepted and ignored, because the parser never builds it.
@@ -1793,6 +1816,24 @@ def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_comman
     assert refused.value.code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
     assert not calls                       # refused by the parser, before the request
+
+    # THE DUAL-ROLE NODES, behaviourally. The flag must not be accepted BEFORE the
+    # subcommand, because that occurrence belongs to the group parser: the
+    # mutation behind it (`types declare`) executed and reported a size in R2 of
+    # this review, and the read behind it (`types show`) ran with the flag
+    # silently dropped by the leaf default. Both refuse now, before any request.
+    for argv in (["types", "--estimate-output", "declare",
+                  "struct DF879Leak { int a; int b; };"],
+                 ["types", "--estimate-output", "show", "DF879Leak"],
+                 ["exports", "--estimate-output", "list"]):
+        calls = fake_transport()
+        with pytest.raises(SystemExit) as hijacked:
+            bn.cli.main(argv + ["--target", "active"])
+        assert hijacked.value.code == 2, argv
+        captured = capsys.readouterr()
+        assert "unrecognized arguments: --estimate-output" in captured.err, argv
+        assert captured.out == "", argv        # NO payload
+        assert not calls, argv                 # and NO side effect
 
     for path in (["save"], ["close"], ["target", "close"], ["load"], ["refresh"],
                  ["py", "exec"], ["go", "rename"], ["batch", "apply"]):
