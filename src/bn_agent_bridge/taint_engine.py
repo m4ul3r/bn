@@ -3656,6 +3656,33 @@ class TaintEngine:
                                 f"{name or '?'} at {hex(int(getattr(ins, 'address', 0)))} "
                                 f"(arg{src_i} -> arg0); propagated to the destination, "
                                 f"not itself flagged as a sink")
+            # #851, the sscanf half: the propagator run is unrolled exactly like the
+            # source run, so an arity_capped model whose call carries more params
+            # than its longest `*arg:N` destination leaves the residual destinations
+            # unmodeled -- and an unmodeled destination the format writes is where a
+            # tainted source would have landed. Disclose it and withhold the
+            # all-clear, as the source path does. Deliberately not gated on the
+            # per-rule hit or on `applied`: "no propagation happened" and "the run is
+            # shorter than the call" are different facts, and only the second is
+            # disclosed here.
+            if (model or {}).get("arity_capped"):
+                _prop_dests = [
+                    _try_arg_index(str(rule.get("to") or ""))
+                    for rule in (model.get("propagates") or [])
+                    if str(rule.get("to", "")).startswith("*arg:")
+                ]
+                _prop_dests = [i for i in _prop_dests if i is not None]
+                if _prop_dests and len(params) > max(_prop_dests) + 1:
+                    _ca = hex(int(getattr(ins, "address", 0)))
+                    _mx, _mn = max(_prop_dests), min(_prop_dests)
+                    add_assumption(
+                        f"scanf_arity_residual @ {_ca}: {name or '?'} model "
+                        f"covers *arg:{_mn}..{_mx} ({len(_prop_dests)} "
+                        f"destination(s)); call has {len(params)} param(s) -- "
+                        f"{len(params) - (_mx + 1)} potential destination(s) "
+                        f"beyond the modeled run (arg:{_mx + 1}+) are not "
+                        f"modeled. scanf_arity_residual"
+                    )
             # variadic propagation: every tainted vararg (from first_index on) flows
             # into the dest buffer and is itself reportable. Uses the actual call
             # params, so no format-string parsing is needed; arg_taint already covers

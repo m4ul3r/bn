@@ -79,10 +79,11 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     for name, model in models.items():
         # #849: skip the DOC-key prefix only, the way the engine's own coercion
         # does (``taint_models._coerce_model_map``). Skipping every ``_``-leading
-        # key also dropped real models -- ``__isoc99_scanf``/``__isoc99_fscanf``,
-        # ``__isoc99_vsscanf``, the ``_IO_*`` family -- which the engine resolves
-        # on a real binary, so the catalog (and the ``--present`` audit built on
-        # it) under-reported the models actually applied.
+        # key also dropped the eight real models the DB keeps under that spelling:
+        # the four ``__isoc99_*`` scanf-family entries and
+        # ``__builtin_bswap{16,32,64}`` / ``__builtin_memset`` -- all of which the
+        # engine resolves on a real binary, so the catalog (and the ``--present``
+        # audit built on it) under-reported the models actually applied.
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
         if model.get("sources") and want in (None, "source"):

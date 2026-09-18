@@ -443,11 +443,16 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
             f"{name} must carry arity_capped=true so the engine can detect "
             "extra destinations beyond the modeled run"
         )
-    # sscanf/isoc99_sscanf use propagates (not sources) and go through a
-    # different engine path -- they do NOT carry arity_capped.
+    # sscanf/isoc99_sscanf reach their destinations through propagates rather
+    # than sources, but their run is unrolled the same way -- so they carry the
+    # flag too, and the engine discloses the residual on the propagator path (an
+    # over-long sscanf's unmodeled destination is where the tainted source would
+    # have landed). Pinning the OPPOSITE here is what let the first cut of the
+    # #851 fix ship the scanf half only, with this test certifying the gap.
     for name in ("sscanf", "__isoc99_sscanf"):
-        assert not models[name].get("arity_capped"), (
-            f"{name} uses propagates, not sources; arity_capped must not be set"
+        assert models[name].get("arity_capped") is True, (
+            f"{name} propagates into its destinations and its run is unrolled "
+            "like scanf's, so it must carry arity_capped=true"
         )
 
 

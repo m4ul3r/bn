@@ -8199,8 +8199,12 @@ def test_scanf_arity_residual_withholds_all_clear_851(models):
     # A call whose actual param count exceeds `max(modeled arg index) + 1` leaves
     # the residual destinations unseeded, so the engine must disclose it and the
     # honesty gate must withhold the all-clear. This is the half the model-DB
-    # tests cannot see: turn the bound into `>=`, or move the block inside the
-    # seeding-success path, and only this test fails.
+    # tests cannot see. Which mutation each check catches: deleting the block or
+    # unwiring the marker is caught here, and flipping the bound to `>=` is caught
+    # by the boundary twin. The block sits outside the per-destination loop on
+    # purpose -- an added "seeding succeeded" gate could not hide the disclosure
+    # behind a clean all-clear anyway, because a run whose destinations are all
+    # unkeyable raises "no taint sources resolved" instead of reporting one.
     func = _scanf_arity_func(5)          # fmt + five destinations; the model covers four
     result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
         func, [te.parse_locator("call:scanf")])
@@ -8217,6 +8221,45 @@ def test_scanf_arity_at_the_modeled_run_stays_clear_851(models):
     func = _scanf_arity_func(4)
     result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
         func, [te.parse_locator("call:scanf")])
+    assert not any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is True, diag
+
+
+def _sscanf_arity_func(destinations):
+    """parse_many(): sscanf(&src, fmt, &d1 .. &dN) -- the propagator twin of
+    _scanf_arity_func: arg0 is the string the destinations are filled FROM, and
+    the model's unrolled run covers *arg:2..5."""
+    src = FVar("src", typ="char[0x40]")
+    args = [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+            FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)]
+    args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}", typ="char[0x40]"))
+             for i in range(1, destinations + 1)]
+    shown = ", ".join(["&src", "fmt"] + [f"&d{i}" for i in range(1, destinations + 1)])
+    return FFunc("parse_many", 0x10,
+                 FSSAFunc([_ext_call(0, 0x10, f"sscanf({shown})", 0x901, args)]),
+                 params=[src])
+
+
+def test_sscanf_arity_residual_withholds_all_clear_851(models):
+    # #851 names scanf AND sscanf. The propagator run is unrolled the same way, so
+    # an over-long sscanf leaves its residual destinations unmodeled -- and an
+    # unmodeled destination is exactly where a tainted source would have landed.
+    # Without the propagator-path disclosure this answers a clean all-clear with
+    # no note, which is the shape the issue was filed for.
+    func = _sscanf_arity_func(5)     # &src, fmt + five destinations; the run covers four
+    result = te.TaintEngine(FBV({0x901: "sscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_sscanf_arity_at_the_modeled_run_stays_clear_851(models):
+    # Boundary twin for the propagator path: four destinations IS *arg:2..5.
+    func = _sscanf_arity_func(4)
+    result = te.TaintEngine(FBV({0x901: "sscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
     assert not any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
     diag = result.get("diagnostics") or {}
     assert diag.get("safe_to_report_all_clear") is True, diag
