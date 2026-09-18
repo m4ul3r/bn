@@ -41,43 +41,69 @@ gets proven; adding one requires the scheduled-break note in the PR.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import pytest
 
 from _bridge_fakes import (_FakeBV, _FakeCFGBlock, _FakeCFGEdge, _FakeCFGLine,
                            _FakeFunction, _load_bridge)
 
 # --- the consumer's decoder, mirrored -------------------------------------
-# Each entry: field -> (json types allowed, required, nullable)
-# "required" means the consumer struct has NO serde default, so an absent
-# field aborts the element. "nullable" means the Rust type is Option<...>.
+# A field carries THREE independent facts, and conflating the first two is a
+# hole this file already had: `required` is a fact about the CONSUMER (its
+# struct has no serde default, so an absent field aborts the element), while
+# `always_emitted` is a fact about the PRODUCER (this bridge emits the key on
+# every row, so its absence means something changed here).
+#
+# They differ exactly for a field the bridge always sends and the consumer
+# defaults -- name, type, width. Checking only `required` made a HALF-DONE
+# rename invisible: drop the old key without adding the new one and the
+# consumer renders a blank forever with no error, which is the silent-blank
+# class this file exists to catch. The guard was catching it only for the
+# fields a consumer would have noticed anyway.
+class _Field(NamedTuple):
+    types: tuple[type, ...]
+    required: bool          # consumer has no serde default -> absence aborts
+    nullable: bool          # consumer type is Option<...> -> null is legal
+    always_emitted: bool    # this bridge emits it on every row
+
+
+def _f(types, required, nullable, always_emitted):
+    return _Field(types, required, nullable, always_emitted)
+
 
 _CFG_INSN = {                      # bn.rs:501-506  struct CfgInsn
-    "a": ((str,), True, False),
-    "t": ((str,), True, False),
+    "a": _f((str,), True, False, True),
+    "t": _f((str,), True, False, True),
 }
 _CFG_EDGE = {                      # bn.rs:509-514  struct CfgEdge
-    "to": ((str,), True, False),   # `pub to: String` -- a null blanks the view
-    "k": ((str,), True, False),
+    "to": _f((str,), True, False, True),   # `pub to: String` -- a null blanks the view
+    "k": _f((str,), True, False, True),
 }
 _CFG_BLOCK = {                     # bn.rs:491-498  struct CfgBlock
-    "start": ((str,), True, False),
-    "insns": ((list,), False, False),
-    "edges": ((list,), False, False),
+    "start": _f((str,), True, False, True),
+    "insns": _f((list,), False, False, True),
+    "edges": _f((list,), False, False, True),
 }
 _DATA_VAR = {                      # bn.rs:535-558  struct DataVar
-    "a": ((str,), True, False),    # `pub addr: String`, no default
-    "n": ((str,), False, False),
-    "t": ((str,), False, False),
-    "w": ((int,), False, False),
-    "v": ((int,), False, True),
-    "p": ((str,), False, True),
-    "ps": ((str,), False, True),
-    "pstr": ((str,), False, True),
-    "sec": ((str,), False, False),
+    # Always emitted (built in the row literal) even though the consumer
+    # defaults all but the address: read_misc._data_var_row.
+    "a": _f((str,), True, False, True),    # `pub addr: String`, no default
+    "n": _f((str,), False, False, True),
+    "t": _f((str,), False, False, True),
+    "w": _f((int,), False, False, True),
+    # Conditional: a decoded scalar, a pointer target and its decorations, and
+    # the section only appear when the slot warrants them -- so an absence
+    # here is ordinary and must stay tolerated even under a scheduled rename.
+    "v": _f((int,), False, True, False),
+    "p": _f((str,), False, True, False),
+    "ps": _f((str,), False, True, False),
+    "pstr": _f((str,), False, True, False),
+    "sec": _f((str,), False, False, False),
 }
 _DATA_SYM = {                      # bn.rs:574-580  struct DataSym
-    "a": ((str,), False, False),
-    "n": ((str,), False, False),
+    "a": _f((str,), False, False, True),
+    "n": _f((str,), False, False, True),
 }
 
 # Container key the consumer reads, per op.
@@ -101,13 +127,27 @@ KNOWN_BREAKS = {
 
 def _check_row(row, model, where, problems):
     assert isinstance(row, dict), f"{where}: row is {type(row).__name__}, not an object"
-    for field, (types, required, nullable) in model.items():
+    for field, spec in model.items():
+        types, required, nullable = spec.types, spec.required, spec.nullable
         if field not in row:
             if required:
                 problems.append(
                     f"{where}: required field {field!r} absent -- the consumer "
                     f"has no serde default for it, so the element (and, inside "
                     f"a Vec, the whole list) fails to decode")
+            elif spec.always_emitted:
+                # The PRODUCER side of the question. The consumer defaults
+                # this field, so its absence is not a decode error -- it is a
+                # permanent silent blank, which is worse: no error anywhere
+                # and a view that quietly stops carrying the value. Flagging
+                # it here is what makes a HALF-DONE rename (old key removed,
+                # new key never added) visible instead of green.
+                problems.append(
+                    f"{where}: field {field!r} is absent, but this bridge "
+                    f"emits it on every row -- the consumer defaults it, so "
+                    f"nothing errors and the value silently becomes blank. "
+                    f"If this is a rename, register it in KNOWN_BREAKS as "
+                    f"`field:{field}-><new>` so the replacement is required")
             continue
         value = row[field]
         if value is None:
@@ -277,3 +317,38 @@ def test_every_modelled_op_names_its_consumer_container(op):
     neither pane checked all day -- we verified against BN and against each
     other, never against a program that decodes our JSON."""
     assert _CONTAINERS[op]
+
+
+def test_a_half_done_rename_on_a_defaulted_field_is_not_tolerated():
+    """The hole this file shipped with, found by sabotage rather than review.
+
+    `required` answered "does the CONSUMER have a serde default"; for a
+    rename the load-bearing question is "does the PRODUCER still emit this".
+    Those differ for `n`/`t`/`w` -- always sent, always defaulted -- so
+    dropping the old key WITHOUT adding the new one passed every check while
+    the consumer rendered a blank forever with no error.
+
+    Driven through `_check_row` directly rather than through an op, because
+    the point is the RULE: a row that omits an always-emitted field must be
+    a problem even when the consumer would not have crashed on it.
+    """
+    problems: list[str] = []
+    row = {"a": "0x2000", "t": "int32_t", "w": 4}      # `n` dropped, nothing added
+    _check_row(row, _DATA_VAR, "data_vars[0]", problems)
+
+    assert problems, "a half-done rename on a defaulted field went unnoticed"
+    assert "'n' is absent" in problems[0]
+    assert "silently becomes blank" in problems[0]
+
+
+def test_a_conditional_field_may_be_absent_without_complaint():
+    """Must-not-fire twin, and the reason `always_emitted` is per-field rather
+    than a blanket rule: a scalar's decoded `v`, a pointer's `p`/`ps`/`pstr`
+    and the containing `sec` are emitted only when the slot warrants them.
+    Flagging those would make every ordinary row a problem and the check
+    would be discarded as noise -- which is how a guard dies."""
+    problems: list[str] = []
+    row = {"a": "0x2000", "n": "g_count", "t": "int32_t", "w": 4}
+    _check_row(row, _DATA_VAR, "data_vars[0]", problems)
+
+    assert problems == []
