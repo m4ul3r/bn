@@ -1344,10 +1344,21 @@ def _send_request_to_instance(
             f"-- stop it with `bn session stop {instance_selector(instance)}`"
         )
     expected_identity = _instance_identity(instance)
+    # #853: `or {}` defaults an ABSENT params (None) and nothing else. A present
+    # non-dict used to be silently corrected to {}, so a caller that sent `[]` or
+    # `"x"` had its request quietly rewritten instead of refused -- the client
+    # half of the contract the bridge now enforces with `invalid_request` (#773).
+    if params is None:
+        params = {}
+    elif not isinstance(params, dict):
+        raise BridgeError(
+            f"invalid_request: params must be a JSON object, got "
+            f"{type(params).__name__}"
+        )
     payload: dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "op": op,
-        "params": params or {},
+        "params": params,
         "_bridge_identity": expected_identity,
     }
     if target is not None:

@@ -1959,16 +1959,21 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
 
 
 @_discloses
-def _render_function_count_text(value: Any, *, label: str = "Total functions") -> str:
+def _render_function_count_text(value: Any, *, label: str = "Total functions",
+                                what: str = "function list/count") -> str:
     """Render a `function list/search --count` result, prefixing the quick-load
     partiality warning when the count is partial (#437).
+
+    ``what`` names the artifact in the warning text (#820); callers that reuse
+    this renderer for non-function counts (e.g. ``types --count``) should pass
+    a matching ``what`` so the warning is self-describing.
 
     #653.1: `function search <q> --count` used the SAME "Total functions:" label as
     the whole-binary `function list --count`, so "Total functions: 17" beside
     "Total functions: 175" read as a contradiction rather than as matches vs total.
     """
     count = value.get("count", 0) if isinstance(value, dict) else 0
-    return f"{_quick_partial_prefix(value)}{label}: {count}"
+    return f"{_quick_partial_prefix(value, what)}{label}: {count}"
 
 
 @_discloses

@@ -605,6 +605,33 @@ def test_list_count_flag_forwards_count_only(fake_transport, capsys, cmd, op, to
     assert total_label in capsys.readouterr().out
 
 
+
+def test_types_count_text_includes_partial_prefix_854(fake_transport, capsys):
+    # #854: `types --count` must prefix the quick-load warning in text mode when
+    # the envelope carries `partial: true`, so a quick-loaded count is not read
+    # as a complete one. The renderer now routes through _render_function_count_text
+    # instead of a bare lambda, giving it the same partiality contract as
+    # `function list --count` and `class list --count`.
+    fake_transport(
+        default={"ok": True, "result": {
+            "count": 7, "total": 7,
+            "analysis_state": "quick", "partial": True,
+        }}
+    )
+    rc = bn.cli.main(["types", "--count", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "quick-loaded" in out, (
+        f"partial prefix missing from types --count output: {out!r}"
+    )
+    # The warning must name 'type list', not the default 'function list/count'
+    # (the what= parameter distinguishes the artifact for the reader, #854).
+    assert "type list" in out, (
+        f"warning must say 'type list', got: {out!r}"
+    )
+    assert "Total types: 7" in out
+
+
 def test_effective_limit_uncaps_for_out_export():
     # #165: default page limit is 100, but --out uncaps it (full-body export);
     # an explicit --limit always wins.

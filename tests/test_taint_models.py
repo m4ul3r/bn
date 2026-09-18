@@ -175,6 +175,27 @@ def test_builtin_catalog_covers_fortify_and_exec_sinks():
     assert "pread" in src_syms, "pread must be a modeled source"
 
 
+def test_build_catalog_includes_underscore_prefixed_real_models_849():
+    # #849: build_catalog must NOT skip models whose names start with a single
+    # `_` but are NOT doc-key prefixed (_comment). Real model names like
+    # ``__isoc99_scanf`` / ``__isoc99_fscanf`` / ``__isoc99_vsscanf`` start
+    # with ``_`` but are genuine sources/propagators -- the engine resolves them
+    # on real binaries while the catalog used to omit them entirely. The fix
+    # matches only the doc-key prefix (``_comment``), not every leading ``_``.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
+    for name in ("__isoc99_scanf", "__isoc99_fscanf"):
+        assert name in src_syms, (
+            f"{name} must appear in the source catalog (starts with '_' but is "
+            "a real model, not a _comment doc key)"
+        )
+    prop_syms = {p["symbol"] for p in build_catalog(models, role="propagator")["propagators"]}
+    assert "__isoc99_vsscanf" in prop_syms, (
+        "__isoc99_vsscanf must appear as a propagator in the catalog"
+    )
+
+
 def test_recv_overflow_comment_names_pread_603():
     # #603-2: the recv_overflow opt-in sink family doc comment must literally
     # name pread alongside read/recv/recvfrom, not just leave it modeled with
@@ -408,3 +429,39 @@ def test_builtin_snprintf_family_declares_size_arm_808():
     entry = {e["symbol"]: e for lst in cat["sinks_by_class"].values() for e in lst}["snprintf"]
     assert entry["len_arg"] == 1 and entry["buf_arg"] == 0
     assert "arguments 1 (length) or 2" in entry["model_description"], entry["model_description"]
+
+
+def test_scanf_family_models_carry_arity_capped_flag_851():
+    # #851: scanf/fscanf (and their isoc99 aliases) declare `arity_capped: true`
+    # so the engine can emit a weak-seed note when a real call has more actual
+    # params than the unrolled *arg:N run covers, rather than silently reporting
+    # a clean all-clear for the unmodeled destinations.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    for name in ("scanf", "__isoc99_scanf", "fscanf", "__isoc99_fscanf"):
+        assert models[name].get("arity_capped") is True, (
+            f"{name} must carry arity_capped=true so the engine can detect "
+            "extra destinations beyond the modeled run"
+        )
+    # sscanf/isoc99_sscanf reach their destinations through propagates rather
+    # than sources, but their run is unrolled the same way -- so they carry the
+    # flag too, and the engine discloses the residual on the propagator path (an
+    # over-long sscanf's unmodeled destination is where the tainted source would
+    # have landed). Pinning the OPPOSITE here is what let the first cut of the
+    # #851 fix ship the scanf half only, with this test certifying the gap.
+    for name in ("sscanf", "__isoc99_sscanf"):
+        assert models[name].get("arity_capped") is True, (
+            f"{name} propagates into its destinations and its run is unrolled "
+            "like scanf's, so it must carry arity_capped=true"
+        )
+
+
+def test_scanf_arity_residual_marker_in_weak_seed_set_851():
+    # #851: the engine emits an assumption containing "scanf_arity_residual"
+    # when a call has more params than the model covers; taint_result must
+    # recognise that marker to withhold the all-clear.
+    from bn_agent_bridge.taint_result import _WEAK_SEED_ASSUMPTION_MARKERS
+    assert "scanf_arity_residual" in _WEAK_SEED_ASSUMPTION_MARKERS, (
+        "scanf_arity_residual must be in _WEAK_SEED_ASSUMPTION_MARKERS so a "
+        "residual-arity assumption withholds safe_to_report_all_clear"
+    )

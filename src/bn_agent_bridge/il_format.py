@@ -120,14 +120,21 @@ def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
 
 
 def _comment_map(bv, func) -> dict[str, str]:
-    """Global comments within the function, including grouped instruction spans."""
+    """Global comments within the function, including grouped instruction spans.
+
+    Snapshots ``bv.address_comments`` before iterating: on a quick-loaded view
+    whose analysis is still settling, BN may mutate the dict between the
+    property access and the iteration, raising ``dictionary changed size during
+    iteration`` (#850). ``mutation_engine._function_comment_state`` already
+    guards with ``dict(all_comments).items()``. ``func.basic_blocks`` is also
+    snapshotted for consistency with all other call sites in this module."""
     address_comments = bv.address_comments
     if not address_comments:
         return {}
-    ranges = [(block.start, block.end) for block in func.basic_blocks]
+    ranges = [(block.start, block.end) for block in list(func.basic_blocks)]
     return {
         hex(address): text
-        for address, text in address_comments.items()
+        for address, text in dict(address_comments).items()
         if text and any(start <= address < end for start, end in ranges)
     }
 

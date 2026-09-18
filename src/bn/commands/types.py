@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
+    _render_function_count_text,
     _render_type_info_text,
     _render_type_list_text,
 )
@@ -24,7 +25,8 @@ def _types(args: argparse.Namespace) -> int:
             "types",
             {"query": args.query, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total types: {value.get('count', 0)}",
+            text_renderer=lambda value: _render_function_count_text(
+                value, label="Total types", what="type list"),
             stem="types-count",
         )
     params = {"query": args.query, "offset": args.offset}

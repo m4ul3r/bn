@@ -91,6 +91,10 @@ _WEAK_SEED_ASSUMPTION_MARKERS = (
     "recvmsg_out_param",
     "source_seed_misanchored",
     "weak_buffer_seed",
+    # #851: a scanf-family call with more actual destinations than the model's
+    # fixed unrolled run; the residual args are unseeded and the all-clear is
+    # not safe to report.
+    "scanf_arity_residual",
 )
 
 # Receive APIs whose ``arg:N`` seed is easy to mis-anchor (header/pointer vs the

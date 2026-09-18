@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -3490,3 +3491,60 @@ def test_decompile_discloses_quick_analysis_state(monkeypatch):
     # The per-function flag is NOT the view state -- it stays False here, which is
     # why it could never carry this disclosure.
     assert quick["analysis_skipped"] is False
+
+
+def test_comment_map_tolerates_dict_mutation_during_iteration_850():
+    # #850: _comment_map iterated bv.address_comments.items() without first
+    # snapshotting the dict; on a quick-loaded view whose analysis is still
+    # settling, BN can add an entry while that walk is in flight, and a live view
+    # then raises exactly what CPython's dict views raise:
+    # ``RuntimeError: dictionary changed size during iteration``.
+    #
+    # The store below reproduces THAT mechanism -- the walk itself mutates the
+    # dict being walked -- so the pre-fix code dies of the production error.
+    # A fake that mutates *before* handing back the view proves nothing: the
+    # pre-fix code then only trips over a synthetic type error, and the fixed
+    # ``dict(...)`` never calls ``items()`` at all.
+    il_format = importlib.import_module("bn_agent_bridge.il_format")
+
+    class _LiveCommentStore(Mapping):
+        """address_comments as the bridge sees it: a live map that analysis may
+        add to at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def items(self):
+            for index, (address, text) in enumerate(self._entries.items()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield address, text
+
+    class _FakeBV:
+        def __init__(self, store) -> None:
+            self.address_comments = store
+
+    class _FakeBlock:
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+
+    class _FakeFunc:
+        basic_blocks = [_FakeBlock(0x1000, 0x1010)]
+
+    store = _LiveCommentStore({0x1000: "a comment"})
+    # Pre-fix this raises the live-view RuntimeError (red-first verified by
+    # reverting the source); post-fix the map is materialised before the walk,
+    # so the answer is the one entry that existed when the call started.
+    assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}

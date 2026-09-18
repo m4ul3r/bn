@@ -61,8 +61,11 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     """Group the model DB into sources / sinks-by-class / propagators.
 
     ``role`` filters to one role; ``sink_class`` filters sinks to one bug class
-    (and implies ``role='sink'``). Doc keys (``_``-prefixed) and non-dict entries
-    are skipped, matching the engine's model coercion.
+    (and implies ``role='sink'``). Doc keys (``_comment``-prefixed) are skipped
+    exactly as the engine's coercion skips them; a non-dict entry is skipped here
+    rather than raised on, because this catalog is a report over a DB the engine
+    has already accepted -- ``_coerce_model_map`` is the gate that refuses a
+    non-dict model with ``TaintError`` before any of this runs.
 
     Every entry carries ``model_name`` (the normalized alias that taint commands
     accept -- #556) and ``is_finding: false`` (#555); sinks additionally carry a
@@ -74,7 +77,15 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     sinks_by_class: dict[str, list[dict[str, Any]]] = {}
     propagators: list[dict[str, Any]] = []
     for name, model in models.items():
-        if str(name).startswith("_") or not isinstance(model, dict):
+        # #849: skip the DOC-key prefix only, the way the engine's own coercion
+        # does (``taint_models._coerce_model_map``). Skipping every ``_``-leading
+        # key also dropped real models -- the four ``__isoc99_*`` scanf-family
+        # spellings and ``__builtin_bswap{16,32,64}``, which the engine resolves on
+        # a real binary, so the catalog (and the ``--present`` audit built on it)
+        # under-reported the models actually applied. The eighth such key,
+        # ``__builtin_memset``, is an empty ``{}`` marker that declares nothing and
+        # so contributes no catalog row either way.
+        if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
         if model.get("sources") and want in (None, "source"):
             tos = ", ".join(str(s.get("to")) for s in model["sources"])
