@@ -1476,6 +1476,15 @@ def _render_target_summary(value: dict[str, Any]) -> str:
             lines.append(
                 f"\t\t{seg.get('start')}-{seg.get('end')} {perms} ({seg.get('length')} bytes)"
             )
+    # #900: the same JSON-only disclosure the function-list family carried.
+    # `target info` publishes `duplicate_starts_*` too, so a text reader was
+    # shown a function count with nothing saying a start address had carried
+    # more than one record. ONE sentence for the fact, taken from the shared
+    # helper -- a second surface inventing its own wording is how one fact
+    # ends up with two spellings.
+    note = _duplicate_starts_note(value)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -3224,6 +3233,11 @@ def _render_orient_text(value: Any) -> str:
                 raw = s.get("value")
                 shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
                 lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
+    # #900: same fact, same sentence, third surface. `evidence orient`
+    # carries the keys and rendered nothing for them.
+    note = _duplicate_starts_note(value)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 

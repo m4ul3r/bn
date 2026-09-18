@@ -4345,7 +4345,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_function_list_text` in both its demangled and undemangled probe
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
-    assert swept == 4984, f"the raise sweep ran {swept} renders, not 4984"
+    # #900: `_render_target_summary` and `_render_orient_text` now read the `duplicate_starts_*` pair through `_duplicate_starts_note`, so these derived populations grow with the two new discovered reads. 4984 -> 5032.
+    assert swept == 5032, f"the raise sweep ran {swept} renders, not 5032"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4512,7 +4513,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # `function list` / `--count` probe forms), x 2 benign payloads each. A
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
-    assert checked == 1449, f"the mirror ran {checked} renders, not 1449"
+    # #900: `_render_target_summary` and `_render_orient_text` now read the `duplicate_starts_*` pair through `_duplicate_starts_note`, so these derived populations grow with the two new discovered reads. 1449 -> 1461.
+    assert checked == 1461, f"the mirror ran {checked} renders, not 1461"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8142,3 +8144,60 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     assert _disclosed(bogus_text, "duplicate_starts_collapsed"), bogus_text
     assert "duplicate starts: ?" not in bogus_text, bogus_text
     assert "1 start address(es)" not in bogus_text, bogus_text
+
+
+# --- #900: the duplicate-start collapse on the remaining two text faces ----
+
+
+_DUP_KEYS = {"duplicate_starts_collapsed": 2, "duplicate_starts_unresolved": 1}
+
+
+def _dup_payloads():
+    ti = {"kind": "target_info", "filename": "/t/svc", "target_id": "a:1",
+          "selector": "svc", "arch": "x86_64", "analyzed": True,
+          "function_count": 15, **_DUP_KEYS}
+    orient = {"kind": "orient_digest", "target": dict(ti), "analyzed": True,
+              "function_count": 15, **_DUP_KEYS}
+    from bn.formatters import _render_orient_text, _render_target_info_text
+    return [("target info", _render_target_info_text, ti),
+            ("evidence orient", _render_orient_text, orient)]
+
+
+def test_target_info_and_orient_disclose_the_duplicate_start_collapse_900():
+    # #883 item 4 fixed the function-list family and named the other two
+    # surfaces as out of fence rather than folding them in. Same defect: the
+    # keys reach JSON and no text renderer, so a reader is shown a function
+    # count with nothing saying a start address carried more than one record.
+    for label, render, payload in _dup_payloads():
+        out = render(payload)
+        assert "duplicate starts" in out, label
+        assert "2 start address(es)" in out, label
+        assert "1 start address(es)" in out, label
+
+
+def test_all_three_surfaces_state_the_collapse_in_ONE_sentence_900():
+    # THE constraint from the #883 review: a second surface inventing its own
+    # wording is how one fact ends up with two spellings. All three faces take
+    # the line from `_duplicate_starts_note`, so the sentence is identical --
+    # asserted by equality between surfaces, not by matching a quoted string
+    # that would drift with the helper.
+    from bn.formatters import _duplicate_starts_note, _render_function_list_text
+    expected = _duplicate_starts_note(dict(_DUP_KEYS))
+    assert expected
+
+    fl = _render_function_list_text({
+        "kind": "function_list", "items": [], "total": 15, "offset": 0,
+        "limit": 100, "returned": 0, "has_more": False, **_DUP_KEYS})
+    rendered = [fl] + [render(payload) for _, render, payload in _dup_payloads()]
+    for out in rendered:
+        assert expected in out
+
+
+def test_a_clean_view_renders_unchanged_on_both_surfaces_900():
+    # Must-not-fire twin. The keys are published ONLY when the collapse
+    # happened, so a clean view must render byte-for-byte as before -- an
+    # alarm on every target info is an alarm a reader learns to skip.
+    for label, render, payload in _dup_payloads():
+        bare = {k: v for k, v in payload.items()
+                if not k.startswith("duplicate_starts")}
+        assert "duplicate starts" not in render(bare), label
