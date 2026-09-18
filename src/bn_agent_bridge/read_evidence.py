@@ -283,7 +283,46 @@ def _abi_arg_register_count(bv, callee_fn) -> int | None:
     return len(regs) or None
 
 
-def _library_param_count(bv, name: str) -> tuple[int, str] | None:
+_C_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _library_signature_applies(callee_fn, name: str) -> bool:
+    """Is an attached library's signature evidence about THIS callee, or merely
+    about something that shares its name?
+
+    The gate the first cut of #759 lacked: it keyed on the name alone, so a
+    statically linked image defining its OWN function under a name a bundled
+    library also carries got every call row to it demoted on a name collision
+    that says nothing about the recovery (#862 review).
+
+    Two ways a library signature does apply, and both are needed -- measured on
+    a dynamically linked C++ target, where 174 of 175 library-name matches were
+    imports and the ONE local match was `__popcountdi2`, statically linked from
+    libgcc and genuinely under-recovered (the true positive this whole change
+    rests on, which an import-only gate would have thrown away):
+
+    * an **imported** callee resolves to the library's symbol by definition;
+    * a **reserved identifier** -- C11 7.1.3 reserves a leading ``__``, and ``_``
+      followed by an uppercase letter, to the implementation -- cannot be a
+      conforming program's own function, so a statically linked copy is still
+      the library's function.
+
+    An ordinary-named local definition is therefore refused, which is exactly
+    the collision shape. The cost is stated plainly: a statically linked
+    ordinary-named library function (a static ``memcpy``) is out of reach here
+    and belongs to the residual tracked in #865.
+    """
+    # `is_imported_function` is the module's existing predicate for this, already
+    # imported here: it reads the symbol kind by NAME, so it works against BN's
+    # enum and the test fake alike (#593's class of divergence) and there is one
+    # answer to "is this callee an import" rather than two.
+    if is_imported_function(callee_fn):
+        return True
+    return name.startswith("__") or (
+        len(name) > 1 and name[0] == "_" and name[1].isupper())
+
+
+def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     """The parameter count an attached type library declares for *name*, with the
     library that declared it -- or None when no library makes a usable claim.
 
@@ -302,7 +341,16 @@ def _library_param_count(bv, name: str) -> tuple[int, str] | None:
       the false-positive rate to 0 over 13,009 comparable call rows.
     * **A variadic library signature**, which states only its fixed count.
     """
-    if not name or name.startswith("_Z"):
+    # `_Z` FIRST, and not merely as one decoration among many: an Itanium mangled
+    # name IS a valid C identifier, so the identifier rule cannot exclude it --
+    # and every such name begins `_Z`, which the reserved-identifier arm of
+    # `_library_signature_applies` would otherwise ADMIT, re-opening exactly the
+    # implicit-parameter false positives this refusal exists to stop. The
+    # identifier rule then covers the schemes that use punctuation (MSVC
+    # `?name@@...`, Swift `$s...`) plus clone suffixes and versioned symbols.
+    if not name or name.startswith("_Z") or not _C_IDENTIFIER_RE.match(name):
+        return None
+    if not _library_signature_applies(callee_fn, name):
         return None
     for lib in (getattr(bv, "type_libraries", None) or []):
         try:
@@ -388,7 +436,17 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # arguments with `authoritative` and no mismatch, against a library that
     # declares one parameter. Recorded whenever the two disagree, including the
     # zero-vs-N case the "genuinely void callee" branch below would wave through.
-    library = _library_param_count(bv, str(getattr(callee_fn, "name", "") or ""))
+    # NOT for a USER prototype. An analyst who set the type has stated the arity
+    # explicitly, and a bundled signature must not outrank that statement -- the
+    # precedence this function already asserts two lines below ("user prototypes
+    # also establish zero arity") and the one #648 earned `authoritative` on. The
+    # first cut ignored `has_user_type`, so a matching-arity call with a user
+    # prototype was demoted by a library that merely disagreed (#862 review).
+    library = (
+        None if has_user_type
+        else _library_param_count(
+            bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
+    )
     if (
         library is not None
         and declared_count is not None

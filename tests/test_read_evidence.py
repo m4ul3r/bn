@@ -3722,6 +3722,20 @@ def _with_type_library(bv, *, symbol, params, variadic=False,
     return bv
 
 
+def _as_import(bv, name="hw_get_version"):
+    """Give the callee an IMPORTED function symbol, the provenance that makes a
+    library signature evidence about it. Measured shape: 174 of 175
+    library-name-matched callees on a dynamically linked target were imports."""
+    callee = next(f for f in bv.functions if f.name == name)
+    # `_FakeSymbol` is the shared stand-in whose `.type.name` is what
+    # `is_imported_function` reads -- the fake `SymbolType` members are plain
+    # strings with no `.name`, which is #593's divergence and would silently
+    # report "not an import" here.
+    callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    return bv
+
+
+
 def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_759(
     monkeypatch,
 ):
@@ -3737,6 +3751,7 @@ def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_75
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
     _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
@@ -3754,6 +3769,7 @@ def test_argument_confidence_kept_when_the_library_agrees_759(monkeypatch):
     bv = _arity_bv(monkeypatch, instance, callee_params=3,
                    arg_texts=["&buf", "0", "0x100"])
     _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
@@ -3787,6 +3803,7 @@ def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeyp
     bv = _arity_bv(monkeypatch, instance, callee_params=3,
                    arg_texts=["fmt", "a", "b"])
     _with_type_library(bv, symbol="hw_get_version", params=1, variadic=True)
+    _as_import(bv)
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
@@ -5182,3 +5199,64 @@ def test_render_function_evidence_text_warns_when_quick_loaded():
     full = _render_function_evidence_text({**value, "analysis_state": "full", "partial": False})
     assert "WARNING" not in full
     assert full.splitlines()[0] == "build_response @ 0x412470"
+
+
+def test_library_cross_check_refuses_a_locally_defined_name_collision_759(monkeypatch):
+    """#862 review blocker: the lookup keyed on the callee's NAME alone, so a
+    statically linked image defining its OWN ordinary-named function under a name
+    an attached library also carries got EVERY call row to it demoted -- a false
+    demotion on a collision that says nothing about the recovery.
+
+    No import symbol and an ordinary identifier means the library is describing
+    something else, so it is not evidence here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_type_library(bv, symbol="hw_get_version", params=3)   # no _as_import
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_library_cross_check_applies_to_a_reserved_identifier_759(monkeypatch):
+    """The other side of that gate, and the shape the whole change rests on.
+    `__popcountdi2` is statically linked from libgcc, so it is NOT an import --
+    an import-only gate would have thrown away the only true positive measured.
+    C11 7.1.3 reserves a leading `__` to the implementation, so a conforming
+    program cannot define it and the library still describes this callee."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+    next(f for f in bv.functions if f.name == "hw_get_version").name = "__popcountdi2"
+    _with_type_library(bv, symbol="__popcountdi2", params=1,
+                       lib_name="libgcc_s_x86_64.so.1")
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["library_arity"] == 1
+    assert call["library_source"] == "libgcc_s_x86_64.so.1"
+
+
+def test_user_prototype_outranks_a_disagreeing_library_759(monkeypatch):
+    """#862 review blocker: AC2. A matching-arity call carrying a USER prototype
+    was demoted because a bundled library stated a different count, so the
+    library outranked the analyst's own statement -- the opposite of the
+    precedence this function asserts two lines below ("user prototypes also
+    establish zero arity") and the one #648 earned `authoritative` on.
+
+    None of the other controls attaches a library, which is why this one does."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2,
+                   arg_texts=["a", "b"], user_type=True)
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "prototype_unverified" not in call
