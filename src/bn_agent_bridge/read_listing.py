@@ -555,7 +555,10 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         address_comments = getattr(bv, "address_comments", None)
         if address_comments is not None:
             comments = len(address_comments)
-            for address, text in list(address_comments.items())[:20]:
+            # #861: `list(address_comments.items())` materialises a VIEW of the
+            # live global comment map, so it walks the collection BN may still be
+            # annotating. Snapshot the whole map first, then walk the snapshot.
+            for address, text in list(dict(address_comments).items())[:20]:
                 comment_locations.append(
                     {
                         "address": hex(int(address)),

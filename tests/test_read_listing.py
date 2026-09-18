@@ -15,6 +15,8 @@ Two halves, both required by the issue:
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from _bridge_fakes import *  # noqa: F401,F403
@@ -261,3 +263,60 @@ def test_list_functions_named_filter_pages_without_building_the_rest(monkeypatch
     assert result["total"] == 500 and result["returned"] == 10 and result["has_more"] is True
     assert all(item["auto_named"] is False for item in result["items"])
     assert _rows_built(functions) <= 11
+
+
+def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypatch):
+    # #861: `_annotation_summary` walked `list(address_comments.items())` -- the
+    # ITEMS VIEW of BN's live global comment map -- so an entry analysis adds
+    # mid-walk raised `RuntimeError: dictionary changed size during iteration`
+    # and the enclosing `except Exception` turned that into a confident
+    # `comments: 0` / no locations. Those counts are what
+    # `bn_kernel.assert_unannotated` reads to certify a view pristine (#733 F2),
+    # so a walk that died must not be able to fabricate a clean bill of health.
+    # The store mutates DURING the walk (the #850 mechanism).
+    bridge = _load_bridge(monkeypatch)
+
+    class _LiveCommentStore(Mapping):
+        """`address_comments` as the bridge sees it: a live map analysis may add
+        to at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def items(self):
+            for index, (address, text) in enumerate(self._entries.items()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield address, text
+
+    class _LiveAnnotationBV(_FakeBV):
+        """`_FakeBV.address_comments` hands back a fresh copy, which no walk can
+        catch changing; real BN exposes the map analysis writes into."""
+
+        def __init__(self, store) -> None:
+            super().__init__()
+            self._live = store
+
+        @property
+        def address_comments(self):
+            return self._live
+
+    store = _LiveCommentStore({0x1000: "a comment"})
+    summary = bridge.read_listing._annotation_summary(None, _LiveAnnotationBV(store))
+
+    # Pre-fix the live-view RuntimeError is swallowed into comments: 0 (#861);
+    # post-fix the map is materialised before the walk, so the counts and the
+    # sample are the entries that existed when the call started.
+    assert summary["comments"] == 1
+    assert summary["comment_locations"] == [{"address": "0x1000", "comment": "a comment"}]

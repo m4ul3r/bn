@@ -3598,3 +3598,50 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+    # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
+    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
+    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # the analysis threads can add to while the walk is in flight. The store
+    # below mutates DURING that walk (the #850 store's mechanism, walked through
+    # `values()` because this site unpacked the value view), so the pre-fix code
+    # dies of the production error and the snapshot returns what was there when
+    # the call started.
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+
+    class _LiveFunctionCommentStore(Mapping):
+        """`func.comments` as the bridge sees it: a live map analysis may add to
+        at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def values(self):
+            for index, text in enumerate(self._entries.values()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield text
+
+    class _FakeFunc:
+        comment = ""
+
+        def __init__(self, store) -> None:
+            self.comments = store
+
+    store = _LiveFunctionCommentStore({0x1000: "a local note"})
+    # Pre-fix: RuntimeError: dictionary changed size during iteration.
+    bodies = read_decompile._annotation_bodies(_FakeFunc(store), {})
+    assert bodies == ["a local note"]

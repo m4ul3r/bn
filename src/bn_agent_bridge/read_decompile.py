@@ -194,11 +194,18 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
     counts as an annotation, so the rule lives in one place.
     """
     function_comment = str(getattr(func, "comment", "") or "")
+    # #861: `func.comments` is BN's per-function map, which analysis threads may
+    # add to while this walk is in flight -- the same live-collection shape #850
+    # snapshotted for `bv.address_comments` (and that `il_format._comment_map`
+    # still reads through). Snapshot the WHOLE collection, not its `.values()`
+    # view: that view iterates the live map, so a parallel text decompile would
+    # still die of "dictionary changed size during iteration".
+    local_comments = dict(getattr(func, "comments", {}) or {})
     return [
         *comments.values(),
         # Local and global bodies can differ at the same address; do not merge
         # their maps and silently discard one of the two annotations.
-        *(getattr(func, "comments", {}) or {}).values(),
+        *local_comments.values(),
         *([function_comment] if function_comment else []),
     ]
 
