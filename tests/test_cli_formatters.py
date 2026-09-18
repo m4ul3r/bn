@@ -3830,9 +3830,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     this run did`) otherwise hides every other counter's rendering behind it.
     """
     sites = _count_helper_sites()
-    assert len(sites) == 18, (
+    # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
+    # through `_stated_count`, which is a read this differential covers.
+    assert len(sites) == 19, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 18. The number is the size of the covered set: a "
+        "count helper, not 19. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3975,7 +3977,9 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
 # transform put there (`None` for a refused counter, which is why `changed=None`
 # prints), so a blanket zero-assertion would be wrong where an inventory is
 # right.
-_RAW_COUNT_SPELLINGS = 49
+# 49 -> 48 (#858 review r5): `_render_trace_text`'s `arg_index` was the last
+# raw numeric spelling in that renderer and now goes through `_stated_count`.
+_RAW_COUNT_SPELLINGS = 48
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -4261,7 +4265,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # discovered read is a discovered pair -- 4 pairs x 8 bogus values, MEASURED
     # on the rebased tree rather than carried over from the pre-merge branch. The
     # assertion still exists to catch the population SHRINKING silently.
-    assert swept == 4880, f"the raise sweep ran {swept} renders, not 4880"
+    #
+    # 4880 -> 4888 (#755): ONE more pair, because `_render_trace_text` now reads
+    # the top-level `callee` to tell an unresolved callee from a callee nothing
+    # was computed for -- 1 pair x 8 bogus values, measured the same way.
+    assert swept == 4888, f"the raise sweep ran {swept} renders, not 4888"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4413,7 +4421,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1413 -> 1421 with the same four pairs the raise sweep gained (#820): the
     # quick-load warning reads `partial` in three more renderers, and the mirror
     # contributes 2 benign payloads per pair. Measured on the rebased tree.
-    assert checked == 1421, f"the mirror ran {checked} renders, not 1421"
+    # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
+    # sweep also gained, x 2 benign payloads.
+    assert checked == 1423, f"the mirror ran {checked} renders, not 1423"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -5110,14 +5120,71 @@ def test_render_trace_text_header_names_callee_not_parameter():
     assert "count" not in out.splitlines()[0]
 
 
-def test_render_trace_text_header_omits_missing_callee_or_register():
+def test_render_trace_text_header_discloses_an_unresolved_callee_755():
+    """#755: the header used to OMIT the callee when the payload said it did not
+    resolve, so the output claimed nothing about which call it answered -- two
+    indirect calls in one function then rendered headers differing only by
+    address, and an analyst who copied a nearby address got an equally confident
+    slice about a different call with no signal at all.
+
+    The callee slot is never silent when the producer computed one; the register
+    stays optional."""
     from bn.formatters import _render_trace_text
     value = {
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
         "arg_index": 0, "arg_label": {"index": 0}, "trace": [],
     }
     out = _render_trace_text(value)
+    assert "backward trace of arg[0] of <unresolved callee> in f @ 0x1010" in out
+    # No register in the label, so the header must not invent one: the arg
+    # descriptor ends at the callee and carries no parenthesised register.
+    assert "<unresolved callee> in f" in out and "(" not in out.splitlines()[0]
+    resolved = _render_trace_text(dict(value, arg_label={"index": 0, "callee": "memcpy"}))
+    assert "backward trace of arg[0] of memcpy in f @ 0x1010" in resolved
+    assert "(" not in resolved.splitlines()[0]
+
+
+def test_render_trace_text_makes_no_callee_claim_when_none_was_computed_755():
+    """#755 review: the disclosure must not become its own absent-vs-null
+    conflation. Only an `arg_label` that arrived as an OBJECT means the producer
+    computed a callee slot; a missing key and an explicit null both claim
+    nothing, which is `_field_present`'s stated rule, how `_field_list` and
+    `_field_dict` already read a nulled field, and the reading the mirror test
+    relies on when it feeds `{key: None}` as a benign payload for every
+    discovered read.
+
+    Round 1 used `_field_declared` -- whose docstring says it answers the
+    DIFFERENT question of which envelope shape arrived -- so an explicit
+    `"arg_label": null` still rendered the affirmative finding. All three states
+    are pinned here so neither direction can drift again."""
+    from bn.formatters import _render_trace_text
+    bare = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "trace": [],
+    }
+
+    # 1. Absent: nothing was computed, so nothing is claimed.
+    out = _render_trace_text(bare)
     assert "backward trace of arg[0] in f @ 0x1010" in out
+    assert "unresolved callee" not in out
+
+    # 2. Explicit null, on either key: still claims nothing (round-2 finding).
+    for nulled in ({"arg_label": None}, {"callee": None},
+                   {"arg_label": None, "callee": None}):
+        nulled_out = _render_trace_text({**bare, **nulled})
+        assert "backward trace of arg[0] in f @ 0x1010" in nulled_out, nulled
+        assert "unresolved callee" not in nulled_out, nulled
+
+    # 3. An arg_label OBJECT is the positive signal: computed, and if its callee
+    #    is missing or null the row says so rather than going silent.
+    for computed in ({"index": 0}, {"index": 0, "callee": None}):
+        assert "of <unresolved callee>" in _render_trace_text(
+            dict(bare, arg_label=computed)), computed
+
+    # A name still wins from either key.
+    assert "of parse_header" in _render_trace_text(
+        dict(bare, arg_label={"index": 0, "callee": "parse_header"}))
+    assert "of parse_header" in _render_trace_text(dict(bare, callee="parse_header"))
 
 
 def test_render_trace_text_renders_caveats_from_assumptions():
@@ -7740,3 +7807,105 @@ def test_the_go_rename_ok_key_reads_the_same_on_both_cli_paths(fake_transport, c
         assert detail_rc == compact_rc, (
             f"{name}: exit code differs across the detail flag: "
             f"{detail_rc} vs {compact_rc}")
+
+
+@pytest.mark.parametrize(
+    "bad", [{"name": "x"}, 0, 1, True, ["x"]],
+    ids=["dict", "zero", "int", "bool", "list"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_callee_755(bad):
+    """#858 review round-2 minor: the top-level `callee` read was a bare `.get`,
+    so a wrong-shaped value rendered straight into the header -- a dict became
+    the raw Python repr `arg[0] of {'name': 'x'}`, and a number read as
+    "unresolved" in silence. Routed through `_text_value`, the module's string
+    sibling of `_field_list`/`_field_dict`/`_count_field`, so a key present in a
+    shape no name reads out of is DISCLOSED rather than interpolated."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0}, "callee": bad, "trace": [],
+    })
+    assert "malformed callee field" in out
+    # Never the value itself, and never a silent claim of a resolved name.
+    assert "{'name'" not in out and "['x']" not in out
+    assert "of <unresolved callee>" in out
+
+
+@pytest.mark.parametrize(
+    "bad", [{"reg": "rdi"}, 0, 7, True, ["rdi"]],
+    ids=["dict", "zero", "int", "bool", "list"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_register_755(bad):
+    """#858 review round 3 MAJOR: the `register` read one line below the repaired
+    `callee` read was still a bare `.get`, interpolating a wrong-shaped value
+    straight into the header (`arg[0] ({'reg': 'rdi'})`) with no disclosure. Same
+    reader, same rule -- and the PR body's claim that `arg_label` had exactly one
+    consumer, so there was no sibling to fix, was wrong: this was the sibling."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0, "callee": "memcpy", "register": bad},
+        "trace": [],
+    })
+    assert "malformed register field" in out
+    assert "{'reg'" not in out and "['rdi']" not in out
+    # The rest of the header still renders: one unusable field must not cost the
+    # callee name it sits beside.
+    assert "backward trace of arg[0] of memcpy in f @ 0x1010" in out
+
+
+def test_render_trace_text_records_a_skew_on_either_callee_key_755():
+    """#858 review round 3 minor: `_text_value(a) or _text_value(b)` short-circuits,
+    so a skew on the SECOND key went unrecorded whenever the first was truthy --
+    the alias trap `_field_list`'s docstring names. Both keys are read."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0, "callee": "memcpy"},
+        "callee": {"name": "shadow"},          # skewed, and second in precedence
+        "trace": [],
+    })
+    assert "malformed callee field" in out
+    # The usable name still wins, and the unusable one never reaches the header.
+    assert "of memcpy in f" in out and "shadow" not in out
+
+
+@pytest.mark.parametrize(
+    "bad", [{"a": 1}, ["x"], True, float("nan"), "abc"],
+    ids=["dict", "list", "bool", "nan", "non-numeric-string"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_arg_index_755(bad):
+    """#858 review round 5: `arg_index` was the THIRD component of this one arg
+    descriptor still read with a bare `.get`, after `callee` (round 2) and
+    `register` (round 4). A wrong-shaped value was interpolated raw --
+    `backward trace of arg[{'a': 1}] of memcpy in f @ 0x1010` -- with no
+    disclosure. Routed through `_stated_count`, the int sibling of `_text_value`:
+    the skew is recorded for the enclosing boundary and the slot states `?`."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": bad, "arg_label": {"index": 0, "callee": "memcpy"}, "trace": [],
+    })
+    assert "malformed arg_index field" in out
+    assert "backward trace of arg[?] of memcpy in f @ 0x1010" in out
+    # The value itself never reaches the header.
+    for leak in ("{'a'", "['x']", "nan", "abc"):
+        assert f"arg[{leak}]" not in out
+
+
+def test_render_trace_text_states_a_readable_arg_index_755():
+    """The readable side, so the reader swap cannot quietly turn every index into
+    `?`: an int renders as itself, and a numeric string still reads (the
+    `_count_field` contract) rather than being disclosed as malformed."""
+    from bn.formatters import _render_trace_text
+    base = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_label": {"index": 2, "callee": "memcpy"}, "trace": [],
+    }
+    assert "arg[2] of memcpy" in _render_trace_text(dict(base, arg_index=2))
+    assert "arg[2] of memcpy" in _render_trace_text(dict(base, arg_index="2"))
+    assert "malformed arg_index" not in _render_trace_text(dict(base, arg_index=2))
+    # Absent is a real default, not a skew: the op always sends one, and a
+    # missing key must not manufacture a disclosure.
+    assert "arg[0] of memcpy" in _render_trace_text(base)
+    assert "malformed arg_index" not in _render_trace_text(base)

@@ -1397,6 +1397,14 @@ def _backward_slice(
         "target_address": hex(target_addr),
         "arg_index": arg_index,
         "arg_label": arg_label,
+        # #755: the traced callee, stated STRUCTURALLY with an explicit null when
+        # it does not resolve (an indirect call through a register or vtable
+        # slot). `arg_label` merely OMITS its `callee` key in that case, so a JSON
+        # consumer could not tell "we looked, and this call has no resolvable
+        # callee" from "this bridge never computed one" -- the same ambiguity the
+        # text header had. Derived from `arg_label` in this one expression so the
+        # header and this field cannot disagree about which call was answered.
+        "callee": arg_label.get("callee") or None,
         "view": view,
         "interprocedural": interprocedural,
         "ip_depth": ip_depth if interprocedural else 0,

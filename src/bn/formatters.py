@@ -5329,7 +5329,15 @@ def _render_trace_text(value: Any) -> str:
     fn_name = value.get("function", "<unknown>")
     fn_addr = value.get("function_address", "<unknown>")
     target_addr = value.get("target_address", "<unknown>")
-    arg_index = value.get("arg_index", 0)
+    # `_stated_count`, not a bare `.get`: the int sibling of the `_text_value`
+    # reads below, and the third component of this one descriptor to need it.
+    # A wrong-shaped index was interpolated raw -- `arg[{'a': 1}]`, `arg[[x]]`,
+    # `arg[nan]` -- with no disclosure, which is the same defect rated major for
+    # `register` one round earlier, two lines away (#858 review round 5). The
+    # reader records the skew for the enclosing boundary and `_stated_count`
+    # renders `?` for it, so the slot states "unreadable" rather than a value
+    # nobody can act on.
+    arg_index = _stated_count(value, "arg_index")
     trace = _field_list(value, "trace")
     hints = [h for h in _field_list(value, "hints") if h]
 
@@ -5340,10 +5348,52 @@ def _render_trace_text(value: Any) -> str:
     # was never what was traced).
     arg_lbl = _field_dict(value, "arg_label")
     arg_desc = f"arg[{arg_index}]"
-    if arg_lbl.get("callee"):
-        arg_desc += f" of {arg_lbl['callee']}"
-    if arg_lbl.get("register"):
-        arg_desc += f" ({arg_lbl['register']})"
+    # #755: never leave the callee slot silent when the producer COMPUTED one. An
+    # indirect call (a vtable slot, a register target) resolves to no name, and
+    # the header then said nothing about which call it answered -- two such calls
+    # in one function rendered headers differing only by address, so an analyst
+    # who copied a nearby address got an equally confident slice about a
+    # different call with no signal to catch it with.
+    #
+    # What counts as "computed" is an `arg_label` that arrived as an OBJECT.
+    # Neither a missing key nor an explicit null does, because in this module a
+    # nulled field claims nothing: that is `_field_present`'s stated rule ("the
+    # key is there AND is not an explicit null"), it is how `_field_list` and
+    # `_field_dict` already read one, and it is the reading the mirror test
+    # relies on when it feeds `{key: None}` as a BENIGN payload for every
+    # discovered read. `_field_declared` answers a deliberately DIFFERENT
+    # question -- which shape of envelope arrived -- so using it here made an
+    # explicit `"arg_label": null` render the affirmative "we looked and found no
+    # resolvable callee", which is the absent-vs-null conflation one level up
+    # (#858 review round 2).
+    #
+    # A name may still arrive on either key; the top-level `callee` is the name
+    # when known and, being nullable, claims nothing by itself.
+    computed = isinstance(value.get("arg_label"), dict)
+    # `_text_value`, not a bare `.get`: it is this module's string sibling of
+    # `_field_list`/`_field_dict`/`_count_field`, so a key PRESENT in a shape no
+    # name reads out of records the skew for the enclosing boundary to disclose
+    # instead of interpolating a raw Python repr into the header (a dict rendered
+    # as `arg[0] of {'name': 'x'}`) or reading a number as "unresolved" in
+    # silence (#858 review round 2 minor).
+    # Both keys go through the reader, and NOT with `or`: short-circuiting on a
+    # truthy first key would leave a skew on the second one unrecorded, which is
+    # the alias trap `_field_list`'s docstring names. Read both, then choose
+    # (#858 review round 3 minor).
+    label_callee = _text_value(arg_lbl, "callee")
+    top_callee = _text_value(value, "callee")
+    callee_name = label_callee or top_callee
+    if callee_name:
+        arg_desc += f" of {callee_name}"
+    elif computed:
+        arg_desc += " of <unresolved callee>"
+    # The register is the SIBLING read one line down, and it had the same bare
+    # `.get`: a wrong-shaped value was interpolated raw into the header with no
+    # disclosure -- `arg[0] ({'reg': 'rdi'})`. Same reader, same rule (#858
+    # review round 3 major).
+    register = _text_value(arg_lbl, "register")
+    if register:
+        arg_desc += f" ({register})"
     header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
