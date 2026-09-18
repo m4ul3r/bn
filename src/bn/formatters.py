@@ -5329,7 +5329,15 @@ def _render_trace_text(value: Any) -> str:
     fn_name = value.get("function", "<unknown>")
     fn_addr = value.get("function_address", "<unknown>")
     target_addr = value.get("target_address", "<unknown>")
-    arg_index = value.get("arg_index", 0)
+    # `_stated_count`, not a bare `.get`: the int sibling of the `_text_value`
+    # reads below, and the third component of this one descriptor to need it.
+    # A wrong-shaped index was interpolated raw -- `arg[{'a': 1}]`, `arg[[x]]`,
+    # `arg[nan]` -- with no disclosure, which is the same defect rated major for
+    # `register` one round earlier, two lines away (#858 review round 5). The
+    # reader records the skew for the enclosing boundary and `_stated_count`
+    # renders `?` for it, so the slot states "unreadable" rather than a value
+    # nobody can act on.
+    arg_index = _stated_count(value, "arg_index")
     trace = _field_list(value, "trace")
     hints = [h for h in _field_list(value, "hints") if h]
 

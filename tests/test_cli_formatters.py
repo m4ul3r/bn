@@ -3830,9 +3830,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     this run did`) otherwise hides every other counter's rendering behind it.
     """
     sites = _count_helper_sites()
-    assert len(sites) == 18, (
+    # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
+    # through `_stated_count`, which is a read this differential covers.
+    assert len(sites) == 19, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 18. The number is the size of the covered set: a "
+        "count helper, not 19. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3975,7 +3977,9 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
 # transform put there (`None` for a refused counter, which is why `changed=None`
 # prints), so a blanket zero-assertion would be wrong where an inventory is
 # right.
-_RAW_COUNT_SPELLINGS = 49
+# 49 -> 48 (#858 review r5): `_render_trace_text`'s `arg_index` was the last
+# raw numeric spelling in that renderer and now goes through `_stated_count`.
+_RAW_COUNT_SPELLINGS = 48
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -7864,3 +7868,44 @@ def test_render_trace_text_records_a_skew_on_either_callee_key_755():
     assert "malformed callee field" in out
     # The usable name still wins, and the unusable one never reaches the header.
     assert "of memcpy in f" in out and "shadow" not in out
+
+
+@pytest.mark.parametrize(
+    "bad", [{"a": 1}, ["x"], True, float("nan"), "abc"],
+    ids=["dict", "list", "bool", "nan", "non-numeric-string"],
+)
+def test_render_trace_text_discloses_a_wrong_shaped_arg_index_755(bad):
+    """#858 review round 5: `arg_index` was the THIRD component of this one arg
+    descriptor still read with a bare `.get`, after `callee` (round 2) and
+    `register` (round 4). A wrong-shaped value was interpolated raw --
+    `backward trace of arg[{'a': 1}] of memcpy in f @ 0x1010` -- with no
+    disclosure. Routed through `_stated_count`, the int sibling of `_text_value`:
+    the skew is recorded for the enclosing boundary and the slot states `?`."""
+    from bn.formatters import _render_trace_text
+    out = _render_trace_text({
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": bad, "arg_label": {"index": 0, "callee": "memcpy"}, "trace": [],
+    })
+    assert "malformed arg_index field" in out
+    assert "backward trace of arg[?] of memcpy in f @ 0x1010" in out
+    # The value itself never reaches the header.
+    for leak in ("{'a'", "['x']", "nan", "abc"):
+        assert f"arg[{leak}]" not in out
+
+
+def test_render_trace_text_states_a_readable_arg_index_755():
+    """The readable side, so the reader swap cannot quietly turn every index into
+    `?`: an int renders as itself, and a numeric string still reads (the
+    `_count_field` contract) rather than being disclosed as malformed."""
+    from bn.formatters import _render_trace_text
+    base = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_label": {"index": 2, "callee": "memcpy"}, "trace": [],
+    }
+    assert "arg[2] of memcpy" in _render_trace_text(dict(base, arg_index=2))
+    assert "arg[2] of memcpy" in _render_trace_text(dict(base, arg_index="2"))
+    assert "malformed arg_index" not in _render_trace_text(dict(base, arg_index=2))
+    # Absent is a real default, not a skew: the op always sends one, and a
+    # missing key must not manufacture a disclosure.
+    assert "arg[0] of memcpy" in _render_trace_text(base)
+    assert "malformed arg_index" not in _render_trace_text(base)
