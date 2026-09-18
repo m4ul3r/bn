@@ -3072,6 +3072,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     caller_total = None
     scan_truncated = False
     has_more = False
+    caller_scan_note = None
     if _field_declared(value, "items"):
         total = value.get("total")
         offset = value.get("offset")
@@ -3080,6 +3081,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         caller_total = value.get("caller_total")
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
+        caller_scan_note = value.get("caller_scan_note")
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -3092,6 +3094,14 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             return (
                 f"no callsites on this page (offset {_fmt_offset(offset)}); "
                 "total count is not a number, so a zero result cannot be confirmed"
+            )
+        if caller_scan_note:
+            # #816: an empty page under a partial caller scan is the one place
+            # "no callsites found" is exactly the false certainty the scan note
+            # exists to prevent -- say what was actually established.
+            return (
+                "no callsites found among the callers examined; the caller scan was "
+                f"incomplete ({caller_scan_note}), so absence is not established"
             )
         return "no callsites found"
 
@@ -3149,9 +3159,15 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         for item in previous:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
-        lines.append(
-            f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
-        )
+        if row.get("disasm_context_reason"):
+            # #816: the call site is real (its identity fields are usable) but the
+            # disassembly sweep produced no entry at its address, so the context is
+            # null by evidence, not by omission -- say WHY, mirroring `hlil: null (...)`.
+            lines.append(f"> unavailable ({row['disasm_context_reason']})")
+        else:
+            lines.append(
+                f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
+            )
         for item in next_instructions:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
@@ -3181,6 +3197,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             "Use --offset/--limit to page."
         )
         body = f"{body}\n\n{footer}" if body else footer
+    if caller_scan_note:
+        # #816: the caller enumeration itself was partial, so everything printed
+        # above is a LOWER BOUND. Name the reason -- a short caller list must never
+        # read as "not called". Same disclosure shape as the truncated
+        # function-pointer scan in `_render_evidence_xrefs_text`.
+        note = (
+            "note: the caller scan was incomplete "
+            f"({caller_scan_note}); the callsites above are a lower bound, not the "
+            "whole set"
+        )
+        body = f"{body}\n\n{note}" if body else note
     if not blocks and not body:
         body = "no callsites found"
     return body

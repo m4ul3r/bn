@@ -621,6 +621,52 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     assert "bn evidence function parse_line" in out
 
 
+def test_render_callsites_shows_missing_context_reason():
+    # #816: a call whose address the disassembly sweep never decoded keeps its row
+    # (identity fields intact) with a null context -- text mode must say WHY the
+    # context is unavailable instead of printing a bare "<unknown>".
+    from bn.formatters import _render_callsites_text
+    value = {"items": [{
+        "callee": {"name": "target_fn", "address": "0x461746"},
+        "containing_function": {"name": "caller_fn", "address": "0x412470"},
+        "call_addr": "0x4124a6", "caller_static": "0x4124ab",
+        "call_instruction": None, "disasm_context_reason": "no_structured_disasm_entry",
+        "previous_instructions": [], "next_instructions": [],
+    }], "total": 1, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "> unavailable (no_structured_disasm_entry)" in out
+    assert "<unknown>" not in out
+
+
+def test_render_callsites_flags_an_incomplete_caller_scan():
+    # #816: a partial caller ENUMERATION makes the rows a lower bound, not the
+    # whole set -- text mode must name the reason, or a short caller list reads
+    # as the complete answer.
+    from bn.formatters import _render_callsites_text
+    note = (
+        "call scan stopped at its budget (256 functions / 4096 LLIL instructions "
+        "examined); the caller list may be incomplete"
+    )
+    value = {
+        "items": [{
+            "callee": {"name": "target_fn", "address": "0x461746"},
+            "containing_function": {"name": "caller_fn", "address": "0x412470"},
+            "call_addr": "0x4124a6", "caller_static": "0x4124ab",
+            "call_instruction": {"address": "0x4124a6", "text": "call target_fn"},
+            "previous_instructions": [], "next_instructions": [],
+            "disasm_context_reason": None,
+        }],
+        "total": None, "total_lower_bound": 1, "has_more": False,
+        "scan_truncated": False, "caller_scan_truncated": True,
+        "callers_scanned": 1, "caller_total": None, "caller_scan_note": note,
+    }
+    out = _render_callsites_text(value)
+    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "note: the caller scan was incomplete" in out
+    assert note in out
+
+
 def _callsite_row(call_addr: str) -> dict:
     return {
         "callee": {"name": "rotl8", "address": "0x401156"},
@@ -4151,13 +4197,13 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 599 read keys
+    """The soft-degrade half of #619, kind-free, so it covers all 601 read keys
     rather than the 200 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4792.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4808.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4176,7 +4222,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4792, f"the raise sweep ran {swept} renders, not 4792"
+    assert swept == 4808, f"the raise sweep ran {swept} renders, not 4808"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4325,7 +4371,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1398, f"the mirror ran {checked} renders, not 1398"
+    assert checked == 1402, f"the mirror ran {checked} renders, not 1402"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
