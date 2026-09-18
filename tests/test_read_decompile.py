@@ -3411,6 +3411,39 @@ def test_cfg_a_block_that_cannot_answer_the_probe_claims_neither_682(monkeypatch
     assert "undetermined_edges" not in result["blocks"][0]
 
 
+
+def test_cfg_a_probe_that_raises_claims_neither_682(monkeypatch):
+    # #889b review: the comment promises "absent OR raising" is indeterminate,
+    # but only the ABSENT variant drove the except path -- the raising half of
+    # a defensive read was unexercised. The whole fix hinges on reading BN's
+    # answer defensively, so the path that exists for a throwing probe needs a
+    # probe that throws.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "hostile", "void hostile(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+
+    # A plain `__get__`-only class is a NON-data descriptor, so the instance
+    # attribute `__init__` sets would shadow it and the probe would never
+    # raise -- a vacuous test that passes against code with no except clause
+    # at all. Use a subclass whose property really raises, on an instance
+    # that has no shadowing entry in its __dict__.
+    class _HostileBlock(type(blk)):
+        @property
+        def has_undetermined_outgoing_edges(self):
+            raise RuntimeError("core refused the undetermined-edges query")
+
+    blk.__class__ = _HostileBlock
+    del blk.__dict__["has_undetermined_outgoing_edges"]
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "hostile", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
+
+
 def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
     # THE load-bearing contract for bn-lens: one assembly instruction can expand
     # to several IL blocks whose first lines share the SAME address, so block

@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import io
 import json
+import os
 import socket
 import sys
 import threading
@@ -2866,6 +2867,69 @@ def test_serialize_error_keeps_user_facing_messages_clean(monkeypatch):
     assert bridge._serialize_error(value_error) == "Unknown operation: bogus"
 
 
+def _raise_from_a_library_file(exc):
+    """Raise *exc* from a module written OUTSIDE the project tree, so the
+    deepest traceback frame belongs to a 'library' for attribution purposes.
+    Built as a real importable file because that is the only way to get a
+    genuine foreign code object -- a lambda defined here is project code."""
+    import importlib.util
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "pretend_library.py")
+        with open(path, "w") as fh:
+            fh.write("def boom(exc):\n    raise exc\n")
+        spec = importlib.util.spec_from_file_location("pretend_library", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.boom(exc)
+
+
+def test_serialize_error_triages_a_library_runtime_error_825(monkeypatch):
+    # #825 item 1: RuntimeError/ValueError are on the user-facing whitelist
+    # because the bridge raises them DELIBERATELY (77 and 16 sites), so a
+    # LIBRARY RuntimeError inherited the same trust and was relayed verbatim
+    # -- reading exactly like a message the bridge composed for the user.
+    # Membership is necessary but not sufficient; origin decides.
+    bridge = _load_bridge(monkeypatch)
+
+    for exc in (RuntimeError("dictionary changed size during iteration"),
+                ValueError("invalid literal for int()")):
+        try:
+            _raise_from_a_library_file(exc)
+        except Exception as raised:  # noqa: BLE001
+            rendered = bridge._serialize_error(raised)
+        assert rendered.startswith("internal error: "), rendered
+        assert type(exc).__name__ in rendered
+
+
+def test_serialize_error_keeps_a_bridge_raised_runtime_error_clean_825(monkeypatch):
+    # THE must-not-fire twin, and the one that matters: 93 deliberate raise
+    # sites report bad input and missing targets this way. Prefixing those
+    # would stamp `internal error:` on every "Function not found".
+    bridge = _load_bridge(monkeypatch)
+    from bn_agent_bridge import _shared
+
+    try:
+        _shared._parse_address("not-an-address")   # raises inside the package
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert not rendered.startswith("internal error"), rendered
+    assert "not a valid address" in rendered
+
+
+def test_serialize_error_never_triages_an_operation_failure_825(monkeypatch):
+    # OperationFailure is exempt from the origin test: the bridge is the only
+    # thing that constructs one, so its origin is never in doubt even when it
+    # is re-raised through library code.
+    bridge = _load_bridge(monkeypatch)
+    failure = bridge.OperationFailure("unsupported", "Symbol not found: bar")
+    try:
+        _raise_from_a_library_file(failure)
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert rendered == "Symbol not found: bar"
+
+
 def test_dispatch_error_discloses_prototype_user_type_residue(monkeypatch):
     """#630 round 3, FINDING 2: when a mutation raises AFTER pinning an unclearable
     has_user_type override, the serialized error RESPONSE must DISCLOSE the residue
@@ -2904,14 +2968,24 @@ def test_dispatch_error_without_residue_has_no_disclosure(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
+    # #825 item 1: the double must raise the way a REAL handler does -- from
+    # inside the package -- or its RuntimeError is (correctly) attributed to
+    # a library and triaged with an `internal error:` prefix. A bare `raise`
+    # in this file cannot express "the bridge composed this message", so it
+    # would be pinning the wrong classification. Delegating to a genuine
+    # bridge raise is also simply a better double: this is what every real
+    # handler does when it rejects input.
+    from bn_agent_bridge import _shared
+    user_facing = "'nope' is not a valid address; expected a decimal or 0x-prefixed hex value"
+
     def _boom(op, params, target):
-        raise RuntimeError("Function not found: foo")
+        _shared._parse_address("nope")
 
     monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
 
     resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
     assert resp["ok"] is False
-    assert resp["error"] == "Function not found: foo"
+    assert resp["error"] == user_facing
     assert resp["result"] is None
 
 

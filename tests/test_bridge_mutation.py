@@ -715,8 +715,16 @@ def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     me = bridge.mutation_engine
 
+    # #825 item 1: raise the way a REAL handler does -- through bridge code.
+    # A bare `raise` in this file is attributed to a library and correctly
+    # triaged with an `internal error:` prefix, so it could no longer stand
+    # in for the handler this test is about. Delegating to a genuine bridge
+    # rejection is what an actual `_op_*` does on bad input.
+    from bn_agent_bridge import _shared
+    user_facing = "'ghost' is not a valid address; expected a decimal or 0x-prefixed hex value"
+
     def boom_user(ctx, bv, op):
-        raise RuntimeError("Function not found: ghost")
+        _shared._parse_address("ghost")
 
     monkeypatch.setattr(me, "_op_set_comment", boom_user)
     bv = _FakeBV()
@@ -725,8 +733,9 @@ def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
         instance._apply_operation(bv, {"op": "set_comment", "comment": "x", "function": "ghost"})
 
     assert excinfo.value.status == "unsupported"
-    assert excinfo.value.message == "Function not found: ghost"
-    assert "RuntimeError" not in excinfo.value.message
+    assert excinfo.value.message == user_facing
+    assert "ValueError" not in excinfo.value.message
+    assert "internal error" not in excinfo.value.message
 
 
 def test_apply_operation_unexpected_error_gets_internal_error_status(monkeypatch):
