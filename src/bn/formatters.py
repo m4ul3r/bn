@@ -2058,6 +2058,47 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     return ""
 
 
+def _duplicate_starts_note(value: Any) -> str:
+    """The #757 duplicate-start counts for the TEXT face, or "" (#883 item 4).
+
+    `duplicate_starts_collapsed` / `duplicate_starts_unresolved` reached JSON on
+    every surface and no text renderer, so a text-mode reader was shown
+    `Total functions: 15` with nothing saying a start address had carried more
+    than one record. Both keys are published ONLY when the collapse actually
+    happened (`read_listing._disclose_collapsed_starts` omits a zero), so this
+    line appears exactly when it is true and a clean view renders byte-for-byte
+    as it did before -- no alarm to explain away.
+
+    The wording states WHOLE ADDRESSES, which is what the keys count:
+    `collapsed` is the number of start addresses whose records were merged (the
+    larger extent kept) -- NOT a number of dropped records, which the payload
+    never states -- and `unresolved` the addresses left carrying more than one
+    record because an extent could not be read, so no record could be chosen.
+    Both counts are read through `_count_field`, so an unreadable one states no
+    number (the enclosing boundary's `! malformed ...` note is what discloses
+    that the key was there) -- pinned by
+    `test_function_list_text_discloses_the_duplicate_start_collapse_883`.
+    """
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    collapsed = _count_field(value, "duplicate_starts_collapsed")
+    if collapsed:
+        parts.append(
+            f"{collapsed} start address(es) carried duplicate function records "
+            "-- the larger extent was kept"
+        )
+    unresolved = _count_field(value, "duplicate_starts_unresolved")
+    if unresolved:
+        parts.append(
+            f"{unresolved} start address(es) left with duplicate records "
+            "(an extent was unreadable, so none was dropped)"
+        )
+    if not parts:
+        return ""
+    return "// duplicate starts: " + "; ".join(parts)
+
+
 @_discloses
 def _render_function_count_text(value: Any, *, label: str = "Total functions",
                                 what: str = "function list/count") -> str:
@@ -2073,7 +2114,13 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     "Total functions: 175" read as a contradiction rather than as matches vs total.
     """
     count = value.get("count", 0) if isinstance(value, dict) else 0
-    return f"{_quick_partial_prefix(value, what)}{label}: {count}"
+    line = f"{_quick_partial_prefix(value, what)}{label}: {count}"
+    # #883 item 4: the count IS the post-collapse count (#757), so the collapse
+    # has to be visible beside it in text too -- "Total functions: 15" with no
+    # trace of the 16th record is the JSON-only disclosure the text face was
+    # missing. Absent keys add nothing.
+    note = _duplicate_starts_note(value)
+    return line if not note else f"{line}\n{note}"
 
 
 @_discloses
@@ -2085,8 +2132,16 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     demangled display_name (#196). A quick-loaded (partial) listing is prefixed
     with a warning so the page isn't mistaken for the whole binary (#437)."""
     page_key = "items" if _field_declared(value, "items") else "functions"
-    return _quick_partial_prefix(value) + _render_paged_list_text(
+    body = _quick_partial_prefix(value) + _render_paged_list_text(
         value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
+    # The #757 collapse counts ride the ENVELOPE, not a row, so the note survives
+    # `--offset`/`--limit` slicing and sits after the paging footer -- the same
+    # placement `_render_name_address_list_text` gives `self_defined_excluded`
+    # (#883 item 4).
+    note = _duplicate_starts_note(value)
+    if not note:
+        return body
+    return note if body == "none" else f"{body}\n{note}"
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
