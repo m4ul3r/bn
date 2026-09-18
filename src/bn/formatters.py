@@ -5018,11 +5018,12 @@ def _mutation_summary(value: Any) -> Any:
     Derives the shared builder's inputs from `results[]` (#685)."""
     if not isinstance(value, dict):
         return value
-    # Idempotent: `_call` evaluates `spill_status` against the ALREADY-transformed
-    # result, so on the compact path this runs on its own output. Without this
-    # guard the second pass sees no `results` and re-zeroes every count -- today
-    # only wasted work (a ~200-byte summary never crosses the spill threshold),
-    # but a spilled mutation would print an all-zero status.
+    # Idempotent on its own output, which the CLI no longer requires: `_call`
+    # evaluates `spill_status` against the RAW result (#693 item 4), and every
+    # other caller here hands this function a fresh bridge payload. The guard
+    # stays for a DIRECT double application -- without it the second pass sees no
+    # `results` and re-zeroes every count -- and is pinned by
+    # `test_mutation_summary_transforms_are_idempotent`.
     if value.get("kind") == "mutation_summary":
         return value
     # Read inside a NESTED capture so this transform can tell an UNREADABLE

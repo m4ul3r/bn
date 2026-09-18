@@ -513,6 +513,54 @@ def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
     assert "4 would rename" not in failed_preview, failed_preview
 
 
+def test_a_non_idempotent_summary_transform_is_applied_once_per_call(
+        monkeypatch, capsys):
+    """#693 item 4: `_call` built the spill status from the ALREADY-transformed
+    result, which silently made every summary transform a two-pass requirement --
+    a requirement nothing enforced, whose failure mode was invisible until a
+    mutation SPILLED, and then printed the transform's SECOND-pass value as the
+    status an agent reads.
+
+    `spill_status` is now evaluated against the raw bridge result, so idempotence
+    is not required of a transform at all. This cell drives a deliberately
+    non-idempotent one: the status must carry its FIRST-pass value, and the
+    transform must never have been handed its own output."""
+    calls: list[object] = []
+
+    def non_idempotent(result):
+        calls.append(result)
+        if isinstance(result, dict) and "passes" in result:
+            return {"kind": "mutation_summary", "measured": True,
+                    "passes": result["passes"] + 1}
+        return {"kind": "mutation_summary", "measured": True, "passes": 1}
+
+    payload = {"success": True, "committed": True, "rolled_back": False,
+               "results": [{"op": "rename_symbol", "status": "verified"}],
+               # Big enough that the status path is really taken.
+               "affected_functions": [{"name": "sub_401000"}] * 40}
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kwargs: {"ok": True, "result": dict(payload)})
+    # A spill is the ONLY path that PRINTS the status, and the defect only became
+    # visible there.
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    args = bn.cli.build_parser().parse_args(
+        ["symbol", "rename", "--target", "active", "--summary", "--format", "json",
+         "sub_401000", "player_update"])
+
+    rc = bn.cli._mutate(args, "rename_symbol", {}, stem="probe",
+                        summary_transform=non_idempotent)
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    assert "full mutation detail" in captured.err, captured.err   # it really spilled
+    status = json.loads(captured.out)
+    assert status["passes"] == 1, status
+    assert status["detail_artifact_path"], status
+    # Anti-vacuity for the mechanism: the transform was handed the bridge's
+    # payload every time, never the summary it produced.
+    assert calls and all("passes" not in call for call in calls), calls
+
+
 def test_go_rename_default_text_reports_real_counts(fake_transport, capsys):
     # End-to-end through the CLI: the DEFAULT (compact) render must not zero out.
     fake_transport({"go_rename": {"ok": True, "result": {
