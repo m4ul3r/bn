@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from _bridge_fakes import _FakeBV, _FakeFunction, _FakeBasicBlock
 
+#: The first id a fresh view's tag counter hands out ('fa5e' marks it as a fake).
+_FIRST_TAG_ID = "0000fa5e-0000-0000-0000-000000000001"
+_SECOND_TAG_ID = "0000fa5e-0000-0000-0000-000000000002"
+
 
 def _bv_with_fn():
     fn = _FakeFunction(0x1000, "sub_1000")
@@ -44,3 +48,39 @@ def test_fake_function_tag_and_address_tag_roundtrip():
     at = fn.get_tags_at(0x1010)[0]
     fn.remove_user_address_tag(0x1010, at)
     assert fn.get_tags_at(0x1010) == []
+
+
+def test_tag_ids_are_per_view_not_per_session():
+    """#786: an absolute tag id must depend on the view the test built and nothing
+    else. With one module-global counter, a view's first tag id was a function of
+    how many tags every earlier test in the session (and, under -n, this worker's
+    share of them) had created -- the id drifted with suite order and with worker
+    assignment. A per-view counter makes the first tag on ANY fresh view the
+    counter's first id, whatever ran before it."""
+    first_bv, _ = _bv_with_fn()
+    first_bv.create_tag_type("Library", "L")
+
+    other_bv, _ = _bv_with_fn()
+    other_bv.create_tag_type("Library", "L")
+    other_bv.add_tag(0x2000, "Library", "burn ids on another view")
+
+    tag = first_bv.add_tag(0x2000, "Library", "libc")
+    assert tag.id == _FIRST_TAG_ID
+    assert other_bv.get_tags_at(0x2000)[0].id == _FIRST_TAG_ID
+
+
+def test_function_and_data_tags_share_the_view_id_space():
+    """A function tag and a data tag on one view are a single id space (as they
+    are in real BN), and two views never share one."""
+    bv, fn = _bv_with_fn()
+    bv.create_tag_type("Important", "!")
+    fn.add_tag("Important", "whole fn", None)
+    bv.add_tag(0x2000, "Important", "global")
+    assert [fn.get_function_tags()[0].id, bv.get_tags_at(0x2000)[0].id] == [
+        _FIRST_TAG_ID, _SECOND_TAG_ID,
+    ]
+
+    second_bv, second_fn = _bv_with_fn()
+    second_bv.create_tag_type("Important", "!")
+    second_fn.add_tag("Important", "whole fn", None)
+    assert second_fn.get_function_tags()[0].id == _FIRST_TAG_ID

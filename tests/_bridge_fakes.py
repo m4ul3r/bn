@@ -440,7 +440,10 @@ class _FakeFunction:
 
     def add_tag(self, tag_type, data, addr=None, auto=False, arch=None):
         tt = self.view.get_tag_type(str(tag_type))
-        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        # The VIEW's id source, not a module-level one (#786): a function tag and
+        # a data tag on the same view are one id space, as they are in real BN,
+        # while ids stay independent of every other view in the run.
+        tag = _FakeTag(tt, str(data), self.view._tag_ids.next())
         if addr is None:
             self._function_tags.append(tag)
         else:
@@ -666,18 +669,21 @@ class _FakeReloc:
 class _TagIdCounter:
     """Deterministic tag-id source. Emits valid UUID strings (real BN tag ids are
     UUIDs, and `_op_tag_remove` now rejects a non-UUID `--id`) that are still
-    stable/predictable per run -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
+    stable/predictable -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
     The 'fa5e' marker keeps them recognizable as fakes and clear of the all-zeros
-    UUID a test may use for the well-formed-but-nonexistent case."""
+    UUID a test may use for the well-formed-but-nonexistent case.
+
+    ONE counter PER VIEW (#786), never a module-level one: an absolute id is then
+    a function of the view the test built and nothing else, so it cannot drift with
+    how many tags earlier tests in the session created nor with which xdist worker
+    ran this one -- the two ways a suite-order-dependent id shows up as a flake.
+    """
     def __init__(self):
         self._n = 0
 
     def next(self) -> str:
         self._n += 1
         return f"0000fa5e-0000-0000-0000-{self._n:012d}"
-
-
-_TAG_IDS = _TagIdCounter()
 
 
 class _FakeTagType:
@@ -770,6 +776,9 @@ class _FakeBV:
         # tag state: {name: _FakeTagType}, data/address tags {addr: [_FakeTag]}
         self._tag_types: dict[str, _FakeTagType] = {}
         self._data_tags: dict[int, list[_FakeTag]] = {}
+        # This view's own tag-id source (#786); `_FakeFunction.add_tag` draws from
+        # it too, so absolute ids depend on this view alone.
+        self._tag_ids = _TagIdCounter()
         # {address: _FakeDataVariable} -- mirrors bv.data_vars' mapping shape.
         self.data_vars = dict(data_vars or {})
 
@@ -1011,7 +1020,7 @@ class _FakeBV:
 
     def add_tag(self, addr, tag_type_name, data, user=True):
         tt = self._tag_types[str(tag_type_name)]  # KeyError if unknown -> handler validates first
-        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        tag = _FakeTag(tt, str(data), self._tag_ids.next())
         self._data_tags.setdefault(int(addr), []).append(tag)
         return tag
 
