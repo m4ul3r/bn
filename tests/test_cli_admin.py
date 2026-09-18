@@ -780,7 +780,7 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
         bn.cli,
         "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_name": "bn_agent_bridge",
@@ -825,7 +825,7 @@ def test_doctor_flags_stale_engine(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {"ok": True, "result": {
+        lambda instance, op, params=None, target=None, **_kwargs: {"ok": True, "result": {
             "plugin_name": "bn_agent_bridge", "plugin_version": bn.cli.VERSION,
             "plugin_build_id": bn.cli.build_id_for_file(install_dir / "bridge.py"),
             # Loaded engine fingerprint differs from on-disk -> stale_engine.
@@ -1097,7 +1097,7 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
         bn.cli,
         "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_name": "bn_agent_bridge",
@@ -1140,7 +1140,7 @@ def test_doctor_names_engine_version(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_version": bn.cli.VERSION, "plugin_build_id": "b",
@@ -1182,7 +1182,7 @@ def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
 
-    def fake_send(instance, op, params=None, target=None):
+    def fake_send(instance, op, params=None, target=None, **_kwargs):
         if instance is ok_inst:
             return {"ok": True, "result": {
                 "plugin_version": bn.cli.VERSION, "plugin_build_id": "b", "targets": []}}

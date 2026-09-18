@@ -69,6 +69,44 @@ def test_leave_request_decrements_and_stamps_activity(monkeypatch):
     assert inst._last_activity > 0.0  # stamped AFTER the request completes
 
 
+def test_a_declared_liveness_probe_cannot_postpone_the_reap_756(monkeypatch):
+    """#756: `_leave_request` stamped the idle clock for EVERY request, and
+    `bn session list` / `bn doctor` issue a real per-instance probe. That traffic
+    belongs to whichever agent ran the command, not to this bridge's owner, so on
+    a host with several agents their routine discovery postponed an orphaned
+    armed bridge's crash fallback indefinitely (measured: an 8s arm died at
+    t+16.1s after one peer listing at t+7.0s, and a 25s arm was still alive at
+    +89s).
+
+    A request that declares itself a liveness probe still counts as in-flight --
+    so it can never be reaped mid-response -- but does not restart the window."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+
+    inst._enter_request()
+    assert inst._inflight == 1
+    # In flight: the reaper must not fire even for a probe.
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is False
+    inst._leave_request(stamp_activity=False)
+
+    assert inst._inflight == 0
+    assert inst._last_activity == 100.0          # window NOT restarted
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is True
+
+
+def test_ordinary_work_still_stamps_the_idle_clock_756(monkeypatch):
+    """The other half of #756: only a DECLARED probe is exempt. Any ordinary
+    request -- including the owner's own `bn target list`, which issues the same
+    `list_targets` op the peer probe does -- keeps the bridge alive."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._enter_request()
+    inst._leave_request()
+
+    assert inst._last_activity > 100.0
+    assert inst._try_idle_shutdown(now=inst._last_activity + 1.0, timeout=30.0) is False
+
+
 # --------------------------------------------------------------------------
 # Idle decision + atomic shutdown latch
 # --------------------------------------------------------------------------

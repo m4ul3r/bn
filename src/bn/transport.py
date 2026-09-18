@@ -1313,6 +1313,7 @@ def _send_request_to_instance(
     default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
     resolved: bool = False,
+    idle_probe: bool = False,
 ) -> dict[str, Any]:
     process_state = _process_state(instance.pid)
     if process_state in {"T", "t"}:
@@ -1363,6 +1364,11 @@ def _send_request_to_instance(
     }
     if target is not None:
         payload["target"] = target
+    # #756: declare a pure liveness/status probe so the bridge counts it as
+    # in-flight but does not restart its idle window. Only set when true, so
+    # every ordinary request's envelope is byte-for-byte unchanged.
+    if idle_probe:
+        payload["idle_probe"] = True
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
     # BN_REQUEST_TIMEOUT is one end-to-end budget, applied exactly once. A caller
@@ -1776,6 +1782,7 @@ def send_request(
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
     resolved: bool = False,
+    idle_probe: bool = False,
 ) -> dict[str, Any]:
     # Validate/resolve the timeout BEFORE choosing an instance: choose_instance()
     # auto-spawns a headless bridge when none is running, so a bad
@@ -1816,4 +1823,5 @@ def send_request(
         default_timeout=default_timeout,
         connect_retries=connect_retries,
         resolved=True,
+        idle_probe=idle_probe,
     )

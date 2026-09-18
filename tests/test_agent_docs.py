@@ -366,7 +366,7 @@ def test_cli_read_and_mutation_failure_boundaries(monkeypatch, tmp_path):
 
     live, dead, stale = instance(1, "live"), instance(2, "dead"), instance(3, "stale")
 
-    def reply(inst, op, params=None, target=None):
+    def reply(inst, op, params=None, target=None, **_kwargs):
         if inst is dead:
             raise OSError("connection refused")
         version = "0.0.0-ancient" if inst is stale else bn.cli.VERSION

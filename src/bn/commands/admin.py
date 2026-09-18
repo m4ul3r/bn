@@ -152,6 +152,10 @@ def _doctor(args: argparse.Namespace) -> int:
                 "doctor",
                 params={},
                 target=None,
+                # #756: a diagnostic status ping, issued by whichever agent ran
+                # `bn doctor` -- never evidence that this bridge's own owner is
+                # still alive, so it must not restart the idle window.
+                idle_probe=True,
             )
             ping = unwrap_result(response, "doctor")
         except Exception as exc:
@@ -1169,6 +1173,10 @@ def _probe_one_instance(entry: dict[str, Any], deadline: float) -> None:
                 instance_id=selector,
                 timeout=remaining,
                 resolved=True,
+                # #756: `session list`'s safety probe runs against every live
+                # instance on the host, so stamping it let one agent's listing
+                # keep another agent's orphaned bridge alive past its interval.
+                idle_probe=True,
             ),
             "list_targets",
         )
