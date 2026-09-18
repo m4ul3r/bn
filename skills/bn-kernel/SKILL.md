@@ -120,9 +120,18 @@ idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
 seconds arms headless idle shutdown; the agent-owned spawn above uses `3600`
 (one hour). A deliberate alternative timeout must be positive; never use `0`,
 `none`, or `off` for an agent-owned bridge. With it enabled, the reaper starts
-after preload, resets after completed requests, and never fires during an
-in-flight request or active load job. Only an enabled reaper provides the
-fallback after the owning agent/process dies; it does not replace normal cleanup.
+after preload, resets after completed **work**, and never fires during an
+in-flight request or active load job. Discovery is not work: `bn session list`
+and `bn doctor` issue a real per-instance request, and that traffic belongs to
+whoever ran the command rather than to the bridge's owner, so both declare
+themselves liveness probes and do **not** restart the window (they are still
+counted in flight, so a probe can never be reaped mid-response). The
+distinction is the caller's declared intent, not the op: your own
+`bn target list` issues the same `list_targets` and does keep the bridge alive.
+Without that exemption, one agent's routine listing kept another agent's
+orphaned bridge alive indefinitely -- which is the whole point of the next
+sentence. Only an enabled reaper provides the fallback after the owning
+agent/process dies; it does not replace normal cleanup.
 
 On every reachable exit, close only the exact selector returned by the bridge
 when a target opened. Never infer it from a path or basename; a basename is valid

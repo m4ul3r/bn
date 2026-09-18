@@ -2316,6 +2316,63 @@ def test_session_list_probes_a_gui_bridge_by_its_selector(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["items"][0]["unsaved_targets"] == 1
 
 
+def test_the_two_peer_probes_declare_themselves_as_probes_756(monkeypatch, capsys, tmp_path):
+    """#859 review: deleting either `idle_probe=True` declaration left the suite
+    green, so the CLI half of the contract was untested. This records the FULL
+    kwarg set at both declaring sites -- the #787 direction -- and pins it.
+
+    `session list` and `doctor` are the two commands that issue a real
+    per-instance request purely to answer "is this bridge alive / would closing
+    it discard work". That traffic belongs to whoever ran the command, never to
+    the bridge's owner, so both must declare `idle_probe=True`. An ordinary
+    command must NOT: `bn target list` issues the same `list_targets` op as the
+    peer probe, and it is real work that keeps the bridge alive."""
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    inst = BridgeInstance(
+        pid=222, socket_path=_P("/tmp/p.sock"), registry_path=_P("/tmp/p.json"),
+        plugin_name="bn_agent_bridge", plugin_version=bn.cli.VERSION,
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="probe-me")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: tmp_path)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: tmp_path)
+    sent: list[dict] = []
+
+    def record_send_request(op, **kwargs):
+        sent.append({"op": op, **kwargs})
+        return {"ok": True, "result": [{"selector": "netsvcd", "unsaved": True}]}
+
+    def record_to_instance(instance, op, **kwargs):
+        sent.append({"op": op, **kwargs})
+        return {"ok": True, "result": {
+            "plugin_version": bn.cli.VERSION, "plugin_build_id": "b", "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", record_send_request)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", record_to_instance)
+
+    assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+    bn.cli.main(["doctor", "--format", "json"])
+    bn.cli.main(["target", "list", "--format", "json", "-i", "probe-me"])
+    capsys.readouterr()
+
+    by_op: dict[str, list[dict]] = {}
+    for call in sent:
+        by_op.setdefault(call["op"], []).append(call)
+
+    # The two peer probes: declared, explicitly True (not merely truthy).
+    probes = [c for c in by_op["list_targets"] if c.get("strict") or c.get("params") == {"strict": True}]
+    assert probes, f"session list issued no strict list_targets probe: {sent}"
+    assert all(c.get("idle_probe") is True for c in probes), probes
+    assert all(c.get("idle_probe") is True for c in by_op["doctor"]), by_op["doctor"]
+
+    # Ordinary work: `bn target list` is the SAME op and must not be exempt.
+    ordinary = [c for c in by_op["list_targets"] if c not in probes]
+    assert ordinary, f"target list issued no plain list_targets: {sent}"
+    assert all(c.get("idle_probe") in (False, None) for c in ordinary), ordinary
+
+
 def test_session_list_probes_instances_concurrently(monkeypatch, capsys):
     """A fleet triage must not pay one probe budget per bridge: a serial sweep
     of a wedged fleet is exactly the "one wedged bridge blocks the survey" the
