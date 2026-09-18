@@ -660,6 +660,68 @@ def test_cli_layout_names_every_top_level_module():
     )
 
 
+# The Conventions bullet documents the handler names an agent greps for, and its
+# one naming exception: `help` is the CLI's own index of the command tree, so its
+# handler is named for what it prints rather than for the verb it is registered
+# under. Asserted live below, so the exception cannot outlive a rename: the
+# registry is the ground truth, and an exemption is only true while it has a
+# subject.
+TOP_LEVEL_HANDLER_NAME_EXCEPTIONS = {"help": "_help_index"}
+
+
+def _registered_handler_names() -> dict[str, str]:
+    """Registered command path -> handler function name, from the live registry.
+
+    Importing `bn.commands` is what POPULATES `_COMMANDS` -- the `@command`
+    decorators run at import -- so the registry is empty without it and a sweep
+    over it would check nothing.
+    """
+    import bn.cli
+
+    import bn.commands  # noqa: F401 -- importing the package registers its commands
+
+    return {
+        " ".join(spec["path"]): spec["handler"].__name__ for spec in bn.cli._COMMANDS
+    }
+
+
+def test_command_handlers_follow_the_documented_naming_convention():
+    """The Conventions bullet names the handler of each command, so a handler
+    that does not follow it is an agent's grep for the implementation coming
+    back empty.
+
+    Derived from the registry rather than from the source: the rule is
+    `_<group>_<subcommand>` for a grouped command and the bare verb for a
+    top-level one, with the two exemptions the same bullet states -- `help`,
+    and an alias, which the registry proves for itself by giving one function
+    two paths.
+    """
+    handlers = _registered_handler_names()
+    assert handlers, "the @command registry is empty, so nothing was checked"
+    paths_by_handler: dict[str, set[str]] = {}
+    for path, name in handlers.items():
+        paths_by_handler.setdefault(name, set()).add(path)
+    violations = []
+    for path, name in sorted(handlers.items()):
+        expected = "_" + "_".join(word.replace("-", "_") for word in path.split())
+        if name == expected:
+            continue
+        if len(paths_by_handler[name]) > 1:  # an alias: `rename` -> `_symbol_rename`
+            continue
+        if TOP_LEVEL_HANDLER_NAME_EXCEPTIONS.get(path) == name:
+            continue
+        violations.append(f"{path!r} -> {name!r}, expected {expected!r}")
+    assert not violations, (
+        "CLAUDE.md's Conventions list documents the handler name for a command "
+        f"path; these registered commands break that rule: {violations}"
+    )
+    for path, name in TOP_LEVEL_HANDLER_NAME_EXCEPTIONS.items():
+        assert handlers.get(path) == name, (
+            f"the documented naming exception {path!r} -> {name!r} is stale: the "
+            f"registry has {handlers.get(path)!r}"
+        )
+
+
 # The lock class is declared at the `@op` decorator, so the declarations are the
 # ground truth for what `lock="none"` actually covers.
 _NONE_LOCK_OP = re.compile(r'@op\(\s*"([^"]+)"\s*,\s*lock="none"')
