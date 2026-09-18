@@ -269,15 +269,41 @@ def test_list_functions_named_filter_pages_without_building_the_rest(monkeypatch
 # left the row with no readable context on the JSON surface: `bn decompile
 # <caller>` plainly renders the call, yet nothing in the row said so. The row now
 # carries a bounded decompiled excerpt around the callsite.
+#
+# The render is in CONTROL-FLOW order, not address order (#792 review): a real
+# pseudo-C body emits switch cases out of sequence and puts the FUNCTION START on
+# the closing brace, so a body whose LINES happen to be address-sorted is a straw
+# fixture -- it cannot catch an anchor rule that assumes monotonic addresses. Every
+# fixture below therefore places the callsite line before an epilogue and ends with
+# a brace carrying the function-entry address.
+
+def _control_flow_batches(call_addr: int) -> list[tuple[int, str]]:
+    """The repro's render shape: out-of-order addresses, a callsite line, a body
+    tail, an epilogue, and a closing brace that carries the FUNCTION START."""
+    return [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),        # header @ func start
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),                     # control flow, not address order
+        (0x500050, "        send_ack(fd);"),
+        (call_addr, "    send_status(fd, &buf);"),             # the callsite, exact address
+        (0x5000b8, "    if (buf == 0) {"),
+        (0x5000c0, "        goto out;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),                 # epilogue
+        (0x5000e8, "    no return;"),
+        (0x500000, "}"),                                       # closing brace @ func start
+    ]
+
 
 def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch):
     bridge = _load_bridge(monkeypatch)
-    call_addr = 0x500010
-    local_addr = 0x500014
+    call_addr = 0x5000b0
     callee = _FakeFunction(0x5a10, "send_status")
     caller = _FakeFunction(0x500000, "handle_reply")
-    caller.basic_blocks = [_FakeBasicBlock(call_addr, local_addr + 4)]
-    caller.arch = _FakeArch(lengths={call_addr: 4, local_addr: 4})
+    caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+    caller.arch = _FakeArch(lengths={call_addr: 4})
     block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock", address=call_addr,
                                  expr_index=9, instr_index=9)
     # A statement whose rendered text is a whole-function-sized blob: the
@@ -286,44 +312,104 @@ def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch)
     blob = _FakeHLILInstruction("send_status(\n" + "x" * 300 + "\n)",
                                 class_name="HighLevelILCall", parent=block,
                                 address=call_addr, expr_index=11, instr_index=11)
-    local_call = _FakeHLILInstruction("send_status(fd, &buf)", class_name="HighLevelILCall",
-                                      parent=block, address=local_addr,
-                                      expr_index=21, instr_index=21)
     caller.low_level_il = [[
         _FakeLLILInstruction(call_addr, _FakeConstPtr(0x5a10), hlils=[blob]),
-        _FakeLLILInstruction(local_addr, _FakeConstPtr(0x5a10), hlils=[local_call]),
     ]]
     bv = _FakeBV(
         functions=[callee, caller],
-        disassembly={call_addr: "bl 0x5a10", local_addr: "bl 0x5a10"},
-        instruction_lengths={call_addr: 4, local_addr: 4},
+        disassembly={call_addr: "bl 0x5a10"},
+        instruction_lengths={call_addr: 4},
     )
-    _install_fake_pseudo_c(monkeypatch, bridge, caller, [[
-        (0x500000, "int32_t handle_reply(int32_t fd)"),
-        (0x500004, "{"),
-        (0x500008, "    uint8_t buf[32];"),
-        (0x50000c, "    prepare(&buf);"),
-        (call_addr, "    send_status(fd, &buf);"),
-        (local_addr, "    send_ack(fd);"),
-        (0x500018, "    return 0;"),
-        (0x50001c, "}"),
-    ]])
+    _install_fake_pseudo_c(monkeypatch, bridge, caller, [_control_flow_batches(call_addr)])
 
     rows = bridge.read_listing._callsites_within_function(None, bv, callee, caller, context=1)
-    by_addr = {row["call_addr"]: row for row in rows}
 
-    failed = by_addr[hex(call_addr)]
-    assert failed["hlil_statement"] is None
-    assert failed["hlil_statement_reason"] == "statement_not_local"
-    excerpt = failed["decompile_excerpt"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["hlil_statement"] is None
+    assert row["hlil_statement_reason"] == "statement_not_local"
+    excerpt = row["decompile_excerpt"]
+    # Exact-address anchoring: the callsite's own line, NOT the trailing brace that
+    # also carries a `<= call_addr` address (the pre-review scan anchored there and
+    # emitted the epilogue).
     assert excerpt["anchor_address"] == hex(call_addr)
     assert excerpt["window"] == 3
     assert any(line.startswith(hex(call_addr)) and "send_status(fd, &buf);" in line
                for line in excerpt["lines"])
-    # The excerpt is a WINDOW around the callsite, not the whole function.
-    assert not any("int32_t handle_reply" in line for line in excerpt["lines"])
+    assert not any("__stack_chk_fail" in line for line in excerpt["lines"])
+    # The function-entry address (header line AND closing brace) stays out of the
+    # window; it is not the callsite.
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
 
-    # Negative control: a localized statement needs no excerpt.
-    resolved = by_addr[hex(local_addr)]
-    assert resolved["hlil_statement"] == "send_status(fd, &buf)"
-    assert "decompile_excerpt" not in resolved
+
+def test_callsite_excerpt_proximity_fallback_never_anchors_on_the_function_entry_792(monkeypatch):
+    """No line carries the callsite address exactly: the window falls back to the
+    nearest guttered line, and the function-ENTRY address is excluded from that
+    contest -- a real render puts it on the closing brace, whose line is last."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),
+        (0x500050, "        prep(fd);"),
+        (0x5000b4, "    if (buf == 0) {"),          # nearest to the callsite below
+        (0x5000c0, "        return -1;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),
+        (0x500000, "}"),                            # closing brace @ func start
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert excerpt["anchor_address"] == "0x5000b4"
+    assert any(line.startswith("0x5000b4") for line in excerpt["lines"])
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
+
+
+def test_callsite_excerpt_without_an_attributable_line_says_so_792(monkeypatch):
+    """Nothing in the render can be attributed to the callsite: the excerpt must
+    say that instead of anchoring on the function's tail."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert "anchor_address" not in excerpt
+    assert excerpt["lines"] == []
+    assert excerpt["reason"] == "statement_not_located"
+
+
+def test_callsite_excerpt_caps_a_long_line_792(monkeypatch):
+    """A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line. Each line is capped (240 chars, the same ceiling
+    `_hlil_text_is_local` refuses) and the capped lines are counted, so a 7-line
+    window cannot become the blob `hlil_statement` deliberately withholds."""
+    bridge = _load_bridge(monkeypatch)
+    text = "    send_status(fd, &buf); /* " + "z" * 583 + " */"
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x5000b0, text),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    capped = [line for line in excerpt["lines"] if "send_status" in line]
+    assert len(capped) == 1
+    assert capped[0].startswith(hex(0x5000b0))
+    assert f"... [+{len(lines[1]) - 240} chars]" in capped[0]
+    assert excerpt["truncated_lines"] == 1
+    assert all(len(line) <= 240 + 40 for line in excerpt["lines"])
+
+
+def _rendered_lines(bridge, monkeypatch, batches):
+    """(lines, gutter addresses) as the callsite excerpt sees them, through the
+    real render + gutter parser rather than a hand-built pair."""
+    func = _FakeFunction(0x500000, "handle_reply")
+    _install_fake_pseudo_c(monkeypatch, bridge, func, [batches])
+    return bridge.read_listing._callsite_decompile_render(_FakeBV(), func)

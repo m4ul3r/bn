@@ -77,6 +77,10 @@ def _callee_variadic_hint(callee) -> dict[str, Any] | None:
 # #792: decompiled lines of context the callsite excerpt carries on either side of
 # the callsite when its HLIL statement cannot be localized.
 _DECOMPILE_EXCERPT_WINDOW = 3
+# #792 review: the per-LINE cap for that window, set to the same 240 characters
+# `il_format._hlil_text_is_local` refuses, so a statement too long to be a local
+# statement cannot reappear in full through the excerpt.
+_EXCERPT_LINE_MAX_CHARS = 240
 
 
 def _callsite_decompile_render(bv, func) -> tuple[list[str], list[int]]:
@@ -102,34 +106,75 @@ def _callsite_decompile_render(bv, func) -> tuple[list[str], list[int]]:
     return lines, addresses
 
 
-def _callsite_decompile_excerpt(render: tuple[list[str], list[int]], call_addr: int) -> dict[str, Any]:
+def _callsite_decompile_excerpt(render: tuple[list[str], list[int]], call_addr: int,
+                                func_start: int) -> dict[str, Any]:
     """A bounded decompiled window around *call_addr* (#792).
 
     When ``hlil_statement`` cannot be localized, the callsite is still readable in
     the decompilation -- this is what ``bn decompile <caller>`` renders, captured
     in-row so an agent need not re-run it and correlate addresses by hand. A row
     that did not carry it offered only disassembly fields for a call the
-    decompiler plainly shows."""
+    decompiler plainly shows.
+
+    The render is in CONTROL-FLOW order, not address order (#792 review): a switch
+    emits its cases out of sequence and the closing brace carries the FUNCTION
+    START, so a positional/scan-order rule anchors on the epilogue. The callsite's
+    own line is found by EXACT address, and only that miss falls back to proximity.
+    """
     lines, addresses = render
     excerpt: dict[str, Any] = {"window": _DECOMPILE_EXCERPT_WINDOW, "lines": []}
     if not lines:
         excerpt["reason"] = "decompile_text_unavailable"
         return excerpt
-    # A statement's gutter address is its FIRST instruction, which can precede the
-    # call (argument setup), so the callsite's own statement is the LAST line at or
-    # before the call address.
-    anchor = next((index for index in range(len(lines) - 1, -1, -1)
-                   if 0 <= addresses[index] <= call_addr), None)
+    # The renderer emits the callsite's statement with the call's own address, so an
+    # exact match IS the callsite and needs no order assumption at all.
+    anchor = next((index for index, address in enumerate(addresses)
+                   if address == call_addr), None)
     if anchor is None:
-        # Nothing at or before the callsite carries an address in this render (a
-        # degraded, header-only body): show the top of it rather than nothing, and
-        # leave `anchor_address` absent rather than naming a line that is not it.
-        anchor = 0
-    else:
-        excerpt["anchor_address"] = hex(addresses[anchor])
+        # No exact hit (the statement's gutter can carry an earlier instruction of
+        # the same statement, or the call sits inside a line keyed elsewhere): fall
+        # back to the numerically nearest guttered line, EXCLUDING the
+        # function-entry address -- a real render puts that on the closing brace,
+        # which in control-flow order is often the LAST line and would otherwise
+        # win every proximity contest. Ties prefer the earlier line, which is the
+        # one a statement's first-instruction key puts before the call.
+        candidates = [index for index, address in enumerate(addresses)
+                      if address >= 0 and address != func_start]
+        if candidates:
+            anchor = min(candidates, key=lambda index: (abs(addresses[index] - call_addr),
+                                                        addresses[index] > call_addr, index))
+    if anchor is None:
+        # Nothing in this render is attributable to the callsite: say so rather
+        # than pointing at the function's tail (#792 review).
+        excerpt["reason"] = "statement_not_located"
+        return excerpt
+    excerpt["anchor_address"] = hex(addresses[anchor])
     window = _DECOMPILE_EXCERPT_WINDOW
-    excerpt["lines"] = lines[max(0, anchor - window):anchor + window + 1]
+    excerpt["lines"] = _cap_excerpt_lines(lines[max(0, anchor - window):anchor + window + 1],
+                                          excerpt)
     return excerpt
+
+
+def _cap_excerpt_lines(lines: list[str], excerpt: dict[str, Any]) -> list[str]:
+    """Cap each excerpted line at ``_EXCERPT_LINE_MAX_CHARS`` (#792 review).
+
+    A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line, and such a row is exactly the null-statement row
+    that needs an excerpt -- 7 of them is the whole-function blob #557 refuses to
+    put in ``hlil_statement``. The cap and the per-line count of capped lines keep
+    the excerpt's cost bounded and its shape self-describing; a truncated line is
+    never presented as verbatim."""
+    capped: list[str] = []
+    truncated = 0
+    for line in lines:
+        if len(line) > _EXCERPT_LINE_MAX_CHARS:
+            truncated += 1
+            line = (line[:_EXCERPT_LINE_MAX_CHARS]
+                    + f" ... [+{len(line) - _EXCERPT_LINE_MAX_CHARS} chars]")
+        capped.append(line)
+    if truncated:
+        excerpt["truncated_lines"] = truncated
+    return capped
 
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
@@ -249,7 +294,7 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
             if decompiled_render is None:
                 decompiled_render = _callsite_decompile_render(bv, func)
             rows[-1]["decompile_excerpt"] = _callsite_decompile_excerpt(
-                decompiled_render, call_addr
+                decompiled_render, call_addr, int(func.start)
             )
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
