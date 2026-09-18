@@ -639,6 +639,41 @@ def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
     assert "out writes into the pointee" not in result["hints"][0]
 
 
+def test_backward_slice_states_the_callee_structurally_755(monkeypatch):
+    """#755: the payload states the traced callee with an explicit null when it
+    does not resolve. `arg_label` merely omitted its `callee` key for an indirect
+    call, so a JSON consumer could not tell "we looked, and this call has no
+    resolvable callee" from "this bridge never computed one" -- the ambiguity that
+    let two different calls in one function look identical."""
+    import types as _types
+    from _bridge_fakes import (
+        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def _slice(dest):
+        arg = _FakeSSAVariable("rec#1")
+        call_insn = _FakeMLILInsn(
+            0x2010, operation="MLIL_CALL_SSA", params=[arg], dest=dest)
+        callee = _FakeFunction(0x3000, "fill_record")
+        callee.parameter_vars = [_types.SimpleNamespace(name="out")]
+        caller = _FakeFunction(0x2000, "caller")
+        caller.medium_level_il = _FakeMLILFunction(
+            instructions=[call_insn], definitions={})
+        bv = _FakeBV(functions=[caller, callee])
+        monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+        return instance._backward_slice("active", "caller", "0x2010", arg_index=0)
+
+    direct = _slice(_FakeConstPtr(0x3000))
+    assert direct["callee"] == "fill_record"
+    # An indirect target (a register/vtable slot, not a constant pointer) resolves
+    # to no name: the key must be PRESENT and null, never absent.
+    indirect = _slice(_FakeSSAVariable("rax#2"))
+    assert "callee" in indirect and indirect["callee"] is None
+
+
 def test_backward_slice_assumptions_nonempty_for_unfollowed_out_param(monkeypatch):
     # #671/#672: `_backward_slice`'s `assumptions` must name an unfollowed
     # out-param fill, not just the depth cap -- end-to-end through
