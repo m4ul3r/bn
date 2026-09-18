@@ -1073,11 +1073,11 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
-def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
+def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any]:
     """Object size with provenance. A defined BN type's width wins (authoritative
-    when present); else the operator-new size at a construction site; else None
-    (never fabricated). ``ctx._find_type`` raises on a miss, so the lookup is
-    guarded."""
+    when present); else the operator-new size at a construction site; else a
+    ``source: "unavailable"`` envelope that says WHY (never fabricated).
+    ``ctx._find_type`` raises on a miss, so the lookup is guarded."""
     try:
         found = ctx._find_type(bv, record["name"])
     except Exception:
@@ -1091,7 +1091,16 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
     if new is not None:
         size, at = new
         return {"value": hex(int(size)), "source": "operator_new", "at": hex(int(at))}
-    return None
+    # #817: a bare null read as "searched both paths, size genuinely unknown",
+    # while the ctor-new path cannot search at all: the seam's
+    # `_operator_new_size_at_ctor` is still an unconditional `return None` stub
+    # (its TODO's #205 is closed). Report the provenance and the reason instead,
+    # so an agent knows the second path was never tried rather than exhausted.
+    return {
+        "value": None,
+        "source": "unavailable",
+        "reason": "operator_new_recovery_unimplemented",
+    }
 
 
 def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
