@@ -4929,6 +4929,21 @@ def _disclose_open_target_collision(targets, bv, saved: str, result: dict) -> No
     the collision probe did. Both a structured key and a rendered note, because
     the harm is that a later `session restart` silently returns fewer targets
     than it had, and an agent needs to see that at save time (#857 round 4).
+
+    WHY THIS SURVIVED #867, which refuses a colliding destination outright:
+    the pre-write refusal tests the REQUESTED path, and the read-only cache
+    fallback writes somewhere else -- a destination chosen only after the
+    primary write has already failed. Extending the refusal there was
+    considered and deliberately rejected: the fallback exists so annotations
+    are NOT lost on a read-only mount, so refusing at that point could
+    destroy the work it was invented to save. Verified live (#867 pass,
+    detail 3) -- the disclosure fires, the save lands, and the `--path`
+    export still carries the annotations.
+
+    So this is the BACKSTOP, not a leftover: it covers the fallback
+    destination and the window between the pre-write check and the write.
+    A future reader seeing "the refusal did not fire here" should not
+    reach for the obvious fix without reading the paragraph above.
     """
     try:
         other = targets.open_target_for_path(saved, exclude=bv)
