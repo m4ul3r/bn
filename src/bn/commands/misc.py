@@ -26,6 +26,8 @@ from ..formatters import (
     _render_strings_text,
 )
 from ..transport import BridgeError, unwrap_result
+from ..wire_limits import (MAX_BYTES_ENV, MAX_OPS_ENV, batch_apply_max_bytes,
+                           batch_apply_max_ops)
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
@@ -618,6 +620,36 @@ def _batch_apply(args: argparse.Namespace) -> int:
             raise BridgeError(
                 f'Manifest ({source}) must have an "ops" array (the list of '
                 f"operations to apply)."
+            )
+        # #769: neither the op count nor the byte size was checked. The
+        # bridge caps the REQUEST at MAX_REQUEST_BYTES, so an oversized
+        # manifest already failed -- but only after the client read the whole
+        # file, serialized it, and paid a round trip, and the answer was a
+        # bare "request too large" naming neither the limit nor a way around
+        # it. Refusing here costs nothing and can say what to do.
+        #
+        # Both ceilings read through `wire_limits`, so the byte limit is the
+        # bridge's own number rather than a second copy of it, and `0` in
+        # either env disables that check for a caller who really means it.
+        max_ops = batch_apply_max_ops()
+        op_count = len(manifest["ops"])
+        if max_ops is not None and op_count > max_ops:
+            raise BridgeError(
+                f"Manifest ({source}) has {op_count} operations, over the "
+                f"{max_ops} limit. A batch this size holds the write lock for "
+                f"the whole run and reverts as ONE unit, so a single failure "
+                f"discards every sibling. Split it, or raise/disable the "
+                f"ceiling with {MAX_OPS_ENV}=<n> (0 disables)."
+            )
+        max_bytes = batch_apply_max_bytes()
+        raw_bytes = len(raw.encode("utf-8"))
+        if max_bytes is not None and raw_bytes > max_bytes:
+            raise BridgeError(
+                f"Manifest ({source}) is {raw_bytes} bytes, over the "
+                f"{max_bytes} limit -- the bridge refuses a request this "
+                f"large on arrival, so sending it can only fail. Split it, "
+                f"or raise/disable the ceiling with {MAX_BYTES_ENV}=<n> "
+                f"(0 disables)."
             )
     # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and
     # naturally put that id in the manifest "target" -- but an instance id is a

@@ -80,7 +80,11 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# Defined in `wire_limits` (symlinked from `bn/`, like `paths`/`version`) so
+# the `batch apply` preflight that warns BEFORE sending and the handler that
+# refuses on arrival read ONE number rather than two copies of it (#769): a
+# client guessing low would refuse requests the bridge would have accepted.
+from .wire_limits import MAX_REQUEST_BYTES  # noqa: F401 - re-exported
 
 # Idle reaper: cap the watcher poll interval so a long BN_IDLE_TIMEOUT doesn't
 # leave a stale process lingering far past its deadline, while a short timeout

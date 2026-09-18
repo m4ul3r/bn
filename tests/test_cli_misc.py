@@ -805,6 +805,97 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, caps
     assert calls[-1]["params"]["ops"][0]["comment"] == comment
 
 
+def _op_manifest(count):
+    import json as _json
+    return _json.dumps({"target": "active", "ops": [
+        {"op": "set_comment", "address": "0x1000", "comment": "x"}] * count})
+
+
+def test_batch_apply_refuses_a_runaway_op_count_before_sending_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #769: neither the op count nor the byte size was checked, so a runaway
+    # generator's manifest was read, serialized and sent -- to be met with a
+    # bare "request too large" that named neither the limit nor a remedy.
+    # Refuse client-side, and say what to do about it.
+    path = tmp_path / "big.json"
+    path.write_text(_op_manifest(6000))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 3                       # invalid_request, like every preflight
+    assert calls == []                   # the whole point: nothing was sent
+    out = capsys.readouterr().out
+    assert "6000 operations" in out and "5000 limit" in out
+    assert "BN_BATCH_APPLY_MAX_OPS" in out
+
+
+def test_batch_apply_op_ceiling_is_raisable_and_disablable_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # A guard with no escape hatch is a wall. `0` disables the check outright
+    # and a number raises it -- both must let the same manifest through.
+    path = tmp_path / "big.json"
+    path.write_text(_op_manifest(6000))
+
+    for value in ("0", "9000"):
+        monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", value)
+        calls = fake_transport({"batch_apply": {"ok": True, "result": {
+            "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+        rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+        assert rc == 0, value
+        assert calls and calls[-1]["op"] == "batch_apply", value
+
+
+def test_batch_apply_ordinary_manifest_is_untouched_by_the_guard_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # Must-not-fire twin: the guard exists for a runaway, not for real work.
+    path = tmp_path / "small.json"
+    path.write_text(_op_manifest(50))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 0
+    assert len(calls[-1]["params"]["ops"]) == 50
+
+
+def test_batch_apply_byte_ceiling_refuses_without_sending_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # The byte ceiling defaults to the BRIDGE's own wire limit -- that
+    # one-number property is asserted in test_bridge_dispatch, where the
+    # bridge is importable. Here: it fires, and it fires before the send.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", "2048")
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")   # isolate the byte check
+
+    path = tmp_path / "wide.json"
+    path.write_text(_op_manifest(200))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 3
+    assert calls == []
+    out = capsys.readouterr().out
+    assert "BN_BATCH_APPLY_MAX_BYTES" in out and "2048" in out
+
+
+def test_batch_apply_malformed_limit_env_falls_back_not_crashes_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # A typo'd env var must not turn a valid command into a hard failure --
+    # this is a guard, not a config parser. The default ceiling still applies.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "not-a-number")
+    path = tmp_path / "small.json"
+    path.write_text(_op_manifest(10))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "batch_apply"
+
+
 def test_batch_apply_full_result_carries_top_level_ok(monkeypatch, fake_transport, capsys):
     # #447: mutation/batch JSON used only success/committed, so `jq '.ok'` read
     # null. Add a top-level `ok` mirroring the read-command envelope.

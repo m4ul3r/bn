@@ -2930,6 +2930,27 @@ def test_serialize_error_never_triages_an_operation_failure_825(monkeypatch):
     assert rendered == "Symbol not found: bar"
 
 
+def test_wire_byte_ceiling_is_one_number_not_two_769(monkeypatch):
+    # THE anti-drift assertion for #769. The CLI refuses an oversized manifest
+    # early ONLY because the bridge would refuse it on arrival, so the two
+    # ceilings must be the same number. A client-side copy guessed LOW would
+    # reject requests the bridge accepts -- the duplicated-constant shape
+    # #777 and #890 were filed for, where the copies drift apart silently.
+    bridge = _load_bridge(monkeypatch)
+    from bn import wire_limits
+
+    assert bridge.MAX_REQUEST_BYTES == wire_limits.MAX_REQUEST_BYTES
+    assert wire_limits.batch_apply_max_bytes() == bridge.MAX_REQUEST_BYTES
+
+    # And it is genuinely shared rather than coincidentally equal: the bridge
+    # module must not carry its own assignment of the constant.
+    import inspect
+    source = inspect.getsource(bridge)
+    assert "MAX_REQUEST_BYTES = " not in source, (
+        "bridge.py reassigns MAX_REQUEST_BYTES; it must import it from "
+        "wire_limits so the CLI preflight and the handler cannot drift")
+
+
 def test_dispatch_error_discloses_prototype_user_type_residue(monkeypatch):
     """#630 round 3, FINDING 2: when a mutation raises AFTER pinning an unclearable
     has_user_type override, the serialized error RESPONSE must DISCLOSE the residue
