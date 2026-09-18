@@ -3801,6 +3801,162 @@ def test_backward_stats_reports_leaves_count(process_func, models):
     assert result["stats"]["leaves"] == len(result["leaves"])
 
 
+def _caller_fan_in_program(n_callers):
+    """`use_len(dst, src, n)` sinks at `memcpy:2` with the length as a bare param;
+    *n_callers* handlers each pass one of their own parameters through as that
+    length -- the fan-in shape #810 is about (the live repro had 20 direct
+    callsites, so the first 16 were followed and 4 dropped)."""
+    dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
+    dst0 = FSSA(dst, 0); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    use_len = FFunc("use_len", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x940(dst#0, src#0, n#0)",
+               reads=[dst0, src0, n0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=0x940),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[dst, src, n])
+    sites = []
+    for i in range(n_callers):
+        x = FVar(f"x{i}", ident=30 + i)
+        x1 = FSSA(x, 1)
+        addr = 0x2100 + i * 0x10
+        caller = FFunc(f"caller_{i}", 0x3000 + i * 0x100, FSSAFunc([
+            FInstr(0, addr, "MLIL_CALL_SSA", f"0x800(a{i}, b{i}, x{i}#1)",
+                   reads=[x1], writes=[],
+                   dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+                   params=[FExpr("MLIL_VAR_SSA", f"a{i}", reads=[]),
+                           FExpr("MLIL_VAR_SSA", f"b{i}", reads=[]),
+                           FExpr("MLIL_VAR_SSA", f"x{i}#1", reads=[x1])]),
+        ]), params=[x])
+        sites.append(FSite(caller, addr))
+    use_len.caller_sites = sites
+    return use_len, FBV({0x940: "memcpy", 0x800: "use_len"})
+
+
+def test_backward_caller_cap_is_leaf_and_truncation(models):
+    # #810: a function with MORE than the caller-site cap (16) previously dropped
+    # the extra callers with an assumption string only -- no leaf, no `truncated`,
+    # so the result read as complete. The drop is now a blocking frontier leaf
+    # (naming the dropped count) plus the forward stats pair.
+    use_len, bv = _caller_fan_in_program(20)
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
+    assert len(caps) == 1, result["leaves"]
+    cap = caps[0]
+    assert cap["callers_total"] == 20
+    assert cap["callers_followed"] == 16
+    assert cap["callers_dropped"] == 4
+    assert cap["function"]["name"] == "use_len"
+    # The signal is machine-readable on the envelope, not prose-only ...
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
+    assert result["stats"]["leaves"] == len(result["leaves"])
+    # ... and the leaf is in the shared blocking vocabulary, so the frontier can
+    # never be counted as a complete answer.
+    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    assert "caller_sites_truncated" in BLOCKING_LEAF_KINDS
+    # Only the followed callers contributed slices: the dropped 4 did not.
+    assert len(result["slices"]) == 16
+    # The caveat names the MEASURED ascent (this fixture resolves every site, so
+    # it equals the cap) -- never the cap constant as if it were coverage.
+    assert any("caller ascent followed 16, capped at 16" in a
+               for a in result["assumptions"]), result["assumptions"]
+
+
+def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(models):
+    # #810 review round 1: the frontier's counts must be MEASURED, not the cap
+    # constant. A site whose recorded address carries no call instruction never
+    # ascends -- the same silent skip that made this cap worth a leaf at all -- so
+    # reporting the constant tells a count-gating consumer 80% coverage where the
+    # truth is 30%, and 0% in the degenerate case pinned below.
+    use_len, bv = _caller_fan_in_program(20)
+    for site in use_len.caller_sites[3:13]:      # 10 of the 16 in-cap sites
+        site.address = int(site.address) + 8     # -> no call instruction there
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
+    assert len(caps) == 1, result["leaves"]
+    assert caps[0]["callers_total"] == 20
+    assert caps[0]["callers_followed"] == 6
+    assert caps[0]["callers_dropped"] == 14
+    # The 6 resolvable sites are exactly the ones that produced slices.
+    assert len(result["slices"]) == 6
+    # The human-readable half must agree with the machine-readable one.
+    assert any("caller ascent followed 6, capped at 16" in a
+               for a in result["assumptions"]), result["assumptions"]
+    # ... and the real text frontier (what a human reads) prints the measurement
+    # the JSON carries, on an envelope that says INCOMPLETE.
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text(result)
+    assert "6 of 20 caller(s) followed; 14 dropped" in text
+    assert "verdict: INCOMPLETE" in text
+
+
+def test_backward_caller_cap_reports_a_zero_ascent_as_zero(models):
+    # #810 review round 1: with every in-cap site unresolvable, no caller ascends
+    # at all. The truncation must still be disclosed, and the frontier must report
+    # the measured 0 -- the value a falsy check would swallow into the constant.
+    use_len, bv = _caller_fan_in_program(20)
+    for site in use_len.caller_sites[:16]:
+        site.address = int(site.address) + 8
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
+    assert len(caps) == 1, result["leaves"]
+    assert caps[0]["callers_total"] == 20
+    assert caps[0]["callers_followed"] == 0
+    assert caps[0]["callers_dropped"] == 20
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
+
+
+def test_backward_under_caller_cap_stays_complete(models):
+    # #810: below the cap nothing changes -- no leaf, no truncated flag, and one
+    # slice per caller (the complete-result contract).
+    use_len, bv = _caller_fan_in_program(3)
+    result = te.TaintEngine(bv, models).backward(
+        use_len, [te.parse_locator("arg:memcpy:2")])
+
+    assert [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"] == []
+    assert result["stats"]["truncated"] is False
+    assert result["stats"]["truncation_cause"] == []
+    assert len(result["slices"]) == 3
+
+
+def test_backward_recursion_limited_slice_is_not_a_complete_result(models, monkeypatch):
+    # #810: the recursion guard is the OTHER way a backward run loses slices, and
+    # a kept-partial slice with no flag would read as a finished answer -- the same
+    # silent-complete shape the caller cap had. Forced here rather than provoked:
+    # the guard fires on Python's own stack limit, which a fixture cannot reach
+    # portably, and the contract under test is the envelope's, not the guard's.
+    use_len, bv = _caller_fan_in_program(3)
+    engine = te.TaintEngine(bv, models)
+
+    def _recursion_guard(*_args, **_kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(engine, "_backward_slice", _recursion_guard)
+    result = engine.backward(use_len, [te.parse_locator("arg:memcpy:2")])
+
+    # Machine-readable: the run-level pair says truncated, with THIS cause (not the
+    # caller cap, which this run never reaches).
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["recursion"]
+    # ... the per-sink row says why the kept partial is partial ...
+    assert [s.get("truncated") for s in result["sink_status"]] == [True], result["sink_status"]
+    assert any("recursion limit reached" in a for a in result["assumptions"])
+    # ... and the human-readable half cannot contradict either.
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text(result)
+    assert "verdict: INCOMPLETE" in text
+    assert "recursion limit (possible unresolved cycle)" in text
+
+
 def test_backward_slices_from_memcpy_length(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)

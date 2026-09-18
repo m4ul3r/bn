@@ -3395,6 +3395,15 @@ def _render_leaf_line(leaf: Any) -> str:
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "caller_sites_truncated":
+        fn = _field_dict(leaf, "function")
+        return (
+            f"  caller_sites_truncated @ {leaf.get('address')}"
+            f"  -> {fn.get('name', '?')} @ {fn.get('address', '?')}"
+            f"  ({leaf.get('callers_followed', '?')} of {leaf.get('callers_total', '?')} "
+            f"caller(s) followed; {leaf.get('callers_dropped', '?')} dropped)"
+            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+        )
     return (
         f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
         + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
@@ -3496,6 +3505,12 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
                      "exhausted; raise --max-iters or narrow the source)")
     if "recursion" in causes:
         parts.append("recursion limit (possible unresolved cycle)")
+    if "caller_cap" in causes:
+        # #810: the backward caller ascent follows only the first N caller sites of
+        # a parameter-origin slice; the rest are dropped (no knob raises the cap).
+        # Name the cause and where the dropped count lives -- the frontier leaf.
+        parts.append("caller-site cap reached (not every caller was followed; "
+                     "see the caller_sites_truncated frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)
@@ -3640,6 +3655,13 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
     else:
         sinks = _field_list(value, "sinks")
         lines.append("sinks: " + (", ".join(_describe_loc(s) for s in sinks) or "<none>"))
+        # #810: a truncated backward run is INCOMPLETE (capped caller ascent, or a
+        # recursion-limited slice). Without this the text showed the same slice
+        # list a complete run shows; a complete run adds no line, so its output is
+        # byte-identical to before.
+        trunc = _taint_truncation_note(_field_dict(value, "stats"))
+        if trunc:
+            lines.append(f"verdict: INCOMPLETE{trunc}")
         slices = _field_list(value, "slices")
         for sl in slices:
             if not isinstance(sl, dict):

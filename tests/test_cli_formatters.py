@@ -4193,17 +4193,17 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    assert checked == 1200, f"the differential ran {checked} cases, not 1200"
+    assert checked == 1206, f"the differential ran {checked} cases, not 1206"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
-    """The soft-degrade half of #619, kind-free, so it covers all 601 read keys
-    rather than the 200 the container probe classifies as containers: a renderer
+    """The soft-degrade half of #619, kind-free, so it covers all 605 read keys
+    rather than the 201 the container probe classifies as containers: a renderer
     that renders an absent field cleanly and DIES on a present wrong-shaped one
     has regressed to the crash this change replaced.
 
     Base, swept the same way over its own population, raises 166 times across
-    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4808.
+    67 (renderer, key) positions in 4544 renders; this commit raises 0 in 4840.
     Two of those renderers
     (`_render_function_info_text`, `_render_taint_text`) are only in the
     population at all because round 8 fixed the arity rule to admit a renderer
@@ -4222,7 +4222,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     assert not raised, raised[:8]
     # Last, so a real raise reports itself instead of being masked by the count
     # it also moves (the round-8 rule, applied to the sweeps too).
-    assert swept == 4808, f"the raise sweep ran {swept} renders, not 4808"
+    assert swept == 4840, f"the raise sweep ran {swept} renders, not 4840"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4371,7 +4371,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked == 1402, f"the mirror ran {checked} renders, not 1402"
+    assert checked == 1411, f"the mirror ran {checked} renders, not 1411"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
