@@ -3832,9 +3832,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    assert len(sites) == 19, (
+    # 19 -> 26 (#823): `_render_spill_gc_text` states five top-level counters
+    # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
+    # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
+    # are the headline's numbers; the two row reads are nested, which is why
+    # they are named in the skipped set below rather than silently dropped.
+    assert len(sites) == 26, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 19. The number is the size of the covered set: a "
+        "count helper, not 26. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3902,6 +3907,18 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # `_render_spill_gc_text` (#823). `removed_count`/`reclaimed_bytes` are
+        # stated on the branch a NON-dry sweep takes, and the probe payload
+        # carries no `dry_run` flag at all; `bytes`/`files` are read off each
+        # candidate ROW, one level below anything a top-level probe reaches.
+        # All four are driven on the real shapes by
+        # `test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823`
+        # (`tests/test_output.py`), which asserts `?` in the body a caller acts
+        # on rather than a fabricated number.
+        "_render_spill_gc_text(bytes) [count not stated in this context]",
+        "_render_spill_gc_text(files) [count not stated in this context]",
+        "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
+        "_render_spill_gc_text(removed_count) [count not stated in this context]",
     ], sorted(not_stated)
 
 
@@ -4226,7 +4243,11 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    assert checked == 1212, f"the differential ran {checked} cases, not 1212"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1212 + 18 (#823) = 1230.
+    assert checked == 1230, f"the differential ran {checked} cases, not 1230"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4272,7 +4293,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    assert swept == 4896, f"the raise sweep ran {swept} renders, not 4896"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4896 + 72 (#823) = 4968.
+    assert swept == 4968, f"the raise sweep ran {swept} renders, not 4968"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4428,7 +4453,11 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    assert checked == 1426, f"the mirror ran {checked} renders, not 1426"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1426 + 21 (#823) = 1447.
+    assert checked == 1447, f"the mirror ran {checked} renders, not 1447"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7180,8 +7209,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4572 + 108 (#823) = 4680.
+    assert swept == 4680, (
+        f"the element sweep ran {swept} renders, not 4680 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

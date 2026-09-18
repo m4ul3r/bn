@@ -164,6 +164,127 @@ def resolve_spill_retention_days(default: int = DEFAULT_SPILL_RETENTION_DAYS) ->
     return value if value >= 0 else default
 
 
+# Why a day-NAMED entry under the spill root was left alone (#823). `bn spill
+# gc` reports every one of these instead of skipping silently: each refusal is
+# a decision, and a decision nobody can inspect is indistinguishable from the
+# bug it prevents (#618).
+_SKIP_SYMLINK = "symlink"
+_SKIP_NOT_A_DIRECTORY = "not a directory"
+_SKIP_OUTSIDE_ROOT = "outside the spill root"
+
+
+@dataclass(frozen=True)
+class _SpillDayDir:
+    """One eligible ``spills/<YYYYMMDD>/`` directory (#823).
+
+    ``entry`` is the path under the configured spill root -- what a report
+    names, because it is the path the caller can see. ``resolved`` is the same
+    directory with every component resolved, which is both what containment was
+    proved against and therefore what gets removed.
+    """
+
+    entry: Path
+    resolved: Path
+    day: date
+
+
+def _spill_day_entries(root: Path) -> tuple[list[_SpillDayDir], list[dict[str, str]]]:
+    """Eligible spill day-directories under *root*, plus the entries refused.
+
+    Four facts make a day directory eligible, and each one is load-bearing:
+
+    * the name is the CANONICAL ``%Y%m%d`` rendering of a date. Anything else
+      in the spill root -- a user's notes, another tool's file, a
+      partially-named dir -- is evidence of something this writer did not
+      create, so it is left alone (#618: act on evidence, never on its
+      absence). ``strptime`` alone is NOT that check: its numeric fields accept
+      unpadded input, so ``202611`` parses happily as 2026-01-01 and a
+      directory by that name -- which this writer, which always calls
+      ``strftime``, could not have produced -- was recursively deleted. The
+      round-trip is the check: a name is eligible only if formatting the parsed
+      date reproduces the name byte for byte.
+    * the entry is NOT a symlink. ``shutil.rmtree`` refuses a symlink outright,
+      so the old loop "survived" one only by suppressing the ``OSError`` that
+      refusal raised -- a refusal it never asked for and could not report, and
+      one that stops protecting anything the moment the removal is done with
+      anything but ``rmtree`` (#823).
+    * the entry RESOLVES inside *root*. The resolved path is what gets
+      destroyed, so containment is proved by resolution rather than assumed
+      from the parent directory the name happens to sit in.
+    * the resolved path really is a directory, so a plain FILE named as a day
+      is a disclosed refusal instead of a silent ``is_dir()`` miss.
+
+    ``root`` is resolved ONCE for that containment check, so a spill root that
+    is itself reached through a symlink still contains its own days.
+    """
+    try:
+        contained_root = root.resolve()
+    except OSError:
+        return [], []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return [], []
+    found: list[_SpillDayDir] = []
+    skipped: list[dict[str, str]] = []
+    for entry in sorted(entries):
+        try:
+            day = datetime.strptime(entry.name, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if day.strftime("%Y%m%d") != entry.name:
+            continue
+        # The name parses as a day, so a refusal from here on is about the
+        # entry, not about the name, and is worth surfacing.
+        if entry.is_symlink():
+            skipped.append({"path": str(entry), "reason": _SKIP_SYMLINK})
+            continue
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            # A symlink loop or an unreadable component: nothing was proved
+            # about this path, so it is not a candidate.
+            skipped.append({"path": str(entry), "reason": _SKIP_OUTSIDE_ROOT})
+            continue
+        if not resolved.is_relative_to(contained_root):
+            skipped.append({"path": str(entry), "reason": _SKIP_OUTSIDE_ROOT})
+            continue
+        if not resolved.is_dir():
+            skipped.append({"path": str(entry), "reason": _SKIP_NOT_A_DIRECTORY})
+            continue
+        found.append(_SpillDayDir(entry=entry, resolved=resolved, day=day))
+    return found, skipped
+
+
+def _directory_bytes(path: Path) -> tuple[int, int]:
+    """Size in bytes and file count of the directory at *path*.
+
+    A file this cannot stat is skipped rather than raising: a spill root is
+    written by other processes, and a stat race must not cost a cleanup command
+    its whole report. Symlinked directories are not descended into
+    (``os.walk``'s default), so the count stays inside the directory.
+    """
+    total = 0
+    files = 0
+    for base, _dirs, names in os.walk(path, onerror=lambda _exc: None):
+        for name in names:
+            try:
+                total += os.stat(os.path.join(base, name)).st_size
+            except OSError:
+                continue
+            files += 1
+    return total, files
+
+
+def _spill_day_row(day_dir: _SpillDayDir, size: int, files: int) -> dict[str, Any]:
+    return {
+        "day": day_dir.day.strftime("%Y%m%d"),
+        "path": str(day_dir.entry),
+        "bytes": size,
+        "files": files,
+    }
+
+
 def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
     """Remove whole spill day-directories older than the retention window.
 
@@ -171,18 +292,10 @@ def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
     ``iterdir()`` over a few dozen names and zero per-file stats -- the
     measured 1.0 GB / 4187-file spill root is reclaimed a day at a time.
 
-    Only an entry that is a directory AND whose name is the CANONICAL
-    ``%Y%m%d`` rendering of a date is eligible. Anything else in the spill root
-    -- a user's notes, another tool's file, a partially-named dir -- is
-    evidence of something this function did not create, so it is left alone
-    (#618: act on evidence, never on its absence).
-
-    ``strptime`` alone is NOT that check: its numeric fields accept unpadded
-    input, so ``202611`` parses happily as 2026-01-01 and a directory by that
-    name -- which this writer, which always calls ``strftime``, could not have
-    produced -- was recursively deleted. The round-trip is the check: a name is
-    eligible only if formatting the parsed date reproduces the name byte for
-    byte.
+    Eligibility is ``_spill_day_entries``': a canonical ``%Y%m%d`` name, a
+    real directory (never a symlink), and a path that resolves inside *root*.
+    The write path is the one caller that must stay cheap and silent, so the
+    refusals it learns about here are dropped; ``bn spill gc`` surfaces them.
     """
     retention = resolve_spill_retention_days()
     if retention == 0:
@@ -195,26 +308,122 @@ def _prune_old_spill_days(root: Path, today: date) -> list[Path]:
         # fallback catches OSError, so an OverflowError here would deny the
         # caller its result AND its artifact over a config value.
         return []
+    days, _skipped = _spill_day_entries(root)
     removed: list[Path] = []
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return []
-    for entry in entries:
-        try:
-            day = datetime.strptime(entry.name, "%Y%m%d").date()
-        except ValueError:
-            continue
-        if day.strftime("%Y%m%d") != entry.name:
-            continue
-        if day >= cutoff or not entry.is_dir():
+    for day_dir in days:
+        if day_dir.day >= cutoff:
             continue
         # A racing peer may remove the same stale day; that is the outcome we
         # wanted either way, so a failure here is never the command's problem.
         with contextlib.suppress(OSError):
-            shutil.rmtree(entry)
-            removed.append(entry)
+            shutil.rmtree(day_dir.resolved)
+            removed.append(day_dir.entry)
     return removed
+
+
+def gc_spills(
+    root: Path | None = None,
+    *,
+    older_than_days: int | None = None,
+    max_bytes: int | None = None,
+    dry_run: bool = False,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Reclaim spill disk space, and report what was (or would be) removed (#823).
+
+    The unit is the whole day directory: artifacts inside one day share one
+    lifetime and the writer only ever creates ``spills/<YYYYMMDD>/``, so
+    day-granular reclamation cannot leave a half-removed day behind.
+
+    Two independent bounds decide the candidates:
+
+    * AGE -- a day strictly older than the window. The window is
+      *older_than_days* when given, else ``BN_SPILL_RETENTION_DAYS`` (default
+      :data:`DEFAULT_SPILL_RETENTION_DAYS`), i.e. exactly the window the write
+      path prunes with: a bare ``bn spill gc`` reclaims what the next spill
+      would have reclaimed anyway, earlier and inspectably.
+    * SIZE -- when *max_bytes* is given, the OLDEST days that survive the age
+      pass join the candidates until the eligible days fit the cap. It is a
+      second bound, not an override: an engagement that widens the retention
+      window can still hold the root to a byte budget.
+
+    *dry_run* builds the full report -- candidates, sizes, kept counts -- and
+    removes nothing.
+
+    Every day-named entry this refused is disclosed under ``skipped`` with its
+    reason, and a removal that failed is reported under ``errors`` instead of
+    being counted as kept. The byte totals cover the ELIGIBLE day directories
+    only: anything else in the spill root belongs to someone else and is never
+    sized, counted or touched (#618).
+    """
+    if root is None:
+        root = spill_root()
+    resolved_today = today if today is not None else datetime.now(timezone.utc).date()
+    retention = older_than_days if older_than_days is not None else resolve_spill_retention_days()
+    cutoff: date | None = None
+    if retention > 0:
+        try:
+            cutoff = resolved_today - timedelta(days=retention)
+        except OverflowError:
+            # Wider than the calendar: keep everything, never raise. Same
+            # reasoning as the write path's guard.
+            cutoff = None
+    days, skipped = _spill_day_entries(root)
+    measured = [(day_dir, *_directory_bytes(day_dir.resolved)) for day_dir in days]
+    measured.sort(key=lambda item: item[0].day)
+    stale = {item[0].entry for item in measured
+             if cutoff is not None and item[0].day < cutoff}
+    candidates = [item for item in measured if item[0].entry in stale]
+    if max_bytes is not None:
+        held = sum(size for day_dir, size, _files in measured
+                   if day_dir.entry not in stale)
+        for item in measured:                      # oldest first
+            if held <= max_bytes:
+                break
+            if item[0].entry in stale:
+                continue
+            candidates.append(item)
+            held -= item[1]
+    candidates.sort(key=lambda item: item[0].day)
+    candidate_rows: list[dict[str, Any]] = []
+    removed_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for day_dir, size, files in candidates:
+        row = _spill_day_row(day_dir, size, files)
+        candidate_rows.append(row)
+        if dry_run:
+            continue
+        try:
+            shutil.rmtree(day_dir.resolved)
+        except FileNotFoundError:
+            # A racing peer removed it first: that is the outcome we wanted.
+            removed_rows.append(row)
+        except OSError as exc:
+            # Anything else means the day is still there, so it is reported
+            # rather than counted as reclaimed.
+            errors.append({"path": row["path"], "error": str(exc)})
+        else:
+            removed_rows.append(row)
+    candidate_entries = {item[0].entry for item in candidates}
+    kept = [item for item in measured if item[0].entry not in candidate_entries]
+    return {
+        "kind": "spill_gc",
+        "root": str(root),
+        "dry_run": dry_run,
+        "older_than_days": retention,
+        "max_bytes": max_bytes,
+        "candidates": candidate_rows,
+        "candidate_count": len(candidate_rows),
+        "candidate_bytes": sum(row["bytes"] for row in candidate_rows),
+        "removed": removed_rows,
+        "removed_count": len(removed_rows),
+        "reclaimed_bytes": sum(row["bytes"] for row in removed_rows),
+        "kept_count": len(kept),
+        "kept_bytes": sum(size for _day_dir, size, _files in kept),
+        "total_bytes": sum(size for _day_dir, size, _files in measured),
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
 def _spill_path(stem: str, suffix: str) -> Path:
