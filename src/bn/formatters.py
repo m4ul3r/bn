@@ -2535,8 +2535,10 @@ def _render_function_evidence_text(value: Any) -> str:
             lines.append(
                 f"  arity: UNVERIFIED — the callee's recovered prototype {counts}, "
                 "so the recovered signature is not corroborated and these arguments "
-                "may be under-recovered. That disagreement is the whole basis for this "
-                "row's `inferred` confidence. Check `bn proto get <callee>`: if you "
+                "may be under-recovered. That disagreement is one reason this row is "
+                "not fully corroborated; any other `arity:` line above names another, "
+                "and a list recovered from MLIL/LLIL is heuristic whatever the library "
+                "says. Check `bn proto get <callee>`: if you "
                 "pinned that prototype deliberately, this row disagrees with your "
                 "statement -- BN cannot tell a pinned prototype from a recovered one "
                 "here, so decide which is right for this binary."

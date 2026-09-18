@@ -4916,9 +4916,16 @@ def test_render_evidence_function_states_the_library_contradiction_759():
     # has_user_type disabled the check on every saved database), so the line now
     # states what it can defend: the contradiction is reported, not judged.
     # The card must not tell the reader the disagreement is harmless when it IS
-    # the demotion trigger (#862 review round 6): it names the disagreement as
-    # the basis, and says the row may disagree with a prototype they pinned.
-    assert "the whole basis for this row's `inferred` confidence" in out
+    # a demotion trigger (#862 review round 6), nor claim it is the ONLY one:
+    # `prototype_unverified` can co-occur with `arity_mismatch`/`arity_unknown`,
+    # whose own `arity:` line prints directly above (round 7).
+    assert "one reason this row is not fully corroborated" in out
+    assert "any other `arity:` line above names another" in out
+    # Neither overclaim may come back: not "the whole basis", and not a named
+    # confidence the row may not even have -- an MLIL/LLIL-sourced list is
+    # `heuristic`, never `inferred` (round 7).
+    assert "the whole basis" not in out
+    assert "this row's `inferred` confidence" not in out
     assert "this row disagrees with your statement" in out
     assert "takes precedence" not in out
     assert "is not evidence against it" not in out

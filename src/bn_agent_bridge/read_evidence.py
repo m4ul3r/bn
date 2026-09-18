@@ -485,10 +485,11 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # The round-1 concern was that a demotion must not SILENTLY overrule an
     # analyst's statement. That is met by DISCLOSURE, not by privilege: a pinned
     # prototype IS demoted like any other, and the row carries `declared_arity`,
-    # `library_arity` and `library_source` while the text line states that the
-    # contradiction is reported rather than judged -- so an analyst who pinned
-    # the prototype can see the claim, confirm with `bn proto get`, and conclude
-    # the library is simply wrong for this binary. Suppression bought the nuance
+    # `library_arity` and `library_source`, and the text line names the
+    # disagreement as the reason it withheld `authoritative` and warns that the
+    # row may be contradicting a prototype the analyst pinned -- so the claim is
+    # visible, checkable with `bn proto get`, and can be judged wrong for this
+    # binary. The renderer owns that wording; this comment does not quote it. Suppression bought the nuance
     # at the price of the feature everywhere it matters.
     library = _library_param_count(
         bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
