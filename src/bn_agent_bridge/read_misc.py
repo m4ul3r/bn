@@ -375,7 +375,11 @@ def _defined_symbol_names(bv) -> set[str]:
     self-export def sits at its own .text/.data address, distinct from the
     veneer, so it is kept."""
     import_addrs: set[int] = set()
-    for attr in ("ImportedFunctionSymbol", "ImportedDataSymbol", "ImportAddressSymbol"):
+    # #827 item 3 / #888: the THIRD copy of the same symbol-kind family, inline
+    # rather than as a constant, which is why the original bullet did not name
+    # it. Read from the one owner too -- the kind names are the part that must
+    # not drift; this loop needs only the names, not the (name, kind) pairing.
+    for attr, _kind in read_xrefs._IMPORT_SYMBOL_TYPES:
         sym_type = getattr(bn.SymbolType, attr, None)
         if sym_type is None:
             continue

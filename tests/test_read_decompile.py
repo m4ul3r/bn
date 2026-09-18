@@ -3598,3 +3598,84 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
+    """#827 item 3 / #888: `_require_mapped_address` and `_address_is_mapped`
+    are NOT interchangeable, and the difference is only visible on a view that
+    cannot answer.
+
+    This exists because the divergence was real and UNTESTED: substituting one
+    policy for the other left 145 tests passing across the three touched
+    modules, so the only thing standing between a future "these two are
+    duplicates" cleanup and a behaviour flip was a comment. A comment is not a
+    test.
+
+    Both policies are pinned here, on the SAME object, so a merge in either
+    direction goes red:
+      * no `is_valid_offset` at all, and
+      * an `is_valid_offset` that raises
+    are the two shapes of "the view cannot answer".
+    """
+    import importlib
+
+    _shared = importlib.import_module("bn_agent_bridge._shared")
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+
+    class _NoAnswer:
+        """A view with no `is_valid_offset`; its 1-byte read also fails."""
+        def read(self, addr, length):
+            raise RuntimeError("cannot read")
+
+    class _RaisingAnswer(_NoAnswer):
+        def is_valid_offset(self, addr):
+            raise RuntimeError("core error")
+
+    for bv in (_NoAnswer(), _RaisingAnswer()):
+        label = type(bv).__name__
+        # PERMISSIVE: returns quietly, so its caller proceeds. #374 depends on
+        # this -- a mapped address with zero refs must stay a clean exit 0, and
+        # rejecting on "cannot tell" would turn that into an error.
+        assert _shared._require_mapped_address(bv, 0x1000) is None, label
+        # STRICT: answers False, i.e. treats "cannot tell" as "not mapped".
+        assert read_decompile._address_is_mapped(bv, 0x1000) is False, label
+
+
+def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
+    """#827 item 3: the other pair deliberately left un-merged.
+
+    `_is_classic_arm_or_thumb_arch` matches by PREFIX; the seam's
+    `_supports_thumb_pointer_tags` matches by SUBSTRING. Measured against the
+    installed BN API, they agree on every ARM *arch* name and disagree on every
+    ARM *platform* name, because BN spells platforms `<os>-<arch>`. The names
+    are pinned as literals so this test needs no BN: it is guarding the RULE,
+    not BN's catalogue.
+    """
+    import importlib
+
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    prefix = read_decompile._is_classic_arm_or_thumb_arch
+
+    def substring(name: str) -> bool:
+        n = (name or "").lower()
+        if "aarch64" in n or "arm64" in n:
+            return False
+        return "thumb" in n or "arm" in n
+
+    # Arch names: the two rules agree, which is why the divergence is invisible
+    # on an ordinary ARM binary (the seam joins arch AND platform, and the arch
+    # name alone already matches under either rule).
+    for arch in ("armv7", "armv7eb", "thumb2", "thumb2eb"):
+        assert prefix(arch) is substring(arch) is True, arch
+
+    # Platform names: every one is `<os>-<arch>`, so NONE starts with
+    # arm/thumb and the two rules disagree on all of them.
+    for platform in ("linux-armv7", "linux-armv7eb", "linux-thumb2",
+                     "ios-armv7", "ios-kernel-thumb2", "mac-armv7",
+                     "windows-thumb2", "efi-armv7", "freebsd-thumb2"):
+        assert prefix(platform) is False, platform
+        assert substring(platform) is True, platform
+
+    # The #600 exclusion is the part they DO share, in both spellings.
+    for arm64 in ("aarch64", "linux-aarch64", "arm64", "mac-arm64"):
+        assert prefix(arm64) is substring(arm64) is False, arm64
