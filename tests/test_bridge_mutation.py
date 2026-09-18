@@ -117,7 +117,7 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     monkeypatch.setattr(
         bridge.mutation_engine,
         "_apply_operation",
-        lambda ctx, bv, op, restores=None: {
+        lambda ctx, bv, op, restores=None, **kwargs: {
             "op": "rename_symbol",
             "kind": "function",
             "address": "0x401000",
@@ -142,6 +142,97 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     assert result["committed"] is False
     assert _has_event(bv, "revert")
     assert not _has_event(bv, "commit")
+
+
+@pytest.mark.parametrize("addrs", [("0x1000",), ("0x1000", "0x2000")])
+def test_batch_function_create_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch, addrs):
+    """#780 (residual of #628): _mutation holds the exclusive target lock across the
+    whole apply loop, and a function_create op reanalyzed inside itself
+    (update_analysis_and_wait) -- so a batch of N creates held the exclusive lock
+    across N full analyses while every concurrent read (which takes
+    _target_lock.read() and waits on _writer) blocked for all of them. The op's
+    reanalysis is deferred to the batch's own post-apply reanalysis, which #628
+    already runs under the write gate alone: exactly ONE reanalysis happens, with
+    the exclusive lock NOT held, and the end state is unchanged (both functions
+    created, verified and visible; a 1-op batch still reanalyzes)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    lock = instance._target_lock
+    bv = _FakeFunctionCreateBV(
+        segments={int(a, 16): _FakeSegment(readable=True, executable=True) for a in addrs},
+        memory={int(a, 16): b"\x55\x48\x89\xe5" for a in addrs},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    original = bv.update_analysis_and_wait
+    waits: list = []
+
+    def analyze():
+        # (exclusive writer held?, write gate held?)
+        waits.append((lock._writer, instance._write_gate.locked()))
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    result = instance._mutation(
+        "active", False,
+        [{"op": "function_create", "address": a} for a in addrs],
+    )
+
+    # The core assertion: no reanalysis at all ran while the exclusive writer lock
+    # was held, and the batch still reanalyzed exactly once (gate-only, #628).
+    assert waits == [(False, True)]
+    assert lock._writer is False
+    assert "refresh" in bv.events
+    # End state unchanged: every op verified and every function live.
+    assert result["success"] is True
+    assert result["committed"] is True
+    assert [r["status"] for r in result["results"]] == ["verified"] * len(addrs)
+    for a in addrs:
+        fn = bv.get_function_at(int(a, 16))
+        assert fn is not None, f"function at {a} missing after the batch"
+        assert fn.name == f"sub_{int(a, 16):x}"
+
+
+def test_batch_function_create_junk_address_still_fails_and_rolls_back(monkeypatch):
+    """#780: the #386 code guard moved from the (now reanalysis-free) per-op apply
+    to the batch's post-analysis verification, so a forced create on non-code must
+    still fail its op, roll the whole batch back, and leave no fabricated function
+    behind -- and it must not reintroduce an exclusive-lock reanalysis."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    lock = instance._target_lock
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True),
+                  0x3000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5", 0x3000: b"\xff\xff\xff\xff"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+        instruction_lengths={0x3000: 0},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    original = bv.update_analysis_and_wait
+    waits: list = []
+
+    def analyze():
+        waits.append((lock._writer, instance._write_gate.locked()))
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    result = instance._mutation("active", False, [
+        {"op": "function_create", "address": "0x1000"},
+        {"op": "function_create", "address": "0x3000"},
+    ])
+
+    assert waits[0] == (False, True)  # the batch reanalysis is still gate-only
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    assert {r["address"]: r["status"] for r in result["results"]} == {
+        "0x1000": "reverted",             # applied, then rolled back with the batch
+        "0x3000": "verification_failed",  # the junk create itself
+    }
+    assert bv.get_function_at(0x1000) is None  # sibling reverted
+    assert bv.get_function_at(0x3000) is None  # fabricated function dropped
 
 
 def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
@@ -186,7 +277,7 @@ def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
     bv = _FakeMutationBV()
     calls = {"restores": 0}
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         if op.get("op") == "boom":
             raise bridge.OperationFailure("unsupported", "nope", requested={})
         restores.append(lambda: None)
@@ -217,7 +308,7 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": "local_rename", "requested": {}}
 
@@ -247,7 +338,7 @@ def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": "local_rename", "requested": {}}
 
     _mutation_with_stubs(
@@ -282,7 +373,7 @@ def test_apply_failure_and_exception_revert_settle_before_var_drift_restore(monk
         bv = _FakeMutationBV()
         order: list[str] = []
 
-        def apply(bv_, op, restores=None):
+        def apply(bv_, op, restores=None, **kwargs):
             if apply_exc is not None:
                 raise apply_exc
             return {"op": "local_rename", "requested": {}}
@@ -334,7 +425,7 @@ def test_preview_with_successful_restore_still_succeeds(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": "local_rename", "requested": {}}
 
@@ -364,7 +455,7 @@ def test_rolled_back_sibling_op_reports_reverted_not_unsupported(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         if op.get("op") == "boom":
             raise bridge.OperationFailure("unsupported", "Function not found: x", requested={})
         return {"op": "rename_symbol", "status": "applied", "requested": {}}
@@ -393,7 +484,7 @@ def test_rolled_back_sibling_reports_rollback_failed_when_revert_fails(monkeypat
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         if op.get("op") == "boom":
             raise bridge.OperationFailure("unsupported", "nope", requested={})
         return {"op": "rename_symbol", "status": "applied", "requested": {}}
@@ -2298,7 +2389,7 @@ def test_mutation_mixed_batch_scopes_blast_radius_and_tags_direct(monkeypatch):
     monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
     monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [dict(d) for d in diffs])
     monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [{"type_name": "Ep", "changed": True}])
-    monkeypatch.setattr(me, "_apply_operation", lambda ctx, b, op, restores=None: {"op": op.get("op")})
+    monkeypatch.setattr(me, "_apply_operation", lambda ctx, b, op, restores=None, **kwargs: {"op": op.get("op")})
     monkeypatch.setattr(me, "_verify_operation", lambda ctx, b, result: {**result, "status": "verified"})
     monkeypatch.setattr(me, "_annotate_operation_results", lambda ctx, results, type_diffs: results)
 
@@ -2557,7 +2648,7 @@ def test_preview_journaled_undo_failure_is_not_success(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": "rename_symbol", "requested": {}}
 
@@ -2588,7 +2679,7 @@ def test_verify_fail_journaled_undo_failure_returns_structured_result(monkeypatc
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": "rename_symbol", "requested": {}}
 
     _mutation_with_stubs(
@@ -2620,7 +2711,7 @@ def test_preview_revert_raise_absorbed_into_structured_result(monkeypatch):
 
     bv.revert_undo_actions = boom
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": "rename_symbol", "requested": {}}
 
@@ -2653,7 +2744,7 @@ def test_verify_fail_restamps_verified_siblings_as_reverted(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": op["op"], "requested": {}}
 
     calls = {"n": 0}
@@ -2687,7 +2778,7 @@ def test_verify_fail_restamps_siblings_rollback_failed_when_revert_fails(monkeyp
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": op["op"], "requested": {}}
 
     calls = {"n": 0}
@@ -2716,7 +2807,7 @@ def test_verify_fail_all_ops_failed_none_restamped_reverted(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": op["op"], "requested": {}}
 
     _mutation_with_stubs(
@@ -2740,7 +2831,7 @@ def test_noop_op_retains_noop_status_through_rollback(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": op["op"], "requested": {}}
 
     calls = {"n": 0}
@@ -3526,7 +3617,7 @@ def test_live_verify_fail_with_proto_on_auto_reports_residue_and_fails(monkeypat
     fn = _FakeFunction(0x401000, "f")  # has_user_type starts False
     bv = _FakeMutationBV(functions=[fn])
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         if op["op"] == "set_prototype":
             fn.set_user_type("uint64_t f(int32_t a)")  # pins has_user_type True
             restores.append(lambda: fn.set_auto_type("int32_t()"))  # value only; flag stays
@@ -3559,7 +3650,7 @@ def test_apply_failure_with_proto_on_auto_discloses_residue(monkeypatch):
     fn = _FakeFunction(0x401000, "f")
     bv = _FakeMutationBV(functions=[fn])
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         if op["op"] == "boom":
             raise bridge.OperationFailure("unsupported", "nope", requested={})
         fn.set_user_type("uint64_t f(int32_t a)")
@@ -3777,7 +3868,7 @@ def test_post_apply_exception_with_proto_on_auto_marks_dirty(monkeypatch):
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         fn.set_user_type("uint64_t f(int32_t a)")           # pins has_user_type True
         restores.append(lambda: fn.set_auto_type("int32_t()"))  # value only; flag stays
         return {"op": "set_prototype", "address": "0x401000",
@@ -3812,7 +3903,7 @@ def test_preview_locals_only_batch_reports_no_proto_residue(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": "local_rename", "requested": {}}
 
@@ -3974,7 +4065,7 @@ def test_preview_proto_plus_safe_ops_on_user_typed_function_allowed(monkeypatch)
     # the user-typed function.
     monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         restores.append(lambda: None)
         return {"op": op["op"], "address": "0x402000",
                 "before_has_user_type": True, "requested": {}}
@@ -4079,7 +4170,7 @@ def test_rolled_back_present_on_the_success_path_652(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         return {"op": op["op"], "requested": {}}
 
     def verify(bv_, result):
@@ -4108,7 +4199,7 @@ def test_duplicate_write_key_rejected_up_front_652(monkeypatch):
     bv = _FakeMutationBV()
     applied = []
 
-    def apply(bv_, op, restores=None):
+    def apply(bv_, op, restores=None, **kwargs):
         applied.append(op)
         return {"op": op["op"], "requested": {}}
 
@@ -4132,7 +4223,7 @@ def test_duplicate_write_key_normalizes_addresses_652(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
     _mutation_with_stubs(monkeypatch, bridge, instance, bv,
-                         apply=lambda bv_, op, restores=None: {"op": op["op"], "requested": {}},
+                         apply=lambda bv_, op, restores=None, **kwargs: {"op": op["op"], "requested": {}},
                          verify=lambda bv_, r: {**r, "status": "verified"})
 
     with pytest.raises(bridge.OperationFailure) as exc:
@@ -4153,7 +4244,7 @@ def test_distinct_and_accumulative_keys_still_apply_652(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
     _mutation_with_stubs(monkeypatch, bridge, instance, bv,
-                         apply=lambda bv_, op, restores=None: {"op": op["op"], "requested": {}},
+                         apply=lambda bv_, op, restores=None, **kwargs: {"op": op["op"], "requested": {}},
                          verify=lambda bv_, r: {**r, "status": "verified"})
 
     result = instance._mutation("active", False, [

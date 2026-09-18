@@ -1685,7 +1685,8 @@ def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = 
     return kind
 
 
-def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
+def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None, *,
+                     defer_reanalysis: bool = False):
     # A manifest op must be a JSON object; a non-object element (e.g.
     # "ops": ["foo"]) gets a clean invalid_request, not an AttributeError (#48).
     if not isinstance(op, dict):
@@ -1719,7 +1720,8 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
         if kind == "types_declare":
             return _op_types_declare(ctx, bv, op)
         if kind == "function_create":
-            return _op_function_create(ctx, bv, op, restores)
+            return _op_function_create(ctx, bv, op, restores,
+                                       defer_reanalysis=defer_reanalysis)
         if kind == "tag_add":
             return _op_tag_add(ctx, bv, op)
         if kind == "tag_remove":
@@ -2087,7 +2089,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     deliberately runs OUTSIDE it, under the gate alone, so concurrent reads
     (doctor, target info, function list, ...) stay live instead of starving for a
     multi-minute reanalysis -- parity with load_binary (#99), refresh (#321) and
-    go_rename (#365). The revert/settle paths stay exclusive on purpose: a reader
+    go_rename (#365). #780 extends that to the per-op reanalysis a function_create
+    op used to run inside the apply loop: it is deferred to this post-apply pass, so
+    an N-create batch reanalyzes once, never inside the exclusive lock. The
+    revert/settle paths stay exclusive on purpose: a reader
     must never observe a half-reverted view. The #479 quick-load refusal is
     unchanged. ``exclusive=None`` means "no exclusive scope" (a no-op), so direct
     engine calls and tests keep working. Every return path produces exactly the
@@ -2228,7 +2233,14 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         restores: list = []
         try:
             for op in operations:
-                results.append(_apply_operation(ctx, bv, op, restores))
+                # #780: function_create is the one op that reanalyzes while it
+                # applies. The batch's own post-apply reanalysis (below, gate-only)
+                # already covers every create, so the per-op one only added N full
+                # analyses under the exclusive lock to an N-create batch, starving
+                # every concurrent read. Defer it -- the same #628 deferral -- and
+                # _verify_function_create does the post-analysis readback + #386
+                # code guard afterwards.
+                results.append(_apply_operation(ctx, bv, op, restores, defer_reanalysis=True))
         except OperationFailure as exc:
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
@@ -3911,7 +3923,8 @@ def _function_create_guard_message(addr: int, reason: str) -> str:
     )
 
 
-def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = None):
+def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = None, *,
+                        defer_reanalysis: bool = False):
     """Create (and analyze) a function at an address inside a BATCH (#308).
 
     Unlike the standalone ``function create`` op (create_comments._function_create,
@@ -3922,7 +3935,17 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     ``remove_function`` (#304) so a later create still works.
     read_misc / create_comments are imported locally to keep this module's
     one-way import direction (create_comments imports mutation_engine, not the
-    reverse)."""
+    reverse).
+
+    #780 lock split: ``defer_reanalysis`` is the batch apply loop's request to run
+    this op's reanalysis OUTSIDE the exclusive target lock, exactly as #628 did for
+    the batch's post-apply reanalysis and for create_comments._function_create. The
+    op then only creates (``create_user_function`` registers the function
+    synchronously); the batch's single post-apply ``update_analysis_and_wait()``
+    analyzes every created function at once, gate-only, and ``_verify_function_create``
+    runs the post-analysis readback + #386 code guard. ``defer_reanalysis=False`` (the
+    default) keeps the op self-contained -- create, analyze, read back and guard -- so
+    direct engine calls and tests are unaffected, mirroring ``exclusive=None``."""
     from . import create_comments, read_misc
 
     addr = _parse_address(op["address"])
@@ -3964,19 +3987,30 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # create_user_function (FORCED), not add_function (an advisory auto hint that
     # declines exactly the auto-skipped data-table / missed-handler addresses this
     # op exists to recover -- #360). Mirrors the standalone create_comments path.
-    bv.create_user_function(addr)
-    bv.update_analysis_and_wait()
-    created = bv.get_function_at(addr)
-    if created is None:
-        # BN's analysis declined to keep a function here; drop the stray
-        # (non-poisoning remove_function) before failing the op.
-        create_comments._remove_created_function(ctx, bv, addr)
-        raise OperationFailure(
-            "verification_failed",
-            f"No function starts at {hex(addr)} after analysis.",
-            requested=requested,
-            observed={"address": hex(addr), "function": None},
-        )
+    # BN registers the user function synchronously, so its return value names the
+    # created function even before any analysis runs.
+    created = bv.create_user_function(addr)
+    if defer_reanalysis:
+        # #780: no reanalysis here -- the batch's post-apply
+        # update_analysis_and_wait() runs once for the whole batch, outside the
+        # exclusive lock, and _verify_function_create then does the post-analysis
+        # readback (is the function still there?) and the #386 code guard. Fall
+        # back to the view lookup if this BN's create_user_function returns None.
+        if created is None:
+            created = bv.get_function_at(addr)
+    else:
+        bv.update_analysis_and_wait()
+        created = bv.get_function_at(addr)
+        if created is None:
+            # BN's analysis declined to keep a function here; drop the stray
+            # (non-poisoning remove_function) before failing the op.
+            create_comments._remove_created_function(ctx, bv, addr)
+            raise OperationFailure(
+                "verification_failed",
+                f"No function starts at {hex(addr)} after analysis.",
+                requested=requested,
+                observed={"address": hex(addr), "function": None},
+            )
     # Register the removal of this created function as a batch restore BEFORE the
     # code guard runs, so a guard REJECTION is covered by the standard batch
     # rollback accounting rather than a fire-and-forget cleanup whose failure is
@@ -3995,27 +4029,28 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     if restores is not None:
         restores.append(_remove_created_restore)
 
-    reason = _function_looks_like_code(bv, created, addr)
-    if reason is not None:
-        # The forced create landed a junk function on non-code; drop it
-        # (non-poisoning remove_function) and fail honestly instead of reporting
-        # the fabricated function verified (#386). The removal boolean is not
-        # discarded: the restore registered above re-checks it on batch rollback
-        # and RAISES if the function still persists, so a failed cleanup is
-        # reported as rolled_back=false rather than a silent clean rollback with
-        # the fabricated function still live (#520).
-        create_comments._remove_created_function(ctx, bv, addr)
-        raise OperationFailure(
-            "verification_failed",
-            _function_create_guard_message(addr, reason),
-            requested=requested,
-            observed={"address": hex(addr), "function": str(created.name)},
-        )
+    if not defer_reanalysis:
+        reason = _function_looks_like_code(bv, created, addr)
+        if reason is not None:
+            # The forced create landed a junk function on non-code; drop it
+            # (non-poisoning remove_function) and fail honestly instead of reporting
+            # the fabricated function verified (#386). The removal boolean is not
+            # discarded: the restore registered above re-checks it on batch rollback
+            # and RAISES if the function still persists, so a failed cleanup is
+            # reported as rolled_back=false rather than a silent clean rollback with
+            # the fabricated function still live (#520).
+            create_comments._remove_created_function(ctx, bv, addr)
+            raise OperationFailure(
+                "verification_failed",
+                _function_create_guard_message(addr, reason),
+                requested=requested,
+                observed={"address": hex(addr), "function": str(created.name)},
+            )
     return {
         "op": "function_create",
         "status": "verified",
         "address": hex(addr),
-        "function": str(created.name),
+        "function": str(created.name) if created is not None else None,
         "requested": requested,
     }
 
@@ -4036,5 +4071,24 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             requested=item.get("requested"),
             observed=item["observed"],
         )
+    # #780: the op's own reanalysis is deferred out of the exclusive lock to the
+    # batch's post-apply one, so the #386 code guard runs HERE -- after that
+    # reanalysis, and before the op can be reported verified. This is the same
+    # check _op_function_create applies when it reanalyzes itself (``defer_reanalysis``
+    # False); running it a second time for a self-analyzing op is a no-op.
+    reason = _function_looks_like_code(bv, fn, addr)
+    if reason is not None:
+        # A junk function on non-code: fail the op. The batch's standard rollback
+        # (the removal restore registered by _op_function_create) drops the
+        # fabricated function -- same net result as the apply-time guard.
+        raise OperationFailure(
+            "verification_failed",
+            _function_create_guard_message(addr, reason),
+            requested=item.get("requested"),
+            observed=item["observed"],
+        )
+    # Report the post-analysis name (the op's readback is post-analysis too when it
+    # analyzes itself; a deferred op only saw the pre-analysis name).
+    item["function"] = str(fn.name)
     item["status"] = "verified"
     return item
