@@ -1917,6 +1917,71 @@ def test_xrefs_identifier_and_field_are_mutually_exclusive(monkeypatch, capsys):
     assert "T.x" in err
 
 
+def test_xrefs_text_mode_refuses_offset_instead_of_discarding_it_738(monkeypatch, capsys):
+    # #738: text mode groups the FULL set by caller and uses --limit only as
+    # a display cap on groups, so --offset never reached the op. Every offset
+    # returned byte-identical output at exit 0 -- an agent paging a hot symbol
+    # re-read page 1 forever and believed it had advanced. Worse, the derived
+    # slicing hint advertises --offset for this stem because the PARSER
+    # accepts it: right about acceptance, wrong about effect.
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--offset", "300",
+                      "--target", "active"])
+
+    assert rc == 2                       # refused before the bridge, like --lines
+    err = capsys.readouterr().err
+    assert "--offset only applies to --format json" in err
+    assert "xrefs" in err
+    # The message must say what to do, not only what is wrong.
+    assert "--format json" in err and "--limit" in err
+
+
+def test_evidence_xrefs_text_mode_refuses_offset_too_738(monkeypatch, capsys):
+    # The issue names BOTH stems; a fix that lands on one leaves the other
+    # silently wrong, which is how a per-renderer defect survives a fix.
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["evidence", "xrefs", "0x401000", "--offset", "150",
+                      "--target", "active"])
+
+    assert rc == 2
+    assert "--offset only applies to --format json" in capsys.readouterr().err
+
+
+def test_xrefs_json_mode_still_pages_with_offset_738(fake_transport, capsys):
+    # Must-not-fire twin: JSON honours --offset correctly today and the
+    # refusal must not touch it -- that is the mode the message redirects to,
+    # so breaking it would make the advice a dead end.
+    calls = fake_transport({"xrefs": {
+        "ok": True, "result": {"kind": "xrefs", "items": [], "total": 1405,
+                               "offset": 300, "limit": 5, "returned": 0,
+                               "has_more": True}}})
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--offset", "300",
+                      "--target", "active", "--format", "json"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["offset"] == 300
+    assert calls[-1]["params"]["limit"] == 5
+
+
+def test_xrefs_text_mode_without_offset_is_unaffected_738(fake_transport, capsys):
+    # Must-not-fire twin: the refusal is conditional on --offset, so ordinary
+    # text use -- including --limit as the documented group display cap --
+    # keeps working and still does not forward paging to the op.
+    calls = fake_transport({"xrefs": {
+        "ok": True, "result": {"kind": "xrefs", "items": [], "total": 0,
+                               "offset": 0, "limit": None, "returned": 0,
+                               "has_more": False}}})
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--target", "active"])
+
+    assert rc == 0
+    assert "offset" not in calls[-1]["params"]
+    assert "limit" not in calls[-1]["params"]
+
+
 def test_trace_render_step_grammar_singular_and_plural():
     from bn import formatters
     base = {

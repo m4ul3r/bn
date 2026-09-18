@@ -860,6 +860,79 @@ def test_batch_apply_ordinary_manifest_is_untouched_by_the_guard_769(
     assert len(calls[-1]["params"]["ops"]) == 50
 
 
+def test_batch_apply_op_ceiling_is_strict_at_both_sides_of_the_boundary_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #769 review finding 2: no test pinned the comparison, so turning
+    # `>` into `>=` left every new test green. The ceiling is a MAXIMUM --
+    # exactly max_ops is allowed and max_ops+1 is not -- and an off-by-one
+    # here silently rejects a batch the user was told was legal.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "50")
+    at = tmp_path / "at.json"
+    at.write_text(_op_manifest(50))
+    over = tmp_path / "over.json"
+    over.write_text(_op_manifest(51))
+
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", str(at), "--preview"]) == 0
+    assert len(calls[-1]["params"]["ops"]) == 50      # AT the cap: allowed
+
+    calls2 = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+    assert bn.cli.main(["batch", "apply", str(over), "--preview"]) == 3
+    assert calls2 == []                                # one over: refused
+
+
+def test_batch_apply_byte_ceiling_is_strict_at_both_sides_of_the_boundary_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # Same gap on the byte clamp. Sized against the REQUEST the manifest
+    # produces (#769 review finding 1), so the boundary is expressed in the
+    # quantity the guard actually compares rather than in file bytes.
+    from bn.wire_limits import request_bytes_for_params
+    import json as _json
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")     # isolate the byte check
+    path = tmp_path / "m.json"
+    path.write_text(_op_manifest(20))
+    exact = request_bytes_for_params(_json.loads(path.read_text()))
+
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(exact))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", str(path), "--preview"]) == 0
+    assert calls and calls[-1]["op"] == "batch_apply"     # AT the cap: allowed
+
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(exact - 1))
+    calls2 = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+    assert bn.cli.main(["batch", "apply", str(path), "--preview"]) == 3
+    assert calls2 == []                                   # one over: refused
+
+
+def test_batch_apply_byte_guard_ignores_manifest_whitespace_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #769 review finding 1: the guard judged the FILE, but the file is
+    # re-serialized before it is sent -- so a pretty-printed manifest was
+    # refused while its compact twin, producing a BYTE-IDENTICAL request,
+    # was accepted. The refusal's stated reason ("sending it can only
+    # fail") was factually false for exactly those inputs.
+    import json as _json
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")
+    ops = _json.loads(_op_manifest(40))
+    compact = tmp_path / "c.json"
+    compact.write_text(_json.dumps(ops))
+    pretty = tmp_path / "p.json"
+    pretty.write_text(_json.dumps(ops, indent=2))
+    assert len(pretty.read_bytes()) > len(compact.read_bytes()) + 500
+
+    # A ceiling that admits the compact file must admit the pretty one too:
+    # they produce the same request.
+    from bn.wire_limits import request_bytes_for_params
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(request_bytes_for_params(ops)))
+    for path in (compact, pretty):
+        calls = fake_transport({"batch_apply": {"ok": True, "result": {
+            "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+        assert bn.cli.main(["batch", "apply", str(path), "--preview"]) == 0, path.name
+        assert calls[-1]["op"] == "batch_apply", path.name
+
+
 def test_batch_apply_byte_ceiling_refuses_without_sending_769(
         monkeypatch, fake_transport, capsys, tmp_path):
     # The byte ceiling defaults to the BRIDGE's own wire limit -- that

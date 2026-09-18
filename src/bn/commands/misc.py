@@ -27,7 +27,7 @@ from ..formatters import (
 )
 from ..transport import BridgeError, unwrap_result
 from ..wire_limits import (MAX_BYTES_ENV, MAX_OPS_ENV, batch_apply_max_bytes,
-                           batch_apply_max_ops)
+                           batch_apply_max_ops, request_bytes_for_params)
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
@@ -570,7 +570,12 @@ def _py_exec(args: argparse.Namespace) -> int:
                      "Kinds: rename_symbol, set_comment, delete_comment, set_prototype, "
                      "local_rename, local_retype, struct_field_set, struct_field_rename, "
                      "struct_field_delete, types_declare. A missing required field is reported "
-                     "as status 'invalid_request' naming the field."
+                     "as status 'invalid_request' naming the field.\n"
+                     "Ceilings: a manifest over 5000 ops, or whose request would exceed the "
+                     "bridge's 32 MiB wire limit, is refused before anything is sent -- a "
+                     "batch that large holds the write lock for the whole run and reverts as "
+                     "ONE unit. Raise or disable either with BN_BATCH_APPLY_MAX_OPS=<n> / "
+                     "BN_BATCH_APPLY_MAX_BYTES=<n> (0 disables)."
                  )),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
@@ -642,13 +647,22 @@ def _batch_apply(args: argparse.Namespace) -> int:
                 f"ceiling with {MAX_OPS_ENV}=<n> (0 disables)."
             )
         max_bytes = batch_apply_max_bytes()
-        raw_bytes = len(raw.encode("utf-8"))
-        if max_bytes is not None and raw_bytes > max_bytes:
+        # #769 review: measure the REQUEST, not the FILE. The file is
+        # re-serialized before it is sent, so a pretty-printed manifest is
+        # far larger than the request it produces -- judging the file
+        # refused inputs the bridge accepts, and made this message's own
+        # reason false for them. The request also carries an envelope the
+        # file lacks, so a compact file exactly at the cap slipped through
+        # and died at the bridge with the bare `request too large` this
+        # guard exists to pre-empt. One quantity, measured the way the
+        # transport serializes it.
+        request_bytes = request_bytes_for_params(manifest)
+        if max_bytes is not None and request_bytes > max_bytes:
             raise BridgeError(
-                f"Manifest ({source}) is {raw_bytes} bytes, over the "
-                f"{max_bytes} limit -- the bridge refuses a request this "
-                f"large on arrival, so sending it can only fail. Split it, "
-                f"or raise/disable the ceiling with {MAX_BYTES_ENV}=<n> "
+                f"Manifest ({source}) produces a {request_bytes}-byte request, "
+                f"over the {max_bytes} limit -- the bridge refuses a request "
+                f"this large on arrival, so sending it can only fail. Split "
+                f"it, or raise/disable the ceiling with {MAX_BYTES_ENV}=<n> "
                 f"(0 disables)."
             )
     # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and

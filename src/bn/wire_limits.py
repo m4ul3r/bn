@@ -17,12 +17,43 @@ would refuse requests the bridge would have accepted.
 """
 from __future__ import annotations
 
+import json
 import os
+from typing import Any
 
 # The wire ceiling. A request line longer than this is refused by the bridge
 # (see ``BridgeHandler.handle``), so it is also the honest client-side
 # ceiling: sending more can only fail.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+# What the bridge caps is the SERIALIZED REQUEST, so that is what a
+# client-side guard must measure. The manifest FILE is not that quantity and
+# not a safe proxy for it, in either direction (#769 review):
+#
+#   * the file is re-serialized before it is sent, so indentation is
+#     discarded -- a pretty-printed 3909-byte manifest and its 2779-byte
+#     compact twin produce the SAME 3024-byte request. Judging the file
+#     refuses inputs the bridge would accept, and the refusal's stated
+#     reason ("sending it can only fail") is then factually false;
+#   * the request also carries an envelope the file does not -- id, op,
+#     target, bridge identity -- so a compact file exactly at the cap
+#     produces an OVER-cap request and dies at the bridge with the bare
+#     `request too large` this guard exists to pre-empt.
+#
+# `REQUEST_ENVELOPE_BYTES` is the non-params part, derived from the real
+# payload shape rather than guessed, and deliberately rounded UP: over-
+# reserving costs a few hundred bytes of a 32 MiB budget, while
+# under-reserving reopens the second bullet.
+REQUEST_ENVELOPE_BYTES = 512
+
+
+def request_bytes_for_params(params: Any) -> int:
+    """Bytes the request carrying *params* will occupy on the wire.
+
+    Serialized the same way `transport` serializes it, so the guard and the
+    sender measure one quantity rather than two.
+    """
+    return len(json.dumps(params).encode("utf-8")) + REQUEST_ENVELOPE_BYTES
 
 # Op-count ceiling for one `batch apply` manifest. Not a wire limit -- a
 # manifest well under the byte cap can still hold enough operations to hold

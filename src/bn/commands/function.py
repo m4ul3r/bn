@@ -263,6 +263,36 @@ def _require_text_format(args: argparse.Namespace, flag: str) -> None:
         raise BridgeError(f"{flag} only applies to --format text")
 
 
+def _reject_text_mode_offset(args: argparse.Namespace, stem: str) -> None:
+    """Refuse `--offset` where text mode cannot honour it, instead of
+    discarding it (#738).
+
+    On the xrefs family text mode GROUPS the full result set by caller and
+    uses `--limit` only as a renderer-side cap on how many groups print, so
+    the offset never reached the op: every offset returned byte-identical
+    output at exit 0. An agent paging a hot symbol re-read page 1 forever
+    and believed it had advanced -- and the derived slicing hint, which
+    reads the flags a parser ACCEPTS, actively advertised `--offset` for
+    these stems in text mode. The hint was right about acceptance and wrong
+    about effect.
+
+    A refusal rather than a forward, because forwarding changes the answer:
+    grouping over a page is not the same result as grouping the full set,
+    and the display cap would have to be redefined. This is the same trade
+    `_require_text_format` already makes from the other direction, and it
+    makes the hint TRUE -- following it in text mode now tells you to
+    switch format rather than handing you page 1 again.
+    """
+    if args.format == "text" and getattr(args, "offset", 0):
+        raise BridgeError(
+            f"--offset only applies to --format json on {stem}: text mode "
+            f"groups the full result set by caller and uses --limit only as "
+            f"a display cap on groups, so an offset cannot move the page. "
+            f"Re-run with --format json to page, or raise --limit to show "
+            f"more groups.")
+
+
+
 @command("decompile", help="Render Binary Ninja Pseudo C for a function", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
@@ -567,6 +597,7 @@ def _xrefs(args: argparse.Namespace) -> int:
     # Text mode groups the full set and uses `limit` only as a renderer-side
     # caller-group display cap, so it must fetch the full set -- don't forward
     # offset/limit to the op or the renderer would group only a slice.
+    _reject_text_mode_offset(args, "xrefs")   # #738
     params: dict[str, Any] = {"identifier": identifier}
     if fn_pointer_scan:
         params["fn_pointer_scan"] = True
@@ -750,6 +781,7 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
     # data sections for stored function pointers so a callback-only function
     # (vtable/dispatch-table slot) isn't reported as dead (#323). Plain `xrefs`
     # stays fast and does not scan.
+    _reject_text_mode_offset(args, "evidence xrefs")   # #738, same reason
     params: dict[str, Any] = {"identifier": args.identifier, "fn_pointer_scan": True}
     limit = _effective_limit(args)
     if args.format != "text":
