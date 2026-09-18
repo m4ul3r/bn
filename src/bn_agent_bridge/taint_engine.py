@@ -2789,68 +2789,80 @@ class TaintEngine:
         """
         if length_idx >= len(params) or dest_idx >= len(params):
             return None
-        # The length operand is usually a VARIABLE whose definition is the
-        # subtraction (`n = cap - progress; read(..., n)`) rather than an inline
-        # expression -- that is the shape #791's own evidence shows. Resolve
-        # through the def chain the way `_syscall_bound_for_length` does, then
-        # fall back to an inline subtraction.
-        len_expr = params[length_idx]
-        if op_name(len_expr) != "MLIL_SUB":
-            var = self._as_single_ssa_var(len_expr)
-            if var is None:
-                return None
-            try:
-                d = ssaf.get_ssa_var_definition(var)
-            except Exception:
-                d = None
-            len_expr = getattr(d, "src", None) if d is not None else None
-            if len_expr is None or op_name(len_expr) != "MLIL_SUB":
-                return None
-        left, right = getattr(len_expr, "left", None), getattr(len_expr, "right", None)
+        sub = next((e for e in self._def_chain(ssaf, params[length_idx])
+                    if op_name(e) == "MLIL_SUB"), None)
+        if sub is None:
+            return None
+        left, right = getattr(sub, "left", None), getattr(sub, "right", None)
         # Both operands must be variables: a constant subtrahend is `v - C`,
         # which `_linear_in_var` already models and `_bounded_copy_reason`
         # already reasons about. This idiom is var-minus-var.
-        total_v = self._as_single_ssa_var(left)
-        cursor_v = self._as_single_ssa_var(right)
-        if total_v is None or cursor_v is None:
-            return None
         if self._int_const(left) is not None or self._int_const(right) is not None:
             return None
-        cursor_c = self._canonical_ssa_var(ssaf, cursor_v)
+        cursor_ids = self._chain_identities(ssaf, right)
+        if not cursor_ids or not self._chain_identities(ssaf, left):
+            return None
         # The SAME cursor must index the destination -- that is what makes this a
-        # residual chunk rather than an unrelated subtraction.
-        #
-        # The destination operand needs the SAME def-chain resolution the length
-        # just had, and for the same reason. On real MLIL SSA a call operand is a
-        # VARIABLE (`read(fd, rsi#2, n#1)`), so reading the operand's own
-        # `expr_reads` yields the destination pointer itself and never the
-        # cursor -- the address arithmetic lives in that variable's DEFINITION
-        # (`rsi#2 = &staging + progress#3`). Matching only on the operand made
-        # this recogniser dead on every real binary while still passing a unit
-        # test whose fixture inlined the ADD into the call, a shape the lifter
-        # does not produce. Check the operand first (cheap, and covers an
-        # inlined address), then its definition.
-        def _mentions_cursor(expr: Any) -> bool:
+        # residual chunk rather than an unrelated subtraction. Both operands get
+        # the same bounded chain walk, for the same reason: on real MLIL the
+        # address arithmetic and the subtraction each live behind their own
+        # variable, and at -O0 behind SEVERAL copies. Cross-dogfood measured the
+        # real shapes -- `rsi#2 -> rcx_1#2 -> ADD` on the destination and
+        # `rdx_1#2 -> n#2 -> rax_3#6(SUB)` on the length at -O0, and an
+        # `MLIL_SX` sitting between the operand and the SUB whenever the length
+        # is written `int n` (read takes size_t, so the widening is always
+        # there). A single hop found 2 of 6 real variants; the chain walk sees
+        # through copies and width extensions alike.
+        for expr in self._def_chain(ssaf, params[dest_idx]):
             for r in expr_reads(expr):
-                rc = self._canonical_ssa_var(ssaf, r)
-                if (var_key(rc) == var_key(cursor_c)
-                        and getattr(rc, "version", None) == getattr(cursor_c, "version", None)):
-                    return True
-            return False
-
-        dest_expr = params[dest_idx]
-        if _mentions_cursor(dest_expr):
-            return str(left), str(right)
-        dest_var = self._as_single_ssa_var(dest_expr)
-        if dest_var is not None:
-            try:
-                d = ssaf.get_ssa_var_definition(dest_var)
-            except Exception:
-                d = None
-            dest_def = getattr(d, "src", None) if d is not None else None
-            if dest_def is not None and _mentions_cursor(dest_def):
-                return str(left), str(right)
+                if self._chain_identities(ssaf, r) & cursor_ids:
+                    return str(left), str(right)
         return None
+
+    def _def_chain(self, ssaf: Any, expr: Any, limit: int = 8) -> list[Any]:
+        """*expr* and the expressions it resolves to through pure SSA copies and
+        width extensions, nearest first.
+
+        Bounded and cycle-safe. Sign/zero extensions are transparent because a
+        widened value denotes the same quantity -- `sx.q(n)` IS `n` for the
+        purpose of asking "what computed this".
+        """
+        out: list[Any] = []
+        seen: set = set()
+        cur = expr
+        for _ in range(limit):
+            if cur is None:
+                break
+            out.append(cur)
+            if op_name(cur) in ("MLIL_SX", "MLIL_ZX"):
+                cur = getattr(cur, "src", None)
+                continue
+            var = self._as_single_ssa_var(cur)
+            if var is None:
+                break
+            ident = (var_key(var), getattr(var, "version", None))
+            if ident in seen:
+                break
+            seen.add(ident)
+            try:
+                defn = ssaf.get_ssa_var_definition(var)
+            except Exception:
+                defn = None
+            cur = getattr(defn, "src", None) if defn is not None else None
+        return out
+
+    def _chain_identities(self, ssaf: Any, expr: Any) -> set:
+        """Canonical ``(key, version)`` identities *expr* can denote along its
+        copy/extension chain -- the comparison key for "is this the same value",
+        tolerant of the widening and copying a real lifter inserts."""
+        ids: set = set()
+        for e in self._def_chain(ssaf, expr):
+            var = self._as_single_ssa_var(e)
+            if var is None:
+                continue
+            canon = self._canonical_ssa_var(ssaf, var)
+            ids.add((var_key(canon), getattr(canon, "version", None)))
+        return ids
 
     def _const_value(self, expr: Any) -> int | None:
         """The integer constant of a CONST/CONST_PTR expression, else None."""

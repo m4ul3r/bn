@@ -8413,46 +8413,77 @@ def _two_recv_callsites():
     return FFunc("recv_both", 0x10, FSSAFunc(instrs), params=[fd])
 
 
-def _residual_chunk_func(*, inline_dest: bool = False):
-    """fill(fd, cap): dst#1 = &staging + progress#1; n#1 = cap#0 - progress#1;
-    read(fd, dst#1, n#1).
+def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
+                         copy_hops: int = 0):
+    """fill(fd, cap): dst = &staging + progress; n = cap - progress;
+    read(fd, dst, n).
 
-    #791's shape reduced. BOTH operands are call arguments that are plain SSA
-    VARIABLES, because that is what a real lifter produces -- the address
-    arithmetic and the subtraction each live in their own `MLIL_SET_VAR_SSA`,
-    and the call just reads the two results. An earlier version of this fixture
-    inlined the `MLIL_ADD` directly into the call's parameter list; that shape
-    does not occur in real MLIL, and it let the recogniser pass here while
-    being dead on every real binary (found by cross-dogfood against a live
-    bridge). `inline_dest=True` keeps the inlined variant covered too, since the
-    matcher checks the operand before its definition.
+    #791's shape reduced, in the spellings a real lifter actually emits. Each
+    knob corresponds to a variant measured against a live bridge during
+    cross-dogfood, because every one of them defeated an earlier version of the
+    matcher:
+
+    * default -- both call operands are plain SSA VARIABLES whose definitions
+      hold the ADD and the SUB. The first implementation read the operands
+      directly and was dead on every real binary while passing a fixture that
+      inlined the ADD into the call.
+    * ``inline_dest`` -- the ADD inlined into the parameter list. Not a shape
+      the lifter produces, kept because the matcher checks the operand before
+      walking its chain.
+    * ``widen_len`` -- an ``MLIL_SX`` between the length operand and the SUB.
+      This is the ordinary ``int n = cap - progress`` spelling: ``read`` takes
+      ``size_t``, so the widening is ALWAYS there, and a matcher that stops at
+      the extension sees no subtraction.
+    * ``copy_hops`` -- extra copy indirections on both operands, the -O0 shape
+      (measured: ``rsi#2 -> rcx_1#2 -> ADD`` and ``rdx_1#2 -> n#2 -> SUB``).
+      A one-hop resolver finds neither.
 
     The destination is a FIXED stack array -- precisely what this engine cannot
-    size, which is why the finding must survive."""
+    size, which is why the finding must survive rather than be downgraded."""
     fd, cap = FVar("fd"), FVar("cap")
     staging = FVar("staging", typ="uint8_t[0x1000]")
     cap0 = FSSA(cap, 0)
-    prog1, n1, dst1 = FSSA(FVar("progress"), 1), FSSA(FVar("n"), 1), FSSA(FVar("dst"), 1)
+    prog1 = FSSA(FVar("progress"), 1)
     sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
                 left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
                 right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
     addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
                       left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
                       right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
-    instrs = []
+    instrs: list = []
+    addr = 0x18
+
+    def _bind(name, src_expr, reads):
+        """Emit `name#1 = <src>` and return the operand that reads it."""
+        nonlocal addr
+        ssa = FSSA(FVar(name), 1)
+        instrs.append(FInstr(len(instrs), addr, "MLIL_SET_VAR_SSA",
+                             f"{name}#1 = {src_expr}", reads=list(reads),
+                             writes=[ssa], src=src_expr))
+        addr += 4
+        return FExpr("MLIL_VAR_SSA", f"{name}#1", reads=[ssa]), ssa
+
     if inline_dest:
-        dest_param = addr_expr
+        dest_param, dest_ssa = addr_expr, None
     else:
-        instrs.append(FInstr(0, 0x1C, "MLIL_SET_VAR_SSA", "dst#1 = &staging + progress#1",
-                             reads=[prog1], writes=[dst1], src=addr_expr))
-        dest_param = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
-    base = len(instrs)
-    instrs.append(FInstr(base, 0x20, "MLIL_SET_VAR_SSA", "n#1 = cap#0 - progress#1",
-                         reads=[cap0, prog1], writes=[n1], src=sub))
-    instrs.append(_ext_call(base + 1, 0x24, "read(fd, dst#1, n#1)", 0x910,
-                            [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest_param,
-                             FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])],
-                            reads=[n1, dst1]))
+        dest_param, dest_ssa = _bind("dst", addr_expr, [prog1])
+        for i in range(copy_hops):
+            dest_param, dest_ssa = _bind(f"dstc{i}", dest_param, [dest_ssa])
+
+    len_src = sub
+    len_reads = [cap0, prog1]
+    if widen_len:
+        narrow, narrow_ssa = _bind("ni", sub, len_reads)
+        len_src = FExpr("MLIL_SX", f"sx.q({narrow})", reads=[narrow_ssa], src=narrow)
+        len_reads = [narrow_ssa]
+    len_param, len_ssa = _bind("n", len_src, len_reads)
+    for i in range(copy_hops):
+        len_param, len_ssa = _bind(f"nc{i}", len_param, [len_ssa])
+
+    call_reads = [len_ssa] + ([dest_ssa] if dest_ssa is not None else [])
+    instrs.append(_ext_call(len(instrs), 0x40, "read(fd, dst, n)", 0x910,
+                            [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest_param, len_param],
+                            reads=call_reads))
     return FFunc("fill", 0x10, FSSAFunc(instrs), params=[fd, cap])
 
 
@@ -8551,9 +8582,14 @@ def test_forward_run_params_echo_the_configured_knobs_812(models):
     assert result["stats"]["max_depth"] <= 3
 
 
-@pytest.mark.parametrize("inline_dest", [False, True],
-                         ids=["dest_via_def_chain", "dest_inlined"])
-def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, inline_dest):
+@pytest.mark.parametrize("shape", [
+    {},                                  # dst/len each one def hop behind the call
+    {"inline_dest": True},               # ADD inlined into the parameter list
+    {"widen_len": True},                 # `int n = cap - progress` -> SX before the SUB
+    {"copy_hops": 2},                    # -O0: several copies on both operands
+    {"widen_len": True, "copy_hops": 2},  # both at once
+], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied"])
+def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape):
     # #791 asked for the chunked-read residual (`n = cap - progress;
     # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
     # by default. It is deliberately recognised and NOT downgraded: the loop
@@ -8563,10 +8599,14 @@ def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, inlin
     # controlled `cap` into a fixed stack buffer -- so suppressing on the shape
     # would clear a real overflow. The class must survive; only the open
     # question is named.
-    # Both destination shapes: the def-chain one a real lifter emits (the case
-    # the first implementation missed entirely, caught by cross-dogfood against
-    # a live bridge) and the inlined one.
-    func = _residual_chunk_func(inline_dest=inline_dest)
+    #
+    # Every shape here is one a live bridge actually produced, and each defeated
+    # an earlier matcher: reading the call operand directly missed all of them;
+    # a single def hop still missed the widened `int n` spelling and every -O0
+    # variant (4 of 6 real variants), because the SUB sits behind an MLIL_SX or
+    # two copies. Disclosure has to hold across the spellings the compiler
+    # chooses, or it is advice that only appears when it is least needed.
+    func = _residual_chunk_func(**shape)
     result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
         func, [te.parse_locator("param:1")],
         enabled_sink_classes={"recv_overflow"})
