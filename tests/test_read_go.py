@@ -415,3 +415,99 @@ def test_go_rename_cancel_rolls_back(monkeypatch):
 
     assert fns[0x401000].name == "sub_401000"
     assert fns[0x402000].name == "sub_402000"
+class _ContainmentOnlyGoBV(_GoBV):
+    """A view where the pcln addresses are INTERIOR PCs of an already-recovered
+    body, so `get_function_at` (START-only) misses every one of them and only
+    `get_functions_containing` answers (#818's relation, which `go rename` still
+    re-resolved with the START-only accessor).
+
+    *starts* names the addresses BN does have a function START at; the rest are
+    answered by containment alone, under the containing body's own name.
+    """
+
+    _CONTAINER_NAME = "sub_400000"
+
+    def __init__(self, blob, *, starts=(), **kw):
+        super().__init__(blob, **kw)
+        self._starts = dict(starts)
+
+    def get_function_at(self, addr):
+        name = self._starts.get(int(addr))
+        return type("F", (), {"name": name})() if name else None
+
+    def get_functions_containing(self, addr):
+        return [type("F", (), {"name": self._CONTAINER_NAME})()]
+
+
+def test_go_rename_accounts_for_containment_only_rows_818(monkeypatch):
+    """#818 review: the two views must state ONE population.
+
+    `go functions` counts `defined` by CONTAINMENT, so on a view whose pcln
+    addresses resolve only as interior PCs it reports `defined 1848` -- while
+    `go rename` re-resolved every candidate with the START-only accessor, matched
+    nothing, and answered `defined_count: 1848` beside `go_renamed_candidates: 0`
+    with `success: true` and `results: []`. Rows #818 promoted to `defined: true`
+    landed in no bucket at all: not a candidate, not `skipped_user_named`, not a
+    failure row, so nothing in the envelope reconciled the two totals.
+
+    The row is DISCLOSED as unrenamable rather than renamed: the recovered name
+    belongs to the function that starts at the pcln entryoff, and the containing
+    body starts elsewhere -- applying it there would mislabel it.
+    """
+    blob = _build_pclntab()          # main.foo @0x401000, main.bar @0x402000
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob))
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("go rename must not use generic mutation"))
+
+    listed = inst._go_functions(None, summary=True)
+    rename = inst._go_rename(None, preview=True)
+
+    # Both views agree that two rows are defined...
+    assert listed["defined"] == 2 and listed["start_match_count"] == 0
+    assert rename["defined_count"] == 2
+    # ...and the rename side accounts for both of them instead of dropping them.
+    assert rename["go_renamed_candidates"] == 0 and rename["results"] == []
+    assert rename["skipped_interior_pc"] == 2
+    assert (rename["go_renamed_candidates"] + rename["skipped_user_named"]
+            + rename["skipped_interior_pc"]) == rename["defined_count"]
+
+    # The chunked/apply path carries the same accounting: one auto-named START
+    # candidate beside one containment-only row.
+    mixed, get_function_at = _fake_functions({0x401000: "sub_401000"})
+    mixed_bv = _ContainmentOnlyGoBV(blob, starts={0x401000: "sub_401000"})
+    monkeypatch.setattr(mixed_bv, "get_function_at", get_function_at)
+    _bridge, mixed_inst = _ctx(monkeypatch, mixed_bv)
+
+    applied = mixed_inst._go_rename(None, preview=True)
+
+    assert applied["go_renamed_candidates"] == 1
+    assert applied["go_verified_count"] == 1 and applied["skipped_interior_pc"] == 1
+    assert applied["defined_count"] == 2
+    assert mixed[0x401000].name == "sub_401000"          # preview reverted it
+
+
+def test_go_functions_summary_carries_the_note_and_the_start_matches_818(monkeypatch):
+    """#818 review: the go/no-go view is the one that must not lose the warning.
+
+    The note was attached after the summary branch returned, so `--summary` could
+    never carry it, and the counter it is gated on (`start_match_count`) was
+    JSON-only: the text renderer did not print it at all. Pre-#818 that view said
+    `defined 0 / undefined 1848` (loud and wrong); once `defined` could be
+    satisfied by containment the same view says `defined 1848 / undefined 0` --
+    the headline a caller decides `go rename` on -- with nothing saying that no
+    row matches a function START.
+    """
+    from bn.formatters import _render_go_functions_summary_text
+
+    blob = _build_pclntab()
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob))
+
+    summary = inst._go_functions(None, summary=True)
+
+    assert summary["defined"] == 2 and summary["undefined"] == 0
+    assert summary["start_match_count"] == 0
+    assert "note" in summary and "interior PC" in summary["note"]
+
+    text = _render_go_functions_summary_text(summary)
+    assert "start_matches: 0" in text
+    assert "interior PC" in text

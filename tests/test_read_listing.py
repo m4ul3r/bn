@@ -311,18 +311,22 @@ def test_function_listing_collapses_duplicate_start_addresses_757(monkeypatch):
 
 def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypatch):
     # #861: `_annotation_summary` walked `list(address_comments.items())` -- the
-    # ITEMS VIEW of BN's live global comment map -- so an entry analysis adds
-    # mid-walk raised `RuntimeError: dictionary changed size during iteration`
-    # and the enclosing `except Exception` turned that into a confident
-    # `comments: 0` / no locations. Those counts are what
-    # `bn_kernel.assert_unannotated` reads to certify a view pristine (#733 F2),
-    # so a walk that died must not be able to fabricate a clean bill of health.
-    # The store mutates DURING the walk (the #850 mechanism).
+    # ITEMS VIEW of the global comment map -- and the enclosing `except
+    # Exception` turned any failure of that walk into a confident `comments: 0`
+    # with no locations. Those counts are what `bn_kernel.assert_unannotated`
+    # reads to certify a view pristine (#733 F2), so a walk that died must not be
+    # able to fabricate a clean bill of health.
+    #
+    # The hazard is NOT reproducible against BN 6.1, where `address_comments`
+    # builds and returns a fresh local dict per access; the snapshot is cheap
+    # insurance, and the MUTATING view below is a fake that forces what the real
+    # accessor does not produce. What this pins is that the snapshot is taken (and
+    # that the counts stay honest if a BN build ever hands back the live store).
     bridge = _load_bridge(monkeypatch)
 
     class _LiveCommentStore(Mapping):
-        """`address_comments` as the bridge sees it: a live map analysis may add
-        to at any moment, including mid-walk."""
+        """`address_comments` as a view that IS the live store: entries added
+        mid-walk, which BN 6.1's accessor never exposes."""
 
         def __init__(self, entries: dict[int, str]) -> None:
             self._entries = dict(entries)
@@ -345,8 +349,8 @@ def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypat
                 yield address, text
 
     class _LiveAnnotationBV(_FakeBV):
-        """`_FakeBV.address_comments` hands back a fresh copy, which no walk can
-        catch changing; real BN exposes the map analysis writes into."""
+        """`_FakeBV.address_comments` hands back a fresh copy, like real BN; this
+        hands back the store itself, so the snapshot has something to defend."""
 
         def __init__(self, store) -> None:
             super().__init__()
@@ -369,13 +373,16 @@ def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypat
 def test_annotation_summary_snapshots_the_live_per_function_map_861(monkeypatch):
     """#861 review: the GLOBAL comment map was snapshotted, but the per-function
     map twelve lines below was still walked through its live `items()` -- the same
-    bug class, on the same call, whose RuntimeError the enclosing handler turned
-    into `existing_annotations.unavailable` on both `target info` and
-    `evidence orient`."""
+    shape, on the same call, one rule for one map and none for the other.
+
+    As with the global map, the hazard is not reproducible against BN 6.1
+    (`Function.comments` also returns a fresh dict per access): the snapshot is
+    cheap insurance, and the fake below forces the mutating store a BN build
+    would have to expose for it to matter."""
     bridge = _load_bridge(monkeypatch)
 
     class _LiveCommentStore(Mapping):
-        """`fn.comments` as BN holds it: a map analysis may add to mid-walk."""
+        """`fn.comments` as a store that IS the live map: entries added mid-walk."""
 
         def __init__(self, entries):
             self._entries = dict(entries)
@@ -450,3 +457,165 @@ def test_function_count_agrees_between_target_info_and_list_count_757(monkeypatc
 
     assert summary["function_count"] == counted["count"] == 2
     assert summary["duplicate_starts_collapsed"] == 1
+
+
+# --- #793 review: the annotation block's samples, and what it stops saying -----
+
+def test_annotation_summary_bounds_the_exclusion_sample_without_moving_a_count_793(monkeypatch):
+    """`symbol_exclusions` was the one UNCAPPED sample in this block.
+
+    On a real 2900-function target it was ~99.5% of the command's JSON (2048+
+    rows, ~180 KB), dominated by a single loader-placeholder family -- enough to
+    trip the tool's own token guard on `target info`, the command every agent
+    runs first, and the same block ships unconditionally on `refresh` and
+    `bundle function`. It is capped like its four sibling samples now.
+
+    The cap may not move a single COUNTER: `bn_kernel.assert_unannotated` reads
+    `comments` / `function_comments` / `user_symbols` (+`analyst_symbols`) to
+    certify a view, so the rows the cap drops are disclosed as a count on the
+    same block instead of by shrinking `placeholder_symbols`.
+    """
+    import json
+
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    limit = bridge.read_listing._ANNOTATION_SAMPLE_LIMIT
+    families = ["init", "fini", "dest", "destr_1a2b", "compar"]
+    placeholders = [
+        SimpleNamespace(auto=False, name=families[i % len(families)],
+                        address=0x401000 + i * 0x10)
+        for i in range(2048)
+    ]
+    analyst = SimpleNamespace(auto=False, name="parse_record", address=0x600000)
+    bv = _FakeBV(functions=[], symbols=[*placeholders, analyst])
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    # Every count is exactly what it was before the cap.
+    assert summary["placeholder_symbols"] == 2048
+    assert summary["user_symbols"] == 2049 and summary["analyst_symbols"] == 1
+    # The sample is bounded, ordered like the walk, and its shortfall is counted.
+    assert len(summary["symbol_exclusions"]) == limit == 20
+    assert [row["name"] for row in summary["symbol_exclusions"]] == [
+        placeholders[i].name for i in range(limit)
+    ]
+    assert summary["symbol_exclusions_dropped"] == 2048 - limit
+    assert (len(summary["symbol_exclusions"])
+            + summary["symbol_exclusions_dropped"]) == summary["placeholder_symbols"]
+    # The block stayed readable: 2048 exclusion rows is ~150 KB of this payload.
+    assert len(json.dumps(summary)) < 8_000, len(json.dumps(summary))
+
+
+def test_annotation_summary_degrades_instead_of_fabricating_zero_comments_793(monkeypatch):
+    """The last swallowing `except` on the annotation surface.
+
+    `_annotation_summary`'s first `try` ended `except Exception: comments = 0;
+    comment_locations = []`, so any OTHER failure of the global comment read --
+    not just the mid-walk mutation #861 fixed -- published a confident
+    `comments: 0` with no `unavailable` marker. That is the count
+    `assert_unannotated` certifies a view on (#733 F2), and it was the only
+    branch of the surface whose failure a caller could not tell from a pristine
+    view: an unreadable `get_symbols` already degraded correctly, which is what
+    made this one a silent hole rather than a pattern.
+
+    It now propagates to `_existing_annotations`, the ONE builder `target info`
+    and `evidence orient` both publish, which answers with the same marker used
+    for every other unreadable annotation count.
+    """
+    bridge = _load_bridge(monkeypatch)
+
+    class _UnreadableCommentStore(_FakeBV):
+        @property
+        def address_comments(self):
+            raise RuntimeError("comment store unreadable")
+
+    bv = _UnreadableCommentStore(functions=[_FakeFunction(0x401000, "parse_header")])
+
+    with pytest.raises(RuntimeError, match="comment store unreadable"):
+        bridge.read_listing._annotation_summary(None, bv)
+
+    block = bridge.read_listing._existing_annotations(None, bv)
+
+    assert block["unavailable"] == (
+        "annotation counts unavailable: comment store unreadable"
+    )
+    # No counts are claimed: a reader must not find an absent `comments` and
+    # assume a pristine zero.
+    assert "comments" not in block and "analyst_symbols" not in block
+
+
+def test_function_search_scopes_duplicate_starts_to_the_matched_population_757(monkeypatch):
+    """The two listing commands must give `duplicate_starts_collapsed` ONE meaning.
+
+    `function list` scopes it to the population its `total` counts. `function
+    search` collapsed the PRE-match population, so `function search <no-match>`
+    answered `total 0, items []` beside `duplicate_starts_collapsed: 2` -- a key
+    whose own contract (this many records were dropped from the rows you got)
+    cannot be satisfied with no retained row, and one a reader is left
+    reconciling against a total it has nothing to do with. It is scoped to the
+    matched population now, which still keeps the property the collapse exists
+    for: both records of one start are in the same group before any row is built,
+    so a phantom twin cannot reach the page as a second row.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        # the conflicting pair: same start, both size_known, 96 bytes are real
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=4),
+    ]
+    _view(monkeypatch, instance, functions)
+
+    listed = instance._list_functions(None, count_only=True)
+    assert listed["total"] == 2 and listed["duplicate_starts_collapsed"] == 1
+
+    # Nothing matched, so no row could have been dropped from the answer.
+    missed = instance._search_functions("active", "widget_missing")
+    assert missed["total"] == 0 and missed["items"] == []
+    assert "duplicate_starts_collapsed" not in missed
+    missed_count = instance._search_functions("active", "widget_missing", count_only=True)
+    assert missed_count["total"] == 0
+    assert "duplicate_starts_collapsed" not in missed_count
+
+    # A partial match discloses only its own population: the one address the
+    # answer contains was never a duplicate.
+    partial = instance._search_functions("active", "widget_init")
+    assert partial["total"] == 1
+    assert "duplicate_starts_collapsed" not in partial
+
+    # The colliding pair is still answered with the larger extent, once.
+    twin = instance._search_functions("active", "widget_poll")
+    assert twin["total"] == 1 and twin["returned"] == 1
+    assert twin["duplicate_starts_collapsed"] == 1
+    assert twin["items"][0]["size"] == 96
+
+
+def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):
+    """Both halves of the #757 disclosure, on both surfaces.
+
+    `function list` disclosed `duplicate_starts_collapsed` AND
+    `duplicate_starts_unresolved`; `_function_name_summary` -- the block
+    `target info` spreads into its payload, and the `target` block inside
+    `evidence orient` -- unpacked the unresolved count and dropped it. The two
+    surfaces agreed on every number they printed while one of them omitted the
+    reason, which reads as "the larger extent won" for an address where no
+    extent could be compared at all and both records are still live.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll"),  # extent unreadable
+    ]
+    bv = _view(monkeypatch, instance, functions)
+
+    summary = bridge._function_name_summary(bv)
+    listed = instance._list_functions(None, count_only=True)
+
+    assert summary["duplicate_starts_unresolved"] == 1
+    assert listed["duplicate_starts_unresolved"] == 1
+    assert summary["function_count"] == listed["count"] == 3
+    assert "duplicate_starts_collapsed" not in summary

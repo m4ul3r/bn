@@ -4616,10 +4616,18 @@ def test_annotation_summary_splits_loader_placeholders_from_analyst_symbols(monk
 
 
 def test_annotation_summary_discloses_every_loader_helper_exclusion(monkeypatch):
+    """Exclusions past the sample cap are COUNTED, not dropped silently.
+
+    This fixture deliberately exceeds the 20-row sample limit. The sample used to
+    be the whole list (one row per excluded symbol, uncapped); it is now bounded
+    like every other sample in the block and `symbol_exclusions_dropped` states
+    how many rows the cap left out, so "every exclusion still needs a reason"
+    stays a claim about the COUNT while the named rows stay a sample.
+    """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     names = ["init", "fini", "dest", "destr", "destr_1a2b", "compar", "compar_1A2B"]
-    # Exceed the legacy location sample: every exclusion still needs a reason.
+    # Exceed the location sample: every exclusion still needs a reason.
     symbols = [
         types.SimpleNamespace(
             auto=False, name=name, address=0x1000 + index * 0x10,
@@ -4635,6 +4643,7 @@ def test_annotation_summary_discloses_every_loader_helper_exclusion(monkeypatch)
 
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
 
+    limit = bridge.read_listing._ANNOTATION_SAMPLE_LIMIT
     assert summary["user_symbols"] == 29
     assert summary["placeholder_symbols"] == 28
     assert summary["analyst_symbols"] == 1
@@ -4643,8 +4652,11 @@ def test_annotation_summary_discloses_every_loader_helper_exclusion(monkeypatch)
     ]
     assert summary["symbol_exclusions"] == [
         {"name": symbol.name, "address": hex(symbol.address), "reason": "name_shape"}
-        for symbol in symbols
+        for symbol in symbols[:limit]
     ]
+    assert summary["symbol_exclusions_dropped"] == 28 - limit
+    assert (len(summary["symbol_exclusions"])
+            + summary["symbol_exclusions_dropped"]) == summary["placeholder_symbols"]
     assert summary["locations_truncated"] is True
 
 

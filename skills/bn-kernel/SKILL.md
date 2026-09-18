@@ -242,8 +242,11 @@ Prefer these curated helpers for list-shaped and common reads:
 - `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed** on malformed payloads: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
 
 The symbol classification is not proof of an untouched database. In
-`existing_annotations`, `symbol_exclusions` lists **every** excluded non-auto
-symbol as `{name, address, reason}` without a cap (`address` is null if unreadable).
+`existing_annotations`, `symbol_exclusions` samples the excluded non-auto symbols
+as `{name, address, reason}` (`address` is null if unreadable); like every other
+sample in that block it is capped at 20 rows, `placeholder_symbols` remains the
+exact number of excluded symbols, and `symbol_exclusions_dropped` states how many
+the cap left out -- so the sample is never to be read as the whole set.
 `reason="debug_info"` means an exact imported name-and-address match and takes
 precedence over `reason="name_shape"`, the loader/engine-name heuristic. This
 includes bare `init`/`fini`, `dest`, and `destr`/`compar` with optional hexadecimal
@@ -252,7 +255,8 @@ comments still refuse, but an analyst rename matching an excluded name shape
 **may remain undetected**. An internal symbol namespace does not prove loader
 origin: user renames can carry it too. `symbol_exclusion_limitations` discloses
 this fallback in the payload. The older `*_locations` samples remain bounded;
-`locations_truncated` refers to those samples, not to `symbol_exclusions`.
+`locations_truncated` refers to those samples, not to `symbol_exclusions`, which
+carries its own dropped count.
 The `comments` count includes global and function-local address comments, even
 when both stores have entries at the same address; local sample rows also name
 their function. `function_comments` counts function-doc comments separately.

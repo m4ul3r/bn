@@ -1750,9 +1750,29 @@ def _render_go_rename_text(value: Any) -> str:
             return ("go rename: cannot say what this run did -- the candidate "
                     "count was unreadable, so neither the renames nor the "
                     "skips can be reported; re-read with --format json")
+        # #818 review: the two reasons below are the ones this op used to drop
+        # SILENTLY, so this line is where a reader learned "1848 defined, 0
+        # already user-named, nothing to do" with no way to reconcile it --
+        # the envelope's two-totals defect, in text. Each is stated through the
+        # count choke point and its fragment exists only when the bridge
+        # reported the bucket, the same absent-key convention the analyst split
+        # uses above.
+        reasons = [
+            f"{_stated_count(value, 'defined_count')} defined at pcln addresses",
+            f"{skipped} already user-named",
+        ]
+        if _field_present(value, "skipped_interior_pc"):
+            reasons.append(
+                f"{_stated_count(value, 'skipped_interior_pc')} resolving only "
+                "inside another function (no BN function starts there)"
+            )
+        if _field_present(value, "skipped_already_named"):
+            reasons.append(
+                f"{_stated_count(value, 'skipped_already_named')} already carrying "
+                "the recovered name"
+            )
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
-                f"({_stated_count(value, 'defined_count')} defined at pcln addresses, "
-                f"{skipped} already user-named)")
+                f"({', '.join(reasons)})")
     failed = _row_list(value, "results")
     # The default is a MEASUREMENT (targeted minus the failures), so it is used
     # only when the envelope claimed no verified count at all -- asking
@@ -1833,6 +1853,13 @@ def _render_go_functions_summary_text(value: Any) -> str:
                        ("undefined", "undefined"), ("renamable", "renamable")):
         if isinstance(value.get(key), int):
             lines.append(f"  {label}: {value[key]}")
+    # #818 review: `defined` is satisfied by CONTAINMENT, so the split between
+    # "resolved at its START" and "resolved only as an interior PC" is the number
+    # that decides whether the addresses can be trusted -- and it was JSON-only
+    # here, through a renderer that did not print it at all. Read in the same
+    # isinstance style as the four counters above (this view's own convention).
+    if isinstance(value.get("start_match_count"), int):
+        lines.append(f"  start_matches: {value['start_match_count']}")
     if value.get("truncated"):
         # #528: disclose that the declared table was only partially recovered.
         lines.append(
@@ -1843,6 +1870,12 @@ def _render_go_functions_summary_text(value: Any) -> str:
     if ts is not None:
         rebase = "" if (tsb is None or tsb == ts) else f"  (BN text {tsb} -- rebase needed)"
         lines.append(f"  text_start: {ts}{rebase}")
+    # #818 review: this view is the go/no-go headline before `go rename`, and the
+    # rebase/containment warning is exactly what it must not lose -- pre-#818 it
+    # was the view that said `defined 0 / undefined 1848` (loud and wrong), and
+    # the note is what keeps the corrected counters from being quiet and wrong.
+    if value.get("note"):
+        lines.append(f"  note: {value['note']}")
     return "\n".join(lines)
 
 

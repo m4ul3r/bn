@@ -3836,9 +3836,15 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # (`comments`, `function_comments`, `user_symbols`, `analyst_symbols`,
     # `placeholder_symbols`) through `_stated_count`, so an unreadable counter
     # prints `?` on the line rather than a confident `0`.
-    assert len(sites) == 24, (
+    # 24 -> 26 (#818 review): `_render_go_rename_text`'s "nothing to do" line now
+    # states `skipped_interior_pc` and `skipped_already_named` -- the two skip
+    # buckets `go rename` used to drop silently, which is what let that line
+    # explain "1848 defined at pcln addresses, 0 already user-named, nothing to
+    # do" with no way to reconcile it. Both live behind the zero-candidate
+    # branch, so both are in the skipped set below by name.
+    assert len(sites) == 26, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 24. The number is the size of the covered set: a "
+        "count helper, not 26. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3898,6 +3904,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(total) [not a payload renderer]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
+        # The same branch for the #818 skip buckets: the recorded context opens
+        # the detail branch (`go_renamed_candidates` readable and non-zero), and
+        # an interior-PC / already-carried-the-name count can only be stated on
+        # the zero-candidate line. Covered by name in
+        # `test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read`,
+        # which drives that branch and asserts the `?` refusal for a count no
+        # value reads out of.
+        "_render_go_rename_text(skipped_already_named) [count not stated in this "
+        "context]",
+        "_render_go_rename_text(skipped_interior_pc) [count not stated in this "
+        "context]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
@@ -3974,7 +3991,12 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
     readable = nothing_to_do()
     assert "(7 defined at pcln addresses, 2 already user-named)" in readable, readable
 
-    for key in ("defined_count", "skipped_user_named"):
+    for key in ("defined_count", "skipped_user_named", "skipped_interior_pc",
+                "skipped_already_named"):
+        # The last two only render when the bridge reported the bucket, and a
+        # bucket it reported in a shape no count reads must reach the line as
+        # `?` -- an unreadable skip count rendered as a real 0 would put the
+        # envelope's two-totals defect back on the one line a caller stops on.
         refused = nothing_to_do(**{key: "lots"})
         body = refused.split("\n! malformed")[0]
         assert "? " in body or "(? " in body, (key, refused)
@@ -4297,7 +4319,12 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
     # #793: 4896 + 8 -- `_render_target_info_annotations_text` reads the
     # `existing_annotations` container (8 bogus values x 1 render). Measured.
-    assert swept == 4904, f"the raise sweep ran {swept} renders, not 4904"
+    # #818 review: 4904 + 32 -- FOUR more discovered (renderer, ctx) pairs, 8
+    # bogus values each: `_render_go_functions_summary_text` reads `note` and
+    # `start_match_count` (the summary view carries the rebase note and the
+    # START-match counter now) and `_render_go_rename_text` reads the two new
+    # skip buckets. Measured on the rebased tree by diffing the population.
+    assert swept == 4936, f"the raise sweep ran {swept} renders, not 4936"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4455,7 +4482,11 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
     # #793: 1426 + 3 -- the new target-info annotation renderer reads
     # `existing_annotations` in three probed contexts. Measured.
-    assert checked == 1429, f"the mirror ran {checked} renders, not 1429"
+    # #818 review: 1429 + 8 -- the same four discovered pairs the raise sweep
+    # gained (`_render_go_functions_summary_text`'s `note` / `start_match_count`
+    # and `_render_go_rename_text`'s two skip buckets), x 2 benign payloads each.
+    # Measured on the rebased tree by diffing the population.
+    assert checked == 1437, f"the mirror ran {checked} renders, not 1437"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

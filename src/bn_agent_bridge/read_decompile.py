@@ -194,12 +194,18 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
     counts as an annotation, so the rule lives in one place.
     """
     function_comment = str(getattr(func, "comment", "") or "")
-    # #861: `func.comments` is BN's per-function map, which analysis threads may
-    # add to while this walk is in flight -- the same live-collection shape #850
-    # snapshotted for `bv.address_comments` (and that `il_format._comment_map`
-    # still reads through). Snapshot the WHOLE collection, not its `.values()`
-    # view: that view iterates the live map, so a parallel text decompile would
-    # still die of "dictionary changed size during iteration".
+    # #861: cheap insurance, NOT a reproduced hazard. Against BN 6.1
+    # `Function.comments` builds and returns a FRESH local dict on every access
+    # (so does `BinaryView.address_comments`), which means a mid-walk
+    # `RuntimeError: dictionary changed size during iteration` cannot arise here,
+    # and the #850 symptom this comment used to lean on was diagnosed on a
+    # settling quick view rather than bisected to an accessor. What the snapshot
+    # costs is one O(n) copy of an already-private dict; what it defends against
+    # is a BN build that ever hands back the live store -- modelled by a
+    # regression test whose fake `comments` adds an entry mid-walk. Snapshot the
+    # WHOLE collection rather than its `.values()` view: if the store ever is
+    # live, that view iterates it and a parallel text decompile dies of
+    # "dictionary changed size during iteration".
     local_comments = dict(getattr(func, "comments", {}) or {})
     return [
         *comments.values(),

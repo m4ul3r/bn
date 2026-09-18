@@ -541,47 +541,72 @@ def _symbol_address_text(symbol) -> str | None:
         return None
 
 
+# ONE bound for every sample array `_annotation_summary` publishes (#733 F2/#793
+# review). The counts beside them stay EXACT: `bn_kernel.assert_unannotated`
+# refuses on `comments` / `function_comments` / `user_symbols` (+`analyst_symbols`),
+# so capping a sample may not move a single counter, and `target info` /
+# `evidence orient` must remain readable on a target with thousands of loader
+# placeholders -- the 20-row samples are what an agent reads; the numbers are what
+# a gate reads.
+_ANNOTATION_SAMPLE_LIMIT = 20
+
+
 def _annotation_summary(ctx, bv) -> dict[str, Any]:
     """Count annotations ALREADY present in the view (#561).
 
     On a cached/shared BNDB, inherited comments/names can bias analysis and let
     an agent over-credit itself for state a prior run produced. Surface counts
-    and bounded annotation samples; symbol exclusions are uncapped so each has
-    a reason. Address-comment counts include both the global map and each
-    function's local map; function-doc comments have their own count."""
+    and bounded annotation samples: every sample array is capped at
+    ``_ANNOTATION_SAMPLE_LIMIT`` rows and one dropped-count field
+    (``symbol_exclusions_dropped``) discloses the only sample whose shortfall a
+    boolean could not state, so the block stays readable on a target with
+    thousands of loader placeholders -- while every COUNT stays exact, because
+    ``bn_kernel.assert_unannotated`` refuses on them (#793 review).
+    Address-comment counts include both the global map and each function's local
+    map; function-doc comments have their own count."""
     comments = 0
     comment_locations: list[dict[str, Any]] = []
-    try:
-        address_comments = getattr(bv, "address_comments", None)
-        if address_comments is not None:
-            comments = len(address_comments)
-            # #861: `list(address_comments.items())` materialises a VIEW of the
-            # live global comment map, so it walks the collection BN may still be
-            # annotating. Snapshot the whole map first, then walk the snapshot.
-            for address, text in list(dict(address_comments).items())[:20]:
-                comment_locations.append(
-                    {
-                        "address": hex(int(address)),
-                        "comment": str(text)[:160],
-                    }
-                )
-    except Exception:
-        comments = 0
-        comment_locations = []
+    # #861 review: this read is deliberately NOT guarded. It used to be wrapped
+    # in `except Exception: comments = 0`, so any OTHER failure of the global
+    # comment read -- the mid-walk mutation the snapshot below defends against,
+    # itself insurance rather than a reproduced crash, being the one failure this
+    # try/except was written for -- published a confident `comments: 0` with no
+    # `unavailable` marker: the fabricated clean bill of health
+    # `assert_unannotated` certifies on (#733 F2), and the one branch of this
+    # surface whose failure a caller could not tell from a pristine view. It now
+    # propagates to `_existing_annotations`, which degrades the whole block to the
+    # same `unavailable` marker an unreadable symbol enumeration already produced.
+    address_comments = getattr(bv, "address_comments", None)
+    if address_comments is not None:
+        comments = len(address_comments)
+        # #861: cheap insurance, NOT a reproduced hazard. Against BN 6.1
+        # `BinaryView.address_comments` builds and returns a FRESH local dict on
+        # every access, so a mid-walk `RuntimeError: dictionary changed size
+        # during iteration` cannot arise here, and the #850 symptom this comment
+        # used to lean on was diagnosed on a settling quick view rather than
+        # bisected to this accessor. What the snapshot costs is one O(n) copy of
+        # a dict that is already private; what it defends against is a BN build
+        # that ever hands back the live store -- which the regression tests model
+        # with a fake whose `items()` adds an entry mid-walk.
+        for address, text in list(dict(address_comments).items())[:_ANNOTATION_SAMPLE_LIMIT]:
+            comment_locations.append(
+                {
+                    "address": hex(int(address)),
+                    "comment": str(text)[:160],
+                }
+            )
 
     function_comments = 0
     function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
-        # #861: the per-function map is live too -- `dict(getattr(func, "comments",
-        # {}))` is the same snapshot the decompile lane takes of the identical
-        # collection -- so walking the attribute directly raised
-        # `RuntimeError: dictionary changed size during iteration` on a view
-        # analysis was still annotating, and the enclosing handler turned that
-        # into an `unavailable` marker on both `target info` and `evidence orient`.
+        # #861: the same cheap insurance on the per-function map, for the same
+        # reason (`Function.comments` also returns a fresh dict under BN 6.1) and
+        # with the same fake-modelled hazard. Taking it here means the two maps
+        # are read through ONE rule rather than one snapshot and one live walk.
         local_comments = dict(getattr(fn, "comments", {}) or {})
         comments += len(local_comments)
         for address, text in local_comments.items():
-            if len(comment_locations) >= 20:
+            if len(comment_locations) >= _ANNOTATION_SAMPLE_LIMIT:
                 break
             comment_locations.append(
                 {
@@ -594,7 +619,7 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             text = str(getattr(fn, "comment", "") or "").strip()
             if text:
                 function_comments += 1
-                if len(function_comment_locations) < 20:
+                if len(function_comment_locations) < _ANNOTATION_SAMPLE_LIMIT:
                     function_comment_locations.append(
                         {
                             "name": str(getattr(fn, "name", "")),
@@ -658,16 +683,27 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             exclusion_reason = "debug_info"
         elif is_placeholder_symbol_name(name):
             exclusion_reason = "name_shape"
-        if len(user_symbol_locations) < 20 and address is not None:
+        if (len(user_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
+                and address is not None):
             user_symbol_locations.append({"name": name, "address": address})
         if exclusion_reason is not None:
             placeholder_symbols += 1
-            symbol_exclusions.append(
-                {"name": name, "address": address, "reason": exclusion_reason}
-            )
+            # #793 review: capped like every other sample in this block, with the
+            # rows the cap left out COUNTED on the block. Uncapped, this one list
+            # was ~99% of a real `target info` payload (2103 rows, ~182 KB,
+            # dominated by one placeholder family on a 2900-function target) and
+            # tripped the tool's own token guard on the command every agent runs
+            # first -- while `placeholder_symbols` above already states the full
+            # number the rows were enumerating, and the two reasons
+            # (`name_shape`/`debug_info`) are visible in a 20-row sample.
+            if len(symbol_exclusions) < _ANNOTATION_SAMPLE_LIMIT:
+                symbol_exclusions.append(
+                    {"name": name, "address": address, "reason": exclusion_reason}
+                )
         else:
             analyst_symbols += 1
-            if len(analyst_symbol_locations) < 20 and address is not None:
+            if (len(analyst_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
+                    and address is not None):
                 analyst_symbol_locations.append({"name": name, "address": address})
 
     return {
@@ -681,6 +717,13 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         "placeholder_symbols": placeholder_symbols,
         "analyst_symbol_locations": analyst_symbol_locations,
         "symbol_exclusions": symbol_exclusions,
+        # The cap on `symbol_exclusions` as a COUNT, the `callers_dropped`
+        # convention, because the boolean below cannot carry it: it is scoped to
+        # the `*_locations` samples by its own name and by the kernel contract.
+        # `placeholder_symbols` remains the exact number of excluded symbols;
+        # this states how many of them the sample does not show, so a consumer
+        # that reads the sample is never told it is the whole set.
+        "symbol_exclusions_dropped": placeholder_symbols - len(symbol_exclusions),
         "symbol_exclusion_limitations": (
             "name_shape is a heuristic, not provenance: analyst renames matching "
             "excluded name families may remain undetected. Internal symbol "
@@ -688,10 +731,12 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             "debug_info requires the imported name and address to match."
         ),
         # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
-        # at 20, so whenever the analyst pair could report truncation the user
-        # pair already does (#733 F2). Not because one sample contains the
-        # other -- it does not, once more than 20 placeholders precede an
-        # analyst row.
+        # at `_ANNOTATION_SAMPLE_LIMIT`, so whenever the analyst pair could
+        # report truncation the user pair already does (#733 F2). Not because
+        # one sample contains the other -- it does not, once more than 20
+        # placeholders precede an analyst row. `symbol_exclusions` is outside
+        # this flag on purpose: it is not a `*_locations` sample, and its own
+        # dropped COUNT (above) is a sharper disclosure than a boolean.
         "locations_truncated": any(
             count > len(locations)
             for count, locations in (
@@ -912,6 +957,15 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     convention in ``read_misc._imports``). A caller whose ``total`` lands below
     its own count of raw BN records can then tell why -- and whether the
     retained row carries the LARGER extent or the conflict was left standing.
+
+    SCOPING, because the two listing commands disagreed about it (#757 review):
+    the counts describe the population the caller collapses, which must be the
+    population its ``total`` is derived from. `function list` collapses the
+    address-filtered population it then counts; `function search` collapses the
+    MATCHED population, so a query that matches nothing reports no collapse
+    rather than the collapse of rows the answer never contained. A caller that
+    collapses one population and counts another reintroduces exactly that
+    mismatch, one command over.
     """
     if collapsed:
         result["duplicate_starts_collapsed"] = collapsed
@@ -1201,13 +1255,23 @@ def _search_functions(
             return needle in name.lower()
 
     matched: list[tuple[Any, str]] = []
-    # #757: collapse the duplicate records BN can hold for one start address
-    # BEFORE matching, so a phantom twin cannot match twice (under two conflicting
-    # sizes) and reach the page.
-    population, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
-        list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
-    )
-    for fn in population:
+    # #757 review: the collapse runs on the MATCHED population -- the same
+    # scoping `function list` gives it, where the collapsed count describes the
+    # rows the answer was built from. Collapsing the pre-match population instead
+    # made the disclosed count describe rows the answer does not contain, so
+    # `function search <no-match>` answered `total 0, items []` beside
+    # `duplicate_starts_collapsed: 2`: a key whose own contract (fewer rows than
+    # the view holds, and here is how many were dropped) cannot be satisfied with
+    # no retained row, and one that a reader must reconcile against a total it has
+    # nothing to do with.
+    #
+    # Running it here keeps the property it exists for: the duplicate records for
+    # one start address are in the SAME group before any row is built, so a
+    # phantom twin still cannot reach the page as a second row carrying the
+    # conflicting size.
+    displays: dict[int, str] = {}
+    matched_functions: list[Any] = []
+    for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
         # Match across name forms (mangled fn.name, demangled display_name, raw)
         # so a demangled C++ query finds a function BN named with the mangled
         # symbol -- the same greppability `--demangle` gives the listing (#196).
@@ -1219,7 +1283,12 @@ def _search_functions(
             # projections behind it) is built for the returned page only, so a
             # `function search --limit 20` over a 50k-function target no longer
             # sizes and materializes every match.
-            matched.append((fn, display))
+            matched_functions.append(fn)
+            displays[id(fn)] = display
+    matched_functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
+        matched_functions
+    )
+    matched = [(fn, displays[id(fn)]) for fn in matched_functions]
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
         # doesn't return each export twice (16-byte veneer + real body). size IS

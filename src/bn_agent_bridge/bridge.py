@@ -1183,6 +1183,35 @@ def _is_go_rename_auto_name(name: str, address: int) -> bool:
     return name == f"sub_{address:x}" or name.startswith("nullsub_")
 
 
+def _disclose_go_rename_skips(
+    result: dict[str, Any],
+    *,
+    skipped_already_named: int = 0,
+    skipped_interior_pc: int = 0,
+) -> dict[str, Any]:
+    """Attach the two #818-review skip buckets `go rename` used to drop silently.
+
+    `skipped_user_named` (a function at the pcln address the user named) was the
+    only skip reason this op ever disclosed, so the two other ways a DEFINED row
+    can fail to become a candidate left the envelope asserting `defined_count: N`
+    beside `go_renamed_candidates: 0` with nothing accounting for N:
+
+    * ``skipped_interior_pc`` -- no BN function STARTS at the pcln address; it
+      resolves only by CONTAINMENT (#818), and the recovered name belongs to the
+      start the view does not have, so it is never applied;
+    * ``skipped_already_named`` -- the function at that start already carries the
+      recovered name (the idempotent re-run, which used to be invisible).
+
+    Present only when non-zero, the listing envelope's own convention, so the
+    common envelope keeps the key set every consumer already parses.
+    """
+    if skipped_already_named:
+        result["skipped_already_named"] = skipped_already_named
+    if skipped_interior_pc:
+        result["skipped_interior_pc"] = skipped_interior_pc
+    return result
+
+
 _IMPORT_SYMBOL_TYPE_NAMES = IMPORT_SYMBOL_TYPE_NAMES
 _is_imported_function = is_imported_function
 
@@ -1215,7 +1244,14 @@ def _function_name_summary(bv) -> dict[str, int]:
     # records here made `target info` (and the `target` block inside `evidence
     # orient`) state a different total from `function list --count` for the same
     # view, so the same collapse runs here and the count it dropped is disclosed.
-    functions, collapsed_starts, _unresolved_starts = read_listing._collapse_duplicate_starts(
+    #
+    # BOTH counts, not just the collapse: `duplicate_starts_unresolved` is the
+    # second half of the same disclosure (an address whose records could not be
+    # ranked by extent, so both were kept) and dropping it here published the
+    # reason on one surface while suppressing it on the other, with the two
+    # agreeing on every number -- the shape where a reader concludes the larger
+    # count is a phantom rather than an unresolved conflict (#757 review).
+    functions, collapsed_starts, unresolved_starts = read_listing._collapse_duplicate_starts(
         functions
     )
     total = len(functions)
@@ -1251,6 +1287,12 @@ def _function_name_summary(bv) -> dict[str, int]:
         # convention, so a consumer that sees fewer functions than BN records can
         # tell why and that the retained row carries the LARGER extent.
         summary["duplicate_starts_collapsed"] = collapsed_starts
+    if unresolved_starts:
+        # The other half, on the same block: `function list` discloses this and
+        # `target info` did not, so an agent comparing the two read an unresolved
+        # conflict as a plain duplicate -- "the larger extent won" -- when no
+        # extent could be compared at all and both records are still live.
+        summary["duplicate_starts_unresolved"] = unresolved_starts
     return summary
 
 
@@ -3378,22 +3420,47 @@ class BinaryNinjaBridge:
                 recovered = read_go._go_functions(self.ctx, selector)
                 items = recovered.get("items") or []
                 bv = self._resolve_view(selector)
-                get_fn = getattr(bv, "get_function_at", None)
                 candidates: list[dict[str, Any]] = []
                 skipped_user_named = 0
+                # #818 review: the DEFECT this closes was an envelope stating two
+                # different totals for one question. `go functions` counts `defined`
+                # by CONTAINMENT (#818), so on a view whose pcln addresses are
+                # interior PCs of some body it reports `defined_count: 1848` -- and
+                # this loop re-resolved with START-only `get_function_at`, matched
+                # nothing, and returned `go_renamed_candidates: 0` with no bucket
+                # accounting for the 1848. Every defined row now lands in exactly
+                # one of the four buckets below (candidate / user-named / already
+                # carries the Go name / no BN function STARTS there), so
+                # `defined_count` reconciles with the sum on the rename side.
+                #
+                # A containment-only row is DISCLOSED, never renamed: the recovered
+                # name belongs to the function that starts at the pcln entryoff, and
+                # the containing function starts somewhere else, so applying it
+                # would mislabel a body under a name that is not its own. That is
+                # also why the auto-name guard cannot rescue it -- the guard compares
+                # the current name against `sub_<addr>` for THIS address.
+                skipped_already_named = 0
+                skipped_interior_pc = 0
                 for it in items:
-                    if not it.get("defined") or not callable(get_fn):
+                    if not it.get("defined"):
                         continue
                     try:
                         addr = int(it["address"], 16)
                     except (KeyError, ValueError, TypeError):
                         continue
-                    fn = get_fn(addr)
-                    if fn is None:
+                    # The walk guarantees a non-empty name for every item it emits
+                    # (an unnamed entry is counted as `skipped` there), which is
+                    # what keeps the four buckets a partition of `defined_count`.
+                    new_name = str(it.get("name") or "")
+                    if not new_name:
+                        continue
+                    fn, start_matched = read_go.resolve_pcln_function(bv, addr)
+                    if fn is None or not start_matched:
+                        skipped_interior_pc += 1
                         continue
                     current = str(getattr(fn, "name", "") or "")
-                    new_name = str(it.get("name") or "")
-                    if not new_name or current == new_name:
+                    if current == new_name:
+                        skipped_already_named += 1
                         continue
                     if not _is_go_rename_auto_name(current, addr):
                         skipped_user_named += 1
@@ -3405,16 +3472,23 @@ class BinaryNinjaBridge:
                     })
 
             if not candidates:
-                return {"kind": "go_rename", "success": True, "committed": False,
-                        "preview": preview, "results": [],
-                        "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
-                        "defined_count": recovered.get("defined_count", 0)}
+                result = {"kind": "go_rename", "success": True, "committed": False,
+                          "preview": preview, "results": [],
+                          "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                          "defined_count": recovered.get("defined_count", 0)}
+                return _disclose_go_rename_skips(
+                    result,
+                    skipped_already_named=skipped_already_named,
+                    skipped_interior_pc=skipped_interior_pc,
+                )
 
             return self._apply_go_renames_chunked(
                 bv,
                 candidates,
                 preview=preview,
                 skipped_user_named=skipped_user_named,
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
                 defined_count=recovered.get("defined_count", 0),
             )
 
@@ -3469,18 +3543,24 @@ class BinaryNinjaBridge:
         preview: bool,
         skipped_user_named: int,
         defined_count: int,
+        skipped_already_named: int = 0,
+        skipped_interior_pc: int = 0,
     ) -> dict[str, Any]:
         get_fn = getattr(bv, "get_function_at", None)
         if not callable(get_fn):
-            return {"kind": "go_rename", "success": False, "committed": False,
-                    "preview": preview, "rolled_back": True,
-                    "results": [{"op": "rename_symbol", "status": "unsupported",
-                                 "message": "BinaryView does not support get_function_at"}],
-                    "go_renamed_candidates": len(candidates),
-                    "go_verified_count": 0, "go_failed_count": 1,
-                    "go_committed_count": 0,
-                    "skipped_user_named": skipped_user_named,
-                    "defined_count": defined_count}
+            return _disclose_go_rename_skips(
+                {"kind": "go_rename", "success": False, "committed": False,
+                 "preview": preview, "rolled_back": True,
+                 "results": [{"op": "rename_symbol", "status": "unsupported",
+                              "message": "BinaryView does not support get_function_at"}],
+                 "go_renamed_candidates": len(candidates),
+                 "go_verified_count": 0, "go_failed_count": 1,
+                 "go_committed_count": 0,
+                 "skipped_user_named": skipped_user_named,
+                 "defined_count": defined_count},
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
+            )
 
         applied: list[dict[str, Any]] = []
         failed_rows: list[dict[str, Any]] = []
@@ -3560,7 +3640,11 @@ class BinaryNinjaBridge:
             result["message"] = "Rollback failed; the view may be partially renamed"
         elif preview and not rolled_back:
             result["message"] = "Preview rollback failed; the view may be partially renamed"
-        return result
+        return _disclose_go_rename_skips(
+            result,
+            skipped_already_named=skipped_already_named,
+            skipped_interior_pc=skipped_interior_pc,
+        )
 
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)

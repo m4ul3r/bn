@@ -34,6 +34,81 @@ _PCLNTAB_MAGICS = {0xFFFFFFF1: "go1.20", 0xFFFFFFF0: "go1.18"}
 _OLD_MAGICS = {0xFFFFFFFA: "go1.16", 0xFFFFFFFB: "go1.2"}
 
 
+def resolve_pcln_function(bv, addr: int):
+    """The BN Function for a pcln address *addr*, plus whether it matched at its START.
+
+    #818: `get_function_at` is START-only, so a pcln entry whose prolog is a few
+    bytes off -- or a `_func` entryoff that is an interior PC -- missed and the
+    row read `defined: false`, and on a table where EVERY row missed that way the
+    0-match note fired (PIE rebase / incomplete analysis) on a view that had
+    resolved all of them. Containment is the relation the row is really asking
+    about, so fall back to `get_functions_containing` -- the same
+    first-containing-function lookup the sibling reads use for an interior
+    address. `defined` stays None only when the view exposes NEITHER accessor
+    (a unit fake): "unknown", never a confident false.
+
+    The START/containment distinction is load-bearing for two different readers,
+    which is why it is returned rather than folded into the record:
+
+    * the rebase note (#818 review) -- an address that resolves only as an
+      INTERIOR PC is not evidence that the table is based correctly, and a
+      constant rebase delta over a dense .text resolves every row to *some* body
+      while matching no start;
+    * `go rename` (bridge `_go_rename`) -- the recovered name belongs to the
+      function that STARTS at the entryoff, so a containing function is never
+      renamed and the row is disclosed as an unrenamable bucket instead.
+    """
+    get_fn = getattr(bv, "get_function_at", None)
+    if callable(get_fn):
+        fn = get_fn(addr)
+        if fn is not None:
+            return fn, True
+    get_containing = getattr(bv, "get_functions_containing", None)
+    if callable(get_containing):
+        try:
+            containers = list(get_containing(addr) or [])
+        except Exception:
+            containers = []
+        if containers:
+            return containers[0], False
+    return None, False
+
+
+def _rebase_note(items: list[Any], *, start_match_count: int, defined_count: int,
+                 text_start: int, text_sec: int | None) -> str | None:
+    """The #217/#818 rebase-or-incomplete-analysis note, or None when none applies.
+
+    ONE builder for the two views that publish it: `go functions` and its
+    `--summary` form. It is keyed on START matches, never on `defined`: once
+    `defined` can be satisfied by containment, a table whose every row lands on an
+    interior PC of *some* body would report `defined: true` everywhere and
+    suppress the warning this note exists to give. The wording says which
+    relation matched, so a reader is not sent to rebase addresses that are merely
+    off-prolog.
+    """
+    if not items or start_match_count:
+        return None
+    if text_sec is not None and text_sec != text_start:
+        return (
+            "None of the recovered addresses match a BN function START, and the "
+            "pcln table's textStart != BN's .text start: the binary is loaded at a "
+            "different base (PIE). Every address resolves at best to an interior PC, "
+            "so rebase each by (text_start_bv - text_start) before use."
+        )
+    if defined_count == 0:
+        return (
+            "0 of the recovered addresses match a BN function: BN analysis may "
+            "be incomplete (run `bn refresh`), or the binary is rebased -- "
+            "compare text_start vs text_start_bv before trusting the addresses."
+        )
+    return (
+        "None of the recovered addresses match a BN function START -- they "
+        "resolve only as interior PCs. BN analysis may be incomplete (run "
+        "`bn refresh`), or the table is rebased by a constant delta: compare "
+        "text_start vs text_start_bv before trusting the addresses."
+    )
+
+
 def _gopclntab_section(bv):
     """The ``.gopclntab`` section object, else None (by name, then by any section
     whose name ends in ``gopclntab`` for the rare renamed/embedded case)."""
@@ -126,40 +201,16 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
             f"walk it rather than emit garbage.",
         )
 
-    get_fn = getattr(bv, "get_function_at", None)
-    get_containing = getattr(bv, "get_functions_containing", None)
-    # #818: `get_function_at` is START-only, so a pcln entry whose prolog is a few
-    # bytes off -- or a `_func` entryoff that is an interior PC -- missed and the
-    # row read `defined: false`, and on a table where EVERY row missed that way
-    # the 0-match note fired (PIE rebase / incomplete analysis) on a view that had
-    # resolved all of them. Containment is the relation the row is really asking
-    # about, so fall back to `get_functions_containing` -- the same
-    # first-containing-function lookup the sibling reads use for an interior
-    # address. `defined` stays None only when the view exposes NEITHER accessor
-    # (a unit fake): "unknown", never a confident false.
-    can_resolve = callable(get_fn) or callable(get_containing)
+    # The resolution relation (start vs containment) is shared with `go rename`,
+    # which must know which of the two matched before it may apply a name; see
+    # `resolve_pcln_function`.
+    can_resolve = (
+        callable(getattr(bv, "get_function_at", None))
+        or callable(getattr(bv, "get_functions_containing", None))
+    )
 
     def resolve_function(addr: int):
-        """The record for *addr*, plus whether it matched at its START.
-
-        The distinction is what keeps the rebase note honest (#818 review): an
-        address that resolves only as an INTERIOR PC of some function is not
-        evidence that the table is based correctly -- a constant rebase delta
-        over a dense .text resolves every row to *some* body while matching no
-        start, which is exactly the shape the note exists to warn about.
-        """
-        if callable(get_fn):
-            fn = get_fn(addr)
-            if fn is not None:
-                return fn, True
-        if callable(get_containing):
-            try:
-                containers = list(get_containing(addr) or [])
-            except Exception:
-                containers = []
-            if containers:
-                return containers[0], False
-        return None, False
+        return resolve_pcln_function(bv, addr)
 
     def cstr(o: int) -> str:
         end = raw.find(b"\x00", o)
@@ -220,16 +271,30 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
                 "expected": nfunc, "recovered": recovered, "skipped": skipped_count,
                 "truncated": truncated, "go_version": go_version}
     text_sec = _gopclntab_text_start(bv)
+    # #818 review: the note is built BEFORE the summary branch returns, so the
+    # go/no-go view carries it too. It used to be attached only to the listing
+    # view, and `--summary` is the view an agent reads to DECIDE whether to run
+    # `go rename` -- the exact decision the note exists to inform.
+    note = _rebase_note(
+        items,
+        start_match_count=start_match_count,
+        defined_count=defined_count,
+        text_start=text_start,
+        text_sec=text_sec,
+    )
     if summary:
         # #414: enough signal to decide whether to run `go rename`.
-        return {"kind": "go_functions_summary", "go_version": go_version,
-                "recovered": recovered, "defined": defined_count,
-                "start_match_count": start_match_count,
-                "undefined": recovered - defined_count, "renamable": renamable_count,
-                "expected": nfunc, "skipped": skipped_count, "truncated": truncated,
-                "text_start": hex(text_start),
-                "text_start_bv": hex(text_sec) if text_sec is not None else None,
-                "pclntab": True}
+        result = {"kind": "go_functions_summary", "go_version": go_version,
+                  "recovered": recovered, "defined": defined_count,
+                  "start_match_count": start_match_count,
+                  "undefined": recovered - defined_count, "renamable": renamable_count,
+                  "expected": nfunc, "skipped": skipped_count, "truncated": truncated,
+                  "text_start": hex(text_start),
+                  "text_start_bv": hex(text_sec) if text_sec is not None else None,
+                  "pclntab": True}
+        if note:
+            result["note"] = note
+        return result
 
     items.sort(key=lambda it: int(it["address"], 16))
     result = _paged_list_result(items, offset=offset, limit=limit, kind="go_functions")
@@ -246,35 +311,11 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     if text_sec is not None:
         result["text_start_bv"] = hex(text_sec)
     result["defined_count"] = defined_count
-    # #818 review: the note is gated on START matches, not on `defined`. Once
-    # `defined` can be satisfied by containment, a table whose every row lands on
-    # an interior PC of *some* body reported `defined: true` everywhere and
-    # suppressed the warning this note exists to give -- and a constant rebase
-    # delta over a dense .text is exactly that shape. The wording says which
-    # relation matched, so a reader is not sent to rebase addresses that are
-    # merely off-prolog.
+    # #818 review: the note is gated on START matches, not on `defined` -- see
+    # `_rebase_note`, which the `--summary` view shares.
     result["start_match_count"] = start_match_count
-    if items and start_match_count == 0:
-        if text_sec is not None and text_sec != text_start:
-            result["note"] = (
-                "None of the recovered addresses match a BN function START, and the "
-                "pcln table's textStart != BN's .text start: the binary is loaded at a "
-                "different base (PIE). Every address resolves at best to an interior PC, "
-                "so rebase each by (text_start_bv - text_start) before use."
-            )
-        elif defined_count == 0:
-            result["note"] = (
-                "0 of the recovered addresses match a BN function: BN analysis may "
-                "be incomplete (run `bn refresh`), or the binary is rebased -- "
-                "compare text_start vs text_start_bv before trusting the addresses."
-            )
-        else:
-            result["note"] = (
-                "None of the recovered addresses match a BN function START -- they "
-                "resolve only as interior PCs. BN analysis may be incomplete (run "
-                "`bn refresh`), or the table is rebased by a constant delta: compare "
-                "text_start vs text_start_bv before trusting the addresses."
-            )
+    if note:
+        result["note"] = note
     return result
 
 
