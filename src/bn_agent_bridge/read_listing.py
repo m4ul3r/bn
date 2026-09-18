@@ -14,7 +14,8 @@ Outbound calls resolve through:
   * ``il_format`` -- the pure IL/HLIL/disasm renderers and iteration helpers
     (``_structured_disasm_entries``, ``_iter_llil_instructions``, ``_il_op_name``,
     ``_hlil_statement_text``, ``_hlil_pre_branch_condition``,
-    ``_instruction_length``, ``_llil_constant_value``);
+    ``_instruction_length``, ``_llil_constant_value``, ``_decompile_text`` for
+    the callsite decompile excerpt);
   * ``_shared`` -- module-free helpers (``_validate_count``, ``_parse_address``,
     ``OperationFailure``).
 
@@ -73,6 +74,64 @@ def _callee_variadic_hint(callee) -> dict[str, Any] | None:
     }
 
 
+# #792: decompiled lines of context the callsite excerpt carries on either side of
+# the callsite when its HLIL statement cannot be localized.
+_DECOMPILE_EXCERPT_WINDOW = 3
+
+
+def _callsite_decompile_render(bv, func) -> tuple[list[str], list[int]]:
+    """The decompiled body of *func*, plus the gutter address of each line (#792).
+
+    Both renderers this can excerpt (``il_format._pseudo_c_text`` and its HLIL
+    fallback) prefix a line with ``hex(address)`` and eight spaces, so the leading
+    token is the line's address; ``-1`` marks a line without one (a blank spacer,
+    a closing brace, or a ``// bn:`` degradation marker). A rendering failure is
+    reported as an empty render -- the callsite's identity never depends on it."""
+    try:
+        text = il_format._decompile_text(bv, func, addresses=True)
+    except Exception:
+        text = ""
+    lines = text.splitlines() if text else []
+    addresses: list[int] = []
+    for line in lines:
+        head = line.split(None, 1)[0] if line.strip() else ""
+        try:
+            addresses.append(int(head, 16) if head[:2] == "0x" else -1)
+        except ValueError:
+            addresses.append(-1)
+    return lines, addresses
+
+
+def _callsite_decompile_excerpt(render: tuple[list[str], list[int]], call_addr: int) -> dict[str, Any]:
+    """A bounded decompiled window around *call_addr* (#792).
+
+    When ``hlil_statement`` cannot be localized, the callsite is still readable in
+    the decompilation -- this is what ``bn decompile <caller>`` renders, captured
+    in-row so an agent need not re-run it and correlate addresses by hand. A row
+    that did not carry it offered only disassembly fields for a call the
+    decompiler plainly shows."""
+    lines, addresses = render
+    excerpt: dict[str, Any] = {"window": _DECOMPILE_EXCERPT_WINDOW, "lines": []}
+    if not lines:
+        excerpt["reason"] = "decompile_text_unavailable"
+        return excerpt
+    # A statement's gutter address is its FIRST instruction, which can precede the
+    # call (argument setup), so the callsite's own statement is the LAST line at or
+    # before the call address.
+    anchor = next((index for index in range(len(lines) - 1, -1, -1)
+                   if 0 <= addresses[index] <= call_addr), None)
+    if anchor is None:
+        # Nothing at or before the callsite carries an address in this render (a
+        # degraded, header-only body): show the top of it rather than nothing, and
+        # leave `anchor_address` absent rather than naming a line that is not it.
+        anchor = 0
+    else:
+        excerpt["anchor_address"] = hex(addresses[anchor])
+    window = _DECOMPILE_EXCERPT_WINDOW
+    excerpt["lines"] = lines[max(0, anchor - window):anchor + window + 1]
+    return excerpt
+
+
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
                                stub_addrs: frozenset[int] = frozenset(),
                                variadic_hint: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -99,6 +158,7 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         for target in callee_addresses:
             code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
+    decompiled_render: tuple[list[str], list[int]] | None = None
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
         # Count tail-branch references too (a `b`/branch into the sink rendered
@@ -181,6 +241,16 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         )
         if variadic_hint is not None:
             rows[-1]["callee_variadic"] = variadic_hint
+        if hlil_statement is None:
+            # #792: the statement is null (with a reason), but the callsite is
+            # still visible in the decompilation. Decompiling the body is a
+            # per-FUNCTION cost, so it is rendered at most once and only when a
+            # row actually needs it.
+            if decompiled_render is None:
+                decompiled_render = _callsite_decompile_render(bv, func)
+            rows[-1]["decompile_excerpt"] = _callsite_decompile_excerpt(
+                decompiled_render, call_addr
+            )
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
 

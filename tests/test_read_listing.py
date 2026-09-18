@@ -261,3 +261,69 @@ def test_list_functions_named_filter_pages_without_building_the_rest(monkeypatch
     assert result["total"] == 500 and result["returned"] == 10 and result["has_more"] is True
     assert all(item["auto_named"] is False for item in result["items"])
     assert _rows_built(functions) <= 11
+
+
+# --- #792: a callsite whose HLIL statement cannot be localized ---------------
+#
+# `hlil_statement: null` + a reason code is the honest answer for one row, but it
+# left the row with no readable context on the JSON surface: `bn decompile
+# <caller>` plainly renders the call, yet nothing in the row said so. The row now
+# carries a bounded decompiled excerpt around the callsite.
+
+def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    call_addr = 0x500010
+    local_addr = 0x500014
+    callee = _FakeFunction(0x5a10, "send_status")
+    caller = _FakeFunction(0x500000, "handle_reply")
+    caller.basic_blocks = [_FakeBasicBlock(call_addr, local_addr + 4)]
+    caller.arch = _FakeArch(lengths={call_addr: 4, local_addr: 4})
+    block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock", address=call_addr,
+                                 expr_index=9, instr_index=9)
+    # A statement whose rendered text is a whole-function-sized blob: the
+    # localization layer refuses it as non-local (#557) -- the shape this issue's
+    # repro reports on a real AArch64 handler.
+    blob = _FakeHLILInstruction("send_status(\n" + "x" * 300 + "\n)",
+                                class_name="HighLevelILCall", parent=block,
+                                address=call_addr, expr_index=11, instr_index=11)
+    local_call = _FakeHLILInstruction("send_status(fd, &buf)", class_name="HighLevelILCall",
+                                      parent=block, address=local_addr,
+                                      expr_index=21, instr_index=21)
+    caller.low_level_il = [[
+        _FakeLLILInstruction(call_addr, _FakeConstPtr(0x5a10), hlils=[blob]),
+        _FakeLLILInstruction(local_addr, _FakeConstPtr(0x5a10), hlils=[local_call]),
+    ]]
+    bv = _FakeBV(
+        functions=[callee, caller],
+        disassembly={call_addr: "bl 0x5a10", local_addr: "bl 0x5a10"},
+        instruction_lengths={call_addr: 4, local_addr: 4},
+    )
+    _install_fake_pseudo_c(monkeypatch, bridge, caller, [[
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x50000c, "    prepare(&buf);"),
+        (call_addr, "    send_status(fd, &buf);"),
+        (local_addr, "    send_ack(fd);"),
+        (0x500018, "    return 0;"),
+        (0x50001c, "}"),
+    ]])
+
+    rows = bridge.read_listing._callsites_within_function(None, bv, callee, caller, context=1)
+    by_addr = {row["call_addr"]: row for row in rows}
+
+    failed = by_addr[hex(call_addr)]
+    assert failed["hlil_statement"] is None
+    assert failed["hlil_statement_reason"] == "statement_not_local"
+    excerpt = failed["decompile_excerpt"]
+    assert excerpt["anchor_address"] == hex(call_addr)
+    assert excerpt["window"] == 3
+    assert any(line.startswith(hex(call_addr)) and "send_status(fd, &buf);" in line
+               for line in excerpt["lines"])
+    # The excerpt is a WINDOW around the callsite, not the whole function.
+    assert not any("int32_t handle_reply" in line for line in excerpt["lines"])
+
+    # Negative control: a localized statement needs no excerpt.
+    resolved = by_addr[hex(local_addr)]
+    assert resolved["hlil_statement"] == "send_status(fd, &buf)"
+    assert "decompile_excerpt" not in resolved
