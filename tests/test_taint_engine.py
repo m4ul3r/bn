@@ -8183,6 +8183,45 @@ def test_scanf_family_models_seed_every_destination_in_the_run_809(models, calle
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
 
 
+def _scanf_arity_func(destinations):
+    """read_many(): scanf(fmt, &d1 .. &dN) -- N variadic destinations, so the
+    call carries N + 1 params (the format string is arg0)."""
+    args = [FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)]
+    args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}", typ="char[0x40]"))
+             for i in range(1, destinations + 1)]
+    shown = ", ".join(["fmt"] + [f"&d{i}" for i in range(1, destinations + 1)])
+    return FFunc("read_many", 0x10,
+                 FSSAFunc([_ext_call(0, 0x10, f"scanf({shown})", 0x900, args)]), params=[])
+
+
+def test_scanf_arity_residual_withholds_all_clear_851(models):
+    # #851: `scanf` declares arity_capped over a fixed *arg:1..4 destination run.
+    # A call whose actual param count exceeds `max(modeled arg index) + 1` leaves
+    # the residual destinations unseeded, so the engine must disclose it and the
+    # honesty gate must withhold the all-clear. This is the half the model-DB
+    # tests cannot see: turn the bound into `>=`, or move the block inside the
+    # seeding-success path, and only this test fails.
+    func = _scanf_arity_func(5)          # fmt + five destinations; the model covers four
+    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
+        func, [te.parse_locator("call:scanf")])
+    assert any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_scanf_arity_at_the_modeled_run_stays_clear_851(models):
+    # The boundary twin: exactly four destinations IS the modeled run, so nothing
+    # is left unseeded and the run must not pay the residual disclosure -- an
+    # unconditional assumption would be a permanent false alarm on every
+    # well-covered scanf, which is its own defect.
+    func = _scanf_arity_func(4)
+    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
+        func, [te.parse_locator("call:scanf")])
+    assert not any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is True, diag
+
+
 def test_sscanf_model_propagates_into_every_destination_in_the_run_809(models):
     # sscanf reads from the caller's string (arg0) rather than a stream, so it
     # PROPAGATES that buffer into each destination; the second destination is the
