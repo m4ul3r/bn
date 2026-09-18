@@ -1420,6 +1420,108 @@ def _mutation_preflight(args: argparse.Namespace):
         ) from exc
 
 
+# #767/#768: a `--count` run reports the whole-target total, so an ordering,
+# paging or aggregate flag beside it can only be ignored -- and a silently
+# dropped flag is how an agent draws a wrong conclusion from a right-looking
+# number. argparse cannot express "this flag excludes each of those": one
+# mutually exclusive group would also exclude the flags from EACH OTHER
+# (`--sort` with `--reverse` is a legitimate pair), so the check is explicit.
+_COUNT_SLICE_FLAGS: tuple[tuple[str, str, Any], ...] = (
+    ("limit", "--limit", None),
+    ("offset", "--offset", 0),
+    ("sort", "--sort", "address"),
+    ("reverse", "--reverse", False),
+    ("summary", "--summary", False),
+)
+
+
+def _refuse_count_only_slices(args: argparse.Namespace, *, command: str) -> None:
+    """Refuse a ``--count`` run that also carries a slice-shaped flag.
+
+    Each flag is compared against its own "not given" value and read with
+    ``getattr``, so a command that does not declare the flag cannot trip it.
+    ``--sort address`` on an address-sorted command is not an offender: it is
+    indistinguishable from the default and means the same thing anyway.
+    """
+    offenders = [
+        flag for attr, flag, unset in _COUNT_SLICE_FLAGS
+        if getattr(args, attr, unset) != unset
+    ]
+    if offenders:
+        raise BridgeError(
+            f"{command} --count reports the whole-target total, so "
+            f"{', '.join(offenders)} would be silently ignored. Drop --count for "
+            "the paged list, or drop the flags for the count."
+        )
+
+
+def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
+    """Read a CLI text-input file that must terminate.
+
+    A FIFO with no writer makes ``Path.read_text`` block forever: no output, no
+    envelope, no timeout -- the worst failure an agent-facing CLI can produce,
+    and one the caller cannot even see in a log (#864). #754/#855 refused a
+    directory by name and wrapped the read; this is that refusal extended to
+    every non-regular input, so the --file / --script / manifest / --models /
+    --resolve-map readers state the rule once instead of five times.
+
+    The null device stays the one deliberate exception: ``--file /dev/null`` is
+    a legitimate "empty input" spelling that #855's scope note protects, which
+    is exactly why a blanket ``is_file()`` guard is wrong. Devices that can
+    block or stream (``/dev/zero``, a FIFO, a socket) are refused by kind.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        raise BridgeError(_with_hint(f"{what} not found: {path}", hint)) from None
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    if stat.S_ISDIR(st.st_mode):
+        raise BridgeError(_with_hint(f"{what} is a directory: {path}", hint))
+    if not stat.S_ISREG(st.st_mode) and not _is_null_device(path):
+        raise BridgeError(
+            f"{what} is not a regular file ({_file_kind(st.st_mode)}): {path}. "
+            "A FIFO or device can block a read forever, so it is refused instead "
+            "of hung on; write the input to a regular file first"
+            + (f" or {hint.rstrip('.')}" if hint else "")
+        )
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+
+
+def _with_hint(message: str, hint: str | None) -> str:
+    """Append *hint* to *message* as one sentence, or return *message* alone."""
+    return f"{message}. {hint}" if hint else message
+
+
+def _is_null_device(path: Path) -> bool:
+    """Whether *path* is the platform's null device (``/dev/null``).
+
+    ``samefile`` needs both paths to exist, so a platform without one simply
+    never matches -- the safe direction, since the path then refuses like every
+    other non-regular input rather than being let through on its name.
+    """
+    try:
+        return os.path.samefile(path, os.devnull)
+    except OSError:
+        return False
+
+
+def _file_kind(mode: int) -> str:
+    """Name a non-regular file type for the refusal message (#864)."""
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    return "not a regular file"
+
+
 def _mutate(
     args: argparse.Namespace,
     op: str,
@@ -1528,8 +1630,6 @@ def _call(
     # -t/--target on a target-required command.
     allow_implicit_target: bool = True,
     text_renderer: Callable[[Any], str] | None = None,
-    page_limit: int | None = None,
-    page_offset: int = 0,
     page_label: str | None = None,
     paged_spill: bool = False,
     stem: str,
@@ -1571,10 +1671,6 @@ def _call(
     timeout_kwargs = (
         {"default_timeout": op_default_timeout} if op_default_timeout is not None else {}
     )
-    effective_page_limit = None
-    if page_limit is not None and page_limit >= 0:
-        effective_page_limit = page_limit
-        request_params["limit"] = page_limit + 1
 
     # #169 L1: --all-instances / --all-targets fan this read across instances
     # and/or targets and aggregate. Gated branch -- the normal single-target path
@@ -1710,10 +1806,9 @@ def _call(
         # recognising unrelated symbol names.
         provenance={"target": target, "instance": getattr(args, "instance", None)},
         slice_hint=slice_hint,
-        # paged_spill keeps the "--limit/--offset to page" spill hint for
-        # commands (function list/search) that page bridge-side and so don't set
-        # the client-side page_limit (#59).
-        paged=(page_limit is not None) or paged_spill,
+        # paged_spill is the "--limit/--offset to page" spill hint, set by the
+        # commands (function list/search) that page bridge-side (#59).
+        paged=paged_spill,
     )
     # A text renderer that display-truncates (e.g. xrefs capping caller groups)
     # produces output too small to spill, so the spill pipe-note never fires and a
@@ -2025,7 +2120,13 @@ def _parse_line_range(value: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(f"expected START:END or START-END, got {value!r}")
     try:
-        start, end = int(parts[0]), int(parts[1])
+        # Base-0 like the bare form above, so `--lines 0x1:0x2` works: the header
+        # prints the range with plain integers, but addresses (and therefore the
+        # ranges an agent copies out of disasm/xrefs output) are hex, and the two
+        # forms must not disagree about which bases they accept (#824). `int(x, 0)`
+        # still parses a leading `-` as negative, so the 1-indexed rejection below
+        # keeps working.
+        start, end = int(parts[0], 0), int(parts[1], 0)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"expected START:END or START-END with integers, got {value!r}"
@@ -2268,9 +2369,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire
-    # before args.format exists) can still emit a JSON error envelope.
+    # before args.format exists) can still emit a JSON error envelope. Scoped to
+    # THIS parse: BnArgumentParser.error reads the global while parsing runs, and
+    # leaving it set leaked the machine format into the next in-process parse --
+    # a later `build_parser().parse_args([...])` with no --format still printed a
+    # JSON envelope to stdout because an earlier main() call asked for json
+    # (#824).
     _MACHINE_ERROR_FORMAT = _requested_output_format(parse_argv)
-    args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    try:
+        args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    finally:
+        _MACHINE_ERROR_FORMAT = None
     (
         args._explicit_instance,
         args._explicit_instance_id,
