@@ -1070,6 +1070,9 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             return
         op = None
         request_id = None
+        # Default: a request whose envelope never parsed stamps the idle clock,
+        # so an unreadable request can never be treated as a free probe (#756).
+        idle_probe = False
         # Idle-reaper accounting: count EVERY non-empty request as in-flight from
         # here through the response write (leave_request runs in the finally, after
         # the write), so the bridge is never deemed idle mid-response -- including
@@ -1105,6 +1108,12 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                     else:
                         op = payload.get("op")
                         request_id = payload.get("id")
+                        # #756: a caller-declared liveness probe still counts as
+                        # in-flight, but must not restart the idle window. Read
+                        # here (not in dispatch) because a refused/erroring probe
+                        # must be exempt too, and default to stamping for any
+                        # request whose envelope never parsed.
+                        idle_probe = payload.get("idle_probe") is True
                         expected_identity = getattr(bridge, "bridge_identity", None)
                         actual_identity = payload.get("_bridge_identity")
                         if (
@@ -1144,7 +1153,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             self._write_response(encoded, op=op, request_id=request_id)
         finally:
             if counted and leave_request is not None:
-                leave_request()
+                leave_request(stamp_activity=not idle_probe)
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -1779,14 +1788,30 @@ class BinaryNinjaBridge:
             self._inflight += 1
             return not self._shutting_down
 
-    def _leave_request(self) -> None:
+    def _leave_request(self, *, stamp_activity: bool = True) -> None:
         """Balance a prior _enter_request and stamp the idle clock. Called only after
         the response has been written, so encoding/transmit time counts as activity
-        and a bridge is never deemed idle mid-response."""
+        and a bridge is never deemed idle mid-response.
+
+        #756: `stamp_activity=False` for a request that DECLARED itself a liveness
+        probe (`idle_probe: true` in the envelope). `bn session list` and
+        `bn doctor` issue a real per-instance request purely to answer "is this
+        bridge alive / would closing it discard work", and that traffic comes from
+        whichever agent happened to run the command -- never from this bridge's
+        owner. Stamping it let routine discovery on a busy host postpone an
+        orphaned bridge's crash fallback indefinitely, which is the mechanism
+        behind bridges outliving their interval and retaining memory.
+
+        The probe is still COUNTED as in-flight by _enter_request, so it can never
+        be reaped mid-response; it just does not restart the idle window. The
+        caller declares the intent because the op cannot: `list_targets` serves the
+        peer probe, the owner's own `bn target list`, and implicit target
+        resolution, so exempting the op would have exempted real work too."""
         with self._request_state_lock:
             if self._inflight > 0:
                 self._inflight -= 1
-            self._last_activity = time.monotonic()
+            if stamp_activity:
+                self._last_activity = time.monotonic()
 
     def _try_idle_shutdown(self, now: float, timeout: float) -> bool:
         """Atomically decide whether to self-shutdown. Returns True (and latches

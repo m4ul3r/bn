@@ -14,16 +14,57 @@ condition wait (never a fixed sleep) to stay fast and non-flaky.
 """
 from __future__ import annotations
 
+import io
+import json
+import os
+import struct
 import time
+import types
 
 import pytest
 
-from _bridge_fakes import _load_bridge
+from _bridge_fakes import _RecordingWriter, _load_bridge
 
 
 def _instance(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     return bridge, bridge.BinaryNinjaBridge()
+
+
+def _same_uid_conn():
+    """Fake accepted-socket whose SO_PEERCRED reports THIS process's uid, so the
+    #612 peer-credential gate in ``handle()`` lets the request through."""
+    class _Conn:
+        def getsockopt(self, level, optname, buflen):
+            return struct.pack("3i", os.getpid(), os.getuid(), os.getgid())[:buflen]
+
+    return _Conn()
+
+
+def _serve_one(bridge, inst, payload, *, dispatched: bool = False) -> float:
+    """Drive ONE real request through ``BridgeHandler.handle()`` against a real
+    bridge instance and return the resulting ``_last_activity``.
+
+    The whole point is to exercise the shipped path -- the envelope field and the
+    handler's read of it -- rather than the private ``stamp_activity`` kwarg.
+    With ``dispatched=False`` identity is left mismatched, so the request is
+    REFUSED without dispatch: the accounting must cover a refused request too,
+    which is why the flag is read before the identity check. With
+    ``dispatched=True`` the envelope carries this bridge's own identity so the
+    request really is dispatched -- otherwise a refactor moving the flag read
+    into the dispatch branch would pass every test here (#859 review round 2).
+    """
+    inst._last_activity = 100.0
+    if dispatched:
+        payload = {**payload, "_bridge_identity": inst.bridge_identity}
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
+    handler.rfile = io.BytesIO((json.dumps(payload) + "\n").encode("utf-8"))
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.handle()
+    assert inst._inflight == 0, "every request must balance its accounting"
+    return inst._last_activity
 
 
 # --------------------------------------------------------------------------
@@ -68,6 +109,88 @@ def test_leave_request_decrements_and_stamps_activity(monkeypatch):
     assert inst._inflight == 0
     assert inst._last_activity > 0.0  # stamped AFTER the request completes
 
+
+def test_a_declared_liveness_probe_cannot_postpone_the_reap_756(monkeypatch):
+    """#756: `_leave_request` stamped the idle clock for EVERY request, and
+    `bn session list` / `bn doctor` issue a real per-instance probe. That traffic
+    belongs to whichever agent ran the command, not to this bridge's owner, so on
+    a host with several agents their routine discovery postponed an orphaned
+    armed bridge's crash fallback indefinitely (measured: an 8s arm died at
+    t+16.1s after one peer listing at t+7.0s, and a 25s arm was still alive at
+    +89s).
+
+    A request that declares itself a liveness probe still counts as in-flight --
+    so it can never be reaped mid-response -- but does not restart the window."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+
+    inst._enter_request()
+    assert inst._inflight == 1
+    # In flight: the reaper must not fire even for a probe.
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is False
+    inst._leave_request(stamp_activity=False)
+
+    assert inst._inflight == 0
+    assert inst._last_activity == 100.0          # window NOT restarted
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is True
+
+
+def test_ordinary_work_still_stamps_the_idle_clock_756(monkeypatch):
+    """The other half of #756: only a DECLARED probe is exempt. Any ordinary
+    request -- including the owner's own `bn target list`, which issues the same
+    `list_targets` op the peer probe does -- keeps the bridge alive."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._enter_request()
+    inst._leave_request()
+
+    assert inst._last_activity > 100.0
+    assert inst._try_idle_shutdown(now=inst._last_activity + 1.0, timeout=30.0) is False
+
+
+def test_the_idle_probe_ENVELOPE_FIELD_is_what_exempts_a_request_756(monkeypatch):
+    """#859 review: the two tests above drive the PRIVATE `stamp_activity` kwarg,
+    so the thing that actually ships -- the `idle_probe` envelope field and the
+    handler's read of it -- had no test. The reviewer proved it by replacing the
+    handler read with `idle_probe = False`: the suite stayed green, i.e. the fix
+    could silently revert.
+
+    This drives one real request through `BridgeHandler.handle()` and pins the
+    contract from the wire in: the same request shape stamps without the field
+    and does not stamp with it."""
+    bridge, inst = _instance(monkeypatch)
+    base = {"id": "r1", "op": "list_targets", "params": {}}
+
+    ordinary = _serve_one(bridge, inst, base)
+    probe = _serve_one(bridge, inst, {**base, "idle_probe": True})
+
+    assert ordinary > 100.0, "an ordinary request must restart the idle window"
+    assert probe == 100.0, "a declared probe must not restart the idle window"
+
+    # And again on the DISPATCHED path, so the rule cannot come to depend on the
+    # request having been refused before it reached an op.
+    dispatched_ordinary = _serve_one(bridge, inst, base, dispatched=True)
+    dispatched_probe = _serve_one(
+        bridge, inst, {**base, "idle_probe": True}, dispatched=True)
+
+    assert dispatched_ordinary > 100.0
+    assert dispatched_probe == 100.0
+
+
+@pytest.mark.parametrize(
+    "flag", [False, "true", 1, None, "yes"],
+    ids=["false", "string-true", "int-1", "null", "string-yes"],
+)
+def test_only_a_real_true_declares_a_probe_756(monkeypatch, flag):
+    """`is True`, not truthiness: a raw client sending `idle_probe: 1` or
+    `"true"` has not spoken this protocol, and the safe reading of an
+    uninterpretable value is "ordinary request" -- stamping keeps a live bridge
+    alive, while wrongly exempting one reaps it early."""
+    bridge, inst = _instance(monkeypatch)
+    stamped = _serve_one(
+        bridge, inst, {"id": "r1", "op": "list_targets", "params": {}, "idle_probe": flag})
+
+    assert stamped > 100.0
 
 # --------------------------------------------------------------------------
 # Idle decision + atomic shutdown latch

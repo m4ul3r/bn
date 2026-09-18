@@ -780,7 +780,7 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
         bn.cli,
         "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_name": "bn_agent_bridge",
@@ -825,7 +825,7 @@ def test_doctor_flags_stale_engine(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {"ok": True, "result": {
+        lambda instance, op, params=None, target=None, **_kwargs: {"ok": True, "result": {
             "plugin_name": "bn_agent_bridge", "plugin_version": bn.cli.VERSION,
             "plugin_build_id": bn.cli.build_id_for_file(install_dir / "bridge.py"),
             # Loaded engine fingerprint differs from on-disk -> stale_engine.
@@ -1097,7 +1097,7 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
         bn.cli,
         "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_name": "bn_agent_bridge",
@@ -1140,7 +1140,7 @@ def test_doctor_names_engine_version(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {
+        lambda instance, op, params=None, target=None, **_kwargs: {
             "ok": True,
             "result": {
                 "plugin_version": bn.cli.VERSION, "plugin_build_id": "b",
@@ -1182,7 +1182,7 @@ def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
 
-    def fake_send(instance, op, params=None, target=None):
+    def fake_send(instance, op, params=None, target=None, **_kwargs):
         if instance is ok_inst:
             return {"ok": True, "result": {
                 "plugin_version": bn.cli.VERSION, "plugin_build_id": "b", "targets": []}}
@@ -2316,6 +2316,63 @@ def test_session_list_probes_a_gui_bridge_by_its_selector(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["items"][0]["unsaved_targets"] == 1
 
 
+def test_the_two_peer_probes_declare_themselves_as_probes_756(monkeypatch, capsys, tmp_path):
+    """#859 review: deleting either `idle_probe=True` declaration left the suite
+    green, so the CLI half of the contract was untested. This records the FULL
+    kwarg set at both declaring sites -- the #787 direction -- and pins it.
+
+    `session list` and `doctor` are the two commands that issue a real
+    per-instance request purely to answer "is this bridge alive / would closing
+    it discard work". That traffic belongs to whoever ran the command, never to
+    the bridge's owner, so both must declare `idle_probe=True`. An ordinary
+    command must NOT: `bn target list` issues the same `list_targets` op as the
+    peer probe, and it is real work that keeps the bridge alive."""
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    inst = BridgeInstance(
+        pid=222, socket_path=_P("/tmp/p.sock"), registry_path=_P("/tmp/p.json"),
+        plugin_name="bn_agent_bridge", plugin_version=bn.cli.VERSION,
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="probe-me")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: tmp_path)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: tmp_path)
+    sent: list[dict] = []
+
+    def record_send_request(op, **kwargs):
+        sent.append({"op": op, **kwargs})
+        return {"ok": True, "result": [{"selector": "netsvcd", "unsaved": True}]}
+
+    def record_to_instance(instance, op, **kwargs):
+        sent.append({"op": op, **kwargs})
+        return {"ok": True, "result": {
+            "plugin_version": bn.cli.VERSION, "plugin_build_id": "b", "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", record_send_request)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", record_to_instance)
+
+    assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+    bn.cli.main(["doctor", "--format", "json"])
+    bn.cli.main(["target", "list", "--format", "json", "-i", "probe-me"])
+    capsys.readouterr()
+
+    by_op: dict[str, list[dict]] = {}
+    for call in sent:
+        by_op.setdefault(call["op"], []).append(call)
+
+    # The two peer probes: declared, explicitly True (not merely truthy).
+    probes = [c for c in by_op["list_targets"] if c.get("strict") or c.get("params") == {"strict": True}]
+    assert probes, f"session list issued no strict list_targets probe: {sent}"
+    assert all(c.get("idle_probe") is True for c in probes), probes
+    assert all(c.get("idle_probe") is True for c in by_op["doctor"]), by_op["doctor"]
+
+    # Ordinary work: `bn target list` is the SAME op and must not be exempt.
+    ordinary = [c for c in by_op["list_targets"] if c not in probes]
+    assert ordinary, f"target list issued no plain list_targets: {sent}"
+    assert all(c.get("idle_probe") in (False, None) for c in ordinary), ordinary
+
+
 def test_session_list_probes_instances_concurrently(monkeypatch, capsys):
     """A fleet triage must not pay one probe budget per bridge: a serial sweep
     of a wedged fleet is exactly the "one wedged bridge blocks the survey" the
@@ -3366,3 +3423,81 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
     assert [p["prefer_bndb"] for p in loads] == [False, False, False]
     assert [p["quick"] for p in loads] == [False, False, True]
     assert len(json.loads(capsys.readouterr().out)["loaded"]) == 3
+
+
+def test_the_probe_flag_reaches_the_WIRE_envelope_756(monkeypatch, tmp_path, capsys):
+    """#859 review round 2: the transport half was the one link nothing
+    exercised. Deleting the emission (`payload["idle_probe"] = True`) or the
+    forwarding (`idle_probe=idle_probe` into `_send_request_to_instance`) left
+    711 tests green while a real wire probe showed the field never reaching the
+    envelope -- so the declaration could be honoured nowhere and nothing failed.
+
+    This drives the real transport against a real Unix socket and asserts the
+    bytes: `session list`'s probe carries `idle_probe: true` in the ENVELOPE,
+    and an ordinary command over the same path does not. Both mutations die
+    here, because both sit on the path from the declaring site to the wire."""
+    import socketserver
+    import threading
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+
+    received: list[dict] = []
+
+    class _H(socketserver.StreamRequestHandler):
+        def handle(self):
+            raw = self.rfile.readline()
+            if not raw:
+                return
+            payload = json.loads(raw.decode("utf-8"))
+            received.append(payload)
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "result": [{"selector": "netsvcd", "unsaved": True}],
+                "bridge_identity": payload.get("_bridge_identity"),
+            }).encode("utf-8"))
+
+    class _S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    sock_path = tmp_path / "wire.sock"
+    server = _S(str(sock_path), _H)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                              daemon=True)
+    thread.start()
+    try:
+        # pid is THIS process so the SO_PEERCRED peer-pid check passes: the
+        # server above really is the peer on the other end of the socket.
+        inst = BridgeInstance(
+            pid=os.getpid(), socket_path=_P(str(sock_path)),
+            registry_path=tmp_path / "wire.json", plugin_name="bn_agent_bridge",
+            plugin_version=bn.cli.VERSION, started_at="2026-01-01T00:00:00Z",
+            meta={}, instance_id="wire-probe",
+            # Without a token `_instance_identity` refuses before the socket is
+            # touched -- and `session list` swallows that into
+            # `unsaved_targets_unavailable` at rc 0, so the test would have
+            # asserted nothing while looking green.
+            instance_token="wire-probe-token")
+        # Both namespaces: `session list` reads `cli.list_instances`, while
+        # `choose_instance` (which `-i` resolution goes through) reads the one in
+        # `bn.transport`'s own module globals.
+        import bn.transport as _t
+        monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [inst])
+        monkeypatch.setattr(_t, "list_instances", lambda **kw: [inst])
+        monkeypatch.setattr(bn.cli, "session_state", types.SimpleNamespace(
+            read=lambda: {}, write=lambda **kw: None))
+
+        assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+        assert bn.cli.main(["target", "list", "--format", "json", "-i", "wire-probe"]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    capsys.readouterr()
+
+    probes = [p for p in received if (p.get("params") or {}).get("strict")]
+    ordinary = [p for p in received if p not in probes]
+    assert probes, f"session list sent no strict probe: {received}"
+    assert all(p.get("idle_probe") is True for p in probes), probes
+    assert ordinary, f"target list sent nothing: {received}"
+    # Absent, not false: the envelope is byte-identical to before for real work.
+    assert all("idle_probe" not in p for p in ordinary), ordinary
