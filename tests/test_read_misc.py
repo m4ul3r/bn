@@ -1627,12 +1627,97 @@ def test_data_symbols_lists_named_data_symbols_only(monkeypatch):
         {"a": "0x2000", "n": "g_state"},
         {"a": "0x2010", "n": "g_table"},
     ]
-    # Paging is opt-in: the default call returns the WHOLE set, because the
-    # consumer builds a goto/search index in one shot and a silent default cap
-    # would drop exactly the renamed globals this read exists to keep visible.
+    # Paging is opt-in AT THIS OP: the default call returns the WHOLE set,
+    # because a direct programmatic caller (the out-of-tree lens builds a
+    # goto/search index in one shot) must not be silently truncated -- a
+    # default cap would drop exactly the renamed globals this read exists to
+    # keep visible. The bounded default lives on the CLI (#682 item 1).
     assert result["limit"] is None
     assert result["total"] == 2 and result["returned"] == 2
     assert result["has_more"] is False
+
+
+class _CountingDataSym:
+    """A DataSymbol whose `address` reads are counted.
+
+    `_data_symbols` reads `address` exactly once per materialized row (to render
+    it) and never in the named-symbol filter, so the count IS the number of rows
+    this read built -- the measurement `_FakeStringRef.type_reads` makes for
+    `strings` (#814)."""
+
+    def __init__(self, address: int, name: str):
+        self._address = address
+        self.name = name
+        self.type = sys.modules["binaryninja"].SymbolType.DataSymbol
+        self.address_reads = 0
+
+    @property
+    def address(self):
+        self.address_reads += 1
+        return self._address
+
+
+def test_data_symbols_builds_rows_for_the_page_only_682(monkeypatch):
+    # #682 item 1, the lock half. This op used to construct a row (address ->
+    # hex, plus name) for EVERY data symbol before slicing the page, so the
+    # default read held the read lock for the whole build. A page must now build
+    # the window only. The scan of the population for the honest `total` stays --
+    # BN hands back the symbol list in one call and there is no count-only API,
+    # so `name` is still read per symbol -- but no row is built outside it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    syms = [_CountingDataSym(0x2000 + i * 8, f"g_{i}") for i in range(3000)]
+    bv = _FakeBV(symbols=syms)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._data_symbols(None, limit=25)
+
+    assert page["total"] == 3000
+    assert page["returned"] == 25 and page["has_more"] is True
+    assert page["items"][0] == {"a": "0x2000", "n": "g_0"}
+    built = sum(s.address_reads for s in syms)
+    assert built <= 26, f"{built} row(s) materialized for a 25-row page of 3000 data symbols"
+
+
+def test_data_symbols_limit_past_the_total_is_not_an_error_682(monkeypatch):
+    # "Let a caller who wants the full set ask for it": a limit larger than the
+    # population clamps to the population instead of erroring or padding, and it
+    # is echoed back so the envelope stays honest about what was asked.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(5)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    whole = instance._data_symbols(None, limit=1000000)
+
+    assert whole["limit"] == 1000000 and whole["returned"] == 5
+    assert whole["total"] == 5 and whole["has_more"] is False
+    assert [s["n"] for s in whole["items"]] == [f"g_{i}" for i in range(5)]
+
+
+def test_data_symbols_offset_past_the_end_discloses_the_total_682(monkeypatch):
+    # #682 item 4, which must keep working now that the CLI defaults to a page:
+    # an over-shot offset is an EMPTY PAGE, not an empty view, and the true
+    # total has to survive so the reader can re-page (the text renderer turns
+    # this into "none (offset N is past the end; M total)").
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(4)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    over = instance._data_symbols(None, offset=2000, limit=100)
+
+    assert over["items"] == [] and over["returned"] == 0
+    assert over["total"] == 4 and over["offset"] == 2000
+    assert over["has_more"] is False
 
 
 def test_data_symbols_pages_on_demand_with_an_honest_total(monkeypatch):

@@ -992,15 +992,23 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     """Every *named* DataSymbol as address + name -- includes internal symbols
     the exports list omits, so a renamed data global stays addressable.
 
-    Paging is OPT-IN: `limit=None` returns the whole set, because the primary
-    consumer builds a goto/search index over every data global in one call and
-    a silent default cap would drop exactly the renamed globals this read
-    exists to keep addressable. `offset`/`limit` are there so an oversized
-    view can still be walked in bounded pages, and the envelope reports the
-    true `total` either way.
+    Paging is OPT-IN at this op, on purpose and permanently: `limit=None`
+    returns the whole set, because a programmatic caller (the out-of-tree lens
+    builds a goto/search index over every data global in one call) must not be
+    silently truncated by a default cap -- that would drop exactly the renamed
+    globals this read exists to keep addressable. The bounded default lives one
+    layer up, on the `bn data symbols` CLI (#682 item 1), which asks for a
+    100-row page through `_effective_limit` and uncaps for `--out`; a direct
+    bridge caller pages explicitly with `offset`/`limit`. An OVERSIZED page is
+    not an error: the window clamps to the population, so `limit` > total
+    returns the whole set and an `offset` past the end returns an empty page
+    with the true `total` still visible (#682 item 4).
 
-    The container stays `syms` (not the `items` of the paged list ops) because
-    it is an established client contract; the paging metadata is additive.
+    Rows are built for the returned WINDOW only (#682 item 1): a page no longer
+    constructs a dict and serializes it for every symbol in the view. The
+    population still has to be scanned for the honest `total` -- BN hands back
+    the symbol list in one call and there is no count-only API -- so the
+    remaining in-lock cost on the page path is that scan, not the build.
     """
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1015,15 +1023,19 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     # flattened into an empty list, making a real BN error indistinguishable
     # from "this binary has no data symbols" -- the silent-empty failure mode.
     symbols = bv.get_symbols_of_type(sym_type)
+    named = [sym for sym in symbols if getattr(sym, "name", "")]
+    start, stop = _page_window(len(named), offset=offset, limit=limit)
     syms = [
-        {"a": hex(int(sym.address)), "n": sym.name}
-        for sym in symbols
-        if getattr(sym, "name", "")
+        # `a`/`n` stay terse on purpose: #682 item 2 names the `cfg` line/edge
+        # keys and the `data vars` row keys, and this row pair is a separate,
+        # older contract the out-of-tree lens decodes by name.
+        {"a": hex(int(sym.address)), "n": sym.name} for sym in named[start:stop]
     ]
     # #275: `items` is the universal data container and `kind` the discriminator.
     # This used to hand-roll a byte-identical envelope under the name `syms`,
     # which every generic consumer (and the paging footer) has to special-case.
-    return _paged_list_result(syms, offset=offset, limit=limit, kind="data_symbols")
+    return _paged_envelope(kind="data_symbols", items=syms, total=len(named),
+                           offset=offset, limit=limit)
 
 
 def _ascii_render(data: bytes) -> str:
