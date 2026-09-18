@@ -5142,27 +5142,44 @@ def test_render_trace_text_header_discloses_an_unresolved_callee_755():
 
 def test_render_trace_text_makes_no_callee_claim_when_none_was_computed_755():
     """#755 review: the disclosure must not become its own absent-vs-null
-    conflation. A payload carrying NEITHER `arg_label` NOR `callee` had nothing
-    computed for the callee, so asserting `<unresolved callee>` would state an
-    affirmative finding about a question never asked -- the exact shape
-    `_field_present`/`_field_skewed` exists to keep apart (#619).
+    conflation. Only an `arg_label` that arrived as an OBJECT means the producer
+    computed a callee slot; a missing key and an explicit null both claim
+    nothing, which is `_field_present`'s stated rule, how `_field_list` and
+    `_field_dict` already read a nulled field, and the reading the mirror test
+    relies on when it feeds `{key: None}` as a benign payload for every
+    discovered read.
 
-    Absent -> the pre-existing no-claim header. Present-but-unresolved -> the
-    disclosure."""
+    Round 1 used `_field_declared` -- whose docstring says it answers the
+    DIFFERENT question of which envelope shape arrived -- so an explicit
+    `"arg_label": null` still rendered the affirmative finding. All three states
+    are pinned here so neither direction can drift again."""
     from bn.formatters import _render_trace_text
     bare = {
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
         "arg_index": 0, "trace": [],
     }
+
+    # 1. Absent: nothing was computed, so nothing is claimed.
     out = _render_trace_text(bare)
     assert "backward trace of arg[0] in f @ 0x1010" in out
     assert "unresolved callee" not in out
 
-    # A producer that DID compute it and found nothing says so, via either the
-    # label or the explicit top-level null.
-    assert "of <unresolved callee>" in _render_trace_text(
-        dict(bare, arg_label={"index": 0}))
-    assert "of <unresolved callee>" in _render_trace_text(dict(bare, callee=None))
+    # 2. Explicit null, on either key: still claims nothing (round-2 finding).
+    for nulled in ({"arg_label": None}, {"callee": None},
+                   {"arg_label": None, "callee": None}):
+        nulled_out = _render_trace_text({**bare, **nulled})
+        assert "backward trace of arg[0] in f @ 0x1010" in nulled_out, nulled
+        assert "unresolved callee" not in nulled_out, nulled
+
+    # 3. An arg_label OBJECT is the positive signal: computed, and if its callee
+    #    is missing or null the row says so rather than going silent.
+    for computed in ({"index": 0}, {"index": 0, "callee": None}):
+        assert "of <unresolved callee>" in _render_trace_text(
+            dict(bare, arg_label=computed)), computed
+
+    # A name still wins from either key.
+    assert "of parse_header" in _render_trace_text(
+        dict(bare, arg_label={"index": 0, "callee": "parse_header"}))
     assert "of parse_header" in _render_trace_text(dict(bare, callee="parse_header"))
 
 

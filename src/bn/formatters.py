@@ -5347,16 +5347,21 @@ def _render_trace_text(value: Any) -> str:
     # who copied a nearby address got an equally confident slice about a
     # different call with no signal to catch it with.
     #
-    # But ABSENT is not null (#619's `_field_present`/`_field_skewed` rule): a
-    # payload carrying neither `arg_label` nor `callee` had nothing computed for
-    # the callee, and asserting `<unresolved callee>` there would state an
-    # affirmative finding about a question never asked. Such a payload keeps the
-    # pre-existing no-claim header.
-    # `_field_declared`, not raw membership: "does the envelope carry this key at
-    # all, null included" is the question this module already answers in one
-    # place, and a second decider spelled `in value` is what #619 forbids.
-    computed = (_field_declared(value, "arg_label")
-                or _field_declared(value, "callee"))
+    # What counts as "computed" is an `arg_label` that arrived as an OBJECT.
+    # Neither a missing key nor an explicit null does, because in this module a
+    # nulled field claims nothing: that is `_field_present`'s stated rule ("the
+    # key is there AND is not an explicit null"), it is how `_field_list` and
+    # `_field_dict` already read one, and it is the reading the mirror test
+    # relies on when it feeds `{key: None}` as a BENIGN payload for every
+    # discovered read. `_field_declared` answers a deliberately DIFFERENT
+    # question -- which shape of envelope arrived -- so using it here made an
+    # explicit `"arg_label": null` render the affirmative "we looked and found no
+    # resolvable callee", which is the absent-vs-null conflation one level up
+    # (#858 review round 2).
+    #
+    # A name may still arrive on either key; the top-level `callee` is the name
+    # when known and, being nullable, claims nothing by itself.
+    computed = isinstance(value.get("arg_label"), dict)
     callee_name = arg_lbl.get("callee") or value.get("callee")
     if callee_name:
         arg_desc += f" of {callee_name}"
