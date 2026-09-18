@@ -3598,3 +3598,132 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+# --- #797: `dataflow defuse` discloses a dropped call argument --------------
+# The defuse half of #489. BN clamps a direct call's MLIL parameters to the
+# callee's recovered arity, so a variadic callee auto-typed fixed-arity leaves
+# its STACK-passed arguments behind as `[sp+N].d = <var>` stores that nothing in
+# the function reads back -- and `uses` then lists the argument set-up for the
+# defused variable as if it were an ordinary use. `trace` already discloses that
+# state (#489); defuse now states the same thing, over the same calls, from the
+# same helper, so the two ops cannot disagree.
+
+def _d797_op(name):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=name))
+
+
+def _d797_reg(name):
+    expr = _d797_op("LLIL_REG")
+    expr.src = types.SimpleNamespace(name=name)
+    return expr
+
+
+def _d797_const(value):
+    expr = _d797_op("LLIL_CONST")
+    expr.constant = value
+    return expr
+
+
+def _d797_add(left, right):
+    expr = _d797_op("LLIL_ADD")
+    expr.left, expr.right = left, right
+    return expr
+
+
+def _d797_store(dest, address):
+    expr = _d797_op("LLIL_STORE")
+    expr.dest, expr.address = dest, address
+    return expr
+
+
+def _d797_call(address):
+    expr = _d797_op("LLIL_CALL")
+    expr.address = address
+    return expr
+
+
+def _d797_ins(name, address, *, params=None, instr_index=0):
+    return types.SimpleNamespace(
+        address=address, instr_index=instr_index,
+        operation=types.SimpleNamespace(name=name),
+        params=list(params or []), src=None, vars_read=[], vars_written=[],
+    )
+
+
+def _defuse_under_recovered_call(monkeypatch):
+    """`_defuse` over a function whose call at 0x401030 was recovered with ONE
+    arg (the caller's format string) while the LLIL hands it two outgoing
+    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, func = _mid_function_bv()
+    bv._memory[0x402000] = b"%d %d\x00"
+    func.arch = types.SimpleNamespace(stack_pointer="sp", address_size=4)
+    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    call_addr = 0x401030
+    func.low_level_il = [[
+        _d797_store(_d797_reg("sp"), 0x401020),
+        _d797_store(_d797_add(_d797_reg("sp"), _d797_const(4)), 0x401024),
+        _d797_call(call_addr),
+    ]]
+    fmt = _d797_op("MLIL_CONST_PTR")
+    fmt.constant = 0x402000
+    call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
+    store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
+    il = types.SimpleNamespace(
+        instructions=[store, call],
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [store],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(bridge.il_format, "_resolve_ssa_variable",
+                        lambda f, i, sel: (ssa_var, []))
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    # The loaded bridge package is its own module COPY (`bn_test_bridge.*`), so
+    # the patch has to land on the alias `_defuse` resolves through, not on the
+    # same-named module this file imports for direct helper tests.
+    monkeypatch.setattr(bridge.read_decompile._taint, "resolve_call_target",
+                        lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
+                            address=0x402100,
+                            function=types.SimpleNamespace(name="my_logger")))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance, il
+
+
+def test_defuse_discloses_a_dropped_stack_arg_797(monkeypatch):
+    """#797: the result names the call whose model dropped the stack args.
+
+    Before this, the stack-arg store appeared in `uses` with nothing saying it
+    feeds a call whose recovered parameters do not include it -- so a def-use
+    answer was read as the complete set of things that touch the variable.
+    """
+    instance, _il = _defuse_under_recovered_call(monkeypatch)
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    hints = result["hints"]
+    assert len(hints) == 1, hints
+    hint = hints[0]
+    assert "call 0x401030" in hint
+    assert "call-model truncation" in hint
+    assert "my_logger" in hint
+    assert "sp+0x0" in hint and "sp+0x4" in hint     # the dropped stores, named
+    assert "proto set my_logger" in hint             # the runnable remedy
+    # The use itself is unchanged: the disclosure is additive, so an existing
+    # consumer of `uses` reads exactly what it read before.
+    assert [u["address"] for u in result["uses"]] == ["0x401024"]
+
+
+def test_defuse_stays_quiet_when_the_call_model_is_complete_797(monkeypatch):
+    """The no-false-positive direction, inherited from the #489 gate: a call
+    whose recovered args are NOT (all) register-passed -- here five args on a
+    4-register convention -- is not a truncated model, so nothing is disclosed
+    and the caller sees no invented caveat."""
+    instance, il = _defuse_under_recovered_call(monkeypatch)
+    il.instructions[1].params = il.instructions[1].params * 5
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == []

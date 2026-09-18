@@ -2313,7 +2313,11 @@ def test_render_class_list_text_warns_when_quick_loaded():
     out = _render_class_list_text(listing)
     assert out.startswith("WARNING: target is quick-loaded; class list is partial.")
     assert "bn refresh" in out
-    assert "classes: 1 shown of 1" in out
+    # #770: the count line states the PAGE and the shared `_paging_footer` states
+    # the total -- this complete page (returned == total, has_more False) adds no
+    # footer, so the header is a bare `classes: 1`, the same shape the --count
+    # line below prints.
+    assert "classes: 1" in out and "shown of" not in out
 
     count = _render_class_list_text({
         "kind": "classes", "count": 1, "total": 1, "artifact_count": 0,

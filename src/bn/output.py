@@ -341,6 +341,12 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     lines = []
     if "ok" in payload:
         lines.append(f"ok: {str(bool(payload.get('ok'))).lower()}")
+    # #796: a preflight ESTIMATE is not an artifact. It reuses this envelope
+    # (bytes/tokens/tokenizer/rerun/summary all mean the same thing) but wrote
+    # nothing, so it says so instead of carrying a path that does not exist --
+    # `estimated: true` in text, `"estimated": true` under --format json.
+    if payload.get("estimated"):
+        lines.append("estimated: true")
     if "spilled" in payload:
         lines.append(f"spilled: {str(bool(payload.get('spilled'))).lower()}")
     if "artifact_path" in payload:
@@ -527,6 +533,56 @@ def write_output_result(
         rendered=render_envelope(artifact, fmt),
         artifact=artifact,
         spilled=True,
+        token_count=token_count,
+    )
+
+
+def estimate_output_result(
+    value: Any,
+    *,
+    fmt: str,
+    rerun_hint: str | None = None,
+) -> OutputWriteResult:
+    """Preflight an output's size WITHOUT emitting or writing it (#796).
+
+    The residual of #409 AC1: `estimate_tokens` only ever ran on an
+    already-rendered payload and only ever surfaced on a spilled/``--out``
+    envelope, so the one question a caller asks BEFORE paying for a large read --
+    how big is this going to be, and which flag slices it -- had no way to be
+    asked. The read still runs (only the bridge can know the payload), but
+    nothing reaches stdout except the size, so the consuming agent learns the
+    cost without spending the context. Nothing is written to disk: no spill
+    artifact, no ``--out`` file, and the envelope carries no path.
+
+    The measurement is of the rendered payload the caller WOULD have received
+    under this ``--format`` (the text renderer has already run when the CLI hands
+    the value over), so the number is the one the spill threshold would have
+    compared -- not a guess from the raw JSON. ``rerun`` is the same
+    parser-derived slicing hint the spill envelope names, and
+    ``spill_token_limit`` is stated only when ``BN_SPILL_TOKENS`` is armed, which
+    is what makes "this read would have spilled" a comparison the caller can do
+    rather than a claim this module makes."""
+    rendered = render_value(value, fmt)
+    encoded = rendered.encode("utf-8")
+    token_count = estimate_tokens(encoded)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "estimated": True,
+        "format": fmt,
+        "bytes": len(encoded),
+        "tokens": token_count,
+        "tokenizer": "estimate",
+        "summary": _summary(value),
+    }
+    limit = resolve_spill_limit()
+    if limit is not None:
+        payload["spill_token_limit"] = limit
+    if rerun_hint:
+        payload["rerun"] = rerun_hint
+    return OutputWriteResult(
+        rendered=render_envelope(payload, fmt),
+        artifact=payload,
+        spilled=False,
         token_count=token_count,
     )
 

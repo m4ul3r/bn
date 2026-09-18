@@ -755,3 +755,40 @@ def test_taint_models_command_reads_user_models_from_env(monkeypatch, capsys, tm
     call = [c for c in calls if c["op"] == "taint_models"][0]
     assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
     assert call["params"]["user_models_via"] == "$BN_TAINT_MODELS"
+
+
+def test_dataflow_defuse_renders_the_dropped_call_arg_disclosure_797(monkeypatch, capsys):
+    """#797: `dataflow defuse` now carries the #489 call-model-truncation
+    disclosure, so a `use` that is argument set-up for an under-recovered callee
+    is no longer read as an ordinary use.
+
+    The same prose `trace` prints for the same call, stated above the listing it
+    explains -- and nothing at all for the ordinary case, so a payload with no
+    truncation to report renders exactly as it did before.
+    """
+    note = ("call 0x13f02: call-model truncation (#489): my_logger was recovered "
+            "with 1 MLIL argument(s), but LLIL shows 2 outgoing stack-arg store(s) "
+            "[sp+0x0, sp+0x4] feeding this call")
+    payload = {"function": {"name": "ReadJpegSections", "address": "0x13e00"},
+               "variable": {"ssa": "r4_1#2", "name": "r4_1", "type": "int32_t"},
+               "definition": None,
+               "uses": [{"address": "0x13ef0", "op": "MLIL_STORE_SSA",
+                         "text": "[r3_3#9 + 4].d = r4_1#2"}],
+               "is_phi": False, "phi_sources": [], "other_versions": [],
+               "hints": [note]}
+    fake, _calls = _fake({"defuse": payload})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["dataflow", "defuse", "ReadJpegSections", "--var", "r4_1#2",
+                      "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert f"hint: {note}" in out
+    # The store the hint is about is still listed as a use, unchanged.
+    assert "[r3_3#9 + 4].d = r4_1#2" in out
+    assert "uses (1):" in out
+
+    other, _calls2 = _fake({"defuse": {**payload, "hints": []}})
+    monkeypatch.setattr(bn.cli, "send_request", other)
+    assert bn.cli.main(["dataflow", "defuse", "ReadJpegSections", "--var", "r4_1#2",
+                        "--target", "active"]) == 0
+    assert "hint:" not in capsys.readouterr().out

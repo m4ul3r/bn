@@ -71,7 +71,8 @@ from ..transport import BridgeError
                        help="Only BN auto-named functions (sub_*/j_sub_*) -- how much "
                             "of a stripped target is still unrecovered; excludes "
                             "import thunks")),
-         ])
+         ],
+         estimable=True)
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.min_address is not None:
@@ -151,7 +152,8 @@ def _function_list(args: argparse.Namespace) -> int:
                        help="Match the query as a whole identifier token (word-boundary): for a "
                             "sink survey, `--word popen` hits popen/popen@plt but not the "
                             "substring FPs zipOpenArchive/my_popen_wrapper")),
-         ])
+         ],
+         estimable=True)
 def _function_search(args: argparse.Namespace) -> int:
     # #410: accept the query positionally OR via --query (matches strings/types
     # muscle memory). _pick errors on both-different / neither.
@@ -221,7 +223,8 @@ def _function_search(args: argparse.Namespace) -> int:
                # lines first.
                arg("--blocks", action="store_true", default=False,
                    help="List basic-block address ranges (with edges), so a large "
-                        "function can be read a region at a time instead of whole")])
+                        "function can be read a region at a time instead of whole")],
+         estimable=True)
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
     demangle = getattr(args, "demangle", False)
@@ -275,7 +278,8 @@ def _require_text_format(args: argparse.Namespace, flag: str) -> None:
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
              arg("--include-annotations", action="store_true", default=False,
                  help="Include inherited comment bodies in text/JSON (default: redact)"),
-         ])
+         ],
+         estimable=True)
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -321,7 +325,8 @@ def _decompile(args: argparse.Namespace) -> int:
                  help="Emit the SSA form of the selected IL view"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                  help="Show only lines START through END (1-indexed, inclusive)"),
-         ])
+         ],
+         estimable=True)
 def _il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -348,7 +353,8 @@ def _il(args: argparse.Namespace) -> int:
                  help="Emit non-SSA form (default: SSA)"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                  help="Show only lines START through END (1-indexed, inclusive)"),
-         ])
+         ],
+         estimable=True)
 def _function_structured_il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -413,7 +419,8 @@ def _render_disasm_text(value: Any) -> str:
                        help="Linear-disassemble up to N units (default 32): one physical "
                             "instruction or one undecodable byte (.byte) per unit, from "
                             "any mapped address, independent of function membership")),
-         ])
+         ],
+         estimable=True)
 def _disasm(args: argparse.Namespace) -> int:
     linear = getattr(args, "linear", None)
     mode = getattr(args, "mode", None)
@@ -478,7 +485,8 @@ def _disasm(args: argparse.Namespace) -> int:
                       "targets are IL instruction indexes (hex), not addresses -- "
                       "first-line addresses collide when one instruction expands to "
                       "several IL blocks; per-line addresses stay real at every level"),
-         ])
+         ],
+         estimable=True)
 def _function_cfg(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -505,7 +513,8 @@ def _function_cfg(args: argparse.Namespace) -> int:
                       "reported, not errors"),
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
-         ])
+         ],
+         estimable=True)
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
@@ -664,7 +673,8 @@ def _load_within_identifiers(path: Path) -> list[str]:
                    arg("--within", help="Restrict callsite search to one containing function"),
                    arg("--within-file", type=Path,
                        help="Restrict callsite search to functions listed in a UTF-8 text file")),
-         ])
+         ],
+         estimable=True)
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
         within_identifiers = [args.within]
@@ -716,7 +726,8 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
                  help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
-         ])
+         ],
+         estimable=True)
 def _evidence_function(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"identifier": args.identifier, "context": args.context}
     if args.limit is not None:
@@ -740,7 +751,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
          target=True, paged=True,
          args=[
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
-         ])
+         ],
+         estimable=True)
 def _evidence_xrefs(args: argparse.Namespace) -> int:
     # Same canonical paging envelope and #184 payload-bounding as `xrefs`: JSON
     # pages the items (and the op drops the deprecated full arrays). Text fetches
@@ -794,7 +806,8 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
                       "u8/i8/u16/i16/u32/i32/u64/i64 or char[N], OFF is hex/decimal, e.g. "
                       "--field command:u32@0 --field name:char[16]@8. Requires --record-size; "
                       "makes --ptr-fields optional (scalar-only records)."),
-         ])
+         ],
+         estimable=True)
 def _evidence_table(args: argparse.Namespace) -> int:
     ptr_fields = None
     if getattr(args, "ptr_fields", None):
@@ -832,7 +845,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
                  help="Declare a descriptor field (repeatable): TYPE is u8/i8/u16/i16/u32/i32/u64/i64, "
                       "char[N], or ptr (resolves a callback/data symbol), OFF is hex/decimal, e.g. "
                       "--field type:u8@2 --field callback:ptr@0x10"),
-         ])
+         ],
+         estimable=True)
 def _evidence_calls(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -862,7 +876,8 @@ def _evidence_calls(args: argparse.Namespace) -> int:
              arg("--providers", default=None, metavar="SELECTOR",
                  help="Target selector for the provider binary that defines the class/vtable "
                       "(name/path/id of another open target); omit to resolve within this binary"),
-         ])
+         ],
+         estimable=True)
 def _evidence_virtual_call(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -891,7 +906,8 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
              arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_surface(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -918,7 +934,8 @@ def _evidence_surface(args: argparse.Namespace) -> int:
                       "(the reported total stays honest, with truncated=true when capped)"),
              arg("--table-entries", type=_non_negative_int, default=6,
                  help="Pointer entries to show around metadata data refs (0 = none)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_message(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -945,7 +962,8 @@ def _evidence_message(args: argparse.Namespace) -> int:
          args=[
              arg("--strings-limit", type=_positive_int, default=20, dest="strings_limit",
                  help="Max strings in the bounded sample (default: 20)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_orient(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -963,7 +981,8 @@ def _evidence_orient(args: argparse.Namespace) -> int:
          args=[
              arg("--limit", type=_positive_int, default=64,
                  help="Maximum entries to show per constructor/destructor section"),
-         ])
+         ],
+         estimable=True)
 def _evidence_init(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1001,7 +1020,8 @@ def _evidence_init(args: argparse.Namespace) -> int:
                       "intra mode (this flag off), for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
-         ])
+         ],
+         estimable=True)
 def _trace(args: argparse.Namespace) -> int:
     return _call(
         args,

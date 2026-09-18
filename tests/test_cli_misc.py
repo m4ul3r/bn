@@ -1558,3 +1558,301 @@ def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--target is empty" in capsys.readouterr().err
+
+
+def test_strings_discloses_the_dropped_count_795(fake_transport, capsys):
+    """#795: the filter's denominator cost a SECOND invocation.
+
+    `strings --count --format json` reported 1359 and the same command with
+    `--probable-format-strings` reported 30, and NOTHING in either answer said
+    what happened to the 1329 in between -- so an agent had to spend a second
+    unfiltered call to learn the filter's denominator. The bridge now reports the
+    dropped count on both the count result and the list envelope, and text mode
+    states it next to the page (the same shape `imports` uses for the exports its
+    own filter excludes, #202).
+    """
+    envelope = {"items": [{"address": "0x401000", "length": 6, "chars": 6,
+                           "type": "ascii", "value": "%s%s"}],
+                "total": 30, "offset": 0, "limit": 1, "returned": 1,
+                "has_more": True, "filtered": 1329}
+    calls = fake_transport({"strings": {"ok": True, "result": envelope}})
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--limit", "1", "--format", "text"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert "%s%s" in stdout
+    assert "// showing 1 of 30 (29 more)" in stdout
+    assert "// 1329 string(s) filtered out by the active filters" in stdout
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    assert calls[-1]["params"]["count_only"] is True
+    capsys.readouterr()          # the list envelope this fake still answers with
+    # The count result carries the same denominator (`filtered`), so the JSON
+    # consumer reads 30 and 1329 from ONE invocation.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    counted = json.loads(capsys.readouterr().out)
+    assert counted["count"] == 30 and counted["filtered"] == 1329
+
+
+def test_strings_count_text_states_the_dropped_count_795(fake_transport, capsys):
+    """The `--count` line is the one an agent stops on, so it carries the
+    denominator itself: `Total strings: 30 (1329 filtered out ...)`. An
+    unfiltered dump is unchanged (nothing was dropped, nothing to disclose)."""
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total strings: 30 (1329 filtered out by the active filters)")
+
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 1359, "total": 1359, "filtered": 0}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "Total strings: 1359"
+
+
+def test_estimate_output_preflights_a_large_read_796(fake_transport, capsys):
+    """#796: `--estimate-output` on the reads whose cost you want to know FIRST.
+
+    The issue's own repro was `bn function list --limit 5 --estimate-output` ->
+    `error: unrecognized arguments` (rc 2), with no way to learn a read's size
+    before paying for it in context. The flag is accepted by every command that
+    renders a payload; under text it prints the size and this command's own
+    slicing knob, and it does NOT print the rows.
+    """
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"name": f"sub_{i:06d}", "address": hex(0x401000 + i * 0x10)}
+                  for i in range(200)],
+        "total": 200, "offset": 0, "limit": 5, "returned": 200, "has_more": True}}})
+
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "estimated: true" in out
+    assert "tokens: " in out and "tokenizer: estimate" in out
+    assert "--limit" in out                      # the slicing knob this command takes
+    assert "sub_000000" not in out               # ...and NOT the payload itself
+    assert calls[-1]["op"] == "list_functions"
+
+    # Under --format json the same run is machine-readable, so a caller can branch
+    # on the cost without parsing prose.
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--format", "json", "--target", "active"])
+    assert rc == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["estimated"] is True and envelope["tokens"] > 0
+    assert envelope["summary"]["total"] == 200
+    assert "items" not in envelope
+
+
+def test_estimate_output_covers_per_function_reads_796(fake_transport, capsys):
+    """The same preflight for the large PER-FUNCTION reads (`decompile`, `il`,
+    `strings`), whose cost is the one an agent most often misjudges: the flag
+    reports the size of the rendering the caller would have received, and names
+    that command's own slicing flag (`decompile`/`il` slice with --lines)."""
+    fake_transport({
+        "decompile": {"ok": True, "result": {"text": "int parse_hdr(char *p)\n{\n" + "  *p++;\n" * 500 + "}\n"}},
+        "strings": {"ok": True, "result": {
+            "items": [{"address": hex(0x402000 + i), "length": 5, "chars": 5,
+                       "type": "ascii", "value": f"str{i}"} for i in range(50)],
+            "total": 50, "offset": 0, "limit": 50, "returned": 50, "has_more": False,
+            "filtered": 0}},
+    })
+
+    assert bn.cli.main(["decompile", "parse_hdr", "--estimate-output",
+                        "--target", "active"]) == 0
+    decompile_out = capsys.readouterr().out
+    assert "estimated: true" in decompile_out
+    assert "--lines START:END" in decompile_out
+    assert "*p++" not in decompile_out            # the decompilation is NOT printed
+    assert "tokens: " in decompile_out
+
+    assert bn.cli.main(["strings", "--estimate-output", "--target", "active"]) == 0
+    strings_out = capsys.readouterr().out
+    assert "estimated: true" in strings_out
+    assert "--limit" in strings_out
+    assert '"str0"' not in strings_out            # the rows are NOT printed
+
+
+def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
+    """#796 review: the flag lives on the code path that implements it, not on
+    every command that happens to share an output-option group.
+
+    The wide placement advertised `--estimate-output` on all 90 leaf parsers while
+    only the `_call` -> `_render_result` path honors it, so `bn close`, `bn save`,
+    `bn load`, `bn refresh` and `bn py exec` executed their side effect and then
+    printed a byte count over the outcome (`save` wrote a BNDB while the flag's own
+    help promised nothing was written), and 18 `_emit_result` commands ignored it
+    outright -- `bn capabilities --estimate-output` printed the very payload the
+    flag exists to avoid.
+
+    The rule is the `fanout=True` precedent (#169 L1 review): an EXPLICIT
+    allow-list on the registry, and a coverage claim DERIVED here from the handlers
+    themselves, so a new command can neither silently inherit the flag nor quietly
+    lose it. Both directions are asserted, because either half alone is a list
+    that can drift from the code.
+    """
+    import argparse
+    import inspect
+    import re
+
+    # Commands whose RESULT IS their side effect: they render through `_call`, so
+    # the allow-list has to exclude them by name. `save` writes a database, the
+    # rest mutate or destroy the session's state -- replacing any of those
+    # outcomes with a size is the defect this test exists for.
+    side_effecting = {("save",), ("close",), ("target", "close"), ("load",),
+                      ("refresh",), ("py", "exec")}
+
+    def derived_estimable():
+        """Re-derive the allow-list from the handlers: a command is estimable iff
+        its handler renders through `_call` and is neither a mutation helper, an
+        `_emit_result` command, nor a named side effect."""
+        found = set()
+        for spec in bn.cli._COMMANDS:
+            path = tuple(spec["path"])
+            if path in side_effecting:
+                continue
+            src = inspect.getsource(spec["handler"])
+            calls = set(re.findall(r"\b(_call|_mutate|_emit_result)\(", src))
+            if "_call" in calls and not (calls & {"_mutate", "_emit_result"}):
+                found.add(path)
+        return found
+
+    parser = bn.cli.build_parser()
+
+    def leaf(path):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        return current
+
+    advertised = {tuple(spec["path"]) for spec in bn.cli._COMMANDS
+                  if "--estimate-output" in bn.cli._known_option_strings(leaf(spec["path"]))}
+    marked = {tuple(spec["path"]) for spec in bn.cli._COMMANDS if spec.get("estimable")}
+
+    # A DUAL-ROLE node (`types`, `exports`) is a leaf AND a group: argparse builds
+    # ONE parser for both roles, so a flag attached there is accepted BEFORE the
+    # subcommand is dispatched -- `bn types --estimate-output declare ...` ran the
+    # declaration and printed a byte count over it, and `bn types --estimate-output
+    # show X` had the flag clobbered back to False by the leaf default (#251's
+    # hazard, on the one node class where an "intermediate" parser and a leaf are
+    # the same object). The builder therefore declines to advertise it on any
+    # group node, derived from the registry rather than a second hand-kept list --
+    # and that derivation is what the two assertions below check in both
+    # directions, so neither a new command nor a new subcommand can reopen it.
+    groups = {tuple(spec["path"])[:i] for spec in bn.cli._COMMANDS
+              for i in range(1, len(tuple(spec["path"])))}
+    assert groups, "no group paths at all -- the derivation is broken"
+    assert all("--estimate-output" not in bn.cli._known_option_strings(leaf(path))
+               for path in groups), (
+        "a GROUP parser carries --estimate-output, so it is accepted before the "
+        "subcommand is dispatched: a mutation behind it runs while its outcome is "
+        f"replaced by a size ({sorted(p for p in groups if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
+
+    asserted = derived_estimable()
+    assert marked == asserted, (
+        f"the registry marks {sorted(marked - asserted)} estimable and misses "
+        f"{sorted(asserted - marked)}; `estimable=True` is the allow-list for the "
+        "flag, so it must agree with the handlers that implement it")
+    assert advertised == marked - groups, (
+        f"advertised {sorted(advertised - (marked - groups))} without being marked, "
+        f"or marked-and-advertisable but not advertised "
+        f"{sorted((marked - groups) - advertised)}")
+    assert len(marked) == 49, (
+        f"{len(marked)} commands are marked estimable, not 49 -- a command that "
+        "joins or leaves this set is a deliberate change to the coverage claim, so "
+        "move the number in the same commit")
+    # ...of which the two dual-role leaves cannot carry the flag (see above), so
+    # 47 advertise it and 45 refuse it by absence.
+    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 45
+    # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
+    # stronger than a bespoke refusal: there is no path on which the flag is
+    # accepted and ignored, because the parser never builds it.
+    assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
+               if tuple(spec["path"]) not in marked)
+    assert len(bn.cli._COMMANDS) - len(marked) == 43
+
+
+def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_commands_796(
+        fake_transport, capsys):
+    """The other half of the scoping: the commands that must never take it.
+
+    A mutation prints a status line because that line IS the answer (#645), and a
+    side-effecting `_call` command (`save`/`close`/`load`/`refresh`/`py exec`)
+    performs its work and then reports it -- for both, `--estimate-output` would
+    replace an outcome with a byte count. Neither advertises the flag, so both
+    refuse it the way argparse refuses any unknown option (rc 2), before any
+    request is sent.
+    """
+    import argparse
+
+    a_mutation = bn.cli._selected_parser_for_argv(
+        bn.cli.build_parser(), ["comment", "set", "0x401000", "note"])
+    assert "--estimate-output" not in bn.cli._known_option_strings(a_mutation)
+
+    parser = bn.cli.build_parser()
+    calls = fake_transport()
+
+    # An argparse refusal exits 2 the same way a usage error always does (the
+    # text-format path raises SystemExit; see `test_argparse_error_text_format_
+    # keeps_stdout_empty`), so the flag is refused by the PARSER, not by a gate
+    # somebody has to remember to write.
+    with pytest.raises(SystemExit) as refused:
+        bn.cli.main(["comment", "set", "0x401000", "note", "--estimate-output",
+                     "--target", "active"])
+    assert refused.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+    assert not calls                       # refused by the parser, before the request
+
+    # THE DUAL-ROLE NODES, behaviourally. The flag must not be accepted BEFORE the
+    # subcommand, because that occurrence belongs to the group parser: the
+    # mutation behind it (`types declare`) executed and reported a size in R2 of
+    # this review, and the read behind it (`types show`) ran with the flag
+    # silently dropped by the leaf default. Both refuse now, before any request.
+    for argv in (["types", "--estimate-output", "declare",
+                  "struct DF879Leak { int a; int b; };"],
+                 ["types", "--estimate-output", "show", "DF879Leak"],
+                 ["exports", "--estimate-output", "list"]):
+        calls = fake_transport()
+        with pytest.raises(SystemExit) as hijacked:
+            bn.cli.main(argv + ["--target", "active"])
+        assert hijacked.value.code == 2, argv
+        captured = capsys.readouterr()
+        assert "unrecognized arguments: --estimate-output" in captured.err, argv
+        assert captured.out == "", argv        # NO payload
+        assert not calls, argv                 # and NO side effect
+
+    for path in (["save"], ["close"], ["target", "close"], ["load"], ["refresh"],
+                 ["py", "exec"], ["go", "rename"], ["batch", "apply"]):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        assert "--estimate-output" not in bn.cli._known_option_strings(current), path
+
+    # Where it IS advertised, the two answers to "where does this go" are refused
+    # by argparse's own mutually exclusive group rather than one silently winning:
+    # a caller who asked for a size AND a file asked for two different things.
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "items": [], "total": 0, "offset": 0, "limit": 5, "returned": 0,
+        "has_more": False}}})
+    with pytest.raises(SystemExit) as conflicting:
+        bn.cli.main(["function", "list", "--estimate-output", "--out", "/tmp/bn-est.json",
+                     "--target", "active"])
+    assert conflicting.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+    assert not calls

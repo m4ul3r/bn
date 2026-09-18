@@ -886,9 +886,60 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "is_phi": is_phi,
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
+        "hints": _call_model_truncation_hints(bv, func, il),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
+
+
+def _call_model_truncation_hints(bv, func, il) -> list[str]:
+    """The #489 call-model-truncation disclosure for THIS function's calls (#797).
+
+    A def-use read of a variable that feeds an under-recovered call used to show
+    the argument set-up as an ordinary use and say nothing about it: BN clamps a
+    direct call's MLIL parameters to the callee's recovered arity, so on a
+    register ABI a variadic callee auto-typed fixed-arity leaves its STACK-passed
+    arguments behind as `[sp+N].d = <var>` stores that nothing in the function
+    reads back, and the store for the defused variable sits in `uses` looking
+    like any other. `trace` already discloses exactly that state with the
+    reviewed #489 note; this reads the SAME helper over the same calls rather
+    than re-deriving the evidence, so the two ops cannot disagree about whether a
+    call's model was truncated (one gate, one wording, one remedy).
+
+    Prints nothing for a call the helper is silent about -- unknown
+    calling-convention arity, a callee that is known fixed-arity, no outgoing
+    stack-arg run, or no caller-passed format string -- which is the
+    no-false-positive direction that note was reviewed for. Returns [] (never
+    raises) on any BN-API shortfall."""
+    from . import read_taint_slice as _ts  # local: this module's import list is documented as il_format/vars/taint_engine/_shared
+
+    hints: list[str] = []
+    try:
+        instructions = list(il.instructions)
+    except Exception:
+        return hints
+    for ins in instructions:
+        if "CALL" not in il_format._il_op_name(ins):
+            continue
+        # The CALL SITE's own address: `_call_model_truncation_note` looks the
+        # instruction up in the LLIL block by address to find the outgoing
+        # stack-arg stores feeding it, so this is the address it wants -- not the
+        # resolved callee's.
+        call_addr = int(getattr(ins, "address", func.start))
+        callee_name = None
+        try:
+            resolved = _taint.resolve_call_target(bv, ins, follow_thunks=False)
+            callee_name = str(getattr(resolved.function, "name", "") or "") or None
+        except Exception:
+            callee_name = None
+        note = _ts._call_model_truncation_note(
+            bv, func, ins, call_addr,
+            list(getattr(ins, "params", None) or []),
+            callee_name,
+        )
+        if note is not None:
+            hints.append(f"call {hex(call_addr)}: {note}")
+    return hints
 
 
 def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
