@@ -1210,6 +1210,14 @@ def _function_name_summary(bv) -> dict[str, int]:
     come from relocations) in a separate bucket so they don't inflate "named".
     Reflects whatever functions analysis has discovered so far."""
     functions = list(getattr(bv, "functions", []) or [])
+    # #757/#793 review: BN can hold two records for one start address, and one
+    # address is one function -- `function list` collapses them. Counting the RAW
+    # records here made `target info` (and the `target` block inside `evidence
+    # orient`) state a different total from `function list --count` for the same
+    # view, so the same collapse runs here and the count it dropped is disclosed.
+    functions, collapsed_starts, _unresolved_starts = read_listing._collapse_duplicate_starts(
+        functions
+    )
     total = len(functions)
     named = imported = 0
     imported_obj_names: set[str] = set()
@@ -1232,12 +1240,18 @@ def _function_name_summary(bv) -> dict[str, int]:
     # object both present) is not double-counted. The bv.functions partition
     # (named/unnamed) is unchanged -- those slots have no function object.
     extra_callable = read_misc._callable_import_slot_names(bv) - imported_obj_names
-    return {
+    summary = {
         "function_count": total,
         "named_function_count": named,
         "unnamed_function_count": total - named - imported,
         "imported_function_count": imported + len(extra_callable),
     }
+    if collapsed_starts:
+        # Present only when a collapse happened, the listing envelope's own
+        # convention, so a consumer that sees fewer functions than BN records can
+        # tell why and that the retained row carries the LARGER extent.
+        summary["duplicate_starts_collapsed"] = collapsed_starts
+    return summary
 
 
 class BinaryNinjaBridge:

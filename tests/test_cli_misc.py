@@ -1558,3 +1558,37 @@ def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--target is empty" in capsys.readouterr().err
+
+
+def test_read_bytes_encoding_discloses_a_capped_read_827(fake_transport, capsys, tmp_path):
+    """#827 item 4 review: the bridge caps an over-long read and says so in the
+    payload, but the raw-bytes path consumed only `hex` -- so `--encoding bytes`
+    handed back a short dump with no marker on the one path documented for
+    piping a blob into another tool. The hex renderer printed the note; this
+    path did not."""
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "length": 4, "hex": "41424344", "ascii": "ABCD",
+            "capped": True, "requested_length": 200000,
+            "note": "capped at 100000 bytes (requested 200000)",
+        }},
+    })
+
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "200000", "--encoding", "bytes"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == "ABCD"
+    assert "capped at 100000 bytes (requested 200000)" in captured.err
+
+    # The --out envelope carries the same two fields, so a saved blob is not
+    # indistinguishable from a complete dump either.
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "200000", "--encoding", "bytes",
+                      "--out", str(tmp_path / "dump.bin"), "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["capped"] is True
+    assert payload["summary"]["requested_length"] == 200000

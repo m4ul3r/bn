@@ -364,3 +364,89 @@ def test_annotation_summary_snapshots_the_live_address_comment_map_861(monkeypat
     # sample are the entries that existed when the call started.
     assert summary["comments"] == 1
     assert summary["comment_locations"] == [{"address": "0x1000", "comment": "a comment"}]
+
+
+def test_annotation_summary_snapshots_the_live_per_function_map_861(monkeypatch):
+    """#861 review: the GLOBAL comment map was snapshotted, but the per-function
+    map twelve lines below was still walked through its live `items()` -- the same
+    bug class, on the same call, whose RuntimeError the enclosing handler turned
+    into `existing_annotations.unavailable` on both `target info` and
+    `evidence orient`."""
+    bridge = _load_bridge(monkeypatch)
+
+    class _LiveCommentStore(Mapping):
+        """`fn.comments` as BN holds it: a map analysis may add to mid-walk."""
+
+        def __init__(self, entries):
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key):
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self):
+            return len(self._entries)
+
+        def items(self):
+            for index, (address, text) in enumerate(self._entries.items()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield address, text
+
+    fn = _FakeFunction(0x401000, "widget_init", total_bytes=28)
+    fn.comments = _LiveCommentStore({0x401000: "a local comment"})
+    bv = _FakeBV(functions=[fn])
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    # Pre-fix the live walk raised (and callers degraded it to the
+    # `unavailable` marker); post-fix the map is materialised before the walk, so
+    # the local address comment is counted and sampled.
+    assert summary["comments"] == 1
+    assert summary["comment_locations"][0]["comment"] == "a local comment"
+
+
+def test_duplicate_start_group_with_an_unreadable_extent_is_disclosed_757(monkeypatch):
+    """#757 review: "keep the larger extent" is undefined when a record's extent
+    cannot be read at all. Letting the record that happens to state a size win
+    would promote the stub-shaped phantom over a real body the view would not
+    size, so the group is left standing and the conflict is disclosed -- the
+    issue's own second answer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll"),  # extent unreadable
+    ]
+    _view(monkeypatch, instance, functions)
+
+    result = instance._list_functions(None)
+
+    assert result["returned"] == 3  # both colliding rows survive
+    assert result["duplicate_starts_unresolved"] == 1
+    assert "duplicate_starts_collapsed" not in result
+
+
+def test_function_count_agrees_between_target_info_and_list_count_757(monkeypatch):
+    """#757 review: collapsing the listing left `target info` (and the `target`
+    block inside `evidence orient`) counting RAW records -- two answers to one
+    question, one of them inside a payload that carries both."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=4),
+    ]
+    bv = _view(monkeypatch, instance, functions)
+
+    summary = bridge._function_name_summary(bv)
+    counted = instance._list_functions(None, count_only=True)
+
+    assert summary["function_count"] == counted["count"] == 2
+    assert summary["duplicate_starts_collapsed"] == 1

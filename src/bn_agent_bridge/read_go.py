@@ -140,18 +140,26 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     can_resolve = callable(get_fn) or callable(get_containing)
 
     def resolve_function(addr: int):
+        """The record for *addr*, plus whether it matched at its START.
+
+        The distinction is what keeps the rebase note honest (#818 review): an
+        address that resolves only as an INTERIOR PC of some function is not
+        evidence that the table is based correctly -- a constant rebase delta
+        over a dense .text resolves every row to *some* body while matching no
+        start, which is exactly the shape the note exists to warn about.
+        """
         if callable(get_fn):
             fn = get_fn(addr)
             if fn is not None:
-                return fn
+                return fn, True
         if callable(get_containing):
             try:
                 containers = list(get_containing(addr) or [])
             except Exception:
                 containers = []
             if containers:
-                return containers[0]
-        return None
+                return containers[0], False
+        return None, False
 
     def cstr(o: int) -> str:
         end = raw.find(b"\x00", o)
@@ -161,6 +169,7 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
 
     items: list[dict[str, Any]] = []
     defined_count = 0
+    start_match_count = 0  # #818 review: rows matching a function START, vs only by containment
     renamable_count = 0  # #414: defined fns whose current BN name `go rename` would replace
     skipped_count = 0  # #528: functab entries that ran off the section or held no name
     for i in range(nfunc):
@@ -186,8 +195,10 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
             skipped_count += 1
             continue
         addr = text_start + entryoff
-        fn_obj = resolve_function(addr) if can_resolve else None
+        fn_obj, start_matched = resolve_function(addr) if can_resolve else (None, False)
         defined = bool(fn_obj) if can_resolve else None
+        if start_matched:
+            start_match_count += 1
         if defined:
             defined_count += 1
             cur = str(getattr(fn_obj, "name", "") or "")
@@ -213,6 +224,7 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
         # #414: enough signal to decide whether to run `go rename`.
         return {"kind": "go_functions_summary", "go_version": go_version,
                 "recovered": recovered, "defined": defined_count,
+                "start_match_count": start_match_count,
                 "undefined": recovered - defined_count, "renamable": renamable_count,
                 "expected": nfunc, "skipped": skipped_count, "truncated": truncated,
                 "text_start": hex(text_start),
@@ -234,19 +246,34 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     if text_sec is not None:
         result["text_start_bv"] = hex(text_sec)
     result["defined_count"] = defined_count
-    if items and defined_count == 0:
+    # #818 review: the note is gated on START matches, not on `defined`. Once
+    # `defined` can be satisfied by containment, a table whose every row lands on
+    # an interior PC of *some* body reported `defined: true` everywhere and
+    # suppressed the warning this note exists to give -- and a constant rebase
+    # delta over a dense .text is exactly that shape. The wording says which
+    # relation matched, so a reader is not sent to rebase addresses that are
+    # merely off-prolog.
+    result["start_match_count"] = start_match_count
+    if items and start_match_count == 0:
         if text_sec is not None and text_sec != text_start:
             result["note"] = (
-                "0 of the recovered addresses match a BN function and the pcln "
-                "table's textStart != BN's .text start: the binary is loaded at a "
-                "different base (PIE). Rebase each address by "
-                "(text_start_bv - text_start) before use."
+                "None of the recovered addresses match a BN function START, and the "
+                "pcln table's textStart != BN's .text start: the binary is loaded at a "
+                "different base (PIE). Every address resolves at best to an interior PC, "
+                "so rebase each by (text_start_bv - text_start) before use."
             )
-        else:
+        elif defined_count == 0:
             result["note"] = (
                 "0 of the recovered addresses match a BN function: BN analysis may "
                 "be incomplete (run `bn refresh`), or the binary is rebased -- "
                 "compare text_start vs text_start_bv before trusting the addresses."
+            )
+        else:
+            result["note"] = (
+                "None of the recovered addresses match a BN function START -- they "
+                "resolve only as interior PCs. BN analysis may be incomplete (run "
+                "`bn refresh`), or the table is rebased by a constant delta: compare "
+                "text_start vs text_start_bv before trusting the addresses."
             )
     return result
 

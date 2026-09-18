@@ -572,7 +572,13 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     function_comments = 0
     function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
-        local_comments = getattr(fn, "comments", {}) or {}
+        # #861: the per-function map is live too -- `dict(getattr(func, "comments",
+        # {}))` is the same snapshot the decompile lane takes of the identical
+        # collection -- so walking the attribute directly raised
+        # `RuntimeError: dictionary changed size during iteration` on a view
+        # analysis was still annotating, and the enclosing handler turned that
+        # into an `unavailable` marker on both `target info` and `evidence orient`.
+        local_comments = dict(getattr(fn, "comments", {}) or {})
         comments += len(local_comments)
         for address, text in local_comments.items():
             if len(comment_locations) >= 20:
@@ -816,19 +822,25 @@ def _filtered_functions(
     return functions
 
 
+def _extent_known(fn) -> bool:
+    """Whether this record's extent can be read at all (#757 review)."""
+    size = il_format._function_size(fn)
+    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
+
+
 def _duplicate_extent_key(fn) -> tuple[int, int]:
     """Order two records that claim the SAME start address by extent (#757).
 
-    A record whose size cannot be read sorts BELOW one with a known size: an
-    unreadable extent cannot out-vote a stated one, and the phantom record of
-    the #757 report is the one carrying the smaller (stub-shaped) size anyway.
+    Only consulted for a group whose every member has a readable extent
+    (see `_collapse_duplicate_starts`), so the readable-size preference here is
+    a tiebreak among comparable records, not a substitute for comparison.
     """
     size = il_format._function_size(fn)
     known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
     return (1 if known else 0, size if known else -1)
 
 
-def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int]:
+def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int, int]:
     """Keep ONE record per start address, and count the addresses that had more.
 
     BN can hold several Function records for a single start address (an
@@ -841,39 +853,70 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int]:
     address that had more than one record is reported so the collapse is
     disclosed rather than silent.
 
+    Returns ``(kept, collapsed, unresolved)``. A group whose members are all
+    sized collapses, and its larger extent wins. A group where any extent is
+    UNREADABLE cannot be ordered by that rule at all, so it is left standing
+    and counted in ``unresolved`` -- the issue's own second answer ("or report
+    the conflict"), and the only option that cannot promote a phantom.
+
     Cheap by construction: addresses with a single record (every address on a
     well-formed target) are never sized -- the extent read happens only inside a
     group that actually collided. Ordering is preserved (the population arrives
     ``(start, name)``-ordered, so first-seen grouping is address order).
     """
-    grouped: dict[int, list[Any]] = {}
+    grouped: dict[object, list[Any]] = {}
     for fn in functions:
-        grouped.setdefault(int(fn.start), []).append(fn)
+        key: object
+        try:
+            key = int(fn.start)
+        except (AttributeError, TypeError, ValueError):
+            # A record whose start cannot be read cannot be shown to be a
+            # duplicate of ANYTHING, so it is keyed by identity and forms its own
+            # group (unit fakes model no `start`; passing the record through
+            # unchanged is the only answer that never invents a collapse).
+            key = fn
+        grouped.setdefault(key, []).append(fn)
     if len(grouped) == len(functions):
-        return functions, 0
+        return functions, 0, 0
     collapsed = 0
+    unresolved = 0
     kept: list[Any] = []
     for group in grouped.values():
         if len(group) == 1:
             kept.append(group[0])
             continue
-        collapsed += 1
-        kept.append(max(group, key=_duplicate_extent_key))
-    return kept, collapsed
+        if all(_extent_known(fn) for fn in group):
+            collapsed += 1
+            kept.append(max(group, key=_duplicate_extent_key))
+            continue
+        # "Keep the larger extent" is undefined when a record's extent cannot be
+        # read at all: choosing the record that happens to state a size lets a
+        # stub-shaped phantom outvote a real body the view would not size -- the
+        # exact confusion #757 was filed for. The issue's other accepted answer
+        # is "report the conflict", so the group is left intact and disclosed.
+        unresolved += 1
+        kept.extend(group)
+    return kept, collapsed, unresolved
 
 
-def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int) -> dict[str, Any]:
-    """Attach the #757 duplicate-start collapse count, when there was one.
+def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
+                               unresolved: int = 0) -> dict[str, Any]:
+    """Attach the #757 duplicate-start counts, when there were any.
 
-    Only present when a collapse happened, so the common envelope keeps the key
-    set every consumer already parses (the ``got_collapsed`` /
-    ``self_defined_excluded`` convention in ``read_misc._imports``). A caller
-    whose ``total`` lands below its own count of raw BN records can then tell
-    why -- and that the retained row carries the LARGER extent, not an
-    arbitrary one of the colliding pair.
+    ``duplicate_starts_collapsed`` counts addresses where the larger extent was
+    kept; ``duplicate_starts_unresolved`` counts addresses left with MORE than
+    one record because at least one extent could not be read, so the issue's
+    rule could not be applied (see `_collapse_duplicate_starts`). Both are
+    present only when non-zero, so the common envelope keeps the key set every
+    consumer already parses (the ``got_collapsed`` / ``self_defined_excluded``
+    convention in ``read_misc._imports``). A caller whose ``total`` lands below
+    its own count of raw BN records can then tell why -- and whether the
+    retained row carries the LARGER extent or the conflict was left standing.
     """
     if collapsed:
         result["duplicate_starts_collapsed"] = collapsed
+    if unresolved:
+        result["duplicate_starts_unresolved"] = unresolved
     return result
 
 
@@ -977,7 +1020,7 @@ def _list_functions(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    functions, collapsed_starts = _collapse_duplicate_starts(
+    functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
         list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
     )
     if min_size is not None:
@@ -1002,7 +1045,7 @@ def _list_functions(
         # kept for back-compat.
         result = {"kind": "functions", "count": len(functions), "total": len(functions),
                   **_analysis_state_fields(bv)}
-        return _disclose_collapsed_starts(result, collapsed_starts)
+        return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     # #411 established that per-page display projection (basic_block_count) must
     # not be computed for the whole filtered set. display_name (a per-function
     # symbol lookup) and size follow the same rule, and #814 extends it to the
@@ -1026,7 +1069,7 @@ def _list_functions(
         kind="functions", items=items, total=len(functions), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts))
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))
 
 
 def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
@@ -1161,7 +1204,7 @@ def _search_functions(
     # #757: collapse the duplicate records BN can hold for one start address
     # BEFORE matching, so a phantom twin cannot match twice (under two conflicting
     # sizes) and reach the page.
-    population, collapsed_starts = _collapse_duplicate_starts(
+    population, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
         list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
     )
     for fn in population:
@@ -1192,7 +1235,7 @@ def _search_functions(
         # here -- only the returned page is enriched/cleaned below.)
         result = {"kind": "functions", "count": len(matched), "total": len(matched),
                   **_analysis_state_fields(bv)}
-        return _disclose_collapsed_starts(result, collapsed_starts)
+        return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     items = [
@@ -1207,4 +1250,4 @@ def _search_functions(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts))
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))

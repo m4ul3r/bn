@@ -107,9 +107,15 @@ def test_go_functions_defined_via_containment_for_an_interior_pc_818(monkeypatch
     assert by_name["main.foo"]["defined"] is True
     assert by_name["main.bar"]["defined"] is True
     assert out["defined_count"] == 2
-    # The 0-match note is gated on defined_count == 0; it must not fire for a view
-    # whose addresses resolved, or it sends the reader off rebasing good addresses.
-    assert "note" not in out
+    # #818 review: `defined` is satisfied by containment, so the note can no longer
+    # be gated on it. Gated there, a table whose every row lands on an interior PC
+    # (a constant rebase delta over a dense .text does exactly this) reported
+    # `defined: true` everywhere with the rebase warning suppressed. It is gated on
+    # START matches now, and its wording says which relation matched -- so a reader
+    # is told the rows are off-prolog, not sent to rebase good addresses blindly.
+    assert out["start_match_count"] == 0
+    assert "note" in out
+    assert "START" in out["note"] and "interior PC" in out["note"]
 
 
 def test_go_functions_count_only_skips_the_list(monkeypatch):
