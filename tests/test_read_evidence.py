@@ -3728,9 +3728,9 @@ def _as_import(bv, name="hw_get_version"):
     library-name-matched callees on a dynamically linked target were imports."""
     callee = next(f for f in bv.functions if f.name == name)
     # `_FakeSymbol` is the shared stand-in whose `.type.name` is what
-    # `is_imported_function` reads -- the fake `SymbolType` members are plain
-    # strings with no `.name`, which is #593's divergence and would silently
-    # report "not an import" here.
+    # `is_imported_function` reads. The fake `SymbolType` members carry `.name`
+    # too now that they are IntEnum (#593), so either shape works; this one names
+    # the member directly without threading a view symbol through the helper.
     callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
     return bv
 

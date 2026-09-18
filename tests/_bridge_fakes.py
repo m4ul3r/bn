@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import importlib
 import importlib.util
 import io
@@ -21,19 +22,30 @@ def _load_bridge(monkeypatch):
     sys.dont_write_bytecode = True
     fake_bn = types.ModuleType("binaryninja")
 
-    class SymbolType:
-        FunctionSymbol = "SymbolType.FunctionSymbol"
-        DataSymbol = "SymbolType.DataSymbol"
-        ImportedFunctionSymbol = "SymbolType.ImportedFunctionSymbol"
-        ImportedDataSymbol = "SymbolType.ImportedDataSymbol"
-        ImportAddressSymbol = "SymbolType.ImportAddressSymbol"
-        ExternalSymbol = "SymbolType.ExternalSymbol"
+    # Real BN models these three as IntEnum, so a member's `str()` is its NUMERIC
+    # value and `.name` is the member name -- `str(SymbolType.ExternalSymbol)` is
+    # "5", never "SymbolType.ExternalSymbol" (#529, #593). The plain-string fakes
+    # this replaces were strictly MORE forgiving: a `str(sym.type) == "SymbolType.X"`
+    # comparison passed the mocked suite and silently never fired against a live
+    # view -- exactly how #529 shipped. Member names AND values are the ones a live
+    # BN 5.4 install exposes (`binaryninja.enums`), so `getattr(bn.SymbolType, name)`
+    # lookups resolve to the same identity a live view hands back.
+    class SymbolType(enum.IntEnum):
+        FunctionSymbol = 0
+        ImportAddressSymbol = 1
+        ImportedFunctionSymbol = 2
+        DataSymbol = 3
+        ImportedDataSymbol = 4
+        ExternalSymbol = 5
+        LibraryFunctionSymbol = 6
+        SymbolicFunctionSymbol = 7
+        LocalLabelSymbol = 8
 
-    class SymbolBinding:
-        NoBinding = "SymbolBinding.NoBinding"
-        LocalBinding = "SymbolBinding.LocalBinding"
-        GlobalBinding = "SymbolBinding.GlobalBinding"
-        WeakBinding = "SymbolBinding.WeakBinding"
+    class SymbolBinding(enum.IntEnum):
+        NoBinding = 0
+        LocalBinding = 1
+        GlobalBinding = 2
+        WeakBinding = 3
 
     class TypeClass:
         # Values match the strings _FakeType carries in its `type_class` field,
@@ -51,13 +63,18 @@ def _load_bridge(monkeypatch):
         NamedTypeReferenceClass = "NamedTypeReferenceClass"
         WideCharTypeClass = "WideCharTypeClass"
 
-    class RelocationType:
-        # The ELF GOT-slot reloc kinds the import classifier cares about (#478):
+    class RelocationType(enum.IntEnum):
+        # The ELF GOT-slot reloc kinds, plus the full live set so a
+        # `getattr(bn.RelocationType, name)` lookup resolves as it does against a
+        # live core. Names and values verified against a live BN 5.4 install;
         # JUMP_SLOT (.rela.plt, callable function import) vs GLOB_DAT (.rela.dyn,
-        # data import). Names mirror real BN's enum members (ELFJumpSlot /
-        # ELFGlobal), verified against a live BinaryView.
-        ELFJumpSlotRelocationType = "RelocationType.ELFJumpSlotRelocationType"
-        ELFGlobalRelocationType = "RelocationType.ELFGlobalRelocationType"
+        # data import) are the two the import classifier distinguishes (#478).
+        ELFGlobalRelocationType = 0
+        ELFCopyRelocationType = 1
+        ELFJumpSlotRelocationType = 2
+        StandardRelocationType = 3
+        IgnoredRelocation = 4
+        UnhandledRelocation = 5
 
     class Symbol:
         def __init__(self, symbol_type, address, name, binding=None):
