@@ -28,7 +28,10 @@ def _list_tag_types(ctx, selector: str | None) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
     types = [_tag_type_entry(tt) for tt in bv.tag_types.values()]
     types.sort(key=lambda t: t["name"])
-    return {"tag_types": types, "count": len(types)}
+    # #819: the #275 discriminator. Unpaged (every tag type is returned), so no
+    # paging quad -- `tag_types` is the container the renderer reads and `count`
+    # its size, matching the presence-tier `{kind, count}` shape.
+    return {"kind": "tag_types", "tag_types": types, "count": len(types)}
 
 
 def _tag_entry(tag, *, scope: str, address: int | None, function: str | None) -> dict[str, Any]:
@@ -56,7 +59,7 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
             _tag_entry(t, scope="function", address=None, function=fn.name)
             for t in fn.get_function_tags(auto=False)
         ]
-        return {"function": fn.name, "address": hex(int(fn.start)),
+        return {"kind": "tags", "function": fn.name, "address": hex(int(fn.start)),
                 "tags": tags, "count": len(tags)}
 
     if address is None:
@@ -75,7 +78,9 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
     # (parity with comment get / xrefs, #374).
     if not tags:
         _require_mapped_address(bv, addr)
-    return {"address": hex(addr), "tags": tags, "count": len(tags)}
+    # #819: the same #275 discriminator as the function branch above -- `tags` is
+    # the container the renderer reads, `count` its size.
+    return {"kind": "tags", "address": hex(addr), "tags": tags, "count": len(tags)}
 
 
 def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, Any]]:

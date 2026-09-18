@@ -100,6 +100,27 @@ def test_get_tags_data_scope_outside_any_function():
     assert ("Bugs", "data tag", "data", None) in datas
 
 
+def test_tag_get_and_types_carry_the_kind_discriminator_819():
+    """#819: `tag types` and `tag get` answered with no `kind`, so a generic
+    consumer could not tell either payload apart from any other object read --
+    the discriminator is what #275 makes the one thing every read shares. Both
+    are unpaged (they return the whole set), so neither carries the paging quad;
+    `count` stays the size of the container the renderers read."""
+    bv, fn = _bv_with_tagged_fn()
+
+    types = read_tags._list_tag_types(_CtxFn(bv), None)
+    assert types["kind"] == "tag_types"
+    assert types["count"] == len(types["tag_types"])
+
+    by_address = read_tags._get_tags(_CtxFn(bv), None, "0x1010", None)
+    assert by_address["kind"] == "tags"
+    assert by_address["count"] == len(by_address["tags"])
+
+    by_function = read_tags._get_tags(_CtxFn(bv), None, None, "sub_1000")
+    assert by_function["kind"] == "tags"
+    assert by_function["count"] == len(by_function["tags"])
+
+
 def test_list_tags_all_scopes_deduped_and_paged():
     bv, fn = _bv_with_tagged_fn()  # 1 function tag, 1 address tag, 1 data tag
     result = read_tags._list_tags(_CtxFn(bv), None)

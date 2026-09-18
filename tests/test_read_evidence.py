@@ -1276,6 +1276,49 @@ def test_init_arrays_no_tls_item_for_non_pe(monkeypatch):
     assert not any("TLS callbacks" in it["name"] for it in result["items"])
 
 
+def test_init_arrays_discloses_the_entry_population_819(monkeypatch):
+    """#819: the top-level `total` counts the SECTIONS in `items`, while the read's
+    `--limit N` caps ENTRIES per section -- so `.total` read as the entry
+    population never moved (one section, whatever the limit), and a bounded read
+    of a 400-constructor table looked like a complete 1-row answer. The entry
+    population now has its own name, next to the per-section counts it sums."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ctor = _FakeFunction(0x401000, "global_ctor")
+    table = b"".join((0x401000 + i * 4).to_bytes(4, "little") for i in range(8))
+    bv = _FakeBV(
+        functions=[ctor],
+        arch=_FakeArch(name="armv7"),
+        sections={".init_array": _FakeSection(".init_array", 0x5000, 0x5020)},
+        memory={0x5000: table},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._init_arrays("active", limit=2)
+
+    assert result["kind"] == "init_arrays"
+    assert result["total"] == 1              # the `items` collection: sections
+    assert result["total_entries"] == 8      # the population the limit bounds
+    assert result["items"][0]["shown_entries"] == 2
+    assert result["items"][0]["truncated"] is True
+
+
+def test_function_evidence_payload_carries_its_kind_discriminator_819(monkeypatch):
+    """#819: `evidence function` was the one read in its family with no `kind`, so
+    `jq .kind` answered null and a generic consumer could not tell this card from
+    any other object payload. The `calls` container the renderers read is
+    untouched (it is the documented leaf, and duplicating the heaviest array in
+    the module under a second key would double this read's payload)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+
+    result = instance._function_evidence("active", "probe_device", context=0)
+
+    assert result["kind"] == "function_evidence"
+    assert [call["address"] for call in result["calls"]] == ["0x401400"]
+
+
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

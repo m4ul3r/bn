@@ -1227,6 +1227,14 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     returned = len(calls)
 
     result = {
+        # #819: the #275 discriminator. This card's rows live under `calls` (the
+        # documented leaf, and what every renderer and consumer reads), not under
+        # `items` -- the card is object-shaped (function + metadata + thunk + a
+        # call list with its own #471 paging quad) and `calls` is the heaviest
+        # array in any read here, so it is not duplicated under a second key.
+        # `kind` is what was missing: without it a generic consumer cannot tell
+        # this payload apart from any other object-shaped read.
+        "kind": "function_evidence",
         "function": {
             "name": func.name,
             "address": hex(func.start),
@@ -2448,11 +2456,19 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
     sections.sort(key=lambda item: int(item["start"], 16))
     # #275: `items` are the init/ctor sections (each retains its nested `entries`
     # table); `kind` discriminates the envelope.
+    #
+    # #819: `total` is the envelope's own count -- the size of the collection in
+    # `items`, i.e. SECTIONS -- and the read's `--limit N` caps ENTRIES per
+    # section, so a reader taking `.total` for the entry population saw a number
+    # that never moves (2 sections on a binary with 400 constructors, whatever the
+    # limit). `total_entries` names that population explicitly, next to the
+    # per-section `total_entries`/`shown_entries`/`truncated` it sums.
     return {
         "kind": "init_arrays",
         "pointer_size": pointer_size,
         "items": sections,
         "total": len(sections),
+        "total_entries": sum(int(section["total_entries"]) for section in sections),
     }
 
 
