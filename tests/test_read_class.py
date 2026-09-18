@@ -2323,3 +2323,60 @@ def test_render_class_list_text_warns_when_quick_loaded():
 
     full = _render_class_list_text({**listing, "analysis_state": "full", "partial": False})
     assert "WARNING" not in full
+
+
+# --- #821: an interior code pointer ends the vtable scan -------------------
+
+
+def _slot(status, *, exact_start=None, kind=None):
+    """A `_normalize_code_pointer`-shaped target, as the scan consumes it."""
+    target = {"status": status}
+    if status == "function":
+        entry = {"name": "fn", "address": "0x401000"}
+        if exact_start is not None:
+            entry["exact_start"] = exact_start
+        target["function"] = entry
+    if kind is not None:
+        target["context"] = {"kind": kind}
+    return target
+
+
+def test_an_interior_code_pointer_is_not_a_vtable_slot_821():
+    # #821: the normalizer reports `function` for an INTERIOR address too --
+    # a data word that happens to equal a mid-function PC -- with
+    # `exact_start: False`. `_slot_is_code` never consulted it, so such a
+    # word was accepted as a slot and the scan ran past the real end of the
+    # table until some later word happened to terminate it. A vtable slot
+    # points at a function ENTRY.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function", exact_start=False)) is False
+
+
+def test_an_entry_point_pointer_is_still_a_vtable_slot_821():
+    # Must-not-fire twin, and the one that matters: the ordinary case is an
+    # exact function start, which is what a vtable is made of. A guard that
+    # ended the scan here would empty every vtable in the binary.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function", exact_start=True)) is True
+
+
+def test_a_function_hit_without_interiority_evidence_still_counts_821():
+    # Tri-state, the rule applied everywhere else today: only an AFFIRMATIVE
+    # `exact_start: False` terminates. An entry that does not carry the key
+    # says nothing about interiority, and ending a scan on absent evidence
+    # would silently truncate a table read through any producer that does
+    # not compute it.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function")) is True
+    assert _slot_is_code({"status": "function"}) is True
+    assert _slot_is_code({"status": "function", "function": None}) is True
+
+
+def test_the_non_function_code_path_is_unchanged_821():
+    # The #205 behaviour this sits beside: a code-classified address is a
+    # slot, a mapped-but-not-code pointer is not. The #821 gate must not
+    # reach either.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("mapped", kind="code")) is True
+    assert _slot_is_code(_slot("mapped", kind="data")) is False
+    assert _slot_is_code(_slot("unmapped")) is False

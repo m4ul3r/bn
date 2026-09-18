@@ -664,8 +664,26 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
     ``seam._address_is_code`` / the ``kind`` classification in
     ``_address_context``). Accepting it would render data/string pointers in an
     r-x mapping as fake unnamed virtual methods. A non-code pointer ends the
-    scan rather than fabricating slots (#205 review)."""
+    scan rather than fabricating slots (#205 review).
+
+    #821: a `status == "function"` hit is NOT sufficient on its own. The
+    normalizer reports `function` for an INTERIOR address too -- a data word
+    that happens to equal some mid-function PC -- with `exact_start: False`
+    on the entry. A vtable slot points at a function ENTRY, so an interior
+    hit is not a virtual method; accepting it extended the slot list past
+    the real end of the table until some later word happened to terminate
+    it, and the warning was only post-hoc. Terminating is the same choice
+    already made for a non-code pointer: end the scan rather than fabricate
+    slots.
+
+    Tri-state, like every other evidence gate here: only an AFFIRMATIVE
+    `exact_start: False` terminates. An entry that does not carry the key --
+    an older payload, or a producer that does not compute it -- says nothing
+    about interiority and must not end a scan on absent evidence."""
     if target.get("status") == "function":
+        entry = target.get("function")
+        if isinstance(entry, dict) and entry.get("exact_start") is False:
+            return False
         return True
     return (target.get("context") or {}).get("kind") == "code"
 
