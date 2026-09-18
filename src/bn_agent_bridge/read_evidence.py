@@ -311,15 +311,19 @@ def _library_signature_applies(callee_fn, name: str) -> bool:
     rests on, which an import-only gate would have thrown away):
 
     * an **imported** callee resolves to the library's symbol by definition;
-    * a **reserved identifier** -- C11 7.1.3 reserves a leading ``__``, and ``_``
-      followed by an uppercase letter, to the implementation -- cannot be a
-      conforming program's own function, so a statically linked copy is still
-      the library's function.
+    * a **reserved identifier** -- C11 7.1.3 reserves a leading ``__`` to the
+      implementation -- cannot be a conforming program's own function, so a
+      statically linked copy is still the library's function. The ``_`` plus an
+      uppercase letter half of that rule was REMOVED: it is where the mangling
+      prefixes live (``_Z``, ``_R``, ``_D``, ``_T``), so it readmitted the
+      collision class it was meant to exclude.
 
     An ordinary-named local definition is therefore refused, which is exactly
-    the collision shape. The cost is stated plainly: a statically linked
-    ordinary-named library function (a static ``memcpy``) is out of reach here
-    and belongs to the residual tracked in #865.
+    the collision shape. Two costs, stated plainly rather than discovered later:
+    a statically linked ordinary-named library function (a static ``memcpy``) is
+    out of reach here, and so is any callee whose name carries a mangling prefix,
+    since ``_library_param_count`` refuses those outright whatever their
+    provenance. Both are part of the residual tracked in #865.
     """
     # `is_imported_function` is the module's existing predicate for this, already
     # imported here: it reads the symbol kind by NAME, so it works against BN's
@@ -468,17 +472,24 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # arguments with `authoritative` and no mismatch, against a library that
     # declares one parameter. Recorded whenever the two disagree, including the
     # zero-vs-N case the "genuinely void callee" branch below would wave through.
-    # NOT for a USER prototype. An analyst who set the type has stated the arity
-    # explicitly, and a bundled signature must not outrank that statement -- the
-    # precedence this function already asserts two lines below ("user prototypes
-    # also establish zero arity") and the one #648 earned `authoritative` on. The
-    # first cut ignored `has_user_type`, so a matching-arity call with a user
-    # prototype was demoted by a library that merely disagreed (#862 review).
-    library = (
-        None if has_user_type
-        else _library_param_count(
-            bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
-    )
+    # Deliberately NOT suppressed for a user prototype. Round 1 of this review
+    # asked for that precedence and it was implemented as
+    # `None if has_user_type else ...`, which the dogfood then measured as
+    # turning the whole cross-check OFF wherever it matters: BN sets
+    # `has_user_type` on almost every function and exposes no API to clear it
+    # (which is why `proto set --preview` is refused), so after a `bn save` and
+    # reopen it reads True for essentially everything -- 104/104 imports and
+    # 853/853 locals on a reopened view, 957/959 on a corpus database. Against a
+    # saved `.bndb`, the normal case, the gate became a no-op versus base.
+    #
+    # The round-1 concern was that a demotion must not SILENTLY overrule an
+    # analyst's statement. That is met by DISCLOSURE instead: the row carries
+    # `declared_arity`, `library_arity` and `library_source`, and the text line
+    # says a user prototype takes precedence, so a pinned prototype is visible
+    # and checkable with `bn proto get` rather than quietly demoted. Suppression
+    # bought the nuance at the price of the feature.
+    library = _library_param_count(
+        bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
     if (
         library is not None
         and declared_count is not None

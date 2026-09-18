@@ -4912,7 +4912,12 @@ def test_render_evidence_function_states_the_library_contradiction_759():
     # The two counts and the library that supplied the contradiction, so the
     # reader can check it rather than take the demotion on trust.
     assert "declares 0 but libgcc_s_x86_64.so.1 declares 1" in out
-    assert "a user prototype takes precedence over the library" in out
+    # The precedence PROMISE is gone (the dogfood showed suppressing on
+    # has_user_type disabled the check on every saved database), so the line now
+    # states what it can defend: the contradiction is reported, not judged.
+    assert "if you pinned that prototype yourself" in out
+    assert "reports the contradiction rather than judging it" in out
+    assert "takes precedence" not in out
 
 
 def test_render_evidence_function_library_contradiction_without_counts():

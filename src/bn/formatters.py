@@ -2535,8 +2535,11 @@ def _render_function_evidence_text(value: Any) -> str:
             lines.append(
                 f"  arity: UNVERIFIED — the callee's recovered prototype {counts}, "
                 "so the recovered signature is not corroborated and these arguments "
-                "may be under-recovered. Confirm with `bn proto get <callee>`; a user "
-                "prototype takes precedence over the library."
+                "may be under-recovered. Confirm with `bn proto get <callee>`: if you "
+                "pinned that prototype yourself the library disagreeing with it is not "
+                "evidence against it, and this row reports the contradiction rather "
+                "than judging it -- BN cannot distinguish a pinned prototype from a "
+                "recovered one here."
             )
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):

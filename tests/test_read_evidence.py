@@ -5241,14 +5241,26 @@ def test_library_cross_check_applies_to_a_reserved_identifier_759(monkeypatch):
     assert call["library_source"] == "libgcc_s_x86_64.so.1"
 
 
-def test_user_prototype_outranks_a_disagreeing_library_759(monkeypatch):
-    """#862 review blocker: AC2. A matching-arity call carrying a USER prototype
-    was demoted because a bundled library stated a different count, so the
-    library outranked the analyst's own statement -- the opposite of the
-    precedence this function asserts two lines below ("user prototypes also
-    establish zero arity") and the one #648 earned `authoritative` on.
+def test_a_library_contradiction_demotes_even_with_a_user_prototype_759(monkeypatch):
+    """#862 DOGFOOD finding, and a deliberate reversal of the round-1 precedence
+    fix. Suppressing the cross-check on `has_user_type` turned the whole feature
+    off wherever it matters: BN sets that flag on almost every function and never
+    clears it (`proto set --preview` is refused precisely because there is no API
+    to clear it), so after a `bn save` + reopen it reads True for essentially
+    everything -- measured 104/104 imports and 853/853 locals on a reopened view,
+    957/959 on a corpus database. Against a saved `.bndb` -- the normal case --
+    the gate was a no-op versus base, including for the `__popcountdi2` callee it
+    was built for.
 
-    None of the other controls attaches a library, which is why this one does."""
+    So the demotion is no longer suppressed. The round-1 concern was that it must
+    not SILENTLY overrule an analyst's own statement, and that is met by
+    disclosure rather than by suppression: the row names both counts and the
+    library, and the text line states that a user prototype takes precedence, so
+    an analyst who pinned one can see the claim and check `bn proto get`.
+
+    This is the shape the pre-dogfood tests never exercised: a callee whose type
+    reads as user-set, which is what every function on a reopened database looks
+    like."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=2,
@@ -5258,39 +5270,30 @@ def test_user_prototype_outranks_a_disagreeing_library_759(monkeypatch):
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
-    assert call["argument_confidence"] == "authoritative"
-    assert "prototype_unverified" not in call
+    assert call["argument_confidence"] == "inferred"
+    assert call["prototype_unverified"] is True
+    assert call["declared_arity"] == 2
+    assert call["library_arity"] == 3
+    # The analyst-facing half of the trade: the contradiction is fully attributed,
+    # so a pinned prototype is checkable rather than quietly overruled.
+    assert call["library_source"] == "libc_x86_64.so.6"
 
 
-@pytest.mark.parametrize(
-    "mangled",
-    ["_ZNSt6vectorIiSaIiEE9push_backERKi",
-     "_RNvCs1234_4core3fmt5write",
-     "_D3std5stdio6writeln",
-     "_TtC4main6Widget"],
-    ids=["itanium", "rust-v0", "dlang", "swift-old"],
-)
-def test_library_cross_check_refuses_every_decorated_scheme_759(monkeypatch, mangled):
-    """#862 review round 2 MAJOR: the reserved-identifier arm was `_` plus an
-    uppercase letter, which is exactly where the mangling prefixes live -- every
-    Rust-v0 `_R...` symbol satisfied it, so a LOCAL Rust-mangled function
-    colliding with a library entry was still demoted. That is the round-1
-    collision class, narrowed to the one scheme the `_Z` refusal did not name.
-
-    A decorated name's implicit parameters (`this`, an sret return slot) make the
-    count comparison meaningless whatever its provenance, so every such scheme is
-    refused -- here even WITH import provenance, which is the stronger claim."""
+def test_an_agreeing_library_leaves_a_user_prototype_alone_759(monkeypatch):
+    """The control for the reversal: dropping the suppression must not demote a
+    user prototype the library AGREES with -- the demotion follows a real
+    contradiction, not the mere presence of a library entry."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
-    next(f for f in bv.functions if f.name == "hw_get_version").name = mangled
-    _with_type_library(bv, symbol=mangled, params=3)
-    _as_import(bv, name=mangled)
+    bv = _arity_bv(monkeypatch, instance, callee_params=3,
+                   arg_texts=["a", "b", "c"], user_type=True)
+    _with_type_library(bv, symbol="hw_get_version", params=3)
+    _as_import(bv)
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
-    assert "prototype_unverified" not in call
     assert call["argument_confidence"] == "authoritative"
+    assert "prototype_unverified" not in call
 
 
 def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
