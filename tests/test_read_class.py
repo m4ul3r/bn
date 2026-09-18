@@ -2264,3 +2264,62 @@ def test_render_class_show_text_secondary_note_reflects_trimmed_slot_count():
     text = _render_class_show_text(rec)
     assert "showing 1 slots" in text
     assert "capped at 64" in text
+
+
+def test_class_list_discloses_quick_analysis_state():
+    """#820: the class lens answers on a --quick view, so both of its envelopes
+    carry the view's analysis state -- the same shape `function list` emits, from
+    the same helper, so a consumer reads one contract for "incomplete"."""
+    bridge_state = importlib.import_module("bn_agent_bridge.bridge_state")
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    full = read_class._class_list(_Ctx(), None, include_all=True)
+    assert full["analysis_state"] == "full"
+    assert full["partial"] is False
+    full_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    assert full_count["analysis_state"] == "full"
+    assert full_count["partial"] is False
+
+    bridge_state._quick_loaded_views.add(bv)
+    try:
+        quick = read_class._class_list(_Ctx(), None, include_all=True)
+        quick_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    finally:
+        bridge_state._quick_loaded_views.discard(bv)
+
+    # The inventory is real, its completeness is not: method counts and the
+    # confidence clustering read functions that pre-analysis don't exist yet.
+    assert quick["analysis_state"] == "quick"
+    assert quick["partial"] is True
+    assert quick_count["analysis_state"] == "quick"
+    assert quick_count["partial"] is True
+
+
+def test_render_class_list_text_warns_when_quick_loaded():
+    """#820: text mode states what the envelope records, for both the listing and
+    the --count line."""
+    from bn.formatters import _render_class_list_text
+    listing = {
+        "kind": "classes",
+        "items": [{"name": "A", "method_count": 1, "has_vtable": True,
+                   "size": None, "bases": [], "confidence": "rtti"}],
+        "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False,
+        "analysis_state": "quick", "partial": True,
+    }
+    out = _render_class_list_text(listing)
+    assert out.startswith("WARNING: target is quick-loaded; class list is partial.")
+    assert "bn refresh" in out
+    assert "classes: 1 shown of 1" in out
+
+    count = _render_class_list_text({
+        "kind": "classes", "count": 1, "total": 1, "artifact_count": 0,
+        "analysis_state": "quick", "partial": True,
+    })
+    assert count.startswith("WARNING: target is quick-loaded; class list is partial.")
+
+    full = _render_class_list_text({**listing, "analysis_state": "full", "partial": False})
+    assert "WARNING" not in full

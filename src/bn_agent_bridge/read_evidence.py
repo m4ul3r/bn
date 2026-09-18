@@ -39,6 +39,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import read_xrefs
 from ._shared import OperationFailure, _parse_address, _validate_count, is_imported_function
+from .read_listing import _analysis_state_fields
 
 
 def _call_destination_value(ctx, insn) -> int | None:
@@ -799,6 +800,10 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         "returned": returned,
         "has_more": offset + returned < matched,
         "warnings": warnings,
+        # #820: a --quick view answers here (the matrix marks this op `partial`),
+        # so disclose that the ABI/argument recovery was read off a function BN
+        # has not analyzed -- the call list is real, its fidelity is not.
+        **_analysis_state_fields(bv),
     }
     if decompile_deferred:
         # #622: additive honesty field -- present only when the decompile was

@@ -2807,3 +2807,35 @@ def test_disasm_count_at_a_decimal_exact_start_does_not_steer_to_linear(monkeypa
     ) == 0
     interior = capsys.readouterr().out
     assert "--linear" in interior
+
+
+def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
+    # #820: a --quick decompile is unresolved-name Pseudo-C with `warnings: []`,
+    # so text mode used to state nothing was degraded. The view-level state now
+    # leads the body -- `analysis_skipped` is per-function and False here.
+    fake_transport({"decompile": {"ok": True, "result": {
+        "function": {"name": "sub_401000", "address": "0x401000"},
+        "text": "int32_t sub_401000()\n{\n    return sub_401100();\n}",
+        "warnings": [], "analysis_skipped": False,
+        "analysis_state": "quick", "partial": True,
+    }}})
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING: target is quick-loaded; decompile is partial." in out
+    assert "bn refresh" in out
+    assert out.index("WARNING") < out.index("int32_t sub_401000()")
+
+    # A fully-analyzed view says nothing extra: no spurious warning, and the body
+    # is still first.
+    fake_transport({"decompile": {"ok": True, "result": {
+        "function": {"name": "sub_401000", "address": "0x401000"},
+        "text": "int32_t sub_401000()\n{\n    return sub_401100();\n}",
+        "warnings": [], "analysis_skipped": False,
+        "analysis_state": "full", "partial": False,
+    }}})
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert out.startswith("int32_t sub_401000()")

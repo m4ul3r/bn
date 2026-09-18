@@ -1939,17 +1939,22 @@ def _render_paged_list_text(
 
 
 _QUICK_PARTIAL_WARNING = (
-    "WARNING: target is quick-loaded; function list/count is partial. "
+    "WARNING: target is quick-loaded; {what} is partial. "
     "Run `bn refresh` for full analysis."
 )
 
 
-def _quick_partial_prefix(value: Any) -> str:
-    """A leading warning line when the functions envelope is quick-loaded/partial
-    (#437), so a text reader doesn't trust a partial count as the whole binary.
-    Empty for a fully-analyzed view."""
+def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
+    """A leading warning line when a read envelope is quick-loaded/partial
+    (#437), so a text reader doesn't trust a partial answer as a complete one.
+    Empty for a fully-analyzed view.
+
+    ``what`` names the partial artifact in the reader's own terms (#820): every
+    op that answers on a quick view now carries the same `partial` flag, so the
+    one message would otherwise tell a `decompile`/`class list`/`types`/
+    `evidence function` reader that a "function list/count" was partial."""
     if isinstance(value, dict) and value.get("partial"):
-        return _QUICK_PARTIAL_WARNING + "\n"
+        return _QUICK_PARTIAL_WARNING.format(what=what) + "\n"
     return ""
 
 
@@ -2353,6 +2358,13 @@ def _render_function_evidence_text(value: Any) -> str:
         f"prototype: {value.get('prototype', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
+    # #820: the view-level analysis state leads the card. Prepended HERE rather
+    # than at the final join because an empty call set returns early -- and a
+    # quick-loaded read with no calls is exactly the card a reader would take for
+    # a complete answer.
+    quick_prefix = _quick_partial_prefix(value, "function evidence")
+    if quick_prefix:
+        lines.insert(0, quick_prefix.rstrip("\n"))
     thunk = _field_dict(value, "thunk")
     # The target envelope goes through the choke point too: a malformed one used
     # to vanish from the card because the raw truth test never told anyone the
@@ -3896,8 +3908,12 @@ def _describe_loc(loc: Any) -> str:
 def _render_type_list_text(value: Any) -> str:
     # Paged envelope ({items,total,...}) -> render the page + the shared footer;
     # a bare list falls through to the per-item body below (back-compat) (#131).
+    # #820: the quick-load warning goes on the ENVELOPE branch only -- the
+    # recursive call is handed the bare `items` list, which carries no state (and
+    # could not: a list has no place to record it), so it cannot double-prefix.
     if _field_declared(value, "items"):
-        return _render_paged_list_text(value, "items", _render_type_list_text)
+        return _quick_partial_prefix(value, "type list") + _render_paged_list_text(
+            value, "items", _render_type_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -5466,6 +5482,10 @@ def _class_inputs_note(value: Any) -> str:
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    # #820: the class lens answers on a --quick view, so its inventory leads with
+    # the analysis-state warning -- both the count-only line and the listing,
+    # since either is read as the target's complete class set.
+    quick_prefix = _quick_partial_prefix(value, "class list")
     # The recorded read happens BEFORE the count-only branch, never after it.
     # #484 count-only is a bare count envelope (no items), with the non-class
     # artifact (#481) share broken out so the domain-class count is honest --
@@ -5479,7 +5499,7 @@ def _render_class_list_text(value: Any) -> str:
         n = value.get("count", 0)
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
-        return f"classes: {n}{tail}{_class_inputs_note(value)}"
+        return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
@@ -5521,7 +5541,7 @@ def _render_class_list_text(value: Any) -> str:
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )
-    return "\n".join(lines)
+    return quick_prefix + "\n".join(lines)
 
 
 def _vtable_slot_label(s: dict[str, Any]) -> str:
