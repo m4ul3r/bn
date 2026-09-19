@@ -330,6 +330,75 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     return result
 
 
+# Architectures whose ABI returns in a register WIDER than a 32-bit write,
+# where that narrower write ZERO-EXTENDS the full register -- so BN infers a
+# 64-bit return for a function that only ever writes 32 bits.
+#
+# Confirmed per arch rather than inherited from x86 (#675 item 5): on x86_64
+# the `eax` write zero-extends `rax`, and AArch64 has the SAME relation
+# (`w0` zero-extends `x0`) -- measured, a cross-built AArch64 binary shows
+# the identical `uint64_t(int32_t, int32_t)` shape. ARM32/thumb2 does NOT
+# belong: its registers are natively 32-bit, there is no widening, and the
+# same measurement finds ZERO over-wide functions there.
+#
+# Emitting nothing outside this set is the point. A note that appeared on
+# ARM firmware while explaining an x86/AArch64 register relation would be
+# worse than no note: it would be a confident claim about a mechanism that
+# target does not have.
+_ZERO_EXTENDING_RETURN_ARCHS = frozenset({"x86_64", "aarch64"})
+
+
+def _return_width_inference_note(bv, func) -> str | None:
+    """Disclose a return width BN inferred from the full register (#675 item 5).
+
+    `int add(int, int)` is recovered as `uint64_t(int32_t, int32_t)` because
+    the callee writes `eax`/`w0` and that write zero-extends the 64-bit
+    register, so BN cannot tell a 32-bit return from a 64-bit one. The
+    prototype then states two different confidence levels in one line and
+    marks neither, and the harm reaches a SECOND surface: a caller returning
+    -1 renders `return 0xffffffff;`.
+
+    A NOTE, not a different answer -- BN cannot do better here, and
+    substituting a narrower type would be the fabrication. It misleads a
+    reader rather than breaking a computation, which is why this discloses
+    where the reserved-keyword guard refuses.
+
+    The signal is narrow ON PURPOSE. `has_user_type is False` is true of
+    nearly every function in a stripped binary, so a note keyed on it fires
+    everywhere and is skipped within a week; return-type confidence reads
+    its MAXIMUM on exactly the over-wide return. What selects the real
+    population is the shape: a pointer-width integer return on an arch where
+    a 32-bit write zero-extends, with the declared parameters all narrower.
+    """
+    try:
+        arch = str(getattr(getattr(bv, "arch", None), "name", "") or "")
+        if arch not in _ZERO_EXTENDING_RETURN_ARCHS:
+            return None
+        if bool(getattr(func, "has_user_type", False)):
+            return None          # an analyst set this; it is not an inference
+        rtype = getattr(func, "return_type", None)
+        if rtype is None or int(getattr(rtype, "width", 0) or 0) != 8:
+            return None
+        params = list(getattr(func, "parameter_vars", []) or [])
+        if not params:
+            return None
+        if any(int(getattr(getattr(p, "type", None), "width", 8) or 8) != 4
+               for p in params):
+            return None
+    except Exception:  # noqa: BLE001 - no evidence is not a claim
+        return None
+    reg = "eax/rax" if arch == "x86_64" else "w0/x0"
+    return (
+        f"return width may be INFERRED, not observed: on {arch} a 32-bit "
+        f"{reg.split('/')[0]} write zero-extends {reg.split('/')[1]}, so a "
+        f"function returning a 32-bit value is indistinguishable from one "
+        f"returning 64 bits and BN widens it. Every declared parameter here "
+        f"is 32-bit, which is the shape that produces the ambiguity -- a "
+        f"negative return will render as a large unsigned value (e.g. -1 as "
+        f"0xffffffff) at call sites. Set the prototype if you know the width."
+    )
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -341,6 +410,9 @@ def _get_prototype(ctx, selector: str | None, identifier):
         },
         **il_format._function_metadata(func),
     }
+    note = _return_width_inference_note(bv, func)
+    if note:
+        result["return_width_note"] = note
     _annotate_containment(ctx, result, identifier, func)
     return result
 

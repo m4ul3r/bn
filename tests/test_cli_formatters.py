@@ -4351,7 +4351,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
     # #825 item 3: `_operation_row_text` now reads `include_root` on a types_declare row, so these derived populations grow with the one new discovered read. 4896 + 8 = 4904.
-    assert swept == 4904, f"the raise sweep ran {swept} renders, not 4904"
+    # #675 item 5: `_render_proto_text` now reads `return_width_note` on a
+    # prototype payload -- one more discovered read, same growth. 4904 + 8 = 4912.
+    assert swept == 4912, f"the raise sweep ran {swept} renders, not 4912"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4508,7 +4510,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
     # #825 item 3: `_operation_row_text` now reads `include_root` on a types_declare row, so these derived populations grow with the one new discovered read. 1426 + 2 = 1428.
-    assert checked == 1428, f"the mirror ran {checked} renders, not 1428"
+    # #675 item 5: `_render_proto_text`'s `return_width_note` read, as above. 1428 + 2 = 1430.
+    assert checked == 1430, f"the mirror ran {checked} renders, not 1430"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

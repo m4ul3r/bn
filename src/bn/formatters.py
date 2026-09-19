@@ -824,6 +824,14 @@ def _render_proto_text(value: Any) -> str:
     # BN renders the prototype anonymously (`uint64_t (int32_t arg1)`); splice in
     # the function name so the output is a copy-pasteable C declaration (#222).
     note = _resolution_note(value)
+    # A return width BN inferred from the full register, disclosed rather than
+    # silently trusted (#675 item 5). It trails the declaration so the first
+    # line stays a copy-pasteable C prototype (#222).
+    # Read through `_text_value`, not an inline isinstance: a shape test here
+    # would drop a malformed note and render byte-identically to a payload that
+    # carried none, which is the exact skew #619 made a suite-wide invariant.
+    raw_width_note = _text_value(value, "return_width_note")
+    width_note = f"\n\nnote: {raw_width_note}" if raw_width_note else ""
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -835,8 +843,8 @@ def _render_proto_text(value: Any) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return note + f"{head} {name}({rest}"
-    return note + prototype
+            return note + f"{head} {name}({rest}" + width_note
+    return note + prototype + width_note
 
 
 @_discloses

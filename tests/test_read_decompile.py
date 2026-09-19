@@ -3744,3 +3744,97 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+# ---------------------------------------------------------------------------
+# #675 item 5: return width inferred from the full register, disclosed
+# ---------------------------------------------------------------------------
+
+
+class _RWType:
+    def __init__(self, width):
+        self.width = width
+
+
+class _RWParam:
+    def __init__(self, width):
+        self.type = _RWType(width)
+
+
+class _RWFunc:
+    def __init__(self, ret_width=8, params=(4, 4), has_user_type=False):
+        self.return_type = _RWType(ret_width)
+        self.parameter_vars = [_RWParam(w) for w in params]
+        self.has_user_type = has_user_type
+
+
+class _RWArch:
+    def __init__(self, name):
+        self.name = name
+
+
+class _RWBV:
+    def __init__(self, arch):
+        self.arch = _RWArch(arch)
+
+
+def _note(arch, **kw):
+    from bn_agent_bridge import read_decompile
+
+    return read_decompile._return_width_inference_note(_RWBV(arch), _RWFunc(**kw))
+
+
+@pytest.mark.parametrize("arch,reg", [("x86_64", "eax"), ("aarch64", "w0")])
+def test_return_width_note_names_the_mechanism_for_each_arch_in_the_set(arch, reg):
+    """The note must explain the arch's OWN register relation, not x86's.
+
+    Both members of the set share one mechanism -- a 32-bit write zero-extends
+    the 64-bit return register -- but they do not share register names. A note
+    that said `eax` on AArch64 would be a confident claim about a register the
+    target does not have.
+    """
+    note = _note(arch)
+    assert note is not None
+    assert arch in note
+    assert reg in note
+
+
+def test_return_width_note_is_silent_on_an_arch_outside_the_set():
+    """The must-not-fire twin: ARM32/thumb2 has no widening to disclose.
+
+    Its registers are natively 32-bit, so the ambiguity this note explains
+    does not exist there -- a measured cross-build finds ZERO over-wide
+    functions. A gate that leaked past its scope would print an x86/AArch64
+    register relation over ARM firmware, which is worse than printing nothing:
+    silence is the correct output where there is no evidence.
+    """
+    for arch in ("thumb2", "armv7", "mipsel32", "riscv32"):
+        assert _note(arch) is None, f"note leaked onto {arch}"
+
+
+def test_return_width_note_defers_to_an_analyst_set_prototype():
+    """A user-set type is not an inference, so there is nothing to disclose."""
+    assert _note("x86_64", has_user_type=True) is None
+
+
+def test_return_width_note_requires_the_ambiguous_shape():
+    """Selectivity is the whole design: a loud note is skipped within a week.
+
+    Only a pointer-width return with all-narrower declared parameters can be
+    the zero-extension artefact. A genuinely 64-bit return (64-bit params), a
+    return that is already 32-bit, and a parameterless function are all
+    ordinary and must stay quiet.
+    """
+    assert _note("x86_64", params=(8, 8)) is None
+    assert _note("x86_64", ret_width=4) is None
+    assert _note("x86_64", params=()) is None
+
+
+def test_return_width_note_warns_about_the_second_surface():
+    """The harm the issue reported is at the CALLER, not the prototype.
+
+    A caller returning -1 renders `return 0xffffffff;`, which is the reading
+    that actually misleads, so the note has to reach past its own output.
+    """
+    note = _note("x86_64")
+    assert "0xffffffff" in note
