@@ -4105,6 +4105,20 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             "message": "A function already starts at this address.",
             "requested": requested,
         }
+    # #675 item 14: capture the CONTAINING functions before the create, while
+    # the answer still exists -- afterwards this address IS a function start
+    # and `get_functions_containing` reports the new one. A create at a
+    # mid-function address succeeded with `verified` and said nothing, so a
+    # caller who mistyped an address, or who did not realise BN had already
+    # attributed those bytes, was left with two overlapping functions and no
+    # trace of it in the result.
+    #
+    # DISCLOSED, not refused -- the opposite call from the reserved-tag guard
+    # beside it, and for the opposite reason: creating a function BN missed
+    # inside a neighbour it over-extended is ordinary RE work, so refusing
+    # would break a legitimate flow. The harm here is that the overlap is
+    # INVISIBLE, not that it happened.
+    overlapped = create_comments._containing_function_rows(bv, addr)
     if len(bytes(bv.read(addr, 1))) == 0:
         raise OperationFailure(
             "invalid_request",
@@ -4179,13 +4193,17 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
                 requested=requested,
                 observed={"address": hex(addr), "function": str(created.name)},
             )
-    return {
+    result = {
         "op": "function_create",
         "status": "verified",
         "address": hex(addr),
         "function": str(created.name) if created is not None else None,
         "requested": requested,
     }
+    # ONE builder for both create paths (the other is
+    # `create_comments._function_create`), so the two cannot state the same
+    # fact differently.
+    return create_comments._with_overlap_note(result, overlapped)
 
 
 def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:

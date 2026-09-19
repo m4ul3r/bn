@@ -4905,3 +4905,79 @@ def test_a_batch_that_reaches_every_op_grows_no_unattempted_rows_675():
     an empty remainder, which is the case every successful batch hits."""
     from bn_agent_bridge import mutation_engine as me
     assert me._unattempted_results(None, []) == []
+
+
+# --- #675 item 14: a create inside an existing function says so -----------
+
+
+def test_a_create_inside_an_existing_function_discloses_the_overlap_675():
+    """#675 item 14: `function create` at a mid-function address returned
+    `verified` with a row carrying only address/function/op/requested/status
+    -- two overlapping functions and no trace of it in the result.
+
+    Disclosed rather than refused, the opposite call from the reserved-tag
+    guard and for the opposite reason: creating a function BN missed inside
+    a neighbour it over-extended is ordinary RE work, so a refusal would
+    break a legitimate flow. The harm is that the overlap is INVISIBLE.
+    """
+    from bn_agent_bridge import create_comments as cc
+    row = cc._with_overlap_note(
+        {"op": "function_create", "status": "verified", "address": "0x401341"},
+        [{"name": "main", "address": "0x401339"}])
+
+    assert row["overlaps"] == [{"name": "main", "address": "0x401339"}]
+    assert "main @ 0x401339" in row["note"]
+    # It must say which reading is which, or the note is just an alarm.
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_a_create_at_a_free_address_grows_no_overlap_keys_675():
+    """Must-not-fire twin: the ordinary create is the common path. A row that
+    always carried `overlaps` would make the disclosure noise, and a consumer
+    testing `"overlaps" in row` would see it every time."""
+    from bn_agent_bridge import create_comments as cc
+    row = {"op": "function_create", "status": "verified", "address": "0x401020"}
+    assert cc._with_overlap_note(dict(row), []) == row
+
+
+def test_both_create_paths_share_one_overlap_builder_675():
+    """`bn function create` runs `create_comments._function_create`; `batch
+    apply` runs `mutation_engine._op_function_create`. Patching only the one
+    found first left the command under test unchanged -- caught by the live
+    run, not by the suite. One builder, so the two cannot state the same
+    fact differently."""
+    import inspect
+    from bn_agent_bridge import create_comments as cc, mutation_engine as me
+    assert "_with_overlap_note" in inspect.getsource(cc._function_create)
+    assert "_with_overlap_note" in inspect.getsource(me._op_function_create)
+    assert "_containing_function_rows" in inspect.getsource(cc._function_create)
+    assert "_containing_function_rows" in inspect.getsource(me._op_function_create)
+
+
+def test_a_view_that_cannot_answer_containment_discloses_nothing_675():
+    """Degrade-safely, as everywhere else: a probe that raises has no
+    evidence of an overlap and must not invent one, nor fail the create."""
+    from bn_agent_bridge import create_comments as cc
+
+    class _Hostile:
+        def get_functions_containing(self, addr):
+            raise RuntimeError("analysis unavailable")
+
+    assert cc._containing_function_rows(_Hostile(), 0x401341) == []
+
+
+def test_a_function_starting_at_the_address_is_not_an_overlap_675():
+    """The exact-start case is a `noop`, handled before this; it must not
+    also be reported as overlapping itself."""
+    from bn_agent_bridge import create_comments as cc
+
+    class _Fn:
+        def __init__(self, start, name):
+            self.start, self.name = start, name
+
+    class _BV:
+        def get_functions_containing(self, addr):
+            return [_Fn(0x401341, "sub_401341"), _Fn(0x401339, "main")]
+
+    rows = cc._containing_function_rows(_BV(), 0x401341)
+    assert rows == [{"name": "main", "address": "0x401339"}]
