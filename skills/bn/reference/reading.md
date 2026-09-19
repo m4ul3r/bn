@@ -132,6 +132,50 @@ Notes:
      --field flags:u8@4 --field expected_len:u16@6 --field callback:ptr@16
   # caller=send_status_cmd call=0x402150 command=0x1101 type=0xed subtype=0x41 flags=0x27 ... callback=0x401139 (status_rsp)
   ```
+- **`bn evidence virtual-call --at <addr> [--providers <selector>]` — consumer/provider.** An abstract/interface call through an imported factory compiles to a vtable-slot dispatch (`[*obj + slot](...)`) whose vtable is **not in the consumer**: the consumer holds the call and the factory, the concrete classes and their vtables live in a separate provider binary. Point the command at the dispatch site (the call itself, not the function) and `--providers` at the provider target — the selector of another open target, name/path/id, and omittable when provider and consumer are the same image. It reports the callsite, the factory/singleton the object came from, the slot offset + index, and one candidate per provider class implementing that slot: `class`, `vtable`, `vtable_entry` (the slot's **address**), `method` (demangled), `method_address` (the pointer's **value**). `resolved: true` only for a single candidate; two provider classes implementing the slot is `ambiguous: true` — which is the answer, not a failure, since which class the factory returns is a runtime decision — and the factory's own class sorts first so a name match is visible rather than buried. A non-resolution is typed in `unresolved_reason_code` (see the family bullet above) and never reads as "the slot does not exist". It needs no manual vtable-offset arithmetic and mutates nothing.
+
+  Sanitized walkthrough — a consumer whose session object arrives from a factory, and a provider library defining two concrete session classes:
+
+  ```c
+  /* consumer.so — the abstract interface only; no vtable body to read here */
+  int dispatch_session_command(int cmd, const uint8_t *buf, size_t len) {
+      struct Session *s = make_session();   /* factory: imported, returns a Session * */
+      return s->send(buf, len);             /* [*s + 0x18](buf, len) */
+  }
+  ```
+
+  ```c
+  /* providers.so — the concrete classes, each with its own vtable */
+  struct UsbSession : Session { int send(const uint8_t *, size_t); };
+  struct NetSession : Session { int send(const uint8_t *, size_t); };
+  ```
+
+  ```bash
+  bn evidence virtual-call --at 0x4012a0 --providers providers.so
+  # virtual call @ 0x4012a0 in dispatch_session_command: vtable slot 0x18 (index 3), object from make_session
+  #   AMBIGUOUS: 2 provider classes implement slot 0x18
+  #   UsbSession  ->  UsbSession::send(unsigned char const*, unsigned long) @ 0x402a10   [providers.so vtable 0x500120 @ 0x500148]
+  #   NetSession  ->  NetSession::send(unsigned char const*, unsigned long) @ 0x402c40   [providers.so vtable 0x5001a0 @ 0x5001c8]
+  ```
+
+  The same read in JSON (each candidate's `vtable_entry` is `vtable + 2 pointer-words of Itanium header + index * pointer size`):
+
+  ```json
+  {"kind": "virtual_call", "callsite": "0x4012a0", "caller": "dispatch_session_command",
+   "factory": "make_session", "slot_offset": "0x18", "slot_index": 3,
+   "candidates": [
+     {"provider": "providers.so", "class": "UsbSession", "vtable": "0x500120",
+      "vtable_entry": "0x500148",
+      "method": "UsbSession::send(unsigned char const*, unsigned long)",
+      "method_address": "0x402a10"},
+     {"provider": "providers.so", "class": "NetSession", "vtable": "0x5001a0",
+      "vtable_entry": "0x5001c8",
+      "method": "NetSession::send(unsigned char const*, unsigned long)",
+      "method_address": "0x402c40"}],
+   "ambiguous": true, "resolved": false}
+  ```
+
+  With one implementing class the same read returns `resolved: true` and a single candidate; confirm either target with `bn xrefs <method_address>` on the provider before you commit to it.
 - `bn trace <fn> <addr> [--arg N] [--interprocedural]` walks **MLIL SSA use-def chains backward** from a call-site argument to trace where it originates. It shows each intermediate SSA variable with its defining instruction and address, terminating at a function parameter, global, memory load, or call boundary. A value that bottoms out at a local whose address was passed into an earlier call in the same function is reported as `out_param_not_followed` (or `interprocedural_out_param_not_followed` under `--interprocedural`), naming the filling callee, rather than the misleading `undefined_or_global`. Add `--interprocedural` (with `--ip-depth N`, default 2) to follow **return values** across call boundaries into callee functions when the callee has a real MLIL body — this works best for self-contained code (static binaries, kernel modules). IP mode follows a value into a callee only when it is that callee's return value, and stops at the callee's own parameters (it does not map callee params back to caller args, nor walk up the caller chain — step up with `bn xrefs` + re-run for those). **Out-pointer / output-parameter writes are not followed**: when a value is loaded from a local that an earlier call filled by-address (`parse(input, &out); use(out.len)`), the slice reports `interprocedural_out_param_not_followed` and names the callee that received the out-pointer, rather than tracing into the callee or silently bottoming out at the local — so the stop is not mistaken for proof of origin (#416). For dynamically-linked PLT/import calls, `--interprocedural` correctly falls through (no callee body to enter), producing identical output to intraprocedural mode. JSON output includes `interprocedural` and `ip_depth` fields. Example:
   ```bash
   bn trace main 0x27e1a --arg 1                              # intra: stops at call boundary
@@ -169,6 +213,8 @@ bn callsites crt_rand --within-file /tmp/rng-functions.txt --format json
 `--within-file` accepts one identifier (name or hex address) per non-empty line; lines beginning with `#` are ignored.
 
 `hlil_statement` is intentionally local-or-null — when Binary Ninja only exposes a coarse enclosing region, expect `null` instead of a noisy whole-function blob. `pre_branch_condition` is the nearest enclosing pre-call HLIL condition when it can be recovered confidently; `null` is normal.
+
+When `hlil_statement` is null, the row also carries **`decompile_excerpt`** (a JSON row field; text mode still prints the reason only): a bounded window of the caller's own decompilation around `call_addr`, so a null statement never costs a second command to read the callsite in context. It is `{window: 3, anchor_address, lines}` — up to 7 lines. `anchor_address` is the line matched to the callsite by **exact address**; when no rendered line carries that address, the window falls back to the numerically nearest line that carries one, **excluding the function-entry address** (a real render is in control-flow order and puts the function start on the closing brace, which must never be read as the callsite). When no line can be attributed to the callsite at all, `anchor_address` is absent and `reason: "statement_not_located"` says so instead of pointing at the function's tail. Each line is capped at 240 characters with a `... [+N chars]` marker, and `truncated_lines` counts the capped ones, so a 7-line window cannot become the whole-function blob `hlil_statement` refuses to emit; `reason: "decompile_text_unavailable"` with empty `lines` means the body could not be rendered. The excerpt is a presentation of the callsite, not a second localization: `hlil_statement` stays null and `hlil_statement_reason` still says why.
 
 The row set is unioned from the LLIL destination **and** the code-ref DB (what `xrefs` reads), so a call the xrefs/dataflow evidence confirms is never dropped for want of a matching LLIL operand. A call whose address the function's structured disassembly walk never decoded keeps its row with its identity fields (`call_addr`, `callee`, `containing_function`, `caller_static`) intact, a `null` `call_instruction` with empty `previous_instructions`/`next_instructions`, and `disasm_context_reason: "no_structured_disasm_entry"` saying why the context is missing — so a hole is never mistaken for "not called". Caller **enumeration** closes the same gap: for an imported callee BN recorded no code ref for, the caller set comes from the same bounded LLIL call scan `xrefs` uses (#622), so `callsites` never reports fewer sites than `xrefs` for the same callee. A scan that hits its budget, or LLIL it could not read, is disclosed rather than reported as a count: `caller_scan_truncated: true` with `caller_scan_note` naming which happened, `total: null` plus `total_lower_bound`, `caller_total: null` (how many callers exist is what the capped scan was still deciding — `callers_scanned` still reports how many it examined), and text mode printing the reason — an incomplete caller list never reads as "not called".
 

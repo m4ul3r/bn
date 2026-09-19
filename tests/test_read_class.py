@@ -964,9 +964,19 @@ def test_size_from_operator_new_when_no_type():
     assert out["at"] == "0x443abc"
 
 
-def test_size_none_when_nothing_resolves():
+def test_size_unavailable_reports_source_and_stub_reason_817():
+    """#817: when neither the BN-type width nor the ctor-new path yields a size,
+    `class show` used to drop a bare `size: null` -- indistinguishable from a
+    search that tried every path and found nothing. The ctor-new path is in fact
+    unimplemented (the seam hook returns None unconditionally), so the record now
+    carries `source: "unavailable"` plus the reason, and the earlier bare-None
+    contract this test used to pin is gone."""
     rec = {"name": "net::Session", "methods": []}
-    assert read_class._object_size(_SizeCtx(), object(), rec) is None
+    assert read_class._object_size(_SizeCtx(), object(), rec) == {
+        "value": None,
+        "source": "unavailable",
+        "reason": "operator_new_recovery_unimplemented",
+    }
 
 
 def test_size_survives_find_type_raising():

@@ -54,6 +54,47 @@ def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
     assert result["total"] == 1
 
 
+def test_xrefs_raw_address_reads_the_ref_lists_once_815(monkeypatch):
+    """#815: the raw-address path probed both ref lists for emptiness and then the
+    builder re-read them for the response, so a high-fan-in symbol's ref set was
+    materialised twice per call. The #374 mapped-address guard now runs on the
+    lists the builder already read, so each list is read exactly once."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401010, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x402000: [_FakeCodeRef(0x401010, caller)]},
+        data_refs={0x402000: [0x401100]},
+        sections={".rodata": _FakeSection(".rodata", 0x402000, 0x403000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    code_reads: list[int] = []
+    data_reads: list[int] = []
+    real_code_refs = bv.get_code_refs
+    real_data_refs = bv.get_data_refs
+
+    def counting_code_refs(address):
+        code_reads.append(int(address))
+        return real_code_refs(address)
+
+    def counting_data_refs(address):
+        data_reads.append(int(address))
+        return real_data_refs(address)
+
+    bv.get_code_refs = counting_code_refs
+    bv.get_data_refs = counting_data_refs
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "0x402000")
+
+    # The answer itself is unchanged...
+    assert result["code_ref_count"] == 1 and result["data_ref_count"] == 1
+    # ...and each ref list was read ONCE (twice before the fix, for code).
+    assert code_reads == [0x402000], code_reads
+    assert data_reads == [0x402000], data_reads
+
+
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
     """A MAPPED address with zero refs must remain a clean total:0 result -- only
     the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
