@@ -4806,3 +4806,102 @@ def test_preview_data_tag_and_tag_type_revert_restore_view_state_782(monkeypatch
     assert result["rolled_back"] is True
     assert sorted(bv.tag_types) == ["Bug", "Scratch"]
 
+
+# --- #675 item 15: a doomed batch must say what it never attempted ---------
+
+
+def test_a_failed_batch_returns_a_row_for_every_submitted_op_675(monkeypatch):
+    """#675 item 15, driven through `_mutation` -- the path production uses.
+
+    The first cut of this test called `_unattempted_results` directly and
+    stayed GREEN with the wiring removed: the right logic through the wrong
+    entry point, which is the form that had just been named against a sibling
+    fix. The helper is not the contract; the batch response is.
+
+    The failure path returned rows only up to and including the op that
+    failed, so a 3-op batch whose first op failed answered with ONE row -- and
+    the response could not express "not attempted". A consumer diffing the
+    manifest against the results reads the missing ops as absent from the
+    REQUEST; a consumer counting reads 1 where it submitted 3.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "Symbol not found: GONE",
+                                          requested={})
+        return {"op": op.get("op"), "status": "applied", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely",
+                        lambda ctx, bv_, state: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: True)
+
+    ops = [{"op": "boom"},
+           {"op": "set_comment", "address": "0x1000", "comment": "a"},
+           {"op": "set_comment", "address": "0x2000", "comment": "b"}]
+    result = instance._mutation("active", False, ops)
+
+    rows = result["results"]
+    assert len(rows) == len(ops), "one row per SUBMITTED op, or the count lies"
+    assert rows[0]["status"] == "unsupported"
+    assert [r["status"] for r in rows[1:]] == ["not_attempted", "not_attempted"]
+    for row, op in zip(rows[1:], ops[1:]):
+        assert "never ran" in row["message"]
+        assert row["requested"]["address"] == op["address"]
+
+
+def test_the_unattempted_helper_shape_675():
+    """#675 item 15: the failure path returned rows only up to and including
+    the op that failed, so a 3-op batch whose first op failed answered with
+    ONE row.
+
+    The response then could not express "not attempted": a consumer diffing
+    the manifest against the results reads the missing ops as absent from the
+    REQUEST, and a consumer counting reads 1 where it submitted 3. Unlike the
+    renderer cases in this family it is not a wording problem -- no field
+    carried the fact at all.
+    """
+    from bn_agent_bridge import mutation_engine as me
+    ops = [
+        {"op": "rename_symbol", "identifier": "GONE", "new_name": "x"},
+        {"op": "set_comment", "address": "0x1000", "comment": "a"},
+        {"op": "set_comment", "address": "0x2000", "comment": "b"},
+    ]
+    rows = me._unattempted_results(None, ops[1:])
+
+    assert len(rows) == 2
+    for row, op in zip(rows, ops[1:]):
+        assert row["status"] == "not_attempted"
+        assert row["op"] == op["op"]
+        assert "never ran" in row["message"]
+        # The row echoes its own request, so the reconciliation holds without
+        # the consumer re-reading the manifest it sent.
+        assert row["requested"]["address"] == op["address"]
+
+
+def test_not_attempted_is_not_a_failure_status_675():
+    """THE property that keeps the fix from making things worse: these ops did
+    not fail, they never ran. Stamping them as failures would turn one bad op
+    into N, inflate the failure count a control loop reads, and change nothing
+    about what actually went wrong.
+
+    Pinned against the shared status set rather than a literal, so a future
+    edit that adds `not_attempted` to the failure set fails here.
+    """
+    from bn.formatters import FAILED_MUTATION_STATUSES
+    assert "not_attempted" not in FAILED_MUTATION_STATUSES
+    # `reverted` is the existing precedent for an honest non-failure status on
+    # a doomed batch (#118); the new one sits beside it.
+    assert "reverted" not in FAILED_MUTATION_STATUSES
+
+
+def test_a_batch_that_reaches_every_op_grows_no_unattempted_rows_675():
+    """Must-not-fire twin: nothing is unattempted when nothing failed, so an
+    ordinary batch's result set is unchanged -- the helper returns no rows for
+    an empty remainder, which is the case every successful batch hits."""
+    from bn_agent_bridge import mutation_engine as me
+    assert me._unattempted_results(None, []) == []

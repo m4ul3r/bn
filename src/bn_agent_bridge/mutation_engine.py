@@ -689,6 +689,43 @@ def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) ->
 
 
 
+def _unattempted_results(ctx, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A row per op the batch never reached, after a sibling op failed (#675
+    item 15).
+
+    The failure path used to return rows only up to and including the op that
+    failed, so a two-op batch whose first op failed answered with ONE row. The
+    response then could not express "not attempted": a consumer diffing the
+    manifest against the results reads the missing op as absent from the
+    request, and a consumer counting reads 1 where it submitted 2. That is the
+    absence-versus-silence shape, in the batch envelope rather than a renderer
+    -- and unlike the rendering cases it is not a wording problem, because
+    there was no field carrying the fact at all.
+
+    `not_attempted` is deliberately NOT in `FAILED_MUTATION_STATUSES`: these
+    ops did not fail, they never ran, and stamping them as failures would turn
+    one bad op into N and inflate the failure count a control loop reads. It
+    sits beside `reverted` (#118) as the other honest non-failure status a
+    doomed batch produces.
+
+    Each row echoes its `requested` op, so the reconciliation a consumer needs
+    -- one row per submitted op, in submission order -- holds without the
+    consumer having to re-read the manifest it sent.
+    """
+    rows: list[dict[str, Any]] = []
+    for op in operations:
+        rows.append({
+            "op": str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>",
+            "status": "not_attempted",
+            "message": (
+                "not attempted: an earlier operation in this batch failed and the "
+                "batch was rolled back, so this operation never ran"
+            ),
+            "requested": _operation_requested(ctx, op),
+        })
+    return rows
+
+
 def _mark_unverified_results(
     ctx, results: list[dict[str, Any]], message: str, status: str = "reverted"
 ) -> list[dict[str, Any]]:
@@ -2300,7 +2337,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "rolled_back": reverted,
                 "message": message,
                 "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
-                + [_operation_failure_result(ctx, operations[len(results)], exc)],
+                + [_operation_failure_result(ctx, operations[len(results)], exc)]
+                + _unattempted_results(ctx, operations[len(results) + 1:]),
                 "affected_functions": [],
                 "affected_types": [],
                 "affected_summary": {
