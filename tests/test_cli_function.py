@@ -3037,3 +3037,129 @@ def test_disasm_lines_is_not_claimed_to_be_text_only_675(fake_transport):
 
     assert rc == 0
     assert calls[-1]["op"] == "disasm"
+
+
+# ---------------------------------------------------------------------------
+# #676 item 5: `bn decompile f1 f2 f3` -- several functions, one round trip
+# ---------------------------------------------------------------------------
+
+
+def _decompile_run(monkeypatch, argv, rows=None, requested=None, resolved=None):
+    """Run *argv*, returning (exit_code, ops_sent, params_sent)."""
+    import bn.cli
+
+    ops: list[str] = []
+    params: list[dict] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kw):
+        ops.append(op)
+        params.append(dict(params or {})) if False else None
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "t.bin"}]}
+        if op == "decompile_batch":
+            body = rows if rows is not None else [
+                {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void){}"}},
+            ]
+            return {"ok": True, "result": {
+                "kind": "decompile_batch",
+                "requested": requested if requested is not None else len(body),
+                "resolved": resolved if resolved is not None else sum(1 for r in body if r["ok"]),
+                "functions": body,
+            }}
+        return {"ok": True, "result": {"text": "int a(void){}"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    code = bn.cli.main(argv)
+    return code, ops
+
+
+def test_several_identifiers_cost_exactly_one_bridge_request(monkeypatch):
+    """The point of the feature, and the thing a bash for-loop cannot do.
+
+    Three functions through a shell loop is three process spawns, three
+    connects and three lock acquisitions. If this sent one request per
+    identifier it would be a nicer-looking loop with the same cost, so the
+    request COUNT is the acceptance, not the output shape.
+    """
+    code, ops = _decompile_run(
+        monkeypatch, ["decompile", "a", "b", "c"],
+        rows=[{"identifier": n, "ok": True, "decompiled": {"text": f"int {n}(void)"}}
+              for n in ("a", "b", "c")],
+    )
+    assert code == 0
+    assert ops.count("decompile_batch") == 1
+    assert "decompile" not in ops
+
+
+def test_one_identifier_keeps_the_singular_op_and_shape(monkeypatch):
+    """`n=1` is NOT the batch with one row.
+
+    Every existing caller, renderer and test reads `text` off the top level of
+    a decompile reply. Routing the common case through the batch envelope to
+    make the shape uniform would break all of them for a tidiness nobody asked
+    for, so the singular path must stay singular.
+    """
+    code, ops = _decompile_run(monkeypatch, ["decompile", "a"])
+    assert code == 0
+    assert "decompile" in ops
+    assert "decompile_batch" not in ops
+
+
+def test_a_miss_keeps_its_slot_and_the_siblings_that_resolved(monkeypatch, capsys):
+    """A typo in the third name must not discard the two that worked.
+
+    That is the entire reason to batch rather than loop: the caller already
+    paid the analysis cost for the functions that resolved, and a shell loop
+    with `set -e` throws them away. The failed row renders IN PLACE, in the
+    order asked for -- a miss that only appeared in a trailing tally would
+    read as if that function had been skipped rather than attempted.
+    """
+    code, _ = _decompile_run(
+        monkeypatch, ["decompile", "a", "b", "nope"],
+        rows=[
+            {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void)"}},
+            {"identifier": "b", "ok": True, "decompiled": {"text": "int b(void)"}},
+            {"identifier": "nope", "ok": False, "error": "Function not found: nope"},
+        ],
+    )
+    out = capsys.readouterr().out
+    assert "int a(void)" in out and "int b(void)" in out
+    assert "Function not found: nope" in out
+    assert out.index("int b(void)") < out.index("Function not found: nope")
+    assert "2 of 3 resolved" in out
+
+
+def test_a_named_identifier_that_misses_fails_the_run(monkeypatch):
+    """Exit 2, deliberately UNLIKE the `--all-*` fan-out's any-success rule.
+
+    Fan-out surveys a population where a target legitimately lacks the thing
+    asked for. Here every identifier was NAMED by the caller, so one that does
+    not resolve is a mistake in the request -- and a zero exit would hide a
+    typo behind the functions that happened to work.
+    """
+    code, _ = _decompile_run(
+        monkeypatch, ["decompile", "a", "nope"],
+        rows=[
+            {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void)"}},
+            {"identifier": "nope", "ok": False, "error": "Function not found: nope"},
+        ],
+    )
+    assert code == 2
+
+
+def test_an_unreadable_tally_states_itself_rather_than_inventing_a_number(monkeypatch, capsys):
+    """`resolved` in a shape no count reads out of must print `?`, not a
+    plausible total derived from the rows this renderer can see.
+
+    "2 of 2 resolved" computed locally would read byte-identically to a
+    genuine full success while the bridge's own counter was unreadable, which
+    is the #683 fabricated-zero harm wearing a different number.
+    """
+    _decompile_run(
+        monkeypatch, ["decompile", "a", "b"],
+        rows=[{"identifier": n, "ok": True, "decompiled": {"text": f"int {n}(void)"}}
+              for n in ("a", "b")],
+        resolved={"unreadable": True},
+    )
+    assert "? of 2 resolved" in capsys.readouterr().out

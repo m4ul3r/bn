@@ -425,12 +425,28 @@ def _target_option(
         "help": (
             "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id); "
             "omit only when exactly one target is open, or use `active` to follow the GUI-selected target explicitly "
-            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all)"
+            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all) "
+            "(env: BN_TARGET)"
         ),
         "required": required,
     }
     if not is_root:
         kwargs["default"] = argparse.SUPPRESS
+    elif not required:
+        # The target half of the per-shell story `-i` already has (#676 item
+        # 11). Fan-out costs `-i` AND `-t` on every command because the sticky
+        # pin in ~/.cache is shared by every shell on the machine -- two agents
+        # in one project clobber each other's target, which is why the skill
+        # tells agents not to use it. An environment variable is per-process-
+        # tree by construction: each agent exports its own, and neither can
+        # see, let alone overwrite, the other's.
+        #
+        # Only when the flag is not `required`: a command that DEMANDS an
+        # explicit target (destructive `close`, whose refusal names `--all`)
+        # must keep demanding one. An exported default is precisely the
+        # ambient selector those refusals exist to prevent, so honouring it
+        # there would reintroduce the hazard through the other door.
+        kwargs["default"] = os.environ.get("BN_TARGET")
     parser.add_argument("-t", "--target", **kwargs)
 
 

@@ -3200,6 +3200,9 @@ class BinaryNinjaBridge:
     def _decompile(self, *a, **k):
         return read_decompile._decompile(self.ctx, *a, **k)
 
+    def _decompile_batch(self, *a, **k):
+        return read_decompile._decompile_batch(self.ctx, *a, **k)
+
     def _function_info(self, *a, **k):
         return read_decompile._function_info(self.ctx, *a, **k)
 
@@ -4288,6 +4291,25 @@ def _bind_decompile(bridge, params, target):
     return bridge._decompile(
         target,
         params["identifier"],
+        addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
+        force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
+        include_annotations=_validate_bool(
+            params.get("include_annotations"),
+            label="include_annotations",
+            default=False,
+        ),
+    )
+
+
+@op("decompile_batch", lock="read",
+    escalation=lambda p: _validate_bool(p.get("force_analysis"), label="force_analysis", default=False))
+def _bind_decompile_batch(bridge, params, target):
+    identifiers = params.get("identifiers")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise BridgeError("decompile_batch requires a non-empty `identifiers` list")
+    return bridge._decompile_batch(
+        target,
+        identifiers,
         addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
         force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
         include_annotations=_validate_bool(

@@ -204,6 +204,56 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
 
 
 
+def _decompile_batch(
+    ctx,
+    selector: str | None,
+    identifiers,
+    *,
+    addresses: bool = False,
+    force_analysis: bool = False,
+    include_annotations: bool = False,
+):
+    """Decompile several functions in ONE round trip (#676 item 5).
+
+    The pain this removes is not typing: every agent that needed three
+    functions wrote a bash `for` loop, which pays bridge round-trip latency
+    per function and -- the part that actually costs -- turns one readable
+    output into N shell invocations whose failures are N separate exit codes
+    nobody aggregates.
+
+    An identifier that does not resolve becomes a FAILED ROW, not an abort.
+    That is the whole reason to batch: a typo in the third name must not
+    discard the two functions that did resolve, because the caller already
+    paid the analysis cost for them. The row carries the error text so the
+    miss is visible per-identifier rather than as one collapsed failure.
+    """
+    rows: list[dict[str, Any]] = []
+    for identifier in identifiers:
+        try:
+            rows.append({
+                "identifier": identifier,
+                "ok": True,
+                "decompiled": _decompile(
+                    ctx, selector, identifier,
+                    addresses=addresses,
+                    force_analysis=force_analysis,
+                    include_annotations=include_annotations,
+                ),
+            })
+        except Exception as exc:  # noqa: BLE001 - one miss must not sink the batch
+            rows.append({
+                "identifier": identifier,
+                "ok": False,
+                "error": str(exc) or exc.__class__.__name__,
+            })
+    return {
+        "kind": "decompile_batch",
+        "requested": len(rows),
+        "resolved": sum(1 for row in rows if row["ok"]),
+        "functions": rows,
+    }
+
+
 def _decompile(
     ctx,
     selector: str | None,

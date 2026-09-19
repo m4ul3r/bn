@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
 from ..formatters import (
@@ -35,6 +35,10 @@ from ..formatters import (
     _text_field,
     _xref_buckets,
     _group_refs_by_caller,
+    _field_list,
+    _render_fallback_text,
+    _stated_count,
+    _text_value,
 )
 from ..transport import BridgeError
 
@@ -293,9 +297,84 @@ def _reject_text_mode_offset(args: argparse.Namespace, stem: str) -> None:
 
 
 
+def _decompile_many(
+    args: argparse.Namespace,
+    identifiers: list[str],
+    shared: dict[str, Any],
+    render_one: Callable[[Any], str],
+) -> int:
+    """`bn decompile f1 f2 f3` -- several functions, ONE round trip (#676 item 5).
+
+    Exit code differs deliberately from the `--all-*` fan-out, which returns 0
+    when ANY instance answered. Fan-out surveys a population where a target
+    legitimately lacks the thing being asked for; here every identifier was
+    NAMED by the caller, so one that does not resolve is a mistake in the
+    request, and reporting success would hide a typo behind two functions that
+    happened to work.
+    """
+    def _render_batch_text(value: Any) -> str:
+        if not isinstance(value, dict):
+            return _render_fallback_text(value)
+        # An EXPLICIT boundary, because this renderer is a closure in a command
+        # module rather than a decorated `formatters` entry point: `_record_skew`
+        # is a no-op with nothing on the stack, so without this the tally's
+        # `_stated_count` cannot see an unreadable counter and prints a
+        # confident `0` -- the #683 fabricated zero, restated.
+        with disclosure_boundary():
+            return _render_batch_body(value)
+
+    def _render_batch_body(value: dict) -> str:
+        rows = _field_list(value, "functions")
+        if rows is None:
+            return _render_fallback_text(value)
+        chunks: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                chunks.append(_render_fallback_text(row))
+                continue
+            name = _text_value(row, "identifier") or "<unnamed>"
+            if row.get("ok"):
+                chunks.append(f"===== {name} =====\n{render_one(row.get('decompiled'))}")
+            else:
+                # A failed row is rendered IN PLACE, not summarised at the end:
+                # the caller asked for these in order, and a miss that only
+                # appears in a trailing tally reads as if that function had
+                # been skipped rather than attempted.
+                reason = _text_value(row, "error") or "did not resolve"
+                chunks.append(f"===== {name} =====\nerror: {reason}")
+        # Stated, not derived from len(chunks): the tally is a headline a
+        # caller acts on, so an unreadable counter must print `?` rather than
+        # a plausible number this renderer invented (#683).
+        resolved = _stated_count(value, "resolved")
+        requested = _stated_count(value, "requested")
+        return "\n\n".join(chunks) + f"\n\n{resolved} of {requested} resolved"
+
+    def _batch_exit_code(value: Any) -> int:
+        if not isinstance(value, dict):
+            return 2
+        rows = _field_list(value, "functions")
+        if rows is None:
+            return 2
+        return 0 if all(isinstance(r, dict) and r.get("ok") for r in rows) else 2
+
+    return _call(
+        args,
+        "decompile_batch",
+        {"identifiers": identifiers, **shared},
+        require_target=True,
+        text_renderer=_render_batch_text,
+        result_exit_code=_batch_exit_code,
+        stem="decompile-batch",
+    )
+
+
 @command("decompile", help="Render Binary Ninja Pseudo C for a function", target=True,
          args=[
-             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("identifier", nargs="+", metavar="IDENTIFIER",
+                 help="Function name or entry address (hex 0x.. or decimal). "
+                      "Several may be given: each is decompiled in one "
+                      "round trip, and one that does not resolve becomes a "
+                      "failed row rather than aborting the rest."),
              arg("--addresses", action="store_true", default=False,
                  help="Show address prefixes on each line"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
@@ -326,19 +405,27 @@ def _decompile(args: argparse.Namespace) -> int:
         # False here, so it cannot carry this.
         return _quick_partial_prefix(value, "decompile") + _resolution_note(value) + text
 
-    return _call(
-        args,
-        "decompile",
-        {
-            "identifier": args.identifier,
-            "addresses": args.addresses,
-            "force_analysis": args.force_analysis,
-            "include_annotations": bool(args.include_annotations),
-        },
-        require_target=True,
-        text_renderer=_render_decompile_text,
-        stem="decompile",
-    )
+    identifiers = list(args.identifier)
+    shared = {
+        "addresses": args.addresses,
+        "force_analysis": args.force_analysis,
+        "include_annotations": bool(args.include_annotations),
+    }
+    if len(identifiers) == 1:
+        # ONE identifier keeps the exact single-function shape it has always
+        # had. The batch envelope is not "the general case with n=1": every
+        # existing caller, renderer and test reads `text` off the top level,
+        # and wrapping the common case to make the rare one uniform would
+        # break all of them to tidy a shape nobody asked to be uniform.
+        return _call(
+            args,
+            "decompile",
+            {"identifier": identifiers[0], **shared},
+            require_target=True,
+            text_renderer=_render_decompile_text,
+            stem="decompile",
+        )
+    return _decompile_many(args, identifiers, shared, _render_decompile_text)
 
 
 @command("il", help="Dump IL for a function", target=True,

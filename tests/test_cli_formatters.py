@@ -1909,6 +1909,21 @@ _PROBE_EXCLUSIONS = {
         "takes its page key and its item renderer as REQUIRED parameters, so the "
         "field it reads is an argument rather than a property of the module, and "
         "every caller reaches it through a renderer that is itself probed"),
+    "_stated_count": (
+        "takes-more-than-a-payload",
+        "takes the payload AND the key as required parameters, so the field it "
+        "reads is an argument rather than a property of the module. It returns "
+        "the count as a STRING for a caller's own headline, or `?` when the key "
+        "was present in a shape no count reads out of -- the fabricated-zero "
+        "case is STATED by the return value, so a caller cannot splice a "
+        "plausible number it never read"),
+    "_text_value": (
+        "takes-more-than-a-payload",
+        "payload AND key are both required, same as its `_field_list` / "
+        "`_field_dict` siblings. It is the accessor the #619 invariant tells "
+        "renderers to use INSTEAD of an inline shape test, so excluding it is "
+        "not a hole: the guard that matters fires on the renderer calling it, "
+        "which is itself probed"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
