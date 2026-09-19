@@ -892,10 +892,16 @@ def _type_is_signed(type_) -> bool:
 
 
 def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
-    """One typed data variable as a compact row: `a`ddress, symbol `n`ame,
-    `t`ype, `w`idth, plus a decoded scalar `v`alue or -- for a single
-    pointer-sized pointer -- the target `p` (with `ps` symbol or `pstr` ASCII
-    preview) and the containing `sec`tion."""
+    """One typed data variable as a row: `address`, `name` (symbol), `type`,
+    `width`, plus a decoded scalar `value` or -- for a single pointer-sized
+    pointer -- the `pointer` target (with `pointer_symbol`, or the
+    `pointer_string` ASCII preview when the target has no symbol) and the
+    containing `section`.
+
+    Key spelling (#682 item 2): spelled out rather than the old one- and
+    two-letter wire form (`a`/`n`/`t`/`w`/`v`/`p`/`ps`/`pstr`/`sec`), which is
+    opaque to the models that read this JSON without the reference open.
+    """
     addr = int(dv.address)
     type_ = dv.type
     try:
@@ -913,32 +919,32 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
         sym = None
     type_text = str(type_)
     row: dict[str, Any] = {
-        "a": hex(addr),
-        "n": sym.name if sym else "",
-        "t": type_text,
-        "w": width,
+        "address": hex(addr),
+        "name": sym.name if sym else "",
+        "type": type_text,
+        "width": width,
     }
     try:
         secs = bv.get_sections_at(addr)
     except Exception:  # noqa: BLE001 - same: the section is decoration
         secs = None
     if secs:
-        row["sec"] = secs[0].name
+        row["section"] = secs[0].name
     is_pointer = _is_pointer_type(type_, type_text)
     try:
         # Every read below is explicitly signed/unsigned: bv.read_int defaults to
         # sign=True, so leaving it implicit renders unsigned data as negative.
         if is_pointer and width == psz:
-            row["p"] = hex(bv.read_int(addr, psz, sign=False))
-            tsym = bv.get_symbol_at(int(row["p"], 16))
+            row["pointer"] = hex(bv.read_int(addr, psz, sign=False))
+            tsym = bv.get_symbol_at(int(row["pointer"], 16))
             if tsym:
-                row["ps"] = tsym.name
+                row["pointer_symbol"] = tsym.name
             else:
-                preview = bv.get_ascii_string_at(int(row["p"], 16), 4)
+                preview = bv.get_ascii_string_at(int(row["pointer"], 16), 4)
                 if preview:
-                    row["pstr"] = preview.value[:48]
+                    row["pointer_string"] = preview.value[:48]
         elif not is_pointer and 0 < width <= 8 and _is_scalar_type(type_, type_text):
-            row["v"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
+            row["value"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
     except Exception:
         pass  # unmapped slot: the row still lists the var, just undecorated
     return row
@@ -986,15 +992,23 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     """Every *named* DataSymbol as address + name -- includes internal symbols
     the exports list omits, so a renamed data global stays addressable.
 
-    Paging is OPT-IN: `limit=None` returns the whole set, because the primary
-    consumer builds a goto/search index over every data global in one call and
-    a silent default cap would drop exactly the renamed globals this read
-    exists to keep addressable. `offset`/`limit` are there so an oversized
-    view can still be walked in bounded pages, and the envelope reports the
-    true `total` either way.
+    Paging is OPT-IN at this op, on purpose and permanently: `limit=None`
+    returns the whole set, because a programmatic caller (the out-of-tree lens
+    builds a goto/search index over every data global in one call) must not be
+    silently truncated by a default cap -- that would drop exactly the renamed
+    globals this read exists to keep addressable. The bounded default lives one
+    layer up, on the `bn data symbols` CLI (#682 item 1), which asks for a
+    100-row page through `_effective_limit` and uncaps for `--out`; a direct
+    bridge caller pages explicitly with `offset`/`limit`. An OVERSIZED page is
+    not an error: the window clamps to the population, so `limit` > total
+    returns the whole set and an `offset` past the end returns an empty page
+    with the true `total` still visible (#682 item 4).
 
-    The container stays `syms` (not the `items` of the paged list ops) because
-    it is an established client contract; the paging metadata is additive.
+    Rows are built for the returned WINDOW only (#682 item 1): a page no longer
+    constructs a dict and serializes it for every symbol in the view. The
+    population still has to be scanned for the honest `total` -- BN hands back
+    the symbol list in one call and there is no count-only API -- so the
+    remaining in-lock cost on the page path is that scan, not the build.
     """
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1009,15 +1023,19 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     # flattened into an empty list, making a real BN error indistinguishable
     # from "this binary has no data symbols" -- the silent-empty failure mode.
     symbols = bv.get_symbols_of_type(sym_type)
+    named = [sym for sym in symbols if getattr(sym, "name", "")]
+    start, stop = _page_window(len(named), offset=offset, limit=limit)
     syms = [
-        {"a": hex(int(sym.address)), "n": sym.name}
-        for sym in symbols
-        if getattr(sym, "name", "")
+        # `a`/`n` stay terse on purpose: #682 item 2 names the `cfg` line/edge
+        # keys and the `data vars` row keys, and this row pair is a separate,
+        # older contract the out-of-tree lens decodes by name.
+        {"a": hex(int(sym.address)), "n": sym.name} for sym in named[start:stop]
     ]
     # #275: `items` is the universal data container and `kind` the discriminator.
     # This used to hand-roll a byte-identical envelope under the name `syms`,
     # which every generic consumer (and the paging footer) has to special-case.
-    return _paged_list_result(syms, offset=offset, limit=limit, kind="data_symbols")
+    return _paged_envelope(kind="data_symbols", items=syms, total=len(named),
+                           offset=offset, limit=limit)
 
 
 def _ascii_render(data: bytes) -> str:
