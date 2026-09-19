@@ -204,6 +204,80 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
 
 
 
+# Mnemonics whose value is chosen WITHOUT a branch, which HLIL renders as an
+# ordinary ternary or folds into a compound condition (#676 item 12). The skill
+# documents these as known lies and tells the reader to confirm in `bn disasm`;
+# a note in the output reaches the reader who did not read the skill, which is
+# every reader at the moment they are wrong.
+#
+# Keyed on the MNEMONIC, not the architecture, and that is the whole reason
+# this is cheap where the return-width note (#675 item 5) needed a measured
+# arch set: the instruction IS the evidence. `csel` in a listing means a
+# selected value in THIS function, whatever the target is, so there is no
+# per-arch fact to inherit wrongly.
+_FLATTENED_GUARD_MNEMONICS = {
+    # AArch64: conditional compare (chains a second test into the flags, which
+    # HLIL merges into one `&&`/`||`) and conditional select.
+    "ccmp", "ccmn", "csel", "csinc", "csinv", "csneg", "cset", "csetm",
+    # x86: the same lie with a different name.
+    "cmova", "cmovae", "cmovb", "cmovbe", "cmovc", "cmove", "cmovg", "cmovge",
+    "cmovl", "cmovle", "cmovna", "cmovnae", "cmovnb", "cmovnbe", "cmovnc",
+    "cmovne", "cmovng", "cmovnge", "cmovnl", "cmovnle", "cmovno", "cmovnp",
+    "cmovns", "cmovnz", "cmovo", "cmovp", "cmovpe", "cmovpo", "cmovs", "cmovz",
+    # ARM32/Thumb: an IT block predicates the instructions that follow it, and
+    # BN's per-instruction mnemonics may not repeat the IT-derived condition.
+    "it", "ite", "itt", "itee", "itet", "itte", "ittt",
+    "iteee", "iteet", "itete", "itett", "ittee", "ittet", "ittte", "itttt",
+}
+
+
+def _flattened_guard_warning(bv, func) -> str | None:
+    """Name the branch-free selects in *func*, or say nothing (#676 item 12).
+
+    The harm is specific and has faked critical findings: HLIL flattens a
+    `ccmp`/`csel` range guard into a ternary, so a bound that IS enforced can
+    read as one that never fires (or the reverse). The reader cannot see that
+    from the Pseudo-C -- by construction, since the flattening is what removed
+    the evidence -- so the disclosure has to come from the listing underneath.
+
+    This states ONLY what was observed: the mnemonics actually present, by
+    name. The skill's other two documented lies -- a hoisted loop-invariant
+    bound aliased to a moving pointer, and a dropped `<< 4` in a size
+    accumulator -- are SEMANTIC properties with no mnemonic to key on, so
+    nothing is claimed about them here. A note that implied this function had
+    been checked for those would be worse than no note.
+    """
+    try:
+        arch = getattr(func, "arch", None)
+        seen: list[str] = []
+        for block in list(func.basic_blocks):
+            addr = int(block.start)
+            end = int(block.end)
+            while addr < end:
+                text, length = il_format._disasm_instruction(bv, addr, arch=arch)
+                if not length or length <= 0:
+                    break
+                if text:
+                    mnemonic = str(text).split(None, 1)[0].strip().lower()
+                    if mnemonic in _FLATTENED_GUARD_MNEMONICS and mnemonic not in seen:
+                        seen.append(mnemonic)
+                addr += length
+        if not seen:
+            return None
+    except Exception:  # noqa: BLE001 - no listing is not evidence of no select
+        return None
+    names = ", ".join(sorted(seen))
+    return (
+        f"branch-free conditional(s) in this function ({names}): Pseudo-C "
+        f"renders these as ternaries, folds them into one compound condition, "
+        f"or decomposes them into raw flag arithmetic (`v`/`z`/`n` locals) -- "
+        f"a two-sided range guard can come out as none of the three shapes a "
+        f"reader is looking for, so a bound that IS enforced can read as one "
+        f"that never fires. Confirm it in `bn disasm` before concluding on an "
+        f"off-by-one, truncation or missing check."
+    )
+
+
 def _decompile_batch(
     ctx,
     selector: str | None,
@@ -288,6 +362,9 @@ def _decompile(
         data_warn = _forced_data_region_warning(bv, func)
         if data_warn:
             warnings.append(data_warn)
+    guard_warn = _flattened_guard_warning(bv, func)
+    if guard_warn:
+        warnings.append(guard_warn)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,

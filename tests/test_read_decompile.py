@@ -3838,3 +3838,117 @@ def test_return_width_note_warns_about_the_second_surface():
     """
     note = _note("x86_64")
     assert "0xffffffff" in note
+
+
+# ---------------------------------------------------------------------------
+# #676 item 12: HLIL trust debt annotated inline, not only in the skill
+# ---------------------------------------------------------------------------
+
+
+class _GuardBlock:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class _GuardFunc:
+    def __init__(self, span=8):
+        self.arch = "probe-arch"
+        self.basic_blocks = [_GuardBlock(0, span)]
+
+
+def _guard_note(monkeypatch, mnemonics, span=None):
+    """Drive the detector over a synthetic 4-byte-per-instruction listing."""
+    from bn_agent_bridge import il_format, read_decompile
+
+    listing = list(mnemonics)
+    monkeypatch.setattr(
+        il_format, "_disasm_instruction",
+        lambda bv, addr, arch=None: (
+            (listing[addr // 4], 4) if addr // 4 < len(listing) else ("", 4)
+        ),
+    )
+    func = _GuardFunc(span if span is not None else 4 * len(listing))
+    return read_decompile._flattened_guard_warning(object(), func)
+
+
+def test_a_branch_free_select_is_named_in_the_output(monkeypatch):
+    """The skill already documents this lie; the note reaches the reader who
+    did not read the skill, which is every reader at the moment they are wrong.
+
+    The mnemonic is NAMED rather than described, because "this function has a
+    flattened guard" sends the reader looking for something they cannot
+    identify in the listing.
+    """
+    note = _guard_note(monkeypatch, ["ccmp x0, x1, #0, ge", "csel x0, x1, x2, lt"])
+    assert note is not None
+    assert "ccmp" in note and "csel" in note
+    assert "bn disasm" in note
+
+
+def test_the_note_is_silent_on_a_function_with_no_select(monkeypatch):
+    """A note on every function is a note nobody reads.
+
+    Selectivity is the feature: the whole point of annotating inline is that
+    its PRESENCE means something, which requires its absence to mean something
+    too.
+    """
+    assert _guard_note(monkeypatch, ["add x0, x1, x2", "ret"]) is None
+
+
+def test_the_same_note_fires_across_architectures_without_an_arch_gate(monkeypatch):
+    """Keyed on the MNEMONIC, not the target -- the instruction IS the evidence.
+
+    This is why item 12 is cheap where the return-width note (#675 item 5)
+    needed a measured arch set: `csel` in a listing means a selected value in
+    THIS function whatever the target is, so there is no per-architecture fact
+    that could be inherited wrongly onto a target that does not have it.
+    """
+    for mnemonic in ("csel x0, x1, x2, lt", "cmovg %eax, %edx", "ite ne"):
+        assert _guard_note(monkeypatch, [mnemonic]) is not None, mnemonic
+
+
+def test_the_note_claims_nothing_about_the_lies_it_cannot_detect(monkeypatch):
+    """The skill documents three HLIL lies; only one has a mnemonic.
+
+    A hoisted loop-invariant bound aliased to a moving pointer, and a dropped
+    `<< 4` in a size accumulator, are SEMANTIC properties with nothing to key
+    on. A note that mentioned them would imply this function had been checked
+    for them, which is worse than no note: it converts an unexamined property
+    into an apparently cleared one.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"])
+    lowered = note.lower()
+    assert "hoist" not in lowered
+    assert "<<" not in note
+    assert "accumulator" not in lowered
+
+
+def test_each_mnemonic_is_named_once_however_often_it_appears(monkeypatch):
+    """A guard that repeats a mnemonic forty times must not print it forty
+    times -- a note long enough to scroll is a note that gets skipped.
+
+    The mechanism is a MEMBERSHIP check while collecting, not the `sorted()`
+    that renders the names: breaking the sort leaves this test green, which
+    cost one wasted sabotage round to discover. Break `mnemonic not in seen`
+    to see this fail.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"] * 40 + ["ccmp x0, x1, #0, ge"])
+    assert note.count("csel") == 1
+    assert note.count("ccmp") == 1
+
+
+def test_an_unreadable_listing_does_not_sink_the_decompile(monkeypatch):
+    """The note is ADDITIVE, so a listing it cannot walk must cost nothing.
+
+    Decompilation succeeding is the caller's actual request; an annotation
+    that could turn a working read into an error would be a worse trade than
+    the annotation is worth.
+    """
+    from bn_agent_bridge import il_format, read_decompile
+
+    def _boom(bv, addr, arch=None):
+        raise RuntimeError("no listing here")
+
+    monkeypatch.setattr(il_format, "_disasm_instruction", _boom)
+    assert read_decompile._flattened_guard_warning(object(), _GuardFunc()) is None
