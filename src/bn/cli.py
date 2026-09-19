@@ -425,12 +425,28 @@ def _target_option(
         "help": (
             "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id); "
             "omit only when exactly one target is open, or use `active` to follow the GUI-selected target explicitly "
-            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all)"
+            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all) "
+            "(env: BN_TARGET)"
         ),
         "required": required,
     }
     if not is_root:
         kwargs["default"] = argparse.SUPPRESS
+    elif not required:
+        # The target half of the per-shell story `-i` already has (#676 item
+        # 11). Fan-out costs `-i` AND `-t` on every command because the sticky
+        # pin in ~/.cache is shared by every shell on the machine -- two agents
+        # in one project clobber each other's target, which is why the skill
+        # tells agents not to use it. An environment variable is per-process-
+        # tree by construction: each agent exports its own, and neither can
+        # see, let alone overwrite, the other's.
+        #
+        # Only when the flag is not `required`: a command that DEMANDS an
+        # explicit target (destructive `close`, whose refusal names `--all`)
+        # must keep demanding one. An exported default is precisely the
+        # ambient selector those refusals exist to prevent, so honouring it
+        # there would reintroduce the hazard through the other door.
+        kwargs["default"] = os.environ.get("BN_TARGET")
     parser.add_argument("-t", "--target", **kwargs)
 
 
@@ -1068,9 +1084,23 @@ _SLICE_VOCABULARY_SET = frozenset(_SLICE_VOCABULARY)
 # group refuses).
 _TEXT_ONLY_SLICE_FLAGS = frozenset({"--lines"})
 
+# The inverse of `_TEXT_ONLY_SLICE_FLAGS`, per command: a flag the parser
+# ACCEPTS but which the handler refuses under `--format text`. #738 made
+# `xrefs`/`evidence xrefs` refuse a text-mode `--offset` -- text groups the
+# FULL result set by caller and `--limit` only caps how many groups print,
+# so an offset cannot move the page. The hint is derived from acceptance,
+# so without this it went on advising `--offset` and, after #738, advised
+# the one thing that now exits 2 (#889c finding 3). Right about acceptance,
+# wrong about effect -- in both directions, before and after the refusal.
+_JSON_ONLY_SLICE_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
+    ("xrefs",): frozenset({"--offset"}),
+    ("evidence", "xrefs"): frozenset({"--offset"}),
+}
+
 
 def _derive_slice_hint(
-    accepted: Iterable[str], text_format: bool, used: Iterable[str] = ()
+    accepted: Iterable[str], text_format: bool, used: Iterable[str] = (),
+    path: tuple[str, ...] = (),
 ) -> str | None:
     """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
 
@@ -1088,6 +1118,10 @@ def _derive_slice_hint(
     a flag-free hint rather than inventing one.
     """
     accepted = set(accepted)
+    # #889c finding 3: drop the flags this command refuses in text mode, so
+    # the hint cannot advise the thing that exits 2.
+    if text_format:
+        accepted -= _JSON_ONLY_SLICE_FLAGS.get(tuple(path), frozenset())
     used = set(used)
 
     def in_order(vocabulary: Iterable[str]) -> list[str]:
@@ -1158,7 +1192,8 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
         # vocabulary order picks which one to name.
         if getattr(args, dest, None) not in (None, False)
     }
-    return _derive_slice_hint(accepted, fmt == "text", used)
+    return _derive_slice_hint(accepted, fmt == "text", used,
+                              tuple(getattr(args, "_command_path", ()) or ()))
 
 
 @lru_cache(maxsize=None)
@@ -1170,7 +1205,7 @@ def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | N
     the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    return _derive_slice_hint(_known_option_strings(sub), text_format)
+    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path)
 
 
 def _spill_next_step_hint(

@@ -824,6 +824,14 @@ def _render_proto_text(value: Any) -> str:
     # BN renders the prototype anonymously (`uint64_t (int32_t arg1)`); splice in
     # the function name so the output is a copy-pasteable C declaration (#222).
     note = _resolution_note(value)
+    # A return width BN inferred from the full register, disclosed rather than
+    # silently trusted (#675 item 5). It trails the declaration so the first
+    # line stays a copy-pasteable C prototype (#222).
+    # Read through `_text_value`, not an inline isinstance: a shape test here
+    # would drop a malformed note and render byte-identically to a payload that
+    # carried none, which is the exact skew #619 made a suite-wide invariant.
+    raw_width_note = _text_value(value, "return_width_note")
+    width_note = f"\n\nnote: {raw_width_note}" if raw_width_note else ""
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -835,8 +843,8 @@ def _render_proto_text(value: Any) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return note + f"{head} {name}({rest}"
-    return note + prototype
+            return note + f"{head} {name}({rest}" + width_note
+    return note + prototype + width_note
 
 
 @_discloses
@@ -4116,6 +4124,13 @@ def _render_cfg_text(value: Any) -> str:
                 parts.append(f"  -> {edge!r}")
                 continue
             parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
+        # #682 item 3, live half: a block BN could not resolve the successors
+        # of emits no edges at all, so without this line it renders exactly
+        # like a block that genuinely has none -- e.g. a `jmp rax` reading as
+        # a dead end. Printed after the edges because a block can have both
+        # known successors and undetermined ones.
+        if block.get("undetermined_edges"):
+            parts.append("  -> <undetermined> (analysis could not resolve the successors)")
     return "\n".join(parts)
 
 
@@ -4173,6 +4188,15 @@ def _render_data_symbols_text(value: Any) -> str:
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `syms`
     if not syms:
+        # #682 item 4: a bare "none" reads as "this view has no data symbols",
+        # which is wrong -- and most misleading in the case that produces it,
+        # an `--offset` past the end. Disclose the real total so the reader can
+        # tell an empty view from an over-shot page and re-page. Both counts go
+        # through the count choke point (#619) rather than a silent default.
+        total = _count_field(value, "total")
+        offset = _count_field(value, "offset")
+        if total and offset >= total:
+            return f"none (offset {offset} is past the end; {total} total)"
         return "none"
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
@@ -4396,8 +4420,15 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # internal noise and moves out of the default line.
         declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
+        # #825 item 3: name the implicit include root when the declaration
+        # came from a file. It is the reason a `#include "sibling.h"`
+        # resolved, so a reader chasing a type that resolved to the wrong
+        # sibling has the directory in front of them. Absent for an inline
+        # declare, so the ordinary row is unchanged.
+        root = item.get("include_root")
+        suffix = f"  (include root: {root})" if root else ""
         if names:
-            return f"types_declare {', '.join(names)}"
+            return f"types_declare {', '.join(names)}{suffix}"
         # No names, so the COUNT is the whole claim -- and it may only be stated
         # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
         # listing printed "types_declare 0 types", which reads as a declare that

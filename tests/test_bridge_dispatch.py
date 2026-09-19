@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import io
 import json
+import os
 import socket
 import sys
 import threading
@@ -2866,6 +2867,90 @@ def test_serialize_error_keeps_user_facing_messages_clean(monkeypatch):
     assert bridge._serialize_error(value_error) == "Unknown operation: bogus"
 
 
+def _raise_from_a_library_file(exc):
+    """Raise *exc* from a module written OUTSIDE the project tree, so the
+    deepest traceback frame belongs to a 'library' for attribution purposes.
+    Built as a real importable file because that is the only way to get a
+    genuine foreign code object -- a lambda defined here is project code."""
+    import importlib.util
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "pretend_library.py")
+        with open(path, "w") as fh:
+            fh.write("def boom(exc):\n    raise exc\n")
+        spec = importlib.util.spec_from_file_location("pretend_library", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.boom(exc)
+
+
+def test_serialize_error_triages_a_library_runtime_error_825(monkeypatch):
+    # #825 item 1: RuntimeError/ValueError are on the user-facing whitelist
+    # because the bridge raises them DELIBERATELY (77 and 16 sites), so a
+    # LIBRARY RuntimeError inherited the same trust and was relayed verbatim
+    # -- reading exactly like a message the bridge composed for the user.
+    # Membership is necessary but not sufficient; origin decides.
+    bridge = _load_bridge(monkeypatch)
+
+    for exc in (RuntimeError("dictionary changed size during iteration"),
+                ValueError("invalid literal for int()")):
+        try:
+            _raise_from_a_library_file(exc)
+        except Exception as raised:  # noqa: BLE001
+            rendered = bridge._serialize_error(raised)
+        assert rendered.startswith("internal error: "), rendered
+        assert type(exc).__name__ in rendered
+
+
+def test_serialize_error_keeps_a_bridge_raised_runtime_error_clean_825(monkeypatch):
+    # THE must-not-fire twin, and the one that matters: 93 deliberate raise
+    # sites report bad input and missing targets this way. Prefixing those
+    # would stamp `internal error:` on every "Function not found".
+    bridge = _load_bridge(monkeypatch)
+    from bn_agent_bridge import _shared
+
+    try:
+        _shared._parse_address("not-an-address")   # raises inside the package
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert not rendered.startswith("internal error"), rendered
+    assert "not a valid address" in rendered
+
+
+def test_serialize_error_never_triages_an_operation_failure_825(monkeypatch):
+    # OperationFailure is exempt from the origin test: the bridge is the only
+    # thing that constructs one, so its origin is never in doubt even when it
+    # is re-raised through library code.
+    bridge = _load_bridge(monkeypatch)
+    failure = bridge.OperationFailure("unsupported", "Symbol not found: bar")
+    try:
+        _raise_from_a_library_file(failure)
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert rendered == "Symbol not found: bar"
+
+
+def test_wire_byte_ceiling_is_one_number_not_two_769(monkeypatch):
+    # THE anti-drift assertion for #769. The CLI refuses an oversized manifest
+    # early ONLY because the bridge would refuse it on arrival, so the two
+    # ceilings must be the same number. A client-side copy guessed LOW would
+    # reject requests the bridge accepts -- the duplicated-constant shape
+    # #777 and #890 were filed for, where the copies drift apart silently.
+    bridge = _load_bridge(monkeypatch)
+    from bn import wire_limits
+
+    assert bridge.MAX_REQUEST_BYTES == wire_limits.MAX_REQUEST_BYTES
+    assert wire_limits.batch_apply_max_bytes() == bridge.MAX_REQUEST_BYTES
+
+    # And it is genuinely shared rather than coincidentally equal: the bridge
+    # module must not carry its own assignment of the constant.
+    import inspect
+    source = inspect.getsource(bridge)
+    assert "MAX_REQUEST_BYTES = " not in source, (
+        "bridge.py reassigns MAX_REQUEST_BYTES; it must import it from "
+        "wire_limits so the CLI preflight and the handler cannot drift")
+
+
 def test_dispatch_error_discloses_prototype_user_type_residue(monkeypatch):
     """#630 round 3, FINDING 2: when a mutation raises AFTER pinning an unclearable
     has_user_type override, the serialized error RESPONSE must DISCLOSE the residue
@@ -2904,14 +2989,24 @@ def test_dispatch_error_without_residue_has_no_disclosure(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
+    # #825 item 1: the double must raise the way a REAL handler does -- from
+    # inside the package -- or its RuntimeError is (correctly) attributed to
+    # a library and triaged with an `internal error:` prefix. A bare `raise`
+    # in this file cannot express "the bridge composed this message", so it
+    # would be pinning the wrong classification. Delegating to a genuine
+    # bridge raise is also simply a better double: this is what every real
+    # handler does when it rejects input.
+    from bn_agent_bridge import _shared
+    user_facing = "'nope' is not a valid address; expected a decimal or 0x-prefixed hex value"
+
     def _boom(op, params, target):
-        raise RuntimeError("Function not found: foo")
+        _shared._parse_address("nope")
 
     monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
 
     resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
     assert resp["ok"] is False
-    assert resp["error"] == "Function not found: foo"
+    assert resp["error"] == user_facing
     assert resp["result"] is None
 
 
@@ -3854,6 +3949,54 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
     assert inst._inflight == 0                 # released after the response
     assert inst._last_activity > 0.0           # stamped only after the write
     assert json.loads(handler.wfile.data.decode("utf-8"))["ok"] is True
+
+
+def test_bridge_response_echoes_the_request_id(monkeypatch):
+    """#825 item 2: the request's `id` was threaded to `_encode_response` for
+    cancel tracking but never emitted, so a client could not correlate a
+    response with its request from the body alone."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps(
+            {"op": "noop", "id": "req-7f3a", "_bridge_identity": inst.bridge_identity}
+        ).encode("utf-8")
+        + b"\n"
+    )
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert json.loads(handler.wfile.data.decode("utf-8"))["id"] == "req-7f3a"
+
+
+def test_bridge_response_omits_id_when_the_request_had_none(monkeypatch):
+    """Must-not-fire twin for #825 item 2: the echo is additive. A request with
+    no `id` must not grow a null one -- a client checking `"id" in response`
+    would otherwise see it on every reply."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps({"op": "noop", "_bridge_identity": inst.bridge_identity}).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )  # NO id
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert "id" not in json.loads(handler.wfile.data.decode("utf-8"))
 
 
 def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
@@ -5588,20 +5731,29 @@ def test_save_onto_an_open_target_is_disclosed_at_save_time_857(monkeypatch, tmp
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867 SUPERSEDES the disclosure this test was written for. Disclosing an
+    # irreversible write is the weaker half of the pair: the save had already
+    # landed, and `session restart` then returned one target for both rows
+    # (measured 2 -> 1, rc 0). The destination is now REFUSED before the
+    # write, so nothing is lost and the caller is one command from safety.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    collision = result["collides_with_open_target"]
-    assert collision["filename"] == str(sidecar)
-    assert collision["target_id"]
-    assert "session restart" in result["note"]
-    # And it reaches the surface an operator actually reads.
-    rendered = formatters._render_save_text(result)
-    assert "also open as target" in rendered
-    assert "one database" in rendered
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert "session restart" in excinfo.value.message
+    assert str(sidecar) in excinfo.value.message
+    # Nothing was written: the sidecar still holds what it held.
+    assert sidecar.read_text() == "bndb"
+    assert raw_view.created_with is None
 
-    # The row state that made this reachable is still observable.
+    # THE payoff of #867, and the assertion worth keeping: the row state that
+    # made the collapse reachable is never created. Under the old behaviour
+    # the raw row's `database_path` was recorded as the sidecar -- the two
+    # rows naming one database, which is what made `session restart` return
+    # one target for both. Refusing before the write means neither row moved.
     rows = {r["filename"]: r for r in instance.targets.refresh()}
-    assert rows[str(raw)]["database_path"] == str(sidecar)
+    assert rows[str(raw)]["database_path"] is None
     assert rows[str(sidecar)]["database_path"] is None
 
 
@@ -5804,11 +5956,14 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867: the destination collision is decided BEFORE the write, so it wins
+    # over the degradation this test was named for -- the save never reaches
+    # the re-home path, because it never reaches the write at all. That
+    # ordering is the point: a degraded save that still collapses two targets
+    # is not a better outcome than a refusal.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    # Degraded, and still disclosed on both halves.
-    assert result["rehomed"] is True
-    assert result["collides_with_open_target"]["filename"] == str(sidecar)
-    assert "session restart" in result["note"]
-    assert "could not restore" in result["note"]
-    assert "also open as target" in formatters._render_save_text(result)
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert sidecar.read_text() == "bndb"          # nothing written

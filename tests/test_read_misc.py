@@ -1479,6 +1479,32 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
     assert "v" not in wide
 
 
+def test_data_vars_row_survives_a_throwing_symbol_or_section_accessor(monkeypatch):
+    # #682 item 4: `get_symbol_at` / `get_sections_at` decorate a row; they do
+    # not define it. They used to sit OUTSIDE the decode try/except, so one
+    # throwing accessor killed the entire windowed read -- contradicting the
+    # function's own guarantee that "the row still lists the var, just
+    # undecorated". Red-first: without the guard this raises out of _data_vars.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _data_window_bv()
+
+    def _boom(addr):
+        raise RuntimeError("symbol server unavailable")
+
+    monkeypatch.setattr(bv, "get_symbol_at", _boom)
+    monkeypatch.setattr(bv, "get_sections_at", _boom)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_vars(None, start="0x2000", end="0x3000")
+
+    rows = {row["a"]: row for row in result["items"]}
+    # Every var is still listed, and still typed -- only the decoration is gone.
+    assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
+    assert rows["0x2000"]["t"] == "int32_t" and rows["0x2000"]["w"] == 4
+    assert rows["0x2000"]["n"] == "" and "sec" not in rows["0x2000"]
+
+
 def test_data_vars_seeks_window_instead_of_scanning_all_vars(monkeypatch):
     # The py_exec predecessor iterated sorted(bv.data_vars) across the WHOLE
     # view; the op must seek via get_next_data_var_after and never visit

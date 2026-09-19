@@ -327,6 +327,8 @@ Add `--preview` before the `-` to diff without committing: `bn batch apply --pre
 
 The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
 
+A manifest over **5000 ops**, or whose request would exceed the bridge's 32 MiB wire limit, is refused before anything is sent (`invalid_request`, exit 3, `observed.request_sent: false`). That is a ceiling on one batch, not on the work: a batch that large holds the write lock for its whole run and reverts as **one** unit, so a single failure discards every sibling. Split it, or raise either ceiling with `BN_BATCH_APPLY_MAX_OPS=<n>` / `BN_BATCH_APPLY_MAX_BYTES=<n>` (`0` disables, a malformed value falls back to the default). The byte ceiling measures the **request** the manifest produces, not the file, so indentation does not count against it.
+
 #### Batch op kinds and their required fields
 
 This table is the whole manifest surface. It is asserted against

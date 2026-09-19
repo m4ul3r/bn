@@ -715,8 +715,16 @@ def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     me = bridge.mutation_engine
 
+    # #825 item 1: raise the way a REAL handler does -- through bridge code.
+    # A bare `raise` in this file is attributed to a library and correctly
+    # triaged with an `internal error:` prefix, so it could no longer stand
+    # in for the handler this test is about. Delegating to a genuine bridge
+    # rejection is what an actual `_op_*` does on bad input.
+    from bn_agent_bridge import _shared
+    user_facing = "'ghost' is not a valid address; expected a decimal or 0x-prefixed hex value"
+
     def boom_user(ctx, bv, op):
-        raise RuntimeError("Function not found: ghost")
+        _shared._parse_address("ghost")
 
     monkeypatch.setattr(me, "_op_set_comment", boom_user)
     bv = _FakeBV()
@@ -725,8 +733,9 @@ def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
         instance._apply_operation(bv, {"op": "set_comment", "comment": "x", "function": "ghost"})
 
     assert excinfo.value.status == "unsupported"
-    assert excinfo.value.message == "Function not found: ghost"
-    assert "RuntimeError" not in excinfo.value.message
+    assert excinfo.value.message == user_facing
+    assert "ValueError" not in excinfo.value.message
+    assert "internal error" not in excinfo.value.message
 
 
 def test_apply_operation_unexpected_error_gets_internal_error_status(monkeypatch):
@@ -4797,3 +4806,228 @@ def test_preview_data_tag_and_tag_type_revert_restore_view_state_782(monkeypatch
     assert result["rolled_back"] is True
     assert sorted(bv.tag_types) == ["Bug", "Scratch"]
 
+
+# --- #675 item 15: a doomed batch must say what it never attempted ---------
+
+
+def test_a_failed_batch_returns_a_row_for_every_submitted_op_675(monkeypatch):
+    """#675 item 15, driven through `_mutation` -- the path production uses.
+
+    The first cut of this test called `_unattempted_results` directly and
+    stayed GREEN with the wiring removed: the right logic through the wrong
+    entry point, which is the form that had just been named against a sibling
+    fix. The helper is not the contract; the batch response is.
+
+    The failure path returned rows only up to and including the op that
+    failed, so a 3-op batch whose first op failed answered with ONE row -- and
+    the response could not express "not attempted". A consumer diffing the
+    manifest against the results reads the missing ops as absent from the
+    REQUEST; a consumer counting reads 1 where it submitted 3.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "Symbol not found: GONE",
+                                          requested={})
+        return {"op": op.get("op"), "status": "applied", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely",
+                        lambda ctx, bv_, state: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: True)
+
+    ops = [{"op": "boom"},
+           {"op": "set_comment", "address": "0x1000", "comment": "a"},
+           {"op": "set_comment", "address": "0x2000", "comment": "b"}]
+    result = instance._mutation("active", False, ops)
+
+    rows = result["results"]
+    assert len(rows) == len(ops), "one row per SUBMITTED op, or the count lies"
+    assert rows[0]["status"] == "unsupported"
+    assert [r["status"] for r in rows[1:]] == ["not_attempted", "not_attempted"]
+    for row, op in zip(rows[1:], ops[1:]):
+        assert "never ran" in row["message"]
+        assert row["requested"]["address"] == op["address"]
+
+
+def test_the_unattempted_helper_shape_675():
+    """#675 item 15: the failure path returned rows only up to and including
+    the op that failed, so a 3-op batch whose first op failed answered with
+    ONE row.
+
+    The response then could not express "not attempted": a consumer diffing
+    the manifest against the results reads the missing ops as absent from the
+    REQUEST, and a consumer counting reads 1 where it submitted 3. Unlike the
+    renderer cases in this family it is not a wording problem -- no field
+    carried the fact at all.
+    """
+    from bn_agent_bridge import mutation_engine as me
+    ops = [
+        {"op": "rename_symbol", "identifier": "GONE", "new_name": "x"},
+        {"op": "set_comment", "address": "0x1000", "comment": "a"},
+        {"op": "set_comment", "address": "0x2000", "comment": "b"},
+    ]
+    rows = me._unattempted_results(None, ops[1:])
+
+    assert len(rows) == 2
+    for row, op in zip(rows, ops[1:]):
+        assert row["status"] == "not_attempted"
+        assert row["op"] == op["op"]
+        assert "never ran" in row["message"]
+        # The row echoes its own request, so the reconciliation holds without
+        # the consumer re-reading the manifest it sent.
+        assert row["requested"]["address"] == op["address"]
+
+
+def test_not_attempted_is_not_a_failure_status_675():
+    """THE property that keeps the fix from making things worse: these ops did
+    not fail, they never ran. Stamping them as failures would turn one bad op
+    into N, inflate the failure count a control loop reads, and change nothing
+    about what actually went wrong.
+
+    Pinned against the shared status set rather than a literal, so a future
+    edit that adds `not_attempted` to the failure set fails here.
+    """
+    from bn.formatters import FAILED_MUTATION_STATUSES
+    assert "not_attempted" not in FAILED_MUTATION_STATUSES
+    # `reverted` is the existing precedent for an honest non-failure status on
+    # a doomed batch (#118); the new one sits beside it.
+    assert "reverted" not in FAILED_MUTATION_STATUSES
+
+
+def test_a_batch_that_reaches_every_op_grows_no_unattempted_rows_675():
+    """Must-not-fire twin: nothing is unattempted when nothing failed, so an
+    ordinary batch's result set is unchanged -- the helper returns no rows for
+    an empty remainder, which is the case every successful batch hits."""
+    from bn_agent_bridge import mutation_engine as me
+    assert me._unattempted_results(None, []) == []
+
+
+# --- #675 item 14: a create inside an existing function says so -----------
+
+
+def test_a_create_inside_an_existing_function_discloses_the_overlap_675():
+    """#675 item 14: `function create` at a mid-function address returned
+    `verified` with a row carrying only address/function/op/requested/status
+    -- two overlapping functions and no trace of it in the result.
+
+    Disclosed rather than refused, the opposite call from the reserved-tag
+    guard and for the opposite reason: creating a function BN missed inside
+    a neighbour it over-extended is ordinary RE work, so a refusal would
+    break a legitimate flow. The harm is that the overlap is INVISIBLE.
+    """
+    from bn_agent_bridge import create_comments as cc
+    row = cc._with_overlap_note(
+        {"op": "function_create", "status": "verified", "address": "0x401341"},
+        [{"name": "main", "address": "0x401339"}])
+
+    assert row["overlaps"] == [{"name": "main", "address": "0x401339"}]
+    assert "main @ 0x401339" in row["note"]
+    # It must say which reading is which, or the note is just an alarm.
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_a_create_at_a_free_address_grows_no_overlap_keys_675():
+    """Must-not-fire twin: the ordinary create is the common path. A row that
+    always carried `overlaps` would make the disclosure noise, and a consumer
+    testing `"overlaps" in row` would see it every time."""
+    from bn_agent_bridge import create_comments as cc
+    row = {"op": "function_create", "status": "verified", "address": "0x401020"}
+    assert cc._with_overlap_note(dict(row), []) == row
+
+
+class _OverlappingCreateBV(_FakeFunctionCreateBV):
+    """A create view whose containment answers, which the stock fake's does
+    not -- so every existing create drive takes the EMPTY path and cannot
+    observe the #675-item-14 note at all."""
+
+    def __init__(self, *, container_start, container_name="main", **kw):
+        super().__init__(**kw)
+        self._container = (container_start, container_name)
+
+    def get_functions_containing(self, addr):
+        start, name = self._container
+        return [types.SimpleNamespace(start=start, name=name)]
+
+
+def _overlap_bv(addr):
+    return _OverlappingCreateBV(
+        container_start=addr - 8,
+        segments={addr: _FakeSegment(readable=True, executable=True)},
+        memory={addr: b"\x55\x48\x89\xe5"},
+    )
+
+
+def test_the_single_command_create_path_returns_the_overlap_675(monkeypatch):
+    """The drive that actually failed in real life, through the entry point
+    `bn function create` uses.
+
+    This replaces an `inspect.getsource` assertion that both paths MENTION
+    the helper. That asserted the call site EXISTS, not that its result
+    REACHES the row -- it would pass a call site whose note is dropped
+    before the row is built, and it asserts source text, which this repo's
+    conventions forbid where a behavioural check is available.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, hex(addr), False)
+
+    row = result["results"][0]
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_the_batch_create_path_returns_the_same_overlap_675(monkeypatch):
+    """The other entry point, asserted on the OBSERVED row rather than on
+    the two call sites agreeing in source. A divergence introduced after
+    the helper call -- the failure the source assertion could not see --
+    fails here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", False, [{"op": "function_create", "address": hex(addr)}])
+
+    row = result["results"][0]
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_a_view_that_cannot_answer_containment_discloses_nothing_675():
+    """Degrade-safely, as everywhere else: a probe that raises has no
+    evidence of an overlap and must not invent one, nor fail the create."""
+    from bn_agent_bridge import create_comments as cc
+
+    class _Hostile:
+        def get_functions_containing(self, addr):
+            raise RuntimeError("analysis unavailable")
+
+    assert cc._containing_function_rows(_Hostile(), 0x401341) == []
+
+
+def test_a_function_starting_at_the_address_is_not_an_overlap_675():
+    """The exact-start case is a `noop`, handled before this; it must not
+    also be reported as overlapping itself."""
+    from bn_agent_bridge import create_comments as cc
+
+    class _Fn:
+        def __init__(self, start, name):
+            self.start, self.name = start, name
+
+    class _BV:
+        def get_functions_containing(self, addr):
+            return [_Fn(0x401341, "sub_401341"), _Fn(0x401339, "main")]
+
+    rows = cc._containing_function_rows(_BV(), 0x401341)
+    assert rows == [{"name": "main", "address": "0x401339"}]

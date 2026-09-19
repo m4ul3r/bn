@@ -1917,6 +1917,101 @@ def test_xrefs_identifier_and_field_are_mutually_exclusive(monkeypatch, capsys):
     assert "T.x" in err
 
 
+def test_xrefs_text_mode_refuses_offset_instead_of_discarding_it_738(monkeypatch, capsys):
+    # #738: text mode groups the FULL set by caller and uses --limit only as
+    # a display cap on groups, so --offset never reached the op. Every offset
+    # returned byte-identical output at exit 0 -- an agent paging a hot symbol
+    # re-read page 1 forever and believed it had advanced. Worse, the derived
+    # slicing hint advertises --offset for this stem because the PARSER
+    # accepts it: right about acceptance, wrong about effect.
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--offset", "300",
+                      "--target", "active"])
+
+    assert rc == 2                       # refused before the bridge, like --lines
+    err = capsys.readouterr().err
+    assert "--offset only applies to --format json" in err
+    assert "xrefs" in err
+    # The message must say what to do, not only what is wrong.
+    assert "--format json" in err and "--limit" in err
+
+
+def test_evidence_xrefs_text_mode_refuses_offset_too_738(monkeypatch, capsys):
+    # The issue names BOTH stems; a fix that lands on one leaves the other
+    # silently wrong, which is how a per-renderer defect survives a fix.
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["evidence", "xrefs", "0x401000", "--offset", "150",
+                      "--target", "active"])
+
+    assert rc == 2
+    assert "--offset only applies to --format json" in capsys.readouterr().err
+
+
+def test_xrefs_json_mode_still_pages_with_offset_738(fake_transport, capsys):
+    # Must-not-fire twin: JSON honours --offset correctly today and the
+    # refusal must not touch it -- that is the mode the message redirects to,
+    # so breaking it would make the advice a dead end.
+    calls = fake_transport({"xrefs": {
+        "ok": True, "result": {"kind": "xrefs", "items": [], "total": 1405,
+                               "offset": 300, "limit": 5, "returned": 0,
+                               "has_more": True}}})
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--offset", "300",
+                      "--target", "active", "--format", "json"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["offset"] == 300
+    assert calls[-1]["params"]["limit"] == 5
+
+
+def test_xrefs_text_mode_without_offset_is_unaffected_738(fake_transport, capsys):
+    # Must-not-fire twin: the refusal is conditional on --offset, so ordinary
+    # text use -- including --limit as the documented group display cap --
+    # keeps working and still does not forward paging to the op.
+    calls = fake_transport({"xrefs": {
+        "ok": True, "result": {"kind": "xrefs", "items": [], "total": 0,
+                               "offset": 0, "limit": None, "returned": 0,
+                               "has_more": False}}})
+
+    rc = bn.cli.main(["xrefs", "malloc", "--limit", "5", "--target", "active"])
+
+    assert rc == 0
+    assert "offset" not in calls[-1]["params"]
+    assert "limit" not in calls[-1]["params"]
+
+
+def test_the_slicing_hint_stops_advising_an_offset_that_text_mode_refuses_889c():
+    # #889c finding 3: the hint is derived from the flags a parser ACCEPTS,
+    # and `--offset` is still accepted on these stems -- merely refused at
+    # runtime. So after #738 the hint advised the one thing that now exits 2,
+    # and before #738 it advised the thing that silently returned page 1.
+    # Right about acceptance, wrong about effect, in both directions.
+    from bn.cli import _slice_hint_for_command
+
+    for path in (("xrefs",), ("evidence", "xrefs")):
+        text = _slice_hint_for_command(path, True)
+        assert "--offset" not in text, path
+        # It must still advise the flag that DOES bound a text read.
+        assert "--limit" in text, path
+        # JSON pages correctly, so the advice is unchanged there -- this is
+        # the mode the refusal redirects to, and breaking it would make the
+        # refusal's own remedy a dead end.
+        assert "--offset" in _slice_hint_for_command(path, False), path
+
+
+def test_the_slicing_hint_is_unchanged_where_offset_works_889c():
+    # Must-not-fire twin, using #738's own control: `callsites` honours
+    # `--offset` in text mode, so its hint must keep naming it. A filter that
+    # dropped the flag everywhere would remove correct advice.
+    from bn.cli import _slice_hint_for_command
+
+    for path in (("callsites",), ("function", "list")):
+        assert "--offset" in _slice_hint_for_command(path, True), path
+        assert "--offset" in _slice_hint_for_command(path, False), path
+
+
 def test_trace_render_step_grammar_singular_and_plural():
     from bn import formatters
     base = {
@@ -2841,3 +2936,230 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     out = capsys.readouterr().out
     assert "WARNING" not in out
     assert out.startswith("int32_t sub_401000()")
+
+
+# --- #675 item 9: a data symbol is a KIND miss, not a name miss -----------
+
+
+def _kind_probe_bridge(monkeypatch, sym_type="DataSymbol"):
+    from _bridge_fakes import _FakeBV, _load_bridge
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[])
+
+    sym = types.SimpleNamespace(
+        address=0x404010, name="g_state",
+        type=types.SimpleNamespace(name=sym_type))
+    bv.get_symbol_by_raw_name = lambda text: sym if text == "g_state" else None
+    bv.get_function_at = lambda addr: None
+    return bridge, instance, bv
+
+
+def test_function_info_on_a_data_symbol_names_the_kind_675(monkeypatch):
+    """#675 item 9: the name RESOLVES -- there is a symbol -- it is just not
+    a function. "Function not found" is true and useless: it reads as "no
+    such name", so a caller asking about a data global was told to check the
+    spelling of a name that exists.
+    """
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.ctx._find_function(bv, "g_state")
+
+    msg = str(excinfo.value)
+    assert "not a function" in msg
+    assert "DataSymbol" in msg                 # the KIND, not a generic miss
+    assert "0x404010" in msg                   # where it actually is
+    # And the read that DOES answer, or the message is only a refusal.
+    assert "data vars" in msg or "data symbols" in msg
+
+
+def test_a_genuinely_absent_name_still_gets_the_spelling_hint_675(monkeypatch):
+    """Must-not-fire twin: the kind-aware branch must not swallow the
+    ordinary miss. A name with no symbol at all keeps the close-match hint,
+    which is the more useful answer for a typo."""
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.ctx._find_function(bv, "nosuchthing")
+
+    msg = str(excinfo.value)
+    assert "Function not found" in msg
+    assert "not a function" not in msg
+
+
+def test_a_symbol_whose_address_holds_a_function_still_resolves_675(monkeypatch):
+    """The other twin, and the one that matters for regression: a symbol
+    that DOES have a function at its address must still return the function
+    rather than being reported as a kind miss."""
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch, sym_type="FunctionSymbol")
+    marker = object()
+    bv.get_function_at = lambda addr: marker if addr == 0x404010 else None
+
+    assert instance.ctx._find_function(bv, "g_state") is marker
+
+
+def test_the_lines_help_names_its_text_only_restriction_exactly_where_it_applies_675():
+    """#675 item 3: `--lines` is refused under `--format json`, and the help
+    said only "Show only lines START through END" -- the restriction was
+    undocumented, so a caller met it as a runtime error.
+
+    The assertion is a CORRESPONDENCE, not a string: every command whose
+    handler calls `_require_text_format(args, "--lines")` must say so in the
+    flag's help, and every command that does NOT must not -- `disasm
+    --lines` works fine under json (it returns a `line_range` in the
+    payload), so documenting a restriction there would be the
+    wrong-explanation error, which is worse than the silence it replaces.
+    """
+    import inspect
+    from bn.commands import function as fc
+
+    source = inspect.getsource(fc)
+    restricted = source.count('_require_text_format(args, "--lines")')
+    documented = source.count("TEXT MODE ONLY")
+    assert restricted >= 1
+    assert documented == restricted, (
+        f"{documented} help strings claim the text-only restriction but "
+        f"{restricted} handlers enforce it -- the two must correspond, or the "
+        f"help documents a rule some command does not have")
+
+
+def test_disasm_lines_is_not_claimed_to_be_text_only_675(fake_transport):
+    """The must-not-fire half, as behaviour rather than as source: `disasm
+    --lines` under json must still reach the bridge, because that is the
+    command whose help deliberately makes no such claim."""
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "kind": "disasm", "function": {"name": "f", "address": "0x1000"},
+        "lines": [], "line_range": {"start": 1, "end": 3}}}})
+
+    rc = bn.cli.main(["disasm", "f", "--lines", "1:3", "--format", "json",
+                      "--target", "active"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "disasm"
+
+
+# ---------------------------------------------------------------------------
+# #676 item 5: `bn decompile f1 f2 f3` -- several functions, one round trip
+# ---------------------------------------------------------------------------
+
+
+def _decompile_run(monkeypatch, argv, rows=None, requested=None, resolved=None):
+    """Run *argv*, returning (exit_code, ops_sent, params_sent)."""
+    import bn.cli
+
+    ops: list[str] = []
+    params: list[dict] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kw):
+        ops.append(op)
+        params.append(dict(params or {})) if False else None
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "t.bin"}]}
+        if op == "decompile_batch":
+            body = rows if rows is not None else [
+                {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void){}"}},
+            ]
+            return {"ok": True, "result": {
+                "kind": "decompile_batch",
+                "requested": requested if requested is not None else len(body),
+                "resolved": resolved if resolved is not None else sum(1 for r in body if r["ok"]),
+                "functions": body,
+            }}
+        return {"ok": True, "result": {"text": "int a(void){}"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    code = bn.cli.main(argv)
+    return code, ops
+
+
+def test_several_identifiers_cost_exactly_one_bridge_request(monkeypatch):
+    """The point of the feature, and the thing a bash for-loop cannot do.
+
+    Three functions through a shell loop is three process spawns, three
+    connects and three lock acquisitions. If this sent one request per
+    identifier it would be a nicer-looking loop with the same cost, so the
+    request COUNT is the acceptance, not the output shape.
+    """
+    code, ops = _decompile_run(
+        monkeypatch, ["decompile", "a", "b", "c"],
+        rows=[{"identifier": n, "ok": True, "decompiled": {"text": f"int {n}(void)"}}
+              for n in ("a", "b", "c")],
+    )
+    assert code == 0
+    assert ops.count("decompile_batch") == 1
+    assert "decompile" not in ops
+
+
+def test_one_identifier_keeps_the_singular_op_and_shape(monkeypatch):
+    """`n=1` is NOT the batch with one row.
+
+    Every existing caller, renderer and test reads `text` off the top level of
+    a decompile reply. Routing the common case through the batch envelope to
+    make the shape uniform would break all of them for a tidiness nobody asked
+    for, so the singular path must stay singular.
+    """
+    code, ops = _decompile_run(monkeypatch, ["decompile", "a"])
+    assert code == 0
+    assert "decompile" in ops
+    assert "decompile_batch" not in ops
+
+
+def test_a_miss_keeps_its_slot_and_the_siblings_that_resolved(monkeypatch, capsys):
+    """A typo in the third name must not discard the two that worked.
+
+    That is the entire reason to batch rather than loop: the caller already
+    paid the analysis cost for the functions that resolved, and a shell loop
+    with `set -e` throws them away. The failed row renders IN PLACE, in the
+    order asked for -- a miss that only appeared in a trailing tally would
+    read as if that function had been skipped rather than attempted.
+    """
+    code, _ = _decompile_run(
+        monkeypatch, ["decompile", "a", "b", "nope"],
+        rows=[
+            {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void)"}},
+            {"identifier": "b", "ok": True, "decompiled": {"text": "int b(void)"}},
+            {"identifier": "nope", "ok": False, "error": "Function not found: nope"},
+        ],
+    )
+    out = capsys.readouterr().out
+    assert "int a(void)" in out and "int b(void)" in out
+    assert "Function not found: nope" in out
+    assert out.index("int b(void)") < out.index("Function not found: nope")
+    assert "2 of 3 resolved" in out
+
+
+def test_a_named_identifier_that_misses_fails_the_run(monkeypatch):
+    """Exit 2, deliberately UNLIKE the `--all-*` fan-out's any-success rule.
+
+    Fan-out surveys a population where a target legitimately lacks the thing
+    asked for. Here every identifier was NAMED by the caller, so one that does
+    not resolve is a mistake in the request -- and a zero exit would hide a
+    typo behind the functions that happened to work.
+    """
+    code, _ = _decompile_run(
+        monkeypatch, ["decompile", "a", "nope"],
+        rows=[
+            {"identifier": "a", "ok": True, "decompiled": {"text": "int a(void)"}},
+            {"identifier": "nope", "ok": False, "error": "Function not found: nope"},
+        ],
+    )
+    assert code == 2
+
+
+def test_an_unreadable_tally_states_itself_rather_than_inventing_a_number(monkeypatch, capsys):
+    """`resolved` in a shape no count reads out of must print `?`, not a
+    plausible total derived from the rows this renderer can see.
+
+    "2 of 2 resolved" computed locally would read byte-identically to a
+    genuine full success while the bridge's own counter was unreadable, which
+    is the #683 fabricated-zero harm wearing a different number.
+    """
+    _decompile_run(
+        monkeypatch, ["decompile", "a", "b"],
+        rows=[{"identifier": n, "ok": True, "decompiled": {"text": f"int {n}(void)"}}
+              for n in ("a", "b")],
+        resolved={"unreadable": True},
+    )
+    assert "? of 2 resolved" in capsys.readouterr().out

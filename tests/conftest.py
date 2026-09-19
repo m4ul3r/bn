@@ -535,10 +535,21 @@ _COLOR_FORCING_VARS = ("FORCE_COLOR", "CLICOLOR_FORCE", "PYTHON_COLORS")
 #: - `BN_SPILL_TOKENS`, the opt-in spill threshold (#409): an ambient value
 #:   re-arms disk output for every test that assumes the default, which is now
 #:   "print the payload, write nothing".
+#: - `BN_TARGET` (#676 item 11), for exactly the reason `BN_INSTANCE` is here:
+#:   it is "the same effect as always passing -t", so an ambient value
+#:   redirects TARGET resolution for every test that does not pass one --
+#:   including the multi-target refusals, which exist precisely to fire when
+#:   no selector was given and would silently stop firing.
 #:
 #: A test that WANTS one of these sets it itself with `monkeypatch.setenv`,
 #: which runs after both gates.
-SCRUBBED_ENV_VARS = (*_COLOR_FORCING_VARS, "BN_TAINT_MODELS", "BN_INSTANCE", "BN_SPILL_TOKENS")
+SCRUBBED_ENV_VARS = (
+    *_COLOR_FORCING_VARS,
+    "BN_TAINT_MODELS",
+    "BN_INSTANCE",
+    "BN_SPILL_TOKENS",
+    "BN_TARGET",
+)
 
 
 def _apply_hermetic_env(patch: pytest.MonkeyPatch) -> None:

@@ -3501,3 +3501,119 @@ def test_the_probe_flag_reaches_the_WIRE_envelope_756(monkeypatch, tmp_path, cap
     assert ordinary, f"target list sent nothing: {received}"
     # Absent, not false: the envelope is byte-identical to before for real work.
     assert all("idle_probe" not in p for p in ordinary), ordinary
+
+
+# ---------------------------------------------------------------------------
+# #676 item 11: BN_TARGET, the per-shell target story `-i` already had
+# ---------------------------------------------------------------------------
+
+
+
+def _capture_target(monkeypatch, argv, env=None):
+    """Run *argv* through `main` and return the target each request carried."""
+    import bn.cli
+
+    seen: list = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(target)
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": "1:1:1", "selector": "alpha.bin"},
+                {"target_id": "1:1:2", "selector": "beta.bin"},
+            ]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    bn.cli.main(argv)
+    return [t for t in seen if t is not None]
+
+
+def test_bn_target_supplies_the_selector_when_no_flag_is_passed(monkeypatch):
+    """The whole point: fan-out stops costing `-t` on every single command.
+
+    The sticky pin cannot do this job -- it lives in ~/.cache and is shared by
+    every shell on the machine, so two agents in one project clobber each
+    other, which is why the skill tells them not to use it. An environment
+    variable is per-process-tree, so each agent's selector is invisible to the
+    other by construction.
+    """
+    assert "beta.bin" in _capture_target(
+        monkeypatch, ["function", "list"], {"BN_TARGET": "beta.bin"}
+    )
+
+
+def test_an_explicit_target_flag_beats_the_environment(monkeypatch):
+    """`-t` is the override, not a duplicate of the export.
+
+    An agent that exports a working target and then reaches for ONE other
+    binary must not have to unset its shell to do it.
+    """
+    assert "alpha.bin" in _capture_target(
+        monkeypatch, ["-t", "alpha.bin", "function", "list"], {"BN_TARGET": "beta.bin"}
+    )
+
+
+def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch):
+    """An UNSET shell variable exports as the empty string, and the bridge
+    collapses an empty selector to the focused GUI view with no count check.
+
+    So the dangerous shape is not a wrong name, it is `export BN_TARGET=$SEL`
+    where SEL was never assigned: the command would then act on whichever tab
+    happened to have focus while LOOKING like it had been told a target. The
+    existing empty-selector refusal covers it, and this pins that the env path
+    reaches that refusal rather than bypassing it.
+    """
+    import bn.cli
+
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kw: {"ok": True, "result": []},
+    )
+    monkeypatch.setenv("BN_TARGET", "   ")
+    assert bn.cli.main(["function", "list"]) == 2
+
+
+def test_a_required_target_option_never_takes_the_environment_default():
+    """A command that DEMANDS an explicit target must keep demanding one.
+
+    `required=True` means the refusal is the feature -- destructive `close`
+    names `--all` in its refusal for a reason. Honouring an ambient default
+    there would reintroduce the ambient-selector hazard through the other
+    door, which is the one thing this whole change must not do.
+    """
+    import argparse
+    import os
+
+    import bn.cli
+
+    prior = os.environ.get("BN_TARGET")
+    os.environ["BN_TARGET"] = "beta.bin"
+    try:
+        strict = argparse.ArgumentParser()
+        bn.cli._target_option(strict, required=True, is_root=True)
+        assert strict.get_default("target") is None
+
+        lenient = argparse.ArgumentParser()
+        bn.cli._target_option(lenient, required=False, is_root=True)
+        assert lenient.get_default("target") == "beta.bin"
+    finally:
+        if prior is None:
+            os.environ.pop("BN_TARGET", None)
+        else:
+            os.environ["BN_TARGET"] = prior
+
+
+def test_bn_target_is_scrubbed_from_the_test_environment():
+    """An ambient BN_TARGET would redirect every test that passes no selector.
+
+    The multi-target refusals exist precisely to fire when nothing was given;
+    an exported value stops them firing and the suite goes green for the wrong
+    reason. Same argument that put BN_INSTANCE on this list.
+    """
+    from conftest import SCRUBBED_ENV_VARS
+
+    assert "BN_TARGET" in SCRUBBED_ENV_VARS

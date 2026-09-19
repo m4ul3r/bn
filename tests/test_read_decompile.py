@@ -3276,7 +3276,7 @@ def _cfg_asm_bv():
         lines=[_FakeCFGLine(0x401000, "cmp eax, 0x0"),
                _FakeCFGLine(0x401004, "je 0x401010")],
         edges=[_FakeCFGEdge(b2, "TrueBranch"),
-               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: must be dropped
+               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: disclosed (#682)
     )
     fn.basic_blocks = [b1, b2]
     return _FakeBV(functions=[fn]), fn
@@ -3299,9 +3299,155 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
         {"a": "0x401000", "t": "cmp eax, 0x0"},
         {"a": "0x401004", "t": "je 0x401010"},
     ]
-    # The edge whose target is None (indirect/unresolved) is dropped, not rendered.
+    # #682 item 3: a null-target edge is NOT emitted as a row. It would have
+    # to carry `to: null`, and bn-tui types that field `pub to: String` with
+    # no serde default -- so a null fails the decode, and because the failure
+    # is inside `Vec<CfgEdge>` the whole CFG parse fails and the TUI shows an
+    # EMPTY view with no error. The shape is also unreachable on BN 6.1.
+    # The unresolved target is reported on the BLOCK instead, where the
+    # disclosure is additive and no consumer breaks.
     assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    assert blocks[0]["undetermined_edges"] is True
     assert blocks[1]["edges"] == []
+    assert "undetermined_edges" not in blocks[1]
+
+
+def test_cfg_edge_rows_stay_exactly_two_keys_for_a_strict_consumer_682(monkeypatch):
+    # Must-not-fire twin for #682 item 3, repointed at the contract that
+    # actually matters. bn-tui decodes an edge as `{to: String, k: String}`
+    # with `to` non-optional, so the edge row must never grow a key that
+    # changes its shape and must never carry a non-string `to` -- the whole
+    # reason the unresolved case moved to the block. Assert the row's exact
+    # key set rather than the absence of one name a later change could rename.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_asm_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "process_packet", view="asm")
+
+    for block in result["blocks"]:
+        for edge in block["edges"]:
+            assert set(edge) == {"to", "k"}, edge
+            assert isinstance(edge["to"], str), edge
+
+
+def test_cfg_asm_blocks_are_sorted_by_start_not_bn_iteration_order(monkeypatch):
+    # #682 item 4: BN yields asm basic blocks in its own order, which is not
+    # address order. Feed them deliberately interleaved -- the shape observed
+    # on a real target -- and require address order out.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401090, "handler", "void handler(void)")
+    b_90 = _FakeCFGBlock(0x401090, lines=[_FakeCFGLine(0x401090, "push rbp")])
+    b_b0 = _FakeCFGBlock(0x4010B0, lines=[_FakeCFGLine(0x4010B0, "ret")])
+    b_9d = _FakeCFGBlock(0x40109D, lines=[_FakeCFGLine(0x40109D, "test eax, eax")])
+    b_a7 = _FakeCFGBlock(0x4010A7, lines=[_FakeCFGLine(0x4010A7, "jmp 0x4010b0")])
+    fn.basic_blocks = [b_90, b_b0, b_9d, b_a7]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "handler", view="asm")
+
+    assert [b["start"] for b in result["blocks"]] == [
+        "0x401090", "0x40109d", "0x4010a7", "0x4010b0",
+    ]
+
+
+def test_cfg_discloses_a_block_whose_successors_bn_could_not_resolve_682(monkeypatch):
+    # #682 item 3, the LIVE half. A cross-dogfood sweep of 12,191 functions x
+    # 3 IL levels over four targets found ZERO edges with `target is None`:
+    # `BasicBlock._make_edges` asserts the reference is non-None and wraps it
+    # through `_create_instance`, which cannot return None. What a real
+    # unresolvable indirect jump (`jmp rax`) produces instead is NO EDGES AT
+    # ALL -- so it rendered byte-identically to a block with no successor,
+    # the same lost distinction, in the shape that actually occurs.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "dispatch", "void dispatch(void)")
+    blk = _FakeCFGBlock(0x401000,
+                        lines=[_FakeCFGLine(0x401000, "jmp rax")],
+                        edges=[], undetermined=True)
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert block["undetermined_edges"] is True
+
+
+def test_cfg_a_genuine_dead_end_block_is_not_marked_undetermined_682(monkeypatch):
+    # Must-not-fire twin, and the whole point of the disclosure: a `ret`
+    # block really has no successors. If both shapes carried the marker the
+    # distinction would be lost in the other direction.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "leaf", "void leaf(void)")
+    fn.basic_blocks = [_FakeCFGBlock(0x401000,
+                                     lines=[_FakeCFGLine(0x401000, "ret")],
+                                     edges=[])]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "leaf", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert "undetermined_edges" not in block
+
+
+def test_cfg_a_block_that_cannot_answer_the_probe_claims_neither_682(monkeypatch):
+    # An IL block object or a reduced view need not implement the property.
+    # Absent -- or raising -- is INDETERMINATE: it must not be reported as
+    # undetermined (a fabricated claim) and must not raise out of the op.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "reduced", "void reduced(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+    del blk.has_undetermined_outgoing_edges
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "reduced", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
+
+
+
+def test_cfg_a_probe_that_raises_claims_neither_682(monkeypatch):
+    # #889b review: the comment promises "absent OR raising" is indeterminate,
+    # but only the ABSENT variant drove the except path -- the raising half of
+    # a defensive read was unexercised. The whole fix hinges on reading BN's
+    # answer defensively, so the path that exists for a throwing probe needs a
+    # probe that throws.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "hostile", "void hostile(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+
+    # A plain `__get__`-only class is a NON-data descriptor, so the instance
+    # attribute `__init__` sets would shadow it and the probe would never
+    # raise -- a vacuous test that passes against code with no except clause
+    # at all. Use a subclass whose property really raises, on an instance
+    # that has no shadowing entry in its __dict__.
+    class _HostileBlock(type(blk)):
+        @property
+        def has_undetermined_outgoing_edges(self):
+            raise RuntimeError("core refused the undetermined-edges query")
+
+    blk.__class__ = _HostileBlock
+    del blk.__dict__["has_undetermined_outgoing_edges"]
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "hostile", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
 
 
 def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
@@ -3598,3 +3744,211 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+# ---------------------------------------------------------------------------
+# #675 item 5: return width inferred from the full register, disclosed
+# ---------------------------------------------------------------------------
+
+
+class _RWType:
+    def __init__(self, width):
+        self.width = width
+
+
+class _RWParam:
+    def __init__(self, width):
+        self.type = _RWType(width)
+
+
+class _RWFunc:
+    def __init__(self, ret_width=8, params=(4, 4), has_user_type=False):
+        self.return_type = _RWType(ret_width)
+        self.parameter_vars = [_RWParam(w) for w in params]
+        self.has_user_type = has_user_type
+
+
+class _RWArch:
+    def __init__(self, name):
+        self.name = name
+
+
+class _RWBV:
+    def __init__(self, arch):
+        self.arch = _RWArch(arch)
+
+
+def _note(arch, **kw):
+    from bn_agent_bridge import read_decompile
+
+    return read_decompile._return_width_inference_note(_RWBV(arch), _RWFunc(**kw))
+
+
+@pytest.mark.parametrize("arch,reg", [("x86_64", "eax"), ("aarch64", "w0")])
+def test_return_width_note_names_the_mechanism_for_each_arch_in_the_set(arch, reg):
+    """The note must explain the arch's OWN register relation, not x86's.
+
+    Both members of the set share one mechanism -- a 32-bit write zero-extends
+    the 64-bit return register -- but they do not share register names. A note
+    that said `eax` on AArch64 would be a confident claim about a register the
+    target does not have.
+    """
+    note = _note(arch)
+    assert note is not None
+    assert arch in note
+    assert reg in note
+
+
+def test_return_width_note_is_silent_on_an_arch_outside_the_set():
+    """The must-not-fire twin: ARM32/thumb2 has no widening to disclose.
+
+    Its registers are natively 32-bit, so the ambiguity this note explains
+    does not exist there -- a measured cross-build finds ZERO over-wide
+    functions. A gate that leaked past its scope would print an x86/AArch64
+    register relation over ARM firmware, which is worse than printing nothing:
+    silence is the correct output where there is no evidence.
+    """
+    for arch in ("thumb2", "armv7", "mipsel32", "riscv32"):
+        assert _note(arch) is None, f"note leaked onto {arch}"
+
+
+def test_return_width_note_defers_to_an_analyst_set_prototype():
+    """A user-set type is not an inference, so there is nothing to disclose."""
+    assert _note("x86_64", has_user_type=True) is None
+
+
+def test_return_width_note_requires_the_ambiguous_shape():
+    """Selectivity is the whole design: a loud note is skipped within a week.
+
+    Only a pointer-width return with all-narrower declared parameters can be
+    the zero-extension artefact. A genuinely 64-bit return (64-bit params), a
+    return that is already 32-bit, and a parameterless function are all
+    ordinary and must stay quiet.
+    """
+    assert _note("x86_64", params=(8, 8)) is None
+    assert _note("x86_64", ret_width=4) is None
+    assert _note("x86_64", params=()) is None
+
+
+def test_return_width_note_warns_about_the_second_surface():
+    """The harm the issue reported is at the CALLER, not the prototype.
+
+    A caller returning -1 renders `return 0xffffffff;`, which is the reading
+    that actually misleads, so the note has to reach past its own output.
+    """
+    note = _note("x86_64")
+    assert "0xffffffff" in note
+
+
+# ---------------------------------------------------------------------------
+# #676 item 12: HLIL trust debt annotated inline, not only in the skill
+# ---------------------------------------------------------------------------
+
+
+class _GuardBlock:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class _GuardFunc:
+    def __init__(self, span=8):
+        self.arch = "probe-arch"
+        self.basic_blocks = [_GuardBlock(0, span)]
+
+
+def _guard_note(monkeypatch, mnemonics, span=None):
+    """Drive the detector over a synthetic 4-byte-per-instruction listing."""
+    from bn_agent_bridge import il_format, read_decompile
+
+    listing = list(mnemonics)
+    monkeypatch.setattr(
+        il_format, "_disasm_instruction",
+        lambda bv, addr, arch=None: (
+            (listing[addr // 4], 4) if addr // 4 < len(listing) else ("", 4)
+        ),
+    )
+    func = _GuardFunc(span if span is not None else 4 * len(listing))
+    return read_decompile._flattened_guard_warning(object(), func)
+
+
+def test_a_branch_free_select_is_named_in_the_output(monkeypatch):
+    """The skill already documents this lie; the note reaches the reader who
+    did not read the skill, which is every reader at the moment they are wrong.
+
+    The mnemonic is NAMED rather than described, because "this function has a
+    flattened guard" sends the reader looking for something they cannot
+    identify in the listing.
+    """
+    note = _guard_note(monkeypatch, ["ccmp x0, x1, #0, ge", "csel x0, x1, x2, lt"])
+    assert note is not None
+    assert "ccmp" in note and "csel" in note
+    assert "bn disasm" in note
+
+
+def test_the_note_is_silent_on_a_function_with_no_select(monkeypatch):
+    """A note on every function is a note nobody reads.
+
+    Selectivity is the feature: the whole point of annotating inline is that
+    its PRESENCE means something, which requires its absence to mean something
+    too.
+    """
+    assert _guard_note(monkeypatch, ["add x0, x1, x2", "ret"]) is None
+
+
+def test_the_same_note_fires_across_architectures_without_an_arch_gate(monkeypatch):
+    """Keyed on the MNEMONIC, not the target -- the instruction IS the evidence.
+
+    This is why item 12 is cheap where the return-width note (#675 item 5)
+    needed a measured arch set: `csel` in a listing means a selected value in
+    THIS function whatever the target is, so there is no per-architecture fact
+    that could be inherited wrongly onto a target that does not have it.
+    """
+    for mnemonic in ("csel x0, x1, x2, lt", "cmovg %eax, %edx", "ite ne"):
+        assert _guard_note(monkeypatch, [mnemonic]) is not None, mnemonic
+
+
+def test_the_note_claims_nothing_about_the_lies_it_cannot_detect(monkeypatch):
+    """The skill documents three HLIL lies; only one has a mnemonic.
+
+    A hoisted loop-invariant bound aliased to a moving pointer, and a dropped
+    `<< 4` in a size accumulator, are SEMANTIC properties with nothing to key
+    on. A note that mentioned them would imply this function had been checked
+    for them, which is worse than no note: it converts an unexamined property
+    into an apparently cleared one.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"])
+    lowered = note.lower()
+    assert "hoist" not in lowered
+    assert "<<" not in note
+    assert "accumulator" not in lowered
+
+
+def test_each_mnemonic_is_named_once_however_often_it_appears(monkeypatch):
+    """A guard that repeats a mnemonic forty times must not print it forty
+    times -- a note long enough to scroll is a note that gets skipped.
+
+    The mechanism is a MEMBERSHIP check while collecting, not the `sorted()`
+    that renders the names: breaking the sort leaves this test green, which
+    cost one wasted sabotage round to discover. Break `mnemonic not in seen`
+    to see this fail.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"] * 40 + ["ccmp x0, x1, #0, ge"])
+    assert note.count("csel") == 1
+    assert note.count("ccmp") == 1
+
+
+def test_an_unreadable_listing_does_not_sink_the_decompile(monkeypatch):
+    """The note is ADDITIVE, so a listing it cannot walk must cost nothing.
+
+    Decompilation succeeding is the caller's actual request; an annotation
+    that could turn a working read into an error would be a worse trade than
+    the annotation is worth.
+    """
+    from bn_agent_bridge import il_format, read_decompile
+
+    def _boom(bv, addr, arch=None):
+        raise RuntimeError("no listing here")
+
+    monkeypatch.setattr(il_format, "_disasm_instruction", _boom)
+    assert read_decompile._flattened_guard_warning(object(), _GuardFunc()) is None
