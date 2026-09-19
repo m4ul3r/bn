@@ -2323,3 +2323,309 @@ def test_render_class_list_text_warns_when_quick_loaded():
 
     full = _render_class_list_text({**listing, "analysis_state": "full", "partial": False})
     assert "WARNING" not in full
+
+
+# --- #675.2: the DECLARED-type fallback for `class list` / `class show` -------
+#
+# The class lens clusters classes from symbols and RTTI, so a class the user
+# DECLARED -- `bn types declare 'class Widget { virtual void draw(); };'` -- is
+# invisible to it: there is no `_ZTV`/`_ZTI` symbol and no demangled method
+# symbol, so `class show Widget` answered "No class named 'Widget'" while
+# `types --query Widget` found it. The fallback reads `bv.types` LIVE on every
+# call: a `types declare` (`define_user_type`) emits no BN symbol/function
+# notification, so it cannot invalidate the memoised class registry -- merging
+# the declared records INTO that memo would serve a stale "no such class" for a
+# type declared a moment ago (#622's cache, #675's triage comment).
+
+class _DeclaredType:
+    """A view type in the minimum shape the fallback reads: a width and a name.
+    No `members`, so the seam's `_type_entry` renders the header-only layout BN
+    gives a declaration whose fields it does not enumerate."""
+    type_class = 4          # StructureTypeClass
+
+    def __init__(self, width=0x10, name="Widget"):
+        self.width = width
+        self.name = name
+
+    def __str__(self):
+        return f"struct {self.name}"
+
+
+def _declared_bv(**types_):
+    """The registry view PLUS defined types -- the `bv.types` half the fallback
+    reads. Nothing here has RTTI, so every type in it is declared-only."""
+    bv = _make_registry_bv()
+    bv.types = dict(types_)
+    return bv
+
+
+class _CountingDeclaredType(_DeclaredType):
+    """A defined type that counts how many times its WIDTH is read.
+
+    A BN type's width is computed lazily on first touch (~1 ms per type,
+    measured), so the declared half takes it only for a record it actually
+    returns. Nothing functional fails if that moves into the record builder --
+    only latency on a view with thousands of types -- which is what this counts.
+    """
+
+    def __init__(self, width=0x10, name="Widget"):
+        # Deliberately not `super().__init__(...)`: that assigns `self.width`,
+        # which this class shadows with the counting property.
+        self._width = width
+        self.name = name
+        self.width_reads = 0
+
+    @property
+    def width(self):
+        self.width_reads += 1
+        return self._width
+
+
+def _declared_ctx(monkeypatch, bv):
+    """A real `BridgeContext` with only the view pinned: `_type_entry` is the
+    seam's own builder, so the test reads the shape a live call produces."""
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: None)
+    monkeypatch.setattr(ctx, "_bases_for", lambda b, r: [])
+    monkeypatch.setattr(ctx, "_instances_for", lambda b, r: {
+        "construction_sites": [], "stored_globals": []})
+    return ctx
+
+
+def test_class_show_falls_back_to_a_declared_type_675(monkeypatch):
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["name"] == "Widget"
+    assert out["confidence"] == "declared-only"
+    assert out["size"] == {"value": "0x10", "source": "declared_type"}
+    # The class-specific evidence is RTTI-driven, and this view has no RTTI class
+    # for the name -- so an empty methods/vtable must not read as "has none".
+    assert out["methods"] == [] and out["vtable"] is None and out["bases"] == []
+    assert any("RTTI" in note for note in out["notes"]), out["notes"]
+    # The card reads `instances` as a container, so a pre-`_enrich` `[]` would be
+    # disclosed as a malformed field on every declared card (#619).
+    from bn.formatters import _render_class_show_text
+    text = _render_class_show_text(out)
+    assert "malformed" not in text
+    assert "no RTTI class" in text
+
+
+def test_class_show_declared_fallback_is_live_not_memoised_675(view_memo_live):
+    """The staleness case #675's triage names: a type enters `bv.types` while the
+    registry memo stays primed, so a fallback folded INTO that memo answers the
+    stale "No class named".
+
+    SCOPE, because the premise needs stating honestly (#907 dogfood measured it
+    false through the CLI): on BN 6.1 a real `types declare` DOES move the
+    per-view generation counter and so DOES invalidate the registry memo. This
+    test's `enumerations == 1` therefore asserts a property of THIS FIXTURE -- a
+    plain `bv.types` assignment fires no notification -- and not a property of the
+    live system. What it proves is the wiring the fix needs: the declared half is
+    read OUTSIDE the registry, so it is fresh regardless of whether the registry
+    was rebuilt. The live-session redefinition case is the one that justifies the
+    live read on its own merits, and it is covered by
+    `test_class_show_tracks_a_REDEFINED_declared_type_675`."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+    bv.types = {}
+
+    ctx = seam.BridgeContext(None)
+    ctx._resolve_view = lambda sel: bv          # instance attribute shadows the seam
+
+    primed = read_class._class_list(ctx, None)
+    assert "Widget" not in [row["name"] for row in primed["items"]]
+    assert bv.functions.enumerations == 1
+
+    # A declare: the type is registered, no notification is fired for it.
+    bv.types["Widget"] = _DeclaredType()
+
+    out = read_class._class_show(ctx, None, "Widget")
+    assert out["name"] == "Widget"
+    assert out["confidence"] == "declared-only"
+    assert bv.functions.enumerations == 1, (
+        "the registry must still be the memoised one -- otherwise this test is "
+        "not exercising the staleness it claims to"
+    )
+
+
+def test_class_show_prefers_the_rtti_record_over_a_declared_type_of_the_same_name_675(
+    monkeypatch,
+):
+    """The twin: a name that is BOTH a defined type and an RTTI-recovered class
+    keeps the RTTI record. The registry is consulted first, so the declared
+    fallback cannot shadow real evidence with a no-evidence record."""
+    bv = _declared_bv(**{"net::Session": _DeclaredType(name="net::Session")})
+    ctx = _declared_ctx(monkeypatch, bv)
+    monkeypatch.setattr(ctx, "_vtable_layout_for", lambda b, a: None)
+
+    out = read_class._class_show(ctx, None, "net::Session")
+
+    assert out["confidence"] == "rtti"
+    assert read_class._DECLARED_TYPE_NOTE not in (out.get("notes") or [])
+    assert "type" not in out, "the declared drill-down must not reach an RTTI record"
+
+
+def test_class_show_unknown_name_still_misses_byte_identically_675(monkeypatch):
+    """A genuinely unknown name must not start reporting the declared records --
+    the fallback is a name lookup, not a looser matcher -- and the hint text stays
+    exactly what it was."""
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(ctx, None, "net::Sesion")     # typo of net::Session
+    assert str(exc.value) == (
+        "No class named 'net::Sesion'. Did you mean: net::Session, net::Pool? Run "
+        "`bn class list` (add --all for name-only clusters) to discover available "
+        "classes."
+    )
+
+
+def test_class_show_resolves_a_declared_type_by_leaf_and_reports_ambiguity_675(
+    monkeypatch,
+):
+    """Declared names go through the registry's OWN name resolution: a bare leaf
+    still reaches a namespaced declaration, and two of them are ambiguous (the
+    envelope the RTTI half already returns), not a silent first-wins pick."""
+    bv = _declared_bv(**{"a::Widget": _DeclaredType(name="a::Widget"),
+                         "b::Widget": _DeclaredType(name="b::Widget")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["ambiguous"] is True
+    assert out["query"] == "Widget"
+    assert {m["name"] for m in out["matches"]} == {"a::Widget", "b::Widget"}
+    assert all(m["confidence"] == "declared-only" for m in out["matches"])
+
+
+def test_class_show_declared_record_carries_the_canonical_type_entry_675(monkeypatch):
+    """The declaration itself is the drill-down: the `type` entry is the seam's
+    canonical `_type_entry` for that name, the same shape `types` reports, so the
+    class answer and the type answer cannot drift."""
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["type"] == ctx._type_entry("Widget", bv.types["Widget"])
+    assert out["type"]["name"] == "Widget"
+    assert out["type"]["kind"] == "struct"
+
+
+def test_class_list_folds_declared_types_out_by_default_and_counts_them_675(monkeypatch):
+    """`class list` is a listing of RTTI/ctor-confirmed classes, so a declared
+    type joins it under `--all` (the flag that already admits non-RTTI clusters)
+    and is counted when folded out -- a default listing that stayed silent about
+    it would read as the blindness #675.2 fixes."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      Gadget=_DeclaredType(name="Gadget", width=0x20))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    default = read_class._class_list(ctx, None)
+    assert "Widget" not in [row["name"] for row in default["items"]]
+    assert default["declared_suppressed"] == 2
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert counted["declared_suppressed"] == 2
+    assert counted["count"] == default["total"]
+
+    full = read_class._class_list(ctx, None, include_all=True)
+    rows = {row["name"]: row for row in full["items"]}
+    assert rows["Widget"]["confidence"] == "declared-only"
+    assert rows["Widget"]["size"] == {"value": "0x10", "source": "declared_type"}
+    assert rows["Widget"]["method_count"] == 0
+    assert rows["Widget"]["has_vtable"] is False
+    assert rows["Gadget"]["size"] == {"value": "0x20", "source": "declared_type"}
+    assert full["declared_suppressed"] == 0
+
+
+def test_class_list_declared_rows_pass_the_existing_filters_675(monkeypatch):
+    """Every filter keeps working on the declared half: `--query` matches the
+    name, `--no-stl` folds a declaration inside `std`, and the RTTI half is
+    untouched."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{"std::Box": _DeclaredType(name="std::Box")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    all_rows = read_class._class_list(ctx, None, include_all=True)
+    assert {"Widget", "std::Box"} <= {row["name"] for row in all_rows["items"]}
+
+    queried = read_class._class_list(ctx, None, include_all=True, query="widget")
+    assert [row["name"] for row in queried["items"]] == ["Widget"]
+
+    stl = read_class._class_list(ctx, None, include_all=True, no_stl=True)
+    assert "std::Box" not in [row["name"] for row in stl["items"]]
+    assert stl["library_suppressed"] == 1
+
+    paged = read_class._class_list(ctx, None, include_all=True, limit=1)
+    assert paged["returned"] == 1 and paged["has_more"] is True
+
+
+def test_declared_width_is_read_only_for_a_record_that_is_returned_675(monkeypatch):
+    """The eager alternative: build the `size` envelope for every defined type.
+    A BN type's width is computed LAZILY on first touch, so that would put the
+    cost of every type in the view on every `class list` -- including the default
+    listing, which counts the declared types and renders none of them -- and no
+    functional assertion would notice. The declared half therefore reads a width
+    exactly where a record states one."""
+    declared = _CountingDeclaredType()
+    bv = _declared_bv(Widget=declared)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    counted = read_class._class_list(ctx, None)            # gated out, none rendered
+    assert counted["declared_suppressed"] == 1
+    assert declared.width_reads == 0
+
+    paged = read_class._class_list(ctx, None, include_all=True)   # a row that states size
+    row = next(r for r in paged["items"] if r["name"] == "Widget")
+    assert row["size"] == {"value": "0x10", "source": "declared_type"}
+    assert declared.width_reads >= 1
+
+    before = declared.width_reads
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["size"] == {"value": "0x10", "source": "declared_type"}
+    assert declared.width_reads > before
+
+
+def test_class_show_tracks_a_REDEFINED_declared_type_675(view_memo_live):
+    """The SECOND staleness axis (#675 item 2 dogfood): redefinition, not first
+    definition. A name whose DEFINITION changes under a primed registry must be
+    reported at its new size -- and the first axis cannot see this, because a
+    fallback that cached per-NAME would answer the old width here while passing
+    `..._is_live_not_memoised_675` unchanged. Two axes because they fail
+    differently: this one moves the value, that one moves the population.
+
+    `enumerations` stays at 1 throughout: the RTTI registry is still the memoised
+    one, so the only moving part is the declared half the fallback rebuilds."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+    bv.types = {}
+
+    ctx = seam.BridgeContext(None)
+    ctx._resolve_view = lambda sel: bv          # instance attribute shadows the seam
+
+    read_class._class_list(ctx, None)           # prime the registry memo
+    assert bv.functions.enumerations == 1
+
+    bv.types["Sprocket"] = _DeclaredType(width=0x14, name="Sprocket")
+    first = read_class._class_show(ctx, None, "Sprocket")
+    assert first["size"] == {"value": "0x14", "source": "declared_type"}
+
+    # A re-declare: same name, wider body, and still no notification fired.
+    bv.types["Sprocket"] = _DeclaredType(width=0x28, name="Sprocket")
+    again = read_class._class_show(ctx, None, "Sprocket")
+
+    assert again["size"] == {"value": "0x28", "source": "declared_type"}, (
+        "a redefined declared type must report its NEW width; a per-name cache "
+        "would still answer 0x14 here while passing the first-definition axis"
+    )
+    assert bv.functions.enumerations == 1, (
+        "the registry must still be the memoised one -- otherwise this test is "
+        "not exercising the staleness it claims to"
+    )

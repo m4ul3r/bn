@@ -5616,6 +5616,16 @@ def _render_class_list_text(value: Any) -> str:
     ven = value.get("vendor_suppressed") or 0
     if value.get("no_vendor") and ven:
         hidden_parts.append(f"{ven} vendored")
+    # #675.2: declared types are folded out by the confidence gate the way
+    # name-only clusters are, so the default listing says they exist instead of
+    # reading as a lens that never saw the class the user declared.
+    ds = _count_field(value, "declared_suppressed")
+    if ds or _field_skewed("declared_suppressed"):
+        # `_stated_count`, not the raw count: an unreadable counter must not print
+        # as `0 declared types`, which reads as "the lens looked and found none".
+        stated = _stated_count(value, "declared_suppressed")
+        hidden_parts.append(
+            f"{stated} declared type{'s' if ds != 1 else ''} (--all to show)")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
@@ -5846,4 +5856,12 @@ def _render_one_class(rec: Any) -> str:
         # #822: the 128-per-list cap is disclosed with exact totals, so a capped
         # result is never read as a complete one (the vtable cap's shape).
         lines.append("  instances (capped): " + "; ".join(hidden))
+    # #675.2: a declared-type record states WHY its vtable/methods/instances are
+    # empty (no RTTI class, no demangled methods, no construction sites for this
+    # name in this view), which is the one line that tells absence from silence on
+    # a card whose every other evidence block is legitimately empty. Through the
+    # choke point, so a malformed `notes` container discloses instead of dropping
+    # the line that carries the distinction.
+    for note in _field_list(rec, "notes"):
+        lines.append(f"  note: {note}")
     return "\n".join(lines)
