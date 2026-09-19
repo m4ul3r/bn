@@ -4797,3 +4797,54 @@ def test_preview_data_tag_and_tag_type_revert_restore_view_state_782(monkeypatch
     assert result["rolled_back"] is True
     assert sorted(bv.tag_types) == ["Bug", "Scratch"]
 
+
+def _commit_mutation(monkeypatch, instance, bv, ops):
+    """The committing sibling of `_preview_mutation` (preview=False).
+
+    Drives the real `_mutation` path, so the dirty-marking decision under test
+    is reached the way a live batch reaches it rather than over a canned
+    envelope.
+    """
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    return instance._mutation("active", False, ops)
+
+
+def test_all_noop_committed_batch_does_not_dirty_the_view_772(monkeypatch):
+    # #772: a committed batch reports `rolled_back: False` -- correctly, nothing
+    # was rolled back -- and the rollback clause keyed on exactly that, so an
+    # ALL-NOOP commit (every op already in the requested state) dirtied a view
+    # nothing had changed and made `bn close` warn about unsaved work that does
+    # not exist. The committed clause above it already covers a real change.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _tag_comment_bv()
+    fn.comment = "already here"
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "function": "handle_request", "comment": "already here"}])
+
+    assert result["committed"] is True
+    assert [r["status"] for r in result["results"]] == ["noop"]
+    assert marked == [], "an all-noop commit changed nothing and must not dirty the view"
+
+
+def test_committed_batch_with_a_real_change_still_dirties_the_view_772(monkeypatch):
+    # The must-not-fire twin, and the one that matters: narrowing the rollback
+    # clause must not cost a genuine commit its dirty mark, or `bn close`
+    # silently discards real work.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _tag_comment_bv()
+    fn.comment = "before"
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    result = _commit_mutation(monkeypatch, instance, bv, [
+        {"op": "set_comment", "function": "handle_request", "comment": "after"}])
+
+    assert result["committed"] is True
+    assert [r["status"] for r in result["results"]] == ["verified"]
+    assert marked, "a committed batch that really changed state must dirty the view"
