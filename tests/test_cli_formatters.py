@@ -4286,7 +4286,7 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #793: `_render_target_info_annotations_text` adds the
     # `existing_annotations` container (6 malformed shapes probed on it) to the
     # same discovered population. Measured.
-    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 1218 -> 1230.
+    # #901 review: the driver of these four deltas is C4's `per_row=True` probe form, NOT C1's nested read -- and the earlier version of this comment said the opposite. Measured: the pair-set diff is +50/-28 = +22 net, `_render_target_summary(per_row=True)` contributing +24 while the orient renderer's two former TOP-LEVEL positions leave (-2). So raise +176 = +24x8 (C4) - 2x8 (C1): C1 alone LOWERS that count by 16. Mirror +46 = +50 (C4) - 4 (C1). Differential +12 and element sweep +36 are C4 entirely; C1 contributes 0 to both. The sweeps also do not discover the nested container as a new position -- that container and its descent already existed; only the two nested KEYS are new. Correct numbers with a wrong explanation is the worse error, because the explanation is the half a reader cannot check. 1218 -> 1230.
     assert checked == 1230, f"the differential ran {checked} cases, not 1230"
 
 
@@ -4347,7 +4347,7 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
     # #900: THREE renderers now read the `duplicate_starts_*` pair through `_duplicate_starts_note` -- `_render_target_summary`, `_render_orient_text`, and `_render_target_info_text`, the composed entry point that delegates to the summary and is counted separately by the sweep. 3 renderers x 2 keys = 6 new pairs, which is what the deltas below measure (6x8=48 and 6x2=12). An earlier version of this comment named two renderers and undercounted by the composed one (#901 review C5) -- the NUMBERS were right, the explanation was not, which is the worse of the two errors because it is the explanation a future reader checks against. 4984 -> 5032.
-    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 5032 -> 5208.
+    # #901 review: the driver of these four deltas is C4's `per_row=True` probe form, NOT C1's nested read -- and the earlier version of this comment said the opposite. Measured: the pair-set diff is +50/-28 = +22 net, `_render_target_summary(per_row=True)` contributing +24 while the orient renderer's two former TOP-LEVEL positions leave (-2). So raise +176 = +24x8 (C4) - 2x8 (C1): C1 alone LOWERS that count by 16. Mirror +46 = +50 (C4) - 4 (C1). Differential +12 and element sweep +36 are C4 entirely; C1 contributes 0 to both. The sweeps also do not discover the nested container as a new position -- that container and its descent already existed; only the two nested KEYS are new. Correct numbers with a wrong explanation is the worse error, because the explanation is the half a reader cannot check. 5032 -> 5208.
     assert swept == 5208, f"the raise sweep ran {swept} renders, not 5208"
 
 
@@ -4516,7 +4516,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
     # #900: THREE renderers now read the `duplicate_starts_*` pair through `_duplicate_starts_note` -- `_render_target_summary`, `_render_orient_text`, and `_render_target_info_text`, the composed entry point that delegates to the summary and is counted separately by the sweep. 3 renderers x 2 keys = 6 new pairs, which is what the deltas below measure (6x8=48 and 6x2=12). An earlier version of this comment named two renderers and undercounted by the composed one (#901 review C5) -- the NUMBERS were right, the explanation was not, which is the worse of the two errors because it is the explanation a future reader checks against. 1449 -> 1461.
-    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 1461 -> 1507.
+    # #901 review: the driver of these four deltas is C4's `per_row=True` probe form, NOT C1's nested read -- and the earlier version of this comment said the opposite. Measured: the pair-set diff is +50/-28 = +22 net, `_render_target_summary(per_row=True)` contributing +24 while the orient renderer's two former TOP-LEVEL positions leave (-2). So raise +176 = +24x8 (C4) - 2x8 (C1): C1 alone LOWERS that count by 16. Mirror +46 = +50 (C4) - 4 (C1). Differential +12 and element sweep +36 are C4 entirely; C1 contributes 0 to both. The sweeps also do not discover the nested container as a new position -- that container and its descent already existed; only the two nested KEYS are new. Correct numbers with a wrong explanation is the worse error, because the explanation is the half a reader cannot check. 1461 -> 1507.
     assert checked == 1507, f"the mirror ran {checked} renders, not 1507"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
@@ -7269,7 +7269,7 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 4572 -> 4608.
+    # #901 review: the driver of these four deltas is C4's `per_row=True` probe form, NOT C1's nested read -- and the earlier version of this comment said the opposite. Measured: the pair-set diff is +50/-28 = +22 net, `_render_target_summary(per_row=True)` contributing +24 while the orient renderer's two former TOP-LEVEL positions leave (-2). So raise +176 = +24x8 (C4) - 2x8 (C1): C1 alone LOWERS that count by 16. Mirror +46 = +50 (C4) - 4 (C1). Differential +12 and element sweep +36 are C4 entirely; C1 contributes 0 to both. The sweeps also do not discover the nested container as a new position -- that container and its descent already existed; only the two nested KEYS are new. Correct numbers with a wrong explanation is the worse error, because the explanation is the half a reader cannot check. 4572 -> 4608.
     assert swept == 4608, (
         f"the element sweep ran {swept} renders, not 4608 -- the size of the "
         "covered set (every list position the population discovered x every "
@@ -8181,19 +8181,35 @@ def _dup_payloads():
             ("evidence orient", _render_orient_text, orient, ("target",))]
 
 
-def _strip_dup(payload, path):
-    """A genuinely clean payload: strips the keys WHERE THEY LIVE, following
-    *path* into the nesting. Stripping only the top level left the orient
-    payload still carrying them, which is what let the clean-view twin
-    enforce the broken renderer."""
+def _strip_dup(payload, path=()):
+    """A genuinely clean payload: strips the keys wherever they live.
+
+    Stripping only the top level left the orient payload still carrying
+    them nested, which is what let the clean-view twin enforce the broken
+    renderer. The first fix was PATH-DIRECTED, which left the symmetric
+    hole: a payload carrying the keys at BOTH levels reported clean at the
+    one path it stripped (#901 review R3b). Not producer-reachable today --
+    each surface emits exactly one level -- but a fixture that can report
+    clean while the payload is not is the same class of trap. Recursive, so
+    "clean" means clean everywhere and the assertion below is total.
+
+    *path* is kept for call-site readability; it no longer bounds the strip.
+    """
     import copy
+
+    def _scrub(node):
+        if isinstance(node, dict):
+            for k in [k for k in node if k.startswith("duplicate_starts")]:
+                del node[k]
+            for v in node.values():
+                _scrub(v)
+        elif isinstance(node, list):
+            for v in node:
+                _scrub(v)
+
     out = copy.deepcopy(payload)
-    target = out
-    for key in path:
-        target = target[key]
-    for k in list(target):
-        if k.startswith("duplicate_starts"):
-            del target[k]
+    _scrub(out)
+    assert "duplicate_starts" not in json.dumps(out), "strip left a key behind"
     return out
 
 
