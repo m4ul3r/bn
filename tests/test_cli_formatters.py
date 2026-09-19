@@ -4286,7 +4286,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #793: `_render_target_info_annotations_text` adds the
     # `existing_annotations` container (6 malformed shapes probed on it) to the
     # same discovered population. Measured.
-    assert checked == 1218, f"the differential ran {checked} cases, not 1218"
+    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 1218 -> 1230.
+    assert checked == 1230, f"the differential ran {checked} cases, not 1230"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4345,8 +4346,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_function_list_text` in both its demangled and undemangled probe
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
-    # #900: `_render_target_summary` and `_render_orient_text` now read the `duplicate_starts_*` pair through `_duplicate_starts_note`, so these derived populations grow with the two new discovered reads. 4984 -> 5032.
-    assert swept == 5032, f"the raise sweep ran {swept} renders, not 5032"
+    # #900: THREE renderers now read the `duplicate_starts_*` pair through `_duplicate_starts_note` -- `_render_target_summary`, `_render_orient_text`, and `_render_target_info_text`, the composed entry point that delegates to the summary and is counted separately by the sweep. 3 renderers x 2 keys = 6 new pairs, which is what the deltas below measure (6x8=48 and 6x2=12). An earlier version of this comment named two renderers and undercounted by the composed one (#901 review C5) -- the NUMBERS were right, the explanation was not, which is the worse of the two errors because it is the explanation a future reader checks against. 4984 -> 5032.
+    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 5032 -> 5208.
+    assert swept == 5208, f"the raise sweep ran {swept} renders, not 5208"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4513,8 +4515,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # `function list` / `--count` probe forms), x 2 benign payloads each. A
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
-    # #900: `_render_target_summary` and `_render_orient_text` now read the `duplicate_starts_*` pair through `_duplicate_starts_note`, so these derived populations grow with the two new discovered reads. 1449 -> 1461.
-    assert checked == 1461, f"the mirror ran {checked} renders, not 1461"
+    # #900: THREE renderers now read the `duplicate_starts_*` pair through `_duplicate_starts_note` -- `_render_target_summary`, `_render_orient_text`, and `_render_target_info_text`, the composed entry point that delegates to the summary and is counted separately by the sweep. 3 renderers x 2 keys = 6 new pairs, which is what the deltas below measure (6x8=48 and 6x2=12). An earlier version of this comment named two renderers and undercounted by the composed one (#901 review C5) -- the NUMBERS were right, the explanation was not, which is the worse of the two errors because it is the explanation a future reader checks against. 1449 -> 1461.
+    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 1461 -> 1507.
+    assert checked == 1507, f"the mirror ran {checked} renders, not 1507"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7266,8 +7269,9 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # #901 review C1: the orient renderer now reads the duplicate-start pair from the NESTED `target` block (`_field_dict(value, "target")`), which the top-level read never touched -- so the sweeps discover the nested container and its two keys as new positions. The previous numbers were measured against a read that could never fire on a real payload. 4572 -> 4608.
+    assert swept == 4608, (
+        f"the element sweep ran {swept} renders, not 4608 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
@@ -8153,14 +8157,44 @@ _DUP_KEYS = {"duplicate_starts_collapsed": 2, "duplicate_starts_unresolved": 1}
 
 
 def _dup_payloads():
+    """Payloads in the shape the PRODUCERS actually emit.
+
+    `evidence orient` nests its target block and does NOT spread it, so the
+    `duplicate_starts_*` keys live under `target` and never at the digest's
+    top level. The first cut of this fixture put them top-level on BOTH
+    surfaces, which did two kinds of damage: the orient renderer could be
+    written against keys no payload carries and still look tested, and --
+    worse -- the clean-view twin stripped only top-level keys, so fixing the
+    renderer made the SUITE go red. A fixture that does not match the
+    producer does not merely fail to catch the defect; it pins the defect as
+    the contract (#901 review C1/C3).
+    """
     ti = {"kind": "target_info", "filename": "/t/svc", "target_id": "a:1",
           "selector": "svc", "arch": "x86_64", "analyzed": True,
           "function_count": 15, **_DUP_KEYS}
-    orient = {"kind": "orient_digest", "target": dict(ti), "analyzed": True,
-              "function_count": 15, **_DUP_KEYS}
+    # NOTE the nesting: no **_DUP_KEYS at the digest's top level.
+    orient = {"kind": "orient_digest", "analyzed": True, "function_count": 15,
+              "target": dict(ti), "sections": [], "imports_summary": {},
+              "strings_sample": {}}
     from bn.formatters import _render_orient_text, _render_target_info_text
-    return [("target info", _render_target_info_text, ti),
-            ("evidence orient", _render_orient_text, orient)]
+    return [("target info", _render_target_info_text, ti, ()),
+            ("evidence orient", _render_orient_text, orient, ("target",))]
+
+
+def _strip_dup(payload, path):
+    """A genuinely clean payload: strips the keys WHERE THEY LIVE, following
+    *path* into the nesting. Stripping only the top level left the orient
+    payload still carrying them, which is what let the clean-view twin
+    enforce the broken renderer."""
+    import copy
+    out = copy.deepcopy(payload)
+    target = out
+    for key in path:
+        target = target[key]
+    for k in list(target):
+        if k.startswith("duplicate_starts"):
+            del target[k]
+    return out
 
 
 def test_target_info_and_orient_disclose_the_duplicate_start_collapse_900():
@@ -8168,7 +8202,7 @@ def test_target_info_and_orient_disclose_the_duplicate_start_collapse_900():
     # surfaces as out of fence rather than folding them in. Same defect: the
     # keys reach JSON and no text renderer, so a reader is shown a function
     # count with nothing saying a start address carried more than one record.
-    for label, render, payload in _dup_payloads():
+    for label, render, payload, _path in _dup_payloads():
         out = render(payload)
         assert "duplicate starts" in out, label
         assert "2 start address(es)" in out, label
@@ -8188,16 +8222,34 @@ def test_all_three_surfaces_state_the_collapse_in_ONE_sentence_900():
     fl = _render_function_list_text({
         "kind": "function_list", "items": [], "total": 15, "offset": 0,
         "limit": 100, "returned": 0, "has_more": False, **_DUP_KEYS})
-    rendered = [fl] + [render(payload) for _, render, payload in _dup_payloads()]
+    rendered = [fl] + [render(p) for _, render, p, _path in _dup_payloads()]
     for out in rendered:
         assert expected in out
+
+
+def test_no_surface_states_the_collapse_TWICE_900():
+    """#901 review C2: the one-sentence test is CONTAINMENT, not equality --
+    a renderer that keeps the shared line AND appends its own second line
+    passes it. Additive drift is the likelier failure than replacement,
+    because the shared line looks correct and someone adds detail beside it.
+
+    Counting occurrences closes that: the fact may appear exactly once per
+    surface, so a second spelling fails whether it replaces the shared
+    sentence or sits next to it.
+    """
+    from bn.formatters import _render_function_list_text
+    fl = _render_function_list_text({
+        "kind": "function_list", "items": [], "total": 15, "offset": 0,
+        "limit": 100, "returned": 0, "has_more": False, **_DUP_KEYS})
+    rendered = [("function list", fl)] + [
+        (label, render(payload)) for label, render, payload, _p in _dup_payloads()]
+    for label, out in rendered:
+        assert out.count("duplicate starts") == 1, label
 
 
 def test_a_clean_view_renders_unchanged_on_both_surfaces_900():
     # Must-not-fire twin. The keys are published ONLY when the collapse
     # happened, so a clean view must render byte-for-byte as before -- an
     # alarm on every target info is an alarm a reader learns to skip.
-    for label, render, payload in _dup_payloads():
-        bare = {k: v for k, v in payload.items()
-                if not k.startswith("duplicate_starts")}
-        assert "duplicate starts" not in render(bare), label
+    for label, render, payload, path in _dup_payloads():
+        assert "duplicate starts" not in render(_strip_dup(payload, path)), label
