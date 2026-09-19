@@ -393,12 +393,21 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
 # it. The records below are what the lens falls back to.
 #
 # They are read LIVE, never memoised, and deliberately NOT merged into the
-# memoised registry: `_build_class_registry` is invalidated by BN's symbol and
-# function notifications, and a `types declare` (`define_user_type`) emits no
-# such notification (#622's cache, #675's triage comment). A declared type folded
-# into that memo would stay invisible until some unrelated rename or analysis
-# pass dropped the registry -- a silently stale miss, worse than the consistent
-# one this fixes.
+# memoised registry. The measured reason is REDEFINITION, not first definition:
+# a per-name cache of a declared type's facts answers the OLD width after the
+# type is re-declared -- measured live on BN 6.1 through the real CLI, where
+# `class show` reported `size 0x10` while the view's type was already `0x18`.
+# Reading this half fresh per call removes that staleness whatever the
+# registry's invalidation covers.
+#
+# An earlier version of this comment justified the live read by claiming a
+# `types declare` (`define_user_type`) fires no symbol/function notification and
+# therefore cannot invalidate the memo (#622's cache, #675's triage comment).
+# That was MEASURED FALSE: `define_user_type` moves the per-view generation
+# counter (observed 3 -> 4 in-process, and 0 -> 1 -> 2 across two CLI declares),
+# so a declare DOES invalidate the registry memo on this build. Kept as a note
+# rather than deleted: the live read is defensive with respect to that
+# question, and correct for the redefinition case either way.
 _DECLARED_CONFIDENCE = "declared-only"
 _DECLARED_TYPE_NOTE = (
     "declared type -- no RTTI class, demangled methods or construction sites for "

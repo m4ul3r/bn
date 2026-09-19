@@ -2415,13 +2415,20 @@ def test_class_show_falls_back_to_a_declared_type_675(monkeypatch):
 
 
 def test_class_show_declared_fallback_is_live_not_memoised_675(view_memo_live):
-    """The staleness case #675's triage names: `types declare` emits no symbol or
-    function change, so nothing invalidates the memoised class registry. Here the
-    registry IS cached (the fixture guarantees the memo is live) and the type
-    appears exactly the way a declare makes it appear -- in `bv.types`, with no
-    notification fired. The `enumerations` counter is the trap: it proves the
-    registry was served from the memo for the whole exchange, so a fallback folded
-    INTO that memo answers the stale "No class named" this test exists to catch."""
+    """The staleness case #675's triage names: a type enters `bv.types` while the
+    registry memo stays primed, so a fallback folded INTO that memo answers the
+    stale "No class named".
+
+    SCOPE, because the premise needs stating honestly (#907 dogfood measured it
+    false through the CLI): on BN 6.1 a real `types declare` DOES move the
+    per-view generation counter and so DOES invalidate the registry memo. This
+    test's `enumerations == 1` therefore asserts a property of THIS FIXTURE -- a
+    plain `bv.types` assignment fires no notification -- and not a property of the
+    live system. What it proves is the wiring the fix needs: the declared half is
+    read OUTSIDE the registry, so it is fresh regardless of whether the registry
+    was rebuilt. The live-session redefinition case is the one that justifies the
+    live read on its own merits, and it is covered by
+    `test_class_show_tracks_a_REDEFINED_declared_type_675`."""
     fns = _counting_registry_fns()
     bv = _NotifyingRegistryBV(fns, [])
     bv.functions = _CountingFunctions(fns)
