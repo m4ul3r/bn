@@ -1820,7 +1820,12 @@ def _code_row(index):
     return {"index": index, "entry_address": hex(0x9010 + index * 8),
             "value": hex(value), "readable": True, "plausible": True,
             "target": {"status": "function", "normalized": hex(value),
-                       "function": {"name": f"m{index}", "address": hex(value)}}}
+                       # The producer ALWAYS writes `exact_start`; omitting it
+                       # here meant every scan test fed the ABSENT-key state,
+                       # so the twin named for exact starts did not build one
+                       # (#901/#821 review). The name now matches the fixture.
+                       "function": {"name": f"m{index}", "address": hex(value),
+                                    "exact_start": True}}}
 
 
 def _data_row(index, value=0xA100):
@@ -2391,7 +2396,11 @@ def _interior_code_row(index):
             "value": hex(value), "readable": True, "plausible": True,
             "target": {"status": "function", "normalized": hex(value),
                        "function": {"name": "m0", "address": "0x400000",
-                                    "exact_start": False, "delta": "0x8"}}}
+                                    # `offset`, not `delta`: seam.py computes
+                                    # `delta` as a LOCAL and writes it out as
+                                    # `entry["offset"]`. The first cut carried a
+                                    # key no producer emits (#901/#821 review).
+                                    "exact_start": False, "offset": "0x8"}}}
 
 
 def test_the_scan_terminates_on_an_interior_pointer_821():
