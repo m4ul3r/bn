@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, arg, command, mutation_output_args, preview_arg, read_text_input
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _refuse_count_only_slices, arg, command, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     _render_function_count_text,
     _render_type_info_text,
@@ -20,6 +20,7 @@ from ..transport import BridgeError
                    help="Show the total type count instead of listing")])
 def _types(args: argparse.Namespace) -> int:
     if args.count:
+        _refuse_count_only_slices(args, command="types")
         return _call(
             args,
             "types",

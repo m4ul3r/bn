@@ -1579,6 +1579,120 @@ def test_imports_count_refuses_flags_it_would_ignore(fake_transport, capsys, ext
     assert extra[0] in err
 
 
+# --- #872: the SIBLING aggregates #767/#768 did not name ---------------------
+
+
+# One table, so the next audit reads the covered set instead of re-deriving
+# it -- #767/#768 fixed only the handlers their own issues named, which is
+# exactly how five siblings kept the defect for another release.
+# Keyed on (command, MODE), not on command. #899's review found the flaw in
+# the first version: it was keyed on commands, so `go functions --summary` --
+# a second aggregate on a command already listed for `--count` -- was
+# STRUCTURALLY INVISIBLE to it. A table that cannot express the thing it is
+# meant to cover will report full coverage of a set it silently narrowed.
+_COUNT_SIBLINGS = [
+    (["exports", "--count"], "exports --count", "list_exports"),
+    (["sections", "--count"], "sections --count", "sections"),
+    (["strings", "--count"], "strings --count", "strings"),
+    (["types", "--count"], "types --count", "types"),
+    (["class", "list", "--count"], "class list --count", "class_list"),
+    (["go", "functions", "--count"], "go functions --count", "go_functions"),
+    (["imports", "--summary"], "imports --summary", "imports"),
+    (["go", "functions", "--summary"], "go functions --summary", "go_functions"),
+]
+
+
+@pytest.mark.parametrize("argv,label,op", _COUNT_SIBLINGS,
+                         ids=[lbl for _, lbl, _op in _COUNT_SIBLINGS])
+@pytest.mark.parametrize("extra", [["--limit", "5"], ["--offset", "1"]])
+def test_count_siblings_refuse_the_paging_flags_they_would_ignore_872(
+        fake_transport, capsys, argv, label, op, extra):
+    # #872: each of these returned the whole-target count and dropped the
+    # paging flags on the floor -- `class list` was worse, FORWARDING a limit
+    # the bridge cannot apply to a scalar. Same refusal as imports (#767).
+    calls = fake_transport()
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", *argv, *extra])
+
+    assert rc == 2, label
+    assert calls == [], f"{label} sent a request it should have refused"
+    err = capsys.readouterr().err
+    mode = label.rsplit(" ", 1)[-1]          # "--count" or "--summary"
+    assert mode in err and extra[0] in err, label
+
+
+@pytest.mark.parametrize("argv,label,op", _COUNT_SIBLINGS,
+                         ids=[lbl for _, lbl, _op in _COUNT_SIBLINGS])
+def test_count_siblings_alone_still_count_872(fake_transport, argv, label, op):
+    # Must-not-fire twin for the whole family: the refusal is conditional on
+    # a slice flag, so a bare --count must still reach the bridge with
+    # count_only set. A guard that broke the feature it protects is worse
+    # than the silent drop it replaced.
+    calls = fake_transport({op: {"ok": True, "result": {"count": 3, "total": 3}}})
+
+    bn.cli.main(["-i", "fake", "-t", "t.bndb", *argv])
+
+    mode = label.rsplit(" ", 1)[-1]
+    key = "count_only" if mode == "--count" else "summary"
+    assert calls, f"{label} sent nothing"
+    assert calls[-1]["params"].get(key) is True, label
+    assert "limit" not in calls[-1]["params"], label
+
+
+@pytest.mark.parametrize("extra", [["--limit", "5"], ["--offset", "1"]])
+def test_imports_summary_refuses_paging_it_would_ignore_872(
+        fake_transport, capsys, extra):
+    # The second aggregate MODE, not just the second command: `--summary`
+    # returns one object, so the paging flags were forwarded to a bridge that
+    # cannot apply them and vanished there. The handler's own comment said
+    # "ignores paging entirely" while the params dict forwarded `offset`.
+    calls = fake_transport()
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--summary", *extra])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "--summary" in err and extra[0] in err
+    # `--summary` is the MODE here, so it must not be listed as its own offender.
+    assert err.count("--summary") == 2      # "imports --summary" + "Drop --summary"
+
+
+def test_the_refusal_names_the_mode_the_caller_actually_used_899():
+    # #899 review: the tail was hard-coded to "for the count", so a
+    # `--summary` refusal told the caller to drop flags "for the count" -- a
+    # mode they did not ask for. The noun follows the mode, derived from the
+    # flag so a future aggregate inherits it rather than adding a third
+    # spelling of the same sentence.
+    import argparse
+    from bn.cli import _refuse_count_only_slices
+    from bn.transport import BridgeError
+
+    seen = {}
+    for mode in ("--count", "--summary"):
+        ns = argparse.Namespace(limit=5, offset=0, sort="address",
+                                reverse=False, summary=False)
+        try:
+            _refuse_count_only_slices(ns, command="go functions", mode=mode)
+        except BridgeError as exc:
+            seen[mode] = str(exc)
+
+    assert "for the count." in seen["--count"]
+    assert "for the summary." in seen["--summary"]
+    # And neither message may name the OTHER mode's noun.
+    assert "summary" not in seen["--count"]
+    assert "for the count" not in seen["--summary"]
+
+
+def test_imports_summary_alone_still_summarises_872(fake_transport):
+    calls = fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports", "summary": {"total": 3}}}})
+
+    bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--summary"])
+
+    assert calls and calls[-1]["params"]["summary"] is True
+
+
 def test_imports_count_alone_still_counts(fake_transport):
     calls = fake_transport({"imports": {"ok": True, "result": {"kind": "imports", "count": 7, "total": 7}}})
 
