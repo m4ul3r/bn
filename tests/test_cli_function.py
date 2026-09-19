@@ -2936,3 +2936,64 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     out = capsys.readouterr().out
     assert "WARNING" not in out
     assert out.startswith("int32_t sub_401000()")
+
+
+# --- #675 item 9: a data symbol is a KIND miss, not a name miss -----------
+
+
+def _kind_probe_bridge(monkeypatch, sym_type="DataSymbol"):
+    from _bridge_fakes import _FakeBV, _load_bridge
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[])
+
+    sym = types.SimpleNamespace(
+        address=0x404010, name="g_state",
+        type=types.SimpleNamespace(name=sym_type))
+    bv.get_symbol_by_raw_name = lambda text: sym if text == "g_state" else None
+    bv.get_function_at = lambda addr: None
+    return bridge, instance, bv
+
+
+def test_function_info_on_a_data_symbol_names_the_kind_675(monkeypatch):
+    """#675 item 9: the name RESOLVES -- there is a symbol -- it is just not
+    a function. "Function not found" is true and useless: it reads as "no
+    such name", so a caller asking about a data global was told to check the
+    spelling of a name that exists.
+    """
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.ctx._find_function(bv, "g_state")
+
+    msg = str(excinfo.value)
+    assert "not a function" in msg
+    assert "DataSymbol" in msg                 # the KIND, not a generic miss
+    assert "0x404010" in msg                   # where it actually is
+    # And the read that DOES answer, or the message is only a refusal.
+    assert "data vars" in msg or "data symbols" in msg
+
+
+def test_a_genuinely_absent_name_still_gets_the_spelling_hint_675(monkeypatch):
+    """Must-not-fire twin: the kind-aware branch must not swallow the
+    ordinary miss. A name with no symbol at all keeps the close-match hint,
+    which is the more useful answer for a typo."""
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instance.ctx._find_function(bv, "nosuchthing")
+
+    msg = str(excinfo.value)
+    assert "Function not found" in msg
+    assert "not a function" not in msg
+
+
+def test_a_symbol_whose_address_holds_a_function_still_resolves_675(monkeypatch):
+    """The other twin, and the one that matters for regression: a symbol
+    that DOES have a function at its address must still return the function
+    rather than being reported as a kind miss."""
+    bridge, instance, bv = _kind_probe_bridge(monkeypatch, sym_type="FunctionSymbol")
+    marker = object()
+    bv.get_function_at = lambda addr: marker if addr == 0x404010 else None
+
+    assert instance.ctx._find_function(bv, "g_state") is marker

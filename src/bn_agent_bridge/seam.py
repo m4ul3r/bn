@@ -452,6 +452,20 @@ class BridgeContext:
             fn = bv.get_function_at(symbol.address)
             if fn is not None:
                 return fn
+            # #675 item 9: the name RESOLVED -- there is a symbol here -- it is
+            # just not a function. "Function not found" is true and useless:
+            # it reads as "no such name", so a caller who asked `function
+            # info` about a data global was told to check their spelling of a
+            # name that exists. Name the kind and the read that answers it.
+            kind = getattr(getattr(symbol, "type", None), "name", None) \
+                or str(getattr(symbol, "type", "") or "symbol")
+            raise RuntimeError(
+                f"{identifier} is a {kind} at "
+                f"{hex(int(getattr(symbol, 'address', 0)))}, not a function, so "
+                f"`function info` has nothing to report for it. Read it with "
+                f"`bn data vars --start {hex(int(getattr(symbol, 'address', 0)))}` "
+                f"or find it in `bn data symbols`."
+            )
 
         # Bounded hint cost, disclosed when it bites (SUGGESTION_CORPUS_MAX).
         capped = len(corpus) > SUGGESTION_CORPUS_MAX
