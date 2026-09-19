@@ -36,10 +36,14 @@ from . import taint_engine as _taint
 from ._shared import _parse_address, _require_mapped_address, _validate_count
 from .bridge_state import require_analysis
 
-# Import symbol kinds, in resolution-preference order. Mirrors the literal that
-# also lives as ``BinaryNinjaBridge._IMPORT_SYMBOL_TYPES`` (used by the imports
-# op, which stays on the bridge); kept here verbatim so the xref free functions
-# need no callback into the class.
+# THE definition of BN's import symbol-kind mapping, in resolution-preference
+# order (#827 item 3). It was duplicated verbatim in `read_misc`, justified by a
+# comment that the copy let "the xref free functions need no callback into the
+# class" -- a rationale that expired when the imports op moved off
+# `BinaryNinjaBridge` and both homes became free-function modules. `read_misc`
+# already imports this module one-way, so the LOWER module owns the list and the
+# higher one reads it: no new import edge, and the two can no longer disagree
+# about what BN calls an import.
 _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
     ("ImportedFunctionSymbol", "function"),
     ("ImportedDataSymbol", "data"),

@@ -58,6 +58,8 @@ bn exports [--count]                                 # public exported symbols (
 bn go functions [--summary | --count]                # recover Go names from .gopclntab (then `bn go rename`, a mutation)
 bn sections [--query <q>]
 bn tag list [--type Bookmarks --query <substr>]      # tags at all scopes; `--type Bookmarks` is the bookmarks tag
+                                                     # UNFILTERED it walks EVERY function (function tags + address tags);
+                                                     # narrow with --function <fn>, or --data for data tags alone
 bn tag get 0x401000 | --function <fn>                # tags at one address, or the whole-function tags
 bn tag types                                         # tag types (built-in + custom)
 bn comment list [--query <q>] [--scope {all|address|function}]   # `all` (default) includes function docs
