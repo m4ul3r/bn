@@ -12,8 +12,24 @@ from ..formatters import (
     _render_load_text,
     _render_refresh_text,
     _render_save_text,
+    _render_target_info_annotations_text,
     _render_target_info_text,
 )
+
+
+def _render_target_info_text_with_annotations(value: Any) -> str:
+    """`target info` text: the shared target summary, then the #793 annotations.
+
+    Composed here rather than inside `formatters._render_target_info_text`
+    because `target list` renders each row through the same summary and must NOT
+    print a provenance block per named target -- only the single-target view has
+    one view's annotations to disclose. `_render_target_info_annotations_text`
+    returns "" when the payload carries no block (an older bridge), so the output
+    is byte-identical to the pre-#793 one in that case.
+    """
+    body = _render_target_info_text(value)
+    annotations = _render_target_info_annotations_text(value)
+    return f"{body}\n{annotations}" if annotations else body
 
 
 @command("load", help="Load a binary into headless bridge",
@@ -282,6 +298,8 @@ def _target_info(args: argparse.Namespace) -> int:
         "target_info",
         {"selector": args.target, "verbose": bool(args.verbose)},
         require_target=True,
-        text_renderer=_render_target_info_text,
+        # #793: `target info` and `evidence orient` describe the same view, so the
+        # text view carries the annotation counts/provenance block too.
+        text_renderer=_render_target_info_text_with_annotations,
         stem="target-info",
     )

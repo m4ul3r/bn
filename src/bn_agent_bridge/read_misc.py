@@ -1013,14 +1013,33 @@ def _ascii_render(data: bytes) -> str:
     return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
 
 
+# Hard ceiling on ONE raw read, mirroring the linear-disassembly cap
+# (`read_decompile._LINEAR_DISASM_MAX`): a request over it is served CAPPED and
+# reports that it was capped (#827 item 4). High enough that an ordinary
+# whole-region dump still fits in one call -- the CLI spills the response, so a
+# bound this size is a guard against a pathological length, not a limit on work.
+_READ_MAX = 100_000
+
+
 def _read(ctx, selector: str | None, address, length: int):
     bv = ctx._resolve_view(selector)
     addr = _parse_address(address)
     if length < 0:
         raise RuntimeError(f"read length must be non-negative, got {length}")
+    requested_length = length
+    capped = length > _READ_MAX
+    # #827 item 4: cap the request, exactly as the linear-disassembly sibling caps
+    # at `read_decompile._LINEAR_DISASM_MAX`. The only other gate was `length < 0`,
+    # so a raw client (or `py exec`) could ask for the whole address space and have
+    # the bridge allocate it before anyone could see the size. The cap REPORTS
+    # itself (`capped`/`requested_length`/a note) rather than silently truncating:
+    # a bounded dump that reads as the whole window is the defect this file's
+    # sibling notes exist to prevent. The CLI spills large output, so the ceiling
+    # is high enough to be a dumping primitive, not a papercut.
+    effective = _READ_MAX if capped else length
 
-    data = bytes(bv.read(addr, length))
-    if length > 0 and not data:
+    data = bytes(bv.read(addr, effective))
+    if effective > 0 and not data:
         raise RuntimeError(f"Address 0x{addr:x} is not mapped (no bytes available)")
 
     result: dict[str, Any] = {
@@ -1029,12 +1048,21 @@ def _read(ctx, selector: str | None, address, length: int):
         "hex": data.hex(),
         "ascii": _ascii_render(data),
     }
-    if len(data) < length:
-        result["requested_length"] = length
+    notes: list[str] = []
+    if capped:
+        result["capped"] = True
+        notes.append(f"capped at {_READ_MAX} bytes (requested {requested_length})")
+    if len(data) < effective:
         result["short_read"] = True
-        result["note"] = (
-            f"short read: requested {length} bytes, only {len(data)} mapped from 0x{addr:x}"
+        notes.append(
+            f"short read: requested {effective} bytes, only {len(data)} mapped "
+            f"from 0x{addr:x}"
         )
+    if notes:
+        # The ORIGINAL request, so a capped read and a short read report the same
+        # key for the same question ("what did the caller ask for?").
+        result["requested_length"] = requested_length
+        result["note"] = "; ".join(notes)
     return result
 
 

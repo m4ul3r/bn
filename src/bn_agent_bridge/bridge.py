@@ -1183,6 +1183,35 @@ def _is_go_rename_auto_name(name: str, address: int) -> bool:
     return name == f"sub_{address:x}" or name.startswith("nullsub_")
 
 
+def _disclose_go_rename_skips(
+    result: dict[str, Any],
+    *,
+    skipped_already_named: int = 0,
+    skipped_interior_pc: int = 0,
+) -> dict[str, Any]:
+    """Attach the two #818-review skip buckets `go rename` used to drop silently.
+
+    `skipped_user_named` (a function at the pcln address the user named) was the
+    only skip reason this op ever disclosed, so the two other ways a DEFINED row
+    can fail to become a candidate left the envelope asserting `defined_count: N`
+    beside `go_renamed_candidates: 0` with nothing accounting for N:
+
+    * ``skipped_interior_pc`` -- no BN function STARTS at the pcln address; it
+      resolves only by CONTAINMENT (#818), and the recovered name belongs to the
+      start the view does not have, so it is never applied;
+    * ``skipped_already_named`` -- the function at that start already carries the
+      recovered name (the idempotent re-run, which used to be invisible).
+
+    Present only when non-zero, the listing envelope's own convention, so the
+    common envelope keeps the key set every consumer already parses.
+    """
+    if skipped_already_named:
+        result["skipped_already_named"] = skipped_already_named
+    if skipped_interior_pc:
+        result["skipped_interior_pc"] = skipped_interior_pc
+    return result
+
+
 _IMPORT_SYMBOL_TYPE_NAMES = IMPORT_SYMBOL_TYPE_NAMES
 _is_imported_function = is_imported_function
 
@@ -1210,6 +1239,21 @@ def _function_name_summary(bv) -> dict[str, int]:
     come from relocations) in a separate bucket so they don't inflate "named".
     Reflects whatever functions analysis has discovered so far."""
     functions = list(getattr(bv, "functions", []) or [])
+    # #757/#793 review: BN can hold two records for one start address, and one
+    # address is one function -- `function list` collapses them. Counting the RAW
+    # records here made `target info` (and the `target` block inside `evidence
+    # orient`) state a different total from `function list --count` for the same
+    # view, so the same collapse runs here and the count it dropped is disclosed.
+    #
+    # BOTH counts, not just the collapse: `duplicate_starts_unresolved` is the
+    # second half of the same disclosure (an address whose records could not be
+    # ranked by extent, so both were kept) and dropping it here published the
+    # reason on one surface while suppressing it on the other, with the two
+    # agreeing on every number -- the shape where a reader concludes the larger
+    # count is a phantom rather than an unresolved conflict (#757 review).
+    functions, collapsed_starts, unresolved_starts = read_listing._collapse_duplicate_starts(
+        functions
+    )
     total = len(functions)
     named = imported = 0
     imported_obj_names: set[str] = set()
@@ -1232,12 +1276,24 @@ def _function_name_summary(bv) -> dict[str, int]:
     # object both present) is not double-counted. The bv.functions partition
     # (named/unnamed) is unchanged -- those slots have no function object.
     extra_callable = read_misc._callable_import_slot_names(bv) - imported_obj_names
-    return {
+    summary = {
         "function_count": total,
         "named_function_count": named,
         "unnamed_function_count": total - named - imported,
         "imported_function_count": imported + len(extra_callable),
     }
+    if collapsed_starts:
+        # Present only when a collapse happened, the listing envelope's own
+        # convention, so a consumer that sees fewer functions than BN records can
+        # tell why and that the retained row carries the LARGER extent.
+        summary["duplicate_starts_collapsed"] = collapsed_starts
+    if unresolved_starts:
+        # The other half, on the same block: `function list` discloses this and
+        # `target info` did not, so an agent comparing the two read an unresolved
+        # conflict as a plain duplicate -- "the larger extent won" -- when no
+        # extent could be compared at all and both records are still live.
+        summary["duplicate_starts_unresolved"] = unresolved_starts
+    return summary
 
 
 class BinaryNinjaBridge:
@@ -2842,6 +2898,15 @@ class BinaryNinjaBridge:
                 "import_symbol_count": "rows returned by imports",
                 "imported_function_count": "callable imported function targets",
             },
+            # #793: the SAME annotation block `evidence orient` publishes, from
+            # the same builder, so the two surfaces cannot disagree about whether
+            # this view already carries inherited state. Orient answered this
+            # while `target info` -- the command every agent reaches for first --
+            # had no annotation key at all, so a cached .bndb read as a pristine
+            # view until a separate `bn comment list` pass contradicted it.
+            "existing_annotations": read_listing._existing_annotations(
+                self.ctx, bv, filename=filename
+            ),
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
         # target info -- the natural reflex, since function info accepts it -- is
@@ -3355,22 +3420,47 @@ class BinaryNinjaBridge:
                 recovered = read_go._go_functions(self.ctx, selector)
                 items = recovered.get("items") or []
                 bv = self._resolve_view(selector)
-                get_fn = getattr(bv, "get_function_at", None)
                 candidates: list[dict[str, Any]] = []
                 skipped_user_named = 0
+                # #818 review: the DEFECT this closes was an envelope stating two
+                # different totals for one question. `go functions` counts `defined`
+                # by CONTAINMENT (#818), so on a view whose pcln addresses are
+                # interior PCs of some body it reports `defined_count: 1848` -- and
+                # this loop re-resolved with START-only `get_function_at`, matched
+                # nothing, and returned `go_renamed_candidates: 0` with no bucket
+                # accounting for the 1848. Every defined row now lands in exactly
+                # one of the four buckets below (candidate / user-named / already
+                # carries the Go name / no BN function STARTS there), so
+                # `defined_count` reconciles with the sum on the rename side.
+                #
+                # A containment-only row is DISCLOSED, never renamed: the recovered
+                # name belongs to the function that starts at the pcln entryoff, and
+                # the containing function starts somewhere else, so applying it
+                # would mislabel a body under a name that is not its own. That is
+                # also why the auto-name guard cannot rescue it -- the guard compares
+                # the current name against `sub_<addr>` for THIS address.
+                skipped_already_named = 0
+                skipped_interior_pc = 0
                 for it in items:
-                    if not it.get("defined") or not callable(get_fn):
+                    if not it.get("defined"):
                         continue
                     try:
                         addr = int(it["address"], 16)
                     except (KeyError, ValueError, TypeError):
                         continue
-                    fn = get_fn(addr)
-                    if fn is None:
+                    # The walk guarantees a non-empty name for every item it emits
+                    # (an unnamed entry is counted as `skipped` there), which is
+                    # what keeps the four buckets a partition of `defined_count`.
+                    new_name = str(it.get("name") or "")
+                    if not new_name:
+                        continue
+                    fn, start_matched = read_go.resolve_pcln_function(bv, addr)
+                    if fn is None or not start_matched:
+                        skipped_interior_pc += 1
                         continue
                     current = str(getattr(fn, "name", "") or "")
-                    new_name = str(it.get("name") or "")
-                    if not new_name or current == new_name:
+                    if current == new_name:
+                        skipped_already_named += 1
                         continue
                     if not _is_go_rename_auto_name(current, addr):
                         skipped_user_named += 1
@@ -3382,16 +3472,23 @@ class BinaryNinjaBridge:
                     })
 
             if not candidates:
-                return {"kind": "go_rename", "success": True, "committed": False,
-                        "preview": preview, "results": [],
-                        "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
-                        "defined_count": recovered.get("defined_count", 0)}
+                result = {"kind": "go_rename", "success": True, "committed": False,
+                          "preview": preview, "results": [],
+                          "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                          "defined_count": recovered.get("defined_count", 0)}
+                return _disclose_go_rename_skips(
+                    result,
+                    skipped_already_named=skipped_already_named,
+                    skipped_interior_pc=skipped_interior_pc,
+                )
 
             return self._apply_go_renames_chunked(
                 bv,
                 candidates,
                 preview=preview,
                 skipped_user_named=skipped_user_named,
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
                 defined_count=recovered.get("defined_count", 0),
             )
 
@@ -3446,18 +3543,24 @@ class BinaryNinjaBridge:
         preview: bool,
         skipped_user_named: int,
         defined_count: int,
+        skipped_already_named: int = 0,
+        skipped_interior_pc: int = 0,
     ) -> dict[str, Any]:
         get_fn = getattr(bv, "get_function_at", None)
         if not callable(get_fn):
-            return {"kind": "go_rename", "success": False, "committed": False,
-                    "preview": preview, "rolled_back": True,
-                    "results": [{"op": "rename_symbol", "status": "unsupported",
-                                 "message": "BinaryView does not support get_function_at"}],
-                    "go_renamed_candidates": len(candidates),
-                    "go_verified_count": 0, "go_failed_count": 1,
-                    "go_committed_count": 0,
-                    "skipped_user_named": skipped_user_named,
-                    "defined_count": defined_count}
+            return _disclose_go_rename_skips(
+                {"kind": "go_rename", "success": False, "committed": False,
+                 "preview": preview, "rolled_back": True,
+                 "results": [{"op": "rename_symbol", "status": "unsupported",
+                              "message": "BinaryView does not support get_function_at"}],
+                 "go_renamed_candidates": len(candidates),
+                 "go_verified_count": 0, "go_failed_count": 1,
+                 "go_committed_count": 0,
+                 "skipped_user_named": skipped_user_named,
+                 "defined_count": defined_count},
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
+            )
 
         applied: list[dict[str, Any]] = []
         failed_rows: list[dict[str, Any]] = []
@@ -3537,7 +3640,11 @@ class BinaryNinjaBridge:
             result["message"] = "Rollback failed; the view may be partially renamed"
         elif preview and not rolled_back:
             result["message"] = "Preview rollback failed; the view may be partially renamed"
-        return result
+        return _disclose_go_rename_skips(
+            result,
+            skipped_already_named=skipped_already_named,
+            skipped_interior_pc=skipped_interior_pc,
+        )
 
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)
@@ -3700,41 +3807,40 @@ class BinaryNinjaBridge:
         # BNDB, inherited comments/names bias analysis and let an agent over-credit
         # itself; surface bounded counts + a provenance hint so the inherited baseline
         # is visible up front instead of requiring a separate `bn comment list` pass.
-        # Annotation counting is best-effort -- if the view can't be resolved/read it
-        # degrades to an `unavailable` marker rather than erroring the whole digest.
+        # #793: the block is built by `read_listing._existing_annotations` -- the ONE
+        # builder, shared with `target info`, which is why the two surfaces can no
+        # longer disagree. `_target_info` (called at the top of this digest) has
+        # already built it, so reuse that rather than pay the function/symbol
+        # walk a second time; the fallback keeps the field a dict for a double that
+        # answers `_target_info` without the key.
+        #
+        # #883 item 2: reuse it by TAKING it, not by leaving a second copy in
+        # place. `_target_info` publishes the block at its own top level and the
+        # digest republished the byte-identical dict again under `target` --
+        # 2629 + 2629 of an 11399-byte payload (46%) on the view this was
+        # measured on, and the same shape at 63% on a denser one. Built once
+        # (#793) and now emitted once: at the digest's top level, which is where
+        # trunk carried it, where `_render_orient_text` reads it, and where the
+        # bn-kernel `assert_unannotated` contract looks for it. Nothing reads the
+        # nested path; `target info` still publishes it, because there the block
+        # is that op's own answer rather than this digest's.
         filename = str(target.get("filename", "") or "")
-        analysis_cache_restored = filename.endswith(".bndb")
-        try:
-            bv = self._resolve_view(selector)
-            annotations = read_listing._annotation_summary(self.ctx, bv)
-            # #733 F2: keyed on ANALYST work, not the raw non-auto count -- the
-            # loader's own placeholders made a pristine view hint that its
-            # entirely-current-run analysis may predate the run.
-            total_annotations = (
-                annotations["comments"] + annotations["function_comments"]
-                + annotations["analyst_symbols"]
-            )
-            hint = None
-            if analysis_cache_restored or total_annotations:
-                hint = (
-                    f"existing BNDB annotations may predate this run: "
-                    f"{annotations['comments']} comment(s), "
-                    f"{annotations['function_comments']} function doc(s), "
-                    f"{annotations['analyst_symbols']} analyst symbol(s) already present "
-                    f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
-                    + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
-                    + " -- do not over-credit current-run analysis"
+        existing_annotations = target.pop("existing_annotations", None)
+        if not isinstance(existing_annotations, dict):
+            # A `_target_info` answered without the block (a double, or a bridge
+            # predating #793): build it here through the same builder, resolving
+            # the view through this bridge's own shim -- the path the digest has
+            # always used, and the one the unit doubles patch -- then degrade to
+            # the marker exactly as before if even that fails.
+            try:
+                bv = self._resolve_view(selector)
+                existing_annotations = read_listing._existing_annotations(
+                    self.ctx, bv, filename=filename
                 )
-            existing_annotations = {
-                **annotations,
-                "analysis_cache_restored": analysis_cache_restored,
-                "provenance_hint": hint,
-            }
-        except Exception as exc:
-            existing_annotations = {
-                "unavailable": f"annotation counts unavailable: {exc}",
-                "analysis_cache_restored": analysis_cache_restored,
-            }
+            except Exception as exc:
+                existing_annotations = read_listing._annotations_unavailable(
+                    exc, filename=filename
+                )
         return {
             "kind": "orient_digest",
             "target": target,

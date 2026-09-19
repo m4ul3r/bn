@@ -1509,6 +1509,55 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+@_discloses
+def _render_target_info_annotations_text(value: Any) -> str:
+    """Render the #793 annotation counts / provenance block for `target info`.
+
+    Its own function (composed onto `_render_target_info_text` by the command,
+    NOT folded into `_render_target_summary`) because `target list` renders every
+    row through that summary: folding it in would print a provenance block per
+    named target, and the fact this block states is about ONE view.
+
+    The wording is deliberately the same as `_render_orient_text`'s
+    `existing_annotations` block: one bridge key, one fact, two commands -- an
+    agent that read the line on `evidence orient` must recognize it here. The
+    INDENT follows this renderer's own grammar (tab-indented detail lines).
+
+    Returns "" when the payload carries no block at all -- an older bridge, or a
+    `target list` row -- so ABSENT stays distinguishable from a block that
+    reported zeroes, and the composed render is then byte-identical to the
+    pre-#793 output.
+    """
+    if not _field_present(value, "existing_annotations"):
+        return ""
+    annotations = _field_dict(value, "existing_annotations")
+    if annotations.get("unavailable"):
+        return f"\texisting annotations: unavailable — {annotations['unavailable']}"
+    # #619/#733 F2: every count goes through the choke point, so a counter the
+    # bridge sent in a shape no count reads prints `?` ON THE LINE a caller acts
+    # on, instead of a confident `0` that would read as "this view is pristine".
+    # #733 F2's analyst/placeholder split prints only when the bridge reports it:
+    # an absent key omits its fragment rather than fabricating a zero.
+    row = (
+        f"\texisting annotations: comments={_stated_count(annotations, 'comments')}, "
+        f"function-docs={_stated_count(annotations, 'function_comments')}, "
+        f"user-symbols={_stated_count(annotations, 'user_symbols')}"
+    )
+    if _field_present(annotations, "analyst_symbols"):
+        row += f", analyst-symbols={_stated_count(annotations, 'analyst_symbols')}"
+        if _field_present(annotations, "placeholder_symbols"):
+            row += f", placeholders={_stated_count(annotations, 'placeholder_symbols')}"
+    # A flag, not a count: through the flag choke point for the one shape a raw
+    # truthiness test gets exactly backwards ("false" is True to Python).
+    restored = _flag_field(annotations, "analysis_cache_restored")
+    row += f", cache-restored={bool(restored)}"
+    lines = [row]
+    hint = annotations.get("provenance_hint")
+    if hint:
+        lines.append(f"\t! {hint}")
+    return "\n".join(lines)
+
+
 def _render_target_choice(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1701,9 +1750,29 @@ def _render_go_rename_text(value: Any) -> str:
             return ("go rename: cannot say what this run did -- the candidate "
                     "count was unreadable, so neither the renames nor the "
                     "skips can be reported; re-read with --format json")
+        # #818 review: the two reasons below are the ones this op used to drop
+        # SILENTLY, so this line is where a reader learned "1848 defined, 0
+        # already user-named, nothing to do" with no way to reconcile it --
+        # the envelope's two-totals defect, in text. Each is stated through the
+        # count choke point and its fragment exists only when the bridge
+        # reported the bucket, the same absent-key convention the analyst split
+        # uses above.
+        reasons = [
+            f"{_stated_count(value, 'defined_count')} defined at pcln addresses",
+            f"{skipped} already user-named",
+        ]
+        if _field_present(value, "skipped_interior_pc"):
+            reasons.append(
+                f"{_stated_count(value, 'skipped_interior_pc')} resolving only "
+                "inside another function (no BN function starts there)"
+            )
+        if _field_present(value, "skipped_already_named"):
+            reasons.append(
+                f"{_stated_count(value, 'skipped_already_named')} already carrying "
+                "the recovered name"
+            )
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
-                f"({_stated_count(value, 'defined_count')} defined at pcln addresses, "
-                f"{skipped} already user-named)")
+                f"({', '.join(reasons)})")
     failed = _row_list(value, "results")
     # The default is a MEASUREMENT (targeted minus the failures), so it is used
     # only when the envelope claimed no verified count at all -- asking
@@ -1784,6 +1853,13 @@ def _render_go_functions_summary_text(value: Any) -> str:
                        ("undefined", "undefined"), ("renamable", "renamable")):
         if isinstance(value.get(key), int):
             lines.append(f"  {label}: {value[key]}")
+    # #818 review: `defined` is satisfied by CONTAINMENT, so the split between
+    # "resolved at its START" and "resolved only as an interior PC" is the number
+    # that decides whether the addresses can be trusted -- and it was JSON-only
+    # here, through a renderer that did not print it at all. Read in the same
+    # isinstance style as the four counters above (this view's own convention).
+    if isinstance(value.get("start_match_count"), int):
+        lines.append(f"  start_matches: {value['start_match_count']}")
     if value.get("truncated"):
         # #528: disclose that the declared table was only partially recovered.
         lines.append(
@@ -1794,6 +1870,12 @@ def _render_go_functions_summary_text(value: Any) -> str:
     if ts is not None:
         rebase = "" if (tsb is None or tsb == ts) else f"  (BN text {tsb} -- rebase needed)"
         lines.append(f"  text_start: {ts}{rebase}")
+    # #818 review: this view is the go/no-go headline before `go rename`, and the
+    # rebase/containment warning is exactly what it must not lose -- pre-#818 it
+    # was the view that said `defined 0 / undefined 1848` (loud and wrong), and
+    # the note is what keeps the corrected counters from being quiet and wrong.
+    if value.get("note"):
+        lines.append(f"  note: {value['note']}")
     return "\n".join(lines)
 
 
@@ -1976,6 +2058,47 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     return ""
 
 
+def _duplicate_starts_note(value: Any) -> str:
+    """The #757 duplicate-start counts for the TEXT face, or "" (#883 item 4).
+
+    `duplicate_starts_collapsed` / `duplicate_starts_unresolved` reached JSON on
+    every surface and no text renderer, so a text-mode reader was shown
+    `Total functions: 15` with nothing saying a start address had carried more
+    than one record. Both keys are published ONLY when the collapse actually
+    happened (`read_listing._disclose_collapsed_starts` omits a zero), so this
+    line appears exactly when it is true and a clean view renders byte-for-byte
+    as it did before -- no alarm to explain away.
+
+    The wording states WHOLE ADDRESSES, which is what the keys count:
+    `collapsed` is the number of start addresses whose records were merged (the
+    larger extent kept) -- NOT a number of dropped records, which the payload
+    never states -- and `unresolved` the addresses left carrying more than one
+    record because an extent could not be read, so no record could be chosen.
+    Both counts are read through `_count_field`, so an unreadable one states no
+    number (the enclosing boundary's `! malformed ...` note is what discloses
+    that the key was there) -- pinned by
+    `test_function_list_text_discloses_the_duplicate_start_collapse_883`.
+    """
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    collapsed = _count_field(value, "duplicate_starts_collapsed")
+    if collapsed:
+        parts.append(
+            f"{collapsed} start address(es) carried duplicate function records "
+            "-- the larger extent was kept"
+        )
+    unresolved = _count_field(value, "duplicate_starts_unresolved")
+    if unresolved:
+        parts.append(
+            f"{unresolved} start address(es) left with duplicate records "
+            "(an extent was unreadable, so none was dropped)"
+        )
+    if not parts:
+        return ""
+    return "// duplicate starts: " + "; ".join(parts)
+
+
 @_discloses
 def _render_function_count_text(value: Any, *, label: str = "Total functions",
                                 what: str = "function list/count") -> str:
@@ -1991,7 +2114,13 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     "Total functions: 175" read as a contradiction rather than as matches vs total.
     """
     count = value.get("count", 0) if isinstance(value, dict) else 0
-    return f"{_quick_partial_prefix(value, what)}{label}: {count}"
+    line = f"{_quick_partial_prefix(value, what)}{label}: {count}"
+    # #883 item 4: the count IS the post-collapse count (#757), so the collapse
+    # has to be visible beside it in text too -- "Total functions: 15" with no
+    # trace of the 16th record is the JSON-only disclosure the text face was
+    # missing. Absent keys add nothing.
+    note = _duplicate_starts_note(value)
+    return line if not note else f"{line}\n{note}"
 
 
 @_discloses
@@ -2003,8 +2132,16 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     demangled display_name (#196). A quick-loaded (partial) listing is prefixed
     with a warning so the page isn't mistaken for the whole binary (#437)."""
     page_key = "items" if _field_declared(value, "items") else "functions"
-    return _quick_partial_prefix(value) + _render_paged_list_text(
+    body = _quick_partial_prefix(value) + _render_paged_list_text(
         value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
+    # The #757 collapse counts ride the ENVELOPE, not a row, so the note survives
+    # `--offset`/`--limit` slicing and sits after the paging footer -- the same
+    # placement `_render_name_address_list_text` gives `self_defined_excluded`
+    # (#883 item 4).
+    note = _duplicate_starts_note(value)
+    if not note:
+        return body
+    return note if body == "none" else f"{body}\n{note}"
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:

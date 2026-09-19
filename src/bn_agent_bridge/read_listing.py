@@ -541,38 +541,72 @@ def _symbol_address_text(symbol) -> str | None:
         return None
 
 
+# ONE bound for every sample array `_annotation_summary` publishes (#733 F2/#793
+# review). The counts beside them stay EXACT: `bn_kernel.assert_unannotated`
+# refuses on `comments` / `function_comments` / `user_symbols` (+`analyst_symbols`),
+# so capping a sample may not move a single counter, and `target info` /
+# `evidence orient` must remain readable on a target with thousands of loader
+# placeholders -- the 20-row samples are what an agent reads; the numbers are what
+# a gate reads.
+_ANNOTATION_SAMPLE_LIMIT = 20
+
+
 def _annotation_summary(ctx, bv) -> dict[str, Any]:
     """Count annotations ALREADY present in the view (#561).
 
     On a cached/shared BNDB, inherited comments/names can bias analysis and let
     an agent over-credit itself for state a prior run produced. Surface counts
-    and bounded annotation samples; symbol exclusions are uncapped so each has
-    a reason. Address-comment counts include both the global map and each
-    function's local map; function-doc comments have their own count."""
+    and bounded annotation samples: every sample array is capped at
+    ``_ANNOTATION_SAMPLE_LIMIT`` rows and one dropped-count field
+    (``symbol_exclusions_dropped``) discloses the only sample whose shortfall a
+    boolean could not state, so the block stays readable on a target with
+    thousands of loader placeholders -- while every COUNT stays exact, because
+    ``bn_kernel.assert_unannotated`` refuses on them (#793 review).
+    Address-comment counts include both the global map and each function's local
+    map; function-doc comments have their own count."""
     comments = 0
     comment_locations: list[dict[str, Any]] = []
-    try:
-        address_comments = getattr(bv, "address_comments", None)
-        if address_comments is not None:
-            comments = len(address_comments)
-            for address, text in list(address_comments.items())[:20]:
-                comment_locations.append(
-                    {
-                        "address": hex(int(address)),
-                        "comment": str(text)[:160],
-                    }
-                )
-    except Exception:
-        comments = 0
-        comment_locations = []
+    # #861 review: this read is deliberately NOT guarded. It used to be wrapped
+    # in `except Exception: comments = 0`, so any OTHER failure of the global
+    # comment read -- the mid-walk mutation the snapshot below defends against,
+    # itself insurance rather than a reproduced crash, being the one failure this
+    # try/except was written for -- published a confident `comments: 0` with no
+    # `unavailable` marker: the fabricated clean bill of health
+    # `assert_unannotated` certifies on (#733 F2), and the one branch of this
+    # surface whose failure a caller could not tell from a pristine view. It now
+    # propagates to `_existing_annotations`, which degrades the whole block to the
+    # same `unavailable` marker an unreadable symbol enumeration already produced.
+    address_comments = getattr(bv, "address_comments", None)
+    if address_comments is not None:
+        comments = len(address_comments)
+        # #861: cheap insurance, NOT a reproduced hazard. Against BN 6.1
+        # `BinaryView.address_comments` builds and returns a FRESH local dict on
+        # every access, so a mid-walk `RuntimeError: dictionary changed size
+        # during iteration` cannot arise here, and the #850 symptom this comment
+        # used to lean on was diagnosed on a settling quick view rather than
+        # bisected to this accessor. What the snapshot costs is one O(n) copy of
+        # a dict that is already private; what it defends against is a BN build
+        # that ever hands back the live store -- which the regression tests model
+        # with a fake whose `items()` adds an entry mid-walk.
+        for address, text in list(dict(address_comments).items())[:_ANNOTATION_SAMPLE_LIMIT]:
+            comment_locations.append(
+                {
+                    "address": hex(int(address)),
+                    "comment": str(text)[:160],
+                }
+            )
 
     function_comments = 0
     function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
-        local_comments = getattr(fn, "comments", {}) or {}
+        # #861: the same cheap insurance on the per-function map, for the same
+        # reason (`Function.comments` also returns a fresh dict under BN 6.1) and
+        # with the same fake-modelled hazard. Taking it here means the two maps
+        # are read through ONE rule rather than one snapshot and one live walk.
+        local_comments = dict(getattr(fn, "comments", {}) or {})
         comments += len(local_comments)
         for address, text in local_comments.items():
-            if len(comment_locations) >= 20:
+            if len(comment_locations) >= _ANNOTATION_SAMPLE_LIMIT:
                 break
             comment_locations.append(
                 {
@@ -585,7 +619,7 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             text = str(getattr(fn, "comment", "") or "").strip()
             if text:
                 function_comments += 1
-                if len(function_comment_locations) < 20:
+                if len(function_comment_locations) < _ANNOTATION_SAMPLE_LIMIT:
                     function_comment_locations.append(
                         {
                             "name": str(getattr(fn, "name", "")),
@@ -649,16 +683,27 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             exclusion_reason = "debug_info"
         elif is_placeholder_symbol_name(name):
             exclusion_reason = "name_shape"
-        if len(user_symbol_locations) < 20 and address is not None:
+        if (len(user_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
+                and address is not None):
             user_symbol_locations.append({"name": name, "address": address})
         if exclusion_reason is not None:
             placeholder_symbols += 1
-            symbol_exclusions.append(
-                {"name": name, "address": address, "reason": exclusion_reason}
-            )
+            # #793 review: capped like every other sample in this block, with the
+            # rows the cap left out COUNTED on the block. Uncapped, this one list
+            # was ~99% of a real `target info` payload (2103 rows, ~182 KB,
+            # dominated by one placeholder family on a 2900-function target) and
+            # tripped the tool's own token guard on the command every agent runs
+            # first -- while `placeholder_symbols` above already states the full
+            # number the rows were enumerating, and the two reasons
+            # (`name_shape`/`debug_info`) are visible in a 20-row sample.
+            if len(symbol_exclusions) < _ANNOTATION_SAMPLE_LIMIT:
+                symbol_exclusions.append(
+                    {"name": name, "address": address, "reason": exclusion_reason}
+                )
         else:
             analyst_symbols += 1
-            if len(analyst_symbol_locations) < 20 and address is not None:
+            if (len(analyst_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
+                    and address is not None):
                 analyst_symbol_locations.append({"name": name, "address": address})
 
     return {
@@ -672,6 +717,20 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
         "placeholder_symbols": placeholder_symbols,
         "analyst_symbol_locations": analyst_symbol_locations,
         "symbol_exclusions": symbol_exclusions,
+        # The cap on `symbol_exclusions` as a COUNT, the `callers_dropped`
+        # convention, because the boolean below cannot carry it: it is scoped to
+        # the `*_locations` samples by its own name and by the kernel contract.
+        # `placeholder_symbols` remains the exact number of excluded symbols;
+        # this states how many of them the sample does not show, so a consumer
+        # that reads the sample is never told it is the whole set.
+        #
+        # Present only when rows were actually dropped, the convention both
+        # sibling disclosers follow (`callers_dropped` in this module,
+        # `duplicate_starts_collapsed` above): a clean view publishes NO key
+        # rather than a zero, so "the cap fired here" is readable from the key
+        # set alone (#793 review nit).
+        **({"symbol_exclusions_dropped": placeholder_symbols - len(symbol_exclusions)}
+           if placeholder_symbols > len(symbol_exclusions) else {}),
         "symbol_exclusion_limitations": (
             "name_shape is a heuristic, not provenance: analyst renames matching "
             "excluded name families may remain undetected. Internal symbol "
@@ -679,10 +738,12 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             "debug_info requires the imported name and address to match."
         ),
         # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
-        # at 20, so whenever the analyst pair could report truncation the user
-        # pair already does (#733 F2). Not because one sample contains the
-        # other -- it does not, once more than 20 placeholders precede an
-        # analyst row.
+        # at `_ANNOTATION_SAMPLE_LIMIT`, so whenever the analyst pair could
+        # report truncation the user pair already does (#733 F2). Not because
+        # one sample contains the other -- it does not, once more than 20
+        # placeholders precede an analyst row. `symbol_exclusions` is outside
+        # this flag on purpose: it is not a `*_locations` sample, and its own
+        # dropped COUNT (above) is a sharper disclosure than a boolean.
         "locations_truncated": any(
             count > len(locations)
             for count, locations in (
@@ -691,6 +752,70 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
                 (user_symbols, user_symbol_locations),
             )
         ),
+    }
+
+
+def _annotations_unavailable(exc: BaseException, *, filename: str = "") -> dict[str, Any]:
+    """The degrade marker for annotation counts nobody could read (#733 F2/#793).
+
+    ONE spelling, used both when the counts themselves fail and when the view
+    cannot be resolved at all: an unreadable summary published as
+    ``comments: 0`` certifies a contaminated view clean, and this marker is what
+    the kernel's ``assert_unannotated`` refuses instead. No counts are claimed --
+    a reader of this marker must not find an absent ``analyst_symbols`` and
+    assume zero.
+    """
+    return {
+        "unavailable": f"annotation counts unavailable: {exc}",
+        "analysis_cache_restored": str(filename or "").endswith(".bndb"),
+    }
+
+
+def _existing_annotations(ctx, bv, *, filename: str = "") -> dict[str, Any]:
+    """Counts + provenance hint for annotations ALREADY present in *bv* (#561).
+
+    ONE builder for the two surfaces that answer "can I trust this view as
+    pristine?" -- `target info` (#793) and the orient digest. #793 was filed on
+    the two of them DISAGREEING: the digest published ``existing_annotations``
+    (with ``analysis_cache_restored`` and ``provenance_hint``) while `target
+    info` -- the command every agent runs first -- had no annotation key at all,
+    so the same cached target read annotated on one surface and clean on the
+    other. Both now publish this block under the same key, from here.
+
+    The caller resolves *bv* itself, the way its own read path resolves it (the
+    digest through the bridge shim its unit doubles patch, `target info` from the
+    view it already holds); a resolution failure degrades to
+    ``_annotations_unavailable`` in the caller. ``analysis_cache_restored`` is
+    derived from *filename*: a ``.bndb`` carries the analysis cache, which is
+    where inherited comments/names come from. ``provenance_hint`` is keyed on
+    ANALYST work, not the raw non-auto count -- the loader's own placeholders
+    made a pristine view hint that its entirely-current-run analysis may predate
+    the run (#733 F2).
+    """
+    analysis_cache_restored = str(filename or "").endswith(".bndb")
+    try:
+        annotations = _annotation_summary(ctx, bv)
+    except Exception as exc:
+        return _annotations_unavailable(exc, filename=filename)
+    total_annotations = (
+        annotations["comments"] + annotations["function_comments"]
+        + annotations["analyst_symbols"]
+    )
+    hint = None
+    if analysis_cache_restored or total_annotations:
+        hint = (
+            f"existing BNDB annotations may predate this run: "
+            f"{annotations['comments']} comment(s), "
+            f"{annotations['function_comments']} function doc(s), "
+            f"{annotations['analyst_symbols']} analyst symbol(s) already present "
+            f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
+            + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
+            + " -- do not over-credit current-run analysis"
+        )
+    return {
+        **annotations,
+        "analysis_cache_restored": analysis_cache_restored,
+        "provenance_hint": hint,
     }
 
 
@@ -747,6 +872,113 @@ def _filtered_functions(
         functions.append(fn)
     functions.sort(key=lambda fn: (int(fn.start), fn.name))
     return functions
+
+
+def _extent_known(fn) -> bool:
+    """Whether this record's extent can be read at all (#757 review)."""
+    size = il_format._function_size(fn)
+    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
+
+
+def _duplicate_extent_key(fn) -> tuple[int, int]:
+    """Order two records that claim the SAME start address by extent (#757).
+
+    Only consulted for a group whose every member has a readable extent
+    (see `_collapse_duplicate_starts`), so the readable-size preference here is
+    a tiebreak among comparable records, not a substitute for comparison.
+    """
+    size = il_format._function_size(fn)
+    known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+    return (1 if known else 0, size if known else -1)
+
+
+def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int, int]:
+    """Keep ONE record per start address, and count the addresses that had more.
+
+    BN can hold several Function records for a single start address (an
+    overlapping or duplicated definition), and their sizes DISAGREE while both
+    rows assert ``size_known: true`` -- so a size-sorted triage or a "small
+    function = stub" heuristic reads whichever record sorted first as fact, per
+    address, with no round trip that could tell the two apart (#757). One
+    address is one function here: the record with the LARGER extent is retained
+    (the real body; the phantom is the smaller, stub-shaped one), and every
+    address that had more than one record is reported so the collapse is
+    disclosed rather than silent.
+
+    Returns ``(kept, collapsed, unresolved)``. A group whose members are all
+    sized collapses, and its larger extent wins. A group where any extent is
+    UNREADABLE cannot be ordered by that rule at all, so it is left standing
+    and counted in ``unresolved`` -- the issue's own second answer ("or report
+    the conflict"), and the only option that cannot promote a phantom.
+
+    Cheap by construction: addresses with a single record (every address on a
+    well-formed target) are never sized -- the extent read happens only inside a
+    group that actually collided. Ordering is preserved (the population arrives
+    ``(start, name)``-ordered, so first-seen grouping is address order).
+    """
+    grouped: dict[object, list[Any]] = {}
+    for fn in functions:
+        key: object
+        try:
+            key = int(fn.start)
+        except (AttributeError, TypeError, ValueError):
+            # A record whose start cannot be read cannot be shown to be a
+            # duplicate of ANYTHING, so it is keyed by identity and forms its own
+            # group (unit fakes model no `start`; passing the record through
+            # unchanged is the only answer that never invents a collapse).
+            key = fn
+        grouped.setdefault(key, []).append(fn)
+    if len(grouped) == len(functions):
+        return functions, 0, 0
+    collapsed = 0
+    unresolved = 0
+    kept: list[Any] = []
+    for group in grouped.values():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        if all(_extent_known(fn) for fn in group):
+            collapsed += 1
+            kept.append(max(group, key=_duplicate_extent_key))
+            continue
+        # "Keep the larger extent" is undefined when a record's extent cannot be
+        # read at all: choosing the record that happens to state a size lets a
+        # stub-shaped phantom outvote a real body the view would not size -- the
+        # exact confusion #757 was filed for. The issue's other accepted answer
+        # is "report the conflict", so the group is left intact and disclosed.
+        unresolved += 1
+        kept.extend(group)
+    return kept, collapsed, unresolved
+
+
+def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
+                               unresolved: int = 0) -> dict[str, Any]:
+    """Attach the #757 duplicate-start counts, when there were any.
+
+    ``duplicate_starts_collapsed`` counts addresses where the larger extent was
+    kept; ``duplicate_starts_unresolved`` counts addresses left with MORE than
+    one record because at least one extent could not be read, so the issue's
+    rule could not be applied (see `_collapse_duplicate_starts`). Both are
+    present only when non-zero, so the common envelope keeps the key set every
+    consumer already parses (the ``got_collapsed`` / ``self_defined_excluded``
+    convention in ``read_misc._imports``). A caller whose ``total`` lands below
+    its own count of raw BN records can then tell why -- and whether the
+    retained row carries the LARGER extent or the conflict was left standing.
+
+    SCOPING, because the two listing commands disagreed about it (#757 review):
+    the counts describe the population the caller collapses, which must be the
+    population its ``total`` is derived from. `function list` collapses the
+    address-filtered population it then counts; `function search` collapses the
+    MATCHED population, so a query that matches nothing reports no collapse
+    rather than the collapse of rows the answer never contained. A caller that
+    collapses one population and counts another reintroduces exactly that
+    mismatch, one command over.
+    """
+    if collapsed:
+        result["duplicate_starts_collapsed"] = collapsed
+    if unresolved:
+        result["duplicate_starts_unresolved"] = unresolved
+    return result
 
 
 def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
@@ -849,7 +1081,9 @@ def _list_functions(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    functions = list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
+        list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    )
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers (typically <= 16 bytes) that
         # otherwise list under the same name as the real body.
@@ -870,8 +1104,9 @@ def _list_functions(
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
-        return {"kind": "functions", "count": len(functions), "total": len(functions),
-                **_analysis_state_fields(bv)}
+        result = {"kind": "functions", "count": len(functions), "total": len(functions),
+                  **_analysis_state_fields(bv)}
+        return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     # #411 established that per-page display projection (basic_block_count) must
     # not be computed for the whole filtered set. display_name (a per-function
     # symbol lookup) and size follow the same rule, and #814 extends it to the
@@ -895,7 +1130,7 @@ def _list_functions(
         kind="functions", items=items, total=len(functions), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(result)
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))
 
 
 def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
@@ -1027,6 +1262,22 @@ def _search_functions(
             return needle in name.lower()
 
     matched: list[tuple[Any, str]] = []
+    # #757 review: the collapse runs on the MATCHED population -- the same
+    # scoping `function list` gives it, where the collapsed count describes the
+    # rows the answer was built from. Collapsing the pre-match population instead
+    # made the disclosed count describe rows the answer does not contain, so
+    # `function search <no-match>` answered `total 0, items []` beside
+    # `duplicate_starts_collapsed: 2`: a key whose own contract (fewer rows than
+    # the view holds, and here is how many were dropped) cannot be satisfied with
+    # no retained row, and one that a reader must reconcile against a total it has
+    # nothing to do with.
+    #
+    # Running it here keeps the property it exists for: the duplicate records for
+    # one start address are in the SAME group before any row is built, so a
+    # phantom twin still cannot reach the page as a second row carrying the
+    # conflicting size.
+    displays: dict[int, str] = {}
+    matched_functions: list[Any] = []
     for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
         # Match across name forms (mangled fn.name, demangled display_name, raw)
         # so a demangled C++ query finds a function BN named with the mangled
@@ -1039,7 +1290,12 @@ def _search_functions(
             # projections behind it) is built for the returned page only, so a
             # `function search --limit 20` over a 50k-function target no longer
             # sizes and materializes every match.
-            matched.append((fn, display))
+            matched_functions.append(fn)
+            displays[id(fn)] = display
+    matched_functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
+        matched_functions
+    )
+    matched = [(fn, displays[id(fn)]) for fn in matched_functions]
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
         # doesn't return each export twice (16-byte veneer + real body). size IS
@@ -1053,8 +1309,9 @@ def _search_functions(
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
-        return {"kind": "functions", "count": len(matched), "total": len(matched),
-                **_analysis_state_fields(bv)}
+        result = {"kind": "functions", "count": len(matched), "total": len(matched),
+                  **_analysis_state_fields(bv)}
+        return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     items = [
@@ -1069,4 +1326,4 @@ def _search_functions(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
     result.update(_analysis_state_fields(bv))
-    return _project_page_fields(result)
+    return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))

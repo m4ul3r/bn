@@ -2423,6 +2423,82 @@ def test_function_text_accepts_valid_views(monkeypatch):
         assert isinstance(text, str)
 
 
+def test_function_text_renders_the_hlil_tree_for_a_string_operation_827(monkeypatch):
+    # #827 item 5: `_format_hlil_tree` read `ins.operation.name` DIRECTLY at three
+    # sites, so an instruction whose `operation` is a bare STRING raised
+    # AttributeError mid-tree -- and `_function_text` swallows that into the flat
+    # `il.instructions` listing, so an entire tree silently rendered as the
+    # inferior listing instead of the tree the view actually had. The defensive
+    # `_il_op_name` exists for exactly this shape; each site is driven below, one
+    # root per site, so a fix that guards only the first one still fails.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Op:
+        def __init__(self, name):
+            self.name = name
+
+    class _StrNode:
+        """An IL instruction whose `operation` is a STRING rather than an object
+        with `.name` (a unit/double shape, and a documented possibility)."""
+
+        def __init__(self, op_name, text, **attrs):
+            self.operation = op_name
+            self.text = text
+            for key, value in attrs.items():
+                setattr(self, key, value)
+
+        def __str__(self):
+            return self.text
+
+    class _StrBlock(_StrNode):
+        def __init__(self, children):
+            super().__init__("HLIL_BLOCK", "")
+            self.children = children
+
+        def __iter__(self):
+            return iter(self.children)
+
+    class _OpNode(_StrNode):
+        """The normal shape: `operation` is an object carrying `.name`."""
+
+        def __init__(self, op_name, text, **attrs):
+            super().__init__(_Op(op_name), text, **attrs)
+
+    class _FlatFallback:
+        def __str__(self):
+            return "FLAT-FALLBACK-LINE"
+
+    def render(root):
+        hlil = types.SimpleNamespace(root=root, instructions=[_FlatFallback()])
+        fn = types.SimpleNamespace(name="widget_poll", start=0x401000, hlil=hlil)
+        return instance._function_text(None, fn, view="hlil")
+
+    # 1. the root/statement op (pre-fix: AttributeError on the root's own op).
+    text = render(_StrBlock([_StrNode("HLIL_ASSIGN", "x = 1", address=0x401000)]))
+    assert "x = 1" in text and "FLAT-FALLBACK-LINE" not in text
+
+    # 2. the HLIL_IF false-branch op.
+    branch = _OpNode("HLIL_IF", "if (x)", condition="x")
+    branch.true = _StrBlock([_StrNode("HLIL_ASSIGN", "y = 2")])
+    branch.false = _StrNode("HLIL_NOP", "empty else")
+    text = render(branch)
+    assert "if (x)" in text and "y = 2" in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+    # 3. the HLIL_SWITCH default op.
+    switch = _OpNode("HLIL_SWITCH", "switch (x)", condition="x")
+    switch.cases = [_StrNode("HLIL_CASE", "case 1:", values=[1],
+                             body=_StrNode("HLIL_ASSIGN", "y = 3"))]
+    switch.default = _StrNode("HLIL_NOP", "empty default")
+    text = render(switch)
+    assert "switch (x)" in text and "case 1:" in text and "y = 3" in text
+    # A NOP default renders no `default:` arm -- the comparison itself is the
+    # site, so this pins that it was made through the guarded helper.
+    assert "default:" not in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+
 def test_il_function_for_rejects_unknown_view(monkeypatch):
     # #527: the structured-IL boundary must reject an unknown view rather than
     # silently substituting MLIL (which the caller then labels as requested).
@@ -3598,3 +3674,50 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+    # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
+    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
+    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # the analysis threads can add to while the walk is in flight. The store
+    # below mutates DURING that walk (the #850 store's mechanism, walked through
+    # `values()` because this site unpacked the value view), so the pre-fix code
+    # dies of the production error and the snapshot returns what was there when
+    # the call started.
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+
+    class _LiveFunctionCommentStore(Mapping):
+        """`func.comments` as the bridge sees it: a live map analysis may add to
+        at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def values(self):
+            for index, text in enumerate(self._entries.values()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield text
+
+    class _FakeFunc:
+        comment = ""
+
+        def __init__(self, store) -> None:
+            self.comments = store
+
+    store = _LiveFunctionCommentStore({0x1000: "a local note"})
+    # Pre-fix: RuntimeError: dictionary changed size during iteration.
+    bodies = read_decompile._annotation_bodies(_FakeFunc(store), {})
+    assert bodies == ["a local note"]

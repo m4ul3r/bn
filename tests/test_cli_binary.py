@@ -254,6 +254,53 @@ def test_target_summary_text_shows_analysis_progress_when_active():
     assert "analysis progress:" not in initial
 
 
+def test_target_info_text_renders_existing_annotations():
+    """#793: `target info` text carries the annotation counts + provenance hint
+    the JSON always had, composed onto the shared target summary (never into
+    `_render_target_summary`, which `target list` renders per row). ABSENT stays
+    distinguishable: a payload with no block renders no line, so an older
+    bridge's output is byte-identical to the pre-#793 one."""
+    from bn.commands.binary import _render_target_info_text_with_annotations
+
+    annotated = _render_target_info_text_with_annotations({
+        "selector": "shared.bndb", "arch": "x86_64", "analysis_state": "full",
+        "existing_annotations": {
+            "comments": 8, "function_comments": 3, "user_symbols": 12,
+            "analyst_symbols": 5, "placeholder_symbols": 7,
+            "analysis_cache_restored": True,
+            "provenance_hint": "existing BNDB annotations may predate this run",
+        },
+    })
+    assert "existing annotations: comments=8, function-docs=3, user-symbols=12" in annotated
+    assert "analyst-symbols=5, placeholders=7" in annotated
+    assert "cache-restored=True" in annotated
+    assert "predate this run" in annotated
+
+    # An unreadable count keeps the line and says so, rather than rendering a
+    # confident "0 comments" for a view whose annotations nobody could read
+    # (#619/#733 F2) -- the shape the orient card is pinned on too.
+    unreadable = _render_target_info_text_with_annotations({
+        "selector": "shared.bndb", "existing_annotations": {
+            "comments": "many", "function_comments": 3, "user_symbols": 12,
+            "analysis_cache_restored": True,
+        },
+    })
+    assert "comments=?, function-docs=3, user-symbols=12" in unreadable
+
+    # An unavailable block prints its own marker, not counts.
+    unavailable = _render_target_info_text_with_annotations({
+        "selector": "shared.bndb", "existing_annotations": {
+            "unavailable": "annotation counts unavailable: view is dead",
+            "analysis_cache_restored": True,
+        },
+    })
+    assert "existing annotations: unavailable" in unavailable
+    assert "view is dead" in unavailable
+
+    plain = _render_target_info_text_with_annotations({"selector": "svc", "arch": "x86_64"})
+    assert "existing annotations" not in plain
+
+
 def test_target_info_verbose_renders_segments():
     """target info --verbose text appends the segment map with r/w/x perms; the
     block is absent when no segments are present (target list rows). (F21)"""
