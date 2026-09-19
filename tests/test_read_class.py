@@ -2583,3 +2583,42 @@ def test_declared_width_is_read_only_for_a_record_that_is_returned_675(monkeypat
     shown = read_class._class_show(ctx, None, "Widget")
     assert shown["size"] == {"value": "0x10", "source": "declared_type"}
     assert declared.width_reads > before
+
+
+def test_class_show_tracks_a_REDEFINED_declared_type_675(view_memo_live):
+    """The SECOND staleness axis (#675 item 2 dogfood): redefinition, not first
+    definition. A name whose DEFINITION changes under a primed registry must be
+    reported at its new size -- and the first axis cannot see this, because a
+    fallback that cached per-NAME would answer the old width here while passing
+    `..._is_live_not_memoised_675` unchanged. Two axes because they fail
+    differently: this one moves the value, that one moves the population.
+
+    `enumerations` stays at 1 throughout: the RTTI registry is still the memoised
+    one, so the only moving part is the declared half the fallback rebuilds."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+    bv.types = {}
+
+    ctx = seam.BridgeContext(None)
+    ctx._resolve_view = lambda sel: bv          # instance attribute shadows the seam
+
+    read_class._class_list(ctx, None)           # prime the registry memo
+    assert bv.functions.enumerations == 1
+
+    bv.types["Sprocket"] = _DeclaredType(width=0x14, name="Sprocket")
+    first = read_class._class_show(ctx, None, "Sprocket")
+    assert first["size"] == {"value": "0x14", "source": "declared_type"}
+
+    # A re-declare: same name, wider body, and still no notification fired.
+    bv.types["Sprocket"] = _DeclaredType(width=0x28, name="Sprocket")
+    again = read_class._class_show(ctx, None, "Sprocket")
+
+    assert again["size"] == {"value": "0x28", "source": "declared_type"}, (
+        "a redefined declared type must report its NEW width; a per-name cache "
+        "would still answer 0x14 here while passing the first-definition axis"
+    )
+    assert bv.functions.enumerations == 1, (
+        "the registry must still be the memoised one -- otherwise this test is "
+        "not exercising the staleness it claims to"
+    )
