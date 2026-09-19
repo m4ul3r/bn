@@ -299,7 +299,11 @@ def _reject_text_mode_offset(args: argparse.Namespace, stem: str) -> None:
              arg("--addresses", action="store_true", default=False,
                  help="Show address prefixes on each line"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
              arg("--force-analysis", action="store_true", default=False,
                  help="If Binary Ninja skipped this function (e.g. too large), override the skip "
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
@@ -350,7 +354,11 @@ def _decompile(args: argparse.Namespace) -> int:
              arg("--ssa", action="store_true",
                  help="Emit the SSA form of the selected IL view"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
          ])
 def _il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
@@ -377,7 +385,11 @@ def _il(args: argparse.Namespace) -> int:
              arg("--no-ssa", dest="ssa", action="store_false", default=True,
                  help="Emit non-SSA form (default: SSA)"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
          ])
 def _function_structured_il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)

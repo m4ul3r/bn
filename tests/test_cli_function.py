@@ -2997,3 +2997,43 @@ def test_a_symbol_whose_address_holds_a_function_still_resolves_675(monkeypatch)
     bv.get_function_at = lambda addr: marker if addr == 0x404010 else None
 
     assert instance.ctx._find_function(bv, "g_state") is marker
+
+
+def test_the_lines_help_names_its_text_only_restriction_exactly_where_it_applies_675():
+    """#675 item 3: `--lines` is refused under `--format json`, and the help
+    said only "Show only lines START through END" -- the restriction was
+    undocumented, so a caller met it as a runtime error.
+
+    The assertion is a CORRESPONDENCE, not a string: every command whose
+    handler calls `_require_text_format(args, "--lines")` must say so in the
+    flag's help, and every command that does NOT must not -- `disasm
+    --lines` works fine under json (it returns a `line_range` in the
+    payload), so documenting a restriction there would be the
+    wrong-explanation error, which is worse than the silence it replaces.
+    """
+    import inspect
+    from bn.commands import function as fc
+
+    source = inspect.getsource(fc)
+    restricted = source.count('_require_text_format(args, "--lines")')
+    documented = source.count("TEXT MODE ONLY")
+    assert restricted >= 1
+    assert documented == restricted, (
+        f"{documented} help strings claim the text-only restriction but "
+        f"{restricted} handlers enforce it -- the two must correspond, or the "
+        f"help documents a rule some command does not have")
+
+
+def test_disasm_lines_is_not_claimed_to_be_text_only_675(fake_transport):
+    """The must-not-fire half, as behaviour rather than as source: `disasm
+    --lines` under json must still reach the bridge, because that is the
+    command whose help deliberately makes no such claim."""
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "kind": "disasm", "function": {"name": "f", "address": "0x1000"},
+        "lines": [], "line_range": {"start": 1, "end": 3}}}})
+
+    rc = bn.cli.main(["disasm", "f", "--lines", "1:3", "--format", "json",
+                      "--target", "active"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "disasm"
