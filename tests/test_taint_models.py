@@ -431,6 +431,51 @@ def test_builtin_snprintf_family_declares_size_arm_808():
     assert "arguments 1 (length) or 2" in entry["model_description"], entry["model_description"]
 
 
+def test_fortified_read_family_arms_the_same_write_as_its_base_876():
+    # #876: the read-family `_chk` entries carried `sources` and `return_bound`
+    # but NO `sink`, while their unfortified counterparts all declare the
+    # bounded-write pair. A tainted length into `__read_chk` therefore reported
+    # reached_sinks=[] -- a false all-clear on the fortified build, which is
+    # the build a hardened target actually ships.
+    #
+    # This contradicted the family's own stated policy: `_comment_fortified`
+    # says the _chk call "still aborts at runtime, so it is lower-severity
+    # than the raw variant but a tainted length/source reaching it is worth
+    # surfacing". Copy/concat honoured that; the read family did not.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    for base in ("read", "recv", "recvfrom", "pread"):
+        base_sink = models[base]["sink"]
+        chk_sink = models[f"{base}_chk"].get("sink")
+        assert chk_sink is not None, f"{base}_chk lost its sink again"
+        # Same write, same arg layout: the _chk trailing buflen is a
+        # compile-time guard, it does not shift buf/len.
+        assert chk_sink["buf_arg"] == base_sink["buf_arg"] == 1, base
+        assert chk_sink["len_arg"] == base_sink["len_arg"] == 2, base
+        # Lower severity, because the fortify check aborts instead of
+        # overflowing -- the same class copy/concat _chk variants use.
+        assert chk_sink["class"] == "fortified_overflow", base
+        assert base_sink["class"] == "overflow_len", base
+        # Same opt-in gate: the ~100% FP fill-loop idiom (#499) that gated the
+        # base sink is identical on the fortified call, so arming one without
+        # the other would make `--sink-class recv_overflow` silently partial.
+        assert chk_sink["optional"] is True, base
+        assert chk_sink["gate"] == base_sink["gate"] == "recv_overflow", base
+
+
+def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876():
+    # Must-not-fire twin. `fgets`/`fread` declare no length sink on EITHER
+    # side -- they are bounded by their own size argument in a shape the
+    # engine does not model as attacker-controlled -- so the #876 sweep must
+    # not "fix" them into existence. The defect was an ASYMMETRY with the
+    # base model, not the absence of a sink.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    for base in ("fgets", "fread"):
+        assert models[base].get("sink") is None, base
+        assert models[f"{base}_chk"].get("sink") is None, base
+
+
 def test_scanf_family_models_carry_arity_capped_flag_851():
     # #851: scanf/fscanf (and their isoc99 aliases) declare `arity_capped: true`
     # so the engine can emit a weak-seed note when a real call has more actual
