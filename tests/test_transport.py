@@ -5581,14 +5581,28 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
         pytest.skip("Linux /proc/net/unix only")
     from bn.transport import path_has_bound_socket
 
-    root = tmp_path / "cache"
+    # Both names are deliberately SHORT, and the guard below is why. `sun_path`
+    # holds 108 bytes including the NUL, and the RENAMED name is the longer of
+    # the two -- so `bind` can succeed on the original path while `connect`
+    # overflows on the moved one, which is a confusing half-failure. Under
+    # pytest-xdist `tmp_path` gains a `popen-gw<N>/` component, and with the
+    # previous `cache` / `cache-moved` spelling that pushed the moved path to
+    # exactly 108 bytes: the suite was green serially and red under `-n`,
+    # contradicting the xdist-clean claim in CLAUDE.md.
+    root = tmp_path / "c"
     inst_dir = root / "instances"
     inst_dir.mkdir(parents=True)
     sock_path = inst_dir / "live.sock"
+    moved = tmp_path / "moved"
+    moved_len = len(str(moved / "instances" / "live.sock"))
+    if moved_len > 107:
+        refuse_silent_skip(
+            f"tmp_path makes the renamed socket path {moved_len} bytes, over the 107-byte "
+            f"AF_UNIX limit; re-run with a shorter --basetemp (pytest --basetemp=/tmp/bn)"
+        )
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(1)                       # bound AND listening, and stays that way
-    moved = tmp_path / "cache-moved"
     try:
         os.rename(root, moved)             # the operator moves the cache
         moved_sock = moved / "instances" / "live.sock"
