@@ -2380,3 +2380,47 @@ def test_the_non_function_code_path_is_unchanged_821():
     assert _slot_is_code(_slot("mapped", kind="code")) is True
     assert _slot_is_code(_slot("mapped", kind="data")) is False
     assert _slot_is_code(_slot("unmapped")) is False
+
+
+def _interior_code_row(index):
+    """A row whose word lands INSIDE a function -- the shape the normalizer
+    produces for a data word that merely equals a mid-function PC. Real
+    producer shape: `exact_start: False` plus the `delta` from the entry."""
+    value = 0x400000 + index * 8
+    return {"index": index, "entry_address": hex(0x9010 + index * 8),
+            "value": hex(value), "readable": True, "plausible": True,
+            "target": {"status": "function", "normalized": hex(value),
+                       "function": {"name": "m0", "address": "0x400000",
+                                    "exact_start": False, "delta": "0x8"}}}
+
+
+def test_the_scan_terminates_on_an_interior_pointer_821():
+    """#821 filed the SCAN, not the predicate.
+
+    The four `_slot_is_code` tests beside this one prove the predicate and
+    cannot observe the termination: `_code_row` -- the builder behind every
+    `_vtable_layout` case in this file -- emits a `function` entry with no
+    `exact_start` key, so every scan test exercises only the ABSENT-key
+    state. Deleting the loop's call to `_slot_is_code` leaves all four green.
+    Right logic, wrong entry point (#901 review).
+
+    The contract is the slot LIST and the COUNT: base accepted the interior
+    word and ran on to the data boundary, reporting slots [0,1,2] and
+    `total: 3` -- an exact total containing a fabricated slot, which is the
+    number an agent actually reads.
+    """
+    rows = [_code_row(0), _interior_code_row(1), _code_row(2), _data_row(3)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+
+    assert [s["index"] for s in layout["slots"]] == [0]
+    assert layout["total"] == 1
+
+
+def test_the_scan_does_not_over_terminate_on_exact_starts_821():
+    """Must-not-fire twin at the SCAN level: an ordinary all-entry-point
+    table must be unaffected, or the guard empties every vtable."""
+    rows = [_code_row(0), _code_row(1), _code_row(2), _data_row(3)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+
+    assert [s["index"] for s in layout["slots"]] == [0, 1, 2]
+    assert layout["total"] == 3
