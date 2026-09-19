@@ -1377,7 +1377,7 @@ def _yes_no(flag: Any) -> str:
     return "yes" if flag is True else "no" if flag is False else ""
 
 
-def _render_target_summary(value: dict[str, Any]) -> str:
+def _render_target_summary(value: dict[str, Any], *, per_row: bool = False) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
     prefix = f"[{view_id}] " if view_id is not None else ""
@@ -1476,6 +1476,24 @@ def _render_target_summary(value: dict[str, Any]) -> str:
             lines.append(
                 f"\t\t{seg.get('start')}-{seg.get('end')} {perms} ({seg.get('length')} bytes)"
             )
+    # #900: the same JSON-only disclosure the function-list family carried.
+    # `target info` publishes `duplicate_starts_*` too, so a text reader was
+    # shown a function count with nothing saying a start address had carried
+    # more than one record. ONE sentence for the fact, taken from the shared
+    # helper -- a second surface inventing its own wording is how one fact
+    # ends up with two spellings.
+    #
+    # `per_row` is False for `target list`, which shares this summary: a
+    # per-row disclosure there would repeat the line for every listed target
+    # (#901 review C4). `_render_target_info_annotations_text` already
+    # documents that deliberate non-folding for the annotations block; this
+    # follows it rather than inventing a second rule. Latent today because
+    # real `target list` rows carry no duplicate keys -- which is exactly
+    # when it is cheap to get right.
+    if not per_row:
+        note = _duplicate_starts_note(value)
+        if note:
+            lines.append(note)
     return "\n".join(lines)
 
 
@@ -1497,7 +1515,7 @@ def _render_target_list_text(value: Any) -> str:
     if not items:
         return "no targets"
     return "\n\n".join(
-        _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
+        _render_target_summary(item, per_row=True) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
     )
 
@@ -3224,6 +3242,16 @@ def _render_orient_text(value: Any) -> str:
                 raw = s.get("value")
                 shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
                 lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
+    # #900: same fact, same sentence, third surface. The keys live under
+    # `target` here, NOT at the digest's top level -- the digest returns
+    # `{"target": <target_info>, ...}` with no spread, so `_target_info`'s
+    # `duplicate_starts_*` never reach the outer dict. Reading the digest
+    # itself looked right and was dead code on every real payload (#901
+    # review C1): the note rendered in a unit test whose fixture put the keys
+    # top-level, and never once on a live orient.
+    note = _duplicate_starts_note(_field_dict(value, "target"))
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
