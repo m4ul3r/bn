@@ -126,11 +126,31 @@ true:
 | `committed` | true for any non-preview mutation that reached apply — including an all-noop |
 | `preview` | true when `--preview` was requested |
 | `measured` | **false** when the counts below could not be derived — the op reported no `results[]` rows to derive them from, or a field they are derived from arrived in a shape no value reads out of and was refused rather than read as a zero; see "Unmeasured mutations" |
-| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]`; `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true |
+| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]` (or, for `go rename`, from its own counters); `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true. `changed_count` is **also** `null`, with `measured` still `true`, when a FAILED revert left an unknown number of changes live — see "A revert that failed" below |
 | `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
 | `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
 | `dirty_after` | `true` iff the BNDB was left modified and needs `bn save` before closing |
 | `prototype_user_type_residue` | present and `true` only when a reverted `proto set` on an AUTO function left an unclearable `has_user_type` override behind; the view is modified even though the prototype value round-tripped, so `dirty_after` is `true` too |
+
+#### A revert that failed makes `changed_count` unknown
+
+`changed_count` is what is LIVE in the view when the call returns. When the
+revert itself failed (`committed: false`, `rolled_back: false`), an unknown
+subset of the applied changes is still live and the exact number is derivable
+from nothing the bridge reports — so `changed_count` is `null`, while `measured`
+stays `true`, because the counters and the failure rows DID read. Read that
+`null` as "unknown", never as "nothing landed": `0` is the "nothing changed,
+don't save" verdict, and this state reports `dirty_after: true` beside it. The
+default text line carries the same two facts as `mutation: rollback failed …
+changed=None … dirty_after=True`.
+
+The `--preview` variant counts the same way, because it is the same live state —
+a preview whose revert failed has really renamed the view. A preview that
+FAILED and reverted cleanly is the other case: it reports `changed_count: 0`,
+since the op is all-or-nothing and a live run of that state commits nothing. Its
+`verified_count` is how far the apply got before the failure, not what would
+land — `go rename`'s detail view states it as `0 would rename (N verified before
+the failure …)`.
 
 #### Unmeasured mutations
 
@@ -272,7 +292,12 @@ line and exit codes are therefore the same as every other mutation: it reports
 so a clean run whose counters read is exit `0` — and a counter that arrives
 unreadable is disclosed by name and the run is the unmeasured `4`, exactly as an
 empty `results[]` would be on any other op. Its own summary is a different
-measurement SOURCE, not an exemption from measurement.
+measurement SOURCE, not an exemption from measurement. Its two rollback states
+follow the same rule as every other mutation — see "A revert that failed makes
+`changed_count` unknown": a preview that failed and reverted cleanly reports
+`changed_count: 0` (all-or-nothing, so a live run of that state commits
+nothing), and a revert that did not complete reports `changed_count: null` with
+`dirty_after: true`.
 
 ### Data variables — bind a recovered type to an address
 
