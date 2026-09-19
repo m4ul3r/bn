@@ -4940,18 +4940,68 @@ def test_a_create_at_a_free_address_grows_no_overlap_keys_675():
     assert cc._with_overlap_note(dict(row), []) == row
 
 
-def test_both_create_paths_share_one_overlap_builder_675():
-    """`bn function create` runs `create_comments._function_create`; `batch
-    apply` runs `mutation_engine._op_function_create`. Patching only the one
-    found first left the command under test unchanged -- caught by the live
-    run, not by the suite. One builder, so the two cannot state the same
-    fact differently."""
-    import inspect
-    from bn_agent_bridge import create_comments as cc, mutation_engine as me
-    assert "_with_overlap_note" in inspect.getsource(cc._function_create)
-    assert "_with_overlap_note" in inspect.getsource(me._op_function_create)
-    assert "_containing_function_rows" in inspect.getsource(cc._function_create)
-    assert "_containing_function_rows" in inspect.getsource(me._op_function_create)
+class _OverlappingCreateBV(_FakeFunctionCreateBV):
+    """A create view whose containment answers, which the stock fake's does
+    not -- so every existing create drive takes the EMPTY path and cannot
+    observe the #675-item-14 note at all."""
+
+    def __init__(self, *, container_start, container_name="main", **kw):
+        super().__init__(**kw)
+        self._container = (container_start, container_name)
+
+    def get_functions_containing(self, addr):
+        start, name = self._container
+        return [types.SimpleNamespace(start=start, name=name)]
+
+
+def _overlap_bv(addr):
+    return _OverlappingCreateBV(
+        container_start=addr - 8,
+        segments={addr: _FakeSegment(readable=True, executable=True)},
+        memory={addr: b"\x55\x48\x89\xe5"},
+    )
+
+
+def test_the_single_command_create_path_returns_the_overlap_675(monkeypatch):
+    """The drive that actually failed in real life, through the entry point
+    `bn function create` uses.
+
+    This replaces an `inspect.getsource` assertion that both paths MENTION
+    the helper. That asserted the call site EXISTS, not that its result
+    REACHES the row -- it would pass a call site whose note is dropped
+    before the row is built, and it asserts source text, which this repo's
+    conventions forbid where a behavioural check is available.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, hex(addr), False)
+
+    row = result["results"][0]
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_the_batch_create_path_returns_the_same_overlap_675(monkeypatch):
+    """The other entry point, asserted on the OBSERVED row rather than on
+    the two call sites agreeing in source. A divergence introduced after
+    the helper call -- the failure the source assertion could not see --
+    fails here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", False, [{"op": "function_create", "address": hex(addr)}])
+
+    row = result["results"][0]
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert "legitimate" in row["note"] and "mistake" in row["note"]
 
 
 def test_a_view_that_cannot_answer_containment_discloses_nothing_675():
