@@ -385,6 +385,106 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     }
 
 
+# #675.2: the DECLARED half of the lens. `class list` / `class show` cluster
+# classes from symbols and RTTI, so a class the user DECLARED -- `bn types
+# declare 'class Widget { virtual void draw(); };'` -- is invisible to that half:
+# it has no `_ZTV`/`_ZTI` symbol and no demangled method symbol, so `class show
+# Widget` answered "No class named 'Widget'" while `types --query Widget` found
+# it. The records below are what the lens falls back to.
+#
+# They are read LIVE, never memoised, and deliberately NOT merged into the
+# memoised registry: `_build_class_registry` is invalidated by BN's symbol and
+# function notifications, and a `types declare` (`define_user_type`) emits no
+# such notification (#622's cache, #675's triage comment). A declared type folded
+# into that memo would stay invisible until some unrelated rename or analysis
+# pass dropped the registry -- a silently stale miss, worse than the consistent
+# one this fixes.
+_DECLARED_CONFIDENCE = "declared-only"
+_DECLARED_TYPE_NOTE = (
+    "declared type -- no RTTI class, demangled methods or construction sites for "
+    "this name in this view; the empty vtable/methods/instances are RTTI evidence "
+    "that is absent, NOT evidence this class has none"
+)
+
+
+def _no_instances() -> dict[str, Any]:
+    """The envelope :func:`_instances` returns when it found nothing.
+
+    The class card reads ``instances`` as a CONTAINER, so the registry's
+    pre-``_enrich`` ``[]`` would be disclosed as a malformed field on every
+    declared card (#619). Built fresh per record: a shared dict would let one
+    caller's append reach every other record."""
+    return {
+        "construction_sites": [],
+        "stored_globals": [],
+        "construction_sites_total": 0,
+        "construction_sites_truncated": False,
+        "stored_globals_total": 0,
+        "stored_globals_truncated": False,
+    }
+
+
+def _declared_types(bv) -> dict[str, Any]:
+    """``{name: type_obj}`` for the view's DEFINED types -- the LIVE read.
+
+    One function owns the enumeration so every consumer of the declared half
+    reads the same, current view (see the block comment above for why nothing
+    here may be memoised)."""
+    return {str(key): type_obj
+            for key, type_obj in list((getattr(bv, "types", None) or {}).items())}
+
+
+def _declared_size(type_obj) -> dict[str, Any] | None:
+    """The ``{value: N}`` size envelope for ONE defined type, or ``None`` when it
+    states no width (never fabricated) -- the same shape :func:`_object_size`
+    reports, so a declared class and an RTTI class state their size one way.
+
+    Called only for a record that is actually HANDED OUT. Reading a type's width
+    is a LAZY operation in BN: measured on a small C++ target, the first pass over
+    its 234 defined types costs ~250 ms (~1 ms per type, cached by BN after), so
+    paying it per record in the builder would put that on every `class list` --
+    including the default listing, whose declared records are counted and never
+    rendered -- and multiples of it on a DWARF-heavy view."""
+    try:
+        width = int(getattr(type_obj, "width", 0) or 0)
+    except Exception:
+        return None
+    return {"value": hex(width), "source": "declared_type"} if width > 0 else None
+
+
+def _declared_type_records(ctx, bv) -> dict[str, dict[str, Any]]:
+    """``{name: ClassRecord}`` for the view's DEFINED types (#675.2).
+
+    Every record is in the class registry's shape, so one renderer and one JSON
+    consumer read both halves of the lens, and every record carries
+    ``confidence: "declared-only"`` plus the note that says which kind of absence
+    its empty ``methods``/``vtable``/``instances`` is (see
+    :data:`_DECLARED_TYPE_NOTE`).
+
+    Built from the cheap facts only. ``size`` (see :func:`_declared_size`) and the
+    canonical ``ctx._type_entry`` -- which walks and renders a type's members --
+    are drill-downs the CALLERS attach to a record they return (a show's matches:
+    both; a listing's page rows: the size), exactly as the vtable layout and
+    object size are drill-downs on the RTTI side. ``ctx`` is unused today, kept
+    for the callers' uniform ``(ctx, bv)`` seam shape, as in
+    :func:`_build_class_registry`."""
+    return {
+        name: {
+            "name": name,
+            "methods": [],
+            "vtable": None,
+            "typeinfo": None,
+            "typeinfo_name": None,
+            "size": None,
+            "bases": [],
+            "instances": _no_instances(),
+            "confidence": _DECLARED_CONFIDENCE,
+            "notes": [_DECLARED_TYPE_NOTE],
+        }
+        for name in _declared_types(bv)
+    }
+
+
 # Standard-library / ABI-runtime top-level namespaces folded out by --no-stl.
 _LIBRARY_NAMESPACES = frozenset({"std", "__gnu_cxx", "__cxxabiv1"})
 
@@ -566,12 +666,26 @@ def _class_list(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
+    # #675.2: the DECLARED records join the candidates -- read live, never folded
+    # into the memoised registry (see `_declared_type_records`). A name the RTTI
+    # half already clustered keeps its RTTI record: the declared one adds no
+    # evidence, and `--all` (the gate that admits non-RTTI clusters) is what
+    # surfaces the rest.
+    needle = query.lower() if query else None
+    declared_only = [
+        rec for name, rec in _declared_type_records(ctx, bv).items()
+        if name not in registry and (needle is None or needle in name.lower())
+    ]
+    # The type objects behind the declared rows, for the size their ROWS state --
+    # read once here and consulted for the returned page only (`_declared_size`).
+    declared_types = _declared_types(bv) if declared_only else {}
     candidates = []
     library_suppressed = 0
     vendor_suppressed = 0
     construction_vtables_suppressed = 0
     thunks_suppressed = 0
-    for rec in registry.values():
+    declared_suppressed = 0
+    for rec in [*registry.values(), *declared_only]:
         name = rec["name"]
         # A thunk is never a type -- drop it unconditionally (even under --all),
         # so it isn't surfaced as a class/namespace (#309).
@@ -584,6 +698,12 @@ def _class_list(
             construction_vtables_suppressed += 1
             continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
+            # #675.2: a declared type is not RTTI/ctor-confirmed either, so the
+            # same gate folds it out of the default listing -- counted, so the
+            # fold-out is disclosed the way the library/vendor suppressions are
+            # rather than leaving `class list` silently blind to it.
+            if rec["confidence"] == _DECLARED_CONFIDENCE:
+                declared_suppressed += 1
             continue
         if no_stl and _is_library_class(name):
             library_suppressed += 1
@@ -610,6 +730,7 @@ def _class_list(
             "include_all": include_all,
             "no_stl": no_stl,
             "no_vendor": no_vendor,
+            "declared_suppressed": declared_suppressed,
             **_analysis_state_fields(bv),
         }
         if total == 0:
@@ -624,6 +745,12 @@ def _class_list(
     # and object size stay show-only -- they are far costlier per class. (#205 review)
     rows = []
     for rec in page:
+        if rec["confidence"] == _DECLARED_CONFIDENCE:
+            # #675.2: the declared row's size, taken for this page only -- the
+            # width is a lazy read in BN (see `_declared_size`).
+            type_obj = declared_types.get(rec["name"])
+            if type_obj is not None:
+                rec["size"] = _declared_size(type_obj)
         try:
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
@@ -645,6 +772,7 @@ def _class_list(
         "vendor_suppressed": vendor_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
+        "declared_suppressed": declared_suppressed,
         **_analysis_state_fields(bv),
     }
     if total == 0:
@@ -1264,6 +1392,35 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     registry = _build_class_registry(ctx, bv)
     matches = _resolve_class_names(registry, name)
     if not matches:
+        # #675.2: before the miss message, fall back to the view's DEFINED types --
+        # the RTTI/symbol half is blind to a class the user DECLARED, which has no
+        # `_ZTV`/`_ZTI` symbol and no demangled method to cluster. Read LIVE and
+        # resolved by the same name resolution as the registry, so a declared
+        # `ns::Widget` still answers a bare `Widget` query. The declared records
+        # come back as they were built: `_enrich`'s RTTI drill-downs (vtable
+        # layout, bases, instances) are precisely what the note says this view has
+        # no evidence for, so running them would only decorate a miss.
+        declared = _declared_type_records(ctx, bv)
+        declared_matches = _resolve_class_names(declared, name)
+        if declared_matches:
+            declared_types = _declared_types(bv)
+            records = []
+            for match in declared_matches:
+                rec = declared[match]
+                type_obj = declared_types.get(match)
+                if type_obj is not None:
+                    rec["size"] = _declared_size(type_obj)
+                    # The canonical `types` entry for the declaration (decl,
+                    # layout, members) -- a SHOW-only drill-down, exactly as the
+                    # vtable layout and object size are, and for the same reason:
+                    # `_type_entry` walks and renders the members, which is
+                    # affordable for the one class being shown and not for a
+                    # listing (see `_declared_type_records`).
+                    rec["type"] = ctx._type_entry(match, type_obj)
+                records.append(rec)
+            if len(records) == 1:
+                return records[0]
+            return {"ambiguous": True, "query": name, "matches": records}
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "
