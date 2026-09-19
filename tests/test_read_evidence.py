@@ -1276,6 +1276,49 @@ def test_init_arrays_no_tls_item_for_non_pe(monkeypatch):
     assert not any("TLS callbacks" in it["name"] for it in result["items"])
 
 
+def test_init_arrays_discloses_the_entry_population_819(monkeypatch):
+    """#819: the top-level `total` counts the SECTIONS in `items`, while the read's
+    `--limit N` caps ENTRIES per section -- so `.total` read as the entry
+    population never moved (one section, whatever the limit), and a bounded read
+    of a 400-constructor table looked like a complete 1-row answer. The entry
+    population now has its own name, next to the per-section counts it sums."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ctor = _FakeFunction(0x401000, "global_ctor")
+    table = b"".join((0x401000 + i * 4).to_bytes(4, "little") for i in range(8))
+    bv = _FakeBV(
+        functions=[ctor],
+        arch=_FakeArch(name="armv7"),
+        sections={".init_array": _FakeSection(".init_array", 0x5000, 0x5020)},
+        memory={0x5000: table},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._init_arrays("active", limit=2)
+
+    assert result["kind"] == "init_arrays"
+    assert result["total"] == 1              # the `items` collection: sections
+    assert result["total_entries"] == 8      # the population the limit bounds
+    assert result["items"][0]["shown_entries"] == 2
+    assert result["items"][0]["truncated"] is True
+
+
+def test_function_evidence_payload_carries_its_kind_discriminator_819(monkeypatch):
+    """#819: `evidence function` was the one read in its family with no `kind`, so
+    `jq .kind` answered null and a generic consumer could not tell this card from
+    any other object payload. The `calls` container the renderers read is
+    untouched (it is the documented leaf, and duplicating the heaviest array in
+    the module under a second key would double this read's payload)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+
+    result = instance._function_evidence("active", "probe_device", context=0)
+
+    assert result["kind"] == "function_evidence"
+    assert [call["address"] for call in result["calls"]] == ["0x401400"]
+
+
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2034,7 +2077,12 @@ def test_function_evidence_slicing_471(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: the call scan moved into read_call_evidence WITH `_function_evidence`,
+    # so the seam is patched where the scan is looked up now -- resolved through
+    # the package the loaded bridge actually uses (`_load_bridge` imports it under
+    # an alias, so a bare `bn_agent_bridge...` import would patch a second copy).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
     monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
@@ -2059,6 +2107,31 @@ def test_function_evidence_slicing_471(monkeypatch):
         instance._function_evidence("active", "dispatch", limit=0)
 
 
+def test_function_evidence_paging_validation_matches_the_shared_helper_827(monkeypatch):
+    """#827 item 8: the bridge re-enforces the CLI's argparse contract for a raw
+    socket / `py exec` client, and it must do so with the SAME code and wording
+    every other paged read uses (`_validate_count`) instead of ad-hoc
+    `invalid_context`/"Invalid offset: -1" messages that no sibling op emits.
+    Validation runs before the view is resolved, so no view is needed here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    with pytest.raises(bridge.OperationFailure) as context_exc:
+        instance._function_evidence("active", "dispatch", context=-1)
+    assert context_exc.value.status == "invalid_request"
+    assert context_exc.value.message == "context must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as offset_exc:
+        instance._function_evidence("active", "dispatch", offset=-1)
+    assert offset_exc.value.status == "invalid_request"
+    assert offset_exc.value.message == "offset must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as limit_exc:
+        instance._function_evidence("active", "dispatch", limit=0)
+    assert limit_exc.value.status == "invalid_request"
+    assert limit_exc.value.message == "limit must be >= 1, got 0"
+
+
 def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     """#622: a paged read returns the call PAGE without paying for the full
     Pseudo-C decompile, and says so -- `decompile_deferred` + a warning line, so
@@ -2067,7 +2140,9 @@ def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: patched where the scan is looked up now (see the slicing test above).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view",
                         lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
@@ -3809,6 +3884,330 @@ def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeyp
 
     assert "prototype_unverified" not in call
     assert call["argument_confidence"] == "authoritative"
+
+
+# --- #865: the callee-side read witness -----------------------------------
+#
+# Where no library names the callee, `_library_param_count` refuses (#862) and
+# `arity_mismatch` is silent -- the rendered list and the recovered prototype are
+# the SAME under-recovery, so `declared_count == len(arguments)` compares the
+# recovery against itself. The witness these tests drive settles that shape from
+# inside the binary: a body that reads an argument register its recovered
+# prototype does not declare takes more arguments than the recovery admits.
+
+
+def _with_llil(bv, *instructions):
+    """Give the callee at 0x401100 a body: one block, in address order."""
+    callee = bv.get_function_at(0x401100)
+    callee.low_level_il = [list(instructions)]
+    return callee
+
+
+def _read_into(address, dest, source_reg):
+    """``dest = <expr reading source_reg>`` -- a SET_REG with a register SOURCE."""
+    insn = _FakeLLILInstruction(
+        address, types.SimpleNamespace(name=dest), operation="LLIL_SET_REG")
+    insn.src = _FakeReg(source_reg)
+    return insn
+
+
+def _write_reg(address, dest):
+    """``dest = <constant>`` -- a SET_REG that reads no register at all."""
+    insn = _FakeLLILInstruction(
+        address, types.SimpleNamespace(name=dest), operation="LLIL_SET_REG")
+    insn.src = _FakeConstPtr(0x4000)
+    return insn
+
+
+def test_argument_confidence_reports_a_body_read_without_demoting_865(
+    monkeypatch,
+):
+    """#865 AC1, the shape neither shipped witness settles: an ordinary-named
+    local function no attached library names, whose recovered prototype declares
+    2 parameters and which HLIL rendered exactly those 2 -- so the #742 guard has
+    nothing to compare (#862's measured residual, `declared_count ==
+    len(arguments)`) and #862 has no library to consult. Its own body reads x2, a
+    third argument register. #865 review: the DETECTION is reported, the demotion is
+    WITHHELD. The scan is layout-order and CFG-blind, and an ABI position is not a
+    parameter count, so on unmutated corpus binaries every natural firing was a
+    correct prototype demoted on an artifact (16 of 16) -- over-demoting spends the
+    credibility `authoritative` exists to carry. The row keeps its confidence and
+    carries the two numbers plus the note saying why they are not an arity claim."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "x0"),
+        _read_into(0x401104, "sp_8", "x2"),   # a THIRD argument register
+    )
+
+    card = instance._function_evidence("active", "probe_device", context=0)
+    call = card["calls"][0]
+
+    assert call["argument_source"] == "hlil"
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
+    assert call["callee_read_arity"] == 3
+    assert call["declared_arity"] == 2
+    assert "NOT an arity claim" in call["callee_arity_note"]
+    # No library named the callee, so the #862 witness stayed silent: this is the
+    # residual itself being answered, not an override of a library verdict.
+    assert "prototype_unverified" not in call
+    assert "arity_mismatch" not in call
+    # The observation reaches TEXT mode too (hoisted into the function-level
+    # warnings), so the caveat is never invisible on the card.
+    assert any("NOTE" in w and "NOT an arity claim" in w for w in card["warnings"])
+
+
+def test_argument_confidence_kept_when_the_callee_body_reads_only_its_declared_args_865(
+    monkeypatch,
+):
+    """#865 AC4, matching arity: reading exactly the registers the prototype
+    declares is what a CORRECT recovery looks like and must stay authoritative."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["a", "b", "c"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "x0"),
+        _read_into(0x401104, "sp_8", "x1"),
+        _read_into(0x401108, "sp_16", "x2"),
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register_865(
+    monkeypatch,
+):
+    """#865 AC4, the genuinely-void callee: a body that reads no argument register
+    agrees with its recovered 0-parameter prototype, so it keeps `authoritative`
+    -- demoting here would flag every `f()` call in a stripped binary for nothing.
+    A body that WRITES an argument register as scratch is not a read."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+    _with_llil(bv, _write_reg(0x401100, "x0"))
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_865(
+    monkeypatch,
+):
+    """#865 AC4, variadic: a variadic body reaches its arguments through the
+    register save area / `va_list`, so an argument-register read is not an arity
+    claim at all -- the body below reads every integer register and the row is
+    left alone."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["fmt"], user_type=True)
+    bv.get_function_at(0x401100).type.has_variable_arguments = True
+    _with_llil(bv, *[_read_into(0x401100 + i * 4, f"sp_{i * 8}", f"x{i}") for i in range(6)])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(monkeypatch):
+    """The witness's own false-positive guard. A compiler routinely reuses a
+    caller-saved argument register as scratch, and a CALL clobbers all of them --
+    only a read of a register the body has not already written says anything about
+    the INCOMING arguments."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    _with_llil(
+        bv,
+        _write_reg(0x401100, "x2"),           # x2 reused as scratch...
+        _read_into(0x401104, "sp_8", "x2"),   # ...then read: not an argument
+        _FakeLLILInstruction(0x401108, None, operation="LLIL_CALL"),
+        _read_into(0x40110C, "sp_16", "x3"),  # read after a call: a result, not setup
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(monkeypatch):
+    """#865's stated intersection, pinned as a KNOWN gap rather than papered over:
+    both witnesses are blind to an import whose body is not in the image, so the
+    row keeps its claim and no witness field is invented for it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    _as_import(bv)   # an imported symbol, no body in this image
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_fires_on_a_sub_register_argument_read_865(monkeypatch):
+    """The REAL-IL shape, which a name-only match missed entirely: BN names a
+    register by the WIDTH the code touched, so a SysV argument read renders as
+    `esi` while `int_arg_regs` lists `rsi`. Measured on a compiled probe, a
+    3-parameter body reported zero argument-register reads and the witness never
+    fired outside the fakes. The scan canonicalizes both sides now."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    bv.get_function_at(0x401100).calling_convention = types.SimpleNamespace(
+        int_arg_regs=["rdi", "rsi", "rdx", "rcx", "r8", "r9"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "esi"),      # the 32-bit form of rsi...
+        _read_into(0x401104, "sp_8", "edx"),      # ...and of rdx: a THIRD argument
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert call["callee_read_arity"] == 3 and call["declared_arity"] == 2
+    assert "callee_arity_note" in call
+
+
+def test_argument_confidence_kept_when_a_sub_register_write_retires_the_argument_865(
+    monkeypatch,
+):
+    """The same canonicalization on the WRITE side: a compiler that reuses the
+    32-bit half of an argument register as scratch (`esi = eax`) retires the whole
+    register, so a later read of either half is not evidence about the incoming
+    argument. x86-64 and AArch64's w-form are both covered."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    bv.get_function_at(0x401100).calling_convention = types.SimpleNamespace(
+        int_arg_regs=["rdi", "rsi", "rdx", "rcx", "r8", "r9"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "edi"),      # arg 0: legitimate, index 0
+        _write_reg(0x401104, "esi"),              # rsi (arg 1) reused as scratch...
+        _read_into(0x401108, "sp_8", "rsi"),      # ...so neither the 64-bit form...
+        _read_into(0x40110c, "sp_16", "esi"),     # ...nor the 32-bit half is an argument
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_argument_confidence_fires_on_an_aarch64_w_register_argument_read_865(monkeypatch):
+    """AArch64's other half of the same rule: `w2` IS `x2`, so a body reading it
+    demonstrates a third argument register (`_arity_bv`'s default ABI list)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "w0"),
+        _read_into(0x401104, "sp_8", "w2"),
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["callee_read_arity"] == 3 and "callee_arity_note" in call
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
+    """#865's second shape, refused rather than guessed at. A decorated name can
+    carry IMPLICIT parameters -- a method's `this`, a by-value class return's sret
+    slot -- which are argument REGISTERS the body legitimately reads and the
+    parameter count never mentions, so a body-reads-more-than-declared comparison
+    is meaningless there. Same refusal `_library_param_count` makes, same
+    measured reason (3 of 4 raw #862 firings on a C++-heavy target were exactly
+    this). Here the callee's body reads three registers against a 2-parameter
+    prototype -- indistinguishable from the true positive above except for the
+    name, which is the whole point."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    callee = bv.get_function_at(0x401100)
+    callee.name = "_ZN4Impl7combineEii"          # an Itanium-mangled method
+    callee.raw_name = callee.name
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "x0"),      # `this`
+        _read_into(0x401104, "sp_8", "x1"),
+        _read_into(0x401108, "sp_16", "x2"),
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_arity_note" not in call
+
+
+def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(monkeypatch):
+    """One rule, two callers: the witness and `_library_param_count` must agree
+    about which names are trustworthy, or a name could be refused by one and
+    trusted by the other."""
+    bridge = _load_bridge(monkeypatch)
+    # #592: the predicate moved with the witness it guards.
+    mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    for plain in ("memcpy", "hw_get_version", "__popcountdi2", "sub_401199"):
+        assert mod._undecorated_name(plain) is True, plain
+    for decorated in ("", "_ZN4Impl7combineEii", "_Rfoo", "_Dbar", "_Tbaz",
+                      "?name@@YAXXZ", "$s4main3fooyyF", "memcpy.cold", "sym@GLIBC_2.2.5"):
+        assert mod._undecorated_name(decorated) is False, decorated
+
+
+def test_argument_confidence_not_demoted_when_a_read_precedes_its_write_in_layout_865(
+    monkeypatch,
+):
+    """The dogfood's first failure shape, and the reason the demotion is withheld.
+
+    Address order is not execution order: the block that READS x1 sits at a lower
+    address than the block that initializes it, so a layout-order scan sees a
+    read before any write and calls the register an argument the callee consumes.
+    Every natural firing measured on unmutated corpus binaries was a correct
+    prototype demoted on an artifact like this one (16 of 16 across two images),
+    which spends exactly the credibility `authoritative` exists to carry. The row
+    keeps its confidence and carries the observation plus the note."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    callee = bv.get_function_at(0x401100)
+    callee.low_level_il = [
+        [_read_into(0x401100, "sp_0", "x0"), _read_into(0x401104, "sp_8", "x1")],
+        [_write_reg(0x401200, "x1")],      # the initializer, laid out AFTER the read
+    ]
+
+    card = instance._function_evidence("active", "probe_device", context=0)
+    call = card["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
+    assert call["callee_read_arity"] == 2          # the observation is still reported
+    assert "NOT an arity claim" in call["callee_arity_note"]
+    assert any("NOTE" in w for w in card["warnings"])
+
+
+def test_argument_confidence_not_demoted_for_a_scratch_register_touch_865(monkeypatch):
+    """The dogfood's second failure shape: a genuinely 1-argument callee whose
+    body touches a register the ABI COULD pass a fourth argument in, purely as
+    scratch. An ABI position is not a parameter count, so the touch must not read
+    as a consumed argument -- the deterministic hand-asm repro the dogfood filed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"])
+    _with_llil(
+        bv,
+        _read_into(0x401100, "sp_0", "x0"),     # the one real argument
+        _read_into(0x401104, "sp_8", "x3"),     # x3 reused as scratch, not an argument
+    )
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+
+    assert call["argument_confidence"] == "authoritative"
+    assert "callee_under_recovered" not in call
+    assert call["callee_read_arity"] == 4
+    assert "NOT an arity claim" in call["callee_arity_note"]
 
 
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
