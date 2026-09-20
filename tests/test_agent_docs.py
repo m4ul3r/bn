@@ -666,11 +666,13 @@ def test_cli_layout_names_every_top_level_module():
 # rule the doc can quietly contradict, which is the exact defect #826 reports.
 # Three properties make the reading load-bearing. The bullet is located by
 # SECTION, so a correct copy elsewhere cannot vouch for a stale one where an
-# agent actually looks. Each clause is matched on what it CLAIMS rather than on
-# its vocabulary, so a bullet denying aliases exist cannot license the alias
-# exemption. And each clause is required exactly when the registry holds a
-# command of that shape, so a clause can neither be struck from the doc nor
-# outlive its subject.
+# agent actually looks. Each clause is matched on the RULE it states rather
+# than on a keyword, so a bullet that names a different naming scheme cannot
+# stand in for the one the tree follows. And each clause is required exactly
+# when the registry holds a command of that shape, so a clause can neither be
+# struck from the doc nor outlive its subject. The reach ends at polarity: a
+# clause carrying its own wording intact but negated around it still reads as
+# stated, which no rewrite of a rule into a different rule does.
 _CONVENTIONS_HEADING = "## Conventions"
 _HANDLER_BULLET_PREFIX = "- Command handlers are named"
 _HANDLER_BULLET_PATTERN = "`_<group>_<subcommand>()`"
@@ -859,12 +861,14 @@ def test_the_alias_exemption_covers_only_the_aliasing_path():
 
 
 def test_the_bullet_parser_reads_each_rule_not_a_keyword():
-    """#826: a clause must be recognised by what it CLAIMS.
+    """#826: a clause must be recognised by the RULE it states.
 
-    `alias` appearing in a clause that DENIES aliases exist used to license the
-    alias exemption, and the top-level clause was not read at all, so striking
-    it from the doc was invisible to every guard. Both are pinned on synthetic
-    bullets so the parser cannot loosen back to keyword matching.
+    `alias` appearing in a clause that denies aliases exist used to license
+    the alias exemption, and the top-level clause was not read at all, so
+    striking it from the doc was invisible to every guard. Each clause is
+    pinned twice on synthetic bullets -- struck entirely, and rewritten into a
+    DIFFERENT rule that keeps the clause's vocabulary -- so neither matcher can
+    loosen back to a keyword and stay green.
     """
     stated = (
         "- Command handlers are named `_<group>_<subcommand>()` (e.g., "
@@ -878,19 +882,30 @@ def test_the_bullet_parser_reads_each_rule_not_a_keyword():
     assert rules.cited == {
         "_function_list", "_decompile", "_help_index", "_symbol_rename"
     }
-    denied = stated.replace(
+    alias_clause = (
         "and a command that is an alias keeps the name of the path it aliases "
-        "(`rename` is `_symbol_rename`)",
-        "and command aliases are forbidden in this CLI",
+        "(`rename` is `_symbol_rename`)"
     )
-    assert _documented_rules(denied).alias is False, (
-        "a bullet denying aliases exist must not license the alias exemption"
+    top_level_clause = "; a top-level command keeps its bare verb (`_decompile`)"
+    assert _documented_rules(stated.replace(alias_clause, "")).alias is False, (
+        "striking the alias clause must stop it counting as documented"
     )
-    struck = stated.replace(
-        "; a top-level command keeps its bare verb (`_decompile`)", ""
-    )
-    assert _documented_rules(struck).top_level is False, (
+    assert _documented_rules(stated.replace(top_level_clause, "")).top_level is False, (
         "striking the top-level clause must stop it counting as documented"
+    )
+    reworded_alias = stated.replace(
+        alias_clause, "and command aliases are forbidden in this CLI"
+    )
+    assert _documented_rules(reworded_alias).alias is False, (
+        "a bullet that says something else about aliases must not license the "
+        "alias exemption just by using the word"
+    )
+    reworded_top_level = stated.replace(
+        top_level_clause, "; a top-level command is prefixed `_top_` (`_top_decompile`)"
+    )
+    assert _documented_rules(reworded_top_level).top_level is False, (
+        "a bullet stating a DIFFERENT top-level naming rule must not read as "
+        "stating the bare-verb one just by using the words"
     )
 
 
