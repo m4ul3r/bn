@@ -15,6 +15,7 @@ Two halves, both required by the issue:
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -1169,23 +1170,24 @@ def _render_duplicate_starts_bullet(m: dict) -> str:
     so this stops deriving it from prose: the entry's operative content is
     produced HERE, out of the measurement, and the file has to match.
 
-    The trade is stated rather than papered over.
+    The trade is stated rather than papered over, because over-claiming is
+    what this entry keeps being reviewed for.
 
     Closed: doc-side drift of any shape -- a clause, a comma, a continuation
-    line, a whole new sentence -- because the file must EQUAL this render; a
-    rename of any published key or per-row marker, because those are
-    interpolated out of the envelope; and a change to either number the entry
-    states, because those are interpolated too (writing "2 rows" here is
-    impossible without the bridge returning two).
+    line, a whole new sentence -- because the file must EQUAL this render; and
+    every identifier, marker and number the entry states, because the test
+    checks the RENDER against the measured sets, so swapping an interpolation
+    here for a literal is red even when the reference is edited to match.
 
-    Not closed: an author who edits this template and the reference together.
-    Nothing can close that -- rounds 3-6 escalated a prose-derived guard five
-    times trying. The two facts rendered as a word rather than a number (which
-    extent wins, whether every unranked record survives) are where that would
-    land. What makes it survivable is the size of the claim: the entry says
-    what a duplicated start does to the ROWS and to the COUNTS and stops, so
-    this template is short enough to read whole, and a sentence in it with no
-    measured value beside it is visible on sight.
+    Not closed: the words that render a boolean (which extent wins, whether
+    every unranked record survives) and the connective sentences that state no
+    identifier and no number. An author editing those here and in the
+    reference together is unreachable, and rounds 3-6 escalated a
+    prose-derived guard five times proving it. What makes it survivable is the
+    size of the claim: the entry says what a duplicated start does to the ROWS
+    and to the COUNTS and stops, so this template is short enough to read
+    whole and a sentence in it with no measured value beside it is visible on
+    sight.
     """
     keys = " / ".join(f"`{k}`" for k in m["count_keys"])
     markers = " or ".join(f'`"{v}"`' for v in m["markers"])
@@ -1274,6 +1276,16 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
 
     # --- THE REFERENCE IS THAT MEASUREMENT, RENDERED --------------------
     expected = _render_duplicate_starts_bullet(m)
+    # First: the render may only STATE values the measurement produced. An
+    # interpolation swapped for a literal -- the one way the template could
+    # still be edited into agreement with a false reference -- is red here.
+    assert set(re.findall(r"duplicate_start\w*", expected)) == (
+        set(m["count_keys"]) | set(m["row_keys"])), expected
+    assert set(re.findall(r'`"(\w+)"`', expected)) == set(m["markers"]), expected
+    assert set(re.findall(r"\d+", expected)) == {
+        "757",                                   # the issue this entry answers
+        str(m["ranked_rows"]), str(m["ranked_dropped_hits"]),
+    }, expected
     assert _duplicate_starts_bullet() == expected, (
         "skills/bn/reference/reading.md's duplicate-start entry is not what the "
         "bridge measures. This entry is GENERATED from the measurement above -- "
