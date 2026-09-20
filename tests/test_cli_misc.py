@@ -1663,6 +1663,30 @@ def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
     assert unreadable.startswith("Total strings: ?")
     assert "Total strings: 0" not in unreadable
 
+    # (d) The filter cannot have dropped a NEGATIVE number of strings, and
+    # both surfaces that state this number say so rather than restating the
+    # impossible quantity. `-2 filtered out by the active filters` is the
+    # confident-wrong-number harm the choke point exists to end, and it
+    # survived the imports repair because the cardinality rule was wired to
+    # the excluded key only (#795 round-5 review).
+    from bn import formatters
+    from bn.commands.misc import _strings_count_text
+
+    for dropped in (-2, "-02"):
+        line = _strings_count_text({"count": 30, "filtered": dropped})
+        listing = formatters._render_strings_text(
+            {"items": [], "total": 0, "count": 30, "filtered": dropped})
+        for rendered in (line, listing):
+            assert "-2" not in rendered, (dropped, rendered)
+            assert "malformed filtered field" in rendered, (dropped, rendered)
+        # ...and neither renders byte-identically to the unfiltered dump, which
+        # is the reading a silent drop would have given it.
+        quiet_line = _strings_count_text({"count": 30})
+        quiet_listing = formatters._render_strings_text(
+            {"items": [], "total": 0, "count": 30})
+        assert line.split("\n! malformed")[0] != quiet_line, (dropped, line)
+        assert listing.split("\n! malformed")[0] != quiet_listing, (dropped, listing)
+
 
 def _count_keys_read(fn_node):
     """The payload keys one count renderer reads, from its own source.

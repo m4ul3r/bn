@@ -11,7 +11,6 @@ from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, 
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
-    _count_field,
     _discloses,
     _field_skewed,
     _nonnegative_count,
@@ -52,9 +51,12 @@ def _strings_count_text(value: Any) -> str:
     an `int`, so `filtered: true` rendered "(True filtered out by the active
     filters)". The headline goes through `_stated_count` for the same reason it
     does everywhere else: `Total strings: 0` fabricated from an unreadable
-    counter reads byte-identically to an empty binary."""
+    counter reads byte-identically to an empty binary. The denominator goes
+    through the CARDINALITY reader the listing surface uses, so a filter that
+    claims to have dropped a negative number of strings is disclosed rather
+    than restated as a quantity (#795 round-5 review)."""
     line = f"Total strings: {_stated_count(value, 'count')}"
-    dropped = _count_field(value, "filtered")
+    dropped = _nonnegative_count(value, "filtered")
     if dropped:
         line += f" ({dropped} filtered out by the active filters)"
     elif _field_skewed("filtered"):

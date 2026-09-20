@@ -4197,11 +4197,12 @@ def _render_strings_text(value: Any) -> str:
     # nothing named the 1329 in between). Same shape as `imports`' note for the
     # exports its own filter excludes (#202).
     if isinstance(value, dict):
-        # ONE read, through the count choke point: absent/null answer 0 (nothing
-        # claimed, so nothing to say), a readable count states the filter's
-        # denominator, and an unreadable one is disclosed as unreadable rather
-        # than rendered as an unfiltered page (#619).
-        dropped = _count_field(value, "filtered")
+        # ONE read, through the CARDINALITY reader: absent/null answer 0
+        # (nothing claimed, so nothing to say), a readable count states the
+        # filter's denominator, and a count no filter could have produced --
+        # unreadable, or negative -- is disclosed as unreadable rather than
+        # rendered as an unfiltered page or as an impossible quantity (#619).
+        dropped = _nonnegative_count(value, "filtered")
         if dropped:
             note = (f"// {dropped} string(s) filtered out by the active filters "
                     f"(--query/--regex, --min-length/--max-length, --section, "
