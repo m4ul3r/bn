@@ -510,6 +510,9 @@ def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatc
     # and a rename really is live (asserted from the producer above).
     assert "0 renamed" not in detail, detail
     assert "unknown number of the renames this run applied are still live" in detail, detail
+    # ...and the counts it CAN support are stated, so the reworded line is not
+    # a vaguer replacement for the numbers it dropped (#693 r3).
+    assert "(1 verified, 1 failed, 3 skipped)" in detail, detail
 
     # Anti-vacuity, BOTH directions, from the SAME producer: the identical run
     # whose revert COMPLETED is a measured zero that is not dirty -- so the null
@@ -542,12 +545,50 @@ def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatc
     assert "0 would rename" not in preview_detail, preview_detail
     assert "unknown number of the renames this run applied are still live" in preview_detail, (
         preview_detail)
+    assert "(2 verified, 0 failed, 3 skipped)" in preview_detail, preview_detail
     # No apply failure happened here (`go_failed_count: 0`, `results: []`), so
     # this view may not name one, and may not send the reader to a list of
     # failures that does not exist -- at a view its own banner says may be left
     # modified.
     assert "before the failure" not in preview_detail, preview_detail
     assert "fix the failure(s) below" not in preview_detail, preview_detail
+
+
+def test_a_failed_preview_whose_revert_also_failed_still_lists_its_failure(monkeypatch):
+    """#693 r3: a failed preview revert is NOT always row-free.
+
+    The bridge computes `rolled_back` whenever the run was a preview OR
+    something failed, so `rolled_back: false` on a preview has TWO shapes: no
+    failure row at all (every rename verified, only the revert failed), and a
+    populated `results[]` (a rename failed AND the revert that followed did not
+    complete). Round 2 wrote the first as a universal into the public reference
+    and into the renderer's own comment, which is the same defect class this PR
+    exists to fix -- a claim the producer does not support -- and a reader who
+    trusts it stops parsing `results[]` on exactly the state that HAS rows.
+
+    This cell is the state's coverage: the unknown-count line is right for it
+    (the revert left renames live), and the failure row must still be listed
+    and counted beside it."""
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    both, live = _go_rename_produced(
+        monkeypatch, preview=True,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    # The shape the round-2 reference said could not occur.
+    assert both["preview"] is True and both["rolled_back"] is False
+    assert both["go_failed_count"] == 1 and len(both["results"]) == 1
+    assert live[0x401000] == "main.f0", live          # a rename is still live
+
+    summary = _go_rename_summary(dict(both))
+    assert summary["changed_count"] is None and summary["measured"] is True, summary
+    assert summary["failed_count"] == 1 and summary["dirty_after"] is True, summary
+
+    detail = _render_go_rename_text(dict(both))
+    assert "unknown number of the renames this run applied are still live" in detail, detail
+    assert "(1 verified, 1 failed, 3 skipped)" in detail, detail
+    # The row is listed under the line, which is why the reference may not tell
+    # a reader there is nothing there.
+    assert "failed: main.f1 @ 0x402000 (verification_failed)" in detail, detail
 
 
 def test_a_failed_preview_does_not_report_its_verified_rows_as_would_land(monkeypatch):

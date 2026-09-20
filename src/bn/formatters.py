@@ -1824,10 +1824,13 @@ def _render_go_rename_text(value: Any) -> str:
     # run of the same state commits zero; stating the rows that verified as
     # "would rename" misleads a caller that plans on it, and this view is the
     # one that CLAIMS those counts. It is asked here from `success` and the
-    # failure ROWS only: the compact summary has a third decider this view does
-    # not (it refuses when `go_failed_count` disagrees with the rows), so on
-    # that one payload the two faces still differ -- a pre-existing gap, named
-    # here rather than papered over by a comment claiming they cannot (#693 r2).
+    # failure ROWS only. The compact summary has deciders this view does not --
+    # it refuses when `go_failed_count` disagrees with the rows, when any
+    # counter it read came back in a shape no count reads out of, and it
+    # classifies each row BY STATUS where this view counts the raw list -- so
+    # on a skewed payload the two faces still differ. A pre-existing gap, named
+    # here rather than papered over by a comment claiming they cannot (#693
+    # r2/r3).
     ok = value.get("success") is not False and not failed
     lines: list[str] = []
     # A revert that did not complete is the ONE state where no line here may
@@ -1839,11 +1842,13 @@ def _render_go_rename_text(value: Any) -> str:
     # a 0 is the "nothing changed, do not save" verdict a control loop acts on.
     #
     # The preview line also named "the failure" and pointed at "the failure(s)
-    # below". On the shape the bridge actually emits for a failed preview revert
-    # -- `results: []` beside `go_failed_count: 0`, both built from the one
-    # `failed_rows` list -- there is NO apply failure and nothing listed below,
-    # and it directed a re-run at a view the banner above says may be left
-    # modified (#693 r2).
+    # below". A failed preview revert may have NO apply failure at all: the
+    # bridge computes `rolled_back` whenever the run was a preview OR something
+    # failed, so `results: []` beside `go_failed_count: 0` (every rename
+    # verified, only the revert failed) is one of its two shapes -- the other
+    # carries rows, and this branch prints them below either way. Naming "the
+    # failure" was wrong on the first shape; directing a re-run was wrong on
+    # both, at a view the banner above says may be left modified (#693 r2/r3).
     if rolled_back is False and not committed:
         lines.append(
             "rollback failed: the preview could not be reverted -- the view "

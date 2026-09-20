@@ -162,13 +162,26 @@ the failure …)`.
 A detail view may not state a count in the failed-revert state either, in
 either direction: `go rename --verbose` says `an unknown number of the renames
 this run applied are still live` rather than `0 renamed` / `0 would rename`,
-because the compact face of that same payload says `changed=None` and a
-bridge-emitted failed preview revert carries **no** failure row at all
-(`results: []` beside `go_failed_count: 0`) — so there is no apply failure to
-name and no list of failures to send the reader to. It states no denominator
-either: the envelope reports what VERIFIED, and a row whose rename was written
-but failed readback is also left modified by a revert that did not complete, so
-"N applied" is not a number this op can honestly put a figure on.
+because the compact face of that same payload says `changed=None`. It names no
+apply failure and directs no re-run: the banner above it says the view may be
+left modified, so "fix it and run again" is the wrong instruction there.
+
+It states no denominator either. The number it *can* report is what VERIFIED,
+and a row whose rename was written and then failed readback is also left
+modified by a revert that did not complete — so "N applied" is not a figure
+this op can put on it. The line reports `(N verified, M failed, S skipped)` and
+leaves the total unstated. When the verified counter is itself absent or
+unreadable the compact face drops to `measured: false` with every derived count
+`null`, and the detail view's `N` is then a fallback derived from the candidate
+count rather than something the envelope reported.
+
+**A failed preview revert may or may not carry a failure row — read both.** The
+bridge computes `rolled_back` whenever the run was a preview **or** something
+failed, so `rolled_back: false` on a preview occurs in two shapes: `results: []`
+beside `go_failed_count: 0` (every rename verified and only the revert failed),
+and a populated `results[]` beside a nonzero counter (a rename failed *and* the
+revert that followed did not complete). The rows are listed under the line in
+both, so do not stop parsing `results[]` because the state is a failed revert.
 
 #### Unmeasured mutations
 
