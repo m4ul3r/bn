@@ -725,6 +725,31 @@ def _documented_rules(bullet: str) -> _DocumentedRules:
     )
 
 
+def _clause_coverage(
+    handlers: dict[str, str], rules: _DocumentedRules
+) -> tuple[list[str], list[str]]:
+    """(command shapes the registry has that the bullet no longer documents,
+    rules the bullet documents that the registry holds no subject for).
+
+    A module-level helper rather than a table inside the test, so dropping a
+    row is itself pinnable: a row silently deleted would leave that command
+    shape unchecked with every other guard green, which is the reported defect
+    one level up.
+    """
+    clauses = (
+        ("grouped `_<group>_<subcommand>` commands",
+         any(" " in path for path in handlers), rules.grouped),
+        ("top-level bare-verb commands",
+         any(" " not in path for path in handlers), rules.top_level),
+        ("aliased commands",
+         len(set(handlers.values())) < len(handlers), rules.alias),
+    )
+    return (
+        [label for label, present, stated in clauses if present and not stated],
+        [label for label, present, stated in clauses if stated and not present],
+    )
+
+
 def _expected_handler_name(path: str) -> str:
     """`_<group>_<subcommand>` for a grouped path, the bare verb for a top-level one."""
     return "_" + "_".join(word.replace("-", "_") for word in path.split())
@@ -802,21 +827,12 @@ def test_command_handlers_follow_the_documented_naming_convention():
     )
     bullet = in_section[0]
     rules = _documented_rules(bullet)
-    clauses = (
-        ("grouped `_<group>_<subcommand>` commands",
-         any(" " in path for path in handlers), rules.grouped),
-        ("top-level bare-verb commands",
-         any(" " not in path for path in handlers), rules.top_level),
-        ("aliased commands",
-         len(set(handlers.values())) < len(handlers), rules.alias),
-    )
-    undocumented = [label for label, present, stated in clauses if present and not stated]
+    undocumented, stale = _clause_coverage(handlers, rules)
     assert not undocumented, (
         f"the registry has {undocumented} but the bullet no longer states the "
         f"rule for them, so nothing checks their handler names. The bullet "
         f"reads: {bullet!r}"
     )
-    stale = [label for label, present, stated in clauses if stated and not present]
     assert not stale, (
         f"the bullet documents {stale} while the registry holds none: a rule is "
         "only true while it has a subject"
@@ -860,52 +876,98 @@ def test_the_alias_exemption_covers_only_the_aliasing_path():
     ], "the alias exemption must come from the documented bullet, not the guard"
 
 
+# A synthetic bullet stating all three rules, and for each clause the exact
+# text to strike and a DIFFERENT rule written in the SAME vocabulary. The
+# rewrite is the load-bearing half: the clause's words survive it, so only a
+# matcher reading the RULE reports the clause absent, and any matcher loosened
+# back towards a keyword reports it present and reds.
+_PARSER_BULLET = (
+    "- Command handlers are named `_<group>_<subcommand>()` (e.g., "
+    "`_function_list`); a top-level command keeps its bare verb "
+    "(`_decompile`) — `help` is `_help_index`, and a command that is an "
+    "alias keeps the name of the path it aliases (`rename` is `_symbol_rename`)"
+)
+_CLAUSE_PINS = (
+    ("grouped", "`_<group>_<subcommand>()`", "`<group>::<subcommand>()`"),
+    ("top_level",
+     "; a top-level command keeps its bare verb (`_decompile`)",
+     "; a top-level command is prefixed `_top_` (`_top_decompile`)"),
+    ("alias",
+     ", and a command that is an alias keeps the name of the path it aliases "
+     "(`rename` is `_symbol_rename`)",
+     ", and an alias command is named `_alias_<path>` (`_alias_rename`)"),
+)
+
+
 def test_the_bullet_parser_reads_each_rule_not_a_keyword():
     """#826: a clause must be recognised by the RULE it states.
 
-    `alias` appearing in a clause that denies aliases exist used to license
-    the alias exemption, and the top-level clause was not read at all, so
-    striking it from the doc was invisible to every guard. Each clause is
-    pinned twice on synthetic bullets -- struck entirely, and rewritten into a
-    DIFFERENT rule that keeps the clause's vocabulary -- so neither matcher can
+    `alias` appearing in a clause that says something else about aliases used
+    to license the alias exemption, and the top-level clause was not read at
+    all, so striking it from the doc was invisible to every guard. Every
+    clause is now pinned twice -- struck entirely, and rewritten into a
+    different rule that keeps the clause's own vocabulary -- so no matcher can
     loosen back to a keyword and stay green.
     """
-    stated = (
-        "- Command handlers are named `_<group>_<subcommand>()` (e.g., "
-        "`_function_list`); a top-level command keeps its bare verb "
-        "(`_decompile`) — `help` is `_help_index`, and a command that is an "
-        "alias keeps the name of the path it aliases (`rename` is `_symbol_rename`)"
-    )
-    rules = _documented_rules(stated)
+    rules = _documented_rules(_PARSER_BULLET)
     assert (rules.grouped, rules.top_level, rules.alias) == (True, True, True)
     assert rules.exceptions == {"help": "_help_index", "rename": "_symbol_rename"}
     assert rules.cited == {
         "_function_list", "_decompile", "_help_index", "_symbol_rename"
     }
-    alias_clause = (
-        "and a command that is an alias keeps the name of the path it aliases "
-        "(`rename` is `_symbol_rename`)"
+    for field, clause, other_rule in _CLAUSE_PINS:
+        assert clause in _PARSER_BULLET, (
+            f"the {field} pin no longer quotes its own clause, so both of its "
+            "mutations are no-ops"
+        )
+        struck = _documented_rules(_PARSER_BULLET.replace(clause, ""))
+        assert getattr(struck, field) is False, (
+            f"striking the {field} clause must stop it counting as documented"
+        )
+        reworded = _documented_rules(_PARSER_BULLET.replace(clause, other_rule))
+        assert getattr(reworded, field) is False, (
+            f"a bullet stating a DIFFERENT {field} rule must not read as stating "
+            "this one just by reusing its words"
+        )
+
+
+def test_a_naming_exception_is_a_path_handler_pair_not_any_backticked_pair():
+    """#826: the Conventions list is dense with backticked prose.
+
+    A matcher that harvested every `x` is `y` pair would grant an exemption
+    the bullet never gave, and the exempted path's handler could then be named
+    anything at all.
+    """
+    with_prose = _PARSER_BULLET + "; the default `--format` is `text` for reads"
+    assert _documented_rules(with_prose).exceptions == {
+        "help": "_help_index", "rename": "_symbol_rename"
+    }, "only a `path` is `_handler` pair is a naming exception"
+
+
+def test_every_command_shape_in_the_registry_must_be_a_documented_rule():
+    """#826: the coverage wiring, not just the parser that feeds it.
+
+    A clause row dropped from `_clause_coverage` would leave that command
+    shape unchecked while every other guard stayed green -- the same defect
+    one level up from an unread clause.
+    """
+    every_shape = {"function list": "_function_list", "decompile": "_decompile",
+                   "symbol rename": "_symbol_rename", "rename": "_symbol_rename"}
+    all_stated = _DocumentedRules(True, True, True, {}, set())
+    assert _clause_coverage(every_shape, all_stated) == ([], [])
+    for field in ("grouped", "top_level", "alias"):
+        undocumented, stale = _clause_coverage(
+            every_shape, all_stated._replace(**{field: False})
+        )
+        assert len(undocumented) == 1 and not stale, (
+            f"a registry holding every command shape must report the {field} "
+            "rule undocumented the moment the bullet stops stating it"
+        )
+    undocumented, stale = _clause_coverage(
+        {"function list": "_function_list"}, all_stated
     )
-    top_level_clause = "; a top-level command keeps its bare verb (`_decompile`)"
-    assert _documented_rules(stated.replace(alias_clause, "")).alias is False, (
-        "striking the alias clause must stop it counting as documented"
-    )
-    assert _documented_rules(stated.replace(top_level_clause, "")).top_level is False, (
-        "striking the top-level clause must stop it counting as documented"
-    )
-    reworded_alias = stated.replace(
-        alias_clause, "and command aliases are forbidden in this CLI"
-    )
-    assert _documented_rules(reworded_alias).alias is False, (
-        "a bullet that says something else about aliases must not license the "
-        "alias exemption just by using the word"
-    )
-    reworded_top_level = stated.replace(
-        top_level_clause, "; a top-level command is prefixed `_top_` (`_top_decompile`)"
-    )
-    assert _documented_rules(reworded_top_level).top_level is False, (
-        "a bullet stating a DIFFERENT top-level naming rule must not read as "
-        "stating the bare-verb one just by using the words"
+    assert undocumented == [] and len(stale) == 2, (
+        "a rule the registry has no subject for must be reported stale"
     )
 
 
