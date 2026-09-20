@@ -3233,6 +3233,13 @@ def _render_orient_text(value: Any) -> str:
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")
+        # #757: this count is the listing's POST-COLLAPSE total, so the note
+        # that explains it belongs under it here for the same reason it does on
+        # `target info` -- a first-contact card is exactly where a silently
+        # reduced number is acted on.
+        duplicate_starts = _duplicate_starts_note(value, total_key="function_count")
+        if duplicate_starts:
+            lines.append(f"  {duplicate_starts}")
     imp = _field_dict(value, "imports_summary")
     total = imp.get("total_symbols", imp.get("total"))
     by_kind = _field_dict(imp, "by_kind")

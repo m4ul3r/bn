@@ -1767,6 +1767,59 @@ def test_render_orient_text_card(monkeypatch):
     assert "--quick" in out2 and "unavailable" in out2
 
 
+def test_orient_digest_discloses_the_duplicate_start_collapse_757(monkeypatch):
+    """The digest's function count is the LISTING's post-collapse total, so it
+    carries the same disclosure obligation `target info` does.
+
+    `_orient_digest` takes `function_count` out of the count-only `function
+    list` envelope, which this change made post-collapse -- and took the number
+    while leaving the two keys that explain it behind, so the text card showed
+    a silently reduced count. `evidence orient` is the other command an agent
+    runs on first contact, which is exactly the surface the #757 text
+    disclosure exists for.
+    """
+    from bn.formatters import _render_orient_text
+
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 3,
+                                               "by_kind": {"function": 3}})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [{"name": ".text"}], "total": 1})
+    # Exactly what the count-only listing hands back on a collided view.
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"kind": "functions", "count": 4, "total": 4,
+                                               "duplicate_starts_collapsed": 1,
+                                               "duplicate_starts_unresolved": 1})
+
+    digest = inst._orient_digest(None)
+    # The keys travel with the number they explain, at the digest's own level.
+    assert digest["function_count"] == 4
+    assert digest["duplicate_starts_collapsed"] == 1
+    assert digest["duplicate_starts_unresolved"] == 1
+
+    card = _render_orient_text(digest)
+    lines = card.splitlines()
+    count_line = next(i for i, line in enumerate(lines) if "functions: 4" in line)
+    assert "duplicate starts" in lines[count_line + 1], card
+    assert "the larger extent was kept" in lines[count_line + 1], card
+    assert "no record was chosen there" in lines[count_line + 1], card
+    # Denominator is the count printed above it, not a page size.
+    assert "all 4 function(s) this answer reports" in lines[count_line + 1], card
+
+    # A clean view publishes neither key and the card is unchanged.
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"kind": "functions", "count": 4, "total": 4})
+    clean = inst._orient_digest(None)
+    assert "duplicate_starts_collapsed" not in clean
+    assert "duplicate" not in _render_orient_text(clean)
+
+
 # --- #455: evidence table record-aware (mixed-record) mode ---
 
 class _RecBV:

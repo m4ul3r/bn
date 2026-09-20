@@ -4350,7 +4350,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # read by `_render_target_summary` (the note sits under the function count
     # it modifies) and therefore by `_render_target_info_text`, which composes
     # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
-    assert swept == 5016, f"the raise sweep ran {swept} renders, not 5016"
+    # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
+    # under the digest's own function count (1 renderer x 2 keys x 8).
+    # Measured by diffing the population, not carried over from a comment.
+    assert swept == 5032, f"the raise sweep ran {swept} renders, not 5032"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4521,7 +4524,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep gained (the two duplicate-start counts now read by
     # `_render_target_summary` and by `_render_target_info_text` composing it),
     # x 2 benign payloads each. Measured by diffing the population.
-    assert checked == 1457, f"the mirror ran {checked} renders, not 1457"
+    # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
+    # gained, x 2 benign payloads each. Measured by diffing the population.
+    assert checked == 1461, f"the mirror ran {checked} renders, not 1461"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

@@ -1021,11 +1021,15 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
     The bullet has to describe two structurally different outcomes -- a start
     whose records can be ranked (one wins on extent) and one whose records
     cannot (none is chosen, every record stays) -- plus how the two counts
-    behave under a row filter and under paging. Each is measured here and
-    returned, so the prose check below compares wording against behaviour
-    instead of against a fixed substring list.
+    behave under a row filter and under paging, which surfaces print them, and
+    what a clean view does. Each is measured here and returned, so the prose
+    check below compares wording against behaviour instead of against a fixed
+    substring list -- and so EVERY sentence of the bullet has a measurement to
+    be checked against.
     """
-    # RESOLVED: both extents readable, so the pair can be ranked.
+    from bn import formatters
+
+    # RANKED: every extent readable, so the group can be ordered by extent.
     resolved_pop = [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
@@ -1035,16 +1039,22 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
     resolved = instance._list_functions(None)
     resolved_rows = [r for r in resolved["items"] if r["address"] == "0x401014"]
     dropped_named = instance._search_functions("active", "poll_stub")
+    ranked_kept, _ = bridge.read_listing._collapse_duplicate_starts(list(resolved_pop))
 
-    # UNRESOLVED: one extent unreadable, so the rule cannot pick a record.
+    # UNRANKED: one extent unreadable, so the rule cannot pick a record. THREE
+    # records, because the bullet may not claim the group is a pair -- this is
+    # the issue's own reported shape (two rows asserting conflicting sizes at
+    # one address, both `size_known: true`).
     _view(monkeypatch, instance, [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_alt", total_bytes=32),
         _FakeFunction(0x401014, "poll_stub"),          # extent unreadable
     ])
     unresolved = instance._list_functions(None)
     unresolved_rows = [r for r in unresolved["items"] if r["address"] == "0x401014"]
-    twin_named = instance._search_functions("active", "poll_stub")
+    named_back = [instance._search_functions("active", row["name"])["total"]
+                  for row in unresolved_rows]
     kept = instance._list_functions(None, min_size=64, count_only=True)
     gone = instance._list_functions(None, min_size=1000, count_only=True)
 
@@ -1054,17 +1064,44 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
     ])
     paged = instance._list_functions(None, offset=3, limit=2)
 
+    # CLEAN: nothing collided, so nothing may be published or printed.
+    _view(monkeypatch, instance, [_FakeFunction(0x401000, "widget_init", total_bytes=28)])
+    clean = instance._list_functions(None)
+
     return {
         "envelopes": (resolved, unresolved, paged, kept, gone),
         "rows": tuple(resolved["items"]) + tuple(unresolved["items"]),
+        # BN holds more than one record for one start, and their sizes disagree.
+        "one_start_holds_conflicting_records": (
+            len(ranked_kept) == len(resolved_pop) - 1
+            and resolved_rows and resolved_rows[0]["size"] == 96
+        ),
         # A ranked start answers with ONE row, and it is the larger extent.
         "resolved_is_one_row": len(resolved_rows) == 1 and resolved_rows[0]["size"] == 96,
-        # The record it dropped is gone from the other command too.
+        # The record it dropped is gone from the other command too, so the
+        # collapse ran on the population BEFORE the query filtered it.
         "dropped_is_unreachable": dropped_named["total"] == 0,
-        # An unranked start answers with EVERY record it has...
-        "unresolved_keeps_all": len(unresolved_rows) == 2,
-        # ...and naming the record that was never ranked returns it.
-        "unranked_twin_reachable": twin_named["total"] == 1,
+        # An unranked start answers with EVERY record it has, whatever the count...
+        "unresolved_keeps_all": len(unresolved_rows) == 3,
+        # ...and naming ANY of them returns that record.
+        "unranked_records_reachable": named_back == [1, 1, 1],
+        # A record BN did size still reports a real size there -- the marker,
+        # not `size_known`, is what says it never won a comparison.
+        "unranked_sized_record_keeps_size_known": (
+            sum(1 for row in unresolved_rows if row["size_known"]) == 2
+        ),
+        # Rows of a duplicated start are labelled individually.
+        "rows_are_labelled": {row.get("duplicate_start") for row in unresolved_rows} == {
+            "unresolved"},
+        # Both keys are published, and the text face prints them.
+        "both_keys_published": {
+            k for env in (resolved, unresolved) for k in env
+            if k.startswith("duplicate_starts_")
+        } == {"duplicate_starts_collapsed", "duplicate_starts_unresolved"},
+        "text_prints_the_counts": (
+            "duplicate starts" in formatters._render_function_list_text(unresolved)
+            and "duplicate starts" in formatters._render_function_count_text(kept)
+        ),
         # `--offset`/`--limit` do not move the counts: this page carries the
         # disclosure while holding none of the addresses it counts.
         "counts_survive_paging": (
@@ -1077,7 +1114,30 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
         ),
         # ...and one that removes every record of it takes the count with them.
         "filter_drops_the_count": "duplicate_starts_unresolved" not in gone,
+        # A view with no collision publishes neither key and prints nothing.
+        "clean_view_is_silent": (
+            not any(k.startswith("duplicate_start") for k in clean)
+            and "duplicate" not in formatters._render_function_list_text(clean)
+        ),
     }
+
+
+#: Splits the bullet into sentences. The trailing class swallows the markdown
+#: that closes one (`**`, a quote, a bracket) so the terminator is still the
+#: period the lookbehind matched.
+_SENTENCE_SPLIT = re.compile(r"(?<=\.)[*`\"')\]]*\s+")
+
+#: ...and into CLAUSES, at every aside boundary, so a claim smuggled into a
+#: parenthetical or an em-dash aside is its own unit rather than riding on the
+#: anchor of the sentence that encloses it.
+_CLAUSE_SPLIT = re.compile(r"[.;()\u2014]")
+
+#: A clause NAMING a CLI flag is making an operational claim. (An envelope or
+#: row key makes one too; that vocabulary is derived from the measurement
+#: rather than listed here, so a key the bridge stops emitting stops being
+#: load-bearing on its own.) A clause that names neither is decoration --
+#: "(every extent readable)", "(#757)" -- and is not required to carry one.
+_CLI_FLAG = re.compile(r"--[a-z][a-z-]*")
 
 
 def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
@@ -1088,11 +1148,18 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     its mirror image, because the guard here was three `in bullet` checks plus
     one absence check: prose that was plainly false about the unresolved case
     still passed it, so nothing ever caught the replacement (#757 review round
-    4). Every claim below is now PAIRED with the measurement that decides
-    whether it is true, and asserted as `(phrase in bullet) is measured` -- so
-    the bullet cannot state a rule the bridge does not hold, cannot omit one it
-    does, and cannot quote a number no envelope carries. Change the collapse
-    rule and the required and forbidden sets swap, which is the point.
+    4). Two properties close that, and BOTH are needed:
+
+    * every claim below is PAIRED with the measurement that decides it and
+      asserted as `(phrase in bullet) is measured`, so the bullet cannot state
+      a rule the bridge does not hold nor omit one it does -- change the
+      collapse rule and the required and forbidden sets swap; and
+    * the claim inventory is COMPLETE: every sentence of the bullet must carry
+      one of those measured claims. Pairing alone only decides the sentences it
+      enumerates, so a bullet that GROWS a sentence -- rather than flipping an
+      enumerated one -- still shipped false prose green (#757 review round 5).
+      An unanchored sentence is an assertion nothing here measures, and it
+      fails.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1100,36 +1167,89 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     bullet = _duplicate_starts_bullet()
 
     claims = (
+        ("the collapse is disclosed on the text face, not only in the JSON",
+         m["text_prints_the_counts"], "disclosed in text, not only in JSON"),
+        ("BN can hold several records for one start address, with sizes that disagree",
+         m["one_start_holds_conflicting_records"],
+         "two Function records for one start address with conflicting sizes"),
+        ("the collapse runs on the address-filtered population, ahead of the query",
+         m["dropped_is_unreachable"], "before the query matches anything"),
         ("a ranked start answers with one row carrying the larger extent",
          m["resolved_is_one_row"], "ONE row carrying the larger extent"),
         ("the record the collapse dropped cannot be named back",
          m["dropped_is_unreachable"], "naming it returns nothing"),
         ("an unranked start keeps every record it has",
          m["unresolved_keeps_all"], "ALL of that address's records stay in the answer"),
-        ("the record that was never ranked is still reachable by name",
-         m["unranked_twin_reachable"], "naming either returns it"),
-        # The mirror image of the line above, decided by the SAME measurement:
-        # round 4 shipped exactly this sentence while the search returned the
-        # twin, and the old substring guard stayed green.
-        ("the unranked twin can never be returned by naming it",
-         not m["unranked_twin_reachable"], "can never be returned by naming it"),
-        ("every duplicated address answers with exactly one row",
-         m["resolved_is_one_row"] and not m["unresolved_keeps_all"],
-         "each address answers with one row"),
-        ("the counts describe the rows the answer contains",
-         not m["counts_survive_paging"], "describe the rows the answer contains"),
+        ("every record of an unranked start is still reachable by name",
+         m["unranked_records_reachable"], "naming any of them returns it"),
+        ("a sized record of an unranked start still reports size_known: true",
+         m["unranked_sized_record_keeps_size_known"], 'not "this size won"'),
+        ("each row of a duplicated start is labelled individually",
+         m["rows_are_labelled"], "therefore carries `duplicate_start`"),
+        ("a --sort size page that separates the group still self-describes",
+         m["rows_are_labelled"],
+         "`--sort size` page that splits the group apart is still self-describing"),
+        ("the row filters inside the counts' scope are --min-size, --named and the query",
+         m["filter_keeps_the_count"] and m["filter_drops_the_count"],
+         "everything `--min-size`, `--named` and the query left"),
+        ("the two counts are the published disclosure keys",
+         m["both_keys_published"],
+         "`duplicate_starts_collapsed` / `duplicate_starts_unresolved`"),
         ("the counts are unaffected by --offset/--limit",
          m["counts_survive_paging"], "NOT affected by `--offset`/`--limit`"),
         ("a filter that removes every record of an address removes its count",
          m["filter_drops_the_count"], "removes its count with it"),
         ("an address that keeps one record stays counted",
          m["filter_keeps_the_count"], "`duplicate_starts_unresolved: 1` beside `total: 1`"),
+        ("a clean view publishes and prints nothing",
+         m["clean_view_is_silent"], "only when non-zero"),
+        # The mirror images, decided by the SAME measurements. Round 4 shipped
+        # the first of these while the search returned the twin, and the old
+        # substring guard stayed green.
+        ("the unranked twin can never be returned by naming it",
+         not m["unranked_records_reachable"], "can never be returned by naming it"),
+        ("every duplicated address answers with exactly one row",
+         m["resolved_is_one_row"] and not m["unresolved_keeps_all"],
+         "each address answers with one row"),
+        ("the counts describe the rows the answer contains",
+         not m["counts_survive_paging"], "describe the rows the answer contains"),
     )
     for what, measured, phrase in claims:
         verb = "must state" if measured else "must NOT state"
         assert (phrase in bullet) is measured, (
             f"reading.md {verb} that {what} -- measured={measured}, "
             f"phrase={phrase!r}\n{bullet}")
+
+    # COMPLETENESS. Every sentence has to be one of the claims above, so a
+    # sentence added to this bullet arrives with a measurement or arrives red.
+    anchors = [phrase for _, measured, phrase in claims if measured]
+    sentences = [s for s in _SENTENCE_SPLIT.split(bullet) if s.strip()]
+    unanchored = [s for s in sentences if not any(a in s for a in anchors)]
+    assert not unanchored, (
+        "every sentence of this bullet must carry a claim this test MEASURES; "
+        "these assert something nothing here decides, which is exactly how "
+        f"three rounds of false prose shipped green: {unanchored}")
+    unused = [a for a in anchors if not any(a in s for s in sentences)]
+    assert not unused, (
+        "these measured claims anchor no sentence, so the inventory and the "
+        f"prose have drifted apart: {unused}")
+    # ...and the same at CLAUSE granularity for any aside that makes an
+    # OPERATIONAL claim -- one naming a CLI flag or an envelope/row key. That
+    # is the smuggling route sentence coverage leaves open: a parenthetical
+    # inside an anchored sentence. Decorative asides name neither and are
+    # exempt, so the rule does not force an anchor onto "(every extent
+    # readable)".
+    keys = {k for env in m["envelopes"] for k in env if "_" in k}
+    keys |= {k for row in m["rows"] for k in row if "_" in k}
+    operational = [
+        c for c in _CLAUSE_SPLIT.split(bullet)
+        if c.strip() and (_CLI_FLAG.search(c) or any(k in c for k in keys))
+    ]
+    smuggled = [c for c in operational if not any(a in c for a in anchors)]
+    assert not smuggled, (
+        "these clauses name a flag or an envelope key -- they make an "
+        "operational claim -- but carry none of the measured claims above, so "
+        f"nothing here decides whether they are true: {smuggled}")
 
     # Every disclosure key the bridge actually emits is named, so a new one
     # cannot ship undocumented.
