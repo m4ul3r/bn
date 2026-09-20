@@ -3547,6 +3547,18 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
         out.append(line)
         if reason:
             out.append(f"        <- {reason}")
+        # #827 item 1: the bridge follows ONE predecessor per step, so a value
+        # defined at a branch join has provenance this chain does not show. The
+        # count of unfollowed parents is the only half of item 1 this change
+        # delivers, and a JSON-only disclosure delivers it to nobody reading the
+        # default text view -- the same asymmetry #810 fixed for the truncation
+        # verdict, and the convention the sibling disclosures in this PR
+        # (analysis_incomplete, the per-callsite frontier) already follow.
+        _alt = _count_field(step, "alternate_parents")
+        if _alt:
+            out.append(
+                f"        <- joins {_alt} other tainted parent(s) not shown "
+                "(this is one of several provenance paths)")
     return out
 
 

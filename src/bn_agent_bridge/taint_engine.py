@@ -2847,29 +2847,61 @@ class TaintEngine:
             for i, side in enumerate(sides):
                 if not (self._chain_identities(ssaf, side) & cursor_ids):
                     continue
-                if self._is_opaque_base(ssaf, sides[1 - i]):
+                if self._is_opaque_base(ssaf, sides[1 - i], cursor_ids):
                     return str(left), str(right)
         return None
 
-    # Ops that make a pointer operand something other than a plain base: any of
-    # them means the cursor is not the only displacement applied.
-    _BASE_DISQUALIFYING_OPS = frozenset({
-        "MLIL_ADD", "MLIL_SUB", "MLIL_LSL", "MLIL_LSR", "MLIL_ASR",
-        "MLIL_MUL", "MLIL_MULU_DP", "MLIL_MULS_DP", "MLIL_ADD_OVERFLOW",
+    # An ALLOW-list, deliberately: a denylist of displacing opcodes is the wrong
+    # shape for a soundness gate, because every opcode nobody thought of defaults
+    # to "safe to claim". Measured on the denylist version: a base displaced with
+    # `MLIL_ADDRESS_OF_FIELD` (`&buf[K]`, the canonical lift of a constant offset
+    # into a fixed array -- the destination kind #791's own repro uses), or with
+    # `MLIL_OR`/`MLIL_ADC` (the spellings an optimiser picks for the same
+    # address arithmetic), all still qualified, so two spellings of one source
+    # line disagreed. These are the forms a pointer BASE can legitimately take;
+    # anything else is either a displacement or something this engine has not
+    # reasoned about, and in both cases the honest answer is to withhold the
+    # claim rather than make it.
+    _OPAQUE_BASE_OPS = frozenset({
+        # the value itself, and copies/widenings of it
+        "MLIL_VAR", "MLIL_VAR_SSA", "MLIL_VAR_ALIASED", "MLIL_VAR_SSA_FIELD",
+        "MLIL_SX", "MLIL_ZX",
+        # a whole object's address, a link-time address, an immediate
+        "MLIL_ADDRESS_OF", "MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT",
+        # a pointer read out of memory: opaque, and the cursor offsets it once
+        "MLIL_LOAD", "MLIL_LOAD_SSA",
     })
 
-    def _is_opaque_base(self, ssaf: Any, expr: Any) -> bool:
+    def _is_opaque_base(self, ssaf: Any, expr: Any, cursor_ids: set) -> bool:
         """Whether *expr* is a pointer base carrying no displacement of its own.
 
         The non-cursor half of a residual-chunk destination. A base reached
-        through copies and width extensions still counts (that is what
-        ``_def_chain`` sees through); one computed by further address arithmetic
-        does not, because then the write extent is that displacement PLUS the
-        chunk rather than the chunk alone."""
+        through copies and width extensions counts (that is what ``_def_chain``
+        sees through); one computed by further address arithmetic does not,
+        because then the write extent is that displacement PLUS the chunk rather
+        than the chunk alone.
+
+        Three things make it False, and each was a measured false claim:
+
+        * an op outside the allow-list above -- a displacement, or an operation
+          this engine has not reasoned about;
+        * a base that IS the cursor (`cursor + cursor`, stride 2 with the base
+          folded away): the extent is `total + cursor`;
+        * a chain that ran out of budget without terminating. ``_def_chain`` is
+          bounded, so "no arithmetic in the chain" really means "none within the
+          budget"; a displaced base behind more copies than that was claimed.
+          Real chains are two or three hops, so refusing at the bound costs
+          nothing and is the only answer that cannot be wrong.
+        """
         if expr is None:
             return False
-        return not any(op_name(e) in self._BASE_DISQUALIFYING_OPS
-                       for e in self._def_chain(ssaf, expr))
+        limit = 8
+        chain = self._def_chain(ssaf, expr, limit=limit)
+        if len(chain) >= limit:
+            return False
+        if not chain or any(op_name(e) not in self._OPAQUE_BASE_OPS for e in chain):
+            return False
+        return not (self._chain_identities(ssaf, expr) & cursor_ids)
 
     def _def_chain(self, ssaf: Any, expr: Any, limit: int = 8) -> list[Any]:
         """*expr* and the expressions it resolves to through pure SSA copies and

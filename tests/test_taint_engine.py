@@ -8460,6 +8460,10 @@ def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
     sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
                 left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
                 right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    # Declared before the shape switch: one variant needs to emit its own
+    # instructions (a base behind more copies than the def-chain budget).
+    instrs: list = []
+    addr = 0x18
     if dest_shape == "scaled":
         # &staging + (progress#1 << 2), the shift INLINE in the ADD -- the
         # spelling a real lifter emits for `uint32_t staging[]`, and the one
@@ -8521,12 +8525,64 @@ def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
         addr_expr = FExpr("MLIL_SUB", "&staging - progress#1", reads=[prog1],
                           left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
                           right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape in ("field_base", "or_base", "adc_base"):
+        # A base carrying its OWN displacement, in the three spellings a lifter
+        # and an optimiser pick for `&buf[K] + cursor`:
+        #   MLIL_ADDRESS_OF_FIELD -- the canonical lift of a constant offset
+        #     into a fixed array, which is the destination kind #791's own repro
+        #     uses;
+        #   MLIL_OR / MLIL_ADC     -- the same address arithmetic after an
+        #     optimiser has rewritten the add.
+        # The real extent from the buffer base is `K + total`, so a destination
+        # that holds exactly `total` bytes still overflows by K. An opcode
+        # DENYLIST let all three through while refusing the MLIL_ADD spelling of
+        # the identical source line -- two spellings of one program disagreeing.
+        _op = {"field_base": "MLIL_ADDRESS_OF_FIELD", "or_base": "MLIL_OR",
+               "adc_base": "MLIL_ADC"}[dest_shape]
+        displaced = FExpr(_op, f"{_op.lower()}(&staging, 0x40)",
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_CONST", "0x40", constant=0x40),
+                          src=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging))
+        addr_expr = FExpr("MLIL_ADD", f"({_op}) + progress#1", reads=[prog1],
+                          left=displaced,
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "cursor_plus_cursor":
+        # progress#1 + progress#1: stride 2 with the base folded away entirely,
+        # so there is no inner ADD to disqualify and the extent is
+        # `total + cursor`. The base must not BE the cursor.
+        addr_expr = FExpr("MLIL_ADD", "progress#1 + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "deep_displaced_base":
+        # A displaced base behind more pure copies than the bounded def-chain
+        # walk can see. "No arithmetic in the chain" only ever meant "none
+        # within the budget", so the walk must refuse at its bound instead of
+        # reading a truncated chain as clean.
+        base = FExpr("MLIL_ADD", "&staging + 0x40", reads=[],
+                     left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                     right=FExpr("MLIL_CONST", "0x40", constant=0x40))
+        for _h in range(9):
+            _s = FSSA(FVar(f"pb{_h}"), 1)
+            instrs.append(FInstr(len(instrs), 0x100 + 4 * _h, "MLIL_SET_VAR_SSA",
+                                 f"pb{_h}#1 = {base}", reads=[], writes=[_s], src=base))
+            base = FExpr("MLIL_VAR_SSA", f"pb{_h}#1", reads=[_s])
+        addr_expr = FExpr("MLIL_ADD", "deep_base + progress#1", reads=[prog1],
+                          left=base,
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "loaded_base":
+        # dst = [&slot] + progress#1: the base is a pointer READ from memory. It
+        # carries no displacement of its own, so the identity holds and the shape
+        # MUST still be claimed -- the allow-list has to admit a real base form,
+        # not only an address-of.
+        slot = FVar("slot", typ="void**")
+        addr_expr = FExpr("MLIL_ADD", "[&slot] + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_LOAD_SSA", "[&slot]",
+                                     src=FExpr("MLIL_ADDRESS_OF", "&slot", src=slot)),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
     else:
         addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
                           left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
                           right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
-    instrs: list = []
-    addr = 0x18
 
     def _bind(name, src_expr, reads):
         """Emit `name#1 = <src>` and return the operand that reads it."""
@@ -8684,8 +8740,9 @@ def test_forward_run_params_echo_the_configured_knobs_812(models):
     {"widen_len": True, "copy_hops": 2},  # both at once
     {"dest_shape": "swapped"},           # cursor + base, operands the other way
     {"dest_shape": "heap_base"},         # an OPAQUE base (a malloc return), unit stride
+    {"dest_shape": "loaded_base"},       # a pointer READ from memory, unit stride
 ], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied",
-        "swapped_operands", "opaque_heap_base"])
+        "swapped_operands", "opaque_heap_base", "loaded_base"])
 def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape):
     # #791 asked for the chunked-read residual (`n = cap - progress;
     # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
@@ -8740,8 +8797,24 @@ def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape
     ("sub_dest",
      "the cursor is SUBTRACTED from the base, so the write runs backwards out "
      "of the buffer and total bounds nothing"),
+    ("field_base",
+     "the base is &buf[K] spelled MLIL_ADDRESS_OF_FIELD, so the extent from the "
+     "buffer base is K + total -- and this is the destination kind #791's own "
+     "repro uses, so an opcode denylist got the issue's own case wrong"),
+    ("or_base",
+     "the same displaced base after an optimiser rewrote the add as MLIL_OR"),
+    ("adc_base",
+     "the same displaced base after an optimiser rewrote the add as MLIL_ADC"),
+    ("cursor_plus_cursor",
+     "stride 2 with the base folded away entirely -- there is no inner ADD to "
+     "disqualify, so the base must be checked against BEING the cursor"),
+    ("deep_displaced_base",
+     "a displaced base behind more pure copies than the bounded def-chain walk "
+     "can see, so 'no arithmetic in the chain' silently meant 'none within the "
+     "budget'"),
 ], ids=["scaled_index", "pointer_table_load", "extra_offset", "cursor_added_twice",
-        "subtracting_destination"])
+        "subtracting_destination", "address_of_field_base", "or_displaced_base",
+        "adc_displaced_base", "cursor_plus_cursor", "deep_displaced_base"])
 def test_residual_chunk_refuses_a_destination_the_cursor_does_not_offset_791(
         models, dest_shape, why):
     # The disclosure's whole value is the sentence it attaches: "the loop's

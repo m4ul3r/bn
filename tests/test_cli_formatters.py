@@ -3840,9 +3840,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # "nothing was dropped" -- exactly the reassurance the block exists to
     # refuse. Routed through the helper rather than `get(k, 0)` so the residue
     # census stays put and these five join the covered set instead.
-    assert len(sites) == 24, (
+    # 24 -> 25 (#827 item 1): `_render_taint_path` now reads `alternate_parents`
+    # through `_count_field`. It is a count in a DISCLOSURE line, so a
+    # fabricated zero would silently delete the disclosure and a fabricated
+    # number would invent one; both are worse than the marker being absent.
+    assert len(sites) == 25, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 24. The number is the size of the covered set: a "
+        "count helper, not 25. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3924,6 +3928,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # #827 item 1: gated behind a truthiness check, so an unreadable value
+        # drops the disclosure clause entirely rather than stating `?`. That is
+        # the intended behaviour -- a disclosure built out of a value nobody can
+        # read is not a disclosure -- and it is asserted directly in
+        # `test_taint_path_discloses_a_phi_join_in_the_text_view_827`, which
+        # sweeps 0 / absent / a string / a bool.
+        "_render_taint_path(alternate_parents) [count not stated in this context]",
     ], sorted(not_stated)
 
 
@@ -8307,3 +8318,35 @@ def test_taint_forward_refuses_a_zero_iteration_budget_812(fake_transport, capsy
     # validator's message blaming the wrong quantity.
     assert "depth must be an integer" not in err, err
 
+
+
+def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
+    # #827 item 1: the bridge follows ONE predecessor per step and discloses the
+    # join as an `alternate_parents` count. That count is the ONLY half of item 1
+    # this PR delivers, and it was JSON-only -- so under the default text view a
+    # phi-join step rendered byte-identically to a linear one and the reader
+    # learned nothing, while the PR body claimed they learn how many parents were
+    # dropped. The PR's two other structural disclosures (analysis_incomplete,
+    # the per-callsite frontier) each got a text line; this is the same
+    # convention.
+    from bn.formatters import _render_taint_path
+    out = _render_taint_path([
+        {"address": "0x10", "op": "MLIL_SET_VAR_SSA", "il_text": "a#1 = src",
+         "reason": "seed"},
+        {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(a#1, b#1)",
+         "reason": "phi join", "alternate_parents": 1},
+    ])
+    joined = "\n".join(out)
+    assert ("        <- joins 1 other tainted parent(s) not shown "
+            "(this is one of several provenance paths)") in out, joined
+    # The linear step must NOT be annotated -- an unconditional marker would be
+    # a permanent false alarm on every ordinary chain.
+    assert joined.count("not shown") == 1, joined
+    # A count of 0, an absent key, and an unreadable value all render nothing:
+    # this is a disclosure, so a fabricated one is the same defect as a missing
+    # one.
+    for bad in (0, None, "two", True):
+        step = {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(...)"}
+        if bad is not None:
+            step["alternate_parents"] = bad
+        assert "not shown" not in "\n".join(_render_taint_path([step])), bad
