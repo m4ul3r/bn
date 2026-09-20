@@ -1678,7 +1678,8 @@ def _count_keys_read(fn_node):
         called = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
         if called == "get" and node.args:
             arg = node.args[0]
-        elif called in ("_count_field", "_stated_count") and len(node.args) > 1:
+        elif (called in ("_count_field", "_stated_count", "_nonnegative_count")
+                and len(node.args) > 1):
             arg = node.args[1]
         elif called == "_field_skewed" and node.args:
             arg = node.args[0]
@@ -1787,6 +1788,16 @@ def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
     "(True self-defined excluded)", "// True self-defined export(s) excluded"
     and "self-defined excluded: True" -- three descriptions of one payload,
     which is worse than the single wrong answer they agreed on before.
+
+    Round-4 review found the repair had left the DECISION duplicated three
+    times and the copies disagreeing on the one shape this matrix did not
+    probe: a NEGATIVE count was stated by the `--count` line and dropped
+    silently by the other two, where base had agreed. It also found the
+    listing's unreadable branch measured by nothing -- every assertion here
+    was satisfied by the trailing `@_discloses` boundary note, which the
+    renderer gets whether or not it states the row itself. So the property is
+    now asserted per surface on the renderer's OWN body, with the boundary
+    note cut off.
     """
     from bn import formatters
     from bn.commands.misc import _imports_count_text
@@ -1798,21 +1809,48 @@ def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
                 formatters._render_imports_summary_text(
                     {"total_symbols": 9, "self_defined_excluded": excluded}))
 
+    def bodies(rendered):
+        """Each surface's own text, with the shared boundary note removed.
+
+        `@_discloses` appends `! malformed <key> field: ...` to EVERY renderer
+        that recorded a skew, so an assertion over the whole string is
+        satisfied by the boundary even when the renderer states nothing --
+        which is how the listing's `elif _field_skewed` branch shipped
+        unmeasured. Cutting the note is what makes each surface answer for
+        itself."""
+        return tuple(r.split("\n! malformed")[0] for r in rendered)
+
+    silent = bodies((_imports_count_text({"count": 9}),
+                     formatters._render_name_address_list_text({"items": [], "total": 0}),
+                     formatters._render_imports_summary_text({"total_symbols": 9})))
+
     # A text-spelled count IS a count, and every surface states it exactly as
     # it states the integer spelling.
     assert surfaces("3") == surfaces(3)
     for rendered in surfaces("3"):
         assert "3" in rendered and "excluded" in rendered, rendered
 
-    # A bool is a flag, and no surface renders it as a quantity.
-    for rendered in surfaces(True):
-        assert "True" not in rendered, rendered
-        assert "malformed self_defined_excluded field" in rendered, rendered
-
-    # A container is unreadable on every surface, and disclosed as such.
-    for rendered in surfaces({"n": 3}):
-        assert "{" not in rendered and "}" not in rendered, rendered
-        assert "malformed self_defined_excluded field" in rendered, rendered
+    # Every shape no count reads out of is stated AS unreadable, by each
+    # surface in its own words -- so the three agree, and none of them renders
+    # byte-identically to the page where the key claimed nothing.
+    #
+    # A NEGATIVE count is in this set on purpose: `_count_field` reads `-02`
+    # back as -2 by the #866 contract, but a survey cannot exclude a negative
+    # number of symbols, so it is not a count either. Base agreed (all three
+    # silent); the round-3 repair made the `--count` line state `(-2
+    # self-defined excluded)` while the other two stayed silent.
+    for excluded in (True, {"n": 3}, [1, 2, 3], "lots", 1.5, -2, "-02"):
+        rendered = surfaces(excluded)
+        for one in rendered:
+            assert f"{excluded}" not in one, (excluded, one)
+            assert "malformed self_defined_excluded field" in one, (excluded, one)
+        for surface, body, quiet in zip(("count", "listing", "summary"),
+                                        bodies(rendered), silent):
+            assert body != quiet, (
+                f"the imports {surface} surface renders an unreadable "
+                f"{excluded!r} byte-identically to a payload that claimed "
+                "nothing, so the whole disclosure is the shared boundary "
+                "note -- state it on the surface itself")
 
     # ...and an ABSENT key claimed nothing, so every surface stays silent.
     for rendered in (_imports_count_text({"count": 9}),

@@ -295,6 +295,39 @@ def _stated_count(source: Any, key: str) -> str:
     return "?" if _field_skewed(key) else str(count)
 
 
+def _nonnegative_count(source: Any, key: str) -> int:
+    """``_count_field`` for a key whose count is a CARDINALITY: how many rows a
+    survey dropped, excluded or filtered. A negative one is not a count.
+
+    The third member of the count family, and it exists because the reading
+    rule and the DOMAIN rule are different questions. ``_count_field`` answers
+    "does the value state this integer", and by the #866 contract ``-2`` --
+    and the text spelling ``"-02"`` -- states one, correctly: a delta, an
+    offset or a difference is legitimately negative. A count of things
+    EXCLUDED is not, and a renderer that restates it as a quantity prints the
+    confident wrong number the choke point exists to end.
+
+    Round-4 review, on the imports trio: taking the paged listing and the
+    ``--summary`` card off ``isinstance(int)`` fixed the READING but left the
+    decision copied three times, and the copies disagreed on the one shape the
+    agreement matrix did not probe -- the ``--count`` line stated
+    "(-2 self-defined excluded)" while the other two tested ``> 0`` and said
+    nothing at all. Base had agreed (all three silent), so the repair turned
+    one consistent answer into a disagreement: exactly the harm the finding it
+    answered had named. Deciding it HERE is what makes that unrepeatable --
+    a surface cannot hold a different opinion about a value it never reads.
+
+    Refused the way every other unreadable shape is refused: the skew is
+    recorded for the enclosing ``@_discloses`` boundary and the caller gets 0,
+    so the ``_field_skewed`` branch each surface already has states it instead
+    of one surface restating an impossible quantity and two saying nothing."""
+    count = _count_field(source, key)
+    if count < 0:
+        _record_skew(key)
+        return 0
+    return count
+
+
 def _text_value(source: Any, key: str) -> str | None:
     """``source[key]`` as TEXT, recording the skew when the key is PRESENT but
     holds something no text can be read out of.
@@ -1701,13 +1734,15 @@ def _render_name_address_list_text(value: Any) -> str:
     or a bare list for back-compat / internal callers (#122)."""
     body = _render_paged_list_text(value, "items", _render_name_address_rows)
     # Surface PIC self-references dropped from the survey so the exclusion isn't
-    # silent (#202) -- through the COUNT CHOKE POINT, like the `--count` line
-    # and the `--summary` card beside it. `isinstance(excluded, int)` made this
-    # one surface answer differently from the other two about the same payload:
-    # a text-spelled count dropped the note entirely and a bool rendered as a
-    # quantity (#619/#795 round-3 review).
-    excluded = _count_field(value, "self_defined_excluded")
-    if excluded > 0:
+    # silent (#202) -- through the ONE READER the three imports surfaces share,
+    # so the decision cannot be made three ways. `isinstance(excluded, int)`
+    # made this surface answer differently from the other two about the same
+    # payload: a text-spelled count dropped the note entirely and a bool
+    # rendered as a quantity (#619/#795 round-3 review); reading through the
+    # choke point separately on each surface then disagreed about a negative
+    # one (round-4 review).
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         note = (
             f"// {excluded} self-defined export(s) excluded "
             "(this module's own symbols modeled as import veneers / GOT slots)"
@@ -2051,8 +2086,16 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     #653.1: `function search <q> --count` used the SAME "Total functions:" label as
     the whole-binary `function list --count`, so "Total functions: 17" beside
     "Total functions: 175" read as a contradiction rather than as matches vs total.
+
+    #795 round-4 review: the count is read through the CHOKE POINT, like every
+    other `--count` line. Interpolated raw, `count: true` rendered "Total
+    functions: True" -- a flag stated as a quantity -- a container rendered a
+    Python repr, and a text-spelled count that IS a number was dropped to a
+    fabricated 0, which on this line reads byte-identically to a binary with no
+    functions (#683). Three CLI surfaces install this renderer, so it was the
+    widest raw count read left in the module.
     """
-    count = value.get("count", 0) if isinstance(value, dict) else 0
+    count = _stated_count(value, "count")
     return f"{_quick_partial_prefix(value, what)}{label}: {count}"
 
 
@@ -4071,8 +4114,10 @@ def _render_imports_summary_text(value: Any) -> str:
     # Label matches the JSON key (`total_symbols`) instead of drifting to
     # "total imports".
     lines = [f"total symbols: {total}"]
-    excluded = _count_field(value, "self_defined_excluded")
-    if excluded > 0:
+    # The same ONE reader the `--count` line and the paged listing use, so the
+    # three surfaces cannot decide this key three ways (#619/#795).
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         lines.append(f"self-defined excluded: {excluded}")
     elif _field_skewed("self_defined_excluded"):
         # STATED on the card, for the same reason the sibling surfaces state

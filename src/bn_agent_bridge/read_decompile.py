@@ -887,13 +887,13 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
         "hints": _call_model_truncation_hints(
-            ctx, bv, func, il, [r for r in ([definition] + list(uses)) if r is not None]),
+            ctx, bv, func, il, [u for u in uses if u is not None]),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
 
 
-def _call_model_truncation_hints(ctx, bv, func, il, rows) -> list[str]:
+def _call_model_truncation_hints(ctx, bv, func, il, uses) -> list[str]:
     """The #489 call-model-truncation disclosure for THIS function's calls (#797).
 
     A def-use read of a variable that feeds an under-recovered call used to show
@@ -908,16 +908,24 @@ def _call_model_truncation_hints(ctx, bv, func, il, rows) -> list[str]:
     the two ops cannot disagree about whether a call's model was truncated (one
     gate, one wording, one remedy).
 
-    Scoped to the calls *rows* -- this variable's definition and uses -- feed,
-    because that is what the disclosure CLAIMS to be: an explanation of a row in
-    this listing. Built over every call in the function it was a different
-    statement, and a wrong one: a variable with no uses at all printed a
-    truncation note above `uses (0):`, and a use downstream of the call got a
-    caveat about argument set-up it has no part in. A row belongs to a call's
-    outgoing-argument run when it IS the call (the variable is a recovered
-    parameter) or it sits between the previous call and this one -- which is
-    exactly the region `_call_model_truncation_note` reads its dropped
-    stack-arg stores from.
+    Scoped to the calls this variable's USES feed, because that is what the
+    disclosure CLAIMS to be: an explanation of a row in this listing. Built
+    over every call in the function it was a different statement, and a wrong
+    one: a variable with no uses at all printed a truncation note above
+    `uses (0):`, and a use downstream of the call got a caveat about argument
+    set-up it has no part in. A use belongs to a call's outgoing-argument run
+    when it IS the call (the variable is a recovered parameter) or it sits
+    between the previous call and this one -- which is exactly the region
+    `_call_model_truncation_note` reads its dropped stack-arg stores from.
+
+    The DEFINITION is deliberately not in that set (#797 round-4 review).
+    Scoping over `[definition] + uses` re-opened the whole defect through the
+    ordinary case: a value computed in this function has a definition ahead of
+    the call, which marked the call fed and put the note back above
+    `uses (0):`. A definition is where the value is PRODUCED -- it is no
+    evidence that the value reaches any call -- so the uses are the scope, and
+    a variable passed to the call shows up in them as the argument-set-up
+    store (or as the call itself when it is a recovered parameter).
 
     Prints nothing for a call the helper is silent about -- unknown
     calling-convention arity, a callee that is known fixed-arity, no outgoing
@@ -931,18 +939,18 @@ def _call_model_truncation_hints(ctx, bv, func, il, rows) -> list[str]:
         instructions = list(il.instructions)
     except Exception:
         return hints
-    row_indexes = {int(getattr(row, "instr_index", -1)) for row in rows}
+    use_indexes = {int(getattr(use, "instr_index", -1)) for use in uses}
     feeding = False
     for ins in instructions:
         index = int(getattr(ins, "instr_index", -1))
         if "CALL" not in il_format._il_op_name(ins):
-            # A row before the next call is part of that call's outgoing-argument
+            # A use before the next call is part of that call's outgoing-argument
             # run; anything after the last call feeds nothing.
-            feeding = feeding or index in row_indexes
+            feeding = feeding or index in use_indexes
             continue
         # Only a call THIS variable reaches: it is the call itself, or one of
-        # the rows sits in the run of stores between the previous call and it.
-        relevant, feeding = (feeding or index in row_indexes), False
+        # the uses sits in the run of stores between the previous call and it.
+        relevant, feeding = (feeding or index in use_indexes), False
         if not relevant:
             continue
         # The CALL SITE's own address: `_call_model_truncation_note` looks the

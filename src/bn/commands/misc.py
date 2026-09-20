@@ -14,6 +14,7 @@ from ..formatters import (
     _count_field,
     _discloses,
     _field_skewed,
+    _nonnegative_count,
     _render_data_symbols_text,
     _render_data_vars_text,
     _render_function_bundle_text,
@@ -152,9 +153,13 @@ def _imports_count_text(value: Any) -> str:
     flag printed as a quantity; a producer that spells counts as text dropped
     the tail entirely; and the headline was interpolated raw, so a container
     landed in the line as a Python repr. Both numbers go through the choke
-    point, under the boundary that discloses what it could not read (#619)."""
+    point, under the boundary that discloses what it could not read (#619) --
+    and the excluded count through the ONE reader the paged listing and the
+    `--summary` card share, so the three surfaces cannot decide it three ways
+    (#795 round-4 review, where this line alone stated a negative count).
+    """
     line = f"Total imports: {_stated_count(value, 'count')}"
-    excluded = _count_field(value, "self_defined_excluded")
+    excluded = _nonnegative_count(value, "self_defined_excluded")
     if excluded:
         line += f" ({excluded} self-defined excluded)"
     elif _field_skewed("self_defined_excluded"):

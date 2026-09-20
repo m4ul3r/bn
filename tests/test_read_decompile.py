@@ -3663,14 +3663,21 @@ def _d797_thunk_resolver(thunk: str, real: str):
     return resolve
 
 
-def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before"):
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before",
+                                 defined=False):
     """`_defuse` over a function whose call at 0x401030 was recovered with ONE
     arg (the caller's format string) while the LLIL hands it two outgoing
     stack-arg stores -- the #489 shape, standing in for an auto-typed variadic.
 
     ``use_at`` places the defused variable's single use: ``"before"`` (the
     default) makes it the argument set-up store feeding that call, ``"after"``
-    moves it past the call, and ``"none"`` gives the variable no uses at all."""
+    moves it past the call, and ``"none"`` gives the variable no uses at all.
+
+    ``defined`` gives the variable a DEFINITION ahead of the call, which the
+    real API supplies whenever the value is computed in this function.
+    Hardcoding it absent meant every case ran with an empty row set, so the
+    scoping the tests below assert was only ever measured on its
+    nothing-to-scope short-circuit (#797 round-4 review)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, func = _mid_function_bv()
@@ -3688,10 +3695,13 @@ def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before"):
     call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
     store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
     trailing = _d797_ins("MLIL_STORE_SSA", 0x401040, instr_index=3)
+    # The variable's own definition, AHEAD of the call the way a value computed
+    # in this function is: `arg1#0 = ...` at 0x401010.
+    defn = _d797_ins("MLIL_SET_VAR_SSA", 0x401010, instr_index=0)
     uses = {"before": [store], "after": [trailing], "none": []}[use_at]
     il = types.SimpleNamespace(
-        instructions=[store, call, trailing],
-        get_ssa_var_definition=lambda v: None,
+        instructions=([defn] if defined else []) + [store, call, trailing],
+        get_ssa_var_definition=lambda v: defn if defined else None,
         get_ssa_var_uses=lambda v: list(uses),
     )
     monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
@@ -3793,6 +3803,16 @@ def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
     listing is incomplete because of a call the variable never touches. A use
     that lands AFTER the call is the same error one step subtler -- it is not
     argument set-up for it, so nothing about that call explains it.
+
+    Round-4 review: (a) and (b) were both green for the wrong reason -- the
+    fixture hardcoded the variable as having NO definition, so every case ran
+    with an empty row set and only the nothing-to-scope short-circuit was
+    measured. Give the variable the definition the real API supplies and the
+    scope re-opened: a definition ahead of the call made the call "fed", so
+    the hint came back above `uses (0):`. A DEFINITION is not evidence that
+    the value reaches a call -- it is where the value is produced -- so the
+    scope is the variable's USES, and (c)/(d) are (a)/(b) with the definition
+    present.
     """
     # (a) No uses at all: there is no listing for a disclosure to qualify.
     instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none")
@@ -3806,3 +3826,29 @@ def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
     downstream = instance._defuse("active", "0x401000", "arg1#0")
     assert [u["address"] for u in downstream["uses"]] == ["0x401040"]
     assert downstream["hints"] == [], downstream["hints"]
+
+    # (c) The same empty listing for a variable that HAS a definition ahead of
+    # the call -- the ordinary case, and the one the fixture never built.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none",
+                                                 defined=True)
+    defined_empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_empty["definition"]["address"] == "0x401010"
+    assert defined_empty["uses"] == []
+    assert defined_empty["hints"] == [], defined_empty["hints"]
+
+    # (d) ...and the downstream use, with that definition present: the call
+    # still explains no row in this listing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after",
+                                                 defined=True)
+    defined_downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_downstream["definition"]["address"] == "0x401010"
+    assert [u["address"] for u in defined_downstream["uses"]] == ["0x401040"]
+    assert defined_downstream["hints"] == [], defined_downstream["hints"]
+
+    # ...while the use that IS the call's argument set-up still gets it, so the
+    # scope narrowed to the right thing rather than to nothing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="before",
+                                                 defined=True)
+    feeding = instance._defuse("active", "0x401000", "arg1#0")
+    assert len(feeding["hints"]) == 1, feeding["hints"]
+    assert "call 0x401030" in feeding["hints"][0]

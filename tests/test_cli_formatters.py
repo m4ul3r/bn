@@ -1904,6 +1904,15 @@ _PROBE_EXCLUSIONS = {
         "`_count_field` for a line that STATES the number, so same shape and "
         "same reason: payload plus key in, a count-or-`?` string out, with the "
         "skew recorded for the ENCLOSING boundary to disclose"),
+    "_nonnegative_count": (
+        "takes-more-than-a-payload",
+        "`_count_field` for a key whose count is a CARDINALITY, so same shape "
+        "and same reason as its two siblings: payload plus key in, an int out, "
+        "with the skew recorded for the ENCLOSING boundary to disclose. It is "
+        "referenced from a command module because the `imports --count` line "
+        "reads the excluded count through the very helper the paged listing "
+        "and the `--summary` card read it through -- one decision, so the "
+        "three surfaces cannot hold three opinions about one payload"),
     "_discloses": (
         "takes-no-payload",
         "it IS the boundary, not a consumer of one: a decorator taking the "
@@ -3805,7 +3814,9 @@ def _count_helper_sites():
     Harvested from the module's own AST, like the other guards here, and keyed
     on the enclosing function so the differential below can look the renderer up
     in the discovered population. A dynamic key is not harvested: there is no
-    payload this file could build for it.
+    payload this file could build for it -- which is also why the count family
+    itself stays out, since each member passes its caller's `key` PARAMETER
+    down to the next.
     """
     import ast
     import inspect
@@ -3824,7 +3835,8 @@ def _count_helper_sites():
     sites = set()
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id in ("_count_field", "_stated_count")):
+                and node.func.id in ("_count_field", "_stated_count",
+                                     "_nonnegative_count")):
             continue
         if len(node.args) != 2:
             continue
@@ -3874,9 +3886,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # they tested it with `isinstance(int)` while the `--count` line beside
     # them went through the choke point, so one payload got three different
     # descriptions. Two more (renderer, key) pairs, measured.
-    assert len(sites) == 22, (
+    # 22 -> 23 (#795 round-4 review): `_render_function_count_text` -- the
+    # renderer behind `function list --count`, `function search --count` and
+    # `types --count`, so the WIDEST count line in the CLI -- now reads its
+    # count through `_stated_count` instead of interpolating it raw.
+    assert len(sites) == 23, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 22. The number is the size of the covered set: a "
+        "count helper, not 23. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3943,6 +3959,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # state it: covered by name in
         # `tests/test_cli_misc.py::test_the_three_imports_surfaces_agree_about_the_excluded_count_795`,
         # which drives all three imports surfaces over the same payload.
+        # Round-4 review: that cover used to be untrue. Every assertion it made
+        # was satisfied by the trailing `@_discloses` note, which the renderer
+        # gets whether or not it states the row -- so replacing this renderer's
+        # unreadable branch with `pass` left the named test GREEN. It now cuts
+        # the boundary note off and requires each surface's own body to differ
+        # from the body it renders for a payload that claimed nothing, so the
+        # exemption fails with the branch it exempts.
         "_render_name_address_list_text(self_defined_excluded) [count not "
         "stated in this context]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
@@ -4020,6 +4043,43 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
         assert f"malformed {key} field" in refused, refused
 
 
+def test_the_function_count_line_never_states_a_count_it_could_not_read():
+    """The widest `--count` line in the CLI, and the last one reading raw.
+
+    This renderer is the `text_renderer` for `function list --count`,
+    `function search --count` and `types --count`, and it interpolated
+    `value.get("count", 0)` straight into the line -- so a bool rendered
+    "Total functions: True" (a flag stated as a quantity), a container
+    rendered a raw Python repr, an explicit null rendered "None", and a
+    text-spelled count that IS a number was dropped to 0. That last one is the
+    #683 harm on the loudest surface there is: "Total functions: 0" from an
+    unreadable counter reads byte-identically to a binary with no functions,
+    which is exactly the answer an agent stops on.
+
+    Round-4 review: the commit that closed this class across the command
+    module left this renderer out, so the claim was wider than the change.
+    """
+    from bn import formatters
+
+    readable = formatters._render_function_count_text({"count": 175})
+    assert readable == "Total functions: 175", readable
+    # A count spelled as text IS a count, and states the same line.
+    assert formatters._render_function_count_text({"count": "175"}) == readable
+
+    for value in (True, {"n": 3}, [1, 2, 3], "lots", 1.5):
+        refused = formatters._render_function_count_text({"count": value})
+        body = refused.split("\n! malformed")[0]
+        assert body == "Total functions: ?", (value, refused)
+        assert f"{value}" not in body, (value, refused)
+        assert "malformed count field" in refused, (value, refused)
+
+    # An ABSENT or null count claimed nothing, so the honest zero is unchanged
+    # and nothing is disclosed.
+    for payload in ({}, {"count": None}):
+        quiet = formatters._render_function_count_text(payload)
+        assert quiet == "Total functions: 0", (payload, quiet)
+
+
 
 # The raw numeric spellings this module still carries, MEASURED rather than
 # described. Each is a count read that does not go through `_count_field` --
@@ -4041,7 +4101,11 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
 # `value.get('offset', 0)` twice (bare and `or 0`) to build its own note; the
 # renderer now delegates to `_paging_footer`, which reads all three counts
 # through the choke point, so both spellings are deliberately GONE.
-_RAW_COUNT_SPELLINGS = 46
+# 46 -> 45 (#795 round-4 review): `_render_function_count_text`'s
+# `value.get('count', 0)` was the widest raw count read left in the module --
+# three CLI surfaces install that renderer -- and now goes through
+# `_stated_count`.
+_RAW_COUNT_SPELLINGS = 45
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
