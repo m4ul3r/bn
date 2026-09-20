@@ -1703,7 +1703,11 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
     So the guard is derived from the module rather than aimed at one function:
     every locally-defined renderer the registry installs whose name states a
     count is driven over the three shapes a raw read gets wrong, on every key
-    its own source reads.
+    its own source reads. And the derivation's own blind spot is closed in the
+    same place -- three of this module's five count lines were inline LAMBDAS,
+    which have no name to probe, so the first version of this guard asserted an
+    inventory of two while five surfaces existed. A count line written as a
+    lambda now fails here instead of quietly joining them.
     """
     import ast
     import inspect
@@ -1714,25 +1718,50 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
     tree = ast.parse(pathlib.Path(inspect.getfile(misc)).read_text(encoding="utf-8"))
     functions = {node.name: node for node in tree.body
                  if isinstance(node, ast.FunctionDef)}
-    installed = {inner.id
-                 for node in ast.walk(tree)
-                 if isinstance(node, ast.keyword) and node.arg == "text_renderer"
-                 for inner in ast.walk(node.value)
+    renderer_values = [node.value for node in ast.walk(tree)
+                       if isinstance(node, ast.keyword) and node.arg == "text_renderer"]
+
+    # A LAMBDA renderer cannot be probed: it has no name, so nothing below --
+    # and nothing in the formatters sweeps either -- can ever reach it. One that
+    # states a count is the exact shape this guard exists for, so it is refused
+    # outright rather than silently skipped.
+    lambda_counters = [ast.unparse(value) for value in renderer_values
+                       if isinstance(value, ast.Lambda)
+                       and "count" in ast.unparse(value)]
+    assert not lambda_counters, (
+        "these `--count` lines are inline lambdas, so no guard can probe them; "
+        f"give each a named renderer that reads through the choke point: "
+        f"{lambda_counters}")
+
+    installed = {inner.id for value in renderer_values
+                 for inner in ast.walk(value)
                  if isinstance(inner, ast.Name) and inner.id in functions}
     counters = sorted(name for name in installed if name.endswith("_count_text"))
-    assert counters == ["_imports_count_text", "_strings_count_text"], (
+    assert counters == ["_exports_count_text", "_go_functions_count_text",
+                        "_imports_count_text", "_sections_count_text",
+                        "_strings_count_text"], (
         f"the count lines this module installs are {counters}; a new one is a "
         "new surface that states a number, so add it in the same commit")
 
     for name in counters:
         renderer = getattr(misc, name)
-        keys = _count_keys_read(functions[name])
-        assert len(keys) >= 2, (name, keys)     # a headline and its qualifier
+        # Keys read by the renderer itself PLUS by any module-local helper it
+        # delegates to, so a renderer that is one line of delegation is probed
+        # on the keys that line actually reads.
+        keys = set(_count_keys_read(functions[name]))
+        for inner in ast.walk(functions[name]):
+            called = isinstance(inner, ast.Call) and getattr(inner.func, "id", None)
+            if called in functions:
+                keys |= _count_keys_read(functions[called])
+        assert keys, name
+
+        readable = renderer({key: 0 for key in keys})
 
         # (a) A bool is not a count. `bool` IS an `int`, so a raw read prints
         # the flag as a quantity -- the one shape that reads as data.
         flagged = renderer({key: True for key in keys})
         assert "True" not in flagged, (name, flagged)
+        assert flagged != readable, (name, flagged)
 
         # (b) A numeric string IS a count, and states the same line the integer
         # spelling does. A raw `isinstance(int)` silently drops the whole
@@ -1740,10 +1769,56 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
         assert renderer({key: "7" for key in keys}) == renderer({key: 7 for key in keys}), name
 
         # (c) A container is disclosed, never interpolated into the line as a
-        # raw Python repr, and never fabricated into a confident 0.
+        # raw Python repr -- and never rendered as the real zero it is not.
+        # Compared against the well-formed zero rather than pattern-matched on
+        # `": 0"`, which a renderer with a different separator walks past.
         unreadable = renderer({key: {"n": 1} for key in keys})
         assert "{" not in unreadable and "}" not in unreadable, (name, unreadable)
-        assert ": 0" not in unreadable, (name, unreadable)
+        assert unreadable != readable, (name, unreadable)
+
+
+def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
+    """One payload, one answer -- across all three surfaces that state it.
+
+    Making only the `--count` line strict was a regression dressed as a fix:
+    the paged listing and the `--summary` card still tested the same key with
+    `isinstance(int)`, so a bridge reporting it as text got the denominator
+    from one surface and silence from the other two, and a bool got
+    "(True self-defined excluded)", "// True self-defined export(s) excluded"
+    and "self-defined excluded: True" -- three descriptions of one payload,
+    which is worse than the single wrong answer they agreed on before.
+    """
+    from bn import formatters
+    from bn.commands.misc import _imports_count_text
+
+    def surfaces(excluded):
+        return (_imports_count_text({"count": 9, "self_defined_excluded": excluded}),
+                formatters._render_name_address_list_text(
+                    {"items": [], "total": 0, "self_defined_excluded": excluded}),
+                formatters._render_imports_summary_text(
+                    {"total_symbols": 9, "self_defined_excluded": excluded}))
+
+    # A text-spelled count IS a count, and every surface states it exactly as
+    # it states the integer spelling.
+    assert surfaces("3") == surfaces(3)
+    for rendered in surfaces("3"):
+        assert "3" in rendered and "excluded" in rendered, rendered
+
+    # A bool is a flag, and no surface renders it as a quantity.
+    for rendered in surfaces(True):
+        assert "True" not in rendered, rendered
+        assert "malformed self_defined_excluded field" in rendered, rendered
+
+    # A container is unreadable on every surface, and disclosed as such.
+    for rendered in surfaces({"n": 3}):
+        assert "{" not in rendered and "}" not in rendered, rendered
+        assert "malformed self_defined_excluded field" in rendered, rendered
+
+    # ...and an ABSENT key claimed nothing, so every surface stays silent.
+    for rendered in (_imports_count_text({"count": 9}),
+                     formatters._render_name_address_list_text({"items": [], "total": 0}),
+                     formatters._render_imports_summary_text({"total_symbols": 9})):
+        assert "excluded" not in rendered and "malformed" not in rendered, rendered
 
 
 def test_estimate_output_preflights_the_raw_bytes_read_796(fake_transport, capsys):

@@ -3663,10 +3663,14 @@ def _d797_thunk_resolver(thunk: str, real: str):
     return resolve
 
 
-def _defuse_under_recovered_call(monkeypatch, *, resolve=None):
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before"):
     """`_defuse` over a function whose call at 0x401030 was recovered with ONE
     arg (the caller's format string) while the LLIL hands it two outgoing
-    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic."""
+    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic.
+
+    ``use_at`` places the defused variable's single use: ``"before"`` (the
+    default) makes it the argument set-up store feeding that call, ``"after"``
+    moves it past the call, and ``"none"`` gives the variable no uses at all."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, func = _mid_function_bv()
@@ -3683,10 +3687,12 @@ def _defuse_under_recovered_call(monkeypatch, *, resolve=None):
     fmt.constant = 0x402000
     call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
     store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
+    trailing = _d797_ins("MLIL_STORE_SSA", 0x401040, instr_index=3)
+    uses = {"before": [store], "after": [trailing], "none": []}[use_at]
     il = types.SimpleNamespace(
-        instructions=[store, call],
+        instructions=[store, call, trailing],
         get_ssa_var_definition=lambda v: None,
-        get_ssa_var_uses=lambda v: [store],
+        get_ssa_var_uses=lambda v: list(uses),
     )
     monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
     ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
@@ -3775,3 +3781,28 @@ def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
     hint = result["hints"][0]
     assert "proto set my_logger" in hint
     assert "j_my_logger" not in hint
+
+
+def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
+    """#797 review: the disclosure is about a USE, so it has to be scoped to one.
+
+    The hint list was built over every call in the FUNCTION, which is not what
+    the reference, `--help` and the renderer all say it is: a def-use of a
+    variable with no uses at all still printed "call 0x...: call-model
+    truncation" immediately above `uses (0):`, telling a reader that an empty
+    listing is incomplete because of a call the variable never touches. A use
+    that lands AFTER the call is the same error one step subtler -- it is not
+    argument set-up for it, so nothing about that call explains it.
+    """
+    # (a) No uses at all: there is no listing for a disclosure to qualify.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none")
+    empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert empty["uses"] == []
+    assert empty["hints"] == [], empty["hints"]
+
+    # (b) The variable's only use sits past the call, so it is not part of the
+    # outgoing-argument run the dropped stack stores belong to.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after")
+    downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert [u["address"] for u in downstream["uses"]] == ["0x401040"]
+    assert downstream["hints"] == [], downstream["hints"]

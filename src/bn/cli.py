@@ -1648,10 +1648,6 @@ def _call(
         spill_status_renderer, f"render the {op} status line as text",
         advice="Rerun with --format json to see the raw status.")
     request_params = dict(params or {})
-    # #796: the preflight flag, resolved once here so every reader below agrees.
-    # It is REFUSED where it cannot apply -- before the request, so a
-    # contradictory invocation costs no bridge work (the same pre-send rule
-    # `_mutation_preflight` states for mutation refusals).
     # #796: the preflight flag. Only commands whose registry entry says
     # `estimable=True` advertise it (see `_common_io_options`), so there is no
     # gate to write here: a mutation, a side-effecting command or an

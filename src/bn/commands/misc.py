@@ -163,6 +163,34 @@ def _imports_count_text(value: Any) -> str:
     return line
 
 
+def _plain_count_text(label: str, value: Any) -> str:
+    """A `--count` line that states ONE number and nothing else.
+
+    The three surfaces below were inline `lambda value: f"{label}:
+    {value.get('count', 0)}"` renderers -- the raw read this module's two other
+    count lines were just taken off, and invisible to any guard because a
+    lambda has no name to probe. One named renderer each, all reading through
+    the choke point, so every `--count` line in the module answers the same way
+    and a new one cannot be written as a lambda without tripping the guard in
+    `tests/test_cli_misc.py` (#619/#795)."""
+    return f"{label}: {_stated_count(value, 'count')}"
+
+
+@_discloses
+def _exports_count_text(value: Any) -> str:
+    return _plain_count_text("Total exports", value)
+
+
+@_discloses
+def _sections_count_text(value: Any) -> str:
+    return _plain_count_text("Total sections", value)
+
+
+@_discloses
+def _go_functions_count_text(value: Any) -> str:
+    return _plain_count_text("Go functions", value)
+
+
 @command("imports", help="List imports", target=True, paged=True,
          fanout=True,
          args=[arg("--summary", action="store_true", default=False,
@@ -249,7 +277,7 @@ def _exports(args: argparse.Namespace) -> int:
             "list_exports",
             {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total exports: {value.get('count', 0)}",
+            text_renderer=_exports_count_text,
             stem="exports-count",
         )
     params = {"offset": args.offset, "limit": _effective_limit(args)}
@@ -281,7 +309,7 @@ def _sections(args: argparse.Namespace) -> int:
             "sections",
             {"query": args.query, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total sections: {value.get('count', 0)}",
+            text_renderer=_sections_count_text,
             stem="sections-count",
         )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
@@ -372,7 +400,7 @@ def _go_functions(args: argparse.Namespace) -> int:
         return _call(
             args, "go_functions", {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Go functions: {value.get('count', 0)}",
+            text_renderer=_go_functions_count_text,
             stem="go-functions-count",
         )
     if args.summary:

@@ -1701,13 +1701,24 @@ def _render_name_address_list_text(value: Any) -> str:
     or a bare list for back-compat / internal callers (#122)."""
     body = _render_paged_list_text(value, "items", _render_name_address_rows)
     # Surface PIC self-references dropped from the survey so the exclusion isn't
-    # silent (#202).
-    excluded = value.get("self_defined_excluded") if isinstance(value, dict) else None
-    if isinstance(excluded, int) and excluded > 0:
+    # silent (#202) -- through the COUNT CHOKE POINT, like the `--count` line
+    # and the `--summary` card beside it. `isinstance(excluded, int)` made this
+    # one surface answer differently from the other two about the same payload:
+    # a text-spelled count dropped the note entirely and a bool rendered as a
+    # quantity (#619/#795 round-3 review).
+    excluded = _count_field(value, "self_defined_excluded")
+    if excluded > 0:
         note = (
             f"// {excluded} self-defined export(s) excluded "
             "(this module's own symbols modeled as import veneers / GOT slots)"
         )
+        body = note if body == "none" else f"{body}\n{note}"
+    elif _field_skewed("self_defined_excluded"):
+        # STATED, not left to the trailing boundary note: omitting the line is
+        # byte-identical to a page where nothing was excluded, which is the
+        # fabricated zero the choke point exists to stop (#619/#683).
+        note = ("// the payload's self-defined-excluded count is not a number "
+                "that can be read (use --format json)")
         body = note if body == "none" else f"{body}\n{note}"
     return body
 
@@ -4060,9 +4071,14 @@ def _render_imports_summary_text(value: Any) -> str:
     # Label matches the JSON key (`total_symbols`) instead of drifting to
     # "total imports".
     lines = [f"total symbols: {total}"]
-    excluded = value.get("self_defined_excluded")
-    if isinstance(excluded, int) and excluded > 0:
+    excluded = _count_field(value, "self_defined_excluded")
+    if excluded > 0:
         lines.append(f"self-defined excluded: {excluded}")
+    elif _field_skewed("self_defined_excluded"):
+        # STATED on the card, for the same reason the sibling surfaces state
+        # it: dropping the row renders byte-identically to a survey that
+        # excluded nothing (#619/#683).
+        lines.append("self-defined excluded: ?")
     needed = _field_list(value, "needed_libraries")
     if needed:
         lines.append("")

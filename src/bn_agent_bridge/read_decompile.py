@@ -886,13 +886,14 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "is_phi": is_phi,
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
-        "hints": _call_model_truncation_hints(ctx, bv, func, il),
+        "hints": _call_model_truncation_hints(
+            ctx, bv, func, il, [r for r in ([definition] + list(uses)) if r is not None]),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
 
 
-def _call_model_truncation_hints(ctx, bv, func, il) -> list[str]:
+def _call_model_truncation_hints(ctx, bv, func, il, rows) -> list[str]:
     """The #489 call-model-truncation disclosure for THIS function's calls (#797).
 
     A def-use read of a variable that feeds an under-recovered call used to show
@@ -907,6 +908,17 @@ def _call_model_truncation_hints(ctx, bv, func, il) -> list[str]:
     the two ops cannot disagree about whether a call's model was truncated (one
     gate, one wording, one remedy).
 
+    Scoped to the calls *rows* -- this variable's definition and uses -- feed,
+    because that is what the disclosure CLAIMS to be: an explanation of a row in
+    this listing. Built over every call in the function it was a different
+    statement, and a wrong one: a variable with no uses at all printed a
+    truncation note above `uses (0):`, and a use downstream of the call got a
+    caveat about argument set-up it has no part in. A row belongs to a call's
+    outgoing-argument run when it IS the call (the variable is a recovered
+    parameter) or it sits between the previous call and this one -- which is
+    exactly the region `_call_model_truncation_note` reads its dropped
+    stack-arg stores from.
+
     Prints nothing for a call the helper is silent about -- unknown
     calling-convention arity, a callee that is known fixed-arity, no outgoing
     stack-arg run, or no caller-passed format string -- which is the
@@ -919,8 +931,19 @@ def _call_model_truncation_hints(ctx, bv, func, il) -> list[str]:
         instructions = list(il.instructions)
     except Exception:
         return hints
+    row_indexes = {int(getattr(row, "instr_index", -1)) for row in rows}
+    feeding = False
     for ins in instructions:
+        index = int(getattr(ins, "instr_index", -1))
         if "CALL" not in il_format._il_op_name(ins):
+            # A row before the next call is part of that call's outgoing-argument
+            # run; anything after the last call feeds nothing.
+            feeding = feeding or index in row_indexes
+            continue
+        # Only a call THIS variable reaches: it is the call itself, or one of
+        # the rows sits in the run of stores between the previous call and it.
+        relevant, feeding = (feeding or index in row_indexes), False
+        if not relevant:
             continue
         # The CALL SITE's own address: `_call_model_truncation_note` looks the
         # instruction up in the LLIL block by address to find the outgoing

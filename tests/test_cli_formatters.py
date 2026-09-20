@@ -3869,9 +3869,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # through `_stated_count`, which is a read this differential covers.
     # 19 -> 20 (#795): `_render_strings_text` now reads `filtered` through
     # `_count_field` to state how many strings the active filters dropped.
-    assert len(sites) == 20, (
+    # 20 -> 22 (#795 round-3 review): the imports LISTING and `--summary`
+    # renderers now read `self_defined_excluded` through `_count_field` too --
+    # they tested it with `isinstance(int)` while the `--count` line beside
+    # them went through the choke point, so one payload got three different
+    # descriptions. Two more (renderer, key) pairs, measured.
+    assert len(sites) == 22, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 20. The number is the size of the covered set: a "
+        "count helper, not 22. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3931,6 +3936,15 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(total) [not a payload renderer]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
+        # #795 round-3 review: same harness cut as the strings pair below --
+        # this renderer's inner `_render_paged_list_text` boundary discloses
+        # first and the differential's body split stops at that note, so the
+        # pair is skipped by the HARNESS, not by the renderer. The renderer DOES
+        # state it: covered by name in
+        # `tests/test_cli_misc.py::test_the_three_imports_surfaces_agree_about_the_excluded_count_795`,
+        # which drives all three imports surfaces over the same payload.
+        "_render_name_address_list_text(self_defined_excluded) [count not "
+        "stated in this context]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
