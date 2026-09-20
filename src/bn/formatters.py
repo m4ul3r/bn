@@ -5619,8 +5619,21 @@ def _render_class_list_text(value: Any) -> str:
     # #675.2: user-declared class types are folded out by the confidence gate the
     # way name-only clusters are, so the default listing says they exist instead
     # of reading as a lens that never saw the class the user declared.
-    ds = _count_field(value, "declared_suppressed")
-    if ds or _field_skewed("declared_suppressed"):
+    #
+    # Read inside its OWN boundary, tight around these three reads so no other
+    # field's skew is swallowed (the mutation card's per-entry layout reads use
+    # the same pattern). The bridge sets this key to a sentinel ON PURPOSE when
+    # it could not measure the set -- or one declaration in it -- and the
+    # `@_discloses` note for a skewed read then says the payload's "rows or
+    # counts may be missing or partial", which reads as a corrupt response
+    # rather than the documented state (#907 review round 3). `_stated_count`
+    # still prints `?` on the line a caller acts on, which IS the disclosure;
+    # what is dropped is only the second, contradictory sentence.
+    with disclosure_boundary():
+        ds = _count_field(value, "declared_suppressed")
+        skewed = _field_skewed("declared_suppressed")
+        stated = _stated_count(value, "declared_suppressed")
+    if ds or skewed:
         # `_stated_count`, not the raw count: an unreadable counter must not print
         # as `0 user-declared class types`, which reads as "the lens looked and
         # found none". The noun names the population exactly, because twice it did
@@ -5628,7 +5641,6 @@ def _render_class_list_text(value: Any) -> str:
         # and every type BN itself imported when it said "declared class type"
         # (#907 review). What it counts is what `--all` adds: the class types this
         # view's USER declared.
-        stated = _stated_count(value, "declared_suppressed")
         hidden_parts.append(
             f"{stated} user-declared class type{'s' if ds != 1 else ''} (--all to show)")
     if hidden_parts:

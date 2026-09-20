@@ -3195,8 +3195,13 @@ def test_an_unreadable_declared_SET_is_disclosed_not_reported_as_zero_675(monkey
 
         listing = read_class._class_list(ctx, None)
         assert listing["declared_suppressed"] == "unreadable", label
-        assert "? user-declared class types (--all to show)" in _render_class_list_text(
-            listing), label
+        text = _render_class_list_text(listing)
+        assert "? user-declared class types (--all to show)" in text, label
+        # `?` IS the disclosure. The generic malformed-payload sentence beside it
+        # would say the response's rows or counts may be missing or partial,
+        # which reads as a corrupt answer rather than this documented state
+        # (#907 review round 3).
+        assert "malformed" not in text, f"{label}: {text}"
         # The RTTI half of the same listing still answers.
         assert listing["total"], f"{label}: the RTTI half went down with it"
         assert read_class._class_list(
