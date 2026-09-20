@@ -3200,6 +3200,13 @@ def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675
     assert shown["name"] == "ns::Widget"
     assert any("could not be read" in note for note in shown["notes"]), shown["notes"]
     assert "could not be read" in _render_class_show_text(shown)
+    # The disclosure JOINS the record's notes, it does not become them. Writing
+    # `rec["notes"] = [disclosure]` instead left the whole targeted suite green
+    # while the card silently lost the RTTI-absence note -- so its empty
+    # vtable/methods/instances read as "this class has none", which is the exact
+    # blindness #675.2 exists to remove (#907 review round 6).
+    assert any("RTTI" in note for note in shown["notes"]), shown["notes"]
+    assert len(shown["notes"]) >= 2, shown["notes"]
 
     # A query that reaches no unreadable declaration carries no such note.
     clean = read_class._class_show(ctx, None, "ns::Widget")
