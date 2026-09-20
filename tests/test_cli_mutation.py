@@ -439,7 +439,8 @@ _GO_RENAME_ADDRS = (0x401000, 0x402000)
 
 
 def _go_rename_produced(monkeypatch, *, preview, readback_fails=(),
-                        lose_on_rollback=(), skipped_user_named=3):
+                        lose_on_rollback=(), skipped_user_named=3,
+                        skipped_already_named=0, skipped_interior_pc=0):
     """Run the REAL `go rename` producer; return (payload, live names).
 
     The dict is `_apply_go_renames_chunked`'s own output -- the exact envelope
@@ -459,7 +460,13 @@ def _go_rename_produced(monkeypatch, *, preview, readback_fails=(),
     payload = instance._apply_go_renames_chunked(
         _GoRenameBV(functions, lose_on_rollback), candidates, preview=preview,
         skipped_user_named=skipped_user_named,
-        defined_count=len(candidates) + skipped_user_named)
+        skipped_already_named=skipped_already_named,
+        skipped_interior_pc=skipped_interior_pc,
+        # The scan's FOUR buckets partition `defined_count` (bridge #818):
+        # candidate / user-named / already carries the Go name / no function
+        # STARTS at the pcln address.
+        defined_count=(len(candidates) + skipped_user_named
+                       + skipped_already_named + skipped_interior_pc))
     return payload, {addr: fn.name for addr, fn in functions.items()}
 
 
@@ -720,8 +727,10 @@ def test_a_live_failed_revert_missing_its_verified_counter_stays_unmeasured(monk
     stated = _go_rename_summary(dict(live))
     assert stated["measured"] is True and stated["verified_count"] == 1, stated
 
-    # ...and the neighbouring rung is untouched: a revert that COMPLETED needs
-    # no counter, because the revert -- not a counter -- established the zero.
+    # ...and the neighbouring rung keeps its sourceless `changed`: a revert
+    # that COMPLETED establishes "nothing landed" without a counter. What it
+    # does NOT establish is how many rows verified first -- see
+    # `test_a_completed_revert_states_no_count_its_envelope_never_stated`.
     reverted, _ = _go_rename_produced(
         monkeypatch, preview=False, readback_fails=(0x402000,))
     assert reverted["rolled_back"] is True
@@ -729,6 +738,112 @@ def test_a_live_failed_revert_missing_its_verified_counter_stays_unmeasured(monk
         {key: value for key, value in reverted.items()
          if key != "go_verified_count"})
     assert completed["measured"] is True and completed["changed_count"] == 0, completed
+
+
+def test_a_completed_revert_states_no_count_its_envelope_never_stated(monkeypatch):
+    """#693 r6: `measured` covers the counter `changed` is read from -- and the
+    summary STATES two more.
+
+    A live run that failed and reverted CLEANLY takes the sourceless rung:
+    nothing landed, and the REVERT establishes that, so no counter is needed
+    for `changed`. The rung still states `verified_count` and `noop_count`
+    though, `_count_field` answers 0 for an absent key, and 0 on this op is the
+    "nothing happened, do not save" verdict #683 discarded a rename batch to.
+    So a version-skewed envelope omitting `go_verified_count` reported
+    `verified_count: 0` beside `measured: true` -- while `--verbose` on the
+    SAME payload derived `candidates - failure rows` and printed a different,
+    non-zero figure. A revert establishes what LANDED, never how many rows
+    verified before the failure, and a count the envelope never stated is not
+    a zero.
+
+    `failed_count` is deliberately NOT in this rule: the failure ROWS answer
+    the same question, `rows_contradict` refuses when the two disagree, and an
+    empty `results[]` beside an absent counter is a zero the rows establish.
+    """
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    reverted, live_names = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=(0x402000,))
+    assert reverted["rolled_back"] is True and reverted["committed"] is False
+    # Ground truth: the revert really did put every name back.
+    assert set(live_names.values()) == {f"sub_{addr:x}"
+                                        for addr in _GO_RENAME_ADDRS}
+    assert reverted["go_verified_count"] == 1, reverted
+    assert reverted["skipped_user_named"] == 3, reverted
+
+    no_verified = {key: value for key, value in reverted.items()
+                   if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(no_verified))
+    assert summary["measured"] is True, summary        # the revert measured `changed`
+    assert summary["changed_count"] == 0, summary      # ...and nothing landed
+    assert summary["verified_count"] is None, summary  # never a fabricated 0
+    assert summary["dirty_after"] is False, summary    # the view really is clean
+    # The detail view still DERIVES a figure here (candidates - failure rows).
+    # The compact face refusing is what stops the two from stating different
+    # numbers for one payload.
+    detail = _render_go_rename_text(dict(no_verified))
+    assert "1 would have" in detail, detail
+
+    no_skipped = {key: value for key, value in reverted.items()
+                  if key != "skipped_user_named"}
+    assert _go_rename_summary(dict(no_skipped))["noop_count"] is None
+
+    # Anti-vacuity: a STATED counter is still reported as its number.
+    stated = _go_rename_summary(dict(reverted))
+    assert stated["verified_count"] == 1 and stated["noop_count"] == 3, stated
+
+    # `failed_count` stays a number when the ROWS establish it...
+    clean, _ = _go_rename_produced(monkeypatch, preview=False)
+    assert clean["results"] == [] and clean["committed"] is True
+    rows_say_zero = _go_rename_summary(
+        {key: value for key, value in clean.items() if key != "go_failed_count"})
+    assert rows_say_zero["measured"] is True, rows_say_zero
+    assert rows_say_zero["failed_count"] == 0, rows_say_zero
+    # ...and the summary refuses when the rows CONTRADICT the absent counter.
+    rows_disagree = _go_rename_summary(
+        {key: value for key, value in reverted.items() if key != "go_failed_count"})
+    assert rows_disagree["measured"] is False, rows_disagree
+
+
+def test_the_op_count_reference_names_the_scan_buckets_it_leaves_out(monkeypatch):
+    """#693 r6: `op_count` is the candidates plus the SCAN-TIME user-named
+    skips -- and the scan has two more buckets it does not include.
+
+    The bridge partitions every DEFINED row into four buckets (#818): a
+    candidate, a user-named skip, a function already carrying the recovered
+    name, and a pcln address no BN function STARTS at. Only the first two
+    reach `op_count`, so it does not reconcile with the `defined_count` the
+    SAME envelope carries -- and on an idempotent re-run every previously
+    renamed function moves into the already-named bucket, so `op_count`
+    collapses toward 0 while the op considered the whole table. Calling it
+    "the distinct functions considered" in the public reference was false by
+    the size of those two buckets, and a reader reconciling the two numbers
+    has no way to tell which to believe. The reference has to NAME the fields
+    it leaves out, so the gap is disclosed rather than discovered.
+    """
+    from pathlib import Path
+
+    from bn.formatters import _go_rename_summary
+
+    payload, _ = _go_rename_produced(
+        monkeypatch, preview=False, skipped_user_named=3,
+        skipped_already_named=2, skipped_interior_pc=4)
+    assert payload["defined_count"] == 11, payload      # 2 + 3 + 2 + 4
+    assert payload["skipped_already_named"] == 2, payload
+    assert payload["skipped_interior_pc"] == 4, payload
+    # candidates (2) + the scan-time user-named skips (3): six of the eleven
+    # rows the op considered are outside it.
+    assert _go_rename_summary(payload)["op_count"] == 5, payload
+
+    reference = (Path(__file__).resolve().parents[1]
+                 / "skills" / "bn" / "reference" / "mutating.md")
+    row = [line for line in reference.read_text(encoding="utf-8").splitlines()
+           if line.startswith("| `op_count`")]
+    assert len(row) == 1, row
+    for field in ("skipped_already_named", "skipped_interior_pc", "defined_count"):
+        assert field in row[0], (
+            f"the op_count row must name `{field}` -- a bucket the op counted "
+            f"and `op_count` leaves out: {row[0]}")
 
 
 def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(

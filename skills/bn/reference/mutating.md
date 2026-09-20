@@ -126,7 +126,7 @@ true:
 | `committed` | true for any non-preview mutation that reached apply — including an all-noop |
 | `preview` | true when `--preview` was requested |
 | `measured` | **false** when the counts below could not be derived. Four causes reach it: the op reported no `results[]` rows to derive them from; a field they are derived from arrived in a shape no value reads out of and was refused rather than read as a zero; an op that reports through its own counters did not state the one its summary measures from; or its failure rows and its own failure counter disagree. `first_error` names the cause in words — see "Unmeasured mutations" |
-| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]` (or, for `go rename`, from its own counters); `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false`. `op_count` is a literal count of what the op could see rather than a derived one, so it stays stated either way — never read it as a batch size, and never branch on it to tell a measured run from an unmeasured one, because it can be `0` or non-zero under both. On a `results[]`-derived summary it is the number of rows. On `go rename` it is the distinct functions considered: the candidates plus the **scan-time** skips. The published `skipped_user_named` folds the apply-time skips in, so `candidates + skipped_user_named` over-counts; the summary subtracts `skipped_changed_during_apply` to get back to the scan-time figure. `changed_count` is **also** `null` when a FAILED revert left an unknown number of changes live — see "A revert that failed" below. The two `null` cases are **not** disjoint: a run can be unmeasured *and* a failed revert, so read `measured` to tell them apart, never the `null` alone |
+| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]` (or, for `go rename`, from its own counters); `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false`. A count is **also** `null` on a `measured` envelope when the counter it is read from was never STATED: `measured` answers for the one counter the summary measures from, and a count the payload did not carry is not a zero. `failed_count` is the exception and is stated anyway, because `results[]` answers the same question — an empty row list beside an absent counter is a `0` the rows established, and rows that contradict the counter make the whole summary unmeasured instead. `op_count` is a literal count of what the op could see rather than a derived one, so it stays stated either way — never read it as a batch size, and never branch on it to tell a measured run from an unmeasured one, because it can be `0` or non-zero under both. On a `results[]`-derived summary it is the number of rows. On `go rename` it is the candidates plus the **scan-time** user-named skips — **not** every function the op considered. The scan sorts each of the `defined_count` rows into four buckets, and the other two (`skipped_already_named`, a function that already carries the recovered name; `skipped_interior_pc`, a pcln address no function STARTS at) are disclosed as their own keys and are **not** in `op_count`, so it does not reconcile with the `defined_count` in the same envelope — on a re-run of an already-renamed view it collapses toward `0` while the op still considered the whole table. The published `skipped_user_named` folds the apply-time skips in, so `candidates + skipped_user_named` over-counts; the summary subtracts `skipped_changed_during_apply` to get back to the scan-time figure. `changed_count` is **also** `null` when a FAILED revert left an unknown number of changes live — see "A revert that failed" below. The two `null` cases are **not** disjoint: a run can be unmeasured *and* a failed revert, so read `measured` to tell them apart, never the `null` alone |
 | `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
 | `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
 | `dirty_after` | `true` iff the BNDB was left modified and needs `bn save` before closing |
@@ -181,7 +181,10 @@ leaves the total unstated.
 
 Under **version skew** the two faces of a failed revert are not
 interchangeable, and the detail view is the weaker one. All four cases below
-were measured on `go rename` in that state:
+were measured on `go rename` in that state, against ONE payload: 2 candidates,
+4 published skips (3 scan-time, 1 apply-time), 1 failure row and a revert that
+did not complete — which un-skewed reports `op_count: 5`, `changed_count: null`,
+`measured: true`, `dirty_after: true`.
 
 * the verified counter is **absent** — the compact face is unmeasured (every
   derived count `null`), while the detail view falls back to
@@ -189,7 +192,8 @@ were measured on `go rename` in that state:
 * the verified counter is **unreadable** — the compact face is unmeasured, and
   the detail view prints `?` rather than a number;
 * the **candidate** counter is **unreadable** — the compact face is unmeasured
-  and both faces disclose the field by name;
+  and both faces disclose the field by name; the detail view states no count at
+  all ("cannot say what this run did");
 * the **candidate** counter is **absent** — the detail view returns early on
   its "nothing to do — no auto-named (`sub_*`) Go functions to rename" line,
   which reads as a clean no-op over a view the compact face of the same payload
@@ -197,17 +201,26 @@ were measured on `go rename` in that state:
   the one cell where the compact face stays `measured: true`; its `changed`
   and `dirty_after` are still right, and the detail line is not.
 
-In the first three the compact face refuses where the detail view derives, so
-believe the compact face. The fourth is the exception in both directions:
-neither face refuses, the compact face's `changed` and `dirty_after` are still
-right while its `op_count` quietly shrinks with the absent counter (5 to 3 on
-the payload above), and the detail line is simply wrong. So `measured` and
-`dirty_after` are the keys to branch on; the text line and `op_count` are not.
+In the first three the compact face REFUSES, so believe it — though only the
+first has the detail view deriving a confident number against it; in the second
+and third the detail view refuses too, with `?` and by naming the field. The
+fourth is the exception in both directions: neither face refuses, the compact
+face's `changed` and `dirty_after` are still right while its `op_count` quietly
+shrinks with the missing counter (5 to 3 on the payload above — and to the same
+3 when that counter is *unreadable* rather than absent, where at least
+`measured` goes `false`), and the detail line is simply wrong. So `measured`
+and `dirty_after` are the keys to branch on; the text line and `op_count` are
+not.
 
-The neighbouring state is different again and deliberately so: on a revert that
-**completed**, an absent verified counter leaves the summary `measured: true`
-with `verified_count: 0`, because there the revert — not a counter — is what
-established that nothing landed.
+The neighbouring state differs in **what the revert can establish**. On a
+revert that **completed**, `changed_count: 0` needs no counter at all: the
+revert is what established that nothing landed, so the summary stays
+`measured: true` with `dirty_after: false`. It establishes nothing about how
+many rows verified BEFORE the failure — so an absent `go_verified_count` there
+reports `verified_count: null`, not `0`, and an absent `skipped_user_named`
+reports `noop_count: null` the same way. The detail view still derives its own
+figure from `candidates − failure rows` in that cell, so it prints a number
+where the compact face refuses: believe the compact face here too.
 
 **A failed preview revert may or may not carry a failure row — read both.** The
 bridge computes `rolled_back` whenever the run was a preview **or** something

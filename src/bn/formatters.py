@@ -5423,6 +5423,27 @@ def _go_rename_summary(value: Any) -> Any:
     measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
 
+    # `measured` covers the counter `changed` is read from. The summary STATES
+    # two more, and on the SOURCELESS rung nothing else gates them: a revert
+    # that completed establishes what LANDED, never how many rows verified
+    # before the failure, so an envelope omitting `go_verified_count` there
+    # reported `verified_count: 0` beside `measured: true` -- while the detail
+    # view of the SAME payload derived `candidates - failure rows` and printed
+    # a different, non-zero figure. A count the envelope never STATED is not a
+    # zero, on any rung: `_count_field` answers 0 for an absent key and 0 on
+    # this op is the "nothing happened, do not save" verdict #683 discarded a
+    # rename batch to (#693 r6).
+    #
+    # `failed` is deliberately not in this rule. The failure ROWS answer the
+    # same question, `rows_contradict` above refuses when the two disagree,
+    # and an empty `results[]` beside an absent counter is a zero the rows
+    # established -- withholding it would refuse a count this payload does
+    # support, which is the mirror of the fabrication.
+    stated_verified = (verified if _field_present(value, "go_verified_count")
+                       else None)
+    stated_noop = (skipped if _field_present(value, "skipped_user_named")
+                   else None)
+
     # The failure explanation (a failure row's message/status, then the top-level
     # `message`) and `dirty_after` come from the shared builder: gating on
     # `not success`, not on `failed`, is what keeps a revert that failed AFTER
@@ -5462,10 +5483,12 @@ def _go_rename_summary(value: Any) -> Any:
         failure_rows=failure_rows,
         failed=failed,
         changed=changed,
-        verified=verified,
+        verified=stated_verified,
         # Already-user-named functions are deliberately left alone: no change,
-        # which is what `noop` means elsewhere.
-        noop=skipped,
+        # which is what `noop` means elsewhere. `op_count` above still uses the
+        # numeric read: it is a literal count of what the op could see, and an
+        # absent counter shrinks it rather than unknowing it.
+        noop=stated_noop,
         committed=committed,
         preview=preview,
         rolled_back=rolled_back,
