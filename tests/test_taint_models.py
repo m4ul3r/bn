@@ -568,17 +568,17 @@ def _ambiguous_slot_program(callee):
             F.FBV({0x910: "fgets", 0x901: callee}))
 
 
-def _reported(program, seed, *, gate=("recv_overflow",)):
-    """Every sink the call under test reports for `seed`.
+def _reported(program, *seeds, gate=("recv_overflow",), at=None):
+    """Every sink reported at `at` (default: the call under test) for `seeds`.
 
     `gate=()` runs with the opt-in class disabled, which must report nothing.
     """
     from bn_agent_bridge import taint_engine as te
     func, bv = program
     result = te.TaintEngine(bv, te.load_models()).forward(
-        func, [te.parse_locator(seed)], enabled_sink_classes=set(gate))
+        func, [te.parse_locator(s) for s in seeds], enabled_sink_classes=set(gate))
     return [s["sink"] for s in result["reached_sinks"]
-            if s["sink"]["address"] == _SINK_ADDR]
+            if s["sink"]["address"] == (at or _SINK_ADDR)]
 
 
 @pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
@@ -661,6 +661,129 @@ def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876(base):
     # Not vacuous: the identical harness, seed and gate DO report the armed
     # fortified read twin.
     assert len(_reported(_plain_length_program("__read_chk"), "param:0")) == 1
+
+
+def _twin_as_bounding_source_program(callee):
+    """``n = callee(3, &buf, 0x40); memcpy(&dst, &buf, n); system(&dst)``.
+
+    Drives the read-family entry as a SOURCE rather than as a sink, which is
+    the half its `sources` and `return_bound` fields describe and the A/B
+    programs above never reach. `return_bound` makes the memcpy length provably
+    bounded (#159) and the `ret` source is what taints it at all; the
+    `*arg:1` source is what taints the copied buffer, so the `system` call is
+    only reachable as a command_injection if the buffer half is declared too.
+    """
+    F = _fakes()
+    n1 = F.FSSA(F.FVar("n"), 1)
+    buf = F.FVar("buf", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
+    params = [F.FExpr("MLIL_CONST", "3", constant=3),
+              F.FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+              F.FExpr("MLIL_CONST", "0x40", constant=0x40)]
+    if callee.lstrip("_").startswith("pread"):
+        params.append(F.FExpr("MLIL_CONST", "0", constant=0))
+    if callee.endswith("_chk"):
+        params.append(F.FExpr("MLIL_CONST", "0x40", constant=0x40))
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", f"n#1 = {callee}(3, &buf, 0x40)", writes=[n1],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", "memcpy(&dst, &buf, n#1)", reads=[n1], writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+                 params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                         F.FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                         F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+        F.FInstr(2, 0x30, "MLIL_CALL_SSA", "system(&dst)", writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
+                 params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)]),
+    ]
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
+            F.FBV({0x901: callee, 0x2010: "memcpy", 0x2020: "system"}))
+
+
+@pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
+def test_fortified_read_source_bounds_a_downstream_copy_like_its_twin_876(base, chk):
+    # The twins carry `sources` and `return_bound` as well as the sink this PR
+    # added, and those fields only speak when the twin is the RECEIVE, not the
+    # copy: a regression dropping `return_bound` turns the bounded copy below
+    # into a false unbounded overflow -- the round-1 blocker's failure mode
+    # arriving through the source half instead of the class. Nothing else here
+    # reaches it, because every other program uses the BARE receive to bound
+    # the length and the twin only as the sink.
+    for callee in (base, chk):
+        copy = _reported(_twin_as_bounding_source_program(callee), f"call:{callee}", gate=())
+        assert len(copy) == 1, (callee, copy)
+        # `ret` + `return_bound.max_from_arg 2`: attacker-derived but provably
+        # bounded by the count this call was given.
+        assert (copy[0]["class"], copy[0].get("source_bound")) == ("bounded_len", "0x40"), (callee, copy)
+        # `*arg:1`: the received bytes really do land in the buffer, so the
+        # copy's destination is tainted and the exec sink downstream fires.
+        shell = _reported(_twin_as_bounding_source_program(callee), f"call:{callee}",
+                          gate=(), at="0x30")
+        assert [s["class"] for s in shell] == ["command_injection"], (callee, shell)
+
+
+# --- #876 sweep completeness: fortified spellings whose bare twin is armed ---
+#
+# The round-2/3 LFS gap was found by asking which SPELLING a real build emits
+# that the DB does not name -- a question enumerating DB keys cannot answer.
+# Asked of the whole fortify surface, the copy family answered the same way:
+# these five are exported by the platform C library, their bare twins carry an
+# armed sink, and the fortified spelling resolved to nothing.
+_FORTIFIED_COPY_PAIRS = (("mempcpy", "__mempcpy_chk"), ("strlcpy", "__strlcpy_chk"),
+                         ("strlcat", "__strlcat_chk"), ("wmemcpy", "__wmemcpy_chk"),
+                         ("wmemmove", "__wmemmove_chk"))
+
+
+def _copy_program(callee):
+    """``read(3, &src, 0x40); callee(&dst, &src, n[, guard]); system(&dst)``.
+
+    `n` is a parameter, not the receive's return, so no bounded downgrade
+    applies and the length arm reports the class the model declares.
+    """
+    F = _fakes()
+    n = F.FVar("n", ident=1); n0 = F.FSSA(n, 0)
+    src = F.FVar("src", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
+    params = [F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+              F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+              F.FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]
+    if callee.endswith("_chk"):
+        params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "read(3, &src, 0x40)", writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+                 params=[F.FExpr("MLIL_CONST", "3", constant=3),
+                         F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                         F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&dst, &src, n#0)", reads=[n0], writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
+        F.FInstr(2, 0x30, "MLIL_CALL_SSA", "system(&dst)", writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
+                 params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)]),
+    ]
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs), params=[n]),
+            F.FBV({0x900: "read", 0x901: callee, 0x2020: "system"}))
+
+
+@pytest.mark.parametrize("base,chk", _FORTIFIED_COPY_PAIRS)
+def test_fortified_copy_spelling_is_modeled_like_its_bare_twin_876(base, chk):
+    # A hardened build emits the `_chk` spelling; with no model at all
+    # `lookup_model` returned None, so `taint forward` answered reached_sinks:[]
+    # where the unfortified build reported the overflow. Unlike the read family
+    # these keep the copy/concat `fortified_overflow` class -- they take no
+    # `len_arg`/`buf_arg` pair and so participate in neither class-keyed
+    # suppressor, exactly like the eight fortified copy entries already here.
+    bare = _reported(_copy_program(base), "param:0", "call:read", gate=())
+    fort = _reported(_copy_program(chk), "param:0", "call:read", gate=())
+    assert len(bare) == 1 and len(fort) == 1, (bare, fort)
+    # the trailing destlen guard appends; it does not shift dest/src/len
+    assert fort[0]["tainted_arg_index"] == bare[0]["tainted_arg_index"] == 2
+    assert bare[0]["class"] == "overflow_len", bare
+    assert fort[0]["class"] == "fortified_overflow", fort
+    assert chk in fort[0]["detail"] and "aborts at runtime" in fort[0]["detail"]
+    # and the copy still propagates the tainted source into the destination,
+    # so a downstream exec sink is reachable through the fortified spelling too
+    for callee in (base, chk):
+        shell = _reported(_copy_program(callee), "param:0", "call:read", gate=(), at="0x30")
+        assert [s["class"] for s in shell] == ["command_injection"], (callee, shell)
 
 
 def test_scanf_family_models_carry_arity_capped_flag_851():
