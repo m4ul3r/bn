@@ -3952,3 +3952,142 @@ def test_an_unreadable_listing_does_not_sink_the_decompile(monkeypatch):
 
     monkeypatch.setattr(il_format, "_disasm_instruction", _boom)
     assert read_decompile._flattened_guard_warning(object(), _GuardFunc()) is None
+
+
+# --- #676 item 5 / #675: the multi-identifier producer, driven directly -----
+#
+# Round 1 major: `_decompile_batch` had no direct test at all. Failure
+# isolation and the requested/resolved counters were asserted only against a
+# hand-authored mock reply in the CLI renderer test -- which proves the
+# renderer reads those keys, and nothing at all about the producer that is
+# supposed to emit them.
+
+
+def _install_per_function_pseudo_c(monkeypatch, bridge, bodies):
+    """Like `_install_fake_pseudo_c`, but dispatches on the FUNCTION.
+
+    The shared helper asserts `fn is func` for one function, so it cannot
+    stand up a batch: a batch that decompiled the same function twice would
+    not exercise ordering or per-row identity at all.
+    """
+    class _FakeContents:
+        def __init__(self, address, text):
+            self.address, self._text = address, text
+
+        def __str__(self):
+            return self._text
+
+    class _FakeLine:
+        def __init__(self, address, text):
+            self.contents = _FakeContents(address, text)
+
+    class _FakeViewObject:
+        def __init__(self, batches):
+            self.batches = [[_FakeLine(a, t) for (a, t) in b] for b in batches]
+
+    class _FakeCursor:
+        def __init__(self, view_obj):
+            self._batches, self._i = view_obj.batches, 0
+
+        def seek_to_begin(self):
+            self._i = 0
+
+        @property
+        def lines(self):
+            return self._batches[self._i] if self._i < len(self._batches) else []
+
+        def next(self):
+            self._i += 1
+            return self._i < len(self._batches)
+
+    class _FakeLinearViewObject:
+        @staticmethod
+        def single_function_language_representation(fn, settings=None,
+                                                    language="Pseudo C"):
+            return _FakeViewObject(bodies[fn.name])
+
+    fake_mod = types.ModuleType("binaryninja.lineardisassembly")
+    fake_mod.LinearViewObject = _FakeLinearViewObject
+    fake_mod.LinearViewCursor = _FakeCursor
+    monkeypatch.setattr(bridge.bn, "lineardisassembly", fake_mod, raising=False)
+
+    class _FakeDisassemblySettings:
+        def set_option(self, option, state=True):
+            return None
+
+    class _FakeDisassemblyOption:
+        ShowAddress = 0
+        ShowTypeCasts = 10
+        WaitForIL = 66
+        DisableLineFormatting = 68
+
+    monkeypatch.setattr(bridge.bn, "DisassemblySettings", _FakeDisassemblySettings,
+                        raising=False)
+    monkeypatch.setattr(bridge.bn, "DisassemblyOption", _FakeDisassemblyOption,
+                        raising=False)
+
+
+def _batch_bridge(monkeypatch):
+    """A bridge whose view holds two real functions with distinct bodies."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    handle = _FakeFunction(0x401000, "handle")
+    parse = _FakeFunction(0x402000, "parse_file")
+    bv = _FakeBV(functions=[handle, parse])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv_, func: {})
+    _install_per_function_pseudo_c(monkeypatch, bridge, {
+        "handle": [[(0x401000, "int32_t handle(void)")], [(0x401004, "{ }")]],
+        "parse_file": [[(0x402000, "int32_t parse_file(void)")],
+                       [(0x402004, "{ return 1; }")]],
+    })
+    return bridge, instance
+
+
+def test_decompile_batch_keeps_a_miss_in_place_and_counts_it_676(monkeypatch):
+    """A typo in the third name must not discard the two that resolved.
+
+    That is the entire reason to batch: the caller already paid the analysis
+    cost for the functions that worked, and a shell `for` loop under `set -e`
+    throws them away. So the miss becomes a FAILED ROW in the caller's own
+    order, carrying its error text, and the counters state the shortfall.
+    """
+    bridge, instance = _batch_bridge(monkeypatch)
+
+    result = instance._decompile_batch(
+        "active", ["handle", "nosuchfn", "parse_file"])
+
+    assert result["kind"] == "decompile_batch"
+    assert [row["identifier"] for row in result["functions"]] == [
+        "handle", "nosuchfn", "parse_file"], "a miss keeps its SLOT"
+    assert [row["ok"] for row in result["functions"]] == [True, False, True]
+
+    # The counters are the shortfall a caller reads, not a row count.
+    assert result["requested"] == 3
+    assert result["resolved"] == 2
+
+    # The two that resolved carry their own bodies, so the rows are not
+    # interchangeable placeholders.
+    assert result["functions"][0]["decompiled"]["text"] == (
+        "int32_t handle(void)\n{ }")
+    assert result["functions"][2]["decompiled"]["text"] == (
+        "int32_t parse_file(void)\n{ return 1; }")
+
+    # The miss says WHY, per identifier, rather than collapsing into one
+    # failure for the whole request.
+    miss = result["functions"][1]
+    assert "decompiled" not in miss
+    assert "nosuchfn" in miss["error"]
+
+
+def test_decompile_batch_that_resolves_everything_reports_no_shortfall_676(
+        monkeypatch):
+    """Must-not-fire twin: `resolved` must track the successes, not be a
+    constant that happens to be right on the failure path."""
+    bridge, instance = _batch_bridge(monkeypatch)
+
+    result = instance._decompile_batch("active", ["handle", "parse_file"])
+
+    assert result["requested"] == result["resolved"] == 2
+    assert all(row["ok"] for row in result["functions"])
+    assert all("error" not in row for row in result["functions"])

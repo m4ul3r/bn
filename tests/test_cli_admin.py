@@ -3557,7 +3557,7 @@ def test_an_explicit_target_flag_beats_the_environment(monkeypatch):
     )
 
 
-def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch):
+def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch, capsys):
     """An UNSET shell variable exports as the empty string, and the bridge
     collapses an empty selector to the focused GUI view with no count check.
 
@@ -3566,15 +3566,33 @@ def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch):
     happened to have focus while LOOKING like it had been told a target. The
     existing empty-selector refusal covers it, and this pins that the env path
     reaches that refusal rather than bypassing it.
+
+    Round 1 blocker: the first cut asserted only `main(...) == 2`, and a 2 is
+    what this argv produces at base too -- from the no-targets-open error on
+    the implicit-target path, which the env default does not even reach. The
+    exit code alone cannot tell the two apart, so the assertions are now the
+    two things only the refusal produces: its own words, and the fact that
+    NOTHING was sent. The base path sends `list_targets` before it fails, so
+    the silence is what separates "refused the selector" from "asked the
+    bridge and got an unrelated error".
     """
     import bn.cli
 
-    monkeypatch.setattr(
-        bn.cli, "send_request",
-        lambda op, **kw: {"ok": True, "result": []},
-    )
+    sent: list[str] = []
+
+    def fake_send_request(op, **kwargs):
+        sent.append(op)
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setenv("BN_TARGET", "   ")
+
     assert bn.cli.main(["function", "list"]) == 2
+
+    assert "--target is empty" in capsys.readouterr().err
+    assert sent == [], (
+        "the empty selector must be refused BEFORE anything reaches the "
+        f"bridge; these ops were sent instead: {sent}")
 
 
 def test_a_required_target_option_never_takes_the_environment_default():
@@ -3617,3 +3635,50 @@ def test_bn_target_is_scrubbed_from_the_test_environment():
     from conftest import SCRUBBED_ENV_VARS
 
     assert "BN_TARGET" in SCRUBBED_ENV_VARS
+
+
+def test_the_runtime_reference_denies_no_environment_default_the_cli_honours(
+        monkeypatch):
+    """runtime.md's routing ladder is where an agent learns how `-t` resolves,
+    and it said -- in bold -- that `BN_TARGET` does not exist, while the root
+    parser had started defaulting `-t` from it.
+
+    A doc that denies a shipped mechanism is worse than one that omits it: the
+    agent reads the denial, keeps paying `-t` on every command, and the
+    clobber hazard the variable exists to remove stays in place. The sibling
+    guard `test_every_flag_the_reference_denies_really_does_not_exist` covers
+    the same failure for FLAGS and cannot see this one, because its token
+    pattern only matches `--spellings`.
+
+    Both halves are asserted in one test on purpose. The doc half alone is
+    satisfiable by deleting the sentence while the mechanism is reverted, and
+    the behaviour half is what the sibling tests above already pin; it is
+    their CONJUNCTION that is the contract.
+    """
+    import re
+    from pathlib import Path
+
+    from test_skill_reference_drift import _SENTENCE, bound_absence_claims
+
+    # The mechanism is really shipped: the exported value reaches the request.
+    assert "beta.bin" in _capture_target(
+        monkeypatch, ["function", "list"], {"BN_TARGET": "beta.bin"})
+
+    # The env analogue of `_DOC_FLAG`/`_ABSENCE_CLAIM`: same denial forms, an
+    # env-variable token instead of a long flag. `bound_absence_claims` is
+    # shared rather than reimplemented -- it is already parameterised over the
+    # token and claim patterns for exactly this reason.
+    env_name = re.compile(r"BN_[A-Z][A-Z0-9_]*")
+    env_absence = re.compile(
+        r"`(BN_[A-Z0-9_]+)`[^.`]{0,30}do(?:es)? not exist"
+        r"|there is no `(BN_[A-Z0-9_]+)`"
+        r"|no such `?(BN_[A-Z0-9_]+)`?"
+        r"|no `(BN_[A-Z0-9_]+)` (?:variable|environment variable|default)")
+
+    doc = Path(__file__).resolve().parents[1] / "skills/bn/reference/runtime.md"
+    denied: set[str] = set()
+    for sentence in _SENTENCE.split(doc.read_text(encoding="utf-8")):
+        denied |= bound_absence_claims(sentence, env_name, env_absence)
+
+    assert "BN_TARGET" not in denied, (
+        "runtime.md denies BN_TARGET while the root `-t` default reads it")

@@ -3163,3 +3163,52 @@ def test_an_unreadable_tally_states_itself_rather_than_inventing_a_number(monkey
         resolved={"unreadable": True},
     )
     assert "? of 2 resolved" in capsys.readouterr().out
+
+
+def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
+    """The reference synopsis is where an agent learns a stem's arity, and it
+    still showed `bn decompile <fn>` after the stem started taking N.
+
+    An undocumented batch is a batch nobody uses -- the friction #676 item 5
+    was filed for (every agent re-inventing the bash `for` loop) survives
+    unchanged if the reference does not say the loop is unnecessary. Worse,
+    an agent who discovers the multi form by accident then reaches for
+    `.items[]` or a top-level `.text`, because the batch answers neither.
+
+    Bound to the PARSER and to the response's own container key, not to the
+    reference's prose: the doc could be reworded freely, but it may not stop
+    documenting an arity the CLI accepts or a leaf the producer emits.
+    """
+    from pathlib import Path
+
+    # The stem really does take N identifiers.
+    parsed = bn.cli.build_parser().parse_args(
+        ["-t", "x", "decompile", "handle", "parse_file", "main"])
+    assert parsed.identifier == ["handle", "parse_file", "main"]
+
+    doc = (Path(__file__).resolve().parents[1]
+           / "skills/bn/reference/reading.md").read_text(encoding="utf-8")
+    synopsis = [line for line in doc.splitlines()
+                if line.startswith("bn decompile ")]
+    assert synopsis, "the reference no longer carries a `bn decompile` synopsis"
+    assert any(line.count("<fn>") > 1 for line in synopsis), (
+        "the synopsis documents a single identifier while the parser takes "
+        f"N: {synopsis}")
+
+    # And the batch's own shape is described. The names are taken from the
+    # producer's envelope rather than retyped here, so renaming a wire key
+    # without touching the reference reds this.
+    from bn_agent_bridge import read_decompile
+
+    class _NoView:
+        def _resolve_view(self, selector):
+            raise RuntimeError("no view in this test")
+
+    envelope = read_decompile._decompile_batch(_NoView(), None, ["a"])
+    container = next(k for k, v in envelope.items() if isinstance(v, list))
+    assert container != "items", (
+        "the batch deliberately does not use the paged-collection container, "
+        "which is exactly why the reference has to say so")
+    for name in (envelope["kind"], container, "requested", "resolved"):
+        assert f"`{name}`" in doc or f'"{name}"' in doc, (
+            f"reading.md never names the batch envelope's {name!r}")

@@ -12,6 +12,7 @@ import socket
 import threading
 import types
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1433,6 +1434,114 @@ def test_save_proceeds_when_the_collision_probe_cannot_answer_867(
 
     assert result["saved"] is True
     assert dest.exists()
+
+
+# --- #867/#857: the post-write disclosure is the BACKSTOP, and it must fire --
+#
+# Round 1 blocker: when the two #857 disclosure tests were rewritten into #867
+# refusal tests, the disclosure lost ALL positive coverage -- stubbing
+# `_disclose_open_target_collision` to a bare `return` left the save-related
+# files green (579 in this file alone), because the only surviving reference
+# was the must-not-fire negative. The two destinations the PRE-WRITE refusal
+# provably cannot cover are the ones asserted below.
+
+
+def test_the_read_only_cache_fallback_destination_is_disclosed_867(
+        monkeypatch, tmp_path):
+    """The refusal tests the REQUESTED path; the fallback writes somewhere else.
+
+    A binary on a read-only mount cannot grow an adjacent `.bndb`, so the save
+    lands in the writable cache (#214/#318) -- a destination chosen only AFTER
+    the primary write failed, and therefore never seen by the pre-write check.
+    If that cache copy is itself open as a target (an agent that loaded it to
+    resume earlier work), the two targets are one database from this moment and
+    `session restart` returns one row for both.
+
+    Extending the refusal here was considered and rejected in
+    `_disclose_open_target_collision`'s own docstring: the fallback exists so
+    annotations are NOT lost on a read-only mount. So disclosure is the only
+    protection this destination has, and this is the test that says so.
+
+    Drives the REAL `open_target_for_path` through `_collect_open_views_state`
+    rather than a lambda, so the probe's own identity matching is exercised
+    against a genuine second view instead of being assumed.
+    """
+    from _bridge_fakes import _SaveBV
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    cache_dest = str(module._cache_bndb_path(str(raw)))
+
+    class _ROSaveBV(_SaveBV):
+        def create_database(self, out: str):
+            self.created_with = out
+            if out == str(raw) + ".bndb":
+                return False          # BN's "wrote nothing" on the RO mount
+            Path(out).write_text("bndb")
+            return True
+
+    bv = _ROSaveBV(str(raw), result=True, write=True)
+    other = _SaveBV(cache_dest, result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(
+        module, "_collect_open_views_state", lambda strict=False: ([bv, other], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    # The premise: the primary really did fail and the cache really was used,
+    # so the destination under test is one the pre-write check never saw.
+    assert result["fallback"] is True, result
+    assert result["path"] == cache_dest
+    assert not (tmp_path / "ro" / "svc.bndb").exists()
+
+    collision = result.get("collides_with_open_target")
+    assert collision, (
+        "the cache fallback landed on a file another target has open and said "
+        "nothing -- the one destination the #867 refusal cannot cover")
+    assert collision["filename"] == cache_dest
+    assert "also open as target" in result["note"]
+    assert "session restart" in result["note"]
+
+
+def test_a_collision_opened_after_the_pre_write_check_is_disclosed_867(
+        monkeypatch, tmp_path):
+    """The other uncovered destination: the check-to-write WINDOW.
+
+    `_save_database` probes, then writes. A target opened on that file in
+    between passes the check and still collapses the two targets, because the
+    collapse is a property of the file after the write, not of the check. The
+    refusal cannot close this -- it is a race, not a missing test -- so the
+    post-write disclosure is what makes it visible, and nothing asserted that.
+
+    The probe answers None once (the pre-write check) and then names the other
+    target, which is exactly what a concurrent `bn load` looks like from here.
+    """
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+    other = {"target_id": "t:2", "selector": "late.bndb",
+             "filename": str(tmp_path / "target.bndb")}
+    answers = [None, other]
+
+    def _probe(path, *, exclude):
+        return answers.pop(0) if answers else other
+
+    monkeypatch.setattr(instance.targets, "open_target_for_path", _probe)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    # The premise: the pre-write check passed (nothing was refused) and the
+    # write really landed, so only a post-write disclosure can carry the fact.
+    assert result["saved"] is True
+    assert dest.exists()
+    assert answers == [], "both probe points must have been reached"
+
+    assert result.get("collides_with_open_target") == other
+    assert "also open as target" in result["note"]
+    assert "'late.bndb'" in result["note"]
 
 
 def test_save_through_a_hard_link_records_the_database_despite_inode_replacement_869(

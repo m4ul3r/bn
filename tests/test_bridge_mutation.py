@@ -4907,6 +4907,75 @@ def test_a_batch_that_reaches_every_op_grows_no_unattempted_rows_675():
     assert me._unattempted_results(None, []) == []
 
 
+def _documented_per_op_statuses() -> set[str]:
+    """The status names `skills/bn/reference/mutating.md` enumerates.
+
+    Parsed from the file's own "Per-op statuses:" bullet list rather than
+    from a copy kept here, so the guard reads the list an agent reads.
+    """
+    import re
+    from pathlib import Path
+
+    doc = (Path(__file__).resolve().parents[1]
+           / "skills/bn/reference/mutating.md").read_text(encoding="utf-8")
+    _, _, tail = doc.partition("Per-op statuses:")
+    assert tail, "mutating.md no longer enumerates per-op statuses"
+    names: set[str] = set()
+    for line in tail.splitlines():
+        if not line.strip():
+            continue
+        match = re.match(r"- `([a-z_]+)` +\u2014", line)
+        if not match:
+            break          # the list ends at the first non-bullet line
+        names.add(match[1])
+    return names
+
+
+def test_every_status_a_doomed_batch_emits_is_in_the_reference_status_list_675(
+        monkeypatch):
+    """The reference's per-op status list is a CLOSED enumeration an agent
+    reads to decide what a row means, so a status the bridge emits and the
+    list omits reads as an unknown failure mode.
+
+    Round 1 major: `not_attempted` shipped on every failed batch and was never
+    added there. The population is taken from a real `_mutation` response
+    rather than from a hand-listed set, so the guard cannot drift from what
+    the engine actually emits -- and one batch with a MIDDLE op failing is
+    enough to produce all three of the doomed-batch statuses at once: the op
+    that already applied (re-stamped), the op that failed, and the ops never
+    reached.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "Symbol not found: GONE",
+                                          requested={})
+        return {"op": op.get("op"), "status": "applied", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely",
+                        lambda ctx, bv_, state: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: True)
+
+    result = instance._mutation("active", False, [
+        {"op": "set_comment", "address": "0x1000", "comment": "a"},
+        {"op": "boom"},
+        {"op": "set_comment", "address": "0x2000", "comment": "b"},
+    ])
+    emitted = {row["status"] for row in result["results"]}
+    # The premise: this really is the doomed-batch shape, not one status.
+    assert len(emitted) == 3, emitted
+
+    documented = _documented_per_op_statuses()
+    assert emitted <= documented, (
+        "mutating.md's per-op status list omits statuses the bridge emits: "
+        f"{sorted(emitted - documented)}")
+
+
 # --- #675 item 14: a create inside an existing function says so -----------
 
 
