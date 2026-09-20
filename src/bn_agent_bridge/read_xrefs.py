@@ -307,6 +307,24 @@ def _code_refs_once(bv, address: int, *, propagate_read_errors: bool = False) ->
     return raw, [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
 
 
+def _data_refs_once(bv, address: int, *, propagate_read_errors: bool = False) -> list:
+    """BN's data refs to *address*, read once -- the mirror of `_code_refs_once`.
+
+    A reader that RAISES has always propagated from here (this read was never
+    wrapped), so *propagate_read_errors* only decides the other way a view can be
+    unable to answer: offering no reader at all. On the guarded literal-address
+    path that must raise too, because the #374 guard keys on this list as well --
+    reading it as `[]` answers a mapped address with the same false-negative
+    `0 callers` the probe this replaced turned into an error."""
+    get_data_refs = getattr(bv, "get_data_refs", None)
+    if not callable(get_data_refs):
+        if propagate_read_errors:
+            raise RuntimeError(
+                f"This view cannot enumerate data references for {hex(int(address))}")
+        return []
+    return list(get_data_refs(address))
+
+
 def _genuine_code_refs(bv, address: int) -> list:
     """Code refs to *address*, with spurious adrp page-base materializations
     dropped when *address* is page-aligned (#284). Non-page-aligned targets
@@ -576,12 +594,12 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     # unfiltered population; `genuine_code_refs` has spurious adrp page-base
     # materializations dropped for a page-aligned target (#284) and is what the
     # response renders. On the guarded (literal-address) path a read that FAILED
-    # raises rather than reading as "no refs", because that is the population the
-    # #374 guard decides on: `0 callers` must mean BN said so.
+    # raises rather than reading as "no refs" -- for BOTH lists, because that is
+    # the population the #374 guard decides on: `0 callers` must mean BN said so.
     all_code_refs, genuine_code_refs = _code_refs_once(
         bv, address, propagate_read_errors=require_refs_or_mapped)
-    get_data_refs = getattr(bv, "get_data_refs", None)
-    raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
+    raw_data_refs = _data_refs_once(
+        bv, address, propagate_read_errors=require_refs_or_mapped)
     if require_refs_or_mapped and not all_code_refs and not raw_data_refs:
         # #374: an address BN holds no ref of ANY kind for must still be mapped
         # to be a legitimate "0 callers" answer; an unmapped one is a typo and is

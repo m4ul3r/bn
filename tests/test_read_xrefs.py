@@ -138,19 +138,22 @@ def test_xrefs_guard_keys_on_bn_refs_not_on_the_284_filtered_list_815(monkeypatc
 
 
 def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_815(monkeypatch):
-    """A code-ref enumeration that FAILED is not evidence of "no refs".
+    """A ref enumeration that FAILED is not evidence of "no refs".
 
     #374 exists to stop a read answering a false-negative `0 callers`, and the
-    guard decides on the code-ref list: if the read that produced that list was
+    guard decides on BOTH ref lists: if the read that produced one of them was
     swallowed into `[]`, a MAPPED address answers a confident `total: 0` for a
-    binary BN could not enumerate. The probe #815 removed read the list unguarded
-    on this path, so the failure surfaced as an error -- that must survive the
-    fold into the builder. Both ways the enumeration can be unavailable are
-    pinned: the reader raising, and the view not offering one at all."""
+    binary BN could not enumerate. The probe #815 removed read both lists
+    unguarded on this path, so the failure surfaced as an error -- that must
+    survive the fold into the builder, for each list and for each way a view can
+    be unable to answer (the reader raising, and no reader at all)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
-    def _view(raising: bool):
+    def _raise(address):
+        raise RuntimeError("BN ref enumeration failed")
+
+    def _use(reader: str, mode: str):
         bv = _FakeBV(
             functions=[_FakeFunction(0x401000, "caller")],
             sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
@@ -158,21 +161,17 @@ def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_8
         )
         # MAPPED, so the #374 guard is not what would save this read.
         bv.is_valid_offset = lambda address: True
-        if raising:
-            def _raise(address):
-                raise RuntimeError("BN ref enumeration failed")
-            bv.get_code_refs = _raise
-        else:
-            bv.get_code_refs = None
-        return bv
+        setattr(bv, reader, _raise if mode == "raises" else None)
+        monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _view(True))
-    with pytest.raises(RuntimeError, match="enumeration failed"):
-        instance._xrefs(None, "0x401234")
+    for reader, kind in (("get_code_refs", "code"), ("get_data_refs", "data")):
+        _use(reader, "raises")
+        with pytest.raises(RuntimeError, match="enumeration failed"):
+            instance._xrefs(None, "0x401234")
 
-    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _view(False))
-    with pytest.raises(RuntimeError, match="cannot enumerate code references"):
-        instance._xrefs(None, "0x401234")
+        _use(reader, "absent")
+        with pytest.raises(RuntimeError, match=f"cannot enumerate {kind} references"):
+            instance._xrefs(None, "0x401234")
 
 
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
