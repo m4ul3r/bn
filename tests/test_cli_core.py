@@ -8,6 +8,11 @@ import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+# The #864 FIFO readers are split across test modules; the stall guard is
+# imported from the one holding the larger group rather than copied, because
+# two copies of a hang guard drift and the stale one is the copy nobody is
+# looking at when the reader regresses.
+from test_cli_types import _must_not_hang
 
 
 def test_spill_warns_about_pipe_trap_when_stdout_is_a_pipe(monkeypatch, capsys):
@@ -375,10 +380,17 @@ def test_both_taint_directions_share_one_resolve_map_policy(monkeypatch, capsys,
     byte-identical copy of the --resolve-map read/refuse policy, so an edit to
     how that file is parsed or refused lands on one direction and silently
     misses the other. One copy now (`_add_resolve_map`, mirroring the
-    `_add_user_models` precedent the issue names), and this pins the two
+    `_add_user_models` precedent the issue names), and this pins the THREE
     observable consequences a divergence would break: the same file parses to
-    the same param, and a bad one is refused before the wire with the same
-    message."""
+    the same param, a bad one is refused before the wire with the same
+    message, and -- the one that regular files cannot see -- a stream is
+    bounded and refused the same way in both directions.
+
+    That third case is what makes this cell load-bearing. The first two
+    compare two byte-identical copies, so they are green at the branch point
+    and stay green when a direction is re-inlined with the pre-fix unbounded
+    `Path(...).read_text()`: same parse, same message, one direction now
+    hanging forever. Only a stream separates them."""
     good = tmp_path / "rmap.json"
     good.write_text(json.dumps({"0x401000": ["0x401100"]}), encoding="utf-8")
     bad = tmp_path / "broken.json"
@@ -420,6 +432,38 @@ def test_both_taint_directions_share_one_resolve_map_policy(monkeypatch, capsys,
         refusals.append(capsys.readouterr().err.replace(str(bad), "<map>"))
     assert "could not read --resolve-map" in refusals[0]
     assert refusals[0] == refusals[1]
+
+    # A regular file cannot tell the two directions apart on the dimension
+    # that actually matters: whether the read goes through the BOUNDED shared
+    # reader. Re-inlining the pre-fix `Path(...).read_text()` into one
+    # direction keeps every assertion above green while that direction blocks
+    # forever on a stream -- #864's rc=124 with no envelope in one taint
+    # direction and a structured refusal in the other, from one flag. So the
+    # parity is asserted on a FIFO too, under the hang guard, which is also
+    # what makes this cell red at the branch point rather than green there.
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    fifo = tmp_path / "stream.json"
+    os.mkfifo(fifo)
+    # A write-only open of a FIFO fails with ENXIO while no reader is attached,
+    # so hold one open for the duration; the writer the reader under test finds
+    # is attached and silent either way.
+    keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    silent_writer = os.open(fifo, os.O_WRONLY)
+    streamed = []
+    try:
+        for tail in directions:
+            seen.clear()
+            with _must_not_hang():
+                rc = bn.cli.main([*tail, "--resolve-map", str(fifo), "--target", "active"])
+            assert rc == 2
+            assert seen == []  # bounded and refused before the wire, both ways
+            streamed.append(capsys.readouterr().err.replace(str(fifo), "<map>"))
+    finally:
+        os.close(silent_writer)
+        os.close(keep_reader)
+
+    assert "went quiet" in streamed[0]
+    assert streamed[0] == streamed[1]
 
 
 def test_entries_validator_hex_aware_and_rejects_zero(capsys):
