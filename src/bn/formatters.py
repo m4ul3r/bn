@@ -1824,13 +1824,15 @@ def _render_go_rename_text(value: Any) -> str:
     # run of the same state commits zero; stating the rows that verified as
     # "would rename" misleads a caller that plans on it, and this view is the
     # one that CLAIMS those counts. It is asked here from `success` and the
-    # failure ROWS only. The compact summary has deciders this view does not --
-    # it refuses when `go_failed_count` disagrees with the rows, when any
-    # counter it read came back in a shape no count reads out of, and it
-    # classifies each row BY STATUS where this view counts the raw list -- so
-    # on a skewed payload the two faces still differ. A pre-existing gap, named
-    # here rather than papered over by a comment claiming they cannot (#693
-    # r2/r3).
+    # failure ROWS only, and that is NOT the compact summary's question: the
+    # summary refuses when `go_failed_count` disagrees with the rows and when
+    # any counter it read came back in a shape no count reads out of, neither
+    # of which this view asks -- and it classifies each row BY STATUS where
+    # this view counts the raw list, which splits them the OTHER way (a
+    # non-failure row beside a zero counter is `ok` to the summary and a
+    # failure to this view). So on a skewed payload the two faces differ in
+    # both directions. A pre-existing gap, named here rather than papered over
+    # by a comment claiming they cannot (#693 r2/r3/r4).
     ok = value.get("success") is not False and not failed
     lines: list[str] = []
     # A revert that did not complete is the ONE state where no line here may
@@ -5388,18 +5390,34 @@ def _go_rename_summary(value: Any) -> Any:
     elif preview:
         # #693 item 2 changed the VALUE a failed preview reports (0 -- the op
         # is all-or-nothing, so a live run of that state commits zero), and it
-        # must not also change what this branch MEASURES. `go_verified_count`
+        # must not also change what this rung MEASURES. `go_verified_count`
         # stays the source either way, because the summary still STATES it as
         # `verified_count` and the detail view still prints it: letting a
-        # failed preview fall through to the sourceless `else` made an envelope
-        # that omits the counter report a fabricated `verified_count: 0` beside
-        # `measured: true`, switching off the #684 fail-safe that exists for
-        # exactly that version-skewed envelope (#693 r2).
+        # failed preview fall through to the sourceless rung below made an
+        # envelope that omits the counter report a fabricated
+        # `verified_count: 0` beside `measured: true`, switching off the #684
+        # fail-safe that exists for exactly that version-skewed envelope
+        # (#693 r2).
         changed = verified if run_ok else 0
         source = "go_verified_count"
+    elif rolled_back is False:
+        # A revert that did NOT complete. `changed` is 0 here only nominally --
+        # the shared builder overrides it to `None`, because an unknown subset
+        # of the renames is live -- so the counts this summary DOES state are
+        # the only numbers a remediation pass has, and `_count_field` answers 0
+        # for an absent key. A fabricated `verified_count: 0` is at its worst
+        # in this cell: it sits beside `changed_count: null` and disagrees with
+        # the detail view, which falls back to `candidates - failure rows` and
+        # printed a DIFFERENT number for the same payload (#693 r4). So the
+        # counter is required here even though the revert, not a counter,
+        # established `changed`.
+        changed = 0
+        source = "go_verified_count"
     else:
-        # Nothing landed, and that is established by the revert rather than by
-        # a counter -- so there is no measurement source to require.
+        # A live run that WAS reverted: nothing landed, and that is established
+        # by the revert rather than by a counter, so there is no measurement
+        # source to require -- pinned by
+        # `test_a_go_rename_summary_with_no_counters_is_not_a_measured_noop`.
         changed = 0
         source = None
     measured = (not unreadable and not rows_contradict

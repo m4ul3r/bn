@@ -673,6 +673,64 @@ def test_a_failed_preview_missing_its_verified_counter_stays_unmeasured(monkeypa
     assert stated["verified_count"] == 1, stated
 
 
+def test_a_live_failed_revert_missing_its_verified_counter_stays_unmeasured(monkeypatch):
+    """#693 r4: the same hole as r2's, one rung down and in the LIVE direction.
+
+    Round 2 named `go_verified_count` on the preview rung and left the rung
+    below sourceless, on the reason that `changed = 0` is established by the
+    revert rather than by a counter. True of `changed` -- but on a revert that
+    did NOT complete the builder overrides that 0 to `None` anyway, so the
+    counts this summary still STATES (`verified_count`, `noop_count`,
+    `failed_count`) are the only numbers a remediation pass has, and
+    `_count_field` answers 0 for an absent key. A LIVE failed revert whose
+    envelope omits the counter therefore reported `verified_count: 0` beside
+    `measured: true` and beside `changed_count: null` -- while the detail view,
+    which falls back to `candidates - failure rows`, printed `1 verified` for
+    the SAME payload. Two faces, two different fabricated numbers, in the one
+    state where the caller has already been told the live delta is unknown.
+
+    A revert that COMPLETED keeps the sourceless rung: nothing landed, the
+    revert establishes it, and that contract is pinned by
+    `test_a_go_rename_summary_with_no_counters_is_not_a_measured_noop`.
+
+    Version skew again, so the payload is the producer's own output with the
+    one key deleted; the counterpart that keeps it is pure producer."""
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    live, _ = _go_rename_produced(
+        monkeypatch, preview=False,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    assert live["preview"] is False and live["rolled_back"] is False
+    assert "go_verified_count" in live          # today's bridge always states it
+
+    skewed = {key: value for key, value in live.items()
+              if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(skewed))
+    assert summary["measured"] is False, summary
+    assert summary["verified_count"] is None, summary   # never a fabricated 0
+    assert summary["failed_count"] is None, summary
+    assert summary["dirty_after"] is True, summary
+    # The detail view's own figure on that envelope is `candidates - failure
+    # rows`, not something the envelope reported -- which is both why the
+    # compact face may not call it a measurement and why a confident 0 there
+    # would have disagreed with the text a reader sees.
+    assert "1 verified" in _render_go_rename_text(dict(skewed))
+
+    # Anti-vacuity: with the counter stated, the same run is measured.
+    stated = _go_rename_summary(dict(live))
+    assert stated["measured"] is True and stated["verified_count"] == 1, stated
+
+    # ...and the neighbouring rung is untouched: a revert that COMPLETED needs
+    # no counter, because the revert -- not a counter -- established the zero.
+    reverted, _ = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=(0x402000,))
+    assert reverted["rolled_back"] is True
+    completed = _go_rename_summary(
+        {key: value for key, value in reverted.items()
+         if key != "go_verified_count"})
+    assert completed["measured"] is True and completed["changed_count"] == 0, completed
+
+
 def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
         monkeypatch, fake_transport, capsys):
     """The same states end to end, because the default and `--verbose` views are
