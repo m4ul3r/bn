@@ -3725,12 +3725,16 @@ def _arity_arch(arg_regs):
 
 
 def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
-              user_type=False, arg_reg_names=None, second=None):
+              user_type=False, arg_reg_names=None, second=None, repeat_first=1):
     """A direct call with a structured prototype and independently rendered args.
 
     `second=(name, params, arg_texts)` appends a SECOND callee and a second call
     site to the same caller: two rows whose fates differ, which is what the paging
-    test needs to show a row's caveat surviving a slice that excludes that row."""
+    test needs to show a row's caveat surviving a slice that excludes that row.
+
+    `repeat_first=N` calls the FIRST callee N times from the same caller instead
+    of once -- the dispatch-function shape, where the per-callee witness must be
+    paid once rather than once per row."""
     names = list(arg_reg_names) if arg_reg_names else [f"x{i}" for i in range(arg_regs)]
 
     def _make_callee(address, name, params):
@@ -3752,6 +3756,9 @@ def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
     caller = _FakeFunction(0x401400, "probe_device")
     functions = [callee, caller]
     sites = [(0x401400, callee, list(arg_texts))]
+    # A distinct base so a repeat can never collide with `second`'s 0x401404.
+    for extra in range(1, max(1, repeat_first)):
+        sites.append((0x401410 + 4 * extra, callee, list(arg_texts)))
     if second is not None:
         other_name, other_params, other_texts = second
         other = _make_callee(0x401500, other_name, other_params)
@@ -3776,7 +3783,8 @@ def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
         lengths[address] = 4
         disassembly[address] = f"bl {target.name}"
     caller.low_level_il = [blocks]
-    caller.basic_blocks = [_FakeBasicBlock(0x401400, 0x401400 + 4 * len(sites))]
+    caller.basic_blocks = [
+        _FakeBasicBlock(0x401400, max(addr for addr, _, _ in sites) + 4)]
     bv = _FakeBV(functions=functions, arch=_arity_arch(names),
                  instruction_lengths=lengths, disassembly=disassembly)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
@@ -4228,6 +4236,48 @@ def test_the_witness_speaks_only_where_bn_determined_the_varargs_flag_882(
         assert "callee_read_arity" not in call
         assert "callee_arity_note" not in call
         assert not any("NOTE" in w for w in card["warnings"])
+
+
+def test_the_callee_witness_is_paid_once_per_callee_not_once_per_row_882(monkeypatch):
+    """The per-callee memo is wired, and stays wired.
+
+    A dispatch function calls the same few callees hundreds of times and the
+    witness is a per-CALLEE fact -- it walks the callee's whole MLIL SSA form, so
+    paying it per call ROW is the one cost this cluster's design says it avoids.
+    That property is invisible in the output: dropping the memo changes not a
+    single field, which is exactly why it needs a test rather than a comment. It
+    was dropped once already, silently, when this branch merged a parent that had
+    withdrawn the predecessor witness and with it the keyword at the call site.
+
+    The row assertions below are the other half: memoizing must not change what
+    any row says.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"],
+                   repeat_first=3)
+    _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)), _SSARead(0x401104, _ssa_var(2)))
+
+    seen: list[int] = []
+    real = mod._callee_arg_use_witness
+
+    def counting(view, callee_fn, **kwargs):
+        seen.append(int(getattr(callee_fn, "start", 0) or 0))
+        return real(view, callee_fn, **kwargs)
+
+    monkeypatch.setattr(mod, "_callee_arg_use_witness", counting)
+
+    card = instance._function_evidence("active", "probe_device", context=0)
+
+    assert len(card["calls"]) == 3
+    for call in card["calls"]:
+        assert call["argument_confidence"] == "inferred"
+        assert call["callee_under_recovered"] is True
+        assert call["callee_read_arity"] == 3
+        assert call["declared_arity"] == 2
+    # Three rows, one callee, one witness walk.
+    assert seen == [0x401100]
 
 
 def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(monkeypatch):

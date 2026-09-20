@@ -1073,7 +1073,8 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
         # not `indirect_call` -- the latter is purely a call-shape mirror of
         # `direct` and does not by itself mean the arity is unknown).
-        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
+        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments,
+                                         read_cache=callee_read_cache)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
         elif (
