@@ -4229,7 +4229,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # anti-vacuity count it also changes.
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
     # #675.2: the class card gained the `notes` read, discovered in `_render_class_show_text` and `_render_one_class` -- two positions x six malformed kinds. 1212 + 12 = 1224.
-    assert checked == 1224, f"the differential ran {checked} cases, not 1224"
+    # #675.2 (#907 review r3): the same card now also reads the canonical `type` entry, so a declared class shows its declaration in TEXT and not only in JSON. Same two positions, same six malformed kinds. 1224 + 12 = 1236.
+    assert checked == 1236, f"the differential ran {checked} cases, not 1236"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4276,7 +4277,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
     # #675.2: the class card's `notes` read adds two discovered positions to the same sweep. 4896 + 24 = 4920.
-    assert swept == 4920, f"the raise sweep ran {swept} renders, not 4920"
+    # #675.2 (#907 review r3): the card's canonical `type` read adds two more discovered positions, plus the nested `layout`/`decl` reads it opens under them. 4920 + 16 = 4936.
+    assert swept == 4936, f"the raise sweep ran {swept} renders, not 4936"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4432,7 +4434,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # sweep also gained, x 2 benign payloads.
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426, + 8 (#675.2's two `notes` positions) = 1434.
-    assert checked == 1434, f"the mirror ran {checked} renders, not 1434"
+    # #675.2 (#907 review r3): the card's canonical `type` read and the `layout`/`decl` reads under it. 1434 + 6 = 1440.
+    assert checked == 1440, f"the mirror ran {checked} renders, not 1440"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

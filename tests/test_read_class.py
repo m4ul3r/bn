@@ -2372,7 +2372,14 @@ _NON_CLASS_DECLARED_KINDS = (
     ("row_t", 7, "char [16]"),                       # ArrayTypeClass
     ("op_t", 8, "int32_t (void*)"),                  # FunctionTypeClass
     ("Flags", "EnumerationTypeClass", "enum Flags"),  # the string-typed spelling
-    ("Nameless", None, "?"),                          # states no kind at all
+)
+
+# A handle that states no kind at all is a different answer: nothing was read,
+# so it is neither a class nor a proven non-class. It misses like the kinds
+# above but the miss DISCLOSES, and it is excluded from the count identity --
+# a count cannot describe a set with an unclassified member (#907 review r3).
+_UNCLASSIFIABLE_DECLARED_KINDS = (
+    ("Nameless", None, "?"),
 )
 
 
@@ -2694,7 +2701,8 @@ def test_class_show_tracks_a_REDEFINED_declared_type_675(view_memo_live):
     )
 
 
-@pytest.mark.parametrize("name,type_class,decl", _NON_CLASS_DECLARED_KINDS)
+@pytest.mark.parametrize("name,type_class,decl",
+                         _NON_CLASS_DECLARED_KINDS + _UNCLASSIFIABLE_DECLARED_KINDS)
 def test_class_show_refuses_a_declared_NON_CLASS_type_675(monkeypatch, name, type_class, decl):
     """`bv.types` is the view's whole type table, so the declared half must ask
     WHICH kind it is holding. An enum / scalar / pointer / array / function
@@ -2702,6 +2710,11 @@ def test_class_show_refuses_a_declared_NON_CLASS_type_675(monkeypatch, name, typ
     `class Color (size 0x4) [declared-only]` is wrong in a way a reader believes
     -- the note even asserts the empty vtable is "RTTI evidence that is absent"
     about a type that can never carry one (#907 review).
+
+    Each miss says which KIND of answer it is. A kind that was READ and is not a
+    class is a plain miss -- nothing about it was left unexamined -- while a
+    handle stating no kind at all has established nothing, so its miss discloses
+    rather than asserting the name is absent (#907 review round 3).
 
     The real class in the same view is asserted alongside, so a filter that
     simply refuses the declared half everywhere cannot pass this."""
@@ -2712,6 +2725,7 @@ def test_class_show_refuses_a_declared_NON_CLASS_type_675(monkeypatch, name, typ
     with pytest.raises(read_class.OperationFailure) as err:
         read_class._class_show(ctx, None, name)
     assert err.value.status == "unknown_class"
+    assert ("could not be read" in str(err.value)) is (type_class is None), str(err.value)
 
     still = read_class._class_show(ctx, None, "Widget")
     assert still["confidence"] == "declared-only"
@@ -2819,39 +2833,6 @@ def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
             if row["confidence"] == "declared-only"] == ["Widget"]
 
 
-def test_one_unreadable_declared_type_does_not_take_down_class_list_675(monkeypatch):
-    """The kind test runs over the view's WHOLE type table on a read path, so a
-    type whose `type_class` cannot be read must cost that ONE row and nothing
-    else. Unguarded it propagates out of the enumeration and `class list` --
-    including the RTTI half, which has no stake in the declared types -- raises
-    instead of answering."""
-    class _Unreadable:
-        name = "Poisoned"
-        width = 0x10
-
-        @property
-        def type_class(self):
-            raise RuntimeError("the type handle is no longer valid")
-
-        def __str__(self):
-            return "struct Poisoned"
-
-    bv = _declared_bv(Widget=_DeclaredType(), Poisoned=_Unreadable())
-    ctx = _declared_ctx(monkeypatch, bv)
-
-    listing = read_class._class_list(ctx, None, include_all=True)
-    declared = [row["name"] for row in listing["items"]
-                if row["confidence"] == "declared-only"]
-    assert declared == ["Widget"], declared
-    # The RTTI half of the same listing still answers.
-    assert [row["name"] for row in listing["items"]
-            if row["confidence"] == "rtti"], listing["items"]
-
-    with pytest.raises(read_class.OperationFailure) as err:
-        read_class._class_show(ctx, None, "Poisoned")
-    assert err.value.status == "unknown_class"
-
-
 def test_the_declared_type_set_is_read_ONCE_per_call_675(monkeypatch):
     """The filters make the enumeration do real work per entry -- each declaration
     is kind-tested and its typedef chain followed -- so the records and the
@@ -2904,13 +2885,18 @@ class _AliasTo:
     """A NamedTypeReference, the shape BN registers for `typedef struct {...} T;`.
 
     Carries NO width and NO members of its own -- that is the whole point of the
-    handle: the facts live on the target it resolves to."""
+    handle: the facts live on the target it resolves to. It DOES carry `.name`,
+    the name it REFERENCES: measured on a live view, the alias BN registers for
+    `typedef struct { int a; int b; int c; } T;` reads `.name == '_T'`, the
+    generated name of the anonymous body. That is the only fact that tells the
+    parser's own companion from a type the user named, so the fake states it."""
     type_class = 11             # NamedTypeReferenceClass
     width = 0
 
-    def __init__(self, target, decl="typedef struct _W W"):
+    def __init__(self, target, decl="typedef struct _W W", name=None):
         self._target = target
         self._decl = decl
+        self.name = name if name is not None else getattr(target, "name", None)
 
     def target(self, bv):
         return self._target
@@ -2996,14 +2982,121 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
 
     assert read_class._class_show(ctx, None, "C")["confidence"] == "declared-only"
 
-    for refused in ("M", "X"):
-        with pytest.raises(read_class.OperationFailure) as err:
-            read_class._class_show(ctx, None, refused)
-        assert err.value.status == "unknown_class", refused
+    # `M` names an ENUM: the kind was READ and it is positively not a class, so
+    # the miss is the plain one -- nothing was left unexamined.
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "M")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" not in str(err.value), str(err.value)
+    # `X` names NOTHING the lens can classify. That is not the same answer: the
+    # kind was never established, so the miss must not assert the name is absent
+    # (#907 review round 3).
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "X")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" in str(err.value), str(err.value)
 
     assert sorted(r["name"] for r in
                   read_class._class_list(ctx, None, include_all=True)["items"]
                   if r["confidence"] == "declared-only") == ["C", "T"]
+
+
+def test_the_parsers_anonymous_body_is_not_a_PEER_of_its_own_typedef_675(monkeypatch):
+    """One `typedef struct { ... } T;` is ONE declared class, under the name the
+    user wrote.
+
+    BN's C parser gives the anonymous body a generated name of its own -- `_T` --
+    and the declare path defines EVERY parsed name, so the user's single
+    declaration puts TWO entries in the user type container. Measured live
+    through the CLI: `types declare 'typedef struct { ... } T;'` reported
+    `count 2, defined_types {_T, T}`, `class list` then said
+    `hidden: 2 user-declared class types` for one declaration and `--all` listed
+    `T` and `_T` as peers of identical width. That is the `<Class>::VTable`
+    artifact-peer family the population rewrite exists to remove, arriving
+    through the user container instead of `bv.types` (#907 review round 3).
+
+    The companion is identified by PROVENANCE, not by name shape alone: an entry
+    is dropped only when another entry in the SAME container is a reference whose
+    `.name` points at it AND is spelled exactly without the leading underscore --
+    i.e. the two halves the parser emits together."""
+    from bn.formatters import _render_class_list_text
+
+    body = _StructBody(width=0xc, name="_T", members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+    bv = _declared_bv(T=_AliasTo(body, decl="struct _T T"), _T=body,
+                      Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = sorted(r["name"] for r in
+                      read_class._class_list(ctx, None, include_all=True)["items"]
+                      if r["confidence"] == "declared-only")
+    assert declared == ["T", "Widget"], (
+        f"the parser's own companion is not a class the user declared: {declared}")
+
+    default = read_class._class_list(ctx, None)
+    assert default["declared_suppressed"] == 2, default["declared_suppressed"]
+    assert ("2 user-declared class types (--all to show)"
+            in _render_class_list_text(default))
+
+    # The name the user wrote still carries the body's facts...
+    assert read_class._class_show(ctx, None, "T")["size"] == {
+        "value": "0xc", "source": "declared_type"}
+    # ...and the generated name answers no class card of its own.
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "_T")
+    assert err.value.status == "unknown_class"
+
+
+def test_a_body_the_user_named_is_not_mistaken_for_a_parser_companion_675(monkeypatch):
+    """The companion rule needs BOTH halves the parser emits, so a struct the
+    user named and aliased separately keeps its own row.
+
+    `struct Body { ... }; typedef struct Body Alias;` puts two entries in the
+    container too, but the alias references `Body`, not `_Body`, so neither is
+    the parser's anonymous companion and the lens reports both. Dropping every
+    alias target instead would delete the commonest hand-written declaration
+    pair."""
+    body = _StructBody(width=0x8, name="Body", members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+    bv = _declared_bv(Body=body, Alias=_AliasTo(body, decl="struct Body Alias"))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = sorted(r["name"] for r in
+                      read_class._class_list(ctx, None, include_all=True)["items"]
+                      if r["confidence"] == "declared-only")
+    assert declared == ["Alias", "Body"], declared
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 2
+
+
+def test_an_artifact_shaped_DECLARATION_is_listed_and_shown_as_one_set_675(monkeypatch):
+    """The thunk / construction-vtable filters read a DEMANGLED SYMBOL's shape,
+    so they have no standing over a name the user typed into `types declare`.
+
+    Applied to the declared half they split the two surfaces: measured live, a
+    declaration whose name matches the thunk spelling was dropped from
+    `class list --all` entirely and attributed to `1 thunk`, while `class show`
+    of the same name returned a full declared-only card -- a row the user could
+    never reach through the listing (#907 review round 3). The
+    construction-vtable filter splits count from rows the same way: it fires
+    before the declared counter, so the default header promises one fewer class
+    than `--all` then lists."""
+    thunk_shaped = "non-virtual thunk to Widget"
+    ctor_vtable_shaped = "Derived{for `Base'}"
+    bv = _declared_bv(**{
+        thunk_shaped: _DeclaredType(name=thunk_shaped),
+        ctor_vtable_shaped: _DeclaredType(name=ctor_vtable_shaped),
+    })
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    rows = sorted(r["name"] for r in listing["items"]
+                  if r["confidence"] == "declared-only")
+    assert rows == sorted((ctor_vtable_shaped, thunk_shaped)), rows
+    # Count and rows describe ONE set: what the default hides is what --all adds.
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == len(rows)
+    # And `class show` answers for exactly the set the listing offered.
+    for name in rows:
+        assert read_class._class_show(ctx, None, name)["confidence"] == "declared-only"
 
 
 def test_only_types_the_USER_declared_are_classes_of_the_lens_675(monkeypatch):
@@ -3114,6 +3207,133 @@ def test_an_unreadable_declared_SET_is_disclosed_not_reported_as_zero_675(monkey
             read_class._class_show(ctx, None, "Widget")
         assert err.value.status == "unknown_class", label
         assert "could not be read" in str(err.value), label
+
+
+def test_ONE_unreadable_declaration_unmeasures_the_count_and_its_own_miss_675(monkeypatch):
+    """A declaration whose KIND could not be established is neither a class nor
+    a proven absence, and neither surface may pretend otherwise.
+
+    The set-level guard already stops a raising container taking `class list`
+    down. One level below it the same failure was rendered as a FACT: the entry
+    was swallowed, so the header stated a measured `N user-declared class types`
+    that silently excluded it, and `class show` of that very name answered a
+    confident `No class named` -- a fabricated count and a fabricated absence off
+    a read that failed, which is the blindness #675.2 exists to remove (#907
+    review round 3).
+
+    So: the count becomes the same stated unknown the set-level failure prints
+    (`?`, #619's rule -- it cannot be measured while a declaration's kind is
+    unknown), the declarations that DID read still list and still show, and the
+    unreadable name's miss says it could not be read. A name that simply is not
+    declared keeps the plain miss: nothing about IT was left unexamined."""
+    from bn.formatters import _render_class_list_text
+
+    class _Unreadable:
+        name = "Poisoned"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct Poisoned"
+
+    bv = _declared_bv(Widget=_DeclaredType(), Poisoned=_Unreadable())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    declared = [row["name"] for row in listing["items"]
+                if row["confidence"] == "declared-only"]
+    assert declared == ["Widget"], declared
+    # The RTTI half, and every declaration that DID read, still answer.
+    assert [row["name"] for row in listing["items"]
+            if row["confidence"] == "rtti"], listing["items"]
+    assert read_class._class_show(ctx, None, "Widget")["confidence"] == "declared-only"
+
+    default = read_class._class_list(ctx, None)
+    assert default["declared_suppressed"] == "unreadable", (
+        f"a count that excludes an unreadable declaration is not measured: "
+        f"{default['declared_suppressed']}")
+    assert ("? user-declared class types (--all to show)"
+            in _render_class_list_text(default))
+    assert read_class._class_list(
+        ctx, None, count_only=True)["declared_suppressed"] == "unreadable"
+
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "Poisoned")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" in str(err.value), str(err.value)
+
+    # A name that was never declared at all keeps the plain miss.
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "NeverDeclared")
+    assert "could not be read" not in str(err.value), str(err.value)
+
+
+def test_a_declared_name_the_RTTI_half_already_clusters_is_not_listed_twice_675(monkeypatch):
+    """A name carried by BOTH halves keeps its RTTI record and is counted once.
+
+    The declared record adds no evidence to a class that already has a vtable and
+    demangled methods, and a second row under the same name reads as two classes.
+    Unpinned, dropping the dedup left the whole targeted suite green while the
+    listing grew a duplicate `[declared-only]` row beside the `[rtti]` one and the
+    hidden count went up by one (#907 review round 3)."""
+    rtti_class = "net::Session"          # the registry double's vtable+typeinfo class
+    bv = _declared_bv(**{rtti_class: _DeclaredType(name=rtti_class),
+                         "Widget": _DeclaredType()})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    rows = [(r["name"], r["confidence"]) for r in listing["items"]
+            if r["name"] == rtti_class]
+    assert rows == [(rtti_class, "rtti")], rows
+    # Only the name the RTTI half does NOT carry is a hidden declared class.
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
+
+
+def test_a_zero_width_declaration_states_no_size_rather_than_0x0_675(monkeypatch):
+    """A forward declaration (`struct F;`) has no width, and `size: 0x0` is a
+    fabricated fact about its layout, not a measurement.
+
+    Live-reachable and previously unpinned: every fixture had a positive width,
+    so widening the guard to `width >= 0` left the targeted suite green while the
+    card began asserting a zero object size for a class whose body is simply not
+    known (#907 review round 3)."""
+    from bn.formatters import _render_class_list_text
+
+    bv = _declared_bv(Forward=_DeclaredType(name="Forward", width=0))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    assert read_class._class_show(ctx, None, "Forward")["size"] is None
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "Forward")
+    assert row["size"] is None, row["size"]
+    assert "0x0" not in _render_class_list_text(
+        read_class._class_list(ctx, None, include_all=True))
+
+
+def test_a_declared_card_shows_its_declaration_in_TEXT_not_only_in_json_675(monkeypatch):
+    """The default output format is text, and the reference promises the
+    declared-only card carries "object size and the canonical `types` entry".
+
+    The record carried the entry and no renderer read it, so the shipped default
+    printed a size and a note and nothing else: an agent that had just declared a
+    class with members saw a card with none and could reasonably read the
+    declaration as empty (#907 review round 3)."""
+    from bn.formatters import _render_class_show_text
+
+    body = _StructBody(width=0x8, name="Body", members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t"),
+        types.SimpleNamespace(offset=4, name="b", type="int32_t")])
+    bv = _declared_bv(Body=body)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    text = _render_class_show_text(read_class._class_show(ctx, None, "Body"))
+
+    assert "a" in text and "b" in text, text
+    assert "int32_t" in text, text
+    assert "malformed" not in text, text
 
 
 def test_both_spellings_of_the_structure_kind_are_admitted_675(monkeypatch):

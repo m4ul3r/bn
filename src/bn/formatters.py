@@ -5869,4 +5869,17 @@ def _render_one_class(rec: Any) -> str:
     # the line that carries the distinction.
     for note in _field_list(rec, "notes"):
         lines.append(f"  note: {note}")
+    # #675.2: the DECLARATION itself. The record carries the canonical `types`
+    # entry and no renderer read it, so the default format -- text -- printed a
+    # size and the note and nothing else: an agent that had just declared a class
+    # WITH members saw a card showing none, and the shipped reference promises
+    # this card carries "object size and the canonical `types` entry" (#907
+    # review round 3). Same precedence as `types show` (`_render_type_info_text`):
+    # the rendered layout when there is one, else the decl line, so an
+    # unfollowable alias states its reference rather than inventing members.
+    entry = _field_dict(rec, "type")
+    declaration = _text_value(entry, "layout") or _text_value(entry, "decl")
+    if declaration:
+        lines.append("  declared as:")
+        lines.extend(f"    {line}" for line in declaration.splitlines())
     return "\n".join(lines)
