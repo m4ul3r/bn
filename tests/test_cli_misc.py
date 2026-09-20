@@ -1701,6 +1701,13 @@ def _count_keys_read(node, functions, seen=()):
 
     keys = set()
     for inner in ast.walk(node):
+        # A bare `value["total"]` is a payload read too, and the one spelling
+        # a `.get`-shaped harvest walks straight past -- which is the whole
+        # failure mode this guard keeps being caught by.
+        if isinstance(inner, ast.Subscript):
+            index = inner.slice
+            if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                keys.add(index.value)
         if not isinstance(inner, ast.Call):
             continue
         called = getattr(inner.func, "attr", None) or getattr(inner.func, "id", None)
@@ -1820,21 +1827,32 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
         "these installed renderers cannot be resolved to a callable, so no "
         f"guard can probe what they render: {unresolved}")
 
-    # A distinctive number, so "does this renderer STATE this count" is read
-    # off the rendering instead of guessed from the renderer's name.
-    sentinel = 4242
+    # Two distinctive numbers, so "does this renderer STATE this count" is
+    # read off the rendering instead of guessed from the renderer's name. The
+    # sentinel appearing verbatim is the common case; a rendering that merely
+    # CHANGES between the two is the general one, and it is what catches a
+    # line that formats its number (`{n:,}`), truncates it or maps it through
+    # a lookup before printing -- none of which stop it being a stated count.
+    sentinel, neighbour = 4242, 4243
     stated, checked = [], 0
     for label, renderer, node in renderers:
         keys = _count_keys_read(node, functions)
         for key in sorted(keys):
-            base = {k: 0 for k in keys}
+            # ONLY the probed key: a sibling key this harness cannot fill
+            # (one the renderer calls `len()` on, say) must not be able to
+            # raise the probe out of the loop and take a raw count read with
+            # it. Every renderer here reads through a default anyway, so an
+            # absent sibling is a shape they all already handle.
+            base: dict = {}
             try:
                 probe = renderer({**base, key: sentinel})
+                nudged = renderer({**base, key: neighbour})
             except Exception:
                 # This renderer's own shape refusal for a bare int here; it
                 # states no count off this key, so there is nothing to probe.
                 continue
-            if not isinstance(probe, str) or str(sentinel) not in probe:
+            if not isinstance(probe, str) or (str(sentinel) not in probe
+                                              and probe == nudged):
                 continue
             stated.append((label, key))
             checked += 1
