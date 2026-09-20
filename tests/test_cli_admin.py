@@ -3900,6 +3900,37 @@ def test_an_ambient_selector_does_not_narrow_an_all_instances_survey(
         f"suppress the survey, even with a different value exported; got {explicit}")
 
 
+def test_a_broken_ambient_default_does_not_break_a_fan_out_survey(
+        monkeypatch, capsys):
+    """A survey consults no selector, so a broken one cannot corrupt it.
+
+    `--all-targets` reads every open target by definition, and under
+    `--all-instances` an ambient value is already not the explicit choice
+    that would narrow the run. Neither resolves anything from the default,
+    so refusing them because a shell variable is empty is not a safety
+    guarantee -- it is a straight regression: at base an empty pin was never
+    filled at all and the same survey returned its rows.
+
+    Asserted as EQUALITY with the no-ambient run rather than "rc 0", because
+    the failure this guards against is the survey silently narrowing, not
+    only erroring, and both spellings of both sources are carried because
+    the refusal they hit was one shared check.
+    """
+    for argv in (["sections", "--all-instances", "--format", "json"],
+                 ["sections", "--all-targets", "--format", "json"]):
+        clean = _fanout_pairs(monkeypatch, capsys, argv)
+        for label, kwargs in (
+                ("an empty export", {"env": {"BN_TARGET": ""}}),
+                ("a whitespace export", {"env": {"BN_TARGET": "   "}}),
+                ("an empty pin", {"sticky": {"target": ""}}),
+                ("a whitespace pin", {"sticky": {"target": "   "}})):
+            got = _fanout_pairs(monkeypatch, capsys, argv, **kwargs)
+            assert got == clean, (
+                f"{argv[1]} under {label} consults no selector, so it must "
+                f"read exactly what it reads with none: got {got}, "
+                f"expected {clean}")
+
+
 def test_bn_target_is_scrubbed_from_the_test_environment():
     """An ambient BN_TARGET would redirect every test that passes no selector.
 

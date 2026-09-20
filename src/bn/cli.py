@@ -1825,8 +1825,24 @@ def _fanout_call(
     # it must not suppress the multi-target auto-survey (#368, #676 item 11).
     fan_target = getattr(args, "target", None)
     if fan_target is not None and not str(fan_target).strip():
-        raise BridgeError(_empty_target_message(
-            args, "omit --target to survey every target"))
+        if not getattr(args, "_empty_ambient_target", None):
+            raise BridgeError(_empty_target_message(
+                args, "omit --target to survey every target"))
+        # An AMBIENT empty value, and a survey consults no selector: with
+        # `--all-targets` every open target is read by definition, and with
+        # `--all-instances` an ambient value is already not the explicit
+        # choice that would narrow it. So this is not one of the resolutions
+        # a broken default corrupts, and refusing here turned a stale shell
+        # variable into "the whole-fleet read no longer runs" -- a straight
+        # regression against base, where an empty pin was never filled and
+        # the same survey succeeded. Drop it and survey.
+        #
+        # `_empty_ambient_target` deliberately stays on the namespace: the
+        # per-instance plan falls back to a normal single resolve when its
+        # `list_targets` peek fails, and THAT is a resolution, so it must
+        # still refuse -- as one instance's error row, not as the whole run.
+        fan_target = None
+        args.target = None
     explicit_target = bool(fan_target) and not getattr(
         args, "_sticky_target", False
     )
