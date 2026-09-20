@@ -2323,9 +2323,28 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
             # forwarding it rather than ignoring it.
             if env_target.strip():
                 args._sticky_target = True
-        elif sticky_target:
+            else:
+                args._ambient_target_source = (
+                    "This came from an exported BN_TARGET. Unset it, or "
+                    "export a selector from `bn target list`.")
+        elif sticky_target is not None:
+            # Presence, not truthiness, on THIS source too. `bn target use
+            # "$SEL"` with SEL unset WRITES an empty pin and exits 0 --
+            # `_target_matches` answers True for "", so the pre-write
+            # validation passes it -- and reading that back as "no pin at
+            # all" put the pin in the state the export was just taken out
+            # of: a bare destructive `close` fell through to the single-open
+            # auto-pick and tore that target down at exit 0. Whitespace was
+            # worse: truthy, so it WAS filled, and then marked ambient for
+            # `close` to discard. An empty pin is not a selector either, and
+            # the empty-selector refusal is the answer for both sources.
             args.target = sticky_target
-            args._sticky_target = True
+            if str(sticky_target).strip():
+                args._sticky_target = True
+            else:
+                args._ambient_target_source = (
+                    "This came from the sticky target pin. Clear it with "
+                    "`bn target clear`.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2354,6 +2373,17 @@ def main(argv: list[str] | None = None) -> int:
         msg = str(exc)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
+        # Same disclosure for the target, and for the same reason: the empty
+        # value the handler just refused was NOT typed on this command line,
+        # so "omit --target" is advice the caller already followed and the
+        # two ambient sources are cleared in completely different ways. Set
+        # only when the ambient value that was filled is itself empty, and
+        # matched on the CLI-side refusals (the manifest's own empty target
+        # is a different value and says so). Hosted here so every stem gets
+        # it -- `close` and `batch apply` raise their own worded refusals.
+        ambient_source = getattr(args, "_ambient_target_source", None)
+        if ambient_source and msg.startswith("--target is empty"):
+            msg += f"\n\n{ambient_source}"
         status = getattr(exc, "status", None)
         requested = getattr(exc, "requested", None)
         observed = getattr(exc, "observed", None)

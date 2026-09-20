@@ -3709,6 +3709,68 @@ def test_an_empty_export_is_refused_by_close_rather_than_discarded(monkeypatch):
     assert rc == 2
 
 
+def test_an_empty_pin_is_refused_by_close_exactly_like_an_empty_export(monkeypatch):
+    """Round 4 fixed the empty EXPORT. The pin is the other half of the pair.
+
+    The pin reaches the same state by the same accident: `bn target use
+    "$SEL"` with SEL unset writes an empty pin and exits 0 (measured --
+    `_target_matches` answers True for "", so the pre-write validation lets it
+    through and `session_state.update(target="")` runs). Reading that back as
+    "no pin" made a bare destructive close fall through to the single-open
+    auto-pick and tear that target down at rc 0 -- the exact behaviour round 4
+    removed on the export path, still shipping on the other one, while
+    runtime.md derives the empty-value guarantee from BOTH sources being
+    ambient.
+
+    Both spellings, because they failed differently: "" was never filled (so
+    the command looked unpinned) and whitespace WAS filled and then marked
+    ambient, which `close` discards. ONE target open -- the configuration
+    where a discarded selector succeeds silently instead of hitting the
+    multi-target refusal.
+    """
+    from bn import session_state
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    empty = _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "   "})
+    blank = _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+
+    assert empty == (2, []), (
+        "an empty pin must reach the empty-selector refusal, not read as no "
+        f"pin at all and let a bare close take the sole target: {empty}")
+    assert blank == (2, []), (
+        "a whitespace pin is not a selector either, so `close` must not "
+        f"discard it as ambient and auto-pick instead: {blank}")
+
+
+def test_an_empty_ambient_selector_says_which_source_it_came_from(
+        monkeypatch, capsys):
+    """"…or omit --target" is advice the caller has already followed.
+
+    Nobody passed a flag: the empty value arrived from the environment or
+    from the pin, and the two are cleared in completely different ways. A
+    refusal that names neither leaves the operator re-running the same command
+    -- and with the pin, re-reading a file they have to know exists. `main`
+    already appends exactly this kind of provenance line for a sticky INSTANCE
+    that points at a dead bridge; this is the same disclosure for the target.
+    """
+    from bn import session_state
+
+    _close_run(monkeypatch, ["close"], {"BN_TARGET": "   "},
+               selectors=("only.bin",))
+    env_err = capsys.readouterr().err
+
+    # The export wins over the pin, so it has to go before the pin is asked.
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+    pin_err = capsys.readouterr().err
+
+    assert "BN_TARGET" in env_err, env_err
+    assert "bn target clear" in pin_err, pin_err
+
+
 def _fanout_pairs(monkeypatch, capsys, argv, env=None, sticky=None):
     """Run a fan-out read; return its (instance, target) pairs and auto-expansion.
 
