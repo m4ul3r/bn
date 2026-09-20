@@ -22,16 +22,13 @@ Outbound calls resolve through:
     ``_hlil_pre_branch_condition``, ``_decompile_text``, ``_function_metadata``,
     ``_render_warnings``, ``_llil_constant_value``, ``_function_is_variadic``,
     the variadic format helpers);
-  * ``read_xrefs`` -- ``_reg_name`` (register identity, robust across real BN and
-    the unit fakes);
   * ``_shared`` -- module-free helpers (``_parse_address``, ``_validate_count``,
     ``is_imported_function``);
   * ``read_listing`` -- ``_analysis_state_fields`` (#820).
 
-Import direction is one-way: this module imports ``il_format``, ``read_xrefs``,
-``read_listing`` and ``_shared`` (plus stdlib + binaryninja). It NEVER imports
-``bridge`` or ``seam`` -- those import it one-way (design spec 3.2). It imports
-``read_xrefs`` but ``read_xrefs`` NEVER imports this module.
+Import direction is one-way: this module imports ``il_format``, ``read_listing``
+and ``_shared`` (plus stdlib + binaryninja). It NEVER imports ``bridge`` or
+``seam`` -- those import it one-way (design spec 3.2).
 """
 from __future__ import annotations
 
@@ -44,7 +41,6 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
-from . import read_xrefs
 from ._shared import _parse_address, _validate_count, is_imported_function
 from .read_listing import _analysis_state_fields
 
@@ -280,25 +276,14 @@ def _callee_function_for_call(ctx, bv, dest_value, target):
     return None
 
 
-def _abi_arg_register_names(bv, callee_fn) -> list[str]:
-    """The platform's integer argument registers, in ABI order (#865).
-
-    Same two-step lookup `_abi_arg_register_count` has always used -- the callee's
-    own calling convention, else the platform default -- but NAMES are what the
-    callee-side witness needs: it asks which argument register a body READS, not
-    how many exist. A `calling_convention` that is a bare string (the test fake's
-    shape, and BN's pre-analysis state) has no `int_arg_regs`, so the platform
-    default answers instead."""
+def _abi_arg_register_count(bv, callee_fn) -> int | None:
+    """How many integer arguments this platform passes in registers, or None."""
     cc = getattr(callee_fn, "calling_convention", None) if callee_fn is not None else None
     if cc is None:
         plat = getattr(bv, "platform", None)
         cc = getattr(plat, "default_calling_convention", None)
-    return [str(reg) for reg in (getattr(cc, "int_arg_regs", None) or []) if str(reg)]
-
-
-def _abi_arg_register_count(bv, callee_fn) -> int | None:
-    """How many integer arguments this platform passes in registers, or None."""
-    return len(_abi_arg_register_names(bv, callee_fn)) or None
+    regs = list(getattr(cc, "int_arg_regs", None) or [])
+    return len(regs) or None
 
 
 _C_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -366,25 +351,6 @@ def _library_signature_applies(callee_fn, name: str) -> bool:
     return name.startswith("__")
 
 
-def _undecorated_name(name: str) -> bool:
-    """Is *name* a plain C identifier, with no language decoration?
-
-    The shared refusal for every name that can carry IMPLICIT parameters a
-    register/count comparison cannot see -- `this` on a method, an sret return
-    slot on a by-value class return. Decorated schemes: Itanium/Rust (`_Z`), Rust
-    v0 (`_R`), D (`_D`), older Swift (`_T`) -- all valid C identifiers, so the
-    identifier rule alone cannot exclude them -- plus the schemes that use
-    punctuation (MSVC `?name@@...`, current Swift `$s...`), clone suffixes
-    (`.cold`, `.part`) and versioned symbols, which it does.
-
-    Two callers, one rule: `_library_param_count` refuses a decorated name whose
-    library signature might differ by an invisible parameter, and the #865
-    callee-body witness refuses it for the same reason from the other direction.
-    """
-    return bool(name) and not name.startswith(_MANGLED_PREFIXES) \
-        and _C_IDENTIFIER_RE.match(name) is not None
-
-
 def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     """The parameter count an attached type library declares for *name*, with the
     library that declared it -- or None when no library makes a usable claim.
@@ -411,7 +377,7 @@ def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     # implicit-parameter false positives this refusal exists to stop. The
     # identifier rule then covers the schemes that use punctuation (MSVC
     # `?name@@...`, Swift `$s...`) plus clone suffixes and versioned symbols.
-    if not _undecorated_name(name):
+    if not name or name.startswith(_MANGLED_PREFIXES) or not _C_IDENTIFIER_RE.match(name):
         return None
     if not _library_signature_applies(callee_fn, name):
         return None
@@ -441,187 +407,8 @@ def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     return claims[0]
 
 
-# IL op sets the callee-side read witness keys on (#865). A call CLOBBERS every
-# caller-saved register, and every register an ABI passes arguments in is
-# caller-saved on each ABI this tool reads (SysV rdi/rsi/rdx/rcx/r8/r9, AArch64
-# x0-x7, ARM32 r0-r3, MIPS a0-a3), so a read of an argument register AFTER a call
-# is the call's result or scratch -- never argument setup -- and treating the call
-# as a write to all of them is both correct and conservative (it can only drop a
-# firing, never manufacture one).
-_LLIL_CALL_OPS = frozenset({
-    "LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL", "LLIL_SYSCALL",
-})
-_LLIL_REG_READ_OPS = frozenset({"LLIL_REG", "LLIL_REG_SPLIT"})
-_LLIL_REG_WRITE_OPS = frozenset({"LLIL_SET_REG", "LLIL_SET_REG_SPLIT"})
-
-# One physical register per family, under every width an ABI can pass an argument
-# in (#865). BN's LLIL names the register by the WIDTH THE CODE TOUCHED, so the
-# SysV argument `rsi` shows up as `esi` in a 32-bit access and `sil` in a byte
-# access while `int_arg_regs` lists the full-width name -- a name-only match
-# missed EVERY real argument read (measured on a compiled probe: a 3-parameter
-# body reported zero argument-register reads, i.e. the witness was inert on a
-# live view and only the fakes agreed with it). Membership is by family, so a
-# 32-bit ABI whose `int_arg_regs` says `eax` does NOT alias to a nonexistent
-# `rax`. AArch64's x/w split is a rule, not a family.
-_REGISTER_FAMILIES: tuple[tuple[str, ...], ...] = (
-    ("rax", "eax", "ax", "al"),
-    ("rbx", "ebx", "bx", "bl"),
-    ("rcx", "ecx", "cx", "cl"),
-    ("rdx", "edx", "dx", "dl"),
-    ("rsi", "esi", "si", "sil"),
-    ("rdi", "edi", "di", "dil"),
-    ("rbp", "ebp", "bp", "bpl"),
-    ("rsp", "esp", "sp", "spl"),
-    *tuple((f"r{n}", f"r{n}d", f"r{n}w", f"r{n}b") for n in range(8, 16)),
-)
-
-
-def _arg_register_index(arg_regs: list[str]) -> dict[str, int]:
-    """Register-name -> argument-position for *arg_regs*, sub-registers included.
-
-    Every name that can reach one of those registers is a key: the exact name
-    `int_arg_regs` lists, its sub-register aliases from the family it belongs to,
-    and (AArch64, ARM64e) the w-form of an x-register and vice versa. One map for
-    reads AND writes, so a scratch write to `esi` correctly disqualifies a later
-    read of `rsi`."""
-    index: dict[str, int] = {}
-    for position, name in enumerate(arg_regs):
-        index.setdefault(name, position)
-        for family in _REGISTER_FAMILIES:
-            if name in family:
-                for alias in family:
-                    index.setdefault(alias, position)
-        if name[:1] in ("x", "w") and name[1:].isdigit():
-            other = ("w" if name[0] == "x" else "x") + name[1:]
-            index.setdefault(other, position)
-    return index
-
-
-def _register_reads(expr) -> set[str]:
-    """Every register name *expr* reads, recursively.
-
-    A register read is an ``LLIL_REG``/``LLIL_REG_SPLIT`` node anywhere in the
-    expression tree -- a bare register, an operand of an arithmetic node, or a
-    sub-expression of a partial-register read. A node that is a register but NOT
-    a read (``SET_REG.dest`` is a raw ``ILRegister``) has no ``operation`` and is
-    skipped, which is also how the test fakes model it."""
-    if expr is None or getattr(expr, "operation", None) is None:
-        return set()
-    if il_format._il_op_name(expr) in _LLIL_REG_READ_OPS:
-        name = read_xrefs._reg_name(expr)
-        return {name} if name else set()
-    reads: set[str] = set()
-    for operand in getattr(expr, "operands", None) or []:
-        reads |= _register_reads(operand)
-    return reads
-
-
-def _callee_body_arg_arity(callee_fn, arg_regs: list[str]) -> int | None:
-    """How many argument registers the callee's OWN BODY reads, or None when the
-    body witnesses nothing.
-
-    ``None`` means NO CLAIM, and it is the answer for a body with no instructions
-    at all -- an import with no implementation in the image, a truncated view, a
-    function BN never disassembled. That intersection (an import with no body) is
-    exactly where this witness and the #862 library cross-check are BOTH blind, so
-    it must stay silent rather than guess.
-
-    The scan is a linear read-before-write walk in address order -- which is the
-    whole problem with it as a VERDICT: address order is not execution order, so a
-    register written on one path and read on another (a loop body laid out before
-    its initializer) counts as a read, and a register the compiler reuses as
-    scratch counts as an argument. The highest index read before any write, plus
-    one, is therefore an OBSERVATION about registers; callers must not treat it as
-    a recovered arity (see :func:`_callee_arg_read_arity`).
-
-    Both sides of that comparison go through :func:`_arg_register_index`, so the
-    width the code touched is irrelevant: `esi` and `rsi` are the same argument,
-    and a write to either retires it."""
-    index = _arg_register_index(arg_regs)
-    all_args = set(index.values())
-    written: set[int] = set()
-    highest = -1
-    saw_instruction = False
-    for insn in il_format._iter_llil_instructions(callee_fn):
-        saw_instruction = True
-        op_name = il_format._il_op_name(insn)
-        if op_name in _LLIL_CALL_OPS:
-            written.update(all_args)
-            continue
-        if op_name in _LLIL_REG_WRITE_OPS:
-            # Only the SOURCE side is read; the destination is a write, whatever
-            # the fake looks like.
-            reads = _register_reads(getattr(insn, "src", None))
-            dest = read_xrefs._reg_name(getattr(insn, "dest", None))
-        else:
-            reads = set()
-            for operand in getattr(insn, "operands", None) or []:
-                reads |= _register_reads(operand)
-            dest = ""
-        for reg in reads:
-            position = index.get(reg)
-            if position is not None and position not in written and position > highest:
-                highest = position
-        if dest:
-            dest_position = index.get(dest)
-            if dest_position is not None:
-                written.add(dest_position)
-    return highest + 1 if saw_instruction else None
-
-
-def _callee_arg_read_arity(bv, callee_fn, *, is_variadic: bool) -> int | None:
-    """The argument arity the callee's own body DEMONSTRATES, or None for no claim.
-
-    The callee-side OBSERVATION of #865, and the only one that needs no name, no
-    library and no import: how many argument registers the body appears to touch.
-    It is deliberately NOT a verdict (#865 review): the scan is layout-order and
-    CFG-blind, so a register written on one path and read on another -- or a
-    register a compiler reuses as scratch -- reads exactly like a consumed
-    argument, and an ABI POSITION is not a PARAMETER COUNT. Measured against
-    unmutated corpus binaries, every natural firing was a correct prototype
-    demoted on such an artifact, which spends the credibility `authoritative`
-    exists to carry. Callers therefore report the number (and the declared count)
-    as a note and leave the argument confidence alone until an SSA-shaped use
-    check can tell a use from a scratch touch.
-
-    Refusals, each leaving the row untouched rather than guessing:
-
-    * a **decorated name** -- the same refusal `_library_param_count` makes, from
-      the other direction: a method's implicit `this` and a by-value class
-      return's sret slot are ARGUMENT REGISTERS the body legitimately reads and
-      the parameter count never mentions, so the body-vs-count comparison is
-      meaningless there. Measured on the C++ probe: BN's own recovered prototype
-      counts `this` consistently on both sides (declared 3 / body reads 3 for a
-      2-parameter method), so nothing fires today -- but a prototype from a
-      library or an analyst that omits `this` would otherwise be demoted for a
-      parameter that is not missing at all;
-    * a **variadic** callee -- its body reads the argument registers through the
-      register save area / `va_list`, so a register read is not an arity;
-    * **no ABI register list** (a stack-arguments-only platform, or a view whose
-      calling convention is unknown) -- no register is an argument register, so
-      the scan has nothing to key on;
-    * a **body that cannot be iterated** -- a malformed body must not fail a read
-      the way `_library_param_count` already refuses to let a malformed library
-      fail one.
-    """
-    if is_variadic:
-        return None
-    name = str(getattr(callee_fn, "name", "") or getattr(callee_fn, "raw_name", "") or "")
-    if not _undecorated_name(name):
-        return None
-    arg_regs = _abi_arg_register_names(bv, callee_fn)
-    if not arg_regs:
-        return None
-    try:
-        return _callee_body_arg_arity(callee_fn, arg_regs)
-    except Exception:  # noqa: BLE001 - a body we cannot walk witnesses nothing
-        return None
-
-
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
-                             arguments: list[dict[str, Any]],
-                             *, read_cache: dict[int, int | None] | None = None
-                             ) -> dict[str, Any]:
+                             arguments: list[dict[str, Any]]) -> dict[str, Any]:
     """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
 
     When a callee has no recovered prototype BN assumes every argument register is
@@ -661,16 +448,6 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
 
     Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
     callee cannot be resolved -- ``callee_unresolved`` carries that case instead.
-
-    ``callee_read_arity``/``declared_arity``/``callee_arity_note`` (#865) DISCLOSE
-    the callee-side observation without acting on it: the body appears to touch
-    ``callee_read_arity`` argument registers against a prototype declaring
-    ``declared_count``, on an HLIL-sourced list whose length agrees with that
-    prototype (where ``arity_mismatch`` is silent by construction, so nothing else
-    here would report it). No confidence is changed -- see
-    :func:`_callee_arg_read_arity` for the measured reason the scan is not yet
-    sound enough to demote on. ``read_cache`` memoizes the per-CALLEE body scan
-    across the call sites of one function.
     """
     evidence: dict[str, Any] = {"arity_unknown": False}
     if dest_value is None:
@@ -729,50 +506,6 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
         evidence["declared_arity"] = declared_count
         evidence["library_arity"] = library[0]
         evidence["library_source"] = library[1]
-    # #865: the witness for the shape #862 cannot reach -- nothing OUTSIDE this
-    # binary settles the arity (no attached library names the callee, the name is
-    # decorated, or it is an ordinary-named local definition), so the recovered
-    # prototype is compared against something inside it instead: the callee's own
-    # body. A body that READS an argument register the prototype does not declare
-    # takes more arguments than the recovery admits, which is a positive reason to
-    # distrust it -- not the absence of a reason to trust it, which is what
-    # demoting on `has_user_type`/`is_import` alone amounts to (#648's own
-    # precedent, where `memset`'s bundled 3-parameter prototype EARNS
-    # `authoritative`).
-    #
-    # Gated to the vacuous AGREEMENT the issue reports: the rendered list matches
-    # the declared arity, so `arity_mismatch` is silent and the row would
-    # otherwise claim `authoritative` off a comparison of the recovery against
-    # itself. Where the rendered list already disagrees, `arity_mismatch` demotes
-    # and this adds nothing. Only an HLIL-sourced list is compared, for #704
-    # round 3's reason: an MLIL/LLIL list is the CALLER's ABI registers (#661) and
-    # its count is not a claim about the callee's operands.
-    callee_read_arity: int | None
-    if read_cache is None:
-        callee_read_arity = _callee_arg_read_arity(bv, callee_fn, is_variadic=is_variadic)
-    else:
-        # A dispatch function calls the same few callees hundreds of times, and the
-        # scan is per CALLEE, not per call site -- pay it once per callee (#865).
-        key = int(getattr(callee_fn, "start", 0) or 0)
-        if key not in read_cache:
-            read_cache[key] = _callee_arg_read_arity(bv, callee_fn, is_variadic=is_variadic)
-        callee_read_arity = read_cache[key]
-    if (
-        arg_source == "hlil"
-        and callee_read_arity is not None
-        and declared_count is not None
-        and callee_read_arity > declared_count
-        and len(arguments) == declared_count
-    ):
-        evidence["callee_read_arity"] = callee_read_arity
-        evidence["declared_arity"] = declared_count
-        evidence["callee_arity_note"] = (
-            f"the callee's body appears to touch {callee_read_arity} argument "
-            f"register(s) against a prototype declaring {declared_count}; a "
-            f"layout-order register scan cannot tell an argument the callee consumes "
-            f"from a register a path reuses as scratch, so this is NOT an arity claim "
-            f"and the argument list above keeps its own provenance"
-        )
     if declared_count is not None and (declared_count > 0 or has_user_type):
         # User prototypes also establish zero arity, but do not guarantee that
         # HLIL recovered that many arguments. Only compare an actual HLIL list;
@@ -920,8 +653,6 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     calls = []
-    # #865: memo for the callee-side read witness, keyed by callee entry address.
-    callee_read_cache: dict[int, int | None] = {}
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
         if op_name not in {
@@ -966,8 +697,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
         # not `indirect_call` -- the latter is purely a call-shape mirror of
         # `direct` and does not by itself mean the arity is unknown).
-        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments,
-                                         read_cache=callee_read_cache)
+        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
         elif (
@@ -1202,19 +932,6 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("under_recovered") and variadic.get("warning"):
             warnings.append(f"{call.get('address', '?')}: {variadic['warning']}")
-        # #865: TEXT-mode disclosure for the callee-side observation. It is a
-        # NOTE, not a demotion reason (see `_argument_arity_evidence`): hoisted --
-        # like the variadic warning above, and for the same reason, computed from
-        # the full call set before slicing -- so it is visible on whichever page is
-        # requested, and a reader of the card sees the same caveat the row carries.
-        if call.get("callee_arity_note"):
-            target = call.get("target")
-            fn_entry = target.get("function") if isinstance(target, dict) else None
-            callee = str((fn_entry or {}).get("name") or "the callee")
-            warnings.append(
-                f"{call.get('address', '?')}: NOTE -- {callee}: "
-                f"{call['callee_arity_note']}"
-            )
     if decompile_deferred:
         warnings.append(
             "Pseudo-C decompile deferred for this sliced read (offset/limit/address "
