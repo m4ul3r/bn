@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
-                   _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args,
-                   preview_arg, read_text_input)
+                   _positive_int, _refuse_count_only_slices, arg, command, decode_json_input, mutex,
+                   mutation_output_args, preview_arg, read_text_input)
 from ..formatters import (
     _render_data_symbols_text,
     _render_data_vars_text,
@@ -591,10 +590,10 @@ def _batch_apply(args: argparse.Namespace) -> int:
         # #864: same shared reader as the other --file shapes; a FIFO manifest
         # blocked here forever with no envelope.
         raw = read_text_input(args.manifest, what="Manifest file")
-    try:
-        manifest = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"Invalid JSON in manifest ({source}): {exc}") from None
+    # #864: and the same shared decoder, so a body the parser cannot take --
+    # malformed, nested past its stack, or too large to build -- is refused
+    # here rather than escaping as a traceback the way a `RecursionError` did.
+    manifest = decode_json_input(raw, refusal=f"Invalid JSON in manifest ({source})")
     # The manifest must be a JSON object {"target": <sel>, "ops": [...]}. A bare
     # array (an easy mistake) would otherwise crash client-side in _call's
     # dict(params) -- and `manifest["preview"]` below assumes a dict. Validate

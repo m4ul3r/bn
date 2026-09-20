@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, arg, command, read_text_input
+from ..cli import _call, _depth_int, arg, command, decode_json_input, read_text_input
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -15,7 +14,6 @@ from ..formatters import (
     _render_values_text,
     _resolution_note,
 )
-from ..transport import BridgeError
 
 
 def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -55,15 +53,14 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     resolved = Path(path).expanduser()
     if not flag and not resolved.exists():
         return
-    try:
-        params["user_models"] = json.loads(
-            read_text_input(resolved, what=f"{source} file"))
-    except ValueError as exc:
-        # #864: the shared reader already refused a missing, unreadable or
-        # blocking path by name (a FIFO here hung with no envelope at all), so
-        # what reaches this wrap is a malformed JSON body. #669's silent-degrade
-        # above keeps an env-sourced missing file out of here entirely.
-        raise BridgeError(f"could not read {source} {path}: {exc}") from None
+    # #864: the shared reader already refused a missing, unreadable or blocking
+    # path by name (a FIFO here hung with no envelope at all), and the shared
+    # decoder refuses a body the parser cannot take -- malformed, nested past
+    # its stack, or too large to build. #669's silent-degrade above keeps an
+    # env-sourced missing file out of here entirely.
+    params["user_models"] = decode_json_input(
+        read_text_input(resolved, what=f"{source} file"),
+        refusal=f"could not read {source} {path}")
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
@@ -81,14 +78,12 @@ def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
     """
     if not args.resolve_map:
         return
-    try:
-        params["resolve_map"] = json.loads(
-            read_text_input(Path(args.resolve_map), what="--resolve-map file"))
-    except ValueError as exc:
-        # #864: the shared reader refuses a directory/FIFO/device by kind --
-        # a FIFO here blocked forever with no envelope; what reaches this
-        # wrap is malformed JSON.
-        raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+    # #864: the shared reader refuses a directory/FIFO/device by kind -- a FIFO
+    # here blocked forever with no envelope -- and the shared decoder refuses a
+    # body the parser cannot take.
+    params["resolve_map"] = decode_json_input(
+        read_text_input(Path(args.resolve_map), what="--resolve-map file"),
+        refusal=f"could not read --resolve-map {args.resolve_map}")
 
 
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",

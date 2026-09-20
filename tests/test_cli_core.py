@@ -466,6 +466,122 @@ def test_both_taint_directions_share_one_resolve_map_policy(monkeypatch, capsys,
     assert streamed[0] == streamed[1]
 
 
+def _json_nested_past_the_decoder(tmp_path):
+    """A JSON document `json.loads` refuses, at a depth MEASURED not guessed.
+
+    The decoder gives up on a deeply nested document with `RecursionError`
+    when its scanner exhausts the interpreter's stack, and the depth that
+    takes is a property of the build's stack size -- around 100k arrays
+    here, more on a host configured with a larger one. A hardcoded depth
+    would decode cleanly there and leave the cell below green without ever
+    staging the shape it exists to pin, so the depth is found by doubling
+    until the decoder actually refuses. Every document tried is far inside
+    the reader's 64 MiB input limit, which is the whole point: bounding the
+    READ does not bound the PARSE.
+    """
+    depth = 100_000
+    while depth <= 3_200_000:
+        document = "[" * depth + "]" * depth
+        try:
+            json.loads(document)
+        except RecursionError:
+            path = tmp_path / "nested.json"
+            path.write_text(document, encoding="utf-8")
+            return path
+        depth *= 2
+    raise AssertionError(
+        "no nesting depth under 3.2M overflowed this build's JSON decoder, so "
+        "the shape under test could not be staged")
+
+
+@pytest.mark.parametrize("argv", [
+    ["taint", "forward", "-f", "dispatch", "--source", "param:1", "--resolve-map"],
+    ["taint", "backward", "-f", "emit", "--sink", "arg:send:1", "--resolve-map"],
+    ["taint", "models", "--models"],
+    ["batch", "apply"],
+])
+def test_a_json_input_the_decoder_refuses_answers_with_an_envelope(
+        monkeypatch, capsys, tmp_path, argv):
+    """#864 one call downstream of the reader it hardened. `read_text_input`
+    guarantees no input SHAPE leaves it except as a structured envelope; the
+    decode on the very next line reintroduced the escape for input
+    STRUCTURE. `json.loads` raises `ValueError` for a malformed document --
+    which every one of these readers already wrapped -- but `RecursionError`
+    for one nested past its scanner's stack, and that is a `RuntimeError`, so
+    it escaped as a raw traceback at rc 1 with empty stdout: #864's measured
+    symptom exactly, from a fifth direction.
+
+    The document is ~400 KB, so the 64 MiB cap the reader now enforces is
+    nowhere near it -- a bound on how much text is READ is not a bound on
+    what PARSING it costs, and only this cell can tell the two apart.
+
+    All four spellings, because the rule is shared and a per-site handler is
+    how three of them came to leak identically: the cross-direction parity
+    cell above cannot see this defect, since both directions leak the same
+    way.
+    """
+    nested = _json_nested_past_the_decoder(tmp_path)
+    seen: list[str] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(op)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "sample"}]}
+        raise AssertionError(f"reached the wire with an undecodable input: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([*argv, str(nested), "--target", "active"])
+
+    assert rc == 2
+    assert seen == []  # refused before the wire, like every other bad input
+    err = capsys.readouterr().err
+    assert "nested too deeply" in err
+    assert "Traceback" not in err
+    assert "RecursionError" not in err
+
+
+def test_a_json_input_too_large_to_build_answers_with_an_envelope(
+        monkeypatch, capsys, tmp_path):
+    """The decoder's other non-`ValueError`. `MemoryError` leaves
+    `json.loads` for a document whose object graph does not fit even though
+    its TEXT was inside the reader's limit -- the decoded form is several
+    times the bytes it came from -- and it is no more a `ValueError` than
+    the `RecursionError` above, so it escaped the same way.
+
+    Forced rather than provoked, for the reason the reader's own memory cell
+    gives: a genuine allocation failure is the one thing a test cannot stage
+    reliably, and what needs pinning is the handler, not the allocator. The
+    stub replaces the decoder in the CLI module's namespace only, so nothing
+    else in the process loses its JSON.
+    """
+    def boom(raw):
+        raise MemoryError
+
+    monkeypatch.setattr(bn.cli, "json", types.SimpleNamespace(loads=boom))
+    document = tmp_path / "rmap.json"
+    document.write_text('{"0x401000": ["0x401100"]}', encoding="utf-8")
+    seen: list[str] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(op)
+        raise AssertionError(f"reached the wire with an undecodable input: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["taint", "forward", "-f", "dispatch", "--source", "param:1",
+                      "--resolve-map", str(document), "--target", "active"])
+
+    assert rc == 2
+    assert seen == []
+    err = capsys.readouterr().err
+    assert "did not fit in memory while being parsed" in err
+    assert "Traceback" not in err
+    assert "MemoryError" not in err
+
+
 def test_entries_validator_hex_aware_and_rejects_zero(capsys):
     # evidence table --entries is wired to the shared count validator: hex is
     # accepted and a degenerate 0/negative is rejected with the standard message (#59).

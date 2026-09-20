@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import select
@@ -1731,6 +1732,51 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
             f"{what} could not be decoded within memory: {path}. {delivered} "
             "byte(s) were read but the text form could not be allocated; pass "
             "a smaller input, or raise the memory limit this command runs under"
+        ) from None
+
+
+def decode_json_input(raw: str, *, refusal: str) -> Any:
+    """Decode a text input's JSON, with every failure a structured envelope.
+
+    `read_text_input` above guarantees that no input SHAPE leaves it except
+    as one: not a hang, not a traceback, not an OOM. The decode one line
+    downstream reintroduced the escape for input STRUCTURE. `json.loads` on
+    a ``str`` raises `ValueError` for a malformed document -- which each of
+    its callers already wrapped -- but `RecursionError` for one nested past
+    the scanner's stack and `MemoryError` for one whose object graph does
+    not fit, and neither of those is a `ValueError`. Both escaped as a raw
+    traceback at rc 1 with empty stdout, which is #864's measured symptom
+    one call after the reader added to prevent it.
+
+    A few hundred KB of nested brackets is far inside the 64 MiB the reader
+    will accept, so the bound that makes the READ safe does not make the
+    PARSE safe -- a limit on how much text arrives says nothing about what
+    building an object graph from it costs.
+
+    Stated once rather than at each reader, for the reason `_add_resolve_map`
+    exists: three call sites decoded a `read_text_input` result and all three
+    leaked identically, so per-site handling is how the defect spread.
+    """
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        # `json.JSONDecodeError` is a `ValueError`. Wording unchanged: this
+        # is the ordinary malformed-document answer, and the only one of the
+        # three that ever reached a caller.
+        raise BridgeError(f"{refusal}: {exc}") from None
+    except RecursionError:
+        raise BridgeError(
+            f"{refusal}: the JSON is nested too deeply to parse -- the "
+            "decoder ran out of stack before reaching the end of the "
+            "document. Nesting this deep is a generator bug rather than a "
+            "document a reader can use; flatten it"
+        ) from None
+    except MemoryError:
+        raise BridgeError(
+            f"{refusal}: the JSON did not fit in memory while being parsed. "
+            "The decoded object graph is several times the size of the text "
+            "it came from, so a document inside the input size limit can "
+            "still exceed what this process can allocate; pass a smaller one"
         ) from None
 
 
