@@ -672,6 +672,11 @@ def _twin_as_bounding_source_program(callee):
     bounded (#159) and the `ret` source is what taints it at all; the
     `*arg:1` source is what taints the copied buffer, so the `system` call is
     only reachable as a command_injection if the buffer half is declared too.
+
+    The fortify guard is deliberately a DIFFERENT constant from the count:
+    with both 0x40 the reported bound is the same either way and
+    `max_from_arg`'s index goes unpinned, which is how a guard-indexed bound
+    would downgrade a real overflow while the suite stayed green.
     """
     F = _fakes()
     n1 = F.FSSA(F.FVar("n"), 1)
@@ -682,7 +687,7 @@ def _twin_as_bounding_source_program(callee):
     if callee.lstrip("_").startswith("pread"):
         params.append(F.FExpr("MLIL_CONST", "0", constant=0))
     if callee.endswith("_chk"):
-        params.append(F.FExpr("MLIL_CONST", "0x40", constant=0x40))
+        params.append(F.FExpr("MLIL_CONST", "0x99", constant=0x99))
     instrs = [
         F.FInstr(0, 0x10, "MLIL_CALL_SSA", f"n#1 = {callee}(3, &buf, 0x40)", writes=[n1],
                  dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
@@ -733,18 +738,23 @@ _FORTIFIED_COPY_PAIRS = (("mempcpy", "__mempcpy_chk"), ("strlcpy", "__strlcpy_ch
                          ("wmemmove", "__wmemmove_chk"))
 
 
-def _copy_program(callee):
+def _copy_program(callee, *, tainted_length=True):
     """``read(3, &src, 0x40); callee(&dst, &src, n[, guard]); system(&dst)``.
 
-    `n` is a parameter, not the receive's return, so no bounded downgrade
-    applies and the length arm reports the class the model declares.
+    `n` is a parameter, not the receive's return, so nothing bounds it and the
+    length arm reports the class the model declares. With
+    `tainted_length=False` the length is a constant and the ONLY route to the
+    destination is the model's own `propagates` source, which is what makes
+    the downstream exec sink evidence for `propagates.from` rather than for
+    the seed.
     """
     F = _fakes()
     n = F.FVar("n", ident=1); n0 = F.FSSA(n, 0)
     src = F.FVar("src", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
+    length = (F.FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]) if tainted_length
+              else F.FExpr("MLIL_CONST", "0x10", constant=0x10))
     params = [F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
-              F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
-              F.FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]
+              F.FExpr("MLIL_ADDRESS_OF", "&src", src=src), length]
     if callee.endswith("_chk"):
         params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
     instrs = [
@@ -753,7 +763,8 @@ def _copy_program(callee):
                  params=[F.FExpr("MLIL_CONST", "3", constant=3),
                          F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
                          F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
-        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&dst, &src, n#0)", reads=[n0], writes=[],
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&dst, &src, len)",
+                 reads=([n0] if tainted_length else []), writes=[],
                  dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
         F.FInstr(2, 0x30, "MLIL_CALL_SSA", "system(&dst)", writes=[],
                  dest=F.FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
@@ -763,27 +774,116 @@ def _copy_program(callee):
             F.FBV({0x900: "read", 0x901: callee, 0x2020: "system"}))
 
 
+def _bounded_copy_program(callee):
+    """``n = read(3, &src, 0x40); callee(&dst, &src, n[, guard])``.
+
+    The #159 idiom again, aimed at the copy family: the length is a modeled
+    receive return provably bounded by a constant count, so the honest verdict
+    is `bounded_len`. The engine reaches that ONLY for `class == overflow_len`,
+    which is why a `_chk` entry may not take a class its bare twin does not.
+    """
+    F = _fakes()
+    n1 = F.FSSA(F.FVar("n"), 1)
+    src = F.FVar("src", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
+    params = [F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+              F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+              F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]
+    if callee.endswith("_chk"):
+        params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "n#1 = read(3, &src, 0x40)", writes=[n1],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+                 params=[F.FExpr("MLIL_CONST", "3", constant=3),
+                         F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                         F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&dst, &src, n#1)", reads=[n1], writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
+    ]
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
+            F.FBV({0x900: "read", 0x901: callee}))
+
+
 @pytest.mark.parametrize("base,chk", _FORTIFIED_COPY_PAIRS)
 def test_fortified_copy_spelling_is_modeled_like_its_bare_twin_876(base, chk):
     # A hardened build emits the `_chk` spelling; with no model at all
     # `lookup_model` returned None, so `taint forward` answered reached_sinks:[]
-    # where the unfortified build reported the overflow. Unlike the read family
-    # these keep the copy/concat `fortified_overflow` class -- they take no
-    # `len_arg`/`buf_arg` pair and so participate in neither class-keyed
-    # suppressor, exactly like the eight fortified copy entries already here.
+    # where the unfortified build reported the overflow.
     bare = _reported(_copy_program(base), "param:0", "call:read", gate=())
     fort = _reported(_copy_program(chk), "param:0", "call:read", gate=())
     assert len(bare) == 1 and len(fort) == 1, (bare, fort)
     # the trailing destlen guard appends; it does not shift dest/src/len
     assert fort[0]["tainted_arg_index"] == bare[0]["tainted_arg_index"] == 2
-    assert bare[0]["class"] == "overflow_len", bare
-    assert fort[0]["class"] == "fortified_overflow", fort
+    # Same class as the bare twin, for the reason `_comment_fortified` states:
+    # `class` is what the engine's FP suppressors test for, so a `_chk` entry
+    # under a different class headlines an overflow its twin calls bounded.
+    # (The engine tests the class string alone -- neither suppressor requires a
+    # `len_arg`/`buf_arg` pair, which these entries do not declare.)
+    assert fort[0]["class"] == bare[0]["class"] == "overflow_len", (bare, fort)
     assert chk in fort[0]["detail"] and "aborts at runtime" in fort[0]["detail"]
-    # and the copy still propagates the tainted source into the destination,
-    # so a downstream exec sink is reachable through the fortified spelling too
+    # ...and that is observable, not stylistic: on the bounded-receive-return
+    # idiom both spellings must reach the same downgrade.
+    bare_b = _reported(_bounded_copy_program(base), "ret:read", gate=())
+    fort_b = _reported(_bounded_copy_program(chk), "ret:read", gate=())
+    assert len(bare_b) == 1 and len(fort_b) == 1, (bare_b, fort_b)
+    assert (bare_b[0]["class"], bare_b[0].get("source_bound")) == ("bounded_len", "0x40"), bare_b
+    assert (fort_b[0]["class"], fort_b[0].get("source_bound")) \
+        == (bare_b[0]["class"], bare_b[0].get("source_bound")), (bare_b, fort_b)
+    # The copy propagates the tainted SOURCE into the destination. Measured
+    # with an UNTAINTED length, so the only route to `&dst` is
+    # `propagates.from` -- with the length tainted too the destination is
+    # tainted either way and a `from` naming the wrong operand goes unnoticed.
     for callee in (base, chk):
-        shell = _reported(_copy_program(callee), "param:0", "call:read", gate=(), at="0x30")
+        shell = _reported(_copy_program(callee, tainted_length=False), "call:read",
+                          gate=(), at="0x30")
         assert [s["class"] for s in shell] == ["command_injection"], (callee, shell)
+
+
+# The same spelling question, asked of the WHOLE export table rather than just
+# the fortify surface: which exported alias of an ARMED model resolves to
+# nothing? Two did, and they are not fortified at all -- the unlocked stdio
+# writers, whose declarations are byte-for-byte their bases' minus the locking.
+_UNLOCKED_WRITE_PAIRS = (("fputs", "fputs_unlocked"), ("fwrite", "fwrite_unlocked"))
+
+
+def _write_program(callee):
+    """``read(3, &src, 0x40); callee(&src, ...)`` -- tainted bytes written out.
+
+    Only arg 0 is tainted, so the multi-arm `fwrite` model reports the data
+    arm alone and the two pairs stay comparable.
+    """
+    F = _fakes()
+    src = F.FVar("src", typ="char[0x40]")
+    params = [F.FExpr("MLIL_ADDRESS_OF", "&src", src=src)]
+    if callee.startswith("fwrite"):
+        params += [F.FExpr("MLIL_CONST", "1", constant=1),
+                   F.FExpr("MLIL_CONST", "0x10", constant=0x10)]
+    params.append(F.FExpr("MLIL_CONST", "0", constant=0))       # the stream
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "read(3, &src, 0x40)", writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+                 params=[F.FExpr("MLIL_CONST", "3", constant=3),
+                         F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                         F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&src, ...)", writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
+    ]
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
+            F.FBV({0x900: "read", 0x901: callee}))
+
+
+@pytest.mark.parametrize("base,alias", _UNLOCKED_WRITE_PAIRS)
+def test_unlocked_write_spelling_is_modeled_like_its_bare_twin_876(base, alias):
+    # Same defect shape as the LFS twin, found by the same question: the alias
+    # is exported, its bare twin carries an armed sink, and it resolved to no
+    # model -- so `--sink-class file_write` reported the exfiltration through
+    # `fputs` and missed the identical one through `fputs_unlocked`.
+    assert _reported(_write_program(alias), "call:read", gate=()) == []
+    bare = _reported(_write_program(base), "call:read", gate=("file_write",))
+    alias_sinks = _reported(_write_program(alias), "call:read", gate=("file_write",))
+    assert len(bare) == 1 and len(alias_sinks) == 1, (bare, alias_sinks)
+    assert alias_sinks[0]["tainted_arg_index"] == bare[0]["tainted_arg_index"] == 0
+    assert alias_sinks[0]["class"] == bare[0]["class"] == "file_write", (bare, alias_sinks)
+    assert alias in alias_sinks[0]["detail"], alias_sinks
 
 
 def test_scanf_family_models_carry_arity_capped_flag_851():
