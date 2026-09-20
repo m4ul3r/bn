@@ -2977,3 +2977,23 @@ def test_an_unreadable_type_TABLE_is_disclosed_not_reported_as_zero_675(monkeypa
             read_class._class_show(ctx, None, "Widget")
         assert err.value.status == "unknown_class", label
         assert "could not be read" in str(err.value), label
+
+
+def test_both_spellings_of_the_structure_kind_are_admitted_675(monkeypatch):
+    """The kind test is duck-typed because BN's `type_class` is an IntEnum while
+    the unit fakes across this repo carry a plain string. The ACCEPT direction of
+    the string branch needs its own case: the refusal parametrization exercises
+    only its reject side, so replacing the whole branch with `return False` left
+    the suite green (#907 review)."""
+    bv = _declared_bv(ByInt=_DeclaredType(name="ByInt"),
+                      ByName=_DeclaredKind("ByName", "StructureTypeClass",
+                                           "struct ByName", width=0x18))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    for name, width in (("ByInt", "0x10"), ("ByName", "0x18")):
+        out = read_class._class_show(ctx, None, name)
+        assert out["confidence"] == "declared-only", name
+        assert out["size"] == {"value": width, "source": "declared_type"}, name
+    assert sorted(row["name"] for row in
+                  read_class._class_list(ctx, None, include_all=True)["items"]
+                  if row["confidence"] == "declared-only") == ["ByInt", "ByName"]
