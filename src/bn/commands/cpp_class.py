@@ -14,10 +14,14 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                      "use evidence table to walk a raw vtable/pointer table as data",
          see_also=("class show", "evidence table"),
          args=[arg("--all", action="store_true", default=False, dest="all_clusters",
-                  help="Include name-only clusters (possible namespaces) and the "
-                       "view's USER-declared class types (class/struct/union declarations "
-                       "you added with `types declare`, not types Binary Ninja imported), "
-                       "not just RTTI/ctor-confirmed classes"),
+                  help="Include name-only clusters (possible namespaces) and every "
+                       "class/struct/union in the view's USER type container (what "
+                       "`types declare` writes -- not types Binary Ninja imported), "
+                       "unfiltered, so the rows are exactly the names `class show` "
+                       "resolves; BN's C parser registers an anonymous typedef's body "
+                       "as a second type (`typedef struct { ... } T;` yields `T` and "
+                       "`_T`), and that half lists too. Not just RTTI/ctor-confirmed "
+                       "classes"),
                arg("--no-stl", action="store_true", default=False, dest="no_stl",
                    help="Hide standard-library / ABI-runtime classes (std::, __gnu_cxx::, __cxxabiv1::, reserved-id internals) so domain classes surface"),
                arg("--no-vendor", action="store_true", default=False, dest="no_vendor",

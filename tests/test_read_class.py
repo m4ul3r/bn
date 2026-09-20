@@ -2888,8 +2888,8 @@ class _AliasTo:
     handle: the facts live on the target it resolves to. It DOES carry `.name`,
     the name it REFERENCES: measured on a live view, the alias BN registers for
     `typedef struct { int a; int b; int c; } T;` reads `.name == '_T'`, the
-    generated name of the anonymous body. That is the only fact that tells the
-    parser's own companion from a type the user named, so the fake states it."""
+    name BN's C parser gave the anonymous body. The fake states it because that
+    is how the chain is followed to the body's facts."""
     type_class = 11             # NamedTypeReferenceClass
     width = 0
 
@@ -2948,18 +2948,20 @@ def test_a_declared_alias_reports_the_STRUCTURE_it_resolves_to_675(monkeypatch):
 
 
 def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch):
-    """The shape `typedef struct { ... } T;` actually takes on BN 6.1, measured:
-    the anonymous body is never registered under a name, so the alias'
-    `target(bv)` is **None** and the chain cannot be followed at all. Refusing on
-    an unresolvable target alone therefore dropped the single most common way a
-    declared class reaches a view -- `class show T` missed -- while the alias was
-    all along stating `named_type_class = StructNamedTypeClass` and a resolved
-    width of its own (#907 review).
+    """A reference the chain cannot be followed through is still admitted on the
+    kind it NAMES.
 
-    So an unfollowable reference is admitted on the kind it NAMES, with the facts
-    it does carry, and an enum alias in the identical shape is still refused. The
-    round-3 fixture could not see this: its `target()` resolved, which made it
-    more forgiving than BN."""
+    Measured on BN 6.1: a NAMESPACED anonymous typedef --
+    `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of None,
+    as does any alias whose body is defined without it, while the alias itself
+    states `named_type_class = StructNamedTypeClass` and a width of its own.
+    Refusing on an unresolvable target alone therefore dropped a common way a
+    declared class reaches a view -- `class show` missed it (#907 review).
+
+    So an unfollowable reference is admitted on the kind it NAMES, with the
+    facts it does carry, and an enum alias in the identical shape is still
+    refused. The round-3 fixture could not see this: its `target()` resolved,
+    which made it more forgiving than BN."""
     unresolvable_struct = _AliasTo(None, decl="struct _T T")
     unresolvable_struct.width = 0x10
     unresolvable_struct.named_type_class = 3         # StructNamedTypeClass
@@ -3001,30 +3003,28 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
                   if r["confidence"] == "declared-only") == ["C", "T"]
 
 
-def test_one_declaration_is_one_ROW_whatever_the_declarator_675(monkeypatch):
-    """One declaration is ONE row, and the row is the name the user wrote.
+def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
+    """The declared population is exactly what the USER TYPE CONTAINER holds.
 
-    BN's C parser gives an anonymous body a generated name of its own and the
-    declare path defines EVERY parsed name, so one `typedef struct { ... } T;`
-    puts TWO entries in the user type container. Measured live: `types declare`
-    reported `count 2, defined_types {_T, T}` and `--all` listed both as peers
-    of identical width -- the `<Class>::VTable` artifact-peer family the
-    population rewrite exists to remove, arriving through the user container
-    (#907 review round 3).
+    Three rounds shipped a name-shape rule that tried to fold BN's C-parser
+    companion out of the listing -- the `_T` its parser registers beside
+    `typedef struct { ... } T;`. Each round measured a new escape (the
+    underscore goes on the LEAF of a namespaced name, a POINTER or ARRAY
+    declarator hides the body, re-declaring the alias orphans it), and the
+    decisive one is not an escape at all: the spelling cannot tell BN's `_T`
+    from a `struct _X { ... };` the user HAND-WROTE beside
+    `typedef struct _X X;` (the GLib/GTK idiom), because they are the same
+    name. Folding therefore dropped a class the user declared, and #675.2's
+    whole point is that `class show` must stop answering a confident absence
+    about a type this view has. The rule was WITHDRAWN rather than refined
+    (#907 review round 5): a name-shape test cannot separate a generated body
+    from a user declaration of the same name, and no further case analysis
+    changes that.
 
-    A rule keyed on the ALIAS's own reference caught only the plain declarator.
-    Measured live at round 4, the parser emits the same companion where no
-    followable reference reaches it: `typedef struct { ... } *P;` registers
-    `_P` behind a POINTER, `typedef struct { ... } A[4];` registers BN's own
-    `anonymous_0` behind an ARRAY, a NAMESPACED declaration spells it
-    `n::_Q` (underscore at the LEAF, not on the qualified name), and
-    re-declaring the alias ORPHANS the body so nothing references it at all.
-    Each escaped and rendered a peer class the user never wrote.
-
-    So the rule is the name BN generates, matched where BN puts it: an entry
-    whose leaf is `_<L>` beside a same-scope entry whose leaf is `<L>`, or
-    BN's own `anonymous_<N>`. It needs no resolution, which is what every
-    escape above had in common."""
+    The invariant it leaves behind, and the one this test exists to hold: no
+    name in the user type container may produce a confident absence, and the
+    listing omits none of them. Seeing BN's own `_T` as a peer row is
+    cosmetic; being told a class you declared does not exist is not."""
     from bn.formatters import _render_class_list_text
 
     def body(name, width=0xc):
@@ -3032,9 +3032,9 @@ def test_one_declaration_is_one_ROW_whatever_the_declarator_675(monkeypatch):
             types.SimpleNamespace(offset=0, name="a", type="int32_t")])
 
     plain, pointed, arrayed = body("_T"), body("_P", 0x4), body("anonymous_0", 0x4)
-    qualified, orphan_body = body("n::_Q", 0x8), body("_T1", 0x8)
+    qualified, orphan, glib = body("n::_Q", 0x8), body("_T1", 0x8), body("_X", 0x8)
     bv = _declared_bv(**{
-        # the plain declarator: alias -> its own generated body
+        # the plain declarator: alias -> the body BN named for it
         "T": _AliasTo(plain, decl="struct _T T"), "_T": plain,
         # a POINTER declarator: nothing resolvable reaches `_P`
         "P": _DeclaredKind("P", 6, "struct _P *", width=8), "_P": pointed,
@@ -3044,92 +3044,30 @@ def test_one_declaration_is_one_ROW_whatever_the_declarator_675(monkeypatch):
         # NAMESPACED: BN puts the underscore on the LEAF
         "n::Q": _AliasTo(qualified, decl="struct n::_Q n::Q"), "n::_Q": qualified,
         # an ORPHANED body: its alias was re-declared onto a named struct
-        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan_body,
-        "Widget": _DeclaredType(),
+        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan,
+        # the GLib/GTK idiom -- the user WROTE `_X`, and the heuristic could
+        # never have known that
+        "_X": glib, "X": _AliasTo(glib, decl="struct _X X"),
     })
     ctx = _declared_ctx(monkeypatch, bv)
 
     declared = sorted(r["name"] for r in
                       read_class._class_list(ctx, None, include_all=True)["items"]
                       if r["confidence"] == "declared-only")
-    assert declared == ["T", "T1", "Widget", "n::Q"], (
-        f"a name BN generated is not a class the user declared: {declared}")
+    assert declared == ["T", "T1", "X", "_P", "_T", "_T1", "_X",
+                        "anonymous_0", "n::Q", "n::_Q"], declared
 
+    # Every listed name answers, and -- the invariant -- every name the
+    # container holds as a class type is BOTH listed and resolvable. A row the
+    # listing omits is the only way a confident absence can be manufactured.
+    for name in declared:
+        assert read_class._class_show(ctx, None, name)["confidence"] == "declared-only"
+
+    # The count describes the same set the rows do, under every flag.
     default = read_class._class_list(ctx, None)
-    assert default["declared_suppressed"] == 4, default["declared_suppressed"]
-    assert ("4 user-declared class types (--all to show)"
+    assert default["declared_suppressed"] == len(declared), default["declared_suppressed"]
+    assert ("10 user-declared class types (--all to show)"
             in _render_class_list_text(default))
-
-    # The name the user wrote carries the body's facts.
-    assert read_class._class_show(ctx, None, "T")["size"] == {
-        "value": "0xc", "source": "declared_type"}
-
-
-def test_a_generated_name_is_off_the_LISTING_but_never_an_asserted_absence_675(monkeypatch):
-    """Folding a name out of the rows is not the same claim as "no such class".
-
-    The leaf rule cannot tell BN's generated `_T` from a `struct _X { ... };`
-    the user hand-wrote beside `typedef struct _X X;` -- the GLib/GTK idiom --
-    because the two are byte-identical in the container (measured: no BN
-    attribute distinguishes them). Answering `class show _X` with
-    `No class named '_X'` therefore fabricated an absence about a declaration
-    the user HAD made, which is the "a suppressed read rendering as a fact"
-    pattern this PR exists to remove (#907 review round 4).
-
-    So the rule is a LISTING rule only: one body is one row, under the name
-    that is not the generated spelling, and every declared name still resolves
-    on `class show`. Nothing the user declared becomes unreachable, and one
-    declaration still counts once."""
-    hidden = _StructBody(width=0x8, name="_X", members=[
-        types.SimpleNamespace(offset=0, name="u", type="int32_t")])
-    bv = _declared_bv(**{"_X": hidden, "X": _AliasTo(hidden, decl="struct _X X")})
-    ctx = _declared_ctx(monkeypatch, bv)
-
-    declared = [r["name"] for r in
-                read_class._class_list(ctx, None, include_all=True)["items"]
-                if r["confidence"] == "declared-only"]
-    assert declared == ["X"], declared
-    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
-
-    shown = read_class._class_show(ctx, None, "_X")
-    assert shown["confidence"] == "declared-only"
-    assert shown["size"] == {"value": "0x8", "source": "declared_type"}
-
-
-def test_a_body_the_user_named_is_not_mistaken_for_a_parser_companion_675(monkeypatch):
-    """The leaf rule fires on the UNDERSCORE spelling BN generates, so a struct
-    the user named and aliased separately keeps its own row.
-
-    `struct Body { ... }; typedef struct Body Alias;` puts two entries in the
-    container too, but neither leaf is the other's with an underscore in front,
-    so the lens reports both. Dropping every alias target instead would delete
-    the commonest hand-written declaration pair."""
-    body = _StructBody(width=0x8, name="Body", members=[
-        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
-    bv = _declared_bv(Body=body, Alias=_AliasTo(body, decl="struct Body Alias"))
-    ctx = _declared_ctx(monkeypatch, bv)
-
-    declared = sorted(r["name"] for r in
-                      read_class._class_list(ctx, None, include_all=True)["items"]
-                      if r["confidence"] == "declared-only")
-    assert declared == ["Alias", "Body"], declared
-    assert read_class._class_list(ctx, None)["declared_suppressed"] == 2
-
-
-def test_a_lone_underscore_declaration_keeps_its_row_675(monkeypatch):
-    """`_<L>` is only a generated spelling when the `<L>` it was generated FOR
-    is in the same scope. A view holding `struct _Private { ... };` and nothing
-    called `Private` has one declaration, and it lists."""
-    bv = _declared_bv(**{"_Private": _DeclaredType(name="_Private"),
-                         "n::_Scoped": _DeclaredType(name="n::_Scoped"),
-                         # same leaf, DIFFERENT scope -- not this one's partner
-                         "other::Scoped": _DeclaredType(name="other::Scoped")})
-    ctx = _declared_ctx(monkeypatch, bv)
-
-    declared = sorted(r["name"] for r in
-                      read_class._class_list(ctx, None, include_all=True)["items"]
-                      if r["confidence"] == "declared-only")
-    assert declared == ["_Private", "n::_Scoped", "other::Scoped"], declared
 
 
 def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675(monkeypatch):
