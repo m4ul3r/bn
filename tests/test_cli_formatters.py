@@ -8326,12 +8326,14 @@ def test_taint_forward_refuses_a_zero_iteration_budget_812(fake_transport, capsy
 def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
     # #827 item 1: the bridge follows ONE predecessor per step and discloses the
     # join as an `alternate_parents` count. That count is the ONLY half of item 1
-    # this PR delivers, and it was JSON-only -- so under the default text view a
-    # phi-join step rendered byte-identically to a linear one and the reader
-    # learned nothing, while the PR body claimed they learn how many parents were
-    # dropped. The PR's two other structural disclosures (analysis_incomplete,
-    # the per-callsite frontier) each got a text line; this is the same
-    # convention.
+    # this PR delivers, and it was JSON-only -- so a text reader saw a phi-join
+    # step rendered byte-identically to a linear one and learned nothing, while
+    # the PR body claimed they learn how many parents were dropped. It rides the
+    # rendered SSA path, which is a `--full` detail, so unlike this PR's two
+    # sibling disclosures (analysis_incomplete, the per-callsite frontier) it is
+    # NOT on the compact default view: the chain it qualifies is not printed
+    # there either, and annotating a step the reader cannot see would disclose
+    # nothing. This test drives the path renderer directly for that reason.
     from bn.formatters import _render_taint_path
     out = _render_taint_path([
         {"address": "0x10", "op": "MLIL_SET_VAR_SSA", "il_text": "a#1 = src",

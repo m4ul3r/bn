@@ -392,6 +392,56 @@ def test_taint_op_threads_max_iters_into_the_engine_812(monkeypatch):
     assert seen == [7, engine_default], seen
 
 
+def test_taint_answers_disclose_the_view_analysis_state_811(monkeypatch):
+    # #811, the view-level half: both taint answers carry the SAME
+    # `{analysis_state, partial}` shape every other read op attaches, imported
+    # from `read_listing` rather than re-derived, so the taint surface cannot
+    # fork the convention. It shipped pinned by nothing -- deleting both
+    # `.update(_analysis_state_fields(bv))` calls left 711 tests green across
+    # all four taint test files -- and the catalog half is the one that matters:
+    # `taint models --present` computes presence by WALKING the view, so on a
+    # quick-loaded view a modeled sink is reported ABSENT merely because its
+    # caller was never analysed. That is a false all-clear in catalog form, and
+    # the disclosure is the only thing standing between a reader and it.
+    from bn_agent_bridge import read_listing as rl
+
+    bv = _BVTriage()
+    ctx = _CtxWithBV(bv)
+    full = rts._taint_models_op(ctx, "active", {"present": True})
+    assert full["analysis_state"] == "full", full
+    assert full["partial"] is False, full
+
+    # The same view, now quick-loaded: the catalog must say so rather than
+    # answering in the same shape as a fully analysed one.
+    rl._quick_loaded_views.add(bv)
+    try:
+        quick = rts._taint_models_op(ctx, "active", {"present": True})
+    finally:
+        rl._quick_loaded_views.discard(bv)
+    assert quick["analysis_state"] == "quick", quick
+    assert quick["partial"] is True, quick
+
+    # The slice half. `require_analysis` refuses a quick view outright, so this
+    # path can only ever report "full" today -- which is exactly why it needs a
+    # test: the fields are there so the contract is uniform and a future
+    # quick-tolerant taint mode cannot ship a silent partial answer, and a
+    # contract kept for a future caller is the easiest kind to delete.
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def forward(self, func, locators, **kw):        # never analyse anything
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    monkeypatch.setattr(rts._taint, "TaintEngine", _RecordingEngine)
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    result = rts._taint_op(_Ctx(_BVPlain()), "active",
+                           {"function": "handler", "sources": ["param:0"]})
+    assert result["analysis_state"] == "full", result
+    assert result["partial"] is False, result
+
+
 def test_present_self_stub_labeled_non_audit_560():
     # A code ref located inside the modeled symbol's OWN body (a self-tailcall
     # stub) is non-audit, distinct from an import thunk.
