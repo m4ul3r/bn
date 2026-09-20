@@ -8950,11 +8950,14 @@ def test_backward_result_carries_a_completeness_gate_812(process_func, models):
     diag = result.get("diagnostics") or {}
     assert diag, result.keys()
     assert "safe_to_report_complete_slice" in diag, diag
-    # ...and its VALUE, end to end. Round 5's falsification lens disabled the
-    # blocking-leaf branch in `backward_diagnostics` so a curtailed slice
-    # answered `true`, and 1237 tests across every taint-touching file stayed
-    # green, because this test asserted only that the key EXISTS. A gate whose
-    # value nothing checks is a claim, not a gate.
+    # ...and its VALUE, end to end: this run has no blocking leaf and is not
+    # truncated, so the gate must CLAIM completeness. Stated precisely, because
+    # a round-6 lens measured what this assertion does and does not catch: it
+    # is load-bearing against a gate that wrongly WITHHOLDS (it reds when the
+    # clean branch is flipped to False), and it does NOT catch a broken
+    # blocking-leaf branch -- there is no blocking leaf here for that branch to
+    # mis-handle. The withholding direction is pinned by the decision-table
+    # test below, which is where a curtailed slice lives.
     from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
     assert diag["safe_to_report_complete_slice"] is True, diag
     assert not [lf for lf in result["leaves"]
@@ -9027,6 +9030,89 @@ def test_backward_next_action_names_the_unseeded_sink_before_the_empty_slice_812
     # The empty-slice line still answers for the case it actually describes.
     seeded = tr.backward_diagnostics([], [], sinks_seeded=1, slices=0)
     assert "the sink seeded but no slice was produced" in seeded["next_action"], seeded
+
+
+def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812():
+    # The rest of the same block's decision surface, every branch of which
+    # shipped pinned by nothing: disabling any one of the three frontier
+    # next_action branches, zeroing the dropped-caller bucket, or dropping
+    # `field_load_unresolved` from backward's UNRESOLVED vocabulary each left
+    # 781 tests green. The harm is not a missing sentence -- it is the block
+    # telling the reader "the slice reached its origins" in one line while its
+    # own gate says the slice is NOT complete in the next.
+    from bn_agent_bridge import taint_result as tr
+
+    # Dropped caller sites: counted under their own heading, and the one
+    # frontier a user can act on by re-running with a narrower sink.
+    dropped = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}, {"kind": "caller_sites_truncated"}],
+        [], sinks_seeded=1, slices=1)
+    assert dropped["frontier"]["dropped_callers"] == 2, dropped
+    assert dropped["frontier"]["unresolved"] == 0, dropped
+    assert "caller ascent was capped" in dropped["next_action"], dropped
+
+    # An unresolved def. `field_load_unresolved` is the shape the issue names as
+    # the motivating one ("bottomed out at an unresolved field load"), so a
+    # vocabulary that omits it reports zero unresolved frontier on exactly the
+    # run the feature exists for.
+    for kind in ("field_load_unresolved", "unmodeled_callee",
+                 "indirect_call_unresolved", "arg_under_recovered"):
+        unres = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
+        assert unres["frontier"]["unresolved"] == 1, (kind, unres)
+        assert "bn proto set" in unres["next_action"], (kind, unres)
+
+    # A coarse-memory frontier: its own bucket and its own remediation.
+    for kind in ("coarse_memory_store", "pointer_escape"):
+        coarse = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
+        assert coarse["frontier"]["coarse_memory"] == 1, (kind, coarse)
+        assert coarse["frontier"]["unresolved"] == 0, (kind, coarse)
+        assert "coarse-memory frontier" in coarse["next_action"], (kind, coarse)
+
+    # Precedence when several fire at once: the dropped ascent wins, because it
+    # is the only one the user can act on directly -- and the buckets stay
+    # separate rather than collapsing into a single total.
+    several = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}, {"kind": "field_load_unresolved"},
+         {"kind": "coarse_memory_store"}], [], sinks_seeded=1, slices=1)
+    assert "caller ascent was capped" in several["next_action"], several
+    assert several["frontier"]["dropped_callers"] == 1, several
+    assert several["frontier"]["unresolved"] == 1, several
+    assert several["frontier"]["coarse_memory"] == 1, several
+
+    # The must-not-fire twin for all three: a clean walk gets the classify
+    # action, so none of these remediations is a permanent fixture on every row.
+    clean = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1)
+    assert "classify each origin" in clean["next_action"], clean
+    assert clean["frontier"] == {"unresolved": 0, "coarse_memory": 0,
+                                 "dropped_callers": 0, "by_kind": {}}, clean
+
+
+def test_backward_weak_sink_seed_withholds_completeness_812():
+    # The last completeness branch. It is DEFENCE-IN-DEPTH, not live coverage:
+    # none of the six assumptions today's backward walk records contains any
+    # `_WEAK_SEED_ASSUMPTION_MARKERS` substring, so the branch cannot fire from
+    # its only caller -- the weak backward seed shapes that exist reach the gate
+    # as a BLOCKING leaf (`arg_under_recovered`) instead. That is precisely why
+    # it is pinned here directly rather than through a run that would not prove
+    # it exists: an unreachable, untested branch is the one a later reader
+    # deletes as dead, and the marker set it keys on is shared with forward and
+    # grows (#851, #863 each added one).
+    from bn_agent_bridge import taint_result as tr
+
+    weak = tr.backward_diagnostics(
+        [], ["--sink arg 1 is source_seed_misanchored: the seeded operand is "
+             "not the value the callee reads"],
+        sinks_seeded=1, slices=1)
+    assert weak["safe_to_report_complete_slice"] is False, weak
+    assert "seed" in weak["complete_slice_reason"], weak
+
+    # And it keys on the MARKERS, not on "an assumption exists": the caller-cap
+    # note the backward walk really does record must not be read as a weak seed,
+    # or every capped ascent would be blamed on its seed.
+    ordinary = tr.backward_diagnostics(
+        [], ["parse_record has 9 callers; caller ascent followed 4, capped at 4"],
+        sinks_seeded=1, slices=1)
+    assert ordinary["safe_to_report_complete_slice"] is True, ordinary
 
 
 def test_truncation_hint_names_the_caller_cap_rather_than_a_depth_cutoff_812():

@@ -8347,11 +8347,14 @@ def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
     # The linear step must NOT be annotated -- an unconditional marker would be
     # a permanent false alarm on every ordinary chain.
     assert joined.count("not shown") == 1, joined
-    # A count of 0, an absent key, an unreadable value and a NEGATIVE count all
-    # render nothing: this is a disclosure, so a fabricated one is the same
-    # defect as a missing one, and "joins -3 other tainted parent(s)" is
-    # fabricated in the one direction a numeric check still admits.
-    for bad in (0, None, "two", True, -3):
+    # A count of 0, an absent key, an unreadable value, a NEGATIVE count and a
+    # value that is merely COERCIBLE to one all render nothing. This is a
+    # disclosure, so a fabricated one is the same defect as a missing one: 1.5
+    # parents do not exist, and the count helper reads a float or a numeric
+    # string as a number by design (it serves counters where that is right), so
+    # the disclosure has to require the real thing -- exactly as the sibling
+    # frontier marker does.
+    for bad in (0, None, "two", True, -3, 1.5, -1.5, "2", [2], {}, float("nan")):
         step = {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(...)"}
         if bad is not None:
             step["alternate_parents"] = bad

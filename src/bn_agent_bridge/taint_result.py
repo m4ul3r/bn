@@ -385,6 +385,16 @@ def backward_diagnostics(
         complete, reason = False, (
             f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
             "origins behind the cut are absent, NOT a complete slice")
+    # DEFENCE-IN-DEPTH, and deliberately kept as such: no assumption today's
+    # backward walk records contains any `_WEAK_SEED_ASSUMPTION_MARKERS`
+    # substring (measured over the six it can emit), so this cannot fire from
+    # the only caller -- the weak backward seed shape that does exist arrives as
+    # a BLOCKING `arg_under_recovered` leaf and is withheld above. It stays
+    # because the marker set is shared with forward and keeps growing (#851 and
+    # #863 each added one), and a gate that silently stops covering a shape is
+    # the failure this whole block exists to prevent. Pinned directly by
+    # `test_backward_weak_sink_seed_withholds_completeness_812` rather than
+    # through a run that would not prove it exists.
     elif weak_seed:
         complete, reason = False, (
             "the sink seed was incomplete or mis-anchored (see caveats), so the "

@@ -3558,12 +3558,18 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
         # chain it qualifies is not printed there either, and annotating a step
         # the reader cannot see would disclose nothing.
         #
-        # A count of 0, an absent key, an unreadable value and a NEGATIVE count
-        # all render nothing. A fabricated disclosure is the same defect as a
-        # missing one, and a negative reads as a number while stating a thing no
-        # count can mean.
-        _alt = _count_field(step, "alternate_parents")
-        if _alt > 0:
+        # A count of 0, an absent key, an unreadable value, a NEGATIVE count and
+        # a value merely COERCIBLE to one all render nothing. A fabricated
+        # disclosure is the same defect as a missing one, and `_count_field`
+        # reads a float or a numeric string AS a number by design -- right for
+        # the counters it serves, wrong here, where "1.5 parents" and a string
+        # spelled like a count are claims the bridge never made. The raw value
+        # decides, exactly as it does for the sibling frontier marker; the
+        # helper still runs so a present-but-unreadable key is recorded as skew
+        # for the enclosing boundary to disclose (#619).
+        _count_field(step, "alternate_parents")
+        _alt = step.get("alternate_parents")
+        if isinstance(_alt, int) and not isinstance(_alt, bool) and _alt > 0:
             out.append(
                 f"        <- joins {_alt} other tainted parent(s) not shown "
                 "(this is one of several provenance paths)")
