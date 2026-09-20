@@ -370,6 +370,58 @@ def test_max_depth_validator_says_depth_not_index(capsys):
     assert "index must be" not in err
 
 
+def test_both_taint_directions_share_one_resolve_map_policy(monkeypatch, capsys, tmp_path):
+    """#824 item 4: taint forward and taint backward each carried their own
+    byte-identical copy of the --resolve-map read/refuse policy, so an edit to
+    how that file is parsed or refused lands on one direction and silently
+    misses the other. One copy now (`_add_resolve_map`, mirroring the
+    `_add_user_models` precedent the issue names), and this pins the two
+    observable consequences a divergence would break: the same file parses to
+    the same param, and a bad one is refused before the wire with the same
+    message."""
+    good = tmp_path / "rmap.json"
+    good.write_text(json.dumps({"0x401000": ["0x401100"]}), encoding="utf-8")
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not json", encoding="utf-8")
+
+    seen: list[dict] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(params or {})
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "sample"}]}
+        assert op == "taint", f"unexpected op: {op}"
+        return {"ok": True, "result": {"direction": params["direction"],
+                                       "function": {"name": "f", "address": "0x1"},
+                                       "sources": [], "sinks": [], "slices": [],
+                                       "reached_sinks": [], "leaves": [],
+                                       "assumptions": [], "soundness": "x"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    directions = (
+        ["taint", "forward", "-f", "dispatch", "--source", "param:1"],
+        ["taint", "backward", "-f", "emit", "--sink", "arg:send:1"],
+    )
+
+    parsed = []
+    for tail in directions:
+        seen.clear()
+        assert bn.cli.main([*tail, "--resolve-map", str(good), "--target", "active"]) == 0
+        parsed.append(seen[-1].get("resolve_map"))
+    assert parsed[0] == parsed[1] == {"0x401000": ["0x401100"]}
+
+    capsys.readouterr()
+    refusals = []
+    for tail in directions:
+        seen.clear()
+        assert bn.cli.main([*tail, "--resolve-map", str(bad), "--target", "active"]) == 2
+        assert seen == []  # refused before the wire, both directions
+        refusals.append(capsys.readouterr().err.replace(str(bad), "<map>"))
+    assert "could not read --resolve-map" in refusals[0]
+    assert refusals[0] == refusals[1]
+
+
 def test_entries_validator_hex_aware_and_rejects_zero(capsys):
     # evidence table --entries is wired to the shared count validator: hex is
     # accepted and a degenerate 0/negative is rejected with the standard message (#59).

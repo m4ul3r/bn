@@ -71,6 +71,26 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     params["user_models_via"] = source
 
 
+def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
+    """Read `--resolve-map <file>` into ``params['resolve_map']`` (#824).
+
+    Forward and backward taint each carried a byte-identical copy of this
+    read/refuse policy. One copy now, mirroring the `_add_user_models`
+    precedent above: a change to how the file is read or how a bad one is
+    refused cannot land on one direction and silently miss the other.
+    """
+    if not args.resolve_map:
+        return
+    try:
+        params["resolve_map"] = json.loads(
+            read_text_input(Path(args.resolve_map), what="--resolve-map file"))
+    except ValueError as exc:
+        # #864: the shared reader refuses a directory/FIFO/device by kind --
+        # a FIFO here blocked forever with no envelope; what reaches this
+        # wrap is malformed JSON.
+        raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+
+
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
          target=True,
          prefer_when="per-function SSA def/use of one variable; "
@@ -189,15 +209,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(
-                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
-        except ValueError as exc:
-            # #864: the shared reader refuses a directory/FIFO/device by kind --
-            # a FIFO here blocked forever with no envelope; what reaches this
-            # wrap is malformed JSON.
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,
@@ -239,15 +251,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "sinks": list(args.sinks),
         "max_depth": int(args.max_depth),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(
-                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
-        except ValueError as exc:
-            # #864: the shared reader refuses a directory/FIFO/device by kind --
-            # a FIFO here blocked forever with no envelope; what reaches this
-            # wrap is malformed JSON.
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,
