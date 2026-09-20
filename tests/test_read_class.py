@@ -2338,17 +2338,54 @@ def test_render_class_list_text_warns_when_quick_loaded():
 # type declared a moment ago (#622's cache, #675's triage comment).
 
 class _DeclaredType:
-    """A view type in the minimum shape the fallback reads: a width and a name.
-    No `members`, so the seam's `_type_entry` renders the header-only layout BN
-    gives a declaration whose fields it does not enumerate."""
+    """A view type in the minimum shape the fallback reads: a width, a name and
+    a KIND. No `members`, so the seam's `_type_entry` renders the header-only
+    layout BN gives a declaration whose fields it does not enumerate.
+
+    `type_class` is BN's `TypeClass` value -- 4 (`StructureTypeClass`) is the one
+    kind that is a C++ class type, and it is what the declared half filters on
+    (#907 review). Left a class attribute with an instance override so
+    `_CountingDeclaredType`, which deliberately does not call `__init__`, still
+    states a kind."""
     type_class = 4          # StructureTypeClass
 
-    def __init__(self, width=0x10, name="Widget"):
+    def __init__(self, width=0x10, name="Widget", type_class=None):
         self.width = width
         self.name = name
+        if type_class is not None:
+            self.type_class = type_class
 
     def __str__(self):
         return f"struct {self.name}"
+
+
+# The kinds BN registers in `bv.types` alongside structures. Every one of these
+# answered `class show` as a `[declared-only]` class before the kind filter
+# (#907 review): `class Color (size 0x4)` for an ENUM, with the note asserting
+# its empty vtable is "RTTI evidence that is absent" about a type that can never
+# carry one. Both spellings of `type_class` are covered because BN's is an
+# IntEnum and the unit fakes elsewhere carry the plain string.
+_NON_CLASS_DECLARED_KINDS = (
+    ("Color", 5, "enum Color"),                      # EnumerationTypeClass
+    ("handle_t", 2, "int32_t"),                      # IntegerTypeClass
+    ("cb_t", 6, "void (*)()"),                       # PointerTypeClass
+    ("row_t", 7, "char [16]"),                       # ArrayTypeClass
+    ("op_t", 8, "int32_t (void*)"),                  # FunctionTypeClass
+    ("Flags", "EnumerationTypeClass", "enum Flags"),  # the string-typed spelling
+)
+
+
+class _DeclaredKind:
+    """A declared type of an arbitrary kind, rendering as its own declaration."""
+
+    def __init__(self, name, type_class, decl, width=4):
+        self.name = name
+        self.type_class = type_class
+        self._decl = decl
+        self.width = width
+
+    def __str__(self):
+        return self._decl
 
 
 def _declared_bv(**types_):
@@ -2629,3 +2666,96 @@ def test_class_show_tracks_a_REDEFINED_declared_type_675(view_memo_live):
         "the registry must still be the memoised one -- otherwise this test is "
         "not exercising the staleness it claims to"
     )
+
+
+@pytest.mark.parametrize("name,type_class,decl", _NON_CLASS_DECLARED_KINDS)
+def test_class_show_refuses_a_declared_NON_CLASS_type_675(monkeypatch, name, type_class, decl):
+    """`bv.types` is the view's whole type table, so the declared half must ask
+    WHICH kind it is holding. An enum / scalar / pointer / array / function
+    declaration is not a class, and answering `class show Color` with
+    `class Color (size 0x4) [declared-only]` is wrong in a way a reader believes
+    -- the note even asserts the empty vtable is "RTTI evidence that is absent"
+    about a type that can never carry one (#907 review).
+
+    The real class in the same view is asserted alongside, so a filter that
+    simply refuses the declared half everywhere cannot pass this."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{name: _DeclaredKind(name, type_class, decl)})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, name)
+    assert err.value.status == "unknown_class"
+
+    still = read_class._class_show(ctx, None, "Widget")
+    assert still["confidence"] == "declared-only"
+
+
+def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypatch):
+    """The count and the listing are one population or neither is trustworthy.
+
+    Before the kind filter the hidden line said `5 declared types` on a view
+    holding ONE declared class, because the count was taken over the whole type
+    table -- a number describing a different population than the rows `--all`
+    then shows (#907 review). Both flow through the same enumeration now, which
+    is what keeps them from re-splitting: the identity assertion below fails if
+    a future change filters one side only."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{n: _DeclaredKind(n, tc, decl)
+                         for n, tc, decl in _NON_CLASS_DECLARED_KINDS})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    full = read_class._class_list(ctx, None, include_all=True)
+    listed = sorted(row["name"] for row in full["items"]
+                    if row["confidence"] == "declared-only")
+    assert listed == ["Widget"], (
+        "only a declared CLASS type may be listed as a class; the enum/scalar/"
+        f"pointer/array/function declarations must not appear: {listed}")
+
+    default = read_class._class_list(ctx, None)
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert default["declared_suppressed"] == len(listed), (
+        "the hidden count must count the rows `--all` lists, not the type table: "
+        f"{default['declared_suppressed']} counted vs {len(listed)} listed")
+    assert counted["declared_suppressed"] == len(listed)
+
+    from bn.formatters import _render_class_list_text
+    assert "1 declared class type (--all to show)" in _render_class_list_text(default)
+
+
+def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
+    """`typedef struct { ... } Widget;` is how C++ code most often reaches a
+    view: BN registers the body as an auto-named struct and `Widget` as a
+    NamedTypeReference to it (see `read_types._follow_typedef`, #674). Filtering
+    on the ALIAS's own kind would leave `class show Widget` answering only for
+    the internal `_Widget`, so the kind test follows the chain -- and a chain
+    that terminates at an enum is still refused."""
+    class _Alias:
+        type_class = 11         # NamedTypeReferenceClass
+
+        def __init__(self, target, width=0x10):
+            self._target = target
+            self.width = width
+
+        def target(self, bv):
+            return self._target
+
+        def __str__(self):
+            return "alias"
+
+    bv = _declared_bv(Widget=_Alias(_DeclaredType(name="_Widget")),
+                      Color=_Alias(_DeclaredKind("_Color", 5, "enum _Color")),
+                      Broken=_Alias(None))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+    assert out["name"] == "Widget" and out["confidence"] == "declared-only"
+
+    for refused in ("Color", "Broken"):
+        with pytest.raises(read_class.OperationFailure) as err:
+            read_class._class_show(ctx, None, refused)
+        assert err.value.status == "unknown_class", refused
+
+    full = read_class._class_list(ctx, None, include_all=True)
+    assert [row["name"] for row in full["items"]
+            if row["confidence"] == "declared-only"] == ["Widget"]

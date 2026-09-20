@@ -14,6 +14,7 @@ from typing import Any
 from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
+from .read_types import _follow_typedef
 from .seam import _view_memo
 
 
@@ -433,14 +434,63 @@ def _no_instances() -> dict[str, Any]:
     }
 
 
-def _declared_types(bv) -> dict[str, Any]:
-    """``{name: type_obj}`` for the view's DEFINED types -- the LIVE read.
+# #675.2 / #907 review: WHICH declared types are classes. `bv.types` is the
+# view's WHOLE type table -- enums, scalars, pointers, arrays, function
+# prototypes and typedef aliases sit in it alongside structures -- so an
+# unfiltered enumeration answered `class show Color` (an enum) with
+# `class Color (size 0x4) [declared-only]`, the note asserting its empty vtable
+# is "RTTI evidence that is absent" about a type that can never carry one, and
+# rendered `(hidden: N declared types)` with N the entire type population.
+#
+# The admitted kind is BN's `StructureTypeClass`, which is exactly C++'s three
+# class-keys (`class`, `struct`, `union`), reached through the typedef follow the
+# type reads already use (#674): `typedef struct { ... } Widget;` registers the
+# body as an auto-named struct and `Widget` as a NamedTypeReference to it, so an
+# alias-blind test would leave `class show Widget` answering only for the
+# internal `_Widget`.
+_STRUCTURE_TYPE_CLASS = 4       # binaryninja.TypeClass.StructureTypeClass
 
-    One function owns the enumeration so every consumer of the declared half
-    reads the same, current view (see the block comment above for why nothing
-    here may be memoised)."""
-    return {str(key): type_obj
-            for key, type_obj in list((getattr(bv, "types", None) or {}).items())}
+
+def _is_class_type(bv, name: str, type_obj) -> bool:
+    """True if *type_obj* declares a C++ class type (``class``/``struct``/``union``).
+
+    Duck-typed over BN's ``TypeClass`` IntEnum and the plain string the unit
+    fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
+
+    Fails CLOSED on every reading that does not state a structure kind -- an
+    absent ``type_class``, and an alias whose chain cannot be followed (an
+    unresolvable target, a cycle, too many hops). A class surface must not
+    report a type AS a class on the strength of a read that failed; the honest
+    answer there is the unknown-class miss."""
+    _, target, reason = _follow_typedef(bv, name, type_obj)
+    if reason is not None:
+        return False
+    tc = getattr(target, "type_class", None)
+    if tc is None:
+        return False
+    try:
+        return int(tc) == _STRUCTURE_TYPE_CLASS
+    except (TypeError, ValueError):
+        pass
+    return "Structure" in str(getattr(tc, "name", None) or tc)
+
+
+def _declared_types(bv) -> dict[str, Any]:
+    """``{name: type_obj}`` for the view's declared CLASS types -- the LIVE read.
+
+    One function owns the enumeration AND the kind filter, so every consumer of
+    the declared half reads the same, current view (see the block comment above
+    for why nothing here may be memoised) and describes the same POPULATION: the
+    listing's rows, its hidden count and `class show`'s fallback all resolve
+    here, which is what stopped the count from counting the type table while the
+    rows were something else (#907 review). Filtering a caller instead would
+    re-split them on the next change."""
+    declared: dict[str, Any] = {}
+    for key, type_obj in list((getattr(bv, "types", None) or {}).items()):
+        name = str(key)
+        if _is_class_type(bv, name, type_obj):
+            declared[name] = type_obj
+    return declared
 
 
 def _declared_size(type_obj) -> dict[str, Any] | None:
@@ -462,7 +512,8 @@ def _declared_size(type_obj) -> dict[str, Any] | None:
 
 
 def _declared_type_records(ctx, bv) -> dict[str, dict[str, Any]]:
-    """``{name: ClassRecord}`` for the view's DEFINED types (#675.2).
+    """``{name: ClassRecord}`` for the view's declared CLASS types (#675.2) --
+    whatever :func:`_declared_types` admits, and nothing else.
 
     Every record is in the class registry's shape, so one renderer and one JSON
     consumer read both halves of the lens, and every record carries

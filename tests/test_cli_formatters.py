@@ -8034,25 +8034,29 @@ def test_render_class_show_text_discloses_a_skewed_notes_container_675():
 
 
 def test_render_class_list_text_discloses_declared_types_folded_out_675():
-    """#675.2: the default listing folds declared types out through the confidence
-    gate, so it says they are there (and how to see them) rather than reading as a
-    lens that never saw the class the user declared."""
+    """#675.2: the default listing folds declared class types out through the
+    confidence gate, so it says they are there (and how to see them) rather than
+    reading as a lens that never saw the class the user declared.
+
+    The noun is "declared CLASS type": the counter counts the class/struct/union
+    declarations `--all` then lists, and saying "declared type" described the
+    view's whole type table instead (#907 review)."""
     from bn.formatters import _render_class_list_text
 
     one = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 1})
-    assert "1 declared type (--all to show)" in one
+    assert "1 declared class type (--all to show)" in one
 
     two = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 2})
-    assert "2 declared types (--all to show)" in two
+    assert "2 declared class types (--all to show)" in two
 
     none = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 0})
     assert "declared" not in none
 
-    # An unreadable counter must not print as "0 declared types", which reads as
-    # "the lens looked and found none" (#619).
+    # An unreadable counter must not print as "0 declared class types", which
+    # reads as "the lens looked and found none" (#619).
     skewed = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": "lots"})
-    assert "? declared types (--all to show)" in skewed
+    assert "? declared class types (--all to show)" in skewed
