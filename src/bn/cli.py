@@ -1505,7 +1505,8 @@ def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
             f"{what} is not a regular file ({_file_kind(st.st_mode)}): {path}. "
             "A device can stream without end, so it is refused instead of read "
             "until it stops; write the input to a regular file, or stream it in "
-            "through a process substitution (`<(cmd)`) or /dev/stdin", hint))
+            "through a process substitution (`<(cmd)`) or a pipe on /dev/stdin "
+            "-- a /dev/stdin that is still a terminal is this same device", hint))
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -1554,7 +1555,14 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    # poll, not select: select's fd_set caps at FD_SETSIZE (1024) and raises a
+    # bare ValueError above it, so a caller launched with a large inherited fd
+    # table would get a traceback at exit 1 instead of the envelope every other
+    # refusal here produces. poll has no such ceiling.
+    waiter = select.poll()
+    waiter.register(fd, select.POLLIN)
     chunks: list[bytes] = []
+    delivered = 0
     try:
         while True:
             try:
@@ -1563,19 +1571,21 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
                 # A writer is attached with nothing ready. Wait for it, but not
                 # forever: an unbounded wait here reproduces the reported
                 # symptom exactly, just from the writer's side of the pipe.
-                if not select.select([fd], [], [], _FIFO_IDLE_TIMEOUT)[0]:
+                if not waiter.poll(_FIFO_IDLE_TIMEOUT * 1000):
                     raise BridgeError(
-                        f"{what} is a FIFO whose writer sent nothing for "
-                        f"{_FIFO_IDLE_TIMEOUT:g}s: {path}. A writer that is "
-                        "attached but silent blocks the read forever, so the "
-                        "wait is bounded and refused rather than hung on; write "
-                        "the input to a regular file, or use a producer that "
-                        "streams"
+                        f"{what} is a FIFO whose writer went quiet for "
+                        f"{_FIFO_IDLE_TIMEOUT:g}s after {delivered} byte(s): "
+                        f"{path}. A writer that is attached but silent blocks "
+                        "the read forever, so the wait is bounded; what did "
+                        "arrive is discarded rather than used as if it were the "
+                        "whole input. Write the input to a regular file, or use "
+                        "a producer that streams"
                     ) from None
                 continue
             if not chunk:
                 break
             chunks.append(chunk)
+            delivered += len(chunk)
     except OSError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
     finally:

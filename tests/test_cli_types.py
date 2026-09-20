@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import resource
 import signal
 import threading
 import time
@@ -351,7 +352,7 @@ def test_types_declare_refuses_a_fifo_whose_writer_is_attached_but_silent(
     assert rc == 2
     assert [call["op"] for call in calls] == []
     captured = capsys.readouterr()
-    assert "sent nothing" in captured.err
+    assert "went quiet" in captured.err
     assert str(fifo) in captured.err
     assert "Traceback" not in captured.err
 
@@ -383,6 +384,43 @@ def test_a_slow_but_steady_producer_is_not_cut_off_by_the_idle_bound(
 
     assert rc == 0
     assert calls[-1]["params"]["declaration"] == "struct R { int a; };"
+
+
+_FD_SETSIZE = 1024
+
+
+@pytest.mark.skipif(
+    resource.getrlimit(resource.RLIMIT_NOFILE)[0] < _FD_SETSIZE + 400,
+    reason="needs headroom to hold more than FD_SETSIZE descriptors open")
+def test_a_fifo_above_fd_setsize_still_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch):
+    """`select()`'s fd_set stops at FD_SETSIZE and raises a bare `ValueError`
+    past it -- not an `OSError`, so it escapes the reader's own handler. A `bn`
+    launched from a supervisor or CI runner that leaks a large descriptor table
+    would then get a Python traceback at exit 1 out of the one code path whose
+    entire job is to answer in a structured envelope. Ballast pushes the pipe
+    past the ceiling so the wait is exercised with a high descriptor."""
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    calls = fake_transport()
+    ballast = [os.open(os.devnull, os.O_RDONLY) for _ in range(_FD_SETSIZE + 100)]
+    read_fd, write_fd = os.pipe()
+    try:
+        assert read_fd > _FD_SETSIZE, f"ballast did not clear FD_SETSIZE ({read_fd})"
+        # The write end stays open and silent, so the read reaches the bounded
+        # wait -- the only place a descriptor is handed to the readiness call.
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+        for fd in ballast:
+            os.close(fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "went quiet" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_types_declare_dev_null_still_reaches_the_op(fake_transport):

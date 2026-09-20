@@ -13,6 +13,11 @@ from bn_agent_bridge._shared import OperationFailure, _serialize_error, _write_j
 from bn.commands.misc import _resolved_out_format
 from bn.output import OutputWriteError, render_value, write_output_result
 from _cli_helpers import *  # noqa: F401,F403
+# The #864 FIFO readers are split across two test modules; the stall guard is
+# imported from the one holding the larger group rather than copied, because
+# two copies of a hang guard drift and the stale one is the copy nobody is
+# looking at when the reader regresses.
+from test_cli_types import _must_not_hang
 
 
 def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
@@ -1597,13 +1602,19 @@ def test_imports_count_alone_still_counts(fake_transport):
 ])
 def test_fifo_file_input_is_refused_not_hung(fake_transport, capsys, tmp_path, argv_tail):
     """#864: a FIFO with no writer blocked `read_text` forever -- zero bytes of
-    output, no envelope, no timeout. The refusal names the path and its kind."""
+    output, no envelope, no timeout. The refusal names the path and its kind.
+
+    Under the guard, because without it a regression here does not turn this
+    test red -- it wedges the run at "still running" and takes the rest of the
+    suite with it, which is how the defect stayed invisible in the first place.
+    """
     fifo = tmp_path / "input.fifo"
     os.mkfifo(fifo)
     calls = fake_transport()
     argv = [a.format(fifo=fifo) for a in argv_tail]
 
-    rc = bn.cli.main([*argv, "--format", "json"])
+    with _must_not_hang():
+        rc = bn.cli.main([*argv, "--format", "json"])
 
     assert rc == 2
     assert calls == []

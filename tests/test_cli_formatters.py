@@ -763,12 +763,14 @@ def test_render_callsites_no_footer_on_complete_single_page():
 
 def test_render_callsites_empty_string_row_does_not_read_as_no_callsites():
     # A row that renders to a literal empty string (fallback text for a raw ""
-    # item) must not be silently dropped into the "no callsites found" fallback
-    # -- that misrepresents a one-row page as a zero-result page.
-    from bn.formatters import _render_callsites_text
+    # item) must not be silently dropped into the zero-result fallback -- that
+    # misrepresents a one-row page as a zero-result page. The comparison is
+    # against the SHARED empty-result marker, not a literal: #824 renamed that
+    # line, and a test pinned to the retired spelling can no longer fail.
+    from bn.formatters import _empty_result, _render_callsites_text
     value = {"items": [""]}
     out = _render_callsites_text(value)
-    assert out != "no callsites found"
+    assert out != _empty_result("callsites")
 
 
 def test_render_callsites_string_offset_footer_renders_unknown_not_fabricated():
@@ -788,10 +790,10 @@ def test_render_callsites_non_int_total_empty_page_does_not_assert_zero():
     # the same confidently-wrong shape the over-shot-page fix (F3) stopped
     # fabricating for a bad offset. The total is unusable, so say so instead
     # of asserting zero.
-    from bn.formatters import _render_callsites_text
+    from bn.formatters import _empty_result, _render_callsites_text
     value = {"items": [], "total": "47", "offset": 60}
     out = _render_callsites_text(value)
-    assert out != "no callsites found"
+    assert out != _empty_result("callsites")
     assert "total count is not a number" in out
     assert "(offset 60)" in out
 
@@ -1153,10 +1155,10 @@ def test_the_disclosure_reaches_an_early_return_path():
     # appending a line per branch: several renderers bail out BEFORE their
     # normal tail -- "none", "no instance has a binary matching ...", the
     # no-possible-values return -- and a per-branch line misses exactly those.
-    from bn.formatters import (_render_data_symbols_text,
+    from bn.formatters import (_EMPTY_RESULT, _render_data_symbols_text,
                                _render_instance_find_text, _render_values_text)
     listing = _render_data_symbols_text({"items": "bad", "total": 3})
-    assert listing != "none" and "malformed items field" in listing
+    assert listing != _EMPTY_RESULT and "malformed items field" in listing
 
     found = _render_instance_find_text({"query": "q", "items": "bad"})
     assert found.startswith("no instance has a binary matching")

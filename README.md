@@ -177,6 +177,7 @@ Every command supports:
 - `--format text`
 - `--format ndjson`
 - `--out <path>`
+- `--estimate-output` (report the size/token estimate of the result instead of printing it)
 
 Interactive read commands default to `text`. Mutation, setup, and export commands default to `json`.
 Add `--format json` when you need stable fields for automation or piping into structured tooling.
