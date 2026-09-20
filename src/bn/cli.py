@@ -1268,6 +1268,32 @@ def _require_nonempty_instance(args: argparse.Namespace) -> None:
         )
 
 
+def _empty_target_message(
+    args: argparse.Namespace,
+    omit_hint: str = "omit --target to use the single open target",
+) -> str:
+    """The refusal for an empty selector, phrased for where it CAME FROM.
+
+    An `-t ""` the caller typed is a flag problem and says so. An empty value
+    that arrived from an AMBIENT source is not: nobody passed `--target` on
+    that command line, so blaming the flag sends the reader looking for an
+    argument they never wrote, and the two sources are cleared in completely
+    different ways (`unset BN_TARGET` vs `bn target clear`). Name the source
+    and its own remedy instead (#676 item 11).
+    """
+    ambient = getattr(args, "_empty_ambient_target", None)
+    if ambient:
+        source, remedy = ambient
+        return (
+            f"{source}: {remedy}. An empty selector is a broken default, not "
+            "a request for the default, so nothing was sent."
+        )
+    return (
+        f"--target is empty: pass a selector from `bn target list`, or "
+        f"{omit_hint}"
+    )
+
+
 def _implicit_target(args: argparse.Namespace) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
@@ -1278,6 +1304,14 @@ def _implicit_target(args: argparse.Namespace) -> str:
     pinned id fails as a safe unknown-selector error instead.
     """
     _require_nonempty_instance(args)
+    # An AMBIENT source supplied an EMPTY selector, and this is the auto-pick
+    # it corrupts. `close` nulls an ambient target so it cannot be steered and
+    # then lands HERE, so without this the broken default falls through to
+    # "there is only one target open, use that" and a bare destructive close
+    # tears down a target the caller never named, at exit 0. Refused before
+    # the peek, so nothing is sent (#676 item 11).
+    if getattr(args, "_empty_ambient_target", None):
+        raise BridgeError(_empty_target_message(args))
     response = send_request(
         "list_targets",
         params={},
@@ -1322,15 +1356,14 @@ def _resolve_target(
     allow_implicit_target: bool = False,
 ) -> str | None:
     target = getattr(args, "target", None)
-    # An explicit-but-empty selector (an unset shell variable, `-t ""`) is
-    # never pin-filled (see _apply_sticky_defaults) and must never be
-    # forwarded either: the bridge collapses "" to the focused GUI view with
-    # no count check, so a write op would silently act on the wrong target.
+    # An explicit-but-empty selector (an unset shell variable, `-t ""`, or an
+    # empty value from an ambient source) must never be forwarded: the bridge
+    # collapses "" to the focused GUI view with no count check, so a write op
+    # would silently act on the wrong target. The message names where the
+    # value came from -- blaming `--target` for a value the environment
+    # supplied sends the reader looking for an argument they never wrote.
     if target is not None and not str(target).strip():
-        raise BridgeError(
-            "--target is empty: pass a selector from `bn target list`, or "
-            "omit --target to use the single open target"
-        )
+        raise BridgeError(_empty_target_message(args))
     if require_target and target is None:
         if allow_implicit_target:
             return _implicit_target(args)
@@ -1792,10 +1825,8 @@ def _fanout_call(
     # it must not suppress the multi-target auto-survey (#368, #676 item 11).
     fan_target = getattr(args, "target", None)
     if fan_target is not None and not str(fan_target).strip():
-        raise BridgeError(
-            "--target is empty: pass a selector from `bn target list`, or "
-            "omit --target to survey every target"
-        )
+        raise BridgeError(_empty_target_message(
+            args, "omit --target to survey every target"))
     explicit_target = bool(fan_target) and not getattr(
         args, "_sticky_target", False
     )
@@ -2277,12 +2308,23 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
     """Fill unset --instance / --target from the environment or sticky state.
 
     Both sources are AMBIENT: the caller did not name this selector on the
-    command line. `_sticky_target` marks that fact, and its consumers read it
-    as exactly that -- a bare destructive `close` nulls it so it cannot be
-    silently steered, and `--all-targets` does not treat it as an explicit
-    choice that suppresses the survey. The environment must therefore be
-    filled HERE and marked the same way; resolving it as an argparse default
-    made it arrive unmarked and walk straight past both (#676 item 11).
+    command line. `_sticky_target` marks exactly that one fact, and it has
+    exactly three readers -- a bare destructive `close` nulls an ambient
+    target so it cannot be silently steered; `--all-instances` does not treat
+    one as the explicit choice that suppresses the multi-target auto-survey
+    (`--all-targets` surveys unconditionally and never consults the marker);
+    and `batch apply` lets one FILL a manifest that named no target but never
+    OVERRIDE one that did. The environment must therefore be filled HERE and
+    marked the same way; resolving it as an argparse default made it arrive
+    unmarked and walk straight past all three (#676 item 11).
+
+    An EMPTY ambient value is marked too -- it is still a value nobody typed
+    -- and additionally recorded in `_empty_ambient_target`, because it is
+    not a selector and must not become one. That record is what stops the
+    implicit single-open auto-pick (`_implicit_target`) standing in for it:
+    a broken default is not a request for the default. It also names the
+    source in the refusal, since the export and the pin are cleared in
+    completely different ways.
 
     `BN_INSTANCE` is DELIBERATELY not treated this way and stays an argparse
     default in `_instance_option`: `session stop` documents the env var as one
@@ -2314,37 +2356,25 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
         sticky_target = state.get("target")
         if env_target is not None:
             args.target = env_target
-            # AMBIENT only when it is actually a selector. An empty export is
-            # not one, and marking it ambient made `close` -- which nulls an
-            # ambient target -- DISCARD it, so a bare close fell through to
-            # the single-open auto-pick and tore that target down at exit 0
-            # where it had refused before. The empty value must survive to
-            # the empty-selector refusal, which is the whole point of
-            # forwarding it rather than ignoring it.
-            if env_target.strip():
-                args._sticky_target = True
-            else:
-                args._ambient_target_source = (
-                    "This came from an exported BN_TARGET. Unset it, or "
-                    "export a selector from `bn target list`.")
+            args._sticky_target = True
+            if not env_target.strip():
+                args._empty_ambient_target = (
+                    "BN_TARGET is exported but empty",
+                    "unset it, or export a selector from `bn target list`")
         elif sticky_target is not None:
             # Presence, not truthiness, on THIS source too. `bn target use
             # "$SEL"` with SEL unset WRITES an empty pin and exits 0 --
-            # `_target_matches` answers True for "", so the pre-write
-            # validation passes it -- and reading that back as "no pin at
-            # all" put the pin in the state the export was just taken out
-            # of: a bare destructive `close` fell through to the single-open
-            # auto-pick and tore that target down at exit 0. Whitespace was
-            # worse: truthy, so it WAS filled, and then marked ambient for
-            # `close` to discard. An empty pin is not a selector either, and
-            # the empty-selector refusal is the answer for both sources.
+            # `_target_matches` answers True for "" -- and reading that back
+            # as "no pin at all" let a bare destructive `close` fall through
+            # to the single-open auto-pick and tear that target down at exit
+            # 0, the hazard the export was just taken out of.
             args.target = sticky_target
-            if str(sticky_target).strip():
-                args._sticky_target = True
-            else:
-                args._ambient_target_source = (
-                    "This came from the sticky target pin. Clear it with "
-                    "`bn target clear`.")
+            args._sticky_target = True
+            if not str(sticky_target).strip():
+                args._empty_ambient_target = (
+                    "the sticky target pin is set but empty",
+                    "clear it with `bn target clear`, or pin a selector from "
+                    "`bn target list`")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2373,17 +2403,6 @@ def main(argv: list[str] | None = None) -> int:
         msg = str(exc)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
-        # Same disclosure for the target, and for the same reason: the empty
-        # value the handler just refused was NOT typed on this command line,
-        # so "omit --target" is advice the caller already followed and the
-        # two ambient sources are cleared in completely different ways. Set
-        # only when the ambient value that was filled is itself empty, and
-        # matched on the CLI-side refusals (the manifest's own empty target
-        # is a different value and says so). Hosted here so every stem gets
-        # it -- `close` and `batch apply` raise their own worded refusals.
-        ambient_source = getattr(args, "_ambient_target_source", None)
-        if ambient_source and msg.startswith("--target is empty"):
-            msg += f"\n\n{ambient_source}"
         status = getattr(exc, "status", None)
         requested = getattr(exc, "requested", None)
         observed = getattr(exc, "observed", None)

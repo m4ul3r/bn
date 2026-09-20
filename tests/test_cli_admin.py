@@ -3575,6 +3575,10 @@ def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch, capsys)
     NOTHING was sent. The base path sends `list_targets` before it fails, so
     the silence is what separates "refused the selector" from "asked the
     bridge and got an unrelated error".
+
+    Round 4 review: those words now name the SOURCE rather than the `--target`
+    flag nobody passed, so the assertion follows them there -- and it is a
+    stronger discriminator, because only the env path can produce them.
     """
     import bn.cli
 
@@ -3589,7 +3593,7 @@ def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch, capsys)
 
     assert bn.cli.main(["function", "list"]) == 2
 
-    assert "--target is empty" in capsys.readouterr().err
+    assert "BN_TARGET is exported but empty" in capsys.readouterr().err
     assert sent == [], (
         "the empty selector must be refused BEFORE anything reaches the "
         f"bridge; these ops were sent instead: {sent}")
@@ -3750,10 +3754,11 @@ def test_an_empty_ambient_selector_says_which_source_it_came_from(
 
     Nobody passed a flag: the empty value arrived from the environment or
     from the pin, and the two are cleared in completely different ways. A
-    refusal that names neither leaves the operator re-running the same command
-    -- and with the pin, re-reading a file they have to know exists. `main`
-    already appends exactly this kind of provenance line for a sticky INSTANCE
-    that points at a dead bridge; this is the same disclosure for the target.
+    refusal that blames `--target` sends the reader looking for an argument
+    they never wrote, and one that names neither source leaves them
+    re-running the same command -- with the pin, re-reading a file they have
+    to know exists. `main` already discloses provenance this way for a sticky
+    INSTANCE on a dead bridge; this is the same disclosure for the target.
     """
     from bn import session_state
 
@@ -3767,8 +3772,45 @@ def test_an_empty_ambient_selector_says_which_source_it_came_from(
     _close_run(monkeypatch, ["close"], selectors=("only.bin",))
     pin_err = capsys.readouterr().err
 
-    assert "BN_TARGET" in env_err, env_err
-    assert "bn target clear" in pin_err, pin_err
+    assert "BN_TARGET" in env_err and "--target" not in env_err, env_err
+    assert "bn target clear" in pin_err and "--target" not in pin_err, pin_err
+
+
+def test_a_broken_ambient_default_does_not_break_the_cleanup_verb(monkeypatch):
+    """An unneeded default must not fail the command that needs no default.
+
+    Refusing an empty ambient selector protects the resolution it corrupts.
+    `bn close --all` and `bn close <path>` resolve nothing -- the caller said
+    what to close -- so the broken default is never consulted, and failing
+    them turns a stale shell variable into "the cleanup verb no longer runs".
+    Worse, the refusal they produced came from close's operand-conflict guard
+    ("Pass --target or --all, not both"), naming a flag the caller never
+    typed, because the empty value had been filled into `args.target` where
+    that guard counts it as a GIVEN operand.
+
+    Both spellings and both ambient sources, because the guard that produced
+    the wrong refusal is per-operand and the two sources fill the same field.
+    """
+    from bn import session_state
+
+    all_env = _close_run(monkeypatch, ["close", "--all"], {"BN_TARGET": "   "},
+                         selectors=("only.bin",))
+    path_env = _close_run(monkeypatch, ["close", "/tmp/bn-not-a-real-target"],
+                          {"BN_TARGET": "   "}, selectors=("only.bin",))
+
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    all_pin = _close_run(monkeypatch, ["close", "--all"], selectors=("only.bin",))
+    path_pin = _close_run(monkeypatch, ["close", "/tmp/bn-not-a-real-target"],
+                          selectors=("only.bin",))
+
+    for label, (rc, sent) in (("--all under an empty export", all_env),
+                              ("a path under an empty export", path_env),
+                              ("--all under an empty pin", all_pin),
+                              ("a path under an empty pin", path_pin)):
+        assert rc == 0 and [op for op, _ in sent] == ["close_binary"], (
+            f"close with {label} names what to close and consults no default, "
+            f"so it must still run; got rc={rc} sent={sent}")
 
 
 def _fanout_pairs(monkeypatch, capsys, argv, env=None, sticky=None):
@@ -3799,6 +3841,12 @@ def _fanout_pairs(monkeypatch, capsys, argv, env=None, sticky=None):
         return {"ok": True, "result": {"kind": "sections", "items": [], "total": 0}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    # Each sub-case starts from NO export. `monkeypatch.setenv` lives for the
+    # whole test, and the export BEATS the pin, so an earlier exported
+    # sub-case would otherwise still be in the environment for a later pinned
+    # one -- the pin would never be read and `pinned == exported` would be
+    # comparing the export to itself.
+    monkeypatch.delenv("BN_TARGET", raising=False)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
 

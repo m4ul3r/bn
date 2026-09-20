@@ -729,13 +729,21 @@ def _batch_apply(args: argparse.Namespace) -> int:
     cli_target = _batch_target_from_cli(args, manifest)
     if cli_target:
         manifest["target"] = cli_target
-    elif getattr(args, "target", None):
+    elif getattr(args, "_sticky_target", False) and manifest.get("target"):
         # The ambient value was demoted. Drop it from the ENVELOPE too, so the
         # request names ONE selector: the bridge resolves `batch_apply` from
         # the manifest's own target (`_batch_apply_selector`, read by both the
         # binder and the destructive gate), and a second, different selector
         # riding beside it is a claim this invocation no longer makes.
+        #
+        # That includes a BROKEN ambient default (an empty export or pin).
+        # This invocation never consults it -- the manifest said what to act
+        # on -- so clearing the record here is what keeps the empty-selector
+        # refusal aimed at the commands that really would have fallen back on
+        # it, instead of failing a manifest that named its own target because
+        # a shell variable in the caller's environment is empty.
         args.target = None
+        args._empty_ambient_target = None
     if args.preview:
         manifest["preview"] = True
     # preview is already set on the manifest above, so it is not passed through
