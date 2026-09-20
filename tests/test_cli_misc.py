@@ -1648,6 +1648,25 @@ def test_read_bytes_encoding_discloses_a_short_read_too_827(fake_transport, caps
     assert summary["requested_length"] == 16
     assert "capped" not in summary                     # the other marker is not invented
 
+    # A bridge that marks the read partial but sends no `requested_length`
+    # leaves the key OUT rather than writing a literal null: the summary states
+    # what the caller asked for, and a null there is a length claim nobody made
+    # (and the documented pairing of the marker with `requested_length` would
+    # read as satisfied by it).
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "hex": "41424344", "short_read": True,
+            "note": "short read: only 4 mapped from 0x1000",
+        }},
+    })
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "16", "--encoding", "bytes",
+                      "--out", str(tmp_path / "partial.bin"), "--format", "json"])
+    assert rc == 0
+    thin = json.loads(capsys.readouterr().out)["summary"]
+    assert thin["short_read"] is True
+    assert "requested_length" not in thin, thin
+
 
 def test_reading_reference_documents_the_read_cap_the_bridge_enforces_827(fake_transport, capsys):
     """The `bn read` reference against the command as it now behaves.

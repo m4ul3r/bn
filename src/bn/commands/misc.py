@@ -488,7 +488,9 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
     # silence here means a complete window. Disclose on stderr (stdout IS the
     # payload) and carry the markers into the --out summary.
     partial_fields: dict[str, Any] = {}
-    if isinstance(result, dict) and (result.get("capped") or result.get("short_read")):
+    # `result` is known to be a dict here: a non-dict one cannot carry the
+    # string `hex` the refusal above requires.
+    if result.get("capped") or result.get("short_read"):
         partial_fields = {key: True for key in ("capped", "short_read") if result.get(key)}
         if result.get("requested_length") is not None:
             # Absent rather than `null`: the summary states what the caller

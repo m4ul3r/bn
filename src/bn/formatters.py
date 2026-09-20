@@ -2072,8 +2072,18 @@ def _duplicate_starts_note(value: Any) -> str:
     The wording states WHOLE ADDRESSES, which is what the keys count:
     `collapsed` is the number of start addresses whose records were merged (the
     larger extent kept) -- NOT a number of dropped records, which the payload
-    never states -- and `unresolved` the addresses left carrying more than one
-    record because an extent could not be read, so no record could be chosen.
+    never states -- and `unresolved` the addresses where BN holds another record
+    whose extent could not be read, so NO record could be chosen there.
+
+    The unresolved half used to read "left with duplicate records (an extent was
+    unreadable, so none was dropped)". Both clauses describe the ANSWER, and the
+    count describes the ADDRESS: a `--min-size` / `--named` answer carries the
+    key with one row at that address because the filter dropped its twin, so the
+    line sent a reader looking for a second row that is not in the listing and
+    denied a drop that had happened (#757 review). It states the finding instead
+    -- the row was not picked on extent -- which is the exact thing the
+    collapsed half's "the larger extent was kept" promises and this half cannot.
+
     Both counts are read through `_count_field`, so an unreadable one states no
     number (the enclosing boundary's `! malformed ...` note is what discloses
     that the key was there) -- pinned by
@@ -2091,8 +2101,8 @@ def _duplicate_starts_note(value: Any) -> str:
     unresolved = _count_field(value, "duplicate_starts_unresolved")
     if unresolved:
         parts.append(
-            f"{unresolved} start address(es) left with duplicate records "
-            "(an extent was unreadable, so none was dropped)"
+            f"{unresolved} start address(es) hold another record whose extent "
+            "could not be read, so no record was chosen there"
         )
     if not parts:
         return ""

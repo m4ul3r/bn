@@ -1005,26 +1005,30 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     """Attach the #757 duplicate-start counts, when there were any.
 
     ``duplicate_starts_collapsed`` counts addresses where the larger extent was
-    kept; ``duplicate_starts_unresolved`` counts addresses left with MORE than
-    one record because at least one extent could not be read, so the issue's
-    rule could not be applied (see `_collapse_duplicate_starts`). Both are
-    present only when non-zero, so the common envelope keeps the key set every
-    consumer already parses (the ``got_collapsed`` / ``self_defined_excluded``
-    convention in ``read_misc._imports``). A caller whose ``total`` lands below
-    its own count of raw BN records can then tell why -- and whether the
-    retained row carries the LARGER extent or the conflict was left standing.
+    kept; ``duplicate_starts_unresolved`` counts addresses where BN holds
+    another record whose extent could not be read, so the issue's rule could not
+    be applied and NO record was chosen there (see `_collapse_duplicate_starts`).
+    Both are present only when non-zero, so the common envelope keeps the key
+    set every consumer already parses (the ``got_collapsed`` /
+    ``self_defined_excluded`` convention in ``read_misc._imports``). A caller
+    whose ``total`` lands below its own count of raw BN records can then tell
+    why -- and whether the retained row carries the LARGER extent or was never
+    ranked at all.
 
-    SCOPING, because the two listing commands disagreed about it (#757 review):
-    the counts describe the rows the answer CONTAINS, which is the population
-    its ``total`` is derived from -- so they are taken from
-    `_StartCollapse.counts` against the retained rows, never from the collapse
-    pass itself. `function search` collapses the MATCHED population, so a query
-    that matches nothing reports no collapse; and both commands recount after
-    ``--min-size`` / ``--named``, so a floor that drops every collapsed address
-    reports none. Counting at the collapse instead published
-    ``duplicate_starts_collapsed: 1`` beside ``total: 0`` -- a key whose own
-    contract (this many of the rows you got were merged) no retained row can
-    satisfy.
+    SCOPING, because the two listing commands disagreed about it twice (#757
+    review): the counts describe the rows the answer CONTAINS, and they are
+    taken from `_StartCollapse.counts` against those rows, never from the
+    collapse pass. The collapse itself runs on the WHOLE address-filtered
+    population in both commands -- `function search` included, so the query is
+    not a collapse boundary and cannot hand back the phantom twin by naming it.
+    An address counts while any record of it survives, through ``--min-size``,
+    ``--named`` and the query alike.
+
+    The two shapes that rule exists to refuse: counting at the collapse
+    published ``duplicate_starts_collapsed: 1`` beside ``total: 0``, a key no
+    retained row can satisfy; and requiring two surviving records for the
+    unresolved half silenced the conflict on exactly the filters that split a
+    pair, leaving a row that was never ranked rendered like one that won.
     """
     if collapsed:
         result["duplicate_starts_collapsed"] = collapsed
@@ -1318,24 +1322,28 @@ def _search_functions(
         def matches(name: str) -> bool:
             return needle in name.lower()
 
-    matched: list[tuple[Any, str]] = []
-    # #757 review: the collapse runs on the MATCHED population -- the same
-    # scoping `function list` gives it, where the collapsed count describes the
-    # rows the answer was built from. Collapsing the pre-match population instead
-    # made the disclosed count describe rows the answer does not contain, so
-    # `function search <no-match>` answered `total 0, items []` beside
-    # `duplicate_starts_collapsed: 2`: a key whose own contract (fewer rows than
-    # the view holds, and here is how many were dropped) cannot be satisfied with
-    # no retained row, and one that a reader must reconcile against a total it has
-    # nothing to do with.
+    # #757 review: the collapse runs on the population the ADDRESS filter left --
+    # the same population `function list` collapses -- and the two published
+    # counts are then taken against the rows this answer kept
+    # (`_StartCollapse.counts`, below). Splitting those two jobs is what makes
+    # one rule work for both commands:
     #
-    # Running it here keeps the property it exists for: the duplicate records for
-    # one start address are in the SAME group before any row is built, so a
-    # phantom twin still cannot reach the page as a second row carrying the
-    # conflicting size.
-    displays: dict[int, str] = {}
-    matched_functions: list[Any] = []
-    for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
+    #   * collapsing the MATCHED population instead made the match a collapse
+    #     boundary, so a query naming the smaller record of a colliding pair got
+    #     the stub-shaped phantom back as a `size_known: true` row -- the exact
+    #     record #757 exists to drop -- while `function list` answered that
+    #     address with the real body; and a query naming the sized twin of an
+    #     UNRESOLVED pair got that row with no disclosure at all, while
+    #     `function list` disclosed it. Same record, two answers.
+    #   * counting at the collapse instead of against the retained rows made
+    #     `function search <no-match>` answer `total 0, items []` beside
+    #     `duplicate_starts_collapsed: 2` -- a key whose contract (this many of
+    #     the rows you got were merged) no retained row can satisfy.
+    population, collapse = _collapse_duplicate_starts(
+        list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    )
+    matched: list[tuple[Any, str]] = []
+    for fn in population:
         # Match across name forms (mangled fn.name, demangled display_name, raw)
         # so a demangled C++ query finds a function BN named with the mangled
         # symbol -- the same greppability `--demangle` gives the listing (#196).
@@ -1347,10 +1355,7 @@ def _search_functions(
             # projections behind it) is built for the returned page only, so a
             # `function search --limit 20` over a 50k-function target no longer
             # sizes and materializes every match.
-            matched_functions.append(fn)
-            displays[id(fn)] = display
-    matched_functions, collapse = _collapse_duplicate_starts(matched_functions)
-    matched = [(fn, displays[id(fn)]) for fn in matched_functions]
+            matched.append((fn, display))
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
         # doesn't return each export twice (16-byte veneer + real body). size IS

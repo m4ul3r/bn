@@ -16,6 +16,7 @@ Two halves, both required by the issue:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
@@ -298,9 +299,9 @@ def test_function_listing_collapses_duplicate_start_addresses_757(monkeypatch):
     assert counted["count"] == counted["total"] == 3
     assert counted["duplicate_starts_collapsed"] == 1
 
-    # `function search` collapses the MATCHED population before building any
-    # row, so the phantom twin cannot reach the page as a second row with the
-    # conflicting size.
+    # `function search` collapses the same population the listing does, before
+    # matching, so the phantom twin cannot reach the page as a second row with
+    # the conflicting size.
     searched = instance._search_functions("active", "widget_poll")
     assert searched["total"] == 1 and searched["returned"] == 1
     assert searched["items"][0]["size"] == 96
@@ -546,18 +547,20 @@ def test_annotation_summary_degrades_instead_of_fabricating_zero_comments_793(mo
     assert "comments" not in block and "analyst_symbols" not in block
 
 
-def test_function_search_scopes_duplicate_starts_to_the_matched_population_757(monkeypatch):
+def test_function_search_scopes_duplicate_starts_to_the_rows_it_returns_757(monkeypatch):
     """The two listing commands must give `duplicate_starts_collapsed` ONE meaning.
 
-    `function list` scopes it to the population its `total` counts. `function
-    search` collapsed the PRE-match population, so `function search <no-match>`
-    answered `total 0, items []` beside `duplicate_starts_collapsed: 2` -- a key
-    whose own contract (this many records were dropped from the rows you got)
-    cannot be satisfied with no retained row, and one a reader is left
-    reconciling against a total it has nothing to do with. It is scoped to the
-    matched population now, which still keeps the property the collapse exists
-    for: both records of one start are in the same group before any row is built,
-    so a phantom twin cannot reach the page as a second row.
+    `function search` published the count taken at the collapse, so `function
+    search <no-match>` answered `total 0, items []` beside
+    `duplicate_starts_collapsed: 2` -- a key whose own contract (this many
+    records were dropped from the rows you got) cannot be satisfied with no
+    retained row, and one a reader is left reconciling against a total it has
+    nothing to do with. The count is taken against the rows the answer KEPT
+    now, which is also what makes the collapse itself safe to run on the whole
+    population (as `function list` does): both records of one start are in the
+    same group before any row is built, so a phantom twin cannot reach the page
+    -- see `test_the_two_listing_commands_disclose_one_duplicate_start_identically_757`
+    for the half that needs the query NOT to be a collapse boundary.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -580,8 +583,8 @@ def test_function_search_scopes_duplicate_starts_to_the_matched_population_757(m
     assert missed_count["total"] == 0
     assert "duplicate_starts_collapsed" not in missed_count
 
-    # A partial match discloses only its own population: the one address the
-    # answer contains was never a duplicate.
+    # A partial match discloses only what its own rows carry: the one address
+    # the answer contains was never a duplicate.
     partial = instance._search_functions("active", "widget_init")
     assert partial["total"] == 1
     assert "duplicate_starts_collapsed" not in partial
@@ -699,6 +702,70 @@ def test_duplicate_start_counts_follow_the_named_filter_757(monkeypatch):
     assert "duplicate_starts_unresolved" not in gone
 
 
+def test_the_two_listing_commands_disclose_one_duplicate_start_identically_757(monkeypatch):
+    """The match filter is a ROW FILTER like any other, so it may not change
+    what the disclosure means.
+
+    `function search` collapsed the POST-match population, so the group split
+    whenever a query matched only one record of a duplicated start. Two
+    consequences, both the shape #757 was filed for:
+
+    * the SMALLER record -- the stub-shaped phantom the collapse exists to
+      drop -- came back as a `size_known: true` row whenever the query happened
+      to name it, while `function list` answered the same address with the real
+      96-byte body;
+    * a query naming the sized twin of an UNRESOLVED pair returned that row with
+      no disclosure at all, while `function list` returned the identical row
+      beside `duplicate_starts_unresolved: 1`.
+
+    Both commands collapse the same population now (everything the address
+    filter left) and count against the rows their own answer kept, so the two
+    answers agree for the same retained record.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # One start, two records, DIFFERENT names -- so a query can name either.
+    collided = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub", total_bytes=4),
+    ]
+    _view(monkeypatch, instance, collided)
+
+    # The phantom is not a function, so naming it cannot conjure it back.
+    phantom = instance._search_functions("active", "poll_stub")
+    assert phantom["total"] == 0 and phantom["items"] == []
+    assert "duplicate_starts_collapsed" not in phantom
+    # ...and the retained record answers with its real extent and the collapse.
+    body = instance._search_functions("active", "widget_poll")
+    assert body["total"] == 1 and body["items"][0]["size"] == 96
+    assert body["duplicate_starts_collapsed"] == 1
+    listed = instance._list_functions(None, min_address="0x401014", max_address="0x401014")
+    assert listed["items"][0]["size"] == 96
+    assert listed["duplicate_starts_collapsed"] == 1
+
+    # The unresolved half: a query naming the sized twin must disclose exactly
+    # what `function list` discloses for that same row.
+    unresolved = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub"),   # extent unreadable
+    ]
+    _view(monkeypatch, instance, unresolved)
+    from_list = instance._list_functions(None, min_size=64, count_only=True)
+    from_search = instance._search_functions("active", "widget_poll", count_only=True)
+    assert from_list["total"] == from_search["total"] == 1
+    assert from_list["duplicate_starts_unresolved"] == 1
+    assert from_search["duplicate_starts_unresolved"] == 1
+
+    # A query that matches nothing still reports no collapse: the counts are
+    # taken against the rows the answer kept, not against the population.
+    missed = instance._search_functions("active", "widget_missing", count_only=True)
+    assert missed["total"] == 0
+    assert "duplicate_starts_collapsed" not in missed
+    assert "duplicate_starts_unresolved" not in missed
+
+
 def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):
     """Both halves of the #757 disclosure, on both surfaces.
 
@@ -740,3 +807,88 @@ def test_annotation_summary_omits_the_dropped_key_when_nothing_was_dropped_793(m
     summary = bridge.read_listing._annotation_summary(None, bv)
 
     assert "symbol_exclusions_dropped" not in summary
+
+
+
+def test_records_with_an_unreadable_start_are_never_grouped_together_757(monkeypatch):
+    """A record whose `start` cannot be read cannot be shown to be a duplicate
+    of ANYTHING, so it must form its own group.
+
+    The fallback keyed the record ITSELF, i.e. on its own `__hash__`/`__eq__`:
+    two records that compare equal (BN wrappers around the same handle, and the
+    minimal fakes a unit test builds) landed in one group and were reported as a
+    collapse the view never had, while an unhashable record raised `TypeError`
+    out of a read op. Keyed on a boxed `id()` now, which is the identity the
+    comment always claimed and cannot collide with a start address.
+    """
+    bridge = _load_bridge(monkeypatch)
+
+    class _NoStart:
+        """A record whose extent AND start are unreadable, and which claims to
+        equal every other record of its kind."""
+
+        name = "ambiguous"
+        raw_name = "ambiguous"
+
+        @property
+        def start(self):
+            raise AttributeError("start")
+
+        def __eq__(self, other):
+            return isinstance(other, _NoStart)
+
+        __hash__ = None          # unhashable, like a BN object with __eq__ set
+
+    pair = [_NoStart(), _NoStart()]
+    kept, collapse = bridge.read_listing._collapse_duplicate_starts(pair)
+
+    # Both pass through untouched, and nothing is claimed about them.
+    assert kept == pair
+    assert collapse.counts(kept) == (0, 0)
+
+    # ...and the same through the command: two rows, no invented collapse.
+    instance = bridge.BinaryNinjaBridge()
+    bv = _view(monkeypatch, instance, pair)
+    summary = bridge._function_name_summary(bv)
+    assert summary["function_count"] == 2
+    assert "duplicate_starts_collapsed" not in summary
+
+
+def _duplicate_starts_bullet() -> str:
+    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`."""
+    reference = (Path(__file__).resolve().parent.parent
+                 / "skills" / "bn" / "reference" / "reading.md")
+    for line in reference.read_text(encoding="utf-8").splitlines():
+        if "duplicate_starts_unresolved" in line:
+            return line
+    raise AssertionError("reading.md carries no duplicate-start bullet")
+
+
+def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
+    """The reference has to say what the payload does.
+
+    The bullet told a reader that `unresolved` addresses "still carry more than
+    one record", which is the rule the counting fix replaced: the count follows
+    the ADDRESS into a filtered answer, where that address appears exactly once
+    because the filter dropped its twin. An agent reconciling
+    `duplicate_starts_unresolved: 1` against `total: 1` under that sentence
+    concludes the payload is self-inconsistent, or that a row is missing. The
+    envelope the bullet must describe is measured here rather than assumed, so
+    the two cannot drift apart again without this going red.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub"),      # extent unreadable
+    ])
+
+    filtered = instance._list_functions(None, min_size=64, count_only=True)
+    assert filtered["total"] == 1 and filtered["duplicate_starts_unresolved"] == 1
+
+    bullet = _duplicate_starts_bullet()
+    assert "still carry more than one record" not in bullet, bullet
+    # The rule that measurement establishes, stated in the reference: the counts
+    # describe the rows the answer contains, through every row filter.
+    assert "--min-size" in bullet and "--named" in bullet, bullet
+    assert "no record was chosen" in bullet, bullet

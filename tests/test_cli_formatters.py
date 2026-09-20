@@ -8102,16 +8102,17 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     assert "duplicate starts" in count_text and "larger extent was kept" in count_text, count_text
 
     # Both keys, and the UNRESOLVED half has to be distinguishable from the
-    # collapse: one says a record was dropped, the other that none was.
+    # collapse: one says a record WAS chosen (its extent won), the other that
+    # none could be.
     both = {**collapsed, "duplicate_starts_unresolved": 2}
     text = formatters._render_function_list_text(both)
     assert "1 start address(es) carried duplicate function records" in text, text
-    assert "2 start address(es) left with duplicate records" in text, text
-    assert "an extent was unreadable, so none was dropped" in text, text
-    # ...and the two halves do not read as one alarm: the unresolved part never
-    # claims a record was kept.
+    assert "2 start address(es) hold another record whose extent" in text, text
+    assert "no record was chosen there" in text, text
+    # ...and the two halves do not read as one alarm: the collapsed part never
+    # says nothing was chosen, which is the whole difference between them.
     collapsed_only = formatters._render_function_list_text(collapsed)
-    assert "none was dropped" not in collapsed_only, collapsed_only
+    assert "no record was chosen" not in collapsed_only, collapsed_only
 
     # A SLICED page (the keys are on the envelope, not on the rows).
     sliced = {**collapsed, "returned": 2, "offset": 5, "has_more": True}
@@ -8172,4 +8173,49 @@ def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757(
                   "offset": 0, "has_more": False, "duplicate_starts_unresolved": 2}
     zero_text = formatters._render_function_list_text(zero_total)
     assert zero_text.splitlines()[0] == "none", zero_text
-    assert "2 start address(es) left with duplicate records" in zero_text, zero_text
+    assert "2 start address(es)" in zero_text and "extent" in zero_text, zero_text
+
+
+def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
+    """The note has to survive the answer it is printed beside.
+
+    `duplicate_starts_unresolved` counts an address for as long as a record of
+    it is in the answer, so a `--min-size` / `--named` answer carries the key
+    with ONE row at that address -- its twin was dropped by the filter. The
+    sentence said "left with duplicate records ... so none was dropped", and
+    both halves of that are false there: the reader is sent looking for a second
+    row that is not in the listing, and told nothing was dropped when the filter
+    dropped exactly the record the conflict is about.
+
+    What IS always true when the key fires is the finding itself: BN holds
+    another record at that address whose extent could not be read, so no record
+    could be chosen -- the row shown was not picked on extent, which is
+    precisely what the collapsed half's "the larger extent was kept" promises
+    and this half cannot.
+    """
+    from bn import formatters
+
+    # The shape a filtered answer has: ONE row at the disclosed address.
+    filtered = {"kind": "functions", "items": [{"name": "widget_poll", "address": "0x401014"}],
+                "total": 1, "returned": 1, "offset": 0, "has_more": False,
+                "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(filtered)
+    # The claims that answer refutes: a second row is here, and nothing went.
+    assert "none was dropped" not in text, text
+    assert "left with duplicate records" not in text, text
+    # ...and the claim it supports: nothing could be chosen at that address.
+    assert "no record was chosen" in text, text
+    assert "extent" in text, text
+
+    count_text = formatters._render_function_count_text(
+        {"kind": "functions", "count": 1, "total": 1, "duplicate_starts_unresolved": 1})
+    assert count_text.startswith("Total functions: 1"), count_text
+    assert "none was dropped" not in count_text, count_text
+    assert "no record was chosen" in count_text, count_text
+
+    # The two halves still read differently -- the collapsed one is the only
+    # one that may say a record was kept for its extent.
+    collapsed_only = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "the larger extent was kept" in collapsed_only, collapsed_only
+    assert "no record was chosen" not in collapsed_only, collapsed_only
