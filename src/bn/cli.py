@@ -1268,6 +1268,24 @@ def _require_nonempty_instance(args: argparse.Namespace) -> None:
         )
 
 
+def blank_selector(value: Any) -> bool:
+    """Whether *value* is PRESENT but says nothing -- ``""`` or whitespace.
+
+    One spelling of the question, because two of them drifted and shipped a
+    hole. `_resolve_target` asked it with `.strip()` while `batch apply`'s
+    manifest fill asked it with plain truthiness, so a whitespace ambient
+    value was "not a selector" to the resolver and "a selector" to the fill:
+    it was dropped from the request envelope and then written into the
+    manifest payload, where it reached the bridge on a DESTRUCTIVE op --
+    exactly the forwarding the reference promises never happens.
+
+    `None` is absence, not blankness, and answers False: the callers that
+    care about "no selector at all" test that separately, because absence is
+    legal everywhere and blankness is legal nowhere (#676 item 11).
+    """
+    return value is not None and not str(value).strip()
+
+
 def _empty_target_message(
     args: argparse.Namespace,
     omit_hint: str = "omit --target to use the single open target",
@@ -1384,7 +1402,7 @@ def _resolve_target(
     # command that should never have been checked (`close --all`, the
     # `--all-*` surveys, then `bn load <path>`, the verb whose whole job is
     # to CREATE the target everything else resolves) (#676 item 11).
-    if target is not None and not str(target).strip():
+    if blank_selector(target):
         if not ambient_empty:
             raise BridgeError(_empty_target_message(args))
         target = None
@@ -1859,7 +1877,7 @@ def _fanout_call(
     # back to a normal single resolve when its `list_targets` peek fails, and
     # THAT is a resolution, so it still refuses in `_resolve_target`, as one
     # instance's error row rather than as the whole run (#676 item 11).
-    if (fan_target is not None and not str(fan_target).strip()
+    if (blank_selector(fan_target)
             and not getattr(args, "_empty_ambient_target", None)):
         raise BridgeError(_empty_target_message(
             args, "omit --target to survey every target"))

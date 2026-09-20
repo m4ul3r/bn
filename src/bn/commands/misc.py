@@ -8,7 +8,7 @@ from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
-                   _positive_int, arg, command, mutex, mutation_output_args,
+                   _positive_int, arg, blank_selector, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
     _render_data_symbols_text,
@@ -559,9 +559,18 @@ def _batch_target_from_cli(args: argparse.Namespace,
     is not that: nobody named it on this command line, and ``batch_apply`` is
     a DESTRUCTIVE op. It may only FILL a manifest that named no target of its
     own; a manifest that DID name one keeps it (#676 item 11).
+
+    A BLANK value is not a selector at all and can fill nothing. This asked
+    that with plain truthiness, which is true of ``"   "``: the resolver read
+    a whitespace ambient value as the absence of a selector and kept it out
+    of the request envelope, while this fill read the same value as a
+    selector and wrote it into the manifest -- so it reached the bridge in
+    the PAYLOAD of a destructive op, the one place the reference promises a
+    blank value never goes. One shared predicate now, so the two answers
+    cannot disagree again.
     """
     cli_target = getattr(args, "target", None)
-    if not cli_target:
+    if cli_target is None or blank_selector(cli_target):
         return None
     if getattr(args, "_sticky_target", False) and manifest.get("target"):
         return None
