@@ -290,32 +290,66 @@ def test_types_declare_waits_for_a_running_process_substitution_writer(
 
 
 def test_a_zero_output_process_substitution_is_refused_the_same_way_either_way(
-        fake_transport, capsys):
+        fake_transport, capsys, monkeypatch):
     """`--file <(cmd)` where cmd writes nothing races the open: sometimes the
     writer has already exited (the probe sees EOF), sometimes it is still
     attached (the probe sees EAGAIN). It is the same input, so it must get the
     same answer -- deciding on whichever state the probe caught means the same
     command is refused or silently accepted as an empty declaration depending
-    on machine load."""
+    on machine load.
+
+    The EAGAIN limb is released by the OBSERVED open, not by a fixed sleep from
+    thread start. A fixed delay races `main()`'s own startup -- measured at
+    0.149-0.285s to reach the FIFO open, against a 0.2s delay -- so the writer
+    usually won, both limbs probed EOF, and the cell silently compared one
+    state with itself: the scheduling race it exists to forbid could be
+    reinstated and it still passed. Keying the release off the open makes the
+    discriminating limb certain, and `opened` is asserted so the cell fails
+    loudly rather than degenerating again if the seam ever moves.
+    """
+    watched: list[str] = []
+    opened = threading.Event()
+    real_open = os.open
+
+    def spy_open(target, *args, **kwargs):
+        fd = real_open(target, *args, **kwargs)
+        if watched and str(target) == watched[0]:
+            opened.set()
+        return fd
+
+    monkeypatch.setattr(os, "open", spy_open)
+
     outcomes = []
-    for writer_exits_after in (0.0, 0.2):
+    for exits_after_the_reader_opens in (None, 0.2):
         calls = fake_transport(_declare_ok())
         read_fd, write_fd = os.pipe()
+        path = f"/dev/fd/{read_fd}"
+        watched[:] = [path]
+        opened.clear()
         closer = None
-        if writer_exits_after:
-            closer = threading.Thread(
-                target=lambda: (time.sleep(writer_exits_after), os.close(write_fd)))
-            closer.start()
-        else:
+        if exits_after_the_reader_opens is None:
+            # Writer already gone before the reader ever opens: probe sees EOF.
             os.close(write_fd)
+        else:
+            # Writer still attached when the reader opens, exiting only after:
+            # the probe sees EAGAIN and then EOF.
+            closer = threading.Thread(target=lambda: (
+                opened.wait(timeout=10),
+                time.sleep(exits_after_the_reader_opens),
+                os.close(write_fd)))
+            closer.start()
         try:
             with _must_not_hang():
-                rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+                rc = bn.cli.main(_declare(path))
         finally:
             if closer is not None:
                 closer.join(timeout=10)
             os.close(read_fd)
-        err = capsys.readouterr().err.replace(f"/dev/fd/{read_fd}", "<pipe>")
+        if exits_after_the_reader_opens is not None:
+            assert opened.is_set(), (
+                "the reader never opened the pipe, so the EAGAIN limb was not "
+                "reached and this cell would be comparing EOF with EOF")
+        err = capsys.readouterr().err.replace(path, "<pipe>")
         outcomes.append((rc, err, [call["op"] for call in calls]))
 
     assert outcomes[0] == outcomes[1], outcomes
