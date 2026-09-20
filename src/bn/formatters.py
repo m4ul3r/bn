@@ -1452,6 +1452,17 @@ def _render_target_summary(value: dict[str, Any]) -> str:
                 parts.append(f"{imported} imported")
             summary += f" ({', '.join(parts)})"
         lines.append(f"\tfunctions: {summary}")
+        # #757: `_function_name_summary` now COLLAPSES duplicated start
+        # addresses, so this number is no longer BN's raw record count. The
+        # note goes here, under the count it modifies, rather than being
+        # composed onto `target info` beside the annotations block: a
+        # post-collapse number and the reason it shrank must not be separable,
+        # and `target info` is the first command an agent runs. Absent keys add
+        # nothing, so `target list` rows (which carry no collapse) and a clean
+        # view render exactly as before.
+        duplicate_starts = _duplicate_starts_note(value, total_key="function_count")
+        if duplicate_starts:
+            lines.append(f"\t{duplicate_starts}")
     import_symbols = value.get("import_symbol_count")
     if import_symbols is not None:
         imported_functions = value.get("imported_function_count")
@@ -1646,6 +1657,16 @@ def _render_instance_gc_text(value: Any) -> str:
     )
 
 
+#: How `read_listing._function_list_row`'s `duplicate_start` marker reads in
+#: text. `collapsed` means this record won the extent comparison at its start
+#: address; `unresolved` means no comparison was possible there, so the row's
+#: own `size_known: true` was never ranked against the other record (#757).
+_DUPLICATE_START_ROW_LABELS = {
+    "collapsed": "kept on extent",
+    "unresolved": "not ranked",
+}
+
+
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
     """Render a BARE list of name/address rows (imports, function pages). With
     ``demangle``, show the demangled ``display_name`` instead of the raw name so
@@ -1689,6 +1710,20 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
                 line += f"  ({size} bytes, {blocks} blocks)"
             else:
                 line += f"  ({size} bytes)"
+        # #757: the row's own half of the duplicate-start disclosure. The two
+        # envelope counts say how many ADDRESSES a whole answer touched, which
+        # does not tell the reader whether THIS row won a comparison -- under
+        # `--sort size` the two records of one start are not even adjacent.
+        # Rendered here so the label reaches the text face, which is the whole
+        # subject of this change. Through the text choke point, because a
+        # marker in a shape no string reads out of would otherwise render
+        # byte-identically to a row that was never part of a collision; an
+        # unrecognized STRING prints verbatim rather than vanishing.
+        duplicate_start = _text_value(item, "duplicate_start")
+        if duplicate_start:
+            label = _DUPLICATE_START_ROW_LABELS.get(
+                duplicate_start, _escape_control_chars(duplicate_start))
+            line += f"  [duplicate start: {label}]"
         lines.append(line)
     return "\n".join(lines)
 
@@ -2078,7 +2113,7 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     return ""
 
 
-def _duplicate_starts_note(value: Any) -> str:
+def _duplicate_starts_note(value: Any, *, total_key: str = "total") -> str:
     """The #757 duplicate-start counts for the TEXT face, or "" (#883 item 4).
 
     `duplicate_starts_collapsed` / `duplicate_starts_unresolved` reached JSON on
@@ -2092,8 +2127,38 @@ def _duplicate_starts_note(value: Any) -> str:
     The wording states WHOLE ADDRESSES, which is what the keys count:
     `collapsed` is the number of start addresses whose records were merged (the
     larger extent kept) -- NOT a number of dropped records, which the payload
-    never states -- and `unresolved` the addresses left carrying more than one
-    record because an extent could not be read, so no record could be chosen.
+    never states -- and `unresolved` the addresses where BN holds another record
+    whose extent could not be read, so NO record could be chosen there.
+
+    The unresolved half used to read "left with duplicate records (an extent was
+    unreadable, so none was dropped)". Both clauses describe the ANSWER, and the
+    count describes the ADDRESS: a `--min-size` / `--named` answer carries the
+    key with one row at that address because the filter dropped its twin, so the
+    line sent a reader looking for a second row that is not in the listing and
+    denied a drop that had happened (#757 review). It states the finding instead
+    -- the row was not picked on extent -- which is the exact thing the
+    collapsed half's "the larger extent was kept" promises and this half cannot.
+
+    SCOPE, stated once and in the note itself: both counts are taken against
+    the population the envelope's own total reports -- after every row filter
+    and BEFORE `--offset`/`--limit` (`read_listing._disclose_collapsed_starts`)
+    -- so a window can carry a count for an address none of its rows holds.
+    Written as bare clauses ("the larger extent was kept", "no record was
+    chosen there") both halves read as statements about the rows in front of
+    the reader, which is false on exactly that window and is the defect the
+    unresolved half already lost once. Naming the DENOMINATOR repairs both at
+    once: "all 7 function(s) this answer reports" is visibly not the 3 rows on
+    screen, and the per-row `duplicate_start` label is what speaks for the
+    rows that are.
+
+    *total_key* is the key holding the number the CALLING renderer is already
+    printing (`total` on the listing, `count` on `--count`, `function_count` on
+    `target info`), named by the caller rather than guessed from a fallback
+    chain so the denominator in this line is always the number directly above
+    it. Read directly rather than through `_count_field`: an unreadable one is
+    already disclosed by the renderer that prints it, so this clause drops
+    instead of recording a second skew for the same field.
+
     Both counts are read through `_count_field`, so an unreadable one states no
     number (the enclosing boundary's `! malformed ...` note is what discloses
     that the key was there) -- pinned by
@@ -2111,12 +2176,26 @@ def _duplicate_starts_note(value: Any) -> str:
     unresolved = _count_field(value, "duplicate_starts_unresolved")
     if unresolved:
         parts.append(
-            f"{unresolved} start address(es) left with duplicate records "
-            "(an extent was unreadable, so none was dropped)"
+            f"{unresolved} start address(es) hold another record whose extent "
+            "could not be read, so no record was chosen there"
         )
     if not parts:
         return ""
-    return "// duplicate starts: " + "; ".join(parts)
+    return (f"// duplicate starts ({_duplicate_starts_scope(value, total_key)}): "
+            + "; ".join(parts))
+
+
+def _duplicate_starts_scope(value: dict[str, Any], total_key: str) -> str:
+    """Which population the #757 counts were taken against, for the note.
+
+    *total_key* is the number the calling renderer prints beside this line, so
+    the denominator here and the number above it are the same field by
+    construction. A non-integer (or absent) one yields the un-numbered form
+    rather than a fabricated `0`."""
+    raw = value.get(total_key)
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return f"counted across all {raw} function(s) this answer reports, not only the rows shown"
+    return "counted across this whole answer, not only the rows shown"
 
 
 @_discloses
@@ -2139,7 +2218,7 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     # has to be visible beside it in text too -- "Total functions: 15" with no
     # trace of the 16th record is the JSON-only disclosure the text face was
     # missing. Absent keys add nothing.
-    note = _duplicate_starts_note(value)
+    note = _duplicate_starts_note(value, total_key="count")
     return line if not note else f"{line}\n{note}"
 
 
@@ -2158,10 +2237,14 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     # `--offset`/`--limit` slicing and sits after the paging footer -- the same
     # placement `_render_name_address_list_text` gives `self_defined_excluded`
     # (#883 item 4).
+    #
+    # APPENDED, never substituted. `_render_paged_list_text` replaces a `none`
+    # body with its footer because the footer STATES the emptiness ("showing 0
+    # of 15"); this note does not, so borrowing that rule rendered an empty
+    # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
+    # beside it (#757 review).
     note = _duplicate_starts_note(value)
-    if not note:
-        return body
-    return note if body == "none" else f"{body}\n{note}"
+    return body if not note else f"{body}\n{note}"
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
@@ -3170,6 +3253,13 @@ def _render_orient_text(value: Any) -> str:
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")
+        # #757: this count is the listing's POST-COLLAPSE total, so the note
+        # that explains it belongs under it here for the same reason it does on
+        # `target info` -- a first-contact card is exactly where a silently
+        # reduced number is acted on.
+        duplicate_starts = _duplicate_starts_note(value, total_key="function_count")
+        if duplicate_starts:
+            lines.append(f"  {duplicate_starts}")
     imp = _field_dict(value, "imports_summary")
     total = imp.get("total_symbols", imp.get("total"))
     by_kind = _field_dict(imp, "by_kind")

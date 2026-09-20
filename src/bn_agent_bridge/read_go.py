@@ -131,18 +131,34 @@ def _rebase_note(items: list[Any], *, start_match_count: int, defined_count: int
             "off-prolog: compare text_start vs text_start_bv before trusting the "
             f"addresses.{extra}"
         )
-    if text_sec is not None and text_sec != text_start:
+    rebased = text_sec is not None and text_sec != text_start
+    if defined_count == 0:
+        # NOTHING resolved -- not to a start, and not by containment either. The
+        # interior-PC wording below is a positive claim about a relation that
+        # held for no row at all, and it used to be reached first whenever the
+        # textStart differed, sending a reader to rebase addresses on the
+        # strength of a containment result the view never produced (#818
+        # review). The load-base mismatch is still the strongest available
+        # explanation when there is one; it just cannot say what the rows
+        # resolve to.
+        if rebased:
+            return (
+                "None of the recovered addresses resolve to a BN function at all, and "
+                "the pcln table's textStart != BN's .text start: the binary is loaded "
+                "at a different base (PIE). Rebase each by "
+                "(text_start_bv - text_start) before use."
+            )
+        return (
+            "0 of the recovered addresses match a BN function: BN analysis may "
+            "be incomplete (run `bn refresh`), or the binary is rebased -- "
+            "compare text_start vs text_start_bv before trusting the addresses."
+        )
+    if rebased:
         return (
             "None of the recovered addresses match a BN function START, and the "
             "pcln table's textStart != BN's .text start: the binary is loaded at a "
             "different base (PIE). Every address resolves at best to an interior PC, "
             "so rebase each by (text_start_bv - text_start) before use."
-        )
-    if defined_count == 0:
-        return (
-            "0 of the recovered addresses match a BN function: BN analysis may "
-            "be incomplete (run `bn refresh`), or the binary is rebased -- "
-            "compare text_start vs text_start_bv before trusting the addresses."
         )
     return (
         "None of the recovered addresses match a BN function START -- they "

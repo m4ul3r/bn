@@ -4345,14 +4345,22 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_function_list_text` in both its demangled and undemangled probe
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
+    # #757 review round 5: 4984 + 32 -- FOUR more discovered (renderer, ctx)
+    # pairs, 8 bogus values each. The same two duplicate-start counts are now
+    # read by `_render_target_summary` (the note sits under the function count
+    # it modifies) and therefore by `_render_target_info_text`, which composes
+    # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
+    # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
+    # under the digest's own function count (1 renderer x 2 keys x 8).
+    # Measured by diffing the population, not carried over from a comment.
     # #693 items 1/2: + 16 -- TWO more discovered pairs, 8 bogus values each, both
     # on `_render_go_rename_text`: it reads `rolled_back` and `success` BEFORE its
     # branch, because the two rollback states are decided from those two fields
     # rather than from the branch a payload happens to walk into.
-    # Both contributions are live on this rebased tree, so the total is their sum:
-    # 4936 + 48 (#883) + 16 (#693) = 5000. The assertion is what MEASURES it --
-    # neither branch's own number survives a merge (#693 rebase).
-    assert swept == 5000, f"the raise sweep ran {swept} renders, not 5000"
+    # Both contributions are live on this MERGED tree, so the total is their sum:
+    # 4984 + 48 (#757 r5) + 16 (#693) = 5048. The assertion is what MEASURES it --
+    # neither branch's own number survives the merge (#893 merge of #873).
+    assert swept == 5048, f"the raise sweep ran {swept} renders, not 5048"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4519,10 +4527,16 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # `function list` / `--count` probe forms), x 2 benign payloads each. A
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
+    # #757 review round 5: 1449 + 8 -- the same FOUR discovered pairs the raise
+    # sweep gained (the two duplicate-start counts now read by
+    # `_render_target_summary` and by `_render_target_info_text` composing it),
+    # x 2 benign payloads each. Measured by diffing the population.
+    # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
+    # gained, x 2 benign payloads each. Measured by diffing the population.
     # #693 items 1/2: + 4 -- the same TWO pairs the raise sweep gained on
-    # `_render_go_rename_text`, x 2 benign payloads each: 1437 + 12 + 4 = 1453,
-    # measured the same way on the rebased tree.
-    assert checked == 1453, f"the mirror ran {checked} renders, not 1453"
+    # `_render_go_rename_text`, x 2 benign payloads each: 1449 + 12 + 4 = 1465,
+    # measured the same way on the MERGED tree.
+    assert checked == 1465, f"the mirror ran {checked} renders, not 1465"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8112,16 +8126,17 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     assert "duplicate starts" in count_text and "larger extent was kept" in count_text, count_text
 
     # Both keys, and the UNRESOLVED half has to be distinguishable from the
-    # collapse: one says a record was dropped, the other that none was.
+    # collapse: one says a record WAS chosen (its extent won), the other that
+    # none could be.
     both = {**collapsed, "duplicate_starts_unresolved": 2}
     text = formatters._render_function_list_text(both)
     assert "1 start address(es) carried duplicate function records" in text, text
-    assert "2 start address(es) left with duplicate records" in text, text
-    assert "an extent was unreadable, so none was dropped" in text, text
-    # ...and the two halves do not read as one alarm: the unresolved part never
-    # claims a record was kept.
+    assert "2 start address(es) hold another record whose extent" in text, text
+    assert "no record was chosen there" in text, text
+    # ...and the two halves do not read as one alarm: the collapsed part never
+    # says nothing was chosen, which is the whole difference between them.
     collapsed_only = formatters._render_function_list_text(collapsed)
-    assert "none was dropped" not in collapsed_only, collapsed_only
+    assert "no record was chosen" not in collapsed_only, collapsed_only
 
     # A SLICED page (the keys are on the envelope, not on the rows).
     sliced = {**collapsed, "returned": 2, "offset": 5, "has_more": True}
@@ -8152,3 +8167,155 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     assert _disclosed(bogus_text, "duplicate_starts_collapsed"), bogus_text
     assert "duplicate starts: ?" not in bogus_text, bogus_text
     assert "1 start address(es)" not in bogus_text, bogus_text
+
+
+def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757():
+    """The collapse note is an ADDITION to the listing, never a substitute for
+    the empty-list marker.
+
+    `_render_function_list_text` returned the note INSTEAD of the body when the
+    body was the bare `none`, borrowing the paging footer's replace-the-marker
+    rule from `_render_paged_list_text` -- but a footer states the emptiness
+    ("showing 0 of 15") and this note does not. An empty listing that carried
+    `duplicate_starts_collapsed` therefore rendered as a single
+    `// duplicate starts: ...` line with nothing saying the list was empty, so a
+    reader was handed the alarm and no answer.
+    """
+    from bn import formatters
+
+    # No total to footer against, so the body IS the bare empty-list marker --
+    # the one shape where the note used to replace it.
+    empty = {"kind": "functions", "items": [],
+             "duplicate_starts_collapsed": 1}
+    text = formatters._render_function_list_text(empty)
+    assert text.splitlines()[0] == "none", text
+    assert "duplicate starts" in text, text
+
+    # ...and the same for an envelope whose total is an honest zero (no paging
+    # happened, so `_paging_footer` has nothing to say either).
+    zero_total = {"kind": "functions", "items": [], "total": 0, "returned": 0,
+                  "offset": 0, "has_more": False, "duplicate_starts_unresolved": 2}
+    zero_text = formatters._render_function_list_text(zero_total)
+    assert zero_text.splitlines()[0] == "none", zero_text
+    assert "2 start address(es)" in zero_text and "extent" in zero_text, zero_text
+
+
+def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
+    """The note has to survive the answer it is printed beside.
+
+    `duplicate_starts_unresolved` counts an address for as long as a record of
+    it is in the answer, so a `--min-size` / `--named` answer carries the key
+    with ONE row at that address -- its twin was dropped by the filter. The
+    sentence said "left with duplicate records ... so none was dropped", and
+    both halves of that are false there: the reader is sent looking for a second
+    row that is not in the listing, and told nothing was dropped when the filter
+    dropped exactly the record the conflict is about.
+
+    What IS always true when the key fires is the finding itself: BN holds
+    another record at that address whose extent could not be read, so no record
+    could be chosen -- the row shown was not picked on extent, which is
+    precisely what the collapsed half's "the larger extent was kept" promises
+    and this half cannot.
+    """
+    from bn import formatters
+
+    # The shape a filtered answer has: ONE row at the disclosed address.
+    filtered = {"kind": "functions", "items": [{"name": "widget_poll", "address": "0x401014"}],
+                "total": 1, "returned": 1, "offset": 0, "has_more": False,
+                "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(filtered)
+    # The claims that answer refutes: a second row is here, and nothing went.
+    assert "none was dropped" not in text, text
+    assert "left with duplicate records" not in text, text
+    # ...and the claim it supports: nothing could be chosen at that address.
+    assert "no record was chosen" in text, text
+    assert "extent" in text, text
+
+    count_text = formatters._render_function_count_text(
+        {"kind": "functions", "count": 1, "total": 1, "duplicate_starts_unresolved": 1})
+    assert count_text.startswith("Total functions: 1"), count_text
+    assert "none was dropped" not in count_text, count_text
+    assert "no record was chosen" in count_text, count_text
+
+    # The two halves still read differently -- the collapsed one is the only
+    # one that may say a record was kept for its extent.
+    collapsed_only = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "the larger extent was kept" in collapsed_only, collapsed_only
+    assert "no record was chosen" not in collapsed_only, collapsed_only
+
+
+def test_the_duplicate_starts_note_scopes_its_counts_to_the_whole_answer_757():
+    """The note states WHICH population it counted, once, and it is not the page.
+
+    Both halves were written as claims about the answer in front of the reader
+    -- "the larger extent was kept", "no record was chosen there" -- while the
+    counts are taken against the filtered population `total` reports, before
+    `--offset`/`--limit`. On a window holding none of the counted addresses
+    that reads as a statement about the rows on screen, which is the same
+    clause-describes-the-answer defect the unresolved half already lost once.
+    Naming the denominator fixes both halves at once: the reader can see that
+    7 is not the 3 rows in front of them.
+    """
+    from bn import formatters
+
+    paged = {"kind": "functions",
+             "items": [{"name": "fn_0", "address": "0x402000"},
+                       {"name": "fn_1", "address": "0x402010"},
+                       {"name": "fn_2", "address": "0x402020"}],
+             "total": 7, "returned": 3, "offset": 3, "has_more": True,
+             "duplicate_starts_collapsed": 1, "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(paged)
+    # The scope is stated ONCE, names the population, and says it is not the page.
+    assert text.count("not only the rows shown") == 1, text
+    assert "all 7 function(s) this answer reports" in text, text
+    # ...and both halves keep their own distinct finding under it.
+    assert "the larger extent was kept" in text, text
+    assert "no record was chosen there" in text, text
+
+    # `--count` has no rows at all, and the same sentence still reads true
+    # against the number it is printed beside.
+    counted = formatters._render_function_count_text(
+        {"kind": "functions", "count": 7, "total": 7, "duplicate_starts_collapsed": 1})
+    assert "all 7 function(s) this answer reports" in counted, counted
+
+    # An envelope with no total to count against states the scope without
+    # inventing a denominator -- never a fabricated "0 functions".
+    bare = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "not only the rows shown" in bare, bare
+    assert "function(s) this answer reports" not in bare, bare
+
+
+def test_a_duplicate_start_row_is_labelled_in_text_757():
+    """The per-row marker reaches the TEXT face, like every other #757
+    disclosure on this PR.
+
+    `duplicate_start` on the row is what tells a reader holding one row of a
+    `--sort size` page that its size never won a comparison; publishing it in
+    JSON only would rebuild the JSON-only disclosure the whole change removes.
+    An unknown value still prints rather than being dropped, so a marker added
+    to the bridge cannot go invisible here.
+    """
+    from bn import formatters
+
+    rows = [
+        {"name": "widget_poll", "address": "0x401014", "size": 96,
+         "basic_block_count": 3, "duplicate_start": "collapsed"},
+        {"name": "tick_stub", "address": "0x401100", "size": 0,
+         "basic_block_count": 0, "duplicate_start": "unresolved"},
+        {"name": "widget_init", "address": "0x401000", "size": 28,
+         "basic_block_count": 1},
+    ]
+    text = formatters._render_name_address_rows(rows)
+    poll, stub, init = text.splitlines()
+    assert poll.endswith("[duplicate start: kept on extent]"), poll
+    assert stub.endswith("[duplicate start: not ranked]"), stub
+    assert "duplicate start" not in init, init
+    # The size column still renders, so the marker qualifies the size rather
+    # than replacing it.
+    assert "(96 bytes, 3 blocks)" in poll, poll
+    # A value this renderer does not know about is shown verbatim, not dropped.
+    unknown = formatters._render_name_address_rows(
+        [{"name": "fn", "address": "0x401200", "duplicate_start": "shadowed"}])
+    assert unknown.endswith("[duplicate start: shadowed]"), unknown

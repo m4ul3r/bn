@@ -615,3 +615,38 @@ def test_go_functions_rebase_note_ratio_boundary_883(monkeypatch):
     half = inst._go_functions(None)
     assert half["defined_count"] == 10 and half["start_match_count"] == 5
     assert "note" in half and "5 of the 10" in half["note"]
+
+
+def test_go_functions_rebase_note_does_not_claim_interior_pcs_when_nothing_resolved_818(monkeypatch):
+    """#818 review: the PIE branch was reached BEFORE the "nothing resolved"
+    branch, so a table where `defined_count` is 0 -- no row resolved to a BN
+    function by START *or* by containment -- was told "Every address resolves at
+    best to an interior PC". That is a positive claim about a relation that held
+    for no row at all, and it sends a reader to rebase addresses on the strength
+    of a containment result the view never produced. The textStart mismatch is
+    still disclosed; what it may not do is invent the interior-PC finding.
+    """
+    from bn.formatters import _render_go_functions_text
+
+    bv = _GoBV(_build_pclntab(text_start=0x400000), defined=set(), text_start=0x800000)
+    bridge, inst = _ctx(monkeypatch, bv)
+    out = inst._go_functions(None)
+
+    assert out["defined_count"] == 0 and out["start_match_count"] == 0
+    note = out["note"]
+    # The rebase/PIE disclosure survives -- that part was true.
+    assert "PIE" in note and "rebase" in note.lower()
+    # ...but nothing resolved, so no row can be said to resolve to anything.
+    assert "interior PC" not in note, note
+    assert "interior PC" not in _render_go_functions_text(out)
+
+    summary = inst._go_functions(None, summary=True)
+    assert "interior PC" not in summary["note"], summary["note"]
+
+    # The interior-PC wording is still what a view that DID resolve rows gets,
+    # so this is a scoping fix and not the note's removal.
+    resolved = _ContainmentOnlyGoBV(_build_pclntab_many(10), starts={})
+    bridge, inst = _ctx(monkeypatch, resolved)
+    interior = inst._go_functions(None)
+    assert interior["defined_count"] == 10 and interior["start_match_count"] == 0
+    assert "interior PC" in interior["note"]

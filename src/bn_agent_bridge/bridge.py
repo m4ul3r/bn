@@ -1251,9 +1251,10 @@ def _function_name_summary(bv) -> dict[str, int]:
     # reason on one surface while suppressing it on the other, with the two
     # agreeing on every number -- the shape where a reader concludes the larger
     # count is a phantom rather than an unresolved conflict (#757 review).
-    functions, collapsed_starts, unresolved_starts = read_listing._collapse_duplicate_starts(
-        functions
-    )
+    # This summary counts EVERY retained record (it has no row filter of its
+    # own), so the counts are taken against the whole kept population.
+    functions, collapse = read_listing._collapse_duplicate_starts(functions)
+    collapsed_starts, unresolved_starts = collapse.counts(functions)
     total = len(functions)
     named = imported = 0
     imported_obj_names: set[str] = set()
@@ -3841,7 +3842,7 @@ class BinaryNinjaBridge:
                 existing_annotations = read_listing._annotations_unavailable(
                     exc, filename=filename
                 )
-        return {
+        digest = {
             "kind": "orient_digest",
             "target": target,
             "analyzed": analyzed,
@@ -3853,6 +3854,18 @@ class BinaryNinjaBridge:
             "sections": sections,
             "existing_annotations": existing_annotations,
         }
+        # #757: `function_count` above is the LISTING's post-collapse total, so
+        # the two keys that explain it have to travel with it. Taking the number
+        # and leaving them behind is what made this card show a silently reduced
+        # count -- the same JSON-only shape the disclosure exists to remove, on
+        # the other command an agent runs on first contact. Copied at the digest's
+        # own level (the nested `target` block carries its own pair for the view,
+        # which this count is not taken from), and only when published.
+        return read_listing._disclose_collapsed_starts(
+            digest,
+            func_count.get("duplicate_starts_collapsed", 0),
+            func_count.get("duplicate_starts_unresolved", 0),
+        )
 
     def _normalize_py_result(self, *a, **k):
         return create_comments._normalize_py_result(self.ctx, *a, **k)
