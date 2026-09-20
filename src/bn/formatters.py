@@ -1818,12 +1818,16 @@ def _render_go_rename_text(value: Any) -> str:
     preview = bool(value.get("preview"))
     committed = bool(value.get("committed", True))
     rolled_back = value.get("rolled_back")
-    # The same question the compact summary answers, from the same two inputs: a
-    # preview whose run reported a failure is NOT a preview of what would land
-    # (#693 item 2). The op is all-or-nothing, so the failure reverted the whole
-    # batch and a live run of the same state commits zero -- stating the rows
-    # that verified as "would rename" misleads a caller that plans on it, and
-    # this view is the one that CLAIMS those counts.
+    # The question the compact summary also answers -- a preview whose run
+    # reported a failure is NOT a preview of what would land (#693 item 2). The
+    # op is all-or-nothing, so the failure reverted the whole batch and a live
+    # run of the same state commits zero; stating the rows that verified as
+    # "would rename" misleads a caller that plans on it, and this view is the
+    # one that CLAIMS those counts. It is asked here from `success` and the
+    # failure ROWS only: the compact summary has a third decider this view does
+    # not (it refuses when `go_failed_count` disagrees with the rows), so on
+    # that one payload the two faces still differ -- a pre-existing gap, named
+    # here rather than papered over by a comment claiming they cannot (#693 r2).
     ok = value.get("success") is not False and not failed
     lines: list[str] = []
     # A revert that did not complete is the ONE state where no line here may
@@ -1848,10 +1852,10 @@ def _render_go_rename_text(value: Any) -> str:
             "rollback failed: the view may be left modified")
         lines.append(
             f"go rename{' (preview)' if preview else ''}: an unknown number of "
-            f"the {verified} applied renames are still live -- the revert "
-            f"failed, so this is neither a plan nor a zero ({len(failed)} "
-            f"failed, {skipped} skipped); re-read the view and save or discard "
-            f"it deliberately")
+            f"the renames this run applied are still live -- the revert failed, "
+            f"so this is neither a plan nor a zero ({verified} verified, "
+            f"{len(failed)} failed, {skipped} skipped); re-read the view and "
+            f"save or discard it deliberately")
     elif preview:
         lines.append("preview: renames applied + reverted (nothing committed)")
         if ok:
@@ -5376,8 +5380,17 @@ def _go_rename_summary(value: Any) -> Any:
     if committed:
         changed = committed_count
         source = "go_committed_count"
-    elif preview and run_ok:
-        changed = verified
+    elif preview:
+        # #693 item 2 changed the VALUE a failed preview reports (0 -- the op
+        # is all-or-nothing, so a live run of that state commits zero), and it
+        # must not also change what this branch MEASURES. `go_verified_count`
+        # stays the source either way, because the summary still STATES it as
+        # `verified_count` and the detail view still prints it: letting a
+        # failed preview fall through to the sourceless `else` made an envelope
+        # that omits the counter report a fabricated `verified_count: 0` beside
+        # `measured: true`, switching off the #684 fail-safe that exists for
+        # exactly that version-skewed envelope (#693 r2).
+        changed = verified if run_ok else 0
         source = "go_verified_count"
     else:
         # Nothing landed, and that is established by the revert rather than by

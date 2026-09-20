@@ -160,12 +160,15 @@ land — `go rename`'s detail view states it as `0 would rename (N verified befo
 the failure …)`.
 
 A detail view may not state a count in the failed-revert state either, in
-either direction: `go rename --verbose` says `an unknown number of the N applied
-renames are still live` rather than `0 renamed` / `0 would rename`, because the
-compact face of that same payload says `changed=None` and a bridge-emitted
-failed preview revert carries **no** failure row at all (`results: []` beside
-`go_failed_count: 0`) — so there is no apply failure to name and no list of
-failures to send the reader to.
+either direction: `go rename --verbose` says `an unknown number of the renames
+this run applied are still live` rather than `0 renamed` / `0 would rename`,
+because the compact face of that same payload says `changed=None` and a
+bridge-emitted failed preview revert carries **no** failure row at all
+(`results: []` beside `go_failed_count: 0`) — so there is no apply failure to
+name and no list of failures to send the reader to. It states no denominator
+either: the envelope reports what VERIFIED, and a row whose rename was written
+but failed readback is also left modified by a revert that did not complete, so
+"N applied" is not a number this op can honestly put a figure on.
 
 #### Unmeasured mutations
 

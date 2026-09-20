@@ -509,7 +509,7 @@ def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatc
     # compact face's `changed=None` is one payload's two views disagreeing,
     # and a rename really is live (asserted from the producer above).
     assert "0 renamed" not in detail, detail
-    assert "unknown number of the 1 applied renames are still live" in detail, detail
+    assert "unknown number of the renames this run applied are still live" in detail, detail
 
     # Anti-vacuity, BOTH directions, from the SAME producer: the identical run
     # whose revert COMPLETED is a measured zero that is not dirty -- so the null
@@ -540,7 +540,7 @@ def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatc
     assert preview_summary["dirty_after"] is True, preview_summary
     preview_detail = _render_go_rename_text(dict(preview_stuck))
     assert "0 would rename" not in preview_detail, preview_detail
-    assert "unknown number of the 2 applied renames are still live" in preview_detail, (
+    assert "unknown number of the renames this run applied are still live" in preview_detail, (
         preview_detail)
     # No apply failure happened here (`go_failed_count: 0`, `results: []`), so
     # this view may not name one, and may not send the reader to a list of
@@ -591,6 +591,47 @@ def test_a_failed_preview_does_not_report_its_verified_rows_as_would_land(monkey
     assert "2 would rename" in _render_go_rename_text(dict(clean))
 
 
+def test_a_failed_preview_missing_its_verified_counter_stays_unmeasured(monkeypatch):
+    """#693 r2: the item-2 fix narrowed `elif preview:` to `elif preview and
+    run_ok:`, which changed the VALUE a failed preview reports (0, not the rows
+    that verified) but also dropped `go_verified_count` as that branch's
+    MEASUREMENT SOURCE -- a failed preview fell through to the `else`, whose
+    `source is None` asks for no counter at all.
+
+    So an envelope that states no verified counter went from the #684 fail-safe
+    (`measured: false`, every derived count `null`, `dirty_after: true`, exit 4)
+    to a fabricated `verified_count: 0` beside `measured: true` and
+    `dirty_after: false` -- the summary claiming a measurement it never made,
+    over the one counter this state's own detail line still prints as "N
+    verified before the failure". The value change was the intent; switching
+    off the fail-safe was not. The source is required for every preview again.
+
+    The missing counter is a VERSION-SKEW envelope, so it cannot come from
+    today's producer -- that is the finding. The payload is therefore the
+    producer's own output with the one key deleted, and the counterpart that
+    keeps it is pure producer."""
+    from bn.formatters import _go_rename_summary
+
+    failed, _ = _go_rename_produced(
+        monkeypatch, preview=True, readback_fails=(0x402000,))
+    assert failed["rolled_back"] is True and failed["go_failed_count"] == 1
+    assert "go_verified_count" in failed          # today's bridge always states it
+
+    skewed = {key: value for key, value in failed.items()
+              if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(skewed))
+    assert summary["measured"] is False, summary
+    assert summary["changed_count"] is None, summary
+    assert summary["verified_count"] is None, summary   # never a fabricated 0
+    assert summary["dirty_after"] is True, summary      # the #684 fail-safe
+
+    # The counterpart, straight from the producer: the counter IS stated, so the
+    # same failed preview is measured and reports the plan of zero.
+    stated = _go_rename_summary(dict(failed))
+    assert stated["measured"] is True and stated["changed_count"] == 0, stated
+    assert stated["verified_count"] == 1, stated
+
+
 def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
         monkeypatch, fake_transport, capsys):
     """The same states end to end, because the default and `--verbose` views are
@@ -614,7 +655,7 @@ def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
     verbose = capsys.readouterr().out
     assert "reverted" not in verbose, verbose
     assert "0 renamed" not in verbose, verbose
-    assert "unknown number of the 1 applied renames are still live" in verbose, verbose
+    assert "unknown number of the renames this run applied are still live" in verbose, verbose
 
     # The bridge-reachable failed PREVIEW: no failure row, a zero failure
     # counter, and the renames really live.
@@ -625,7 +666,7 @@ def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
     assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
     stuck_preview = capsys.readouterr().out
     assert "0 would rename" not in stuck_preview, stuck_preview
-    assert "unknown number of the 2 applied renames are still live" in stuck_preview, (
+    assert "unknown number of the renames this run applied are still live" in stuck_preview, (
         stuck_preview)
 
     # ...and the failed preview that DID revert, the one state a plan of zero is
