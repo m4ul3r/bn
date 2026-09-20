@@ -5752,10 +5752,30 @@ def _render_class_list_text(value: Any) -> str:
     # here is the `items`/`classes` alias pair, so either spelling being wrong is
     # a page nobody could read.
     page_unreadable = _field_skewed("items") or _field_skewed("classes")
+    # Every number this renderer states besides its rows is folded-out share
+    # bookkeeping: how many of the surveyed rows it did NOT show. That makes
+    # each one a CARDINALITY, so each reads through `_nonnegative_count` -- a
+    # survey cannot have folded out -2 rows -- and each states an unreadable
+    # one as `?` through the `elif _field_skewed(...)` branch the imports card
+    # beside it already uses. Dropping the share instead (what the raw `or 0`
+    # did) renders byte-identically to a survey that folded out NOTHING, so
+    # the boundary note would arrive after the reader had already decided
+    # (#619/#683). The keys stay literal at every read on purpose: a local
+    # helper taking the key as a parameter hides all five from the module's
+    # own (renderer, key) count differential.
     if "count" in value and not value.get("items") and not value.get("classes"):
-        n = value.get("count", 0)
-        art = value.get("artifact_count") or 0
-        tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
+        # The headline STATES the number, so `_stated_count`. Read raw, this
+        # line described a payload two ways depending on which surface the
+        # caller hit: a flag as a quantity, a container as a Python repr, and
+        # an impossible "-2 non-class artifacts" at rc 0 with nothing said.
+        n = _stated_count(value, "count")
+        art = _nonnegative_count(value, "artifact_count")
+        if art:
+            tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})"
+        elif _field_skewed("artifact_count"):
+            tail = " (? non-class RTTI/type artifacts)"
+        else:
+            tail = ""
         return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
     # #770: the count line states the PAGE, and the shared paging footer carries
     # the total/resume half -- the same split every other paged list uses. This
@@ -5766,18 +5786,26 @@ def _render_class_list_text(value: Any) -> str:
     header = f"classes: {len(rows)}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
     hidden_parts = []
-    cv = value.get("construction_vtables_suppressed") or 0
+    cv = _nonnegative_count(value, "construction_vtables_suppressed")
     if cv:
         hidden_parts.append(f"{cv} construction-vtable artifact{'s' if cv != 1 else ''} (--all to show)")
-    th = value.get("thunks_suppressed") or 0
+    elif _field_skewed("construction_vtables_suppressed"):
+        hidden_parts.append("? construction-vtable artifacts (--all to show)")
+    th = _nonnegative_count(value, "thunks_suppressed")
     if th:
         hidden_parts.append(f"{th} thunk{'s' if th != 1 else ''}")
-    lib = value.get("library_suppressed") or 0
+    elif _field_skewed("thunks_suppressed"):
+        hidden_parts.append("? thunks")
+    lib = _nonnegative_count(value, "library_suppressed")
     if value.get("no_stl") and lib:
         hidden_parts.append(f"{lib} library/STL")
-    ven = value.get("vendor_suppressed") or 0
+    elif value.get("no_stl") and _field_skewed("library_suppressed"):
+        hidden_parts.append("? library/STL")
+    ven = _nonnegative_count(value, "vendor_suppressed")
     if value.get("no_vendor") and ven:
         hidden_parts.append(f"{ven} vendored")
+    elif value.get("no_vendor") and _field_skewed("vendor_suppressed"):
+        hidden_parts.append("? vendored")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)

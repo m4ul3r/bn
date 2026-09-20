@@ -3890,9 +3890,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # renderer behind `function list --count`, `function search --count` and
     # `types --count`, so the WIDEST count line in the CLI -- now reads its
     # count through `_stated_count` instead of interpolating it raw.
-    assert len(sites) == 23, (
+    # 23 -> 29 (#795 round-6 review): `_render_class_list_text` stated SIX
+    # numbers of its own raw -- the count-only headline through `_stated_count`
+    # now, and the non-class artifact share plus the three suppressed shares
+    # through `_nonnegative_count`, because a cardinality cannot be negative.
+    # Six more (renderer, key) pairs this differential now covers, measured.
+    assert len(sites) == 29, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 23. The number is the size of the covered set: a "
+        "count helper, not 29. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3950,6 +3955,15 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",
+        # #795 round-6 review: the class lens states these two on its
+        # COUNT-ONLY branch, which this differential's context never takes --
+        # it fills every harvested key, so the listing branch always wins.
+        # Their honesty is pinned directly by
+        # `test_the_class_listing_reads_its_count_and_every_cardinality_through_the_choke_point_795`.
+        # The renderer's four `hidden:` shares ARE stated in this context and
+        # are checked above.
+        "_render_class_list_text(artifact_count) [count not stated in this context]",
+        "_render_class_list_text(count) [count not stated in this context]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # #795 round-3 review: same harness cut as the strings pair below --
@@ -4105,7 +4119,12 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # `value.get('count', 0)` was the widest raw count read left in the module --
 # three CLI surfaces install that renderer -- and now goes through
 # `_stated_count`.
-_RAW_COUNT_SPELLINGS = 45
+# 45 -> 39 (#795 round-6 review): `_render_class_list_text` stated SIX numbers
+# of its own raw -- the count-only headline, the non-class artifact share
+# beside it, and the three suppressed shares in the `hidden:` tail. The
+# headline now reads through `_stated_count` and the four cardinalities
+# through `_nonnegative_count`, so all six spellings are deliberately GONE.
+_RAW_COUNT_SPELLINGS = 39
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -4410,7 +4429,13 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # MEASURED by diffing `_runtime_population()` rather than carried over.
     # 4928 -> 4936 (#797): `hints` is one more discovered read on
     # `_render_defuse_text` (1 pair x 8 bogus values), measured.
-    assert swept == 4936, f"the raise sweep ran {swept} renders, not 4936"
+    # 4936 -> 4944 (#795 round-6 review): the class listing's non-class artifact
+    # share was read `or 0` inside its own conditional and was therefore
+    # discovered by nothing; routing it through `_nonnegative_count` makes it
+    # ONE more discovered read (1 pair x 8 bogus values), measured by diffing
+    # `_runtime_population()`. The listing's other five newly-choked numbers
+    # were already discovered reads, so they add nothing here.
+    assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4571,7 +4596,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1432 -> 1434 (#795): the one `_render_strings_text`/`filtered` pair, x 2.
     # 1434 -> 1437 (#797): the one `_render_defuse_text`/`hints` pair -- a LIST,
     # so its benign half is 3 payloads (None/[]/{}), measured.
-    assert checked == 1437, f"the mirror ran {checked} renders, not 1437"
+    # 1437 -> 1439 (#795 round-6 review): the one new `_render_class_list_text`
+    # /`artifact_count` pair the raise sweep also gained, x 2 benign payloads.
+    assert checked == 1439, f"the mirror ran {checked} renders, not 1439"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -4892,6 +4919,57 @@ def test_the_class_count_only_envelope_still_discloses_a_falsy_wrong_listing():
         assert "malformed items field" in out, bogus
     # A genuinely empty listing is a real count-only envelope and stays quiet.
     assert _render_class_list_text({"count": 3, "items": []}) == bare
+
+
+def test_the_class_listing_reads_its_count_and_every_cardinality_through_the_choke_point_795():
+    """One count contract on the class lens's own numbers (#795 round-6 review).
+
+    Besides its rows this renderer states five numbers: the count-only
+    headline, the non-class artifact share beside it, and the three suppressed
+    shares in the `hidden:` tail. Every one was read raw, so the class lens
+    described a payload exactly the way the imports trio did before the
+    round-3/4/5 repairs -- a flag as a quantity, a container as a Python repr,
+    a text-spelled count silently dropping its qualifier -- and on the four
+    keys that are CARDINALITIES (how many rows the lens folded OUT) it stated
+    an impossible negative at rc 0 with nothing disclosed. Same payload, two
+    descriptions, depending on which surface the caller hit.
+    """
+    from bn.formatters import _render_class_list_text as render
+
+    # (a) The HEADLINE states the count, so it follows `_stated_count`: a bool
+    # is not a quantity, a numeric string states the line the integer states,
+    # and a container is disclosed instead of interpolated as a repr.
+    assert render({"count": 3}) == "classes: 3"
+    assert render({"count": "3"}) == render({"count": 3})
+    flagged = render({"count": True})
+    assert "classes: True" not in flagged and "malformed count field" in flagged
+    boxed = render({"count": {"n": 1}})
+    assert "{" not in boxed and "}" not in boxed and "malformed count field" in boxed
+
+    # (b) The four CARDINALITIES cannot be negative -- a survey cannot have
+    # folded out -2 rows -- and are refused the way the imports trio refuses
+    # it: the share is not restated as a quantity and the skew reaches the
+    # `@_discloses` boundary note.
+    for key, rest in (("artifact_count", {"count": 3}),
+                      ("construction_vtables_suppressed", {"items": []}),
+                      ("thunks_suppressed", {"items": []}),
+                      ("library_suppressed", {"items": [], "no_stl": True}),
+                      ("vendor_suppressed", {"items": [], "no_vendor": True})):
+        negative = render({**rest, key: -2})
+        assert "-2" not in negative, (key, negative)
+        assert f"malformed {key} field" in negative, (key, negative)
+        flag = render({**rest, key: True})
+        assert "True" not in flag, (key, flag)
+        assert f"malformed {key} field" in flag, (key, flag)
+        # A text-spelled share states the same line the integer spelling does.
+        assert render({**rest, key: "2"}) == render({**rest, key: 2}), key
+        # ...and the share is STATED as unknown, not dropped. A dropped share
+        # renders byte-identically to a survey that folded out nothing, so the
+        # reader has already decided by the time the boundary note arrives
+        # (#619/#683) -- the harm the trailing note alone cannot repair.
+        body = negative.split("\n! malformed")[0]
+        assert body != render({**rest, key: 0}), (key, body)
+        assert "?" in body, (key, body)
 
 
 def test_class_show_renders_a_declared_but_unnamed_base_instead_of_dropping_it():
