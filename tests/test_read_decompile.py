@@ -4004,6 +4004,11 @@ def _install_per_function_pseudo_c(monkeypatch, bridge, bodies):
         @staticmethod
         def single_function_language_representation(fn, settings=None,
                                                     language="Pseudo C"):
+            # The shared helper asserts this and the first cut of this fake
+            # dropped it, which made a local copy MORE FORGIVING than the
+            # helper it names as its model: a producer asking for a different
+            # representation left both batch tests green.
+            assert language == "Pseudo C"
             return _FakeViewObject(bodies[fn.name])
 
     fake_mod = types.ModuleType("binaryninja.lineardisassembly")

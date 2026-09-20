@@ -3595,34 +3595,92 @@ def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch, capsys)
         f"bridge; these ops were sent instead: {sent}")
 
 
-def test_a_required_target_option_never_takes_the_environment_default():
-    """A command that DEMANDS an explicit target must keep demanding one.
+def _close_run(monkeypatch, argv, env=None, selectors=("alpha.bin", "beta.bin")):
+    """Run *argv* through `main`, returning `(rc, [(op, target), ...])`.
 
-    `required=True` means the refusal is the feature -- destructive `close`
-    names `--all` in its refusal for a reason. Honouring an ambient default
-    there would reintroduce the ambient-selector hazard through the other
-    door, which is the one thing this whole change must not do.
+    Pins a nonexistent instance so no probe can reach a live bridge even if a
+    future change moved one of these paths onto the transport.
     """
-    import argparse
-    import os
-
     import bn.cli
 
-    prior = os.environ.get("BN_TARGET")
-    os.environ["BN_TARGET"] = "beta.bin"
-    try:
-        strict = argparse.ArgumentParser()
-        bn.cli._target_option(strict, required=True, is_root=True)
-        assert strict.get_default("target") is None
+    sent: list[tuple[str, object]] = []
 
-        lenient = argparse.ArgumentParser()
-        bn.cli._target_option(lenient, required=False, is_root=True)
-        assert lenient.get_default("target") == "beta.bin"
-    finally:
-        if prior is None:
-            os.environ.pop("BN_TARGET", None)
-        else:
-            os.environ["BN_TARGET"] = prior
+    def fake_send_request(op, *, params=None, target=None, **kwargs):
+        sent.append((op, target))
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": f"1:1:{i}", "selector": sel}
+                for i, sel in enumerate(selectors, start=1)]}
+        return {"ok": True, "result": {"closed": [{"selector": target}], "count": 1}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setenv("BN_INSTANCE", "prfleet-nonexistent-889")
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    return bn.cli.main(argv), sent
+
+
+def test_a_bare_destructive_close_never_takes_the_environment_default(monkeypatch):
+    """A destructive op must not be steered by an AMBIENT selector.
+
+    `close`'s handler already nulls a sticky-injected target for exactly this
+    reason: a bare `bn close` must not silently tear down whichever target
+    some earlier `bn target use` happened to pin. An exported selector is the
+    same ambient value from a different source, so honouring it there
+    reintroduces the hazard through the other door -- the one thing #676 item
+    11 must not do.
+
+    Round 2 blocker: the guarantee was implemented as "a `required=True`
+    target option never takes the env default", and NO command in the tree
+    sets `required=True` -- every `--target` comes from `@command(target=True)`
+    with `required=False`. So the protection covered zero commands and a bare
+    `close` closed the exported selector at rc 0. This test drives the real
+    command, so it cannot pass while that is true.
+
+    Two open targets, so a bare close has to refuse rather than fall through
+    to the legitimate single-open case.
+    """
+    rc, sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "beta.bin"})
+
+    assert [op for op, _ in sent] == ["list_targets"], (
+        "a bare destructive close must not act on the exported selector; "
+        f"it sent {sent}")
+    assert rc == 2
+
+
+def test_the_sticky_pin_and_the_environment_default_are_refused_alike(monkeypatch):
+    """The two ambient sources must behave identically at the destructive op,
+    or the safer-looking one is the one that surprises you.
+
+    Pinned as a PAIR: asserting only the env half would stay green if the
+    sticky guard were deleted, and the whole argument for the env default is
+    that it is the sticky pin's equal minus the cross-agent clobber.
+    """
+    from bn import session_state
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "beta.bin"})
+    sticky_rc, sticky_sent = _close_run(monkeypatch, ["close"])
+
+    monkeypatch.setattr(session_state, "read", lambda: {})
+    env_rc, env_sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "beta.bin"})
+
+    assert (sticky_rc, [op for op, _ in sticky_sent]) == (2, ["list_targets"])
+    assert (env_rc, [op for op, _ in env_sent]) == (sticky_rc,
+                                                    [op for op, _ in sticky_sent])
+
+
+def test_an_explicit_target_still_closes_that_target(monkeypatch):
+    """Must-not-fire twin: the refusal is about AMBIENCE, not about `close`.
+
+    An explicit `-t` is the caller naming the target, and it must still work
+    -- otherwise the fix above would have made `close` unusable rather than
+    safe.
+    """
+    rc, sent = _close_run(monkeypatch, ["-t", "beta.bin", "close"],
+                          {"BN_TARGET": "alpha.bin"})
+
+    assert ("close_binary", "beta.bin") in sent, sent
+    assert rc == 0
 
 
 def test_bn_target_is_scrubbed_from_the_test_environment():

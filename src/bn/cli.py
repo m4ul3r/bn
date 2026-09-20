@@ -432,21 +432,16 @@ def _target_option(
     }
     if not is_root:
         kwargs["default"] = argparse.SUPPRESS
-    elif not required:
-        # The target half of the per-shell story `-i` already has (#676 item
-        # 11). Fan-out costs `-i` AND `-t` on every command because the sticky
-        # pin in ~/.cache is shared by every shell on the machine -- two agents
-        # in one project clobber each other's target, which is why the skill
-        # tells agents not to use it. An environment variable is per-process-
-        # tree by construction: each agent exports its own, and neither can
-        # see, let alone overwrite, the other's.
-        #
-        # Only when the flag is not `required`: a command that DEMANDS an
-        # explicit target (destructive `close`, whose refusal names `--all`)
-        # must keep demanding one. An exported default is precisely the
-        # ambient selector those refusals exist to prevent, so honouring it
-        # there would reintroduce the hazard through the other door.
-        kwargs["default"] = os.environ.get("BN_TARGET")
+    # `BN_TARGET` is NOT resolved here (#676 item 11). It is an AMBIENT
+    # selector, exactly like the sticky pin, and both are filled together in
+    # `_apply_sticky_defaults` so they carry the same marker and every
+    # consumer that must distinguish "the caller named this" from "something
+    # in the environment did" sees them alike. Resolving it as an argparse
+    # default instead made it arrive unmarked, and a bare destructive `close`
+    # -- which nulls an ambient target precisely so it cannot be steered --
+    # then tore down the exported selector at exit 0. Guarding it on
+    # `required=False` looked like the fix and covered nothing: no command in
+    # this tree sets `required=True` on `--target`.
     parser.add_argument("-t", "--target", **kwargs)
 
 
@@ -2278,7 +2273,16 @@ def _explicit_instance_options(argv: list[str]) -> tuple[bool, bool]:
 
 
 def _apply_sticky_defaults(args: argparse.Namespace) -> None:
-    """Fill unset --instance / --target from per-project sticky state."""
+    """Fill unset --instance / --target from the environment or sticky state.
+
+    Both sources are AMBIENT: the caller did not name this selector on the
+    command line. `_sticky_target` marks that fact, and its consumers read it
+    as exactly that -- a bare destructive `close` nulls it so it cannot be
+    silently steered, and `--all-targets` does not treat it as an explicit
+    choice that suppresses the survey. The environment must therefore be
+    filled HERE and marked the same way; resolving it as an argparse default
+    made it arrive unmarked and walk straight past both (#676 item 11).
+    """
     state = session_state.read()
     # Presence, not truthiness (#690 r3): `-i "$INST"` with $INST unset must
     # not be silently replaced by the pin -- the same doctrine as -t below.
@@ -2288,12 +2292,21 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
         if sticky_instance:
             args.instance = sticky_instance
             args._sticky_instance = True
-    # Only an ABSENT -t is filled from the pin. An explicit `-t ""` stays as
-    # given so the handler can tell "no selector" from "empty selector" (close
-    # must reject the latter instead of letting a pin paper over it).
+    # Only an ABSENT -t is filled. An explicit `-t ""` stays as given so the
+    # handler can tell "no selector" from "empty selector" (close must reject
+    # the latter instead of letting an ambient value paper over it).
     if getattr(args, "target", None) is None:
+        # The environment beats the pin: it is per-process-tree, so it is the
+        # narrower statement of intent of the two. Presence, not truthiness
+        # again -- `export BN_TARGET=$SEL` with SEL unset exports "", and that
+        # must reach the empty-selector refusal rather than falling through to
+        # a pin the caller never chose for this command.
+        env_target = os.environ.get("BN_TARGET")
         sticky_target = state.get("target")
-        if sticky_target:
+        if env_target is not None:
+            args.target = env_target
+            args._sticky_target = True
+        elif sticky_target:
             args.target = sticky_target
             args._sticky_target = True
 

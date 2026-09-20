@@ -1544,6 +1544,52 @@ def test_a_collision_opened_after_the_pre_write_check_is_disclosed_867(
     assert "'late.bndb'" in result["note"]
 
 
+def test_the_degraded_rehomed_save_discloses_its_collision_too_867(
+        monkeypatch, tmp_path):
+    """The THIRD disclosure callsite, and round 2 left it uncovered.
+
+    A save whose `create_database` re-homes the live view and whose restore
+    then fails returns a degraded `rehomed` success. Its own comment says the
+    disclosure must be unconditional there, because that branch wrote a real
+    file and can land on another open target exactly like the clean one --
+    and deleting the call left both bridge test files fully green (322
+    passed), which is the same "declared load-bearing, covered by nothing"
+    shape as the original blocker.
+
+    The note assertion is the part that matters: the degraded branch already
+    SET a note, so the disclosure has to append to it. A disclosure that
+    overwrote it would tell the caller their database collides while hiding
+    that their live target is still homed at the copy.
+    """
+    from _bridge_fakes import _RestoreFailSaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "svc"
+    binary.write_bytes(b"\x7fELF")
+    dest = tmp_path / "export.bndb"
+    other = {"target_id": "t:3", "selector": "export.bndb",
+             "filename": str(dest)}
+    answers = [None, other]
+
+    bv = _RestoreFailSaveBV(str(binary))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: answers.pop(0) if answers else other)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+
+    result = instance._save_database(None, str(dest))
+
+    # The premise: this is really the DEGRADED branch, not the clean one.
+    assert result["rehomed"] is True
+    assert result["saved"] is True
+    assert answers == [], "both probe points must have been reached"
+
+    assert result.get("collides_with_open_target") == other
+    assert "also open as target" in result["note"]
+    assert "could not restore" in result["note"], (
+        "the disclosure must APPEND to the degradation note, not replace it")
+
+
 def test_save_through_a_hard_link_records_the_database_despite_inode_replacement_869(
         monkeypatch, tmp_path):
     """#889c finding 1: the identity fix was evaluated at the wrong MOMENT.

@@ -3209,6 +3209,12 @@ def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
     assert container != "items", (
         "the batch deliberately does not use the paged-collection container, "
         "which is exactly why the reference has to say so")
-    for name in (envelope["kind"], container, "requested", "resolved"):
+    # The counters come off the envelope too. Retyping `requested`/`resolved`
+    # here made the docstring's claim false for exactly those two: renaming
+    # one in the producer left this guard green.
+    counters = sorted(k for k, v in envelope.items()
+                      if isinstance(v, int) and not isinstance(v, bool))
+    assert counters, "the batch envelope no longer carries a shortfall counter"
+    for name in (envelope["kind"], container, *counters):
         assert f"`{name}`" in doc or f'"{name}"' in doc, (
             f"reading.md never names the batch envelope's {name!r}")
