@@ -3900,7 +3900,8 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             # #812: the frontier count is computed by the bridge against the
             # canonical blocking-leaf vocabulary and carried on the row. It used
             # to be recomputed here against one hard-coded kind, which reported
-            # zero for the other ten and dropped the marker. Absent (a bridge
+            # zero for the other NINE of the ten canonical blocking kinds and
+            # dropped the marker. Absent (a bridge
             # older than this CLI) -> show no marker rather than a number this
             # side cannot derive correctly.
             nfront = br.get("frontier")

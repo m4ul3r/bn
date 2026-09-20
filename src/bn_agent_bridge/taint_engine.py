@@ -2027,7 +2027,7 @@ class TaintEngine:
                 # #812: this callsite's BLOCKING frontier-leaf count, derived
                 # from the canonical BLOCKING_LEAF_KINDS. The text renderer used
                 # to compute its own "(N frontier)" marker by counting a single
-                # hard-coded kind (`unmodeled_callee`) out of the eleven that
+                # hard-coded kind (`unmodeled_callee`) out of the ten that
                 # block a claim, so every other frontier -- an under-recovered
                 # arg, a coarse store, a pointer escape, an unresolved indirect
                 # call, an unlifted instruction -- displayed as zero and the
