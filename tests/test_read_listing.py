@@ -1006,12 +1006,24 @@ def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeyp
 
 
 def _duplicate_starts_bullet() -> str:
-    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`."""
+    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`.
+
+    The WHOLE entry, continuation lines included. Returning only the first line
+    that mentions the key let a second physical line of the same bullet carry
+    prose no check ever saw (#757 review round 6).
+    """
     reference = (Path(__file__).resolve().parent.parent
                  / "skills" / "bn" / "reference" / "reading.md")
-    for line in reference.read_text(encoding="utf-8").splitlines():
-        if "duplicate_starts_unresolved" in line:
-            return line
+    lines = reference.read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines):
+        if "duplicate_starts_unresolved" not in line:
+            continue
+        entry = [line]
+        for nxt in lines[i + 1:]:
+            if not nxt.strip() or nxt.startswith("- ") or nxt.startswith("#"):
+                break
+            entry.append(nxt)
+        return "\n".join(entry)
     raise AssertionError("reading.md carries no duplicate-start bullet")
 
 
@@ -1064,6 +1076,46 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
     ])
     paged = instance._list_functions(None, offset=3, limit=2)
 
+    # THE FOUR TEXT SURFACES that print a post-collapse function count, so the
+    # bullet's claims about WHERE the note appears are measured rather than
+    # asserted. `target info` reads the summary the bridge builds; the orient
+    # card reads the digest shape `_orient_digest` produces (its key COPY is
+    # pinned by `test_orient_digest_discloses_the_duplicate_start_collapse_757`
+    # -- what is measured here is the text face, which is what the bullet
+    # claims).
+    surface_bv = _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub", total_bytes=4),
+        _FakeFunction(0x401100, "widget_tick", total_bytes=64),
+        _FakeFunction(0x401100, "tick_stub"),
+    ])
+    summary = bridge._function_name_summary(surface_bv)
+    count_env = instance._list_functions(None, count_only=True)
+    faces = {
+        "listing": formatters._render_function_list_text(instance._list_functions(None)),
+        "count": formatters._render_function_count_text(count_env),
+        # A real card, not a two-line stub: the note has to sit UNDER the count
+        # with the rest of the card after it, which a stub cannot show.
+        "target info": formatters._render_target_summary(
+            {"selector": "t", "arch": "x86_64", "import_symbol_count": 0, **summary}),
+        "evidence orient": formatters._render_orient_text({
+            "kind": "orient_digest", "target": {"basename": "t"}, "analyzed": True,
+            "analysis_state": "full",
+            "function_count": count_env["total"],
+            **{k: v for k, v in count_env.items() if k.startswith("duplicate_start")},
+            "imports_summary": {"total_symbols": 0, "by_kind": {}},
+        }),
+    }
+
+    def _note_line(face: str) -> int:
+        lines = faces[face].splitlines()
+        return next((i for i, line in enumerate(lines) if "duplicate starts" in line), -1)
+
+    def _count_line(face: str) -> int:
+        lines = faces[face].splitlines()
+        return next((i for i, line in enumerate(lines) if "functions" in line), -1)
+
     # CLEAN: nothing collided, so nothing may be published or printed.
     _view(monkeypatch, instance, [_FakeFunction(0x401000, "widget_init", total_bytes=28)])
     clean = instance._list_functions(None)
@@ -1093,14 +1145,30 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
         # Rows of a duplicated start are labelled individually.
         "rows_are_labelled": {row.get("duplicate_start") for row in unresolved_rows} == {
             "unresolved"},
-        # Both keys are published, and the text face prints them.
+        # Both keys are published...
         "both_keys_published": {
             k for env in (resolved, unresolved) for k in env
             if k.startswith("duplicate_starts_")
         } == {"duplicate_starts_collapsed", "duplicate_starts_unresolved"},
-        "text_prints_the_counts": (
-            "duplicate starts" in formatters._render_function_list_text(unresolved)
-            and "duplicate starts" in formatters._render_function_count_text(kept)
+        # ...and EVERY text face that prints a post-collapse function count
+        # prints the note. Measured across all four, so the bullet cannot name
+        # a surface the note does not reach (nor stay silent about one it does).
+        "text_prints_on_every_surface": all(_note_line(f) >= 0 for f in faces),
+        # WHERE it appears differs, and the bullet has to say so: the two
+        # listing surfaces end with it...
+        "note_is_last_on_the_listing_surfaces": all(
+            _note_line(f) == len(faces[f].splitlines()) - 1 for f in ("listing", "count")
+        ),
+        # ...while the two cards put it directly under the count it modifies,
+        # with more of the card after it.
+        "note_sits_under_the_count_on_the_cards": all(
+            _note_line(f) == _count_line(f) + 1
+            and _note_line(f) < len(faces[f].splitlines()) - 1
+            for f in ("target info", "evidence orient")
+        ),
+        # ...so "trailing" is not true of every surface, and may not be claimed.
+        "note_is_last_everywhere": all(
+            _note_line(f) == len(faces[f].splitlines()) - 1 for f in faces
         ),
         # `--offset`/`--limit` do not move the counts: this page carries the
         # disclosure while holding none of the addresses it counts.
@@ -1122,22 +1190,43 @@ def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
     }
 
 
+#: The bullet, pinned EXACTLY. Every check below decides the claims it can
+#: name; four rounds of review proved that a claim can always be phrased to
+#: sit outside whatever the current rule inspects -- token-free, behind a
+#: comma, in a semicolon clause, on a continuation line. Finer split rules
+#: lose that race by construction. Equality does not: the prose cannot change
+#: at all without this failing, and the only legitimate way to change it is to
+#: edit this constant, which puts a human back in front of the paired claims
+#: below and the measurements behind them. The claims are what make the pinned
+#: text TRUE; this makes it the only text that ships (#757 review round 6).
+_PINNED_BULLET = (
+    '- **Duplicate function start addresses are disclosed in text, not only in JSON.** Binary Ninja can hold two Function records for one start address with conflicting sizes (#757). '
+    '`function list` and `function search` collapse the same population, everything `--min-address`/`--max-address` left, before the query matches anything; what happens there depends on whether the records can be RANKED. '
+    '**Ranked** (every extent readable): the address answers with ONE row carrying the larger extent, the rest are gone from both commands, and naming it returns nothing. '
+    "**Unranked** (any extent unreadable): no record is chosen, so ALL of that address's records stay in the answer, however many there are, and naming any of them returns it. "
+    'A record BN did size still reports `size_known: true` there, which means BN stated a size, not "this size won". '
+    'Each returned row of a duplicated start therefore carries `duplicate_start`: `"collapsed"` when this record won on extent, `"unresolved"` when nothing was ranked here — so a `--sort size` page that splits the group apart is still self-describing. '
+    'The counts are `duplicate_starts_collapsed` / `duplicate_starts_unresolved`, printed in text as a `// duplicate starts` line: last on the `function list` listing and on `--count`, and directly under the function count on `target info` and on `evidence orient`, whose counts are post-collapse too. '
+    '**Scope, one rule:** both counts are taken over the whole filtered answer `total` reports, everything `--min-size`, `--named` and the query left, and are NOT affected by `--offset`/`--limit`, so a page can disclose an address none of its rows holds, which is why the note names the total it counted against and why the rows carry their own label. '
+    'They count ADDRESSES, not dropped records: a filter that removes every record of an address removes its count with it, while an address that keeps even one record stays counted, so `duplicate_starts_unresolved: 1` beside `total: 1` is the expected shape, not a missing row. '
+    'Both keys exist only when non-zero, so a clean view prints nothing extra.'
+)
+
+
 #: Splits the bullet into sentences. The trailing class swallows the markdown
 #: that closes one (`**`, a quote, a bracket) so the terminator is still the
 #: period the lookbehind matched.
 _SENTENCE_SPLIT = re.compile(r"(?<=\.)[*`\"')\]]*\s+")
 
-#: ...and into CLAUSES, at every aside boundary, so a claim smuggled into a
-#: parenthetical or an em-dash aside is its own unit rather than riding on the
-#: anchor of the sentence that encloses it.
-_CLAUSE_SPLIT = re.compile(r"[.;()\u2014]")
-
-#: A clause NAMING a CLI flag is making an operational claim. (An envelope or
-#: row key makes one too; that vocabulary is derived from the measurement
-#: rather than listed here, so a key the bridge stops emitting stops being
-#: load-bearing on its own.) A clause that names neither is decoration --
-#: "(every extent readable)", "(#757)" -- and is not required to carry one.
-_CLI_FLAG = re.compile(r"--[a-z][a-z-]*")
+#: Every technical token in the bullet -- anything backticked, and every CLI
+#: flag -- must sit INSIDE a measured claim. Chasing ever-finer split points
+#: (sentence, then parenthetical, then comma) is an arms race the prose keeps
+#: winning; this is granularity-free instead. Strip the measured claims out of
+#: the bullet and whatever technical content is left over is, by construction,
+#: an assertion nothing decides. Connective prose -- "what happens there
+#: depends on", "(every extent readable)" -- carries no such token and stays
+#: free.
+_TECHNICAL_TOKEN = re.compile(r"`|--[a-z]")
 
 
 def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
@@ -1148,32 +1237,44 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     its mirror image, because the guard here was three `in bullet` checks plus
     one absence check: prose that was plainly false about the unresolved case
     still passed it, so nothing ever caught the replacement (#757 review round
-    4). Two properties close that, and BOTH are needed:
+    4). Three properties close that, and all three are needed:
 
     * every claim below is PAIRED with the measurement that decides it and
       asserted as `(phrase in bullet) is measured`, so the bullet cannot state
       a rule the bridge does not hold nor omit one it does -- change the
-      collapse rule and the required and forbidden sets swap; and
-    * the claim inventory is COMPLETE: every sentence of the bullet must carry
-      one of those measured claims. Pairing alone only decides the sentences it
-      enumerates, so a bullet that GROWS a sentence -- rather than flipping an
-      enumerated one -- still shipped false prose green (#757 review round 5).
-      An unanchored sentence is an assertion nothing here measures, and it
-      fails.
+      collapse rule and the required and forbidden sets swap;
+    * every SENTENCE must carry one of those measured claims, because pairing
+      alone decides only the sentences it enumerates and a bullet that GREW a
+      sentence still shipped false prose green (#757 review round 5); and
+    * every TECHNICAL TOKEN -- anything backticked, any CLI flag -- must sit
+      inside one. Sentence coverage still let a false claim ride into an
+      anchored sentence behind a comma, and chasing finer split points is an
+      arms race the prose keeps winning (#757 review round 6). Stripping the
+      measured claims and requiring the residue to be free of technical tokens
+      is granularity-free: whatever is left cannot make an operational claim.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     m = _measure_duplicate_start_behaviour(bridge, instance, monkeypatch)
     bullet = _duplicate_starts_bullet()
+    # The whole entry, exactly -- no comma, clause, continuation line or
+    # token-free sentence can reach the reference without coming through the
+    # claims below first.
+    assert bullet == _PINNED_BULLET, (
+        "the reference entry no longer matches its pin. Every claim in it is "
+        "MEASURED below; change the prose only by editing `_PINNED_BULLET` and "
+        "re-deriving those measurements.\nshipped: " + bullet)
 
     claims = (
         ("the collapse is disclosed on the text face, not only in the JSON",
-         m["text_prints_the_counts"], "disclosed in text, not only in JSON"),
+         m["text_prints_on_every_surface"], "disclosed in text, not only in JSON"),
         ("BN can hold several records for one start address, with sizes that disagree",
          m["one_start_holds_conflicting_records"],
          "two Function records for one start address with conflicting sizes"),
         ("the collapse runs on the address-filtered population, ahead of the query",
-         m["dropped_is_unreachable"], "before the query matches anything"),
+         m["dropped_is_unreachable"],
+         "`function list` and `function search` collapse the same population, everything "
+         "`--min-address`/`--max-address` left, before the query matches anything"),
         ("a ranked start answers with one row carrying the larger extent",
          m["resolved_is_one_row"], "ONE row carrying the larger extent"),
         ("the record the collapse dropped cannot be named back",
@@ -1183,9 +1284,14 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
         ("every record of an unranked start is still reachable by name",
          m["unranked_records_reachable"], "naming any of them returns it"),
         ("a sized record of an unranked start still reports size_known: true",
+         m["unranked_sized_record_keeps_size_known"],
+         "A record BN did size still reports `size_known: true` there"),
+        ("...and that size is not a won comparison",
          m["unranked_sized_record_keeps_size_known"], 'not "this size won"'),
         ("each row of a duplicated start is labelled individually",
-         m["rows_are_labelled"], "therefore carries `duplicate_start`"),
+         m["rows_are_labelled"],
+         'therefore carries `duplicate_start`: `"collapsed"` when this record won on '
+         'extent, `"unresolved"` when nothing was ranked here'),
         ("a --sort size page that separates the group still self-describes",
          m["rows_are_labelled"],
          "`--sort size` page that splits the group apart is still self-describing"),
@@ -1194,7 +1300,19 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
          "everything `--min-size`, `--named` and the query left"),
         ("the two counts are the published disclosure keys",
          m["both_keys_published"],
-         "`duplicate_starts_collapsed` / `duplicate_starts_unresolved`"),
+         "The counts are `duplicate_starts_collapsed` / `duplicate_starts_unresolved`"),
+        ("every text face that prints a post-collapse count prints the note",
+         m["text_prints_on_every_surface"],
+         "printed in text as a `// duplicate starts` line"),
+        ("the two listing surfaces end with the note",
+         m["note_is_last_on_the_listing_surfaces"],
+         "last on the `function list` listing and on `--count`"),
+        ("the two cards put the note directly under the count it modifies",
+         m["note_sits_under_the_count_on_the_cards"],
+         "directly under the function count on `target info` and on `evidence orient`"),
+        ("the counts are scoped to the number total reports",
+         m["filter_keeps_the_count"],
+         "both counts are taken over the whole filtered answer `total` reports"),
         ("the counts are unaffected by --offset/--limit",
          m["counts_survive_paging"], "NOT affected by `--offset`/`--limit`"),
         ("a filter that removes every record of an address removes its count",
@@ -1213,6 +1331,11 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
          "each address answers with one row"),
         ("the counts describe the rows the answer contains",
          not m["counts_survive_paging"], "describe the rows the answer contains"),
+        # The note is the LAST line on two surfaces and mid-card on the other
+        # two, so "trailing" as a blanket claim sends a reader to the end of a
+        # card that discloses in the middle (#757 review round 6).
+        ("the note is trailing on every surface",
+         m["note_is_last_everywhere"], "as a trailing `// duplicate starts` line"),
     )
     for what, measured, phrase in claims:
         verb = "must state" if measured else "must NOT state"
@@ -1233,23 +1356,19 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     assert not unused, (
         "these measured claims anchor no sentence, so the inventory and the "
         f"prose have drifted apart: {unused}")
-    # ...and the same at CLAUSE granularity for any aside that makes an
-    # OPERATIONAL claim -- one naming a CLI flag or an envelope/row key. That
-    # is the smuggling route sentence coverage leaves open: a parenthetical
-    # inside an anchored sentence. Decorative asides name neither and are
-    # exempt, so the rule does not force an anchor onto "(every extent
-    # readable)".
-    keys = {k for env in m["envelopes"] for k in env if "_" in k}
-    keys |= {k for row in m["rows"] for k in row if "_" in k}
-    operational = [
-        c for c in _CLAUSE_SPLIT.split(bullet)
-        if c.strip() and (_CLI_FLAG.search(c) or any(k in c for k in keys))
-    ]
-    smuggled = [c for c in operational if not any(a in c for a in anchors)]
-    assert not smuggled, (
-        "these clauses name a flag or an envelope key -- they make an "
-        "operational claim -- but carry none of the measured claims above, so "
-        f"nothing here decides whether they are true: {smuggled}")
+    # ...and no technical token may sit OUTSIDE one. Strip every measured claim
+    # from the bullet; what remains must be connective prose, because anything
+    # backticked or flag-shaped in the residue is an operational assertion this
+    # test does not decide. This is what closes the comma route, and every
+    # finer one after it, without another split rule.
+    residue = bullet
+    for anchor in anchors:
+        residue = residue.replace(anchor, " ")
+    leftover = [frag for frag in residue.split() if _TECHNICAL_TOKEN.search(frag)]
+    assert not leftover, (
+        "these technical tokens sit outside every measured claim, so nothing "
+        f"here decides what the prose around them asserts: {leftover}\n"
+        f"residue: {residue}")
 
     # Every disclosure key the bridge actually emits is named, so a new one
     # cannot ship undocumented.
