@@ -1005,26 +1005,56 @@ def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeyp
     assert searched["duplicate_starts_unresolved"] == 1
 
 
+#: Ends the duplicate-start list item: the next top-level bullet, or a real
+#: ATX heading (CommonMark needs the space -- `#757 note:` is NOT a heading, it
+#: is a lazy continuation of this item, which is exactly how round 7's review
+#: smuggled false prose past a first-line-only extractor).
+_ENTRY_END = re.compile(r"- |#{1,6}\s")
+
+
 def _duplicate_starts_bullet() -> str:
     """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`.
 
-    The WHOLE entry, continuation lines included. Returning only the first line
-    that mentions the key let a second physical line of the same bullet carry
-    prose no check ever saw (#757 review round 6).
+    The WHOLE list item: from its first line to the line that opens the NEXT
+    item, blank lines and indented paragraphs included. Two narrower rules have
+    already been defeated -- returning the first line only (round 6), and
+    stopping at the first blank or `#`-prefixed line (round 7), which let a
+    lazy continuation and an indented second paragraph carry prose no check
+    ever saw. Everything between the two bullets belongs to this entry, so
+    everything between them is compared.
     """
     reference = (Path(__file__).resolve().parent.parent
                  / "skills" / "bn" / "reference" / "reading.md")
     lines = reference.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if "duplicate_starts_unresolved" not in line:
-            continue
-        entry = [line]
-        for nxt in lines[i + 1:]:
-            if not nxt.strip() or nxt.startswith("- ") or nxt.startswith("#"):
-                break
-            entry.append(nxt)
-        return "\n".join(entry)
-    raise AssertionError("reading.md carries no duplicate-start bullet")
+    starts = [i for i, line in enumerate(lines)
+              if "duplicate_starts_unresolved" in line]
+    assert starts, "reading.md carries no duplicate-start bullet"
+    assert len(starts) == 1, (
+        "more than one line of reading.md names the disclosure key, so the "
+        f"entry is no longer identifiable: lines {[i + 1 for i in starts]}")
+    entry = [lines[starts[0]]]
+    for nxt in lines[starts[0] + 1:]:
+        if _ENTRY_END.match(nxt):
+            break
+        entry.append(nxt)
+    return "\n".join(entry)
+
+
+def _publishes_duplicate_starts(payload) -> bool:
+    """Does this payload disclose a duplicated start ANYWHERE in JSON?
+
+    Recursive on purpose. `evidence orient` carries the counts twice -- at its
+    own level and inside its nested `target` block -- so a top-level-only test
+    reads a payload that still discloses in JSON as silent, and the entry's
+    parity claim then holds vacuously on exactly the surface it was written
+    for (#757 review round 7).
+    """
+    if isinstance(payload, Mapping):
+        return any(str(k).startswith("duplicate_start")
+                   or _publishes_duplicate_starts(v) for k, v in payload.items())
+    if isinstance(payload, (list, tuple)):
+        return any(_publishes_duplicate_starts(v) for v in payload)
+    return False
 
 
 def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
@@ -1035,13 +1065,23 @@ def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
     disclosure exactly when the payload behind it publishes it. Where the line
     lands inside a card is a rendering detail and is deliberately not claimed
     (#757 review round 7).
+
+    Each face is the payload the bridge really builds rendered by the text
+    renderer the COMMAND really uses -- `target info` composes annotations onto
+    the shared summary, so measuring the shared renderer measured a proxy.
     """
     from bn import formatters
+    from bn.commands import binary as binary_cmd
 
     bv = _view(monkeypatch, instance, population)
-    monkeypatch.setattr(instance, "_target_info",
-                        lambda sel: {"basename": "t", "analyzed": True,
-                                     "analysis_state": "full"})
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    listing = instance._list_functions(None)
+    counted = instance._list_functions(None, count_only=True)
+    info = instance._target_info(None)
+    # Only the digest's sub-reads are stubbed, and only the ones that need a
+    # richer view than this population: its function count, and both counts,
+    # still come from the real collapse.
     monkeypatch.setattr(bridge.read_misc, "_imports",
                         lambda ctx, sel, **k: {"kind": "imports_summary",
                                                "total_symbols": 0, "by_kind": {}})
@@ -1049,19 +1089,13 @@ def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
                         lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
     monkeypatch.setattr(bridge.read_misc, "_sections",
                         lambda ctx, sel, **k: {"items": [{"name": ".text"}], "total": 1})
-
-    listing = instance._list_functions(None)
-    counted = instance._list_functions(None, count_only=True)
-    summary = {"selector": "t", "arch": "x86_64", "import_symbol_count": 0,
-               **bridge._function_name_summary(bv)}
-    # The REAL digest, not a hand-built dict: the orient card is the surface
-    # that took the post-collapse number while leaving its two keys behind.
     digest = instance._orient_digest(None)
     return {
         "function list": (listing, formatters._render_function_list_text(listing)),
         "function list --count": (counted,
                                   formatters._render_function_count_text(counted)),
-        "target info": (summary, formatters._render_target_summary(summary)),
+        "target info": (info,
+                        binary_cmd._render_target_info_text_with_annotations(info)),
         "evidence orient": (digest, formatters._render_orient_text(digest)),
     }
 
@@ -1134,6 +1168,11 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
         "markers": tuple(sorted(
             {row[k] for env in (ranked, unranked) for row in env["items"]
              for k in row_keys if k in row})),
+        # Which marker each case puts on its rows, so the entry can say what
+        # the two values MEAN without the mapping being a phrase.
+        "ranked_marker": ranked_rows[0].get("duplicate_start") if ranked_rows else None,
+        "unranked_marker": ({row.get("duplicate_start") for row in unranked_rows}
+                            or {None}).pop(),
         "ranked_rows": len(ranked_rows),
         "ranked_kept_size": ranked_rows[0]["size"] if ranked_rows else None,
         "ranked_group_sizes": tuple(sorted(
@@ -1150,12 +1189,22 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
                                              for row in paged["items"]),
         "parity": tuple(
             (f"{state} {face}",
-             any(k.startswith("duplicate_start") for k in payload),
+             _publishes_duplicate_starts(payload),
              "duplicate starts" in text)
             for state, faces in (("collided", collided), ("clean", clean_faces))
             for face, (payload, text) in faces.items()
         ),
     }
+
+
+#: The only backticked tokens the rendered entry may name that do NOT come off
+#: an envelope: the two commands that collapse, the total the counts are taken
+#: over, and the two paging flags they ignore. Everything else it backticks
+#: has to be a measured key or marker, which is what makes an invented or
+#: mis-spelled identifier unwritable rather than merely undocumented.
+_RENDER_VOCABULARY = frozenset({
+    "function list", "function search", "total", "--offset", "--limit",
+})
 
 
 def _render_duplicate_starts_bullet(m: dict) -> str:
@@ -1170,27 +1219,36 @@ def _render_duplicate_starts_bullet(m: dict) -> str:
     so this stops deriving it from prose: the entry's operative content is
     produced HERE, out of the measurement, and the file has to match.
 
-    The trade is stated rather than papered over, because over-claiming is
-    what this entry keeps being reviewed for.
+    The trade is stated exactly, because over-claiming is what this entry
+    keeps being reviewed for and round 7's first attempt over-claimed here.
 
-    Closed: doc-side drift of any shape -- a clause, a comma, a continuation
-    line, a whole new sentence -- because the file must EQUAL this render; and
-    every identifier, marker and number the entry states, because the test
-    checks the RENDER against the measured sets, so swapping an interpolation
-    here for a literal is red even when the reference is edited to match.
+    Closed: doc-side drift of ANY shape. The reference's whole list item --
+    continuation lines, lazy `#`-prefixed lines and indented paragraphs
+    included -- must EQUAL this render, so nothing reaches the reference that
+    did not come through here.
 
-    Not closed: the words that render a boolean (which extent wins, whether
-    every unranked record survives) and the connective sentences that state no
-    identifier and no number. An author editing those here and in the
-    reference together is unreachable, and rounds 3-6 escalated a
-    prose-derived guard five times proving it. What makes it survivable is the
-    size of the claim: the entry says what a duplicated start does to the ROWS
-    and to the COUNTS and stops, so this template is short enough to read
+    Narrowed, not closed: the render's technical vocabulary. Every backticked
+    token in it must be a key or marker the envelope produced or one of the
+    few command/flag names in `_RENDER_VOCABULARY`, and every number must be
+    one the measurement supplied, so an invented key, a forged marker or an
+    unmeasured count cannot be written here at all. Reusing vocabulary that IS
+    measured is still possible.
+
+    NOT closed, and nothing closes it: an author who edits this template and
+    the reference together in plain English drawn from the measured
+    vocabulary. Round 7's review demonstrated ten such edits shipping green --
+    a "usually" hedge, a contradicting parenthetical, a verbless clause, a
+    claim about a command the entry does not name, a false count reusing a
+    measured digit, and a consistent DELETION of a true clause among them.
+    Rounds 3-6 escalated a prose-derived guard five times trying to close this
+    class and each escalation was defeated; the operator's ruling for round 7
+    was to stop escalating and cut the claim instead. What makes the residual
+    survivable is size: the entry says what a duplicated start does to the
+    ROWS and to the COUNTS and stops, so this template is short enough to read
     whole and a sentence in it with no measured value beside it is visible on
     sight.
     """
     keys = " / ".join(f"`{k}`" for k in m["count_keys"])
-    markers = " or ".join(f'`"{v}"`' for v in m["markers"])
     row_key = " / ".join(f"`{k}`" for k in m["row_keys"])
     extent = ("larger" if m["ranked_kept_size"] == max(m["ranked_group_sizes"])
               else "smaller")
@@ -1210,12 +1268,15 @@ def _render_duplicate_starts_bullet(m: dict) -> str:
         f"the {extent} extent, and naming a record the collapse dropped returns "
         f"{m['ranked_dropped_hits']} rows. **Unranked** (any extent unreadable): "
         f"no record is chosen, so {stays} and {named}. Each returned row of a "
-        f"duplicated start carries {row_key}, {markers}. The counts {keys} count "
-        "ADDRESSES, not dropped records, over the whole filtered answer `total` "
-        "reports, and are unchanged by `--offset`/`--limit` -- so a page can "
-        "disclose an address none of its rows holds -- and are absent when zero. "
-        "Wherever a payload publishes them its text face prints them too, so no "
-        "text face reads clean while its JSON discloses."
+        f"duplicated start carries {row_key} — "
+        f'`"{m["ranked_marker"]}"` on the row a ranked address kept, '
+        f'`"{m["unranked_marker"]}"` on every row of an address nothing could '
+        f"be ranked at. The counts {keys} count ADDRESSES, not dropped records, "
+        "over the whole filtered answer `total` reports, and are unchanged by "
+        "`--offset`/`--limit` — so a page can disclose an address none of its "
+        "rows holds — and are absent when zero. Wherever a payload publishes "
+        "them its text face prints them too, so no text face reads clean while "
+        "its JSON discloses."
     )
 
 
@@ -1265,8 +1326,9 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     assert m["paged_count"] == 1 and not m["paged_holds_a_counted_address"], m
 
     # --- TEXT / JSON PARITY ---------------------------------------------
-    # The only text claim: a face discloses exactly when its payload publishes.
-    # Both directions, on a collided view and on a clean one.
+    # The only text claim: a face discloses exactly when its payload publishes
+    # it ANYWHERE, nested blocks included. Both directions, on a collided view
+    # and on a clean one.
     for face, publishes, discloses in m["parity"]:
         assert discloses is publishes, (
             f"{face}: payload publishes={publishes} but its text "
@@ -1276,16 +1338,25 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
 
     # --- THE REFERENCE IS THAT MEASUREMENT, RENDERED --------------------
     expected = _render_duplicate_starts_bullet(m)
-    # First: the render may only STATE values the measurement produced. An
-    # interpolation swapped for a literal -- the one way the template could
-    # still be edited into agreement with a false reference -- is red here.
-    assert set(re.findall(r"duplicate_start\w*", expected)) == (
-        set(m["count_keys"]) | set(m["row_keys"])), expected
-    assert set(re.findall(r'`"(\w+)"`', expected)) == set(m["markers"]), expected
+    # The render's technical vocabulary is a CLOSED set: every backticked
+    # token in it is a key or marker the envelope produced, or one of the few
+    # command and flag names below. An invented key (hyphenated or otherwise),
+    # a forged marker and an unmeasured count are unwritable here, in the
+    # template as much as in the reference.
+    measured_vocabulary = (set(m["count_keys"]) | set(m["row_keys"])
+                           | {f'"{v}"' for v in m["markers"]})
+    backticked = set(re.findall(r"`([^`]+)`", expected))
+    assert backticked - _RENDER_VOCABULARY == measured_vocabulary, (
+        "the rendered entry names technical tokens the envelope did not "
+        f"produce: {sorted(backticked - _RENDER_VOCABULARY - measured_vocabulary)}"
+        f"\nmeasured: {sorted(measured_vocabulary)}\n{expected}")
     assert set(re.findall(r"\d+", expected)) == {
         "757",                                   # the issue this entry answers
         str(m["ranked_rows"]), str(m["ranked_dropped_hits"]),
     }, expected
+    # ...and the marker mapping the entry states is the one the rows carry.
+    assert f'`"{m["ranked_marker"]}"` on the row a ranked address kept' in expected
+    assert m["ranked_marker"] != m["unranked_marker"], m
     assert _duplicate_starts_bullet() == expected, (
         "skills/bn/reference/reading.md's duplicate-start entry is not what the "
         "bridge measures. This entry is GENERATED from the measurement above -- "
