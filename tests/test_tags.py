@@ -105,7 +105,12 @@ def test_tag_get_and_types_carry_the_kind_discriminator_819():
     consumer could not tell either payload apart from any other object read --
     the discriminator is what #275 makes the one thing every read shares. Both
     are unpaged (they return the whole set), so neither carries the paging quad;
-    `count` stays the size of the container the renderers read."""
+    `count` stays the size of the container the renderers read.
+
+    `tag get` is `tags_at`, NOT `tags`: the paged `tag list` already answers to
+    `tags` with its rows under `items`, and one discriminator naming two shapes
+    hands a consumer that branches on it a silent null from whichever it did not
+    expect."""
     bv, fn = _bv_with_tagged_fn()
 
     types = read_tags._list_tag_types(_CtxFn(bv), None)
@@ -113,12 +118,16 @@ def test_tag_get_and_types_carry_the_kind_discriminator_819():
     assert types["count"] == len(types["tag_types"])
 
     by_address = read_tags._get_tags(_CtxFn(bv), None, "0x1010", None)
-    assert by_address["kind"] == "tags"
+    assert by_address["kind"] == "tags_at"
     assert by_address["count"] == len(by_address["tags"])
 
     by_function = read_tags._get_tags(_CtxFn(bv), None, None, "sub_1000")
-    assert by_function["kind"] == "tags"
+    assert by_function["kind"] == "tags_at"
     assert by_function["count"] == len(by_function["tags"])
+
+    paged = read_tags._list_tags(_CtxFn(bv), None)
+    assert paged["kind"] == "tags" and "items" in paged
+    assert by_address["kind"] != paged["kind"]
 
 
 def test_list_tags_all_scopes_deduped_and_paged():

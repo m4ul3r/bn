@@ -277,7 +277,7 @@ def _callee_function_for_call(ctx, bv, dest_value, target):
 
 
 def _abi_arg_register_names(bv, callee_fn) -> list[str]:
-    """The platform's integer argument registers, in ABI order (#865).
+    """The platform's integer argument registers, in ABI order (#882).
 
     Same two-step lookup `_abi_arg_register_count` has always used -- the callee's
     own calling convention, else the platform default -- but NAMES are what the
@@ -374,7 +374,7 @@ def _undecorated_name(name: str) -> bool:
     (`.cold`, `.part`) and versioned symbols, which it does.
 
     Two callers, one rule: `_library_param_count` refuses a decorated name whose
-    library signature might differ by an invisible parameter, and the #865
+    library signature might differ by an invisible parameter, and the #882
     callee-body witness refuses it for the same reason from the other direction.
     """
     return bool(name) and not name.startswith(_MANGLED_PREFIXES) \
@@ -1015,8 +1015,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
         # not `indirect_call` -- the latter is purely a call-shape mirror of
         # `direct` and does not by itself mean the arity is unknown).
-        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments,
-                                         read_cache=callee_read_cache)
+        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
         elif (

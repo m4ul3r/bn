@@ -2110,8 +2110,11 @@ def test_function_evidence_slicing_471(monkeypatch):
 def test_function_evidence_paging_validation_matches_the_shared_helper_827(monkeypatch):
     """#827 item 8: the bridge re-enforces the CLI's argparse contract for a raw
     socket / `py exec` client, and it must do so with the SAME code and wording
-    every other paged read uses (`_validate_count`) instead of ad-hoc
-    `invalid_context`/"Invalid offset: -1" messages that no sibling op emits.
+    every other paged read uses (`_validate_count`) instead of the ad-hoc
+    `invalid_context`/"Invalid offset: -1" messages this op used to emit. The
+    sibling `callsites` read (`read_listing.py`) still raises `invalid_context`
+    with the same ad-hoc idiom and is out of this PR's scope -- so this asserts
+    the SHARED wording, not that the old spelling is extinct.
     Validation runs before the view is resolved, so no view is needed here."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

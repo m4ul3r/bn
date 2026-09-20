@@ -59,7 +59,7 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
             _tag_entry(t, scope="function", address=None, function=fn.name)
             for t in fn.get_function_tags(auto=False)
         ]
-        return {"kind": "tags", "function": fn.name, "address": hex(int(fn.start)),
+        return {"kind": "tags_at", "function": fn.name, "address": hex(int(fn.start)),
                 "tags": tags, "count": len(tags)}
 
     if address is None:
@@ -79,8 +79,11 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
     if not tags:
         _require_mapped_address(bv, addr)
     # #819: the same #275 discriminator as the function branch above -- `tags` is
-    # the container the renderer reads, `count` its size.
-    return {"kind": "tags", "address": hex(addr), "tags": tags, "count": len(tags)}
+    # the container the renderer reads, `count` its size. Deliberately NOT `tags`,
+    # which the PAGED `tag list` already claims for an `items`-shaped payload: one
+    # `kind` naming two shapes is the silent-null failure #275 exists to stop, so
+    # the scoped read gets its own discriminator.
+    return {"kind": "tags_at", "address": hex(addr), "tags": tags, "count": len(tags)}
 
 
 def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, Any]]:
