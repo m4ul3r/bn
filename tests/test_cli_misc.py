@@ -1688,118 +1688,187 @@ def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
         assert listing.split("\n! malformed")[0] != quiet_listing, (dropped, listing)
 
 
-def _count_keys_read(fn_node):
-    """The payload keys one count renderer reads, from its own source.
+def _count_keys_read(node, functions, seen=()):
+    """The payload keys one renderer reads, from its own source.
 
     Derived rather than listed, so a renderer that grows a third counter is
-    probed on it without anyone remembering to extend a table."""
+    probed on it without anyone remembering to extend a table. Follows calls
+    to module-local helpers as well, so a renderer that is one line of
+    delegation is probed on the keys that line actually reads. Takes any AST
+    node, because an installed renderer is as often a `lambda` expression as
+    it is a `def`."""
     import ast
 
     keys = set()
-    for node in ast.walk(fn_node):
-        if not isinstance(node, ast.Call):
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Call):
             continue
-        called = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
-        if called == "get" and node.args:
-            arg = node.args[0]
+        called = getattr(inner.func, "attr", None) or getattr(inner.func, "id", None)
+        if called == "get" and inner.args:
+            arg = inner.args[0]
         elif (called in ("_count_field", "_stated_count", "_nonnegative_count")
-                and len(node.args) > 1):
-            arg = node.args[1]
-        elif called == "_field_skewed" and node.args:
-            arg = node.args[0]
+                and len(inner.args) > 1):
+            arg = inner.args[1]
+        elif called == "_field_skewed" and inner.args:
+            arg = inner.args[0]
         else:
             continue
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             keys.add(arg.value)
+    for inner in ast.walk(node):
+        name = (isinstance(inner, ast.Call)
+                and getattr(inner.func, "id", None))
+        if name and name in functions and name not in seen:
+            keys |= _count_keys_read(functions[name], functions, seen + (name,))
     return keys
 
 
-def test_every_count_line_this_module_installs_reads_through_the_choke_point_795():
-    """One count contract, on every `--count` line this module renders (#619).
+def _installed_text_renderers(module):
+    """Every `text_renderer=` a module installs, resolved to a CALLABLE.
 
-    `bn.formatters` keeps the reading honest for the renderers that live there,
-    and the probe population in `tests/test_cli_formatters.py` is derived from
-    that module -- so a `text_renderer=` DEFINED in a command module is reached
-    by no differential, no mirror and no raise sweep. Both of this module's
-    count lines were written that way, and #795 fixed only one of them: the
-    sibling one function below still tested its counter with `isinstance(int)`,
-    which is the same second decider with all three of the same failure modes.
+    The population has to be the renderers themselves rather than their
+    spellings, which is the whole lesson of #795's first five rounds: the
+    guard below was derived first from two hand-named functions, then from a
+    `*_count_text` name suffix, then from that suffix plus a refusal for any
+    lambda whose source contained the literal substring `count`. Each of those
+    is a spelling test, and each was walked past by the next count line that
+    simply spelled itself differently.
 
-    So the guard is derived from the module rather than aimed at one function:
-    every locally-defined renderer the registry installs whose name states a
-    count is driven over the three shapes a raw read gets wrong, on every key
-    its own source reads. And the derivation's own blind spot is closed in the
-    same place -- three of this module's five count lines were inline LAMBDAS,
-    which have no name to probe, so the first version of this guard asserted an
-    inventory of two while five surfaces existed. A count line written as a
-    lambda now fails here instead of quietly joining them.
+    A `lambda` is not actually unprobeable -- it is only unNAMEable. Compiling
+    the expression in its own module's namespace yields the same callable the
+    registry installs, so it is probed like any other, and a lambda that
+    correctly DELEGATES to a choke-point renderer passes instead of being
+    refused for its shape. Returns `(label, callable, ast node)` triples for
+    the renderers this module DEFINES; one imported from `bn.formatters` is
+    already covered by that module's own differential, mirror and raise sweep.
     """
     import ast
     import inspect
     import pathlib
 
-    from bn.commands import misc
-
-    tree = ast.parse(pathlib.Path(inspect.getfile(misc)).read_text(encoding="utf-8"))
+    tree = ast.parse(pathlib.Path(inspect.getfile(module)).read_text(encoding="utf-8"))
     functions = {node.name: node for node in tree.body
                  if isinstance(node, ast.FunctionDef)}
-    renderer_values = [node.value for node in ast.walk(tree)
-                       if isinstance(node, ast.keyword) and node.arg == "text_renderer"]
 
-    # A LAMBDA renderer cannot be probed: it has no name, so nothing below --
-    # and nothing in the formatters sweeps either -- can ever reach it. One that
-    # states a count is the exact shape this guard exists for, so it is refused
-    # outright rather than silently skipped.
-    lambda_counters = [ast.unparse(value) for value in renderer_values
-                       if isinstance(value, ast.Lambda)
-                       and "count" in ast.unparse(value)]
-    assert not lambda_counters, (
-        "these `--count` lines are inline lambdas, so no guard can probe them; "
-        f"give each a named renderer that reads through the choke point: "
-        f"{lambda_counters}")
+    def resolve(node):
+        if isinstance(node, ast.Name):
+            return [(node.id, getattr(module, node.id, None), functions.get(node.id))]
+        if isinstance(node, ast.IfExp):        # `A if flag else B` installs both
+            return resolve(node.body) + resolve(node.orelse)
+        if isinstance(node, ast.Lambda):
+            expression = ast.Expression(body=node)
+            ast.fix_missing_locations(expression)
+            try:
+                fn = eval(compile(expression, "<text_renderer>", "eval"),
+                          vars(module))
+            except Exception:                  # closes over a local: unprobeable
+                fn = None
+            return [(ast.unparse(node), fn, node)]
+        return [(ast.unparse(node), None, None)]
 
-    installed = {inner.id for value in renderer_values
-                 for inner in ast.walk(value)
-                 if isinstance(inner, ast.Name) and inner.id in functions}
-    counters = sorted(name for name in installed if name.endswith("_count_text"))
-    assert counters == ["_exports_count_text", "_go_functions_count_text",
-                        "_imports_count_text", "_sections_count_text",
-                        "_strings_count_text"], (
-        f"the count lines this module installs are {counters}; a new one is a "
-        "new surface that states a number, so add it in the same commit")
+    installed = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "text_renderer":
+            installed.extend(resolve(node.value))
+    # Unprobeable means "no callable came back", or "this module defines it
+    # but its source is somewhere this harness cannot read". A renderer that
+    # resolves fine and simply lives in `bn.formatters` is neither.
+    unresolved = [label for label, fn, node in installed
+                  if not callable(fn)
+                  or (getattr(fn, "__module__", None) == module.__name__
+                      and node is None)]
+    mine = [(label, fn, node) for label, fn, node in installed
+            if callable(fn) and node is not None
+            and getattr(fn, "__module__", None) == module.__name__]
+    return mine, unresolved, functions
 
-    for name in counters:
-        renderer = getattr(misc, name)
-        # Keys read by the renderer itself PLUS by any module-local helper it
-        # delegates to, so a renderer that is one line of delegation is probed
-        # on the keys that line actually reads.
-        keys = set(_count_keys_read(functions[name]))
-        for inner in ast.walk(functions[name]):
-            called = isinstance(inner, ast.Call) and getattr(inner.func, "id", None)
-            if called in functions:
-                keys |= _count_keys_read(functions[called])
-        assert keys, name
 
-        readable = renderer({key: 0 for key in keys})
+def test_every_count_line_this_module_installs_reads_through_the_choke_point_795():
+    """One count contract, on every `--count` line this module renders (#619).
 
-        # (a) A bool is not a count. `bool` IS an `int`, so a raw read prints
-        # the flag as a quantity -- the one shape that reads as data.
-        flagged = renderer({key: True for key in keys})
-        assert "True" not in flagged, (name, flagged)
-        assert flagged != readable, (name, flagged)
+    `bn.formatters` keeps the reading honest for the renderers that live
+    there, and the probe population in `tests/test_cli_formatters.py` is
+    derived from that module -- so a `text_renderer=` DEFINED in a command
+    module is reached by no differential, no mirror and no raise sweep. This
+    module's count lines were all written that way.
 
-        # (b) A numeric string IS a count, and states the same line the integer
-        # spelling does. A raw `isinstance(int)` silently drops the whole
-        # qualifier for a producer that spells its counts as text.
-        assert renderer({key: "7" for key in keys}) == renderer({key: 7 for key in keys}), name
+    Five rounds of #795 review each found the NEXT count line walking past
+    whatever this guard selected on, because every selection so far was a
+    SPELLING: two hand-named functions, then a `*_count_text` name suffix,
+    then that suffix plus a refusal for any lambda whose source happened to
+    contain the substring `count`. A line spelled `f"Total exports: {...}"`
+    over a key named `total` satisfied none of those filters and shipped its
+    raw read; symmetrically a lambda that correctly DELEGATED to a choke-point
+    renderer was refused for its shape alone.
 
-        # (c) A container is disclosed, never interpolated into the line as a
-        # raw Python repr -- and never rendered as the real zero it is not.
-        # Compared against the well-formed zero rather than pattern-matched on
-        # `": 0"`, which a renderer with a different separator walks past.
-        unreadable = renderer({key: {"n": 1} for key in keys})
-        assert "{" not in unreadable and "}" not in unreadable, (name, unreadable)
-        assert unreadable != readable, (name, unreadable)
+    So the population is no longer a spelling and neither is the selection.
+    Every renderer this module installs is resolved to the callable the
+    registry installs -- a lambda included, because a lambda is unNAMEable,
+    not unprobeable -- and one is a count line if, DRIVEN with a distinctive
+    number on a key it reads, it prints that number. Whatever answers yes is
+    then driven over the three shapes a raw read gets wrong. A count line
+    cannot opt out by being named differently, spelled differently or written
+    inline, because the question asked of it is what it renders.
+    """
+    from bn.commands import misc
+
+    renderers, unresolved, functions = _installed_text_renderers(misc)
+    # The honest remainder of the old lambda refusal: something this harness
+    # cannot turn into a callable (a lambda closing over a local, say) is the
+    # one renderer shape no probe can reach, so it is refused outright.
+    assert not unresolved, (
+        "these installed renderers cannot be resolved to a callable, so no "
+        f"guard can probe what they render: {unresolved}")
+
+    # A distinctive number, so "does this renderer STATE this count" is read
+    # off the rendering instead of guessed from the renderer's name.
+    sentinel = 4242
+    stated, checked = [], 0
+    for label, renderer, node in renderers:
+        keys = _count_keys_read(node, functions)
+        for key in sorted(keys):
+            base = {k: 0 for k in keys}
+            try:
+                probe = renderer({**base, key: sentinel})
+            except Exception:
+                # This renderer's own shape refusal for a bare int here; it
+                # states no count off this key, so there is nothing to probe.
+                continue
+            if not isinstance(probe, str) or str(sentinel) not in probe:
+                continue
+            stated.append((label, key))
+            checked += 1
+            readable = renderer(base)
+
+            # (a) A bool is not a count. `bool` IS an `int`, so a raw read
+            # prints the flag as a quantity -- the one shape that reads as
+            # data.
+            flagged = renderer({**base, key: True})
+            assert "True" not in flagged, (label, key, flagged)
+            assert flagged != readable, (label, key, flagged)
+
+            # (b) A numeric string IS a count, and states the same line the
+            # integer spelling does. A raw `isinstance(int)` silently drops
+            # the whole qualifier for a producer that spells counts as text.
+            assert renderer({**base, key: "7"}) == renderer({**base, key: 7}), (label, key)
+
+            # (c) A container is disclosed, never interpolated into the line
+            # as a raw Python repr -- and never rendered as the real zero it
+            # is not. Compared against the well-formed zero rather than
+            # pattern-matched on `": 0"`, which a renderer with a different
+            # separator walks past.
+            unreadable = renderer({**base, key: {"n": 1}})
+            assert "{" not in unreadable and "}" not in unreadable, (label, key, unreadable)
+            assert unreadable != readable, (label, key, unreadable)
+
+    # ...and the derivation cannot quietly degrade into probing nothing. The
+    # five historical count lines are a FLOOR, not the filter: one of them
+    # ceasing to state its number is a surface that changed behaviour, and a
+    # SIXTH line is caught by the probe above whatever it is called.
+    assert checked, "no installed renderer states a count, so this proves nothing"
+    assert {label for label, _key in stated} >= {
+        "_exports_count_text", "_go_functions_count_text", "_imports_count_text",
+        "_sections_count_text", "_strings_count_text"}, sorted(stated)
 
 
 def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
