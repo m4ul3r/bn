@@ -3709,6 +3709,87 @@ def test_an_empty_export_is_refused_by_close_rather_than_discarded(monkeypatch):
     assert rc == 2
 
 
+def _fanout_pairs(monkeypatch, capsys, argv, env=None, sticky=None):
+    """Run a fan-out read; return its (instance, target) pairs and auto-expansion.
+
+    Two instances, one of them holding TWO targets: that is the only shape
+    where "apply the selector to every instance" and "survey every target"
+    produce different answers, so it is the shape this question has to be
+    asked in.
+    """
+    import json as _json
+    import types
+
+    import bn.cli
+
+    insts = [types.SimpleNamespace(instance_id="solo"),
+             types.SimpleNamespace(instance_id="multi")]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: dict(sticky or {}))
+
+    def fake_send_request(op, *, params=None, target=None, instance_id=None,
+                          **kwargs):
+        if op == "list_targets":
+            rows = ([{"target_id": "m-t1"}, {"target_id": "m-t2"}]
+                    if instance_id == "multi" else [{"target_id": "solo-t1"}])
+            return {"ok": True, "result": rows}
+        return {"ok": True, "result": {"kind": "sections", "items": [], "total": 0}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+
+    assert bn.cli.main(argv) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    return (sorted((row["instance"], row.get("target"))
+                   for row in payload["instances"]),
+            payload.get("auto_expanded_instances"))
+
+
+def test_an_ambient_selector_does_not_narrow_an_all_instances_survey(
+        monkeypatch, capsys):
+    """The OTHER consumer of the ambient marker, and the one nothing pinned.
+
+    `--all-instances` asks two different questions of a `-t`: an explicit one
+    is a choice, applied to every instance, while an AMBIENT one is not -- it
+    must not suppress the multi-target auto-survey (#368 facet 1, already
+    pinned for the sticky pin in test_cli_core.py). Making `BN_TARGET` ambient
+    in round 3 moved the export from the first answer to the second, which is
+    a real change to a read surface and was pinned by nothing: the export half
+    of this test passes at the round-2 head and at this one, for OPPOSITE
+    reasons, if you only assert an exit code.
+
+    So the three cases are asserted together, and the export is asserted to
+    equal the SURVEY, not merely "not an error". runtime.md states exactly
+    this ("a bare read under `--all-instances` still surveys every target
+    rather than treating the export as a chosen one. Where you need the export
+    to mean 'this exact target, no survey' ... pass `-t`"), and the pin is
+    carried along because the two ambient sources must not drift apart.
+    """
+    survey = ([("multi", "m-t1"), ("multi", "m-t2"), ("solo", "solo-t1")],
+              ["multi"])
+
+    argv = ["sections", "--all-instances", "--format", "json"]
+    exported = _fanout_pairs(monkeypatch, capsys, argv,
+                             env={"BN_TARGET": "beta.bin"})
+    pinned = _fanout_pairs(monkeypatch, capsys, argv,
+                           sticky={"target": "beta.bin"})
+    explicit = _fanout_pairs(monkeypatch, capsys,
+                             ["-t", "beta.bin", *argv],
+                             env={"BN_TARGET": "alpha.bin"})
+
+    assert exported == survey, (
+        "an exported BN_TARGET is ambient: --all-instances must still survey "
+        f"every target rather than apply it per instance; got {exported}")
+    assert pinned == exported, (
+        "the sticky pin and the export are the same ambient value from two "
+        f"sources and must fan out alike; pin={pinned} export={exported}")
+    assert explicit == ([("multi", "beta.bin"), ("solo", "beta.bin")], None), (
+        "an explicit -t IS a choice: it must apply to every instance and "
+        f"suppress the survey, even with a different value exported; got {explicit}")
+
+
 def test_bn_target_is_scrubbed_from_the_test_environment():
     """An ambient BN_TARGET would redirect every test that passes no selector.
 
