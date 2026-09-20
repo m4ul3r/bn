@@ -2572,16 +2572,28 @@ def _render_function_evidence_text(value: Any) -> str:
             # argument(s)" in the same authoritative voice the recovered facts on
             # this card use, with nothing saying the count came from counting
             # conversion specifiers in a string literal. Print the marker the
-            # payload already carries rather than inventing a second vocabulary,
-            # and omit it entirely if a future producer states a firmer
-            # confidence, so this never contradicts its own payload.
+            # payload already carries rather than inventing a second vocabulary.
+            #
+            # It is spelled `count: <confidence>` because #886 asks for a marker
+            # that reads as "this COUNT is a heuristic"; a bare `[heuristic]`
+            # beside `UNDER-RECOVERED` hedges the whole finding instead, which is
+            # a different and weaker claim than the payload makes.
+            #
+            # OMITTED for `authoritative` -- this card's own firm word, the one
+            # the sibling `arguments: (hlil authoritative)` line above renders --
+            # because hedging facts the payload calls firm contradicts the
+            # payload. Any OTHER word still renders: the renderer cannot claim a
+            # confidence it does not know means "corroborated", so the hedge is
+            # the safe default and nothing goes out silently.
+            #
             # Read through `_text_value`, not an inline isinstance: a bare shape
             # test DROPS a present-but-unreadable confidence with nothing
             # rendered and nothing recorded, so the line comes out
             # byte-identical to a payload that never carried the field -- the
             # same silent-absence defect this marker exists to close.
             _conf = _text_value(variadic, "confidence")
-            _mark = f" [{_conf}]" if _conf else ""
+            _mark = "" if _conf is None or _conf.strip().lower() == "authoritative" \
+                else f" [count: {_conf}]"
             if variadic.get("under_recovered") and variadic.get("warning"):
                 lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:

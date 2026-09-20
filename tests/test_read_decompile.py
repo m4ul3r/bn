@@ -3650,17 +3650,45 @@ def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
     ARM *platform* name, because BN spells platforms `<os>-<arch>`. The names
     are pinned as literals so this test needs no BN: it is guarding the RULE,
     not BN's catalogue.
+
+    The seam side calls the REAL predicate through a minimal view. The first
+    cut re-declared the substring rule as a local closure, and a test that
+    asserts a COPY of the rule is green whatever the rule does: rewriting the
+    seam's last line to `joined.startswith(...)` -- the exact merge this pair
+    exists to forbid, and the one #600 already paid for once -- left it
+    passing. The whole point of the test is that that mutation goes red.
     """
     import importlib
 
     read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    seam = importlib.import_module("bn_agent_bridge.seam")
     prefix = read_decompile._is_classic_arm_or_thumb_arch
+    ctx = seam.BridgeContext(None)
+
+    class _Named:
+        """An arch/platform object shaped the way the seam reads one: it takes
+        `.name`, and also `str()`, which BN's objects answer with the name."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __str__(self) -> str:
+            return self.name
+
+    class _View:
+        """The minimum the seam predicate reads. `arch` is absent on purpose:
+        the seam joins arch AND platform names, so an ARM arch name sitting
+        beside the platform name would satisfy either rule and hide the very
+        divergence under test."""
+
+        address_size = 4
+        arch = None
+
+        def __init__(self, name: str) -> None:
+            self.platform = _Named(name)
 
     def substring(name: str) -> bool:
-        n = (name or "").lower()
-        if "aarch64" in n or "arm64" in n:
-            return False
-        return "thumb" in n or "arm" in n
+        return ctx._supports_thumb_pointer_tags(_View(name))
 
     # Arch names: the two rules agree, which is why the divergence is invisible
     # on an ordinary ARM binary (the seam joins arch AND platform, and the arch
@@ -3679,3 +3707,66 @@ def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
     # The #600 exclusion is the part they DO share, in both spellings.
     for arm64 in ("aarch64", "linux-aarch64", "arm64", "mac-arm64"):
         assert prefix(arm64) is substring(arm64) is False, arm64
+
+    # The seam's 4-byte gate is part of the rule it is being pinned against: a
+    # 64-bit view is never Thumb-tagged whatever its names say, so a future
+    # "just use the arch predicate" merge cannot claim equivalence here either.
+    class _WideView(_View):
+        address_size = 8
+
+    assert ctx._supports_thumb_pointer_tags(_WideView("linux-armv7")) is False
+
+
+def test_variadic_text_marks_the_count_as_heuristic_and_omits_a_firm_one_886():
+    """#827 item 6 / #886: the variadic count's confidence must reach TEXT, and
+    must read as a claim about the COUNT.
+
+    `read_evidence` stamps `confidence: heuristic` / `provenance:
+    abi-format-heuristic` on the diagnostic, and the text renderer printed
+    `expected >= N argument(s)` in the same voice as the recovered facts beside
+    it -- JSON-only disclosure, the #883 shape. #886 asks specifically that the
+    marker read as "this count is a heuristic" rather than as a hedge on the
+    whole finding, which is why it is spelled `count: <confidence>`.
+
+    Four states are pinned, because the marker shipped with NONE of them:
+    reverting the render site left every selected variadic test green, so
+    deleting the marker was invisible to CI.
+      * a hedging confidence renders, and names the count as its subject;
+      * the card's FIRM word (`authoritative` -- the same spelling the sibling
+        `arguments: (hlil authoritative)` line renders) is OMITTED, because
+        bracketing a hedge onto facts the payload calls firm contradicts the
+        payload;
+      * an UNRECOGNISED word still renders: the renderer cannot claim a word
+        it does not know means "corroborated", and dropping it would be the
+        silent absence this marker exists to close;
+      * a present-but-UNREADABLE confidence is disclosed by the render
+        boundary rather than dropped, which is the whole reason the field is
+        read through `_text_value` and not an inline isinstance (#619).
+    """
+    from bn.formatters import _render_function_evidence_text
+
+    def render(variadic: dict) -> str:
+        return _render_function_evidence_text(
+            {"calls": [{"address": "0x1000",
+                        "variadic": {"is_variadic": True, **variadic}}]}
+        )
+
+    under = {"under_recovered": True,
+             "warning": "imported variadic call `f` under-recovered in HLIL: "
+                        "recovered 1 of an expected >= 3 argument(s)"}
+    fmt = {"callee": "f", "format_string": "%s%d", "format_conversions": 2}
+
+    # Both rendered branches carry the marker, and both drop to the bare line
+    # when the payload never stated a confidence.
+    for payload in (under, fmt):
+        assert "[count: heuristic]" in render({**payload, "confidence": "heuristic"})
+        assert "[count:" not in render(payload)
+
+    firm = render({**under, "confidence": "authoritative"})
+    assert "[count:" not in firm and "authoritative" not in firm, firm
+    assert "variadic: UNDER-RECOVERED —" in firm, firm
+
+    assert "[count: medium]" in render({**under, "confidence": "medium"})
+
+    skewed = render({**under, "confidence": {"level": "heuristic"}})
+    assert "[count:" not in skewed and "malformed confidence field" in skewed, skewed
