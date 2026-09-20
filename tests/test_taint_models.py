@@ -431,49 +431,230 @@ def test_builtin_snprintf_family_declares_size_arm_808():
     assert "arguments 1 (length) or 2" in entry["model_description"], entry["model_description"]
 
 
-def test_fortified_read_family_arms_the_same_write_as_its_base_876():
+# --- #876: the fortified read family, driven through the ENGINE --------------
+#
+# Model-DB field values are not the claim. The claim is what a
+# `--sink-class recv_overflow` query REPORTS at a fortified callsite, so every
+# test below runs `TaintEngine.forward` and compares the `_chk` entry against
+# its bare twin on the SAME program. Reading `sink["class"]` back out of the
+# JSON cannot see the engine's two class-keyed false-positive suppressors --
+# the #159 provably-bounded receive-return downgrade and the #307
+# reused-aliased-slot re-headline -- and those are exactly what a fortified
+# class silently opted the family out of.
+
+_FORTIFIED_READ_PAIRS = (("read", "__read_chk"), ("recv", "__recv_chk"),
+                         ("recvfrom", "__recvfrom_chk"), ("pread", "__pread_chk"))
+
+_SINK_ADDR = "0x20"          # where every fixture below puts the call under test
+
+
+def _fakes():
+    """The synthetic MLIL-SSA fakes the engine's own tier-1 suite drives it with.
+
+    Imported, never re-declared: a private second copy of the fakes is a second
+    definition of "what the engine sees", and a test asserting against its own
+    shape has stopped measuring the production seam.
+    """
+    import test_taint_engine
+    return test_taint_engine
+
+
+def _call_under_test(F, callee, index, length, reads, dest):
+    """``rv#1 = callee(3, <dest>, <length>[, offset][, objsize])`` at ``_SINK_ADDR``.
+
+    `pread` takes a trailing offset, and a FORTIFY `_chk` twin a trailing
+    objsize guard -- a compile-time bound, not data flow: it appends, it does
+    not shift buf/len. The byte count lands in its own SSA var, as a real
+    caller writes it, so a `ret:` seed can distinguish this callsite from a
+    same-named one earlier in the program.
+    """
+    params = [F.FExpr("MLIL_CONST", "3", constant=3), dest, length]
+    if callee.lstrip("_").startswith("pread"):
+        params.append(F.FExpr("MLIL_CONST", "0", constant=0))
+    if callee.endswith("_chk"):
+        params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
+    return F.FInstr(index, int(_SINK_ADDR, 16), "MLIL_CALL_SSA",
+                    f"rv#1 = {callee}(3, dst, len)", reads=reads,
+                    writes=[F.FSSA(F.FVar("rv"), 1)],
+                    dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+                    params=params)
+
+
+def _plain_length_program(callee, *, sized_destination=False):
+    """``[dst = malloc(n);] callee(3, dst, n)`` for an attacker-controlled `n`.
+
+    By default the destination is an untracked stack buffer, so nothing bounds
+    the write and the finding must stand as a real overflow. With
+    `sized_destination` the destination is allocated in-function with the very
+    length being written -- the #443 bounded-write pair's reason for declaring
+    `buf_arg`, and the only place a wrong `buf_arg` is observable.
+    """
+    F = _fakes()
+    n = F.FVar("n", ident=1); n0 = F.FSSA(n, 0)
+    length = F.FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])
+    instrs = []
+    if sized_destination:
+        rax1 = F.FSSA(F.FVar("rax"), 1)
+        instrs.append(F.FInstr(0, 0x10, "MLIL_CALL_SSA", "rax#1 = malloc(n#0)",
+                               reads=[n0], writes=[rax1],
+                               dest=F.FExpr("MLIL_CONST_PTR", "0x902", constant=0x902),
+                               params=[F.FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]))
+        dest, reads = F.FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1]), [n0, rax1]
+    else:
+        dest = F.FExpr("MLIL_ADDRESS_OF", "&dst", src=F.FVar("dst", typ="char[0x10]"))
+        reads = [n0]
+    instrs.append(_call_under_test(F, callee, len(instrs), length, reads, dest))
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs), params=[n]),
+            F.FBV({0x901: callee, 0x902: "malloc"}))
+
+
+def _bounded_receive_program(callee):
+    """``n = read(3, &src, 0x40); callee(3, &dst, n)``.
+
+    The #159 idiom `_comment_recv_overflow` itself names as the ~100%-false-
+    positive one: the length is the return of a modeled receive provably
+    bounded by a constant count, so the honest verdict is `bounded_len` with
+    that bound, not an overflow.
+    """
+    F = _fakes()
+    n1 = F.FSSA(F.FVar("n"), 1)
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "n#1 = read(3, &src, 0x40)", writes=[n1],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+                 params=[F.FExpr("MLIL_CONST", "3", constant=3),
+                         F.FExpr("MLIL_ADDRESS_OF", "&src", src=F.FVar("src", typ="char[0x40]")),
+                         F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        _call_under_test(F, callee, 1, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]), [n1],
+                         F.FExpr("MLIL_ADDRESS_OF", "&dst", src=F.FVar("dst", typ="char[0x10]"))),
+    ]
+    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
+            F.FBV({0x900: "read", 0x901: callee}))
+
+
+def _ambiguous_slot_program(callee):
+    """``fgets(&slot, 8, fp); slot = 0x10; n = slot @ mem; callee(3, &dst, n)``.
+
+    The #307 shape: the length reads an address-taken slot whose taint arrived
+    version-agnostically through an out-param write, and a competing in-function
+    store makes the reaching definition path-ambiguous. The engine cannot stand
+    behind an overflow VERDICT there, so it re-headlines to the neutral
+    `tainted_len` without dropping the flow.
+    """
+    F = _fakes()
+    slot = F.FVar("slot", ident=30); slot4 = F.FSSA(slot, 4)
+    rp1 = F.FSSA(F.FVar("rp"), 1); ln1 = F.FSSA(F.FVar("ln"), 1)
+    instrs = [
+        F.FInstr(0, 0x04, "MLIL_SET_VAR_SSA", "rp#1 = &slot", writes=[rp1],
+                 src=F.FExpr("MLIL_ADDRESS_OF", "&slot", src=slot)),
+        F.FInstr(1, 0x08, "MLIL_CALL_SSA", "fgets(rp#1, 8, fp)", reads=[rp1], writes=[],
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+                 params=[F.FExpr("MLIL_VAR_SSA", "rp#1", reads=[rp1]),
+                         F.FExpr("MLIL_CONST", "8", constant=8),
+                         F.FExpr("MLIL_CONST", "0", constant=0)]),
+        F.FInstr(2, 0x0c, "MLIL_SET_VAR_ALIASED", "slot = 0x10", dest=slot,
+                 src=F.FExpr("MLIL_CONST", "0x10", constant=0x10)),
+        F.FInstr(3, 0x10, "MLIL_SET_VAR_SSA", "ln#1 = slot @ mem", reads=[slot4], writes=[ln1],
+                 src=F.FExpr("MLIL_VAR_ALIASED", "slot @ mem", reads=[slot4])),
+        _call_under_test(F, callee, 4, F.FExpr("MLIL_VAR_SSA", "ln#1", reads=[ln1]), [ln1],
+                         F.FExpr("MLIL_ADDRESS_OF", "&dst", src=F.FVar("dst", typ="char[0x10]"))),
+    ]
+    return (F.FFunc("handler", 0x00, F.FSSAFunc(instrs)),
+            F.FBV({0x910: "fgets", 0x901: callee}))
+
+
+def _reported(program, seed, *, gate=("recv_overflow",)):
+    """Every sink the call under test reports for `seed`.
+
+    `gate=()` runs with the opt-in class disabled, which must report nothing.
+    """
+    from bn_agent_bridge import taint_engine as te
+    func, bv = program
+    result = te.TaintEngine(bv, te.load_models()).forward(
+        func, [te.parse_locator(seed)], enabled_sink_classes=set(gate))
+    return [s["sink"] for s in result["reached_sinks"]
+            if s["sink"]["address"] == _SINK_ADDR]
+
+
+@pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
+def test_fortified_read_sink_fires_under_the_gate_like_its_base_twin_876(base, chk):
     # #876: the read-family `_chk` entries carried `sources` and `return_bound`
-    # but NO `sink`, while their unfortified counterparts all declare the
-    # bounded-write pair. A tainted length into `__read_chk` therefore reported
-    # reached_sinks=[] -- a false all-clear on the fortified build, which is
-    # the build a hardened target actually ships.
-    #
-    # This contradicted the family's own stated policy: `_comment_fortified`
-    # says the _chk call "still aborts at runtime, so it is lower-severity
-    # than the raw variant but a tainted length/source reaching it is worth
-    # surfacing". Copy/concat honoured that; the read family did not.
-    from bn_agent_bridge.taint_engine import load_models
-    models = load_models()
-    for base in ("read", "recv", "recvfrom", "pread"):
-        base_sink = models[base]["sink"]
-        chk_sink = models[f"{base}_chk"].get("sink")
-        assert chk_sink is not None, f"{base}_chk lost its sink again"
-        # Same write, same arg layout: the _chk trailing buflen is a
-        # compile-time guard, it does not shift buf/len.
-        assert chk_sink["buf_arg"] == base_sink["buf_arg"] == 1, base
-        assert chk_sink["len_arg"] == base_sink["len_arg"] == 2, base
-        # Lower severity, because the fortify check aborts instead of
-        # overflowing -- the same class copy/concat _chk variants use.
-        assert chk_sink["class"] == "fortified_overflow", base
-        assert base_sink["class"] == "overflow_len", base
-        # Same opt-in gate: the ~100% FP fill-loop idiom (#499) that gated the
-        # base sink is identical on the fortified call, so arming one without
-        # the other would make `--sink-class recv_overflow` silently partial.
-        assert chk_sink["optional"] is True, base
-        assert chk_sink["gate"] == base_sink["gate"] == "recv_overflow", base
+    # but NO `sink`, so a tainted length into `__read_chk` answered
+    # reached_sinks=[] -- a false all-clear on the FORTIFY build a hardened
+    # target actually ships. Opt-in exactly like the bare twin: the ~100%-FP
+    # fill-loop idiom (#499) is the same call shape, so arming one without the
+    # other would make `--sink-class recv_overflow` silently partial.
+    assert _reported(_plain_length_program(chk), "param:0", gate=()) == []
+    bare = _reported(_plain_length_program(base), "param:0")
+    fort = _reported(_plain_length_program(chk), "param:0")
+    assert len(bare) == 1 and len(fort) == 1, (bare, fort)
+    # arg 2 is the armed length on both -- the trailing objsize guard appends,
+    # it does not shift buf/len.
+    assert fort[0]["tainted_arg_index"] == bare[0]["tainted_arg_index"] == 2
+    # ...and the SAME bug class. `fortified_overflow` reads as "lower severity"
+    # but is what opts the entry out of the suppressors the next two tests pin;
+    # the fortify nuance is carried in `detail`, which the class is not free to
+    # encode without changing what the engine does with the finding.
+    assert fort[0]["class"] == bare[0]["class"] == "overflow_len", (bare, fort)
+    assert chk in fort[0]["detail"] and "aborts at runtime" in fort[0]["detail"]
 
 
-def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876():
+@pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
+def test_fortified_read_sink_declares_the_write_destination_876(base, chk):
+    # `buf_arg` is observable only through the #443 bounded-write downgrade:
+    # with the destination allocated in-function from the very length being
+    # written, the copy provably fits and the finding is relabeled. A `buf_arg`
+    # naming any other argument -- the fd, or the _chk trailing guard -- leaves
+    # it an overflow, so this is the test that catches a mis-declared pair.
+    for callee in (base, chk):
+        sinks = _reported(_plain_length_program(callee, sized_destination=True), "param:0")
+        assert len(sinks) == 1, (callee, sinks)
+        assert sinks[0]["class"] == "bounded_len", (callee, sinks)
+        assert "attacker-derived length, but" in sinks[0]["detail"], (callee, sinks)
+
+
+@pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
+def test_fortified_read_sink_takes_the_bounded_receive_downgrade_876(base, chk):
+    # #159, and the reason the class may not differ from the bare twin's: the
+    # length is the return of a modeled receive provably bounded by a constant
+    # count -- the dominant idiom `_comment_recv_overflow` names as ~100% false
+    # positive. The engine's downgrade tests `class == "overflow_len"`, so a
+    # `fortified_overflow` twin reported a FALSE overflow at exactly the
+    # callsite its bare twin calls bounded.
+    bare = _reported(_bounded_receive_program(base), "ret:read")
+    fort = _reported(_bounded_receive_program(chk), "ret:read")
+    assert len(bare) == 1 and len(fort) == 1, (bare, fort)
+    assert (bare[0]["class"], bare[0].get("source_bound")) == ("bounded_len", "0x40"), bare
+    assert (fort[0]["class"], fort[0].get("source_bound")) \
+        == (bare[0]["class"], bare[0].get("source_bound")), (bare, fort)
+
+
+@pytest.mark.parametrize("base,chk", _FORTIFIED_READ_PAIRS)
+def test_fortified_read_sink_neutralizes_an_ambiguous_length_876(base, chk):
+    # #307, the gate's other class-keyed suppressor: a length read from a reused
+    # address-taken slot with a competing in-function writer is a path-ambiguous
+    # reaching definition, so the overflow VERDICT is dropped for the neutral
+    # `tainted_len`. Nothing is hidden -- the flow stays in reached_sinks -- but
+    # a fortified class skipped the re-headline and kept the unsound label.
+    bare = _reported(_ambiguous_slot_program(base), "arg:fgets:0")
+    fort = _reported(_ambiguous_slot_program(chk), "arg:fgets:0")
+    assert len(bare) == 1 and len(fort) == 1, (bare, fort)
+    assert (bare[0]["class"], bare[0].get("via")) == ("tainted_len", "reused_aliased_slot"), bare
+    assert (fort[0]["class"], fort[0].get("via")) \
+        == (bare[0]["class"], bare[0].get("via")), (bare, fort)
+
+
+@pytest.mark.parametrize("base", ("fgets", "fread"))
+def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876(base):
     # Must-not-fire twin. `fgets`/`fread` declare no length sink on EITHER
     # side -- they are bounded by their own size argument in a shape the
     # engine does not model as attacker-controlled -- so the #876 sweep must
     # not "fix" them into existence. The defect was an ASYMMETRY with the
     # base model, not the absence of a sink.
-    from bn_agent_bridge.taint_engine import load_models
-    models = load_models()
-    for base in ("fgets", "fread"):
-        assert models[base].get("sink") is None, base
-        assert models[f"{base}_chk"].get("sink") is None, base
+    for callee in (base, f"__{base}_chk"):
+        assert _reported(_plain_length_program(callee), "param:0") == [], callee
+    # Not vacuous: the identical harness, seed and gate DO report the armed
+    # fortified read twin.
+    assert len(_reported(_plain_length_program("__read_chk"), "param:0")) == 1
 
 
 def test_scanf_family_models_carry_arity_capped_flag_851():
