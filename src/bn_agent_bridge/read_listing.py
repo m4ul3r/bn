@@ -911,17 +911,25 @@ class _StartCollapse(NamedTuple):
     def counts(self, retained: list[Any]) -> tuple[int, int]:
         """``(collapsed, unresolved)`` for the rows *retained* still holds.
 
-        A collapsed address counts while its surviving record is in the answer:
-        that row IS one row instead of two because of the merge. An unresolved
-        address counts only while MORE THAN ONE of its records survives -- the
-        key states that an address is still carrying duplicates, and a filter
-        that leaves one record there has left no conflict to report.
+        ONE rule for both halves: an address counts while a record of it is in
+        the answer. For a collapsed address that row IS one row instead of two
+        because of the merge; for an unresolved one it is a row whose extent was
+        never ranked against the other record at that address.
+
+        Requiring TWO surviving records for the unresolved half -- "the answer
+        no longer contains the conflict" -- reads plausibly and is wrong: an
+        unreadable extent scores 0, so `--min-size` drops the unsized twin of
+        every unresolved pair and `--named` puts the two in different
+        partitions, which made the disclosure structurally unreachable on the
+        very filters #757 was filed against. The surviving row then rendered
+        exactly like a resolved collapse, which the reference tells a reader
+        means the larger extent won (#757 review round 2).
         """
         live = {id(fn) for fn in retained}
         collapsed = sum(1 for fn in self.collapsed if id(fn) in live)
         unresolved = sum(
             1 for group in self.unresolved
-            if sum(1 for fn in group if id(fn) in live) > 1
+            if any(id(fn) in live for fn in group)
         )
         return collapsed, unresolved
 
@@ -959,10 +967,14 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartC
             key = int(fn.start)
         except (AttributeError, TypeError, ValueError):
             # A record whose start cannot be read cannot be shown to be a
-            # duplicate of ANYTHING, so it is keyed by identity and forms its own
-            # group (unit fakes model no `start`; passing the record through
-            # unchanged is the only answer that never invents a collapse).
-            key = fn
+            # duplicate of ANYTHING, so it forms its own group (unit fakes model
+            # no `start`; passing the record through unchanged is the only
+            # answer that never invents a collapse). Keyed on IDENTITY -- the
+            # record itself was keyed on its own `__hash__`/`__eq__`, which
+            # raises TypeError on an unhashable one and would coalesce two
+            # equal-comparing records into a collapse the view never had. Boxed
+            # in a tuple so the id cannot collide with a start address.
+            key = (id(fn),)
         grouped.setdefault(key, []).append(fn)
     if len(grouped) == len(functions):
         return functions, _StartCollapse((), ())

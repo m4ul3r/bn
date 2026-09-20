@@ -490,7 +490,10 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
     partial_fields: dict[str, Any] = {}
     if isinstance(result, dict) and (result.get("capped") or result.get("short_read")):
         partial_fields = {key: True for key in ("capped", "short_read") if result.get(key)}
-        partial_fields["requested_length"] = result.get("requested_length")
+        if result.get("requested_length") is not None:
+            # Absent rather than `null`: the summary states what the caller
+            # asked for, and a bridge that did not send it has nothing to state.
+            partial_fields["requested_length"] = result["requested_length"]
         note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
         print(f"note: {note}", file=sys.stderr)
     if args.out:

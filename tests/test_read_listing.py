@@ -644,9 +644,14 @@ def test_duplicate_start_counts_follow_the_named_filter_757(monkeypatch):
 
     `--named` partitions the population after the collapse, so a collapse among
     the auto-named rows was disclosed on the `--named` answer that contains none
-    of them. And an unresolved group only stays unresolved while MORE THAN ONE
-    of its records survives -- a filter that leaves one record at that address
-    leaves no conflict in the answer to report.
+    of them. The unresolved half follows the SAME rule as its sibling: the
+    address counts while a record of it is in the answer. Requiring two
+    survivors instead made the disclosure structurally unreachable under
+    `--min-size` (an unreadable extent reads as 0, so the floor drops the
+    unsized twin of every unresolved pair) and under `--named` (the two records
+    land in different partitions), leaving a row whose extent was never
+    comparable rendered exactly like a resolved one -- which
+    `reading.md` tells the reader means the larger extent won.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -663,8 +668,10 @@ def test_duplicate_start_counts_follow_the_named_filter_757(monkeypatch):
     unnamed = instance._list_functions(None, named=False, count_only=True)
     assert unnamed["total"] == 1 and unnamed["duplicate_starts_collapsed"] == 1
 
-    # The unresolved half: the unsized twin is what `--min-size` drops, so the
-    # answer holds one record at that address and no conflict to disclose.
+    # The unresolved half: a filter that drops one record of the pair leaves a
+    # row whose extent could not be ranked against the record still at that
+    # address, so the conflict is disclosed for as long as the address is in
+    # the answer -- and disappears only with the address itself.
     unsized = [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
@@ -675,7 +682,21 @@ def test_duplicate_start_counts_follow_the_named_filter_757(monkeypatch):
     assert whole["duplicate_starts_unresolved"] == 1
     filtered = instance._list_functions(None, min_size=64, count_only=True)
     assert filtered["total"] == 1
-    assert "duplicate_starts_unresolved" not in filtered
+    assert filtered["duplicate_starts_unresolved"] == 1
+    # ...and the same through `--named`, which splits the pair the other way.
+    split = [
+        _FakeFunction(0x401014, "sub_401014"),      # extent unreadable
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+    ]
+    _view(monkeypatch, instance, split)
+    for want in (True, False):
+        answer = instance._list_functions(None, named=want, count_only=True)
+        assert answer["total"] == 1
+        assert answer["duplicate_starts_unresolved"] == 1, want
+    # The address leaves the answer entirely -> so does the disclosure.
+    gone = instance._list_functions(None, min_size=1000, count_only=True)
+    assert gone["total"] == 0
+    assert "duplicate_starts_unresolved" not in gone
 
 
 def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):
