@@ -2110,9 +2110,17 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
             f"{' '.join(path)} takes arguments this sweep cannot synthesize "
             f"({unfillable}); add them to _ESTIMATE_ARG_VALUES rather than "
             "letting the command drop out of the coverage claim")
+        # A NONEXISTENT instance id on every probe, never a bare `--target
+        # active`. The transport is stubbed here so nothing can leave the
+        # process either way, but `active` resolves to whatever target some
+        # other session has focused, and a sweep this wide is exactly the shape
+        # that must not depend on a fixture to stay harmless: if a change ever
+        # re-routes one of these 285 invocations past the stub, it must find
+        # nothing on the other end rather than a live view.
         base = (list(path)
                 + [_ESTIMATE_ARG_VALUES[p] for p in positionals[path]]
-                + required + ["--target", "active"])
+                + required
+                + ["--instance", "prfleet-nonexistent-879", "--target", "active"])
         for mode in _estimate_emit_modes(leaf(path)):
             argv = base + mode + ["--estimate-output"]
             fake_transport(default=_ESTIMATE_STUB)
