@@ -3931,6 +3931,171 @@ def test_a_broken_ambient_default_does_not_break_a_fan_out_survey(
                 f"expected {clean}")
 
 
+def _ambient_run(monkeypatch, argv, *, env=None, sticky=None,
+                 selectors=("only.bin",)):
+    """Run *argv* through `main` under one ambient-target state.
+
+    Returns `(rc, [(op, target), ...])` -- the exit code plus every request
+    that reached the transport and the selector it carried, which is what
+    separates "refused before anything was sent" from "asked the bridge and
+    got an unrelated error". Pins a nonexistent instance so no probe can
+    reach a live bridge, and stubs `list_instances` empty so `load`'s
+    ambient-routing guard sees a single-bridge machine.
+    """
+    import bn.cli
+
+    sent: list[tuple[str, object]] = []
+
+    def fake_send_request(op, *, params=None, target=None, **kwargs):
+        sent.append((op, target))
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": f"1:1:{i}", "selector": sel}
+                for i, sel in enumerate(selectors, start=1)]}
+        if op == "close_binary":
+            return {"ok": True, "result": {"closed": [{"selector": target}],
+                                           "count": 1}}
+        if op == "load_binary":
+            return {"ok": True, "result": {"target_id": "1:1:9",
+                                           "selector": "loaded.bin"}}
+        if op == "save_database":
+            return {"ok": True, "result": {"path": "/tmp/bn-not-a-real.bndb"}}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: dict(sticky or {}))
+    monkeypatch.setenv("BN_INSTANCE", "prfleet-nonexistent-889")
+    # Each cell starts from NO export: `setenv` lives for the whole test and
+    # the export BEATS the pin, so a leftover export would make a "pin" cell
+    # measure the export again.
+    monkeypatch.delenv("BN_TARGET", raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    return bn.cli.main(argv), sent
+
+
+# The four ways an ambient source can supply a value that is not a selector:
+# two sources x two spellings. They are carried together everywhere below
+# because each round of this fix has repaired one and left the other.
+_BROKEN_AMBIENT = (
+    ("an empty export", {"env": {"BN_TARGET": ""}}),
+    ("a whitespace export", {"env": {"BN_TARGET": "   "}}),
+    ("an empty pin", {"sticky": {"target": ""}}),
+    ("a whitespace pin", {"sticky": {"target": "   "}}),
+)
+
+
+def test_a_broken_ambient_default_does_not_refuse_the_verb_that_creates_a_target(
+        monkeypatch, tmp_path):
+    """`bn load <path>` cannot need a resolved target: it MAKES one.
+
+    `_apply_sticky_defaults` fills `args.target` on EVERY namespace, including
+    the stems that have no `-t` of their own, so an unassigned export (or an
+    empty pin) put an empty string on `load`'s namespace too -- and the
+    pre-dispatch refusal then failed the one command whose entire job is to
+    open the target everything else resolves. rc 2 with nothing sent, where
+    three of the four cells run at the merge base.
+
+    Asserted against the no-ambient run's shape rather than "not 2": the
+    failure to guard against is `load` quietly not sending, and an exit code
+    alone cannot tell a refused selector from a bridge that declined.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+
+    clean = _ambient_run(monkeypatch, ["load", str(binary)])
+    assert (clean[0], [op for op, _ in clean[1]]) == (0, ["load_binary"]), clean
+
+    for label, kwargs in _BROKEN_AMBIENT:
+        rc, sent = _ambient_run(monkeypatch, ["load", str(binary)], **kwargs)
+        assert (rc, [op for op, _ in sent]) == (0, ["load_binary"]), (
+            f"`bn load <path>` under {label} names what to act on and resolves "
+            f"no target, so a broken ambient default has nothing to corrupt; "
+            f"got rc={rc} sent={sent}")
+        assert [t for _, t in sent] == [None], (
+            f"`load` must not forward the ambient value at all under {label}; "
+            f"got {sent}")
+
+
+def test_a_broken_ambient_default_is_judged_where_it_would_be_used(monkeypatch,
+                                                                   tmp_path):
+    """The refusal belongs at the consumption site, not on an exempt-verb list.
+
+    Three consecutive review rounds each found one more verb the pre-dispatch
+    gate should never have touched (`close --all`/`close <path>`, then the
+    `--all-instances`/`--all-targets` surveys, then `bn load`), because the
+    question it asked was "is the ambient default broken, and is this command
+    exempt?" -- which can only ever be answered by naming commands, and the
+    list is only ever as complete as the last review.
+
+    Asked at the point the value is actually reached for, the same question
+    needs no list: an empty ambient value is the ABSENCE of a selector, so a
+    command that must resolve one hits the refusal and a command that says
+    what to act on some other way is untouched. This test states that as the
+    contract -- refusal IFF the invocation resolves its target from the
+    default -- over both classes at once, so adding a fourth exemption cannot
+    satisfy it and neither can deleting the refusal.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+
+    # Resolves its target FROM the ambient default (an explicit `-t` is absent,
+    # so the single-open auto-pick would stand in for the broken value).
+    resolving = (["function", "list"], ["close"])
+    # Says what to act on some other way: a path to open, `--all`, the
+    # bridge-side single-open resolution, every open target by construction.
+    naming_its_own = (["load", str(binary)],
+                      ["close", "--all"],
+                      ["save"],
+                      ["sections", "--all-targets", "--format", "json"])
+
+    for argv in resolving:
+        for label, kwargs in _BROKEN_AMBIENT:
+            rc, sent = _ambient_run(monkeypatch, argv, **kwargs)
+            assert (rc, sent) == (2, []), (
+                f"`bn {' '.join(argv)}` resolves its target from the ambient "
+                f"default, so {label} is the resolution it corrupts and must "
+                f"be refused before anything is sent; got rc={rc} sent={sent}")
+
+    for argv in naming_its_own:
+        clean = _ambient_run(monkeypatch, argv)
+        for label, kwargs in _BROKEN_AMBIENT:
+            got = _ambient_run(monkeypatch, argv, **kwargs)
+            assert got == clean, (
+                f"`bn {' '.join(argv)}` resolves nothing from the ambient "
+                f"default, so under {label} it must do exactly what it does "
+                f"with the variable unset; got {got}, expected {clean}")
+
+
+def test_an_empty_ambient_value_never_reaches_the_bridge_as_a_selector(
+        monkeypatch, tmp_path):
+    """The hazard is the empty STRING, and dropping it must not forward it.
+
+    The bridge collapses an empty selector to the focused GUI view with no
+    count check, which is why an empty ambient value may never be sent. The
+    inversion answers "not a selector" with the ABSENCE of one -- `None` --
+    and the difference matters: `None` goes to the bridge's own single-open
+    resolution and its #688 destructive gate, where `""` goes to whichever
+    tab has focus. This pins that every verb, refused or not, sends either a
+    real selector or nothing at all.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+
+    for argv in (["function", "list"], ["close"], ["close", "--all"],
+                 ["save"], ["load", str(binary)],
+                 ["sections", "--all-targets", "--format", "json"]):
+        for label, kwargs in _BROKEN_AMBIENT:
+            _rc, sent = _ambient_run(monkeypatch, argv, **kwargs)
+            blank = [(op, t) for op, t in sent
+                     if t is not None and not str(t).strip()]
+            assert blank == [], (
+                f"`bn {' '.join(argv)}` under {label} forwarded an empty "
+                f"selector; the bridge would resolve it to the focused view: "
+                f"{blank}")
+
+
 def test_bn_target_is_scrubbed_from_the_test_environment():
     """An ambient BN_TARGET would redirect every test that passes no selector.
 

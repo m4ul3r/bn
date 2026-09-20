@@ -736,14 +736,14 @@ def _batch_apply(args: argparse.Namespace) -> int:
         # binder and the destructive gate), and a second, different selector
         # riding beside it is a claim this invocation no longer makes.
         #
-        # That includes a BROKEN ambient default (an empty export or pin).
-        # This invocation never consults it -- the manifest said what to act
-        # on -- so clearing the record here is what keeps the empty-selector
-        # refusal aimed at the commands that really would have fallen back on
-        # it, instead of failing a manifest that named its own target because
-        # a shell variable in the caller's environment is empty.
+        # A BROKEN ambient default (an empty export or pin) lands here too,
+        # and needs nothing extra: it is not a selector, so `_resolve_target`
+        # treats it as the absence of one, and `batch_apply` requires no
+        # target of its own -- the manifest named it. Clearing the marker
+        # here as well used to be what kept the empty-selector refusal off
+        # this command; it no longer is, because the refusal is now asked at
+        # the resolution, and this invocation performs none (#676 item 11).
         args.target = None
-        args._empty_ambient_target = None
     if args.preview:
         manifest["preview"] = True
     # preview is already set on the manifest above, so it is not passed through

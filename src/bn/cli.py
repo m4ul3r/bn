@@ -1304,12 +1304,16 @@ def _implicit_target(args: argparse.Namespace) -> str:
     pinned id fails as a safe unknown-selector error instead.
     """
     _require_nonempty_instance(args)
-    # An AMBIENT source supplied an EMPTY selector, and this is the auto-pick
-    # it corrupts. `close` nulls an ambient target so it cannot be steered and
-    # then lands HERE, so without this the broken default falls through to
-    # "there is only one target open, use that" and a bare destructive close
-    # tears down a target the caller never named, at exit 0. Refused before
-    # the peek, so nothing is sent (#676 item 11).
+    # THE refusal for a broken ambient default, and the only one left: this
+    # auto-pick is precisely what the empty value corrupts. Every caller that
+    # gets here needs a target and was given no usable selector -- either the
+    # ambient value was empty and `_resolve_target` read it as the absence of
+    # one, or `close` nulled it so it could not steer a destructive op -- and
+    # without this guard the broken default falls through to "there is only
+    # one target open, use that": a bare `bn close` then tears down a target
+    # the caller never named, at exit 0. Refused before the peek, so nothing
+    # is sent. A command that resolves no target never reaches this function
+    # and is therefore unaffected by construction (#676 item 11).
     if getattr(args, "_empty_ambient_target", None):
         raise BridgeError(_empty_target_message(args))
     response = send_request(
@@ -1356,18 +1360,40 @@ def _resolve_target(
     allow_implicit_target: bool = False,
 ) -> str | None:
     target = getattr(args, "target", None)
-    # An explicit-but-empty selector (an unset shell variable, `-t ""`, or an
-    # empty value from an ambient source) must never be forwarded: the bridge
-    # collapses "" to the focused GUI view with no count check, so a write op
-    # would silently act on the wrong target. The message names where the
-    # value came from -- blaming `--target` for a value the environment
-    # supplied sends the reader looking for an argument they never wrote.
+    ambient_empty = getattr(args, "_empty_ambient_target", None)
+    # An empty selector must never be FORWARDED: the bridge collapses "" to
+    # the focused GUI view with no count check, so a write op would silently
+    # act on the wrong target. What happens instead depends on where the
+    # empty value came from, and this is the only place that asks:
+    #
+    #  * A `-t ""` the caller TYPED is a broken argument. Refuse it, naming
+    #    the flag, because the flag is what they wrote.
+    #
+    #  * An AMBIENT source (an unassigned export, an empty pin) supplied no
+    #    selector at all -- an empty string is the ABSENCE of one, not a
+    #    request for anything -- so treat it as absent and let the ordinary
+    #    no-selector path below decide. A command that must resolve a target
+    #    then reaches `_implicit_target`, which refuses rather than letting
+    #    the single-open auto-pick stand in for a broken default; a command
+    #    that names what to act on some other way resolves nothing, so it
+    #    runs exactly as it would with the variable unset.
+    #
+    # Asked HERE, at the moment the value is reached for, the question needs
+    # no list of exempt verbs -- which is what three consecutive review
+    # rounds of a pre-dispatch gate produced, each round finding one more
+    # command that should never have been checked (`close --all`, the
+    # `--all-*` surveys, then `bn load <path>`, the verb whose whole job is
+    # to CREATE the target everything else resolves) (#676 item 11).
     if target is not None and not str(target).strip():
-        raise BridgeError(_empty_target_message(args))
+        if not ambient_empty:
+            raise BridgeError(_empty_target_message(args))
+        target = None
     if require_target and target is None:
         if allow_implicit_target:
             return _implicit_target(args)
-        raise BridgeError("This command requires --target")
+        raise BridgeError(
+            _empty_target_message(args) if ambient_empty
+            else "This command requires --target")
     return target
 
 
@@ -1824,25 +1850,19 @@ def _fanout_call(
     # by _apply_sticky_defaults, which sets _sticky_target -- is NOT explicit:
     # it must not suppress the multi-target auto-survey (#368, #676 item 11).
     fan_target = getattr(args, "target", None)
-    if fan_target is not None and not str(fan_target).strip():
-        if not getattr(args, "_empty_ambient_target", None):
-            raise BridgeError(_empty_target_message(
-                args, "omit --target to survey every target"))
-        # An AMBIENT empty value, and a survey consults no selector: with
-        # `--all-targets` every open target is read by definition, and with
-        # `--all-instances` an ambient value is already not the explicit
-        # choice that would narrow it. So this is not one of the resolutions
-        # a broken default corrupts, and refusing here turned a stale shell
-        # variable into "the whole-fleet read no longer runs" -- a straight
-        # regression against base, where an empty pin was never filled and
-        # the same survey succeeded. Drop it and survey.
-        #
-        # `_empty_ambient_target` deliberately stays on the namespace: the
-        # per-instance plan falls back to a normal single resolve when its
-        # `list_targets` peek fails, and THAT is a resolution, so it must
-        # still refuse -- as one instance's error row, not as the whole run.
-        fan_target = None
-        args.target = None
+    # A `-t ""` the caller TYPED is a broken argument on a survey too, and the
+    # survey never reaches `_resolve_target` on this path, so the same rule is
+    # applied here with the remedy this surface actually has. An AMBIENT empty
+    # value is NOT that: it named no selector, `bool("")` already keeps it out
+    # of `explicit_target` below, and the survey resolves nothing from it. The
+    # marker deliberately stays on the namespace -- the per-instance plan falls
+    # back to a normal single resolve when its `list_targets` peek fails, and
+    # THAT is a resolution, so it still refuses in `_resolve_target`, as one
+    # instance's error row rather than as the whole run (#676 item 11).
+    if (fan_target is not None and not str(fan_target).strip()
+            and not getattr(args, "_empty_ambient_target", None)):
+        raise BridgeError(_empty_target_message(
+            args, "omit --target to survey every target"))
     explicit_target = bool(fan_target) and not getattr(
         args, "_sticky_target", False
     )
@@ -2336,11 +2356,18 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
 
     An EMPTY ambient value is marked too -- it is still a value nobody typed
     -- and additionally recorded in `_empty_ambient_target`, because it is
-    not a selector and must not become one. That record is what stops the
-    implicit single-open auto-pick (`_implicit_target`) standing in for it:
-    a broken default is not a request for the default. It also names the
-    source in the refusal, since the export and the pin are cleared in
-    completely different ways.
+    not a selector and must not become one. Nothing is decided here: the
+    record is READ where the value would be used, and only there. An empty
+    ambient value reaching `_resolve_target` is the absence of a selector,
+    so a command that must resolve one hits `_implicit_target`, which
+    refuses rather than letting the single-open auto-pick stand in for a
+    broken default, and a command that says what to act on some other way
+    (`bn load <path>`, `close --all`, a manifest carrying its own target,
+    the `--all-*` surveys) resolves nothing and is untouched. Marking here
+    and judging there is what keeps that list a CONSEQUENCE rather than an
+    exemption table this function would have to be taught. The record also
+    names the source in the refusal, since the export and the pin are
+    cleared in completely different ways.
 
     `BN_INSTANCE` is DELIBERATELY not treated this way and stays an argparse
     default in `_instance_option`: `session stop` documents the env var as one
