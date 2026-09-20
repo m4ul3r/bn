@@ -312,10 +312,14 @@ def _data_refs_once(bv, address: int, *, propagate_read_errors: bool = False) ->
 
     A reader that RAISES has always propagated from here (this read was never
     wrapped), so *propagate_read_errors* only decides the other way a view can be
-    unable to answer: offering no reader at all. On the guarded literal-address
-    path that must raise too, because the #374 guard keys on this list as well --
-    reading it as `[]` answers a mapped address with the same false-negative
-    `0 callers` the probe this replaced turned into an error."""
+    unable to answer: offering no reader at all. Set it ONLY where this list is
+    the evidence the #374 guard decides on -- a literal address BN holds no code
+    ref for -- because there, reading an unavailable list as `[]` produces the
+    false-negative `0 callers` #374 exists to prevent. With code refs in hand the
+    guard is already satisfied and never consults this list: the probe this
+    replaced was `bool(list(code) or list(data))`, whose `or` short-circuited and
+    never touched the data reader in that branch, so raising there would invent a
+    refusal base did not have."""
     get_data_refs = getattr(bv, "get_data_refs", None)
     if not callable(get_data_refs):
         if propagate_read_errors:
@@ -594,12 +598,16 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     # unfiltered population; `genuine_code_refs` has spurious adrp page-base
     # materializations dropped for a page-aligned target (#284) and is what the
     # response renders. On the guarded (literal-address) path a read that FAILED
-    # raises rather than reading as "no refs" -- for BOTH lists, because that is
-    # the population the #374 guard decides on: `0 callers` must mean BN said so.
+    # raises rather than reading as "no refs", because that is the population the
+    # #374 guard decides on: `0 callers` must mean BN said so. The data list is
+    # guarded only when there are no code refs -- the same short-circuit the
+    # probe's `bool(list(code) or list(data))` had, so a view that cannot
+    # enumerate data refs keeps answering an address BN holds code refs for.
     all_code_refs, genuine_code_refs = _code_refs_once(
         bv, address, propagate_read_errors=require_refs_or_mapped)
     raw_data_refs = _data_refs_once(
-        bv, address, propagate_read_errors=require_refs_or_mapped)
+        bv, address,
+        propagate_read_errors=require_refs_or_mapped and not all_code_refs)
     if require_refs_or_mapped and not all_code_refs and not raw_data_refs:
         # #374: an address BN holds no ref of ANY kind for must still be mapped
         # to be a legitimate "0 callers" answer; an unmapped one is a typo and is

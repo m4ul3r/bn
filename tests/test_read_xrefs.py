@@ -153,9 +153,10 @@ def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_8
     def _raise(address):
         raise RuntimeError("BN ref enumeration failed")
 
-    def _use(reader: str, mode: str):
+    def _use(reader: str, mode: str, *, code_refs=None):
         bv = _FakeBV(
             functions=[_FakeFunction(0x401000, "caller")],
+            code_refs=code_refs or {},
             sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
             segments={0x401234: _FakeSegment(readable=True, executable=True)},
         )
@@ -164,6 +165,7 @@ def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_8
         setattr(bv, reader, _raise if mode == "raises" else None)
         monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
+    # No code refs, so each list in turn is the evidence the guard decides on.
     for reader, kind in (("get_code_refs", "code"), ("get_data_refs", "data")):
         _use(reader, "raises")
         with pytest.raises(RuntimeError, match="enumeration failed"):
@@ -172,6 +174,35 @@ def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_8
         _use(reader, "absent")
         with pytest.raises(RuntimeError, match=f"cannot enumerate {kind} references"):
             instance._xrefs(None, "0x401234")
+
+
+def test_xrefs_unreadable_data_refs_still_answer_an_address_with_code_refs_815(monkeypatch):
+    """The mirror of the rule above, and its limit: a list the guard never
+    consults must not be able to refuse the read.
+
+    The probe #815 removed was `bool(list(code_refs) or list(data_refs))`, whose
+    `or` short-circuits: with code refs in hand it never touched the data reader,
+    so a view that cannot enumerate data refs still answered. Propagating a data
+    read failure in that branch would invent a refusal base did not have -- and
+    would split the answer by how the identifier was spelled, since the name path
+    is unguarded."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401010, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x401234: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda address: True
+    bv.get_data_refs = None
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "0x401234")
+
+    assert result["code_ref_count"] == 1 and result["data_ref_count"] == 0
+    assert result["total"] == 1
 
 
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
