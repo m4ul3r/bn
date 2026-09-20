@@ -440,55 +440,94 @@ def _no_instances() -> dict[str, Any]:
 _DECLARED_UNREADABLE = "unreadable"
 
 
-# #675.2 / #907 review: WHICH declared types are classes. `bv.types` is the
-# view's WHOLE type table -- enums, scalars, pointers, arrays, function
-# prototypes and typedef aliases sit in it alongside structures -- so an
-# unfiltered enumeration answered `class show Color` (an enum) with
-# `class Color (size 0x4) [declared-only]`, the note asserting its empty vtable
-# is "RTTI evidence that is absent" about a type that can never carry one, and
-# rendered `(hidden: N declared types)` with N the entire type population.
+# #675.2 / #907 review: WHICH types the declared half answers for. Two axes, and
+# both were measured wrong before this block existed.
 #
-# The admitted kind is BN's `StructureTypeClass`, which is exactly C++'s three
-# class-keys (`class`, `struct`, `union`), reached through the typedef follow the
-# type reads already use (#674): `typedef struct { ... } Widget;` registers the
-# body as an auto-named struct and `Widget` as a NamedTypeReference to it, so an
-# alias-blind test would leave `class show Widget` answering only for the
-# internal `_Widget`.
+# KIND. `bv.types` holds enums, scalars, pointers, arrays, function prototypes
+# and typedef aliases alongside structures, so an unfiltered enumeration answered
+# `class show Color` (an enum) with `class Color (size 0x4) [declared-only]`, the
+# note asserting its empty vtable is "RTTI evidence that is absent" about a type
+# that can never carry one. The admitted kind is BN's `StructureTypeClass`,
+# exactly C++'s three class-keys (`class`, `struct`, `union`).
+#
+# PROVENANCE. `bv.types` is not the set the user declared either -- it is every
+# type BN has, including the ones IT imported. Measured on a stock system ELF
+# with zero user declarations: 53 types, 25 of them structure-kind (the ELF
+# format structs, `FILE`, the libc `_IO_*` family), so the lens rendered
+# `classes: 0 shown of 0 (hidden: 25 declared class types (--all to show))`
+# directly above its own note saying the target has no C++ type evidence at all,
+# and `class show <an ELF format struct>` answered a class card. On a C++ target
+# it additionally listed BN's own generated `<Class>::VTable` structs as peer
+# "classes" of the class they belong to -- the artifact family #309/#481 exist to
+# suppress. The population is therefore the USER type container: the set
+# `types declare` (`define_user_type`) writes to, which is what #675 item 2 asks
+# about and what this module's comments have always claimed.
 _STRUCTURE_TYPE_CLASS = 4       # binaryninja.TypeClass.StructureTypeClass
+
+# `binaryninja.NamedTypeReferenceClass` values that NAME a C++ class type:
+# ClassNamedTypeClass, StructNamedTypeClass, UnionNamedTypeClass. An alias BN
+# cannot resolve still states the kind it references, and on BN 6.1
+# `typedef struct { ... } T;` is exactly that case: the anonymous body is not
+# registered under a name, so `target(bv)` is None while the reference itself
+# reads `struct _T T` with StructNamedTypeClass -- measured. Refusing on an
+# unresolvable target alone would therefore drop the single most common way a
+# declared class reaches a view, while `typedef enum { ... } M;` (EnumNamedType-
+# Class, target also None) must still be refused.
+_CLASS_NAMED_TYPE_CLASSES = frozenset({2, 3, 4})
+_CLASS_NAMED_TYPE_PREFIXES = ("Class", "Struct", "Union")
+
+
+def _names_a_class_type(type_obj) -> bool:
+    """True if *type_obj* is a NamedTypeReference NAMING a class type.
+
+    Prefix-matched, not substring-matched: every ``NamedTypeReferenceClass``
+    spelling ends in ``NamedTypeClass``, so ``"Class" in name`` is true of
+    ``EnumNamedTypeClass`` too."""
+    ntc = getattr(type_obj, "named_type_class", None)
+    if ntc is None:
+        return False
+    try:
+        return int(ntc) in _CLASS_NAMED_TYPE_CLASSES
+    except (TypeError, ValueError):
+        pass
+    return str(getattr(ntc, "name", None) or ntc).startswith(_CLASS_NAMED_TYPE_PREFIXES)
 
 
 def _class_type_target(bv, name: str, type_obj):
-    """The STRUCTURE a declaration resolves to -- *type_obj* itself when it is
-    one, the followed target when it is an alias for one -- or ``None`` when the
-    declaration is not a C++ class type at all.
+    """The handle carrying a declaration's facts when the declaration is a C++
+    class type -- the structure itself, the structure its alias chain reaches, or
+    an unresolvable reference that still NAMES a class -- else ``None``.
 
     Kind test duck-typed over BN's ``TypeClass`` IntEnum and the plain string the
     unit fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
 
-    The TARGET rather than the alias, because that is the handle a declaration's
-    facts live on: a NamedTypeReference states no members and no width of its
-    own, so a card built from the alias rendered
+    The resolved TARGET is preferred because that is where a declaration's facts
+    live: a NamedTypeReference states no members and (for a resolvable alias) a
+    width that is not its own, so a card built from the alias rendered
     ``kind: named_type_ref ... size=0x0`` for a 0x30-wide class and could not show
     the class the user asked about (#907 review). ``read_types``' struct reader
     resolves the same way, for the same reason (#674) -- one convention for which
     handle carries a declaration's facts. The record keeps the DECLARED name; the
     entry's own ``decl`` discloses the underlying body.
 
-    Fails CLOSED on every reading that does not reach a structure -- an absent
-    ``type_class``, an alias whose chain cannot be followed (an unresolvable
-    target, a cycle, too many hops), and a kind that cannot be read at all. A
-    class surface must not report a type AS a class on the strength of a read
-    that failed; the honest answer there is the unknown-class miss.
+    Fails CLOSED on every reading that neither reaches a structure nor names one
+    -- an absent ``type_class``, an alias that names an enum or nothing, and a
+    kind that cannot be read at all. A class surface must not report a type AS a
+    class on the strength of a read that failed; the honest answer there is the
+    unknown-class miss.
 
-    The read is guarded because this runs over the view's WHOLE type table on a
-    read path: an exception from one type's ``type_class`` would otherwise take
-    down the entire `class list`, where before it could at worst contribute one
-    bogus row (:func:`_declared_size` guards its width read for the same
+    The read is guarded because this runs over every declaration on a read path:
+    an exception from one type's ``type_class`` would otherwise take down the
+    entire `class list` (:func:`_declared_size` guards its width read for the same
     reason)."""
     try:
         _, target, reason = _follow_typedef(bv, name, type_obj)
         if reason is not None:
-            return None
+            # The chain did not terminate (an unregistered anonymous body, a
+            # cycle, too many hops). The reference it stopped on still states
+            # which kind it names, which is enough to admit the class -- carrying
+            # only the facts it does have -- and to keep refusing an enum alias.
+            return target if _names_a_class_type(target) else None
         tc = getattr(target, "type_class", None)
         if tc is None:
             return None
@@ -501,33 +540,56 @@ def _class_type_target(bv, name: str, type_obj):
         return None
 
 
-def _declared_types(bv) -> dict[str, Any] | None:
-    """``{declared name: the structure carrying its facts}`` for the view's
-    declared CLASS types -- the LIVE read -- or ``None`` when the view's type
-    table could not be READ AT ALL.
+def _user_declared_entries(bv) -> list[tuple[str, Any]] | None:
+    """``[(name, type_obj)]`` for the types the USER declared in this view, or
+    ``None`` when that set could not be read.
 
-    One function owns the enumeration AND the kind filter, so every consumer of
-    the declared half reads the same, current view (see the block comment above
-    for why nothing here may be memoised) and describes the same POPULATION: the
+    BN's user type container is the set `types declare` (``define_user_type``)
+    writes to, and it is the only observable answer to "did the user declare
+    this": on a freshly loaded view it is empty while ``bv.types`` already holds
+    everything BN imported (see the PROVENANCE note above). A view that exposes
+    no container at all has no user declarations to offer, which is an empty
+    answer and not a failed read -- the lens simply has no declared half there,
+    exactly as before #675.2."""
+    container = getattr(bv, "user_type_container", None)
+    if container is None:
+        return []
+    entries = container.types
+    if entries is None:
+        return None
+    # `{type_id: (QualifiedName, Type)}` -- keyed by id, so the NAME comes out of
+    # the value, and a declaration renamed in place keeps one entry.
+    return [(str(entry[0]), entry[1]) for entry in entries.values()]
+
+
+def _declared_types(bv) -> dict[str, Any] | None:
+    """``{declared name: the handle carrying its facts}`` for the USER-declared
+    class types in this view -- the LIVE read -- or ``None`` when the user's
+    declarations could not be READ AT ALL.
+
+    One function owns the enumeration AND both filters, so every consumer of the
+    declared half reads the same, current view (see the block comment above for
+    why nothing here may be memoised) and describes the same POPULATION: the
     listing's rows, its hidden count and `class show`'s fallback all resolve
     here, which is what stopped the count from counting the type table while the
     rows were something else (#907 review). Filtering a caller instead would
     re-split them on the next change.
 
-    ``None`` is distinct from ``{}`` on purpose. An unreadable type table must not
-    report as zero declared classes: `0` reads as "the lens looked and found
-    none", which is the exact blindness #675.2 exists to remove, so the callers
-    disclose it instead (`? declared class types` on the listing, and a miss that
-    does not claim the name is absent). Guarded here rather than per entry
-    because a raising ``types`` property or ``items()`` took `class list` down
-    whole -- the RTTI half included, which has no stake in the declared types."""
+    ``None`` is distinct from ``{}`` on purpose. An unreadable set must not report
+    as zero declared classes: `0` reads as "the lens looked and found none", which
+    is the exact blindness #675.2 exists to remove, so the callers disclose it
+    instead (`? user-declared class types` on the listing, and a miss that does
+    not claim the name is absent). Guarded here rather than per entry because a
+    raising container took `class list` down whole -- the RTTI half included,
+    which has no stake in the declared types."""
     try:
-        entries = list((getattr(bv, "types", None) or {}).items())
+        entries = _user_declared_entries(bv)
     except Exception:
         return None
+    if entries is None:
+        return None
     declared: dict[str, Any] = {}
-    for key, type_obj in entries:
-        name = str(key)
+    for name, type_obj in entries:
         target = _class_type_target(bv, name, type_obj)
         if target is not None:
             declared[name] = target

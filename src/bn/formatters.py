@@ -5616,19 +5616,21 @@ def _render_class_list_text(value: Any) -> str:
     ven = value.get("vendor_suppressed") or 0
     if value.get("no_vendor") and ven:
         hidden_parts.append(f"{ven} vendored")
-    # #675.2: declared class types are folded out by the confidence gate the way
-    # name-only clusters are, so the default listing says they exist instead of
-    # reading as a lens that never saw the class the user declared.
+    # #675.2: user-declared class types are folded out by the confidence gate the
+    # way name-only clusters are, so the default listing says they exist instead
+    # of reading as a lens that never saw the class the user declared.
     ds = _count_field(value, "declared_suppressed")
     if ds or _field_skewed("declared_suppressed"):
         # `_stated_count`, not the raw count: an unreadable counter must not print
-        # as `0 declared class types`, which reads as "the lens looked and found
-        # none". The noun is "declared CLASS type" because that is the population
-        # the counter counts and `--all` then lists -- it counted the view's whole
-        # type table when it said "declared type" (#907 review).
+        # as `0 user-declared class types`, which reads as "the lens looked and
+        # found none". The noun names the population exactly, because twice it did
+        # not: it counted the view's WHOLE type table when it said "declared type",
+        # and every type BN itself imported when it said "declared class type"
+        # (#907 review). What it counts is what `--all` adds: the class types this
+        # view's USER declared.
         stated = _stated_count(value, "declared_suppressed")
         hidden_parts.append(
-            f"{stated} declared class type{'s' if ds != 1 else ''} (--all to show)")
+            f"{stated} user-declared class type{'s' if ds != 1 else ''} (--all to show)")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)

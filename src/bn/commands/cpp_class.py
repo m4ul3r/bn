@@ -14,9 +14,10 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                      "use evidence table to walk a raw vtable/pointer table as data",
          see_also=("class show", "evidence table"),
          args=[arg("--all", action="store_true", default=False, dest="all_clusters",
-                  help="Include name-only clusters (possible namespaces) and the view's "
-                       "declared class types (class/struct/union declarations), not just "
-                       "RTTI/ctor-confirmed classes"),
+                  help="Include name-only clusters (possible namespaces) and the "
+                       "view's USER-declared class types (class/struct/union declarations "
+                       "you added with `types declare`, not types Binary Ninja imported), "
+                       "not just RTTI/ctor-confirmed classes"),
                arg("--no-stl", action="store_true", default=False, dest="no_stl",
                    help="Hide standard-library / ABI-runtime classes (std::, __gnu_cxx::, __cxxabiv1::, reserved-id internals) so domain classes surface"),
                arg("--no-vendor", action="store_true", default=False, dest="no_vendor",
