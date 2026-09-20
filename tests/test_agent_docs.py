@@ -825,6 +825,16 @@ def test_command_handlers_follow_the_documented_naming_convention():
         "Two copies is how the section an agent reads goes stale while a guard "
         "reads the other one"
     )
+    strays = {
+        path.relative_to(REPO).as_posix(): copies
+        for path in AGENT_FACING_DOCS
+        if path != CLAUDE_MD and (copies := _prefixed(_doc_text(path).splitlines()))
+    }
+    assert not strays, (
+        f"another agent-facing doc states the handler-naming rule: {strays}. The "
+        "rule lives in one place so an agent cannot read a contradicting second "
+        "copy, and only CLAUDE.md's copy is checked against the registry"
+    )
     bullet = in_section[0]
     rules = _documented_rules(bullet)
     undocumented, stale = _clause_coverage(handlers, rules)
@@ -877,10 +887,16 @@ def test_the_alias_exemption_covers_only_the_aliasing_path():
 
 
 # A synthetic bullet stating all three rules, and for each clause the exact
-# text to strike and a DIFFERENT rule written in the SAME vocabulary. The
-# rewrite is the load-bearing half: the clause's words survive it, so only a
-# matcher reading the RULE reports the clause absent, and any matcher loosened
-# back towards a keyword reports it present and reds.
+# text to strike plus the DIFFERENT rules it is rewritten into, each written
+# in the clause's OWN vocabulary. The rewrites are the load-bearing half: the
+# clause's words survive them, so only a matcher reading the RULE reports the
+# clause absent. A matcher loosened to any word the rewrites carry reports the
+# clause present and reds -- which is why a clause needs one rewrite per word
+# form it can be reduced to (`alias` and `aliases` are two). Words that occur
+# ONLY inside the operative phrase cannot be covered this way: a rewrite
+# carrying them would state the rule again. Loosening a matcher to one of
+# those stays green, which is bounded -- the doc must still spell the rule out
+# for the guard to read it as stated.
 _PARSER_BULLET = (
     "- Command handlers are named `_<group>_<subcommand>()` (e.g., "
     "`_function_list`); a top-level command keeps its bare verb "
@@ -888,14 +904,18 @@ _PARSER_BULLET = (
     "alias keeps the name of the path it aliases (`rename` is `_symbol_rename`)"
 )
 _CLAUSE_PINS = (
-    ("grouped", "`_<group>_<subcommand>()`", "`<group>::<subcommand>()`"),
+    ("grouped", "`_<group>_<subcommand>()`",
+     ("`<group>::<subcommand>()`", "`_<group>-<subcommand>()`")),
     ("top_level",
      "; a top-level command keeps its bare verb (`_decompile`)",
-     "; a top-level command is prefixed `_top_` (`_top_decompile`)"),
+     ("; a top-level command is prefixed `_top_` (`_top_decompile`)",
+      "; a top-level command keeps its group prefix, never its bare verb"
+      " (`_top_decompile`)")),
     ("alias",
      ", and a command that is an alias keeps the name of the path it aliases "
      "(`rename` is `_symbol_rename`)",
-     ", and an alias command is named `_alias_<path>` (`_alias_rename`)"),
+     (", and an alias command is named `_alias_<path>` (`_alias_rename`)",
+      ", and command aliases are forbidden in this CLI")),
 )
 
 
@@ -905,9 +925,9 @@ def test_the_bullet_parser_reads_each_rule_not_a_keyword():
     `alias` appearing in a clause that says something else about aliases used
     to license the alias exemption, and the top-level clause was not read at
     all, so striking it from the doc was invisible to every guard. Every
-    clause is now pinned twice -- struck entirely, and rewritten into a
-    different rule that keeps the clause's own vocabulary -- so no matcher can
-    loosen back to a keyword and stay green.
+    clause is pinned by striking it and by rewriting it into other rules that
+    keep its vocabulary, so a matcher cannot loosen towards a keyword -- in
+    either the clause's singular or its plural form -- and stay green.
     """
     rules = _documented_rules(_PARSER_BULLET)
     assert (rules.grouped, rules.top_level, rules.alias) == (True, True, True)
@@ -915,20 +935,28 @@ def test_the_bullet_parser_reads_each_rule_not_a_keyword():
     assert rules.cited == {
         "_function_list", "_decompile", "_help_index", "_symbol_rename"
     }
-    for field, clause, other_rule in _CLAUSE_PINS:
+    assert {field for field, _, _ in _CLAUSE_PINS} == {
+        field for field in _DocumentedRules._fields
+        if field not in ("exceptions", "cited")
+    }, (
+        "every clause `_documented_rules` reports needs an anti-loosening pin; "
+        "a row dropped from _CLAUSE_PINS silently removes one"
+    )
+    for field, clause, other_rules in _CLAUSE_PINS:
         assert clause in _PARSER_BULLET, (
-            f"the {field} pin no longer quotes its own clause, so both of its "
+            f"the {field} pin no longer quotes its own clause, so all of its "
             "mutations are no-ops"
         )
         struck = _documented_rules(_PARSER_BULLET.replace(clause, ""))
         assert getattr(struck, field) is False, (
             f"striking the {field} clause must stop it counting as documented"
         )
-        reworded = _documented_rules(_PARSER_BULLET.replace(clause, other_rule))
-        assert getattr(reworded, field) is False, (
-            f"a bullet stating a DIFFERENT {field} rule must not read as stating "
-            "this one just by reusing its words"
-        )
+        for other_rule in other_rules:
+            reworded = _documented_rules(_PARSER_BULLET.replace(clause, other_rule))
+            assert getattr(reworded, field) is False, (
+                f"a bullet stating a DIFFERENT {field} rule must not read as "
+                f"stating this one just by reusing its words: {other_rule!r}"
+            )
 
 
 def test_a_naming_exception_is_a_path_handler_pair_not_any_backticked_pair():
