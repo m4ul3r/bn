@@ -144,6 +144,13 @@ don't save" verdict, and this state reports `dirty_after: true` beside it. The
 default text line carries the same two facts as `mutation: rollback failed …
 changed=None … dirty_after=True`.
 
+This is a rule of the compact-status schema itself, so it holds for **every**
+mutation, whichever way that op measures: the `results[]`-derived summary every
+op gets by default, and `go rename`'s own-counter summary alike. A `--preview`
+whose non-journaled restore failed is the plainest case — it verified every op
+and still left the view modified, so it reports `changed_count: null`, not the
+plan it verified.
+
 The `--preview` variant counts the same way, because it is the same live state —
 a preview whose revert failed has really renamed the view. A preview that
 FAILED and reverted cleanly is the other case: it reports `changed_count: 0`,
@@ -151,6 +158,14 @@ since the op is all-or-nothing and a live run of that state commits nothing. Its
 `verified_count` is how far the apply got before the failure, not what would
 land — `go rename`'s detail view states it as `0 would rename (N verified before
 the failure …)`.
+
+A detail view may not state a count in the failed-revert state either, in
+either direction: `go rename --verbose` says `an unknown number of the N applied
+renames are still live` rather than `0 renamed` / `0 would rename`, because the
+compact face of that same payload says `changed=None` and a bridge-emitted
+failed preview revert carries **no** failure row at all (`results: []` beside
+`go_failed_count: 0`) — so there is no apply failure to name and no list of
+failures to send the reader to.
 
 #### Unmeasured mutations
 

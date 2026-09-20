@@ -1826,16 +1826,35 @@ def _render_go_rename_text(value: Any) -> str:
     # this view is the one that CLAIMS those counts.
     ok = value.get("success") is not False and not failed
     lines: list[str] = []
-    if preview:
-        if rolled_back is False:
-            # The JSON already says `rolled_back: false` beside an unknown
-            # `changed_count`, so the text may not answer "reverted" here: this
-            # banner is the only line that carries the failed revert.
-            lines.append("rollback failed: the preview could not be reverted -- the view "
-                         "may be left modified by an unknown number of the renames")
-        else:
-            lines.append("preview: renames applied + reverted (nothing committed)")
-        if ok and rolled_back is not False:
+    # A revert that did not complete is the ONE state where no line here may
+    # state a number for what is live: an unknown subset of the renames the
+    # apply made is still in the view, which is exactly why the compact face of
+    # this payload reports `changed=None` (#693 item 1). Both lines this branch
+    # replaces stated a confident `0` -- "0 would rename" on the preview, "0
+    # renamed" live -- so the two views of ONE payload disagreed, and on this op
+    # a 0 is the "nothing changed, do not save" verdict a control loop acts on.
+    #
+    # The preview line also named "the failure" and pointed at "the failure(s)
+    # below". On the shape the bridge actually emits for a failed preview revert
+    # -- `results: []` beside `go_failed_count: 0`, both built from the one
+    # `failed_rows` list -- there is NO apply failure and nothing listed below,
+    # and it directed a re-run at a view the banner above says may be left
+    # modified (#693 r2).
+    if rolled_back is False and not committed:
+        lines.append(
+            "rollback failed: the preview could not be reverted -- the view "
+            "may be left modified by an unknown number of the renames"
+            if preview else
+            "rollback failed: the view may be left modified")
+        lines.append(
+            f"go rename{' (preview)' if preview else ''}: an unknown number of "
+            f"the {verified} applied renames are still live -- the revert "
+            f"failed, so this is neither a plan nor a zero ({len(failed)} "
+            f"failed, {skipped} skipped); re-read the view and save or discard "
+            f"it deliberately")
+    elif preview:
+        lines.append("preview: renames applied + reverted (nothing committed)")
+        if ok:
             lines.append(f"go rename (preview): {verified} would rename, {len(failed)} failed, "
                          f"{skipped} skipped (already user-named)")
         else:
@@ -1845,11 +1864,8 @@ def _render_go_rename_text(value: Any) -> str:
     elif not committed and not ok:
         # All-or-nothing: a failure reverted the WHOLE batch, so NOTHING landed --
         # don't claim "N renamed" for rows that passed readback before the revert.
-        if rolled_back is False:
-            lines.append("rollback failed: the view may be left modified")
-        else:
-            lines.append("rolled back: the batch was reverted because a rename failed — "
-                         "NOTHING was committed")
+        lines.append("rolled back: the batch was reverted because a rename failed — "
+                     "NOTHING was committed")
         lines.append(f"go rename: 0 renamed ({verified} would have, {len(failed)} failed, "
                      f"{skipped} skipped); fix the failure(s) below and re-run")
     else:
@@ -5029,6 +5045,16 @@ def _build_mutation_summary(
         first_error = message or first_error or (
             "prototype has_user_type override could not be cleared"
         )
+    # A revert that did NOT complete leaves an unknown subset of the applied
+    # changes LIVE. `skills/bn/reference/mutating.md` states that rule of the
+    # ONE compact-status schema, so it belongs HERE and not in one caller:
+    # shipped in `_go_rename_summary` alone it was a documented contract the
+    # `results[]`-derived sibling did not obey, and a generic PREVIEW whose
+    # non-journaled restore fails reaches exactly this state -- and reported a
+    # confident plan for it while its own message said the view may be left
+    # modified (#693 r2). The predicate is the one `dirty_after` uses below;
+    # see its note for why `not committed` is part of it.
+    revert_failed = rolled_back is False and not committed
     unmeasured = not measured
     if unmeasured:
         # Review of the first cut of this fix (#684): `dirty_after: None` is
@@ -5062,7 +5088,7 @@ def _build_mutation_summary(
         # `dirty_after` is a deliberate fail-safe True, NOT unknown (#684).
         "measured": not unmeasured,
         "op_count": op_count,
-        "changed_count": (None if unmeasured else changed),
+        "changed_count": (None if unmeasured or revert_failed else changed),
         "verified_count": (None if unmeasured else verified),
         "noop_count": (None if unmeasured else noop),
         "failed_count": (None if unmeasured else failed),
@@ -5088,7 +5114,7 @@ def _build_mutation_summary(
         # `measured` still gets the safe answer from `dirty_after` alone.
         "dirty_after": (True if unmeasured else (
             (committed and bool(changed))
-            or (rolled_back is False and not committed)
+            or revert_failed
             or proto_residue
         )),
     }
@@ -5317,17 +5343,17 @@ def _go_rename_summary(value: Any) -> Any:
     #   preview, ok    -> what WOULD land, i.e. the rows that verified (NOT the
     #                     candidate count, which over-reports every candidate the
     #                     apply skipped because it changed underneath us);
-    #   revert FAILED  -> UNKNOWN. The revert did not complete, so an unknown
-    #                     subset of the applied renames is still live; `0` is a
-    #                     claim this state cannot support, and on this op a 0 is
-    #                     the "nothing changed, do not save" verdict a control
-    #                     loop acts on (#693 item 1). `None` is the schema's
-    #                     "unknown", read beside `rolled_back: false` and the
-    #                     fail-safe `dirty_after: true` the builder already sets
-    #                     for this state -- so `changed_count` never reads as
-    #                     "nothing landed" while renames are live. `measured`
-    #                     stays True: the counters DID read, which is what that
-    #                     key reports;
+    #   revert FAILED  -> UNKNOWN, decided by the SHARED builder rather than
+    #                     here: stating the rule in this caller alone left the
+    #                     `results[]`-derived sibling reporting a confident
+    #                     integer for the identical live state, while
+    #                     `mutating.md` states it of the one compact-status
+    #                     schema (#693 item 1 / r2). Whatever this ladder
+    #                     computes for that state, `_build_mutation_summary`
+    #                     overrides it to `None` beside the fail-safe
+    #                     `dirty_after: true` it already sets; `measured` stays
+    #                     True, because the counters DID read -- what is
+    #                     unknown is the live delta, not the measurement;
     #   otherwise      -> nothing landed. A live run that failed and WAS
     #                     reverted, or a PREVIEW that failed: the op is
     #                     all-or-nothing, so running the same state live commits
@@ -5350,9 +5376,6 @@ def _go_rename_summary(value: Any) -> Any:
     if committed:
         changed = committed_count
         source = "go_committed_count"
-    elif rolled_back is False:
-        changed = None
-        source = None
     elif preview and run_ok:
         changed = verified
         source = "go_verified_count"
