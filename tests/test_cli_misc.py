@@ -1620,6 +1620,92 @@ def test_strings_count_text_states_the_dropped_count_795(fake_transport, capsys)
     assert capsys.readouterr().out.strip() == "Total strings: 1359"
 
 
+def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
+        fake_transport, capsys):
+    """One count contract, on BOTH surfaces that state this number (#619/#795).
+
+    The listing renderer reads `filtered` through `_count_field`; the `--count`
+    line tested it with `isinstance(int)` -- a SECOND decider over a question
+    this codebase already decided, and it answers differently in both
+    directions. A producer that spells counts as text (`"1329"`) dropped the
+    disclosure entirely, which is the second unfiltered invocation #795 exists
+    to remove; and `bool` IS an `int` in Python, so `filtered: true` rendered
+    "(True filtered out by the active filters)" -- a flag printed as a quantity,
+    with nothing saying the number was unreadable.
+    """
+    # (a) A numeric-string count states the same denominator an int one does.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": "30", "total": "30", "filtered": "1329"}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--probable-format-strings", "--format", "text"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total strings: 30 (1329 filtered out by the active filters)")
+
+    # (b) A bool is not a count. It is disclosed as unreadable -- the same
+    # reading the listing renderer already gives it -- never rendered as one.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": True}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--format", "text"]) == 0
+    flagged = capsys.readouterr().out
+    assert "True filtered out" not in flagged
+    assert flagged.startswith("Total strings: 30")
+    assert "filtered-string count is not a number that can be read" in flagged
+
+    # (c) An unreadable HEADLINE count is `?`, not a fabricated 0: "Total
+    # strings: 0" from a container reads byte-identically to a real empty
+    # binary, which is the #683 harm the choke point's stated sibling exists for.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": {"n": 30}, "total": 30}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--format", "text"]) == 0
+    unreadable = capsys.readouterr().out
+    assert unreadable.startswith("Total strings: ?")
+    assert "Total strings: 0" not in unreadable
+
+
+def test_estimate_output_preflights_the_raw_bytes_read_796(fake_transport, capsys):
+    """#796: `read --encoding bytes` is a SECOND emit path, and it must preflight
+    like the first one.
+
+    `read` is marked estimable, but its `--encoding bytes` branch returns before
+    `_call` and wrote the payload straight to `sys.stdout.buffer` -- so
+    `--estimate-output` was accepted and ignored at rc 0, dumping the very bytes
+    the flag's own help promises it prints INSTEAD of ("the read still runs;
+    nothing is written"). The same command with `--encoding hex` printed the
+    estimate, so one command's two halves disagreed about what the flag means.
+    """
+    payload = "41" * 64                      # 64 bytes of 'A'
+    fake_transport({"read": {"ok": True, "result": {
+        "kind": "bytes", "address": "0x401000", "length": 64, "hex": payload}}})
+
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--estimate-output", "--target", "active"]) == 0
+    text = capsys.readouterr().out
+    assert "estimated: true" in text
+    assert "tokens: " in text and "tokenizer: estimate" in text
+    assert "bytes: 64" in text                   # the raw payload's real size
+    assert "--length" in text                    # this command's own slicing knob
+    assert "AAAA" not in text                    # ...and NOT the payload itself
+
+    # Machine-readable under --format json, and it measures the RAW byte payload
+    # (64 bytes), not a hex rendering of it.
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--estimate-output", "--format", "json",
+                        "--target", "active"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["estimated"] is True and envelope["format"] == "bytes"
+    assert envelope["bytes"] == 64 and envelope["tokens"] > 0
+    assert envelope["summary"] == {"kind": "bytes", "address": "0x401000", "length": 64}
+    assert "hex" not in envelope
+
+    # Without the flag the raw bytes still reach stdout unchanged: the preflight
+    # is opt-in and replaces nothing when it is not asked for.
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--target", "active"]) == 0
+    assert capsys.readouterr().out == "A" * 64
+
+
 def test_estimate_output_preflights_a_large_read_796(fake_transport, capsys):
     """#796: `--estimate-output` on the reads whose cost you want to know FIRST.
 
@@ -1685,7 +1771,90 @@ def test_estimate_output_covers_per_function_reads_796(fake_transport, capsys):
     assert '"str0"' not in strings_out            # the rows are NOT printed
 
 
-def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
+# Argument values that make a read command's parser accept an invocation, keyed
+# by the registry's OWN argument name (positionals) or the parser's `dest`
+# (required options). One vocabulary, not a per-command argv list: a command
+# that grows a required argument this table cannot fill fails the sweep loudly
+# instead of silently dropping out of the coverage claim.
+_ESTIMATE_ARG_VALUES = {
+    "identifier": "main", "callee": "main", "function": "main",
+    "name": "Widget", "query": "a", "address": "0x401000",
+    "type_name": "int32_t", "struct_name": "hdr",
+    "at": "0x401000", "var": "x#1", "start": "0x401000", "end": "0x402000",
+    "arg_index": "1", "sinks": "arg:memcpy:0", "sources": "call:recv",
+}
+# One permissive reply for every op. The sweep is about which EMIT PATH a
+# handler takes, not about any single op's payload shape.
+_ESTIMATE_STUB = {"ok": True, "result": {
+    "kind": "probe", "items": [], "total": 0, "offset": 0, "limit": 10,
+    "returned": 0, "has_more": False, "count": 0, "hex": "41414141",
+    "text": "probe\n", "name": "probe", "address": "0x401000",
+}}
+
+
+def _estimate_emit_modes(leaf_parser):
+    """Every alternate emit mode a command's OWN parser offers, derived from it.
+
+    A handler is free to branch on its own flags and take a different way out --
+    `read --encoding bytes` returns before `_call` and writes to
+    `sys.stdout.buffer` -- so sweeping the boolean flags and every value of
+    every choice flag is what reaches the second path. Deriving the modes from
+    the parser (rather than listing them) is what makes the sweep grow with the
+    surface instead of going stale the next time a handler grows a branch.
+    """
+    import argparse
+
+    modes = [[]]
+    for action in leaf_parser._actions:
+        if not action.option_strings:
+            continue
+        flag = action.option_strings[0]
+        # --out is mutually exclusive with the flag under test (argparse rc 2),
+        # --stdin would block on a tty, and --help exits before dispatch.
+        if flag in ("--estimate-output", "--out", "--help", "--stdin"):
+            continue
+        if isinstance(action, argparse._StoreTrueAction):
+            modes.append([flag])
+        elif action.choices:
+            modes.extend([flag, str(choice)] for choice in action.choices)
+    return modes
+
+
+def _estimate_required_flags(leaf_parser):
+    """The command's own REQUIRED options, filled from the shared vocabulary.
+
+    Derived from the parser rather than listed per command: `taint forward`
+    needs `--source`, `evidence virtual-call` needs `--at`, and a command that
+    grows a new required option must either be fillable or say so."""
+    argv, unfillable = [], []
+    for action in leaf_parser._actions:
+        if not action.option_strings or not action.required:
+            continue
+        if action.dest not in _ESTIMATE_ARG_VALUES:
+            unfillable.append(action.dest)
+            continue
+        argv += [action.option_strings[0], _ESTIMATE_ARG_VALUES[action.dest]]
+    return argv, unfillable
+
+
+def _is_error_envelope(out: str) -> bool:
+    """A refusal reported as a machine-readable envelope is not a payload."""
+    try:
+        return json.loads(out).get("ok") is False
+    except (ValueError, AttributeError):
+        return False
+
+
+def _is_estimate_envelope(out: str) -> bool:
+    """Did this invocation print the preflight instead of the payload?"""
+    try:
+        return json.loads(out).get("estimated") is True
+    except (ValueError, AttributeError):
+        return any(line.strip() == "estimated: true" for line in out.splitlines())
+
+
+def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
+        fake_transport, capsys, monkeypatch):
     """#796 review: the flag lives on the code path that implements it, not on
     every command that happens to share an output-option group.
 
@@ -1698,38 +1867,25 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
     flag exists to avoid.
 
     The rule is the `fanout=True` precedent (#169 L1 review): an EXPLICIT
-    allow-list on the registry, and a coverage claim DERIVED here from the handlers
-    themselves, so a new command can neither silently inherit the flag nor quietly
-    lose it. Both directions are asserted, because either half alone is a list
-    that can drift from the code.
+    allow-list on the registry. What proves the allow-list is a coverage claim
+    rather than a wish is the sweep below, which RUNS every marked command in
+    every emit mode its parser offers and reads what landed on stdout.
+
+    That is deliberately not a source-text derivation. The previous version of
+    this test derived the set by grepping each handler for `_call(` with no
+    `_mutate`/`_emit_result` beside it, and `read` satisfies that grep while its
+    `--encoding bytes` branch returns above the `_call` and writes the payload
+    straight to `sys.stdout.buffer` -- a second emit path no reading of the
+    source's call names can see, which shipped the flag accepted-and-ignored at
+    rc 0 on exactly the read whose size a caller most wants to preflight.
     """
     import argparse
-    import inspect
-    import re
-
-    # Commands whose RESULT IS their side effect: they render through `_call`, so
-    # the allow-list has to exclude them by name. `save` writes a database, the
-    # rest mutate or destroy the session's state -- replacing any of those
-    # outcomes with a size is the defect this test exists for.
-    side_effecting = {("save",), ("close",), ("target", "close"), ("load",),
-                      ("refresh",), ("py", "exec")}
-
-    def derived_estimable():
-        """Re-derive the allow-list from the handlers: a command is estimable iff
-        its handler renders through `_call` and is neither a mutation helper, an
-        `_emit_result` command, nor a named side effect."""
-        found = set()
-        for spec in bn.cli._COMMANDS:
-            path = tuple(spec["path"])
-            if path in side_effecting:
-                continue
-            src = inspect.getsource(spec["handler"])
-            calls = set(re.findall(r"\b(_call|_mutate|_emit_result)\(", src))
-            if "_call" in calls and not (calls & {"_mutate", "_emit_result"}):
-                found.add(path)
-        return found
 
     parser = bn.cli.build_parser()
+    # `main()` rebuilds the whole argparse tree per call (~110 ms x 285 probes),
+    # and it only ever PARSES with it -- nothing below mutates parser state --
+    # so the sweep hands it the one tree it already built.
+    monkeypatch.setattr(bn.cli, "build_parser", lambda: parser)
 
     def leaf(path):
         current = parser
@@ -1751,7 +1907,7 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
     # hazard, on the one node class where an "intermediate" parser and a leaf are
     # the same object). The builder therefore declines to advertise it on any
     # group node, derived from the registry rather than a second hand-kept list --
-    # and that derivation is what the two assertions below check in both
+    # and that derivation is what the assertions below check in both
     # directions, so neither a new command nor a new subcommand can reopen it.
     groups = {tuple(spec["path"])[:i] for spec in bn.cli._COMMANDS
               for i in range(1, len(tuple(spec["path"])))}
@@ -1762,11 +1918,6 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
         "subcommand is dispatched: a mutation behind it runs while its outcome is "
         f"replaced by a size ({sorted(p for p in groups if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
 
-    asserted = derived_estimable()
-    assert marked == asserted, (
-        f"the registry marks {sorted(marked - asserted)} estimable and misses "
-        f"{sorted(asserted - marked)}; `estimable=True` is the allow-list for the "
-        "flag, so it must agree with the handlers that implement it")
     assert advertised == marked - groups, (
         f"advertised {sorted(advertised - (marked - groups))} without being marked, "
         f"or marked-and-advertisable but not advertised "
@@ -1784,6 +1935,92 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796():
     assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
                if tuple(spec["path"]) not in marked)
     assert len(bn.cli._COMMANDS) - len(marked) == 43
+
+    # THE COVERAGE CLAIM, observed. One invariant over every marked command in
+    # every emit mode its parser offers: whatever lands on stdout is the
+    # ESTIMATE ENVELOPE or a machine-readable refusal -- never a payload -- and
+    # a run that exits 0 produced the envelope. A handler that reaches an emit
+    # path the flag does not gate lands in `leaked` with the argv that got there.
+    positionals = {tuple(spec["path"]): [a[0][0] for a in spec["args"]
+                                         if not a[0][0].startswith("-")]
+                   for spec in bn.cli._COMMANDS}
+    leaked, probed, emitted, covered = [], 0, 0, set()
+    for path in sorted(advertised):
+        required, unfillable = _estimate_required_flags(leaf(path))
+        unfillable += [p for p in positionals[path]
+                       if p not in _ESTIMATE_ARG_VALUES]
+        assert not unfillable, (
+            f"{' '.join(path)} takes arguments this sweep cannot synthesize "
+            f"({unfillable}); add them to _ESTIMATE_ARG_VALUES rather than "
+            "letting the command drop out of the coverage claim")
+        base = (list(path)
+                + [_ESTIMATE_ARG_VALUES[p] for p in positionals[path]]
+                + required + ["--target", "active"])
+        for mode in _estimate_emit_modes(leaf(path)):
+            argv = base + mode + ["--estimate-output"]
+            fake_transport(default=_ESTIMATE_STUB)
+            try:
+                rc = bn.cli.main(argv)
+            except SystemExit as exc:                 # argparse refusals
+                rc = exc.code
+            out = capsys.readouterr().out
+            probed += 1
+            estimated = _is_estimate_envelope(out)
+            if rc == 0:
+                emitted += 1
+                covered.add(path)
+            if estimated:
+                continue
+            if rc == 0 or (out.strip() and not _is_error_envelope(out)):
+                leaked.append((" ".join(argv), out[:160]))
+    assert not leaked, (
+        "these invocations of --estimate-output put something other than the "
+        f"estimate envelope on stdout: {leaked[:6]}")
+    # ...and the sweep cannot quietly degrade into "every probe errored out":
+    # every advertised command reached an emitting path at least once, and the
+    # probe count is pinned so a mode class cannot silently stop being swept.
+    assert covered == advertised, (
+        f"never reached an emitting path: {sorted(advertised - covered)}")
+    assert probed == 285, (
+        f"the sweep ran {probed} probes, not 285 -- a flag class joining or "
+        "leaving the derivation changes the coverage claim, so move the number "
+        "in the same commit")
+    assert emitted, "no probe reached an emit path at all"
+
+
+def test_the_output_reference_documents_the_estimate_preflight_796():
+    """#796: the preflight has to be discoverable where an agent looks for it.
+
+    The issue's own repro grepped `src/`, `skills/`, `README.md` and
+    `CLAUDE.md`, and `--estimate-output` had zero hits outside `src/` -- so a
+    flag whose whole purpose is letting an agent bound a read before paying for
+    it shipped invisible to the agent surface it was filed for. Two places
+    carry it: the runtime reference that enumerates the output flags and the
+    envelope keys, and the reading reference's "bound the read" guidance, which
+    is where a reader is already being told to slice.
+
+    The envelope half is derived from the envelope this CLI actually emits, so
+    the reference cannot drift from the payload the next time a key is added.
+    """
+    from bn.output import estimate_output_result
+
+    root = Path(bn.cli.__file__).resolve().parents[2]
+    runtime = (root / "skills" / "bn" / "reference" / "runtime.md").read_text(encoding="utf-8")
+    reading = (root / "skills" / "bn" / "reference" / "reading.md").read_text(encoding="utf-8")
+
+    assert "--estimate-output" in runtime, (
+        "the reference that enumerates every output flag does not name "
+        "--estimate-output, so the preflight is undiscoverable from the skill")
+    assert "--estimate-output" in reading, (
+        "the reading reference tells an agent to bound a large read but never "
+        "names the flag that measures one first")
+
+    envelope = estimate_output_result({"items": [], "total": 0}, fmt="json",
+                                      rerun_hint="rerun with --limit").artifact
+    undocumented = sorted(key for key in envelope if f"`{key}`" not in runtime)
+    assert not undocumented, (
+        f"the estimate envelope carries keys the reference never states: "
+        f"{undocumented}")
 
 
 def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_commands_796(

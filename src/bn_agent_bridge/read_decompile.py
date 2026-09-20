@@ -886,13 +886,13 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "is_phi": is_phi,
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
-        "hints": _call_model_truncation_hints(bv, func, il),
+        "hints": _call_model_truncation_hints(ctx, bv, func, il),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
 
 
-def _call_model_truncation_hints(bv, func, il) -> list[str]:
+def _call_model_truncation_hints(ctx, bv, func, il) -> list[str]:
     """The #489 call-model-truncation disclosure for THIS function's calls (#797).
 
     A def-use read of a variable that feeds an under-recovered call used to show
@@ -902,9 +902,10 @@ def _call_model_truncation_hints(bv, func, il) -> list[str]:
     arguments behind as `[sp+N].d = <var>` stores that nothing in the function
     reads back, and the store for the defused variable sits in `uses` looking
     like any other. `trace` already discloses exactly that state with the
-    reviewed #489 note; this reads the SAME helper over the same calls rather
-    than re-deriving the evidence, so the two ops cannot disagree about whether a
-    call's model was truncated (one gate, one wording, one remedy).
+    reviewed #489 note; this reads the SAME helper over the same calls AND
+    resolves the callee name through the same two steps the sibling uses, so
+    the two ops cannot disagree about whether a call's model was truncated (one
+    gate, one wording, one remedy).
 
     Prints nothing for a call the helper is silent about -- unknown
     calling-convention arity, a callee that is known fixed-arity, no outgoing
@@ -926,12 +927,24 @@ def _call_model_truncation_hints(bv, func, il) -> list[str]:
         # stack-arg stores feeding it, so this is the address it wants -- not the
         # resolved callee's.
         call_addr = int(getattr(ins, "address", func.start))
-        callee_name = None
-        try:
-            resolved = _taint.resolve_call_target(bv, ins, follow_thunks=False)
-            callee_name = str(getattr(resolved.function, "name", "") or "") or None
-        except Exception:
-            callee_name = None
+        # The callee name, resolved EXACTLY as `trace` resolves it: the modeled
+        # name first, then the resolved callee function -- both of which follow
+        # thunks. Resolving it here without following thunks was the one place
+        # the two ops could still disagree, and the disagreement was live in
+        # both directions: the shared note's known-fixed-arity gate keys on this
+        # name, so a PLT stub / veneer in front of `strlen` presented as
+        # `j_strlen`, matched no denylist entry, and fired the exact residual
+        # false positive that denylist exists to close -- on a call `trace` is
+        # silent about. And when the note does fire, its `proto set <name>`
+        # remedy would have named the veneer, whose prototype is not the one
+        # that truncated the model.
+        callee_name = _ts._modeled_callee_name(bv, ins)
+        if not callee_name:
+            try:
+                callee_name = str(getattr(_ts._resolve_callee(ctx, bv, ins),
+                                          "name", "") or "") or None
+            except Exception:
+                callee_name = None
         note = _ts._call_model_truncation_note(
             bv, func, ins, call_addr,
             list(getattr(ins, "params", None) or []),

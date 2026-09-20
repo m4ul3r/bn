@@ -3651,7 +3651,19 @@ def _d797_ins(name, address, *, params=None, instr_index=0):
     )
 
 
-def _defuse_under_recovered_call(monkeypatch):
+def _d797_thunk_resolver(thunk: str, real: str):
+    """A `resolve_call_target` that actually HONORS `follow_thunks`, so the two
+    resolutions differ the way they do on a real PLT stub / GCC veneer: the
+    unfollowed answer is the thunk's own name, the followed one is the real
+    callee."""
+    def resolve(bv_, ins, follow_thunks=False):
+        return types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name=real if follow_thunks else thunk))
+    return resolve
+
+
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None):
     """`_defuse` over a function whose call at 0x401030 was recovered with ONE
     arg (the caller's format string) while the LLIL hands it two outgoing
     stack-arg stores -- the #489 shape, standing in for an auto-typed variadic."""
@@ -3684,10 +3696,11 @@ def _defuse_under_recovered_call(monkeypatch):
     # The loaded bridge package is its own module COPY (`bn_test_bridge.*`), so
     # the patch has to land on the alias `_defuse` resolves through, not on the
     # same-named module this file imports for direct helper tests.
-    monkeypatch.setattr(bridge.read_decompile._taint, "resolve_call_target",
-                        lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
-                            address=0x402100,
-                            function=types.SimpleNamespace(name="my_logger")))
+    monkeypatch.setattr(
+        bridge.read_decompile._taint, "resolve_call_target",
+        resolve or (lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name="my_logger"))))
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     return instance, il
 
@@ -3727,3 +3740,38 @@ def test_defuse_stays_quiet_when_the_call_model_is_complete_797(monkeypatch):
     result = instance._defuse("active", "0x401000", "arg1#0")
 
     assert result["hints"] == []
+
+
+def test_defuse_resolves_the_callee_through_thunks_like_its_sibling_797(monkeypatch):
+    """#797 review: `defuse` resolved the callee WITHOUT following thunks while
+    `trace` follows them, and the shared note keys its two safety gates on that
+    name -- so the claim that "the two ops cannot disagree" was false.
+
+    The gate that matters here is the known-fixed-arity denylist: a PLT stub /
+    GCC veneer in front of `strlen` resolves unfollowed to `j_strlen`, which is
+    in no denylist, so the shared note fired on a call `trace` is silent about.
+    That is exactly the residual false positive the #489 denylist was added to
+    close, re-opened on the second op.
+    """
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_strlen", "strlen"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == [], result["hints"]
+
+
+def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
+    """The other half of the same disagreement: when the note DOES fire through
+    a thunk, its `proto set` remedy must name the callee whose prototype is
+    actually wrong. `bn proto set j_my_logger ...` retypes the veneer and leaves
+    the model truncated, so a copy-pasted remedy silently does nothing."""
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_my_logger", "my_logger"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert len(result["hints"]) == 1, result["hints"]
+    hint = result["hints"][0]
+    assert "proto set my_logger" in hint
+    assert "j_my_logger" not in hint

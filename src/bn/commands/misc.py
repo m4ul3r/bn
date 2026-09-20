@@ -11,6 +11,9 @@ from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, 
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
+    _count_field,
+    _discloses,
+    _field_skewed,
     _render_data_symbols_text,
     _render_data_vars_text,
     _render_function_bundle_text,
@@ -24,10 +27,12 @@ from ..formatters import (
     _render_read_text,
     _render_sections_text,
     _render_strings_text,
+    _stated_count,
 )
 from ..transport import BridgeError, unwrap_result
 
 
+@_discloses
 def _strings_count_text(value: Any) -> str:
     """The `strings --count` line, with the filter's denominator (#795).
 
@@ -35,11 +40,27 @@ def _strings_count_text(value: Any) -> str:
     the 1329 strings the filter dropped, so the denominator cost a SECOND
     unfiltered invocation. Mirrors `_imports_count_text`'s excluded-count tail:
     the bridge's own `filtered` count is disclosed parenthetically when it is
-    non-zero, and the line is unchanged on an unfiltered dump."""
-    line = f"Total strings: {value.get('count', 0)}"
-    filtered = value.get("filtered")
-    if isinstance(filtered, int) and filtered > 0:
-        line += f" ({filtered} filtered out by the active filters)"
+    non-zero, and the line is unchanged on an unfiltered dump.
+
+    Both numbers are read through the COUNT CHOKE POINT, which is the same
+    reading `_render_strings_text` gives them one surface over (#619 review).
+    An `isinstance(int)` test here was a second decider over a question this
+    codebase already answers, and it answered wrong in both directions: a
+    producer that spells counts as text (`"1329"`) had its disclosure dropped
+    entirely -- reinstating the extra invocation #795 removed -- while `bool` IS
+    an `int`, so `filtered: true` rendered "(True filtered out by the active
+    filters)". The headline goes through `_stated_count` for the same reason it
+    does everywhere else: `Total strings: 0` fabricated from an unreadable
+    counter reads byte-identically to an empty binary."""
+    line = f"Total strings: {_stated_count(value, 'count')}"
+    dropped = _count_field(value, "filtered")
+    if dropped:
+        line += f" ({dropped} filtered out by the active filters)"
+    elif _field_skewed("filtered"):
+        # The same wording the listing surface uses, so one payload cannot be
+        # described two ways depending on which flag the caller passed.
+        line += ("\n// the payload's filtered-string count is not a number that "
+                 "can be read (use --format json)")
     return line
 
 
@@ -502,6 +523,24 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         data = bytes.fromhex(hex_payload)
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
+    summary = {"kind": "bytes", "address": address, "length": len(data)}
+    if getattr(args, "estimate_output", False):
+        # #796: this is `read`'s SECOND emit path, and the flag has to mean the
+        # same thing on it. `_call` -> `_render_result` implements the preflight
+        # for the `--encoding hex` half; this branch returns above that call, so
+        # asking here is the only place the raw-byte payload can be measured
+        # instead of written. `--out` is refused beside the flag by the parser's
+        # own mutually exclusive group, so there is no destination to resolve.
+        from ..output import estimate_bytes_result
+
+        estimate = estimate_bytes_result(
+            data,
+            fmt=args.format,
+            summary=summary,
+            rerun_hint=cli._slice_hint_for_args(args, args.format),
+        )
+        sys.stdout.write(estimate.rendered)
+        return 0
     if args.out:
         from ..output import write_bytes_result
 
@@ -509,7 +548,7 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             data,
             out_path=args.out,
             fmt=args.format,
-            summary={"kind": "bytes", "address": address, "length": len(data)},
+            summary=summary,
         )
         sys.stdout.write(result.rendered)
     else:

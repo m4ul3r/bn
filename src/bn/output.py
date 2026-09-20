@@ -562,18 +562,59 @@ def estimate_output_result(
     ``spill_token_limit`` is stated only when ``BN_SPILL_TOKENS`` is armed, which
     is what makes "this read would have spilled" a comparison the caller can do
     rather than a claim this module makes."""
-    rendered = render_value(value, fmt)
-    encoded = rendered.encode("utf-8")
+    return _estimate_envelope(
+        render_value(value, fmt).encode("utf-8"),
+        fmt=fmt, payload_format=fmt, summary=_summary(value),
+        rerun_hint=rerun_hint)
+
+
+def estimate_bytes_result(
+    data: bytes,
+    *,
+    fmt: str,
+    summary: dict[str, Any] | None = None,
+    rerun_hint: str | None = None,
+) -> OutputWriteResult:
+    """:func:`estimate_output_result` for a RAW BYTE payload (#796).
+
+    The byte sibling of the pair this module already keeps for writing
+    (:func:`write_output_result` / :func:`write_bytes_result`), and it exists
+    for the same reason: a raw-byte emit is not a rendered value, so measuring
+    it through ``render_value`` would report the size of a Python ``repr`` the
+    caller never receives. ``read --encoding bytes`` writes ``data`` to
+    ``stdout.buffer`` verbatim, so ``data`` IS the payload the preflight has to
+    measure, and ``format`` states ``bytes`` rather than the envelope's own
+    ``--format``.
+
+    It exists at all because that second emit path had no preflight: the
+    command advertised ``--estimate-output``, its ``--encoding hex`` half
+    honored it, and its ``--encoding bytes`` half wrote the payload to stdout at
+    rc 0 -- one command, two answers to what the flag means."""
+    return _estimate_envelope(bytes(data), fmt=fmt, payload_format="bytes",
+                              summary=summary, rerun_hint=rerun_hint)
+
+
+def _estimate_envelope(
+    encoded: bytes,
+    *,
+    fmt: str,
+    payload_format: str,
+    summary: dict[str, Any] | None,
+    rerun_hint: str | None,
+) -> OutputWriteResult:
+    """The one estimate envelope, built once for both payload kinds so the two
+    preflights cannot state the same measurement in two different shapes."""
     token_count = estimate_tokens(encoded)
     payload: dict[str, Any] = {
         "ok": True,
         "estimated": True,
-        "format": fmt,
+        "format": payload_format,
         "bytes": len(encoded),
         "tokens": token_count,
         "tokenizer": "estimate",
-        "summary": _summary(value),
     }
+    if summary is not None:
+        payload["summary"] = summary
     limit = resolve_spill_limit()
     if limit is not None:
         payload["spill_token_limit"] = limit

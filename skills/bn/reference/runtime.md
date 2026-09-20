@@ -223,6 +223,7 @@ Defaults:
 - Setup and export commands → `--format json`.
 - `--format ndjson` is available where it makes sense.
 - `--out <path>` writes the full body to disk and returns an envelope on stdout.
+- `--estimate-output` reports how big this command's output **would** be instead of printing or writing it (#796). Mutually exclusive with `--out`.
 
 **Spill envelopes (opt-in).** Nothing is written to disk unless `BN_SPILL_TOKENS` names a positive token count. With it set, output over that threshold (~3 bytes/token heuristic) is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
 
@@ -235,6 +236,18 @@ Defaults:
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
 - `spill_token_limit` — the threshold that tripped (so you can see how far over you went).
 - `rerun` — the **command-specific slicing knob** to bound the next read (e.g. `--limit`/`--offset` for lists, `--lines` for `disasm`/`il`, `--address-window` for `evidence function`), so you re-run bounded instead of blind.
+
+**Size preflight — `--estimate-output` (#796).** The question you ask *before* paying for a large read: how big is this going to be, and which flag slices it. The read still runs (only the bridge knows the payload), but nothing reaches stdout except the measurement, and **nothing is written to disk** — no spill artifact, no `--out` file, no path in the envelope. It is advertised only on the read commands that render a payload; a mutation or a side-effecting command (`save`/`close`/`load`/`refresh`/`py exec`) refuses it the way argparse refuses any unknown option, so it can never replace an outcome with a byte count. The envelope reuses the spill keys above plus one of its own:
+
+- `estimated` — always `true`; this is what tells a consumer the envelope is a preflight and **not** the data (there is no `items`, no `path`, no `sha256`).
+- `format`, `bytes`, `tokens`, `tokenizer`, `summary` — as above, measured on the rendering you would have received under this `--format`. `read --encoding bytes` is measured as the raw byte payload it would have written, and reports `format: bytes`.
+- `spill_token_limit` — stated only when `BN_SPILL_TOKENS` is armed, so "would this have spilled?" is a comparison you make rather than a claim this tool makes.
+- `rerun` — the same command-specific slicing knob the spill envelope names.
+
+```bash
+bn function list --estimate-output            # estimated: true, tokens: …, rerun: --limit/--offset
+bn read <addr> --length 0x100000 --encoding bytes --estimate-output   # format: bytes, bytes: 1048576
+```
 
 **Choosing the spill point (#409).** Spill is armed by you, not by a default:
 - **No threshold (default)** — unset, empty, non-numeric, zero and negative all mean **no spill**: the full payload goes to stdout and the *consuming* agent/Harness bounds what is read. A typo can never silently re-arm disk output.
