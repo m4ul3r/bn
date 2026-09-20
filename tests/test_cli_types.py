@@ -430,10 +430,92 @@ def test_an_endless_dribble_is_refused_rather_than_read_without_end(
     assert rc == 2
     assert [call["op"] for call in calls] == []
     captured = capsys.readouterr()
-    # Names the total bound and that bytes DID arrive: the idle-bound
-    # refusal's "went quiet" would be a false description of this producer.
-    assert "still delivering" in captured.err
+    # Names the total bound it hit. It deliberately does NOT claim the writer
+    # "went quiet" (false here) nor that it is "still delivering" (unknowable
+    # at the bound -- the producer may have stopped inside the last window).
+    assert "could not finish within" in captured.err
     assert "went quiet" not in captured.err
+    assert "still delivering" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """Both bounds above are CLOCKS, and a clock does not bound memory. The
+    drain buffers what it reads, so a fast endless producer exhausts the heap
+    long before either clock fires and dies as a bare `MemoryError` -- not an
+    `OSError`, so it escapes the reader's handler as a raw traceback with no
+    envelope. That is #864's symptom class (no output, no envelope) from a
+    fourth direction, and the same escape shape as the `select` `ValueError`.
+    Measured before the cap: ~0.24-0.36 GB/s accumulated, so the shipped 300s
+    total bound would need tens of GB resident to ever be reached.
+
+    The cap is patched down here so the cell costs a few KiB instead of 64 MiB;
+    the production value refuses no document a caller meant to pass.
+    """
+    monkeypatch.setattr(bn.cli, "_FIFO_MAX_BYTES", 4096)
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    stop = threading.Event()
+
+    def _flood():
+        blob = b"x" * 4096
+        while not stop.is_set():
+            try:
+                os.write(write_fd, blob)
+            except OSError:
+                return
+
+    writer = threading.Thread(target=_flood, daemon=True)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        stop.set()
+        writer.join(timeout=10)
+        os.close(write_fd)
+        os.close(read_fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "delivered more than" in captured.err
+    # The whole point: a structured envelope, never the bare MemoryError.
+    assert "Traceback" not in captured.err
+    assert "MemoryError" not in captured.err
+
+
+def test_the_idle_wait_cannot_overshoot_the_total_bound(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """The idle wait is clamped to whatever of the total bound is left, so the
+    worst case is the total and not total-plus-one-idle-window. With an idle
+    bound far larger than the total, a silent writer must still be answered at
+    the total: unclamped, the readiness wait would sit for a whole idle window
+    first and the documented bound would silently be the sum of the two."""
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 5.0)
+    monkeypatch.setattr(bn.cli, "_FIFO_TOTAL_TIMEOUT", 0.5)
+    calls = fake_transport()
+    fifo = tmp_path / "decl.h"
+    os.mkfifo(fifo)
+    # A write-only open fails with ENXIO while no reader is attached, so hold
+    # one open; the writer the reader finds is attached and silent either way.
+    keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    silent_writer = os.open(fifo, os.O_WRONLY)
+    started = time.monotonic()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(str(fifo)))
+    finally:
+        os.close(silent_writer)
+        os.close(keep_reader)
+    elapsed = time.monotonic() - started
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    assert elapsed < 2.5, f"the idle wait overshot the total bound ({elapsed:.2f}s)"
+    captured = capsys.readouterr()
+    assert "could not finish within" in captured.err
     assert "Traceback" not in captured.err
 
 

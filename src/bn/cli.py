@@ -1531,6 +1531,19 @@ _FIFO_IDLE_TIMEOUT = 30.0
 # streams, so a bound this generous cannot cut off a correct producer, and it
 # is what makes "the read terminates" true rather than nearly true.
 _FIFO_TOTAL_TIMEOUT = 300.0
+# ...and how many bytes it will accumulate before it gives up. Neither clock
+# above bounds MEMORY: the drain buffers what it reads so the text can be
+# parsed, so a fast producer (`<(cat /dev/zero)` sustains hundreds of MB/s
+# here) exhausts the heap long before either clock can fire, and `MemoryError`
+# -- not an `OSError` -- escapes this function's handler as a raw traceback
+# with no envelope. That is #864's symptom class from a fourth direction, and
+# structurally the round-3 escape again: a non-OSError leaving the one path
+# whose whole job is a structured refusal. It is also exactly what the by-kind
+# refusal already says about a character device ("a device can stream without
+# end"), so the same rule has to hold for an endless stream that happens to
+# arrive through a pipe. A declaration, a script, a manifest or a model map is
+# a document, so a cap this generous refuses no input a caller meant to pass.
+_FIFO_MAX_BYTES = 64 << 20
 
 
 def _read_fifo_text(path: Path, *, what: str) -> str:
@@ -1552,6 +1565,15 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
       every idle window keeps the idle bound alive indefinitely, so the drain
       is bounded by `_FIFO_TOTAL_TIMEOUT` as well. Without it the read has no
       termination guarantee at all, only a fast answer for the stalled case.
+    * **A writer that floods** -- the two bounds above are clocks, and a clock
+      does not bound memory. The drain buffers what it reads so the text can
+      be parsed, so a fast endless producer exhausts the heap well before
+      either clock fires and dies as a bare ``MemoryError`` -- not an
+      ``OSError``, so it escapes the handler below exactly the way the
+      ``select`` ``ValueError`` did. `_FIFO_MAX_BYTES` caps the accumulation,
+      which is the same judgement the by-kind refusal already makes about a
+      character device: nothing bounds an endless stream, so it is refused
+      rather than read until it stops.
     * **A writer that delivers nothing at all** -- refused on the DELIVERED
       BYTE COUNT, never on which state the first probe happened to catch.
       Whether the writer had already exited (the probe sees EOF) or was still
@@ -1581,9 +1603,14 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
         while True:
             left = _FIFO_TOTAL_TIMEOUT - (time.monotonic() - started)
             if left <= 0:
+                # Deliberately state-neutral: at this point the producer may be
+                # mid-stream or may have just gone quiet inside the last idle
+                # window, and the drain cannot tell. Saying either would assert
+                # something it does not know, so it reports the bound it hit
+                # and what arrived.
                 raise BridgeError(
-                    f"{what} is a FIFO still delivering after "
-                    f"{_FIFO_TOTAL_TIMEOUT:g}s ({delivered} byte(s) so far): "
+                    f"{what} is a FIFO the read could not finish within "
+                    f"{_FIFO_TOTAL_TIMEOUT:g}s ({delivered} byte(s) delivered): "
                     f"{path}. The wait for each next byte is bounded, but a "
                     "producer that says something inside every one of those "
                     "windows would stream without end, so the read is bounded "
@@ -1617,6 +1644,16 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
                 break
             chunks.append(chunk)
             delivered += len(chunk)
+            if delivered > _FIFO_MAX_BYTES:
+                raise BridgeError(
+                    f"{what} is a FIFO that delivered more than "
+                    f"{_FIFO_MAX_BYTES >> 20} MiB: {path}. These readers take a "
+                    "document, and the bytes are buffered so the text can be "
+                    "parsed, so an endless producer would exhaust memory long "
+                    "before either time bound could answer. What arrived is "
+                    "discarded rather than truncated into a partial input. "
+                    "Write the input to a regular file"
+                )
     except OSError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
     finally:
