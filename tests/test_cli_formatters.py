@@ -1887,6 +1887,30 @@ _PROBE_EXCLUSIONS = {
         "to probe -- what it does is make the skew its caller's choke-point "
         "reads record reach a boundary, which is the property the pipe-note test "
         "asserts behaviourally"),
+    # The CHOKE POINT itself, now referenced from a command module: the
+    # `strings --count` line reads its two numbers through the same helpers
+    # `_render_strings_text` uses one surface over, so the two `strings`
+    # surfaces cannot answer "how many did the filter drop" differently (#795
+    # round-2 review). Excluded for the reason the list exists to record: these
+    # are what the differential MEASURES, not something it can measure.
+    "_count_field": (
+        "takes-more-than-a-payload",
+        "the field it reads is an ARGUMENT, not a property of the module: it "
+        "takes the payload AND the key, returns an int rather than a rendering, "
+        "and is the choke point every probed renderer's disclosure is derived "
+        "from -- a differential over it would be measuring the oracle"),
+    "_stated_count": (
+        "takes-more-than-a-payload",
+        "`_count_field` for a line that STATES the number, so same shape and "
+        "same reason: payload plus key in, a count-or-`?` string out, with the "
+        "skew recorded for the ENCLOSING boundary to disclose"),
+    "_discloses": (
+        "takes-no-payload",
+        "it IS the boundary, not a consumer of one: a decorator taking the "
+        "renderer (or nothing, under `prefix=`), with no required payload "
+        "argument at all. Same class as `disclosure_boundary` above -- what it "
+        "does is make the skew its wrapped renderer recorded reach a note, "
+        "which is the property every probe below asserts behaviourally"),
 }
 
 
