@@ -5579,6 +5579,7 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
     """
     if not Path("/proc/net/unix").exists():
         pytest.skip("Linux /proc/net/unix only")
+    from bn.paths import socket_path_budget
     from bn.transport import path_has_bound_socket
 
     # Both names are deliberately SHORT, and the guard below is why. `sun_path`
@@ -5594,11 +5595,18 @@ def test_a_renamed_directory_makes_a_live_socket_unknowable_not_unbound(tmp_path
     inst_dir.mkdir(parents=True)
     sock_path = inst_dir / "live.sock"
     moved = tmp_path / "moved"
-    moved_len = len(str(moved / "instances" / "live.sock"))
-    if moved_len > 107:
+    # Count BYTES, not characters: `sun_path` is a fixed byte array, so a
+    # non-ASCII `tmp_path` spends more of the budget than its character count
+    # shows and `len(str(...))` would wave through a path `connect` then
+    # rejects -- reintroducing the raw OSError this guard exists to replace.
+    # `socket_path_budget()` is the same limit the production code applies.
+    budget = socket_path_budget()
+    moved_len = len(os.fsencode(moved / "instances" / "live.sock"))
+    if moved_len > budget:
         refuse_silent_skip(
-            f"tmp_path makes the renamed socket path {moved_len} bytes, over the 107-byte "
-            f"AF_UNIX limit; re-run with a shorter --basetemp (pytest --basetemp=/tmp/bn)"
+            f"tmp_path makes the renamed socket path {moved_len} bytes, over the "
+            f"{budget}-byte AF_UNIX limit; re-run with a shorter --basetemp "
+            f"(pytest --basetemp=/tmp/bn)"
         )
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
