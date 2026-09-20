@@ -660,13 +660,61 @@ def test_cli_layout_names_every_top_level_module():
     )
 
 
-# The Conventions bullet documents the handler names an agent greps for, and its
-# one naming exception: `help` is the CLI's own index of the command tree, so its
-# handler is named for what it prints rather than for the verb it is registered
-# under. Asserted live below, so the exception cannot outlive a rename: the
-# registry is the ground truth, and an exemption is only true while it has a
-# subject.
-TOP_LEVEL_HANDLER_NAME_EXCEPTIONS = {"help": "_help_index"}
+# The Conventions bullet in CLAUDE.md is the rule this guard enforces, so the
+# guard READS it instead of restating it: a rule mirrored into Python here is a
+# rule the doc can quietly contradict, which is the exact defect #826 reports.
+# The bullet supplies the per-command exceptions (`help` is the CLI's own index
+# of the command tree, so its handler is named for what it prints rather than
+# for the verb it is registered under) and it licenses the alias exemption. The
+# registry is the ground truth both are checked against, so an exemption is only
+# true while it has a subject.
+_HANDLER_BULLET_PREFIX = "- Command handlers are named"
+_HANDLER_BULLET_PATTERN = "`_<group>_<subcommand>()`"
+_DOC_HANDLER_EXCEPTION = re.compile(r"`([a-z][\w -]*)` is `(_\w+)`")
+_DOC_ALIAS_CLAUSE = re.compile(r"\balias(?:es)?\b")
+
+
+def _handler_convention_bullet() -> str:
+    """The Conventions bullet documenting handler names, verbatim from CLAUDE.md."""
+    for line in _doc_text().splitlines():
+        if line.startswith(_HANDLER_BULLET_PREFIX):
+            return line
+    return ""
+
+
+def _expected_handler_name(path: str) -> str:
+    """`_<group>_<subcommand>` for a grouped path, the bare verb for a top-level one."""
+    return "_" + "_".join(word.replace("-", "_") for word in path.split())
+
+
+def _naming_violations(
+    handlers: dict[str, str], documented: dict[str, str], alias_rule: bool
+) -> list[str]:
+    """Registered paths whose handler name the documented rule does not allow.
+
+    The alias exemption is granted to the ALIASING path only -- a path whose
+    handler is named after a DIFFERENT path of the same handler, which is what
+    "keeps the name of the path it aliases" means. Exempting every path of a
+    multi-path handler instead would let an aliased handler be renamed to
+    anything at all and stay green.
+    """
+    paths_by_handler: dict[str, set[str]] = {}
+    for path, name in handlers.items():
+        paths_by_handler.setdefault(name, set()).add(path)
+    violations = []
+    for path, name in sorted(handlers.items()):
+        expected = _expected_handler_name(path)
+        if name == expected:
+            continue
+        if documented.get(path) == name:
+            continue
+        if alias_rule and any(
+            _expected_handler_name(other) == name
+            for other in paths_by_handler[name] - {path}
+        ):
+            continue
+        violations.append(f"{path!r} -> {name!r}, expected {expected!r}")
+    return violations
 
 
 def _registered_handler_names() -> dict[str, str]:
@@ -690,36 +738,60 @@ def test_command_handlers_follow_the_documented_naming_convention():
     that does not follow it is an agent's grep for the implementation coming
     back empty.
 
-    Derived from the registry rather than from the source: the rule is
-    `_<group>_<subcommand>` for a grouped command and the bare verb for a
-    top-level one, with the two exemptions the same bullet states -- `help`,
-    and an alias, which the registry proves for itself by giving one function
-    two paths.
+    The rule is read out of the bullet and applied to the registry, so the two
+    halves of the claim fail together: reword the bullet and the exemptions it
+    grants disappear; rename a handler and the registry stops matching.
     """
     handlers = _registered_handler_names()
     assert handlers, "the @command registry is empty, so nothing was checked"
-    paths_by_handler: dict[str, set[str]] = {}
-    for path, name in handlers.items():
-        paths_by_handler.setdefault(name, set()).add(path)
-    violations = []
-    for path, name in sorted(handlers.items()):
-        expected = "_" + "_".join(word.replace("-", "_") for word in path.split())
-        if name == expected:
-            continue
-        if len(paths_by_handler[name]) > 1:  # an alias: `rename` -> `_symbol_rename`
-            continue
-        if TOP_LEVEL_HANDLER_NAME_EXCEPTIONS.get(path) == name:
-            continue
-        violations.append(f"{path!r} -> {name!r}, expected {expected!r}")
-    assert not violations, (
-        "CLAUDE.md's Conventions list documents the handler name for a command "
-        f"path; these registered commands break that rule: {violations}"
+    bullet = _handler_convention_bullet()
+    assert _HANDLER_BULLET_PATTERN in bullet, (
+        "CLAUDE.md's Conventions list no longer carries a handler-naming bullet "
+        f"stating {_HANDLER_BULLET_PATTERN}; this guard reads the rule from that "
+        f"bullet, so without it nothing is enforced. Found: {bullet!r}"
     )
-    for path, name in TOP_LEVEL_HANDLER_NAME_EXCEPTIONS.items():
+    documented = dict(_DOC_HANDLER_EXCEPTION.findall(bullet))
+    alias_rule = bool(_DOC_ALIAS_CLAUSE.search(bullet))
+    violations = _naming_violations(handlers, documented, alias_rule)
+    assert not violations, (
+        "these registered commands break the naming rule CLAUDE.md's Conventions "
+        f"bullet documents: {violations}. The bullet reads: {bullet!r}"
+    )
+    for path, name in sorted(documented.items()):
         assert handlers.get(path) == name, (
-            f"the documented naming exception {path!r} -> {name!r} is stale: the "
-            f"registry has {handlers.get(path)!r}"
+            f"the bullet's naming exception {path!r} is `{name}`, but the registry "
+            f"has {handlers.get(path)!r}: an exemption is only true while it has "
+            "a subject"
         )
+    counts: dict[str, int] = {}
+    for name in handlers.values():
+        counts[name] = counts.get(name, 0) + 1
+    aliased = sorted(name for name, count in counts.items() if count > 1)
+    assert alias_rule == bool(aliased), (
+        f"the bullet {'documents' if alias_rule else 'omits'} the alias exemption "
+        f"while the registry's multi-path handlers are {aliased}"
+    )
+
+
+def test_the_alias_exemption_covers_only_the_aliasing_path():
+    """#826: the exemption belongs to an alias PATH, not to its handler.
+
+    Pinned against a synthetic registry because the live one holds no
+    counter-example: while every alias is well-named, "exempt the whole handler"
+    and "exempt only the aliasing path" agree. They disagree the moment an
+    aliased handler is renamed, and that is the case the wider form waved
+    through for both of the registry's aliases.
+    """
+    aliased = {"symbol rename": "_symbol_rename", "rename": "_symbol_rename"}
+    assert _naming_violations(aliased, {}, True) == []
+    renamed = {"symbol rename": "_rename_symbol", "rename": "_rename_symbol"}
+    assert _naming_violations(renamed, {}, True) == [
+        "'rename' -> '_rename_symbol', expected '_rename'",
+        "'symbol rename' -> '_rename_symbol', expected '_symbol_rename'",
+    ], "a multi-path handler that follows the rule on NO path must not be exempt"
+    assert _naming_violations(aliased, {}, False) == [
+        "'rename' -> '_symbol_rename', expected '_rename'"
+    ], "the alias exemption must come from the documented bullet, not the guard"
 
 
 # The lock class is declared at the `@op` decorator, so the declarations are the
