@@ -442,8 +442,14 @@ def test_builtin_snprintf_family_declares_size_arm_808():
 # reused-aliased-slot re-headline -- and those are exactly what a fortified
 # class silently opted the family out of.
 
+# `__pread64_chk` is the FORTIFY spelling a large-file-offset build emits, and
+# it needs its own row: `lookup_model`'s LFS64 allowlist rewrites `pread64` to
+# `pread`, so the BARE half of the gate already covers that build, but it has
+# no `pread64_chk` entry -- the fortified half only covers it if the model DB
+# names the spelling itself.
 _FORTIFIED_READ_PAIRS = (("read", "__read_chk"), ("recv", "__recv_chk"),
-                         ("recvfrom", "__recvfrom_chk"), ("pread", "__pread_chk"))
+                         ("recvfrom", "__recvfrom_chk"), ("pread", "__pread_chk"),
+                         ("pread", "__pread64_chk"))
 
 _SINK_ADDR = "0x20"          # where every fixture below puts the call under test
 
