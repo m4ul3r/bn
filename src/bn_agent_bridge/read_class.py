@@ -758,11 +758,21 @@ def _class_list(
             construction_vtables_suppressed += 1
             continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
-            # #675.2: a declared type is not RTTI/ctor-confirmed either, so the
-            # same gate folds it out of the default listing -- counted, so the
+            # #675.2: a declared class type is not RTTI/ctor-confirmed either, so
+            # the same gate folds it out of the default listing -- counted, so the
             # fold-out is disclosed the way the library/vendor suppressions are
             # rather than leaving `class list` silently blind to it.
-            if rec["confidence"] == _DECLARED_CONFIDENCE:
+            #
+            # Counted only when the REMAINING filters would have kept it, because
+            # the number is read as "what `--all` would add" (#907 review): the
+            # gate fires before --no-stl/--no-vendor, so an unconditional count
+            # promised two more classes under `--no-stl` where `--all --no-stl`
+            # then showed one. The suppression the user asked for is disclosed by
+            # its own counter on the `--all` run, not twice.
+            if rec["confidence"] == _DECLARED_CONFIDENCE and not (
+                (no_stl and _is_library_class(name))
+                or (no_vendor and _is_vendor_class(name))
+            ):
                 declared_suppressed += 1
             continue
         if no_stl and _is_library_class(name):

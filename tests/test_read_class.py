@@ -2699,15 +2699,27 @@ def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypa
     table -- a number describing a different population than the rows `--all`
     then shows (#907 review). Both flow through the same enumeration now, which
     is what keeps them from re-splitting: the identity assertion below fails if
-    a future change filters one side only."""
+    a future change filters one side only.
+
+    Asserted under each flag that can move one side and not the other, because
+    the confidence gate fires BEFORE --no-stl/--no-vendor: the number is read as
+    "what `--all` would add", so a `std::` declaration counted under `--no-stl`
+    promises a row `--all --no-stl` does not show. Compared against the UNPAGED
+    listing throughout -- `--limit` windows the rows and the count is not a page
+    count."""
+    from bn.formatters import _render_class_list_text
+
+    def declared_rows(**kw):
+        listing = read_class._class_list(ctx, None, include_all=True, **kw)
+        return sorted(row["name"] for row in listing["items"]
+                      if row["confidence"] == "declared-only")
+
     bv = _declared_bv(Widget=_DeclaredType(),
                       **{n: _DeclaredKind(n, tc, decl)
                          for n, tc, decl in _NON_CLASS_DECLARED_KINDS})
     ctx = _declared_ctx(monkeypatch, bv)
 
-    full = read_class._class_list(ctx, None, include_all=True)
-    listed = sorted(row["name"] for row in full["items"]
-                    if row["confidence"] == "declared-only")
+    listed = declared_rows()
     assert listed == ["Widget"], (
         "only a declared CLASS type may be listed as a class; the enum/scalar/"
         f"pointer/array/function declarations must not appear: {listed}")
@@ -2718,9 +2730,27 @@ def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypa
         "the hidden count must count the rows `--all` lists, not the type table: "
         f"{default['declared_suppressed']} counted vs {len(listed)} listed")
     assert counted["declared_suppressed"] == len(listed)
-
-    from bn.formatters import _render_class_list_text
     assert "1 declared class type (--all to show)" in _render_class_list_text(default)
+
+    # Same identity under the flags that fold rows out AFTER the confidence gate.
+    bv.types["std::Box"] = _DeclaredType(name="std::Box")
+    bv.types["boost::Ref"] = _DeclaredType(name="boost::Ref")
+    assert declared_rows() == sorted(["Widget", "boost::Ref", "std::Box"])
+    for flags in ({}, {"no_stl": True}, {"no_vendor": True},
+                  {"no_stl": True, "no_vendor": True}, {"query": "box"},
+                  {"query": "widget"}, {"query": "handle"}):
+        rows = declared_rows(**flags)
+        for mode in ({}, {"count_only": True}):
+            envelope = read_class._class_list(ctx, None, **flags, **mode)
+            assert envelope["declared_suppressed"] == len(rows), (
+                f"under {flags or 'no flags'}{' --count' if mode else ''} the "
+                f"hidden count says {envelope['declared_suppressed']} declared "
+                f"class type(s) while `--all` lists {len(rows)}: {rows}")
+
+    # A page window moves the ROWS, never the count: the count is not a page count.
+    paged = read_class._class_list(ctx, None, include_all=True, limit=1)
+    assert paged["returned"] == 1 and paged["has_more"] is True
+    assert read_class._class_list(ctx, None, limit=1)["declared_suppressed"] == 3
 
 
 def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
