@@ -486,25 +486,29 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
     Measured before the cap: ~0.24-0.36 GB/s accumulated, so the shipped 300s
     total bound would need tens of GB resident to ever be reached.
 
-    The cap and the chunk size are both patched down so the cell costs a few
-    KiB instead of 64 MiB, and so the refused byte count can be asserted
-    TIGHTLY -- which is what pins the UNIT. A predicate that counted chunks or
-    iterations instead of bytes would leave the real bound at cap-many chunks
-    (64Ki x 64KiB in production) and the memory escape would be back with the
-    suite still green, so "it refused eventually" is not enough: it has to
-    refuse within one chunk of the cap.
+    The cap and the chunk size are patched down so the cell costs a few KiB,
+    and the writer is given a BOUNDED budget. That budget is what pins the
+    UNIT, and it has to be independent of the drain's own counter: asserting
+    on the byte figure the refusal REPORTS is circular, because a predicate
+    that counts chunks reports chunks and the assertion still holds. With a
+    budget of 256 KiB against a 8192-byte cap, byte-counting refuses after
+    ~9 KiB while chunk-counting would need 8192 chunks = 8 MiB, so it never
+    refuses at all: the writer's budget runs out, the drain reaches EOF and
+    DISPATCHES the input, and the rc assertion below goes red.
     """
     monkeypatch.setattr(bn.cli, "_FIFO_CHUNK", 1024)
     monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 8192)
     calls = fake_transport(_declare_ok())
     read_fd, write_fd = os.pipe()
     stop = threading.Event()
+    budget = 256 * 1024
 
     def _flood():
         blob = b"x" * 4096
-        while not stop.is_set():
+        written = 0
+        while not stop.is_set() and written < budget:
             try:
-                os.write(write_fd, blob)
+                written += os.write(write_fd, blob)
             except OSError:
                 return
 
@@ -515,9 +519,11 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
             rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
     finally:
         stop.set()
+        # Close the read end FIRST: once the drain has refused, the writer is
+        # blocked on a full pipe and only EPIPE releases it.
+        os.close(read_fd)
         writer.join(timeout=10)
         os.close(write_fd)
-        os.close(read_fd)
 
     assert rc == 2
     assert [call["op"] for call in calls] == []
@@ -526,10 +532,6 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
     # The whole point: a structured envelope, never the bare MemoryError.
     assert "Traceback" not in captured.err
     assert "MemoryError" not in captured.err
-    # ...and the UNIT: refused within one chunk of the 8192-byte cap, not at
-    # 8192 CHUNKS. The reported figure is the bytes actually accumulated.
-    reported = int(re.search(r"\((\d+) byte\(s\) so far\)", captured.err).group(1))
-    assert 8192 < reported <= 8192 + 1024, reported
 
 
 def test_a_regular_file_over_the_limit_is_refused_before_it_is_read(
