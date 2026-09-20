@@ -3683,6 +3683,32 @@ def test_an_explicit_target_still_closes_that_target(monkeypatch):
     assert rc == 0
 
 
+def test_an_empty_export_is_refused_by_close_rather_than_discarded(monkeypatch):
+    """The two guarantees must not cancel each other out.
+
+    Round 3 made an exported selector AMBIENT so a bare destructive `close`
+    cannot be steered by it. An EMPTY export is not a selector, and marking
+    it ambient too made `close` -- which DISCARDS an ambient target -- throw
+    it away: with one target open the bare close then fell through to the
+    single-open auto-pick and tore that target down at exit 0, where it had
+    refused with nothing sent.
+
+    That is worse than the hazard the round-3 fix removed: the empty export
+    is the shape the whole refusal exists for (`export BN_TARGET=$SEL` where
+    SEL was never assigned), and the destructive command is where it matters
+    most. ONE target open, because that is the configuration where a
+    discarded selector silently succeeds instead of hitting the multi-target
+    refusal.
+    """
+    rc, sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "   "},
+                          selectors=("only.bin",))
+
+    assert sent == [], (
+        "an empty export must reach the empty-selector refusal, not be "
+        f"discarded as ambient; these ops were sent: {sent}")
+    assert rc == 2
+
+
 def test_bn_target_is_scrubbed_from_the_test_environment():
     """An ambient BN_TARGET would redirect every test that passes no selector.
 

@@ -1786,9 +1786,10 @@ def _fanout_call(
         advice="Rerun with --format json to see the raw result.")
     fan_instances = getattr(args, "all_instances", False)
     fan_targets = getattr(args, "all_targets", False)
-    # Only a -t passed on the CLI counts as explicit (applies to every instance). A
-    # STICKY target pin (filled by _apply_sticky_defaults, which sets _sticky_target)
-    # is NOT explicit -- it must not suppress the multi-target auto-survey (#368).
+    # Only a -t passed on the CLI counts as explicit (applies to every instance).
+    # An AMBIENT target -- the sticky pin or an exported BN_TARGET, both filled
+    # by _apply_sticky_defaults, which sets _sticky_target -- is NOT explicit:
+    # it must not suppress the multi-target auto-survey (#368, #676 item 11).
     fan_target = getattr(args, "target", None)
     if fan_target is not None and not str(fan_target).strip():
         raise BridgeError(
@@ -2282,6 +2283,14 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
     choice that suppresses the survey. The environment must therefore be
     filled HERE and marked the same way; resolving it as an argparse default
     made it arrive unmarked and walk straight past both (#676 item 11).
+
+    `BN_INSTANCE` is DELIBERATELY not treated this way and stays an argparse
+    default in `_instance_option`: `session stop` documents the env var as one
+    of the three ways to NAME an instance (positional, `-i`, `BN_INSTANCE`),
+    and only the sticky pin is excluded there (#588). Marking it ambient would
+    break a documented behaviour, where marking the target one FIXES an
+    undocumented hazard -- nothing says a bare `close` follows an ambient
+    selector, and the reference says the opposite.
     """
     state = session_state.read()
     # Presence, not truthiness (#690 r3): `-i "$INST"` with $INST unset must
@@ -2305,7 +2314,15 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
         sticky_target = state.get("target")
         if env_target is not None:
             args.target = env_target
-            args._sticky_target = True
+            # AMBIENT only when it is actually a selector. An empty export is
+            # not one, and marking it ambient made `close` -- which nulls an
+            # ambient target -- DISCARD it, so a bare close fell through to
+            # the single-open auto-pick and tore that target down at exit 0
+            # where it had refused before. The empty value must survive to
+            # the empty-selector refusal, which is the whole point of
+            # forwarding it rather than ignoring it.
+            if env_target.strip():
+                args._sticky_target = True
         elif sticky_target:
             args.target = sticky_target
             args._sticky_target = True
