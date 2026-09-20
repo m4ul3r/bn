@@ -549,6 +549,25 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
+def _batch_target_from_cli(args: argparse.Namespace,
+                           manifest: dict[str, Any]) -> str | None:
+    """The CLI selector this invocation may apply to *manifest*, if any.
+
+    An EXPLICIT ``-t`` is the per-invocation selector and WINS over a manifest
+    ``"target"`` (#366). An AMBIENT one -- the sticky pin or an exported
+    ``BN_TARGET``, both filled and marked by ``cli._apply_sticky_defaults`` --
+    is not that: nobody named it on this command line, and ``batch_apply`` is
+    a DESTRUCTIVE op. It may only FILL a manifest that named no target of its
+    own; a manifest that DID name one keeps it (#676 item 11).
+    """
+    cli_target = getattr(args, "target", None)
+    if not cli_target:
+        return None
+    if getattr(args, "_sticky_target", False) and manifest.get("target"):
+        return None
+    return cli_target
+
+
 @command("batch", "apply", help="Apply a JSON manifest", fmt="json", target=True,
          args=[
              preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
@@ -659,10 +678,13 @@ def _batch_apply(args: argparse.Namespace) -> int:
         # #889c finding 2: `-t` and `--preview` are folded into BOTH the
         # params and the envelope AFTER this check, so a flat reserve let a
         # long selector carry the request over the cap and into the bridge's
-        # bare `request too large`. Count them where they are known.
+        # bare `request too large`. Count them where they are known -- the
+        # selector this invocation will really send, which is not always the
+        # ambient `args.target` (see the demotion below).
         request_bytes = request_bytes_for_params(
             manifest,
-            selector=getattr(args, "target", None) or manifest.get("target"),
+            selector=(_batch_target_from_cli(args, manifest)
+                      or manifest.get("target")),
             preview=bool(getattr(args, "preview", False)),
         )
         if max_bytes is not None and request_bytes > max_bytes:
@@ -692,14 +714,28 @@ def _batch_apply(args: argparse.Namespace) -> int:
             "open target"
         )
     # Accept -t/--target like every other target-required mutate command (#308).
-    # CLI -t WINS over a manifest "target" (#366): it is the explicit per-invocation
-    # selector, so a fan-out agent that copies the documented {"target":"active"}
-    # example but passes a correct -t isn't sabotaged by the in-payload value
-    # ("active" doesn't resolve under multi-target headless). Without -t the
-    # manifest "target" is still honored.
-    cli_target = getattr(args, "target", None)
+    # An EXPLICIT CLI -t WINS over a manifest "target" (#366): it is the explicit
+    # per-invocation selector, so a fan-out agent that copies the documented
+    # {"target":"active"} example but passes a correct -t isn't sabotaged by the
+    # in-payload value ("active" doesn't resolve under multi-target headless).
+    # An AMBIENT one -- the sticky pin or an exported BN_TARGET, both filled and
+    # marked by `_apply_sticky_defaults` -- is NOT that: nobody named it on this
+    # command line, and `batch_apply` is a DESTRUCTIVE op. Letting it through
+    # dispatched the whole manifest at the ambient selector and discarded the
+    # target the file itself named, which is the same hazard a bare destructive
+    # `close` refuses (#676 item 11). An ambient value may only FILL a manifest
+    # that named none; without any CLI target the manifest "target" is honored
+    # as before.
+    cli_target = _batch_target_from_cli(args, manifest)
     if cli_target:
         manifest["target"] = cli_target
+    elif getattr(args, "target", None):
+        # The ambient value was demoted. Drop it from the ENVELOPE too, so the
+        # request names ONE selector: the bridge resolves `batch_apply` from
+        # the manifest's own target (`_batch_apply_selector`, read by both the
+        # binder and the destructive gate), and a second, different selector
+        # riding beside it is a claim this invocation no longer makes.
+        args.target = None
     if args.preview:
         manifest["preview"] = True
     # preview is already set on the manifest above, so it is not passed through

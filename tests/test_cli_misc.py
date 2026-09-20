@@ -1084,6 +1084,80 @@ def test_batch_apply_manifest_target_used_when_no_flag(monkeypatch, fake_transpo
     rc = bn.cli.main(["batch", "apply", "-", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "explicit"
+
+
+def test_batch_apply_manifest_target_beats_an_ambient_selector(monkeypatch, fake_transport):
+    """#676 item 11, round 4: `batch apply` is a DESTRUCTIVE op, and the #366
+    override above is written for "the explicit per-invocation selector". An
+    exported `BN_TARGET` -- or a sticky pin -- is not one: both are AMBIENT,
+    the class of value a bare destructive `bn close` already refuses to be
+    steered by, and `_apply_sticky_defaults` marks them for exactly this
+    question.
+
+    Letting them through here dispatched the WHOLE manifest at the ambient
+    selector and silently discarded the target the manifest itself named: every
+    op ran against a binary the caller never named on this command line, and
+    the file's own statement of intent was thrown away without a word.
+
+    The two ambient sources are asserted as a PAIR because they must behave
+    alike -- the env half alone would stay green while the pin still won, and
+    the whole argument for the export is that it is the pin's equal minus the
+    cross-agent clobber.
+    """
+    import io
+
+    from bn import session_state
+
+    responses = {"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}}
+
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "manifest.bin", "ops": []}'))
+    monkeypatch.setenv("BN_TARGET", "exported.bin")
+    env_calls = fake_transport(responses)
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "pinned.bin"})
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "manifest.bin", "ops": []}'))
+    pin_calls = fake_transport(responses)
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+
+    assert env_calls[-1]["params"].get("target") == "manifest.bin", (
+        "an exported BN_TARGET must not override the manifest's own target on "
+        f"a destructive batch apply; it sent {env_calls[-1]['params'].get('target')!r}")
+    assert pin_calls[-1]["params"].get("target") == "manifest.bin", (
+        "a sticky pin must not override the manifest's own target either; it "
+        f"sent {pin_calls[-1]['params'].get('target')!r}")
+    # ONE selector on the wire. `batch_apply` resolves the manifest's target
+    # (bridge `_batch_apply_selector`, read by the binder AND the destructive
+    # gate), so a demoted ambient value riding on the ENVELOPE beside it would
+    # be a second, contradictory claim -- and the byte guard counts one
+    # selector, not two different ones.
+    assert [c[-1]["target"] for c in (env_calls, pin_calls)] == [None, None], (
+        "the demoted ambient selector must not ride on the request envelope "
+        f"either: {env_calls[-1]['target']!r} / {pin_calls[-1]['target']!r}")
+
+
+def test_batch_apply_ambient_selector_still_fills_a_manifest_that_names_none(
+        monkeypatch, fake_transport):
+    """Must-not-fire twin: ambience demotes the CLI value, it does not delete it.
+
+    A manifest with no "target" of its own has named nothing to protect, so the
+    ambient selector is still the best answer available -- refusing it there
+    would break the single-agent convenience `BN_TARGET` exists for and push
+    the request onto the bridge's focused-tab fallback. Without this half, the
+    sibling above is satisfiable by ignoring an ambient target everywhere.
+    """
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"ops": []}'))
+    monkeypatch.setenv("BN_TARGET", "exported.bin")
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+    assert calls[-1]["params"].get("target") == "exported.bin"
+
+
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
     pytest.param(["--max-length", "80"], {"max_length": 80}, id="max-length"),
