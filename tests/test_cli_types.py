@@ -438,40 +438,99 @@ def test_an_endless_dribble_is_refused_rather_than_read_without_end(
 
 
 _FD_SETSIZE = 1024
+# The ballast the probe burns to push its pipe past the ceiling, plus room for
+# everything the interpreter and the test runner already hold open.
+_FD_HEADROOM = _FD_SETSIZE + 400
 
 
-@pytest.mark.skipif(
-    resource.getrlimit(resource.RLIMIT_NOFILE)[0] < _FD_SETSIZE + 400,
-    reason="needs headroom to hold more than FD_SETSIZE descriptors open")
-def test_a_fifo_above_fd_setsize_still_answers_with_an_envelope(
+@contextlib.contextmanager
+def _descriptor_headroom(needed: int = _FD_HEADROOM):
+    """Raise this process's ``RLIMIT_NOFILE`` soft limit to *needed* for the block.
+
+    The probe below is the only regression guard for the FD_SETSIZE blocker,
+    and conditioning it on the INHERITED soft limit made it vanish silently:
+    at the conventional 1024 default it skipped and the run still exited 0, so
+    the same commit executed the guard in one full-suite run and skipped it in
+    another depending only on the limit the worker happened to inherit. A guard
+    that disappears when the environment shrugs is not a guard.
+
+    POSIX lets a process raise its own soft limit up to the hard limit, so the
+    probe takes the headroom it needs instead of asking the environment for it,
+    and skips only when the HARD limit genuinely cannot hold the descriptors --
+    a statement about the host's real capability rather than about a default.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < needed:
+        pytest.skip(f"hard RLIMIT_NOFILE ({hard}) cannot hold {needed} descriptors")
+    raise_it = soft != resource.RLIM_INFINITY and soft < needed
+    if raise_it:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    try:
+        yield
+    finally:
+        if raise_it:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def _assert_a_high_descriptor_fifo_answers_with_an_envelope(
         fake_transport, capsys, monkeypatch):
     """`select()`'s fd_set stops at FD_SETSIZE and raises a bare `ValueError`
     past it -- not an `OSError`, so it escapes the reader's own handler. A `bn`
     launched from a supervisor or CI runner that leaks a large descriptor table
     would then get a Python traceback at exit 1 out of the one code path whose
     entire job is to answer in a structured envelope. Ballast pushes the pipe
-    past the ceiling so the wait is exercised with a high descriptor."""
+    past the ceiling so the wait is exercised with a high descriptor.
+
+    Shared by the two cells below so that the descriptor limit the guard runs
+    under is the ONLY difference between them.
+    """
     monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
     calls = fake_transport()
-    ballast = [os.open(os.devnull, os.O_RDONLY) for _ in range(_FD_SETSIZE + 100)]
-    read_fd, write_fd = os.pipe()
-    try:
-        assert read_fd > _FD_SETSIZE, f"ballast did not clear FD_SETSIZE ({read_fd})"
-        # The write end stays open and silent, so the read reaches the bounded
-        # wait -- the only place a descriptor is handed to the readiness call.
-        with _must_not_hang():
-            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
-    finally:
-        os.close(write_fd)
-        os.close(read_fd)
-        for fd in ballast:
-            os.close(fd)
+    with _descriptor_headroom():
+        ballast = [os.open(os.devnull, os.O_RDONLY) for _ in range(_FD_SETSIZE + 100)]
+        read_fd, write_fd = os.pipe()
+        try:
+            assert read_fd > _FD_SETSIZE, f"ballast did not clear FD_SETSIZE ({read_fd})"
+            # The write end stays open and silent, so the read reaches the
+            # bounded wait -- the only place a descriptor is handed to the
+            # readiness call.
+            with _must_not_hang():
+                rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+            for fd in ballast:
+                os.close(fd)
 
     assert rc == 2
     assert [call["op"] for call in calls] == []
     captured = capsys.readouterr()
     assert "went quiet" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_a_fifo_above_fd_setsize_still_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch):
+    """The guard at whatever descriptor limit this run inherited."""
+    _assert_a_high_descriptor_fifo_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch)
+
+
+def test_the_fd_setsize_guard_still_runs_at_a_conventional_descriptor_limit(
+        fake_transport, capsys, monkeypatch):
+    """The guard must not be able to vanish. This pins the exact condition that
+    made it disappear -- a soft limit at the conventional 1024 default, below
+    the headroom the probe needs -- and asserts the high-descriptor envelope is
+    still VERIFIED there rather than skipped past at a green exit."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < _FD_HEADROOM:
+        pytest.skip(f"hard RLIMIT_NOFILE ({hard}) cannot hold {_FD_HEADROOM} descriptors")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_FD_SETSIZE, hard))
+    try:
+        _assert_a_high_descriptor_fifo_answers_with_an_envelope(
+            fake_transport, capsys, monkeypatch)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def test_types_declare_dev_null_still_reaches_the_op(fake_transport):
