@@ -1833,6 +1833,17 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
     * only counter-shaped count lines are in the inventory today. One stating
       `len(<rows>)` would fail the "still states a count" assertion rather than
       being probed in a shape of its own.
+    * the POPULATION is the `text_renderer=` keyword arguments in this
+      module's AST, so the "unclassified renderer fails" rule reaches exactly
+      the renderers installed that way. One reaching the registry by any other
+      route -- a `**kwargs` spread, an options dict assembled at runtime, an
+      attribute assigned after construction -- is not in the population and is
+      not demanded a classification. MEASURED, not assumed: installing a
+      raw-count renderer as `_call(args, op, {}, **OPTS)` leaves this test
+      GREEN. It is named here rather than chased, because widening the scan
+      for it is the same "one more shape" move the enumerated claim replaced;
+      no renderer in this module is installed that way, and one that were
+      would be an odd spelling of a call that is otherwise literal everywhere.
     * nothing is inferred from a renderer's `__module__`. Round 8's guard
       claimed to fail CLOSED on a callable whose home module could not be told
       and did not -- `functools.partial(...).__module__` is `'functools'`,
