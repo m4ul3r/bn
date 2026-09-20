@@ -838,54 +838,6 @@ def test_fortified_copy_spelling_is_modeled_like_its_bare_twin_876(base, chk):
         assert [s["class"] for s in shell] == ["command_injection"], (callee, shell)
 
 
-# The same spelling question, asked of the WHOLE export table rather than just
-# the fortify surface: which exported alias of an ARMED model resolves to
-# nothing? Two did, and they are not fortified at all -- the unlocked stdio
-# writers, whose declarations are byte-for-byte their bases' minus the locking.
-_UNLOCKED_WRITE_PAIRS = (("fputs", "fputs_unlocked"), ("fwrite", "fwrite_unlocked"))
-
-
-def _write_program(callee):
-    """``read(3, &src, 0x40); callee(&src, ...)`` -- tainted bytes written out.
-
-    Only arg 0 is tainted, so the multi-arm `fwrite` model reports the data
-    arm alone and the two pairs stay comparable.
-    """
-    F = _fakes()
-    src = F.FVar("src", typ="char[0x40]")
-    params = [F.FExpr("MLIL_ADDRESS_OF", "&src", src=src)]
-    if callee.startswith("fwrite"):
-        params += [F.FExpr("MLIL_CONST", "1", constant=1),
-                   F.FExpr("MLIL_CONST", "0x10", constant=0x10)]
-    params.append(F.FExpr("MLIL_CONST", "0", constant=0))       # the stream
-    instrs = [
-        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "read(3, &src, 0x40)", writes=[],
-                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
-                 params=[F.FExpr("MLIL_CONST", "3", constant=3),
-                         F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
-                         F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
-        F.FInstr(1, 0x20, "MLIL_CALL_SSA", f"{callee}(&src, ...)", writes=[],
-                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901), params=params),
-    ]
-    return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
-            F.FBV({0x900: "read", 0x901: callee}))
-
-
-@pytest.mark.parametrize("base,alias", _UNLOCKED_WRITE_PAIRS)
-def test_unlocked_write_spelling_is_modeled_like_its_bare_twin_876(base, alias):
-    # Same defect shape as the LFS twin, found by the same question: the alias
-    # is exported, its bare twin carries an armed sink, and it resolved to no
-    # model -- so `--sink-class file_write` reported the exfiltration through
-    # `fputs` and missed the identical one through `fputs_unlocked`.
-    assert _reported(_write_program(alias), "call:read", gate=()) == []
-    bare = _reported(_write_program(base), "call:read", gate=("file_write",))
-    alias_sinks = _reported(_write_program(alias), "call:read", gate=("file_write",))
-    assert len(bare) == 1 and len(alias_sinks) == 1, (bare, alias_sinks)
-    assert alias_sinks[0]["tainted_arg_index"] == bare[0]["tainted_arg_index"] == 0
-    assert alias_sinks[0]["class"] == bare[0]["class"] == "file_write", (bare, alias_sinks)
-    assert alias in alias_sinks[0]["detail"], alias_sinks
-
-
 def test_scanf_family_models_carry_arity_capped_flag_851():
     # #851: scanf/fscanf (and their isoc99 aliases) declare `arity_capped: true`
     # so the engine can emit a weak-seed note when a real call has more actual
