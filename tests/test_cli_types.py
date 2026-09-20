@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import resource
 import signal
 import threading
 import time
+from pathlib import Path
 
 import bn.cli
 import pytest
@@ -484,10 +486,16 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
     Measured before the cap: ~0.24-0.36 GB/s accumulated, so the shipped 300s
     total bound would need tens of GB resident to ever be reached.
 
-    The cap is patched down here so the cell costs a few KiB instead of 64 MiB;
-    the production value refuses no document a caller meant to pass.
+    The cap and the chunk size are both patched down so the cell costs a few
+    KiB instead of 64 MiB, and so the refused byte count can be asserted
+    TIGHTLY -- which is what pins the UNIT. A predicate that counted chunks or
+    iterations instead of bytes would leave the real bound at cap-many chunks
+    (64Ki x 64KiB in production) and the memory escape would be back with the
+    suite still green, so "it refused eventually" is not enough: it has to
+    refuse within one chunk of the cap.
     """
-    monkeypatch.setattr(bn.cli, "_FIFO_MAX_BYTES", 4096)
+    monkeypatch.setattr(bn.cli, "_FIFO_CHUNK", 1024)
+    monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 8192)
     calls = fake_transport(_declare_ok())
     read_fd, write_fd = os.pipe()
     stop = threading.Event()
@@ -516,6 +524,106 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
     captured = capsys.readouterr()
     assert "delivered more than" in captured.err
     # The whole point: a structured envelope, never the bare MemoryError.
+    assert "Traceback" not in captured.err
+    assert "MemoryError" not in captured.err
+    # ...and the UNIT: refused within one chunk of the 8192-byte cap, not at
+    # 8192 CHUNKS. The reported figure is the bytes actually accumulated.
+    reported = int(re.search(r"\((\d+) byte\(s\) so far\)", captured.err).group(1))
+    assert 8192 < reported <= 8192 + 1024, reported
+
+
+def test_a_regular_file_over_the_limit_is_refused_before_it_is_read(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """The FIFO limb counts bytes as they arrive; the regular-file limb had no
+    bound at all, so the same reader refused an endless stream with an envelope
+    and then died on a too-large file with a bare `MemoryError` and no envelope
+    -- one limb bounded, its sibling not. The size is already in hand from the
+    stat the kind checks use, so it is enforced before a single byte is read.
+
+    A sparse file keeps the cell cheap: it claims the size without occupying
+    the disk, which is also the realistic shape (a mistyped path to a large
+    artifact) rather than a contrived one.
+    """
+    monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 4096)
+    big = tmp_path / "decl.h"
+    with open(big, "wb") as fh:
+        fh.truncate(4096 * 8)
+    calls = fake_transport(_declare_ok())
+
+    rc = bn.cli.main(_declare(str(big)))
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "limit for a text input" in captured.err
+    assert "Traceback" not in captured.err
+    # The negative control: at the limit it is still read and still dispatched,
+    # so the cap refuses the oversized file rather than the feature.
+    ok = tmp_path / "small.h"
+    ok.write_text("struct S { int a; };", encoding="utf-8")
+    assert bn.cli.main(_declare(str(ok))) == 0
+    assert calls[-1]["params"]["declaration"] == "struct S { int a; };"
+
+
+@pytest.mark.parametrize("target", ["fifo", "regular"])
+def test_a_memory_error_answers_with_an_envelope_not_a_traceback(
+        fake_transport, capsys, monkeypatch, tmp_path, target):
+    """`MemoryError` is not an `OSError`, so it escaped both limbs' handlers as
+    a raw traceback at rc 1 -- the round-3 `select` `ValueError` shape, out of
+    the one code path whose entire job is a structured envelope. The byte cap
+    bounds what the reader will KEEP, but a caller whose own address-space
+    budget is smaller than the cap (a container, a `ulimit -v`) hits the
+    allocation failure before the cap is ever reached, so the handler has to
+    catch it as well as bound it.
+
+    Forced rather than provoked with a real limit: a genuine OOM is the one
+    failure a test cannot stage reliably, and what needs pinning is the
+    handler, not the allocator.
+    """
+    calls = fake_transport(_declare_ok())
+    if target == "regular":
+        path = tmp_path / "decl.h"
+        path.write_text("struct S { int a; };", encoding="utf-8")
+
+        real_read_text = Path.read_text
+
+        def boom(self, *args, **kwargs):
+            # Only the input under test: the CLI reads its own session pin
+            # through the same method, and failing that instead would stage a
+            # different defect.
+            if self == path:
+                raise MemoryError
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        spelling = str(path)
+    else:
+        fifo = tmp_path / "decl.h"
+        os.mkfifo(fifo)
+        keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        writer = os.open(fifo, os.O_WRONLY)
+        os.write(writer, b"struct S { int a; };")
+        os.close(writer)
+        real_read = os.read
+
+        def boom(fd, size):
+            real_read(fd, size)
+            raise MemoryError
+
+        monkeypatch.setattr(os, "read", boom)
+        spelling = str(fifo)
+
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(spelling))
+    finally:
+        if target == "fifo":
+            os.close(keep_reader)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "did not fit in memory" in captured.err
     assert "Traceback" not in captured.err
     assert "MemoryError" not in captured.err
 

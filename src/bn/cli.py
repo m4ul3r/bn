@@ -1503,14 +1503,38 @@ def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
     if not stat.S_ISREG(st.st_mode) and not _is_null_device(path):
         raise BridgeError(_with_hint(
             f"{what} is not a regular file ({_file_kind(st.st_mode)}): {path}. "
-            "A device can stream without end, so it is refused instead of read "
-            "until it stops; write the input to a regular file, or stream it in "
-            "through a process substitution (`<(cmd)`) or a pipe on /dev/stdin "
-            "-- a /dev/stdin that is still a terminal is this same device", hint))
+            "Nothing bounds a read from a socket or a device -- it can stream "
+            "without end -- so it is refused instead of read until it stops; "
+            "write the input to a regular file, or stream it in through a "
+            "process substitution (`<(cmd)`) or a pipe on /dev/stdin -- a "
+            "/dev/stdin that is still a terminal is this same device", hint))
+    if st.st_size > _MAX_INPUT_BYTES:
+        # The FIFO limb counts bytes as they arrive because it cannot know the
+        # size in advance. Here the size is already in hand from the stat
+        # above, so the same limit is enforced before a single byte is read --
+        # otherwise this branch is the unbounded sibling of a bounded one.
+        raise BridgeError(_with_hint(
+            f"{what} is {st.st_size >> 20} MiB, over the "
+            f"{_MAX_INPUT_BYTES >> 20} MiB limit for a text input: {path}. The "
+            "whole file is read into memory to be parsed, so one this large "
+            "would exhaust the heap before it could be used; the FIFO reader "
+            "refuses an endless stream for exactly the same reason", hint))
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # `MemoryError` is not an `OSError`, so without this it escapes as a
+        # raw traceback -- the same shape as round 3's `select` `ValueError`.
+        # The size check above refuses what is too large to read at all; this
+        # covers a caller whose own address-space budget is smaller than that
+        # limit, where even an in-limit file cannot be allocated.
+        raise BridgeError(
+            f"{what} did not fit in memory: {path}. The whole file is read in "
+            f"to be parsed, and {st.st_size} byte(s) exceeded what this "
+            "process could allocate; pass a smaller input, or raise the "
+            "memory limit this command runs under"
+        ) from None
 
 
 # One page: the FIFO drain below reads in whole chunks rather than byte-wise.
@@ -1531,19 +1555,21 @@ _FIFO_IDLE_TIMEOUT = 30.0
 # streams, so a bound this generous cannot cut off a correct producer, and it
 # is what makes "the read terminates" true rather than nearly true.
 _FIFO_TOTAL_TIMEOUT = 300.0
-# ...and how many bytes it will accumulate before it gives up. Neither clock
-# above bounds MEMORY: the drain buffers what it reads so the text can be
-# parsed, so a fast producer (`<(cat /dev/zero)` sustains hundreds of MB/s
-# here) exhausts the heap long before either clock can fire, and `MemoryError`
-# -- not an `OSError` -- escapes this function's handler as a raw traceback
-# with no envelope. That is #864's symptom class from a fourth direction, and
+# ...and, for EITHER limb of `read_text_input`, how many bytes it will take at
+# all. Neither clock above bounds MEMORY: the drain buffers what it reads so
+# the text can be parsed, so a fast producer (`<(cat /dev/zero)` sustains
+# hundreds of MB/s here) exhausts the heap long before either clock can fire,
+# and `MemoryError` -- not an `OSError` -- escapes as a raw traceback with no
+# envelope. That is #864's symptom class from a fourth direction, and
 # structurally the round-3 escape again: a non-OSError leaving the one path
-# whose whole job is a structured refusal. It is also exactly what the by-kind
-# refusal already says about a character device ("a device can stream without
-# end"), so the same rule has to hold for an endless stream that happens to
-# arrive through a pipe. A declaration, a script, a manifest or a model map is
-# a document, so a cap this generous refuses no input a caller meant to pass.
-_FIFO_MAX_BYTES = 64 << 20
+# whose whole job is a structured refusal. It is also what the by-kind refusal
+# already says about a device -- nothing bounds a read from it -- so the same
+# rule has to hold for an endless stream that arrives through a pipe, and for
+# a regular file too large to hold: bounding one limb and not its sibling
+# would just move the escape. The FIFO limb counts as it reads; the regular
+# file is checked against its stat before any read. A declaration, a script,
+# a manifest or a model map is a document, so this refuses no real input.
+_MAX_INPUT_BYTES = 64 << 20
 
 
 def _read_fifo_text(path: Path, *, what: str) -> str:
@@ -1570,10 +1596,13 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
       be parsed, so a fast endless producer exhausts the heap well before
       either clock fires and dies as a bare ``MemoryError`` -- not an
       ``OSError``, so it escapes the handler below exactly the way the
-      ``select`` ``ValueError`` did. `_FIFO_MAX_BYTES` caps the accumulation,
-      which is the same judgement the by-kind refusal already makes about a
-      character device: nothing bounds an endless stream, so it is refused
-      rather than read until it stops.
+      ``select`` ``ValueError`` did. `_MAX_INPUT_BYTES` caps the accumulation,
+      counted in BYTES rather than chunks, which is the same judgement the
+      by-kind refusal already makes about a device: nothing bounds an endless
+      stream, so it is refused rather than read until it stops. The cap is
+      what the drain will KEEP; a caller whose own address-space budget is
+      smaller still gets a structured refusal, because the handler below now
+      catches ``MemoryError`` too rather than letting it out as a traceback.
     * **A writer that delivers nothing at all** -- refused on the DELIVERED
       BYTE COUNT, never on which state the first probe happened to catch.
       Whether the writer had already exited (the probe sees EOF) or was still
@@ -1596,7 +1625,10 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
     # refusal here produces. poll has no such ceiling.
     waiter = select.poll()
     waiter.register(fd, select.POLLIN)
-    chunks: list[bytes] = []
+    # A bytearray, not a list of chunks joined at the end: the join would hold
+    # the pieces AND the result at once, doubling peak memory at exactly the
+    # moment the cap below says memory is the scarce thing.
+    buf = bytearray()
     delivered = 0
     started = time.monotonic()
     try:
@@ -1642,23 +1674,44 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
                 continue
             if not chunk:
                 break
-            chunks.append(chunk)
+            buf += chunk
             delivered += len(chunk)
-            if delivered > _FIFO_MAX_BYTES:
+            if delivered > _MAX_INPUT_BYTES:
+                # Counted in BYTES, deliberately: counting chunks or
+                # iterations would make the real bound this many CHUNKS, i.e.
+                # 64Ki x 64KiB, and the memory escape would be back with the
+                # suite still green.
+                buf.clear()
                 raise BridgeError(
                     f"{what} is a FIFO that delivered more than "
-                    f"{_FIFO_MAX_BYTES >> 20} MiB: {path}. These readers take a "
-                    "document, and the bytes are buffered so the text can be "
-                    "parsed, so an endless producer would exhaust memory long "
-                    "before either time bound could answer. What arrived is "
-                    "discarded rather than truncated into a partial input. "
-                    "Write the input to a regular file"
+                    f"{_MAX_INPUT_BYTES >> 20} MiB ({delivered} byte(s) so "
+                    f"far): {path}. These readers take a document, and the "
+                    "bytes are buffered so the text can be parsed, so an "
+                    "endless producer would exhaust memory long before either "
+                    "time bound could answer. What arrived is discarded rather "
+                    "than truncated into a partial input. Write the input to a "
+                    "regular file"
                 )
     except OSError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # Not an `OSError`, so without this it escapes as a raw traceback --
+        # the round-3 `select` `ValueError` shape exactly. The cap above
+        # bounds what this drain will KEEP; this covers a caller whose own
+        # address-space budget is smaller than that cap, where the allocation
+        # fails before the cap is ever reached. Drop the buffer first: the
+        # message itself has to be built while memory is already scarce.
+        buf.clear()
+        raise BridgeError(
+            f"{what} is a FIFO whose data did not fit in memory after "
+            f"{delivered} byte(s): {path}. The bytes are buffered so the text "
+            "can be parsed, and this process could not allocate that much; "
+            "pass a smaller input, or raise the memory limit this command "
+            "runs under"
+        ) from None
     finally:
         os.close(fd)
-    if not chunks:
+    if not buf:
         raise BridgeError(
             f"{what} is a FIFO that delivered no data: {path}. An empty pipe "
             "cannot be told apart from a producer that never ran, so it is "
@@ -1667,9 +1720,18 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
             "actually writes"
         )
     try:
-        return b"".join(chunks).decode("utf-8")
+        return buf.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # The decoded str is a second copy of the buffer, so the decode is its
+        # own allocation and its own way to escape without an envelope.
+        buf.clear()
+        raise BridgeError(
+            f"{what} could not be decoded within memory: {path}. {delivered} "
+            "byte(s) were read but the text form could not be allocated; pass "
+            "a smaller input, or raise the memory limit this command runs under"
+        ) from None
 
 
 def _with_hint(message: str, hint: str | None) -> str:

@@ -136,5 +136,17 @@ def test_atomic_write_fsyncs_the_pin_before_the_rename(project, monkeypatch):
     assert events.index("fsync:file") < events.index("replace"), (
         "the fsync must precede the rename that publishes the pin: " f"{events}"
     )
+    # The other half of the same guarantee, and the half three review rounds
+    # found unpinned: the rename is only durable once its PARENT directory is
+    # synced, and deleting that call left this module green because the event
+    # was recorded here but never asserted.
+    assert "fsync:dir" in events, (
+        "the parent directory must be fsynced too, or the rename that "
+        f"publishes the pin is not itself durable: {events}"
+    )
+    assert events.index("replace") < events.index("fsync:dir"), (
+        "the directory fsync must follow the rename it makes durable: "
+        f"{events}"
+    )
     assert state["target"] == "t.bndb"
     assert json.loads(session_state_path().read_text())["target"] == "t.bndb"
