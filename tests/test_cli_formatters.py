@@ -8022,3 +8022,271 @@ def test_render_trace_text_states_a_readable_arg_index_755():
     # missing key must not manufacture a disclosure.
     assert "arg[0] of memcpy" in _render_trace_text(base)
     assert "malformed arg_index" not in _render_trace_text(base)
+
+
+# ---------------------------------------------------------------------------
+# #812 / #811 / #805: the four taint renderings the census counters above only
+# COUNT. A census differential moves when a renderer gains a read, so it holds
+# the disclosure contract -- but it never asserts what any of these four
+# actually print, and every one of them is a line a reader acts on.
+# ---------------------------------------------------------------------------
+
+
+def _per_source_frontier_payload():
+    """A forward result whose per-callsite rows carry the bridge's own blocking
+    frontier count, in the three states the row can be in."""
+    return {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x10"},
+        "sources": [{"kind": "arg", "callee": "recv", "index": 1}],
+        "reached_sinks": [], "leaves": [], "assumptions": [],
+        "by_source": {
+            # Three leaves, two of them BLOCKING -- and neither of the two is
+            # `unmodeled_callee`, the single kind the CLI used to count.
+            "0x14": {"reached_sinks": [], "frontier": 2,
+                     "leaves": [{"kind": "coarse_memory_store"},
+                                {"kind": "pointer_escape"},
+                                {"kind": "arg_dropped_partial"}]},
+            # Leaves, but none of them blocking: a marker here would be noise.
+            "0x1c": {"reached_sinks": [], "frontier": 0,
+                     "leaves": [{"kind": "arg_dropped_partial"}]},
+            # No `frontier` key at all -- a bridge older than this CLI.
+            "0x24": {"reached_sinks": [],
+                     "leaves": [{"kind": "coarse_memory_store"}]},
+        },
+        "soundness": "may-analysis",
+    }
+
+
+def test_per_source_frontier_marker_uses_the_bridge_count_812():
+    # #812's headline defect, CLI end: this marker used to be recomputed here by
+    # counting ONE hard-coded leaf kind (`unmodeled_callee`) out of the eleven
+    # that block a claim, so a callsite whose frontier was a coarse store or a
+    # pointer escape printed no marker at all -- on the row a reader uses to
+    # choose which callsite to triage. The count is now the bridge's, computed
+    # against the canonical vocabulary the CLI cannot import.
+    from bn.formatters import _render_taint_text
+    rows = {ln.strip().split(":", 1)[0]: ln.strip()
+            for ln in _render_taint_text(_per_source_frontier_payload()).splitlines()
+            if ln.startswith("  0x")}
+    assert rows["0x14"] == "0x14: no sinks; 3 leaf(s) (2 frontier)", rows
+    # A zero count prints no marker: "(0 frontier)" reads as a finding about
+    # the frontier when it is the absence of one.
+    assert rows["0x1c"] == "0x1c: no sinks; 1 leaf(s)", rows
+    # Absent key -> no marker. The CLI must not fall back to a number it cannot
+    # derive correctly; that fallback IS the bug.
+    assert rows["0x24"] == "0x24: no sinks; 1 leaf(s)", rows
+
+
+def test_per_source_frontier_marker_ignores_an_unreadable_count_812():
+    # The count arrives over JSON, so a malformed row must degrade to no marker
+    # rather than interpolating a string into a "(N frontier)" claim.
+    from bn.formatters import _render_taint_text
+    payload = _per_source_frontier_payload()
+    payload["by_source"]["0x14"]["frontier"] = "lots"
+    row = next(ln.strip() for ln in _render_taint_text(payload).splitlines()
+               if ln.startswith("  0x14"))
+    assert row == "0x14: no sinks; 3 leaf(s)", row
+    assert "lots" not in row
+
+
+def test_backward_text_renders_the_completeness_gate_812():
+    # #812: forward printed a diagnostics block and backward printed none, so a
+    # text reader could not tell a slice that reached every origin from one that
+    # abandoned caller sites at the ascent cap. The gate is deliberately
+    # `safe_to_report_complete_slice` -- backward starts AT a sink and never
+    # answers forward's "no sink was reached" question.
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text({
+        "direction": "backward",
+        "function": {"name": "use_len", "address": "0x800"},
+        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+        "slices": [], "leaves": [], "assumptions": [],
+        "diagnostics": {
+            "sinks_seeded": 1, "slices": 0, "truncated": True,
+            "truncation_cause": ["caller_cap"],
+            "frontier": {"unresolved": 2, "coarse_memory": 1, "dropped_callers": 3,
+                         "by_kind": {"caller_sites_truncated": 3,
+                                     "field_load_unresolved": 2,
+                                     "coarse_memory_store": 1}},
+            "next_action": "re-run against a specific caller",
+            "safe_to_report_complete_slice": False,
+            "complete_slice_reason": "6 frontier leaf(s) remain",
+        },
+        "soundness": "may-analysis",
+    })
+    body = [ln.rstrip() for ln in out.splitlines()]
+    assert "diagnostics:" in body, out
+    assert "  walked: 1 seeded sink(s), 0 slice(s)" in body, out
+    # The dropped-caller clause is the one frontier a user can act on, so it is
+    # named on the same line rather than left to `by_kind` in the JSON.
+    assert "  frontier: 2 unresolved, 1 coarse-memory, 3 dropped-caller-site(s)" in body, out
+    assert "  safe_to_report_complete_slice: false" in body, out
+    assert "    reason: 6 frontier leaf(s) remain" in body, out
+    assert "  next: re-run against a specific caller" in body, out
+    # Forward's key must never appear on a backward render -- that was the whole
+    # reason the gate got its own name.
+    assert "safe_to_report_all_clear" not in out, out
+
+
+def test_backward_text_marks_a_complete_slice_as_may_analysis_812():
+    # The other side of the gate: a True value is still not a proof, and the
+    # qualifier is what stops the line reading as one. A backward run with no
+    # diagnostics block at all (an older bridge) must print no block, not an
+    # empty heading.
+    from bn.formatters import _render_taint_text
+    base = {
+        "direction": "backward",
+        "function": {"name": "use_len", "address": "0x800"},
+        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+        "slices": [], "leaves": [], "assumptions": [], "soundness": "may-analysis",
+    }
+    out = _render_taint_text(dict(base, diagnostics={
+        "sinks_seeded": 1, "slices": 1, "truncated": False, "truncation_cause": [],
+        "frontier": {"unresolved": 0, "coarse_memory": 0, "dropped_callers": 0,
+                     "by_kind": {}},
+        "next_action": "classify each origin",
+        "safe_to_report_complete_slice": True,
+        "complete_slice_reason": "every seeded sink was walked to its origins",
+    }))
+    assert ("  safe_to_report_complete_slice: true (may-analysis, not a proof)"
+            in [ln.rstrip() for ln in out.splitlines()]), out
+    # dropped_callers == 0 drops the clause entirely rather than printing a zero.
+    assert "dropped-caller-site" not in out, out
+    assert "diagnostics:" not in _render_taint_text(base)
+
+
+def test_analysis_incomplete_note_rides_a_run_that_found_sinks_811():
+    # #811: an unread callee body is a coverage hole that survives INTO a run
+    # WITH findings -- and a run with findings carries no diagnostics block at
+    # all, so leaving the disclosure JSON-only hid it in exactly the case a
+    # reader is most likely to stop reading early. It prints under the verdict
+    # it qualifies and NAMES the functions, so the reader knows which region the
+    # result does not speak for.
+    from bn.formatters import _render_taint_text
+    sink = {"callee": "memcpy", "address": "0x24", "tainted_arg_index": 2,
+            "class": "overflow_len", "detail": "tainted length"}
+    payload = {
+        "direction": "forward",
+        "function": {"name": "handler", "address": "0x10"},
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [{"sink": sink, "path": []}],
+        "leaves": [], "assumptions": [],
+        "stats": {"functions_visited": 2, "max_depth": 1, "sinks": 1, "leaves": 0,
+                  "truncated": False, "truncation_cause": [],
+                  "analysis_incomplete": True,
+                  "analysis_incomplete_functions": ["helper_a", "helper_b"]},
+        "soundness": "may-analysis",
+    }
+    lines = [ln.rstrip() for ln in _render_taint_text(payload).splitlines()]
+    note = next(i for i, ln in enumerate(lines) if "NOTE: analysis incomplete" in ln)
+    assert lines[note] == (
+        "  NOTE: analysis incomplete -- 2 callee body/bodies could not be read "
+        "(helper_a, helper_b); their contents were never examined"), lines[note]
+    # Directly under the verdict it qualifies -- a disclosure parked after the
+    # flows list is one a reader scanning the verdict never sees.
+    assert lines[note - 1].startswith("verdict:"), lines[note - 3:note + 1]
+
+    # Must-not-fire: a fully analysed run pays nothing, or every clean result
+    # would carry a permanent incompleteness warning.
+    clean = dict(payload, stats=dict(payload["stats"], analysis_incomplete=False,
+                                     analysis_incomplete_functions=[]))
+    assert "analysis incomplete" not in _render_taint_text(clean)
+
+    # The flag with no names still discloses -- an unnamed hole is still a hole,
+    # and a renderer that needs the list would print nothing at all here.
+    unnamed = dict(payload, stats=dict(payload["stats"],
+                                       analysis_incomplete_functions=[]))
+    assert ("  NOTE: analysis incomplete -- a callee body could not be read; "
+            "their contents were never examined"
+            in [ln.rstrip() for ln in _render_taint_text(unnamed).splitlines()])
+
+
+def _union_last_use_payload(by_source):
+    return {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x10"},
+        "sources": [{"kind": "call", "callee": "read"}],
+        "reached_sinks": [], "leaves": [], "assumptions": [],
+        "diagnostics": {
+            "source_callsites": 2, "tainted_values": 4, "last_use": None,
+            "unmodeled_calls_reached": False, "truncated": False,
+            "truncation_cause": [], "analysis_incomplete": False,
+            "frontier": {"unresolved": 0, "coarse_memory": 0, "seed_misanchored": 0,
+                         "by_kind": {}},
+            "safe_to_report_all_clear": True, "all_clear_reason": "r",
+            "next_action": "n", "last_use_by_source": by_source,
+        },
+        "soundness": "may-analysis",
+    }
+
+
+def test_per_callsite_last_use_is_not_rendered_as_no_propagation_805():
+    # #805: a per-callsite attributed union has NO single last use, so the
+    # scalar is deliberately null and `last_use_by_source` carries the real
+    # answer. Rendering only the scalar printed "seed did not propagate" for a
+    # run that propagated from every callsite -- the union's null means
+    # AMBIGUOUS, not ABSENT, and the two must not share a line.
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_union_last_use_payload({
+        "0x20": {"label": "ta#1", "address": "0x24",
+                 "reason": "assignment/copy of tainted value"},
+        "0x30": None,
+    }))
+    body = [ln.rstrip() for ln in out.splitlines()]
+    assert "  last propagated use: differs per source callsite --" in body, out
+    assert "    0x20: ta#1 @ 0x24 (assignment/copy of tainted value)" in body, out
+    # A callsite that genuinely did not propagate is named as such, per row --
+    # that is the distinction the shared line destroyed.
+    assert "    0x30: <none — this callsite did not propagate>" in body, out
+    assert "seed did not propagate" not in out, out
+
+
+def test_the_genuinely_absent_last_use_still_says_so_805():
+    # The must-not-fire twin. The per-callsite branch may only pre-empt the
+    # "<none>" line when there is something to show: an all-null map (every
+    # callsite seeded and none propagated) is the ABSENT case, and suppressing
+    # the honest "<none>" there would replace a fact with an empty heading.
+    from bn.formatters import _render_taint_text
+    for by_source in ({}, {"0x20": None, "0x30": None}):
+        out = _render_taint_text(_union_last_use_payload(by_source))
+        assert "  last propagated use: <none — seed did not propagate>" in [
+            ln.rstrip() for ln in out.splitlines()], (by_source, out)
+        assert "differs per source callsite" not in out, by_source
+
+
+def test_taint_forward_threads_the_iteration_budget_to_the_bridge_812(fake_transport):
+    # #812: a fixpoint-truncated result tells the user to "raise --max-iters".
+    # The flag has to reach the engine for that advice to be actionable, and the
+    # request params are the only place the CLI can be held to it. Asserted with
+    # the flag and without, because the default is what every existing run gets.
+    def _run(extra):
+        calls = fake_transport({
+            "taint": {"ok": True, "result": {
+                "direction": "forward",
+                "function": {"name": "handler", "address": "0x10"},
+                "sources": [], "reached_sinks": [], "leaves": [],
+                "assumptions": [], "soundness": "may"}},
+        })
+        rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "param:0",
+                          "--target", "active", "--format", "json"] + extra)
+        assert rc == 0
+        assert calls[-1]["op"] == "taint"
+        return calls[-1]["params"]
+
+    assert _run(["--max-iters", "7"])["max_iters"] == 7
+    # The documented default, echoed back by the bridge in `run_params`; the
+    # engine's own constructor default is the same number.
+    assert _run([])["max_iters"] == 256
+
+
+def test_taint_forward_refuses_a_zero_iteration_budget_812():
+    # An iteration budget of 0 analyses nothing, so the floor is 1 and the
+    # argparse error must say "iterations" -- the shared `_depth_int` validator
+    # would have blamed "depth", naming a different flag than the one that was
+    # wrong.
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["taint", "forward", "-f", "handler", "--source", "param:0",
+                     "--target", "active", "--max-iters", "0"])
+    assert exc.value.code == 2
+

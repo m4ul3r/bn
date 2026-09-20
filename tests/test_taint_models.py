@@ -337,6 +337,58 @@ def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
     assert rows["0x5010"]["function"] == "parse_record"
 
 
+class _BVPlain:
+    """The minimum a `_taint_op` request needs of a view: an identity the
+    quick-loaded WeakSet can be asked about. The engine is recorded, not run, so
+    nothing here is read."""
+
+
+def test_taint_op_threads_max_iters_into_the_engine_812(monkeypatch):
+    # #812: a fixpoint-truncated result's remediation string names `--max-iters`,
+    # and until this handler forwarded the knob that advice pointed at nothing a
+    # user could do. The threading is what makes the remediation real, so it is
+    # pinned END TO END on the handler: the value in the request becomes the
+    # engine's budget, and an absent value leaves the engine's own default --
+    # the reason every pre-existing caller and the whole backward path are
+    # unaffected by the new knob.
+    #
+    # The recorder SUBCLASSES the real engine rather than replacing it, so the
+    # observed `max_iters` is whatever the real constructor resolved (including
+    # its default), not a kwargs dict this test could read either way.
+    import inspect
+
+    seen: list[int] = []
+    # Read off the REAL class before it is patched: the absent-value contract is
+    # "the engine's own default", and comparing against the signature proves the
+    # handler did not substitute one of its own.
+    engine_default = inspect.signature(
+        rts._taint.TaintEngine).parameters["max_iters"].default
+
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def __init__(self, bv, models, **kw):
+            super().__init__(bv, models, **kw)
+            seen.append(self.max_iters)
+
+        def forward(self, func, locators, **kw):        # never analyse anything
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    monkeypatch.setattr(rts._taint, "TaintEngine", _RecordingEngine)
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    ctx = _Ctx(_BVPlain())
+    request = {"function": "handler", "sources": ["param:0"]}
+    rts._taint_op(ctx, "active", dict(request, max_iters=7))
+    rts._taint_op(ctx, "active", dict(request))
+    # 7 from the request; then the engine's own default, NOT a zero or a None
+    # that would make the fixpoint analyse nothing. 256 is also the CLI flag's
+    # default, so the two ends agree on the budget an unflagged run gets.
+    assert engine_default == 256, engine_default
+    assert seen == [7, engine_default], seen
+
+
 def test_present_self_stub_labeled_non_audit_560():
     # A code ref located inside the modeled symbol's OWN body (a self-tailcall
     # stub) is non-audit, distinct from an import thunk.

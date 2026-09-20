@@ -8564,6 +8564,25 @@ def test_attributed_union_last_use_does_not_depend_on_callsite_order_805(models)
     assert set(d1.get("last_use_by_source") or {}) == {"0x20", "0x30"}, d1
     assert (d1.get("last_use_by_source") or {}) == (d2.get("last_use_by_source") or {})
     assert d1.get("tainted_values") == d2.get("tainted_values")
+    # #874 r2: order-agreement ALONE is satisfied by a DEGENERATE union -- a
+    # fixture where no callsite propagates yields `last_use is None` and
+    # `tainted_values == 0` in both orders, passes every line above, and sees
+    # nothing of the defect. So pin that this union is the non-degenerate case
+    # the bug actually rode on, with exact values:
+    #
+    #   * both callsites DID propagate, into DIFFERENT local values -- that
+    #     disagreement is the only thing an elected representative could be
+    #     wrong about, so without it the test cannot observe the bug at all;
+    #   * the null scalar therefore means AMBIGUOUS, not "nothing propagated";
+    #   * tainted_values is the SUM over the per-callsite runs (2 + 2), not the
+    #     representative's own 2 -- reverting to `base_diag.get(...)` halves it.
+    _by_src = d1["last_use_by_source"]
+    assert {a: (u or {}).get("label") for a, u in _by_src.items()} == {
+        "0x20": "ta#1", "0x30": "tb#1"}, _by_src
+    assert {a: (u or {}).get("address") for a, u in _by_src.items()} == {
+        "0x20": "0x24", "0x30": "0x34"}, _by_src
+    assert d1["last_use"] is None, d1["last_use"]
+    assert d1["tainted_values"] == 4, d1["tainted_values"]
 
 
 def test_forward_run_params_echo_the_configured_knobs_812(models):
@@ -8729,3 +8748,148 @@ def test_backward_result_carries_a_completeness_gate_812(process_func, models):
     # `max_iters` bounds the forward fixpoint only; echoing it on a backward run
     # is how the "raise --max-iters" advice reached runs it could never fix.
     assert "max_iters" not in result["run_params"], result["run_params"]
+
+
+def _phi_join_of_source_and_unconditional_func():
+    """join(fd): gets(&buf); v#1 = buf; x#1 = phi(fd#0, v#1); strcpy(&dst, x#1).
+
+    The multi-parent provenance shape #827 item 1's second site needs. `x#1` is
+    a join of TWO tainted values:
+
+      * ``parents[0]`` is ``fd``, the run's declared ``--source param:0``, whose
+        own ``why`` entry has no parents at all -- a dead end for the walk;
+      * ``parents[1]`` reaches ``buf``, the buffer ``gets()`` taints
+        UNCONDITIONALLY (independently of ``--source``), which is the
+        injected root the tagger is looking for.
+
+    The parent ORDER is the whole point, and it is not incidental: ``read_taint``
+    preserves ``ssa_reads`` order, so listing ``fd#0`` first puts the injected
+    root strictly behind ``parents[1]``. A walk that follows only the first
+    parent answers False here and the strcpy finding is then attributed to
+    ``param:0`` -- a causal claim the flow does not support.
+    """
+    fd = FVar("fd")
+    buf = FVar("buf", typ="char[0x40]")
+    dst = FVar("dst", typ="char[0x40]")
+    fd0, bufssa = FSSA(fd, 0), FSSA(buf, 0)
+    v1, x1 = FSSA(FVar("v"), 1), FSSA(FVar("x"), 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "v#1 = buf", reads=[bufssa], writes=[v1],
+               src=FExpr("MLIL_VAR_SSA", "buf", reads=[bufssa])),
+        FInstr(2, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
+               reads=[fd0, v1], writes=[x1]),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    bv = FBV({0x401070: "gets", 0x401090: "strcpy"})
+    return FFunc("join", 0x10, FSSAFunc(instrs), params=[fd]), bv
+
+
+def test_unconditional_root_behind_a_later_phi_parent_is_still_tagged_827(models):
+    # #827 item 1, second site: `_rooted_at_unconditional` is a REACHABILITY
+    # question ("is any ancestor an unconditionally-injected root?"), and it used
+    # to follow parents[0] only. A join whose injected root sits behind the
+    # SECOND parent then answered False, UNDER-tagging the finding: the strcpy
+    # got rendered as though the run's declared --source causally reached it,
+    # when the taint it copies was created by gets()'s own always-unsafe read.
+    #
+    # The observable is the finding's signature source, the same sentinel #615
+    # already pins for the single-parent case: "?" (no declared source traced
+    # here), never "param:0".
+    func, bv = _phi_join_of_source_and_unconditional_func()
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
+    assert len(strcpy_sinks) == 1, result["reached_sinks"]
+    # A REAL arg-taint finding, not the unconditional sentinel shape -- so the
+    # "?" below is the multi-parent walk's work and not #615's arg_index-is-None
+    # branch answering for it.
+    assert strcpy_sinks[0]["sink"]["tainted_arg_index"] == 1, strcpy_sinks[0]["sink"]
+    assert strcpy_sinks[0]["signature"]["source"] == "?", strcpy_sinks[0]["signature"]
+    assert "param:0" not in strcpy_sinks[0]["signature"]["rendered"], strcpy_sinks[0]["signature"]
+
+
+def test_unconditional_tag_does_not_fire_without_an_injected_root_827(models):
+    # The must-not-fire twin: the walk now visits EVERY parent, so a join with
+    # no injected ancestor anywhere in its provenance must still attribute the
+    # finding to the declared --source. A walk that returned True on any join
+    # would erase source attribution from every phi-joined finding in the
+    # binary, which is the same information loss in the other direction.
+    fd = FVar("fd")
+    dst = FVar("dst", typ="char[0x40]")
+    fd0 = FSSA(fd, 0)
+    v1, x1 = FSSA(FVar("v"), 1), FSSA(FVar("x"), 1)
+    instrs = [
+        FInstr(0, 0x14, "MLIL_SET_VAR_SSA", "v#1 = fd#0", reads=[fd0], writes=[v1],
+               src=FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])),
+        FInstr(1, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
+               reads=[fd0, v1], writes=[x1]),
+        FInstr(2, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    func = FFunc("join_clean", 0x10, FSSAFunc(instrs), params=[fd])
+    result = te.TaintEngine(FBV({0x401090: "strcpy"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
+    assert len(strcpy_sinks) == 1, result["reached_sinks"]
+    assert strcpy_sinks[0]["signature"]["source"] == "param:0", strcpy_sinks[0]["signature"]
+
+
+def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
+    # #812's headline defect, bridge end: the per-callsite row now carries its
+    # OWN blocking-frontier count, derived from the canonical
+    # BLOCKING_LEAF_KINDS. The CLI used to recompute the "(N frontier)" marker
+    # by counting one hard-coded kind (`unmodeled_callee`) out of the eleven
+    # that block a claim, so a callsite whose frontier was a coarse store, a
+    # pointer escape or an unresolved indirect call counted ZERO and the marker
+    # vanished -- silently, on the row a reader uses to pick which callsite to
+    # triage first.
+    #
+    # Canned per-callsite runs (the `_forward_run` seam
+    # test_forward_attributed_gate_recomputed_over_union_leaves already uses):
+    # the leaf VOCABULARY is what is under test here, and a fixture that has to
+    # produce three different real frontier kinds from one synthetic function
+    # would pin the fixture instead.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run(leaves):
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
+            "diagnostics": {"safe_to_report_all_clear": False, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    # Callsite A: two BLOCKING leaves, neither of them `unmodeled_callee` (the
+    # kind the old CLI-side count was hard-coded to), plus one non-blocking row
+    # that must NOT be counted -- a frontier marker that counts every leaf is
+    # just `len(leaves)` under a scarier name.
+    a = _run([{"kind": "coarse_memory_store", "address": "0x24"},
+              {"kind": "pointer_escape", "address": "0x28"},
+              {"kind": "arg_dropped_partial", "address": "0x2c"}])
+    # Callsite B: the one kind the old count DID see, so the test distinguishes
+    # "counts the right vocabulary" from "counts more things".
+    b = _run([{"kind": "unmodeled_callee", "address": "0x34"}])
+    runs = iter([a, b])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["by_source"]["0xa"]["frontier"] == 2, out["by_source"]["0xa"]
+    assert out["by_source"]["0xb"]["frontier"] == 1, out["by_source"]["0xb"]
+    # The row's own leaf list is untouched -- `frontier` is an added count, not
+    # a filter, so a reader can still see the non-blocking row it excluded.
+    assert len(out["by_source"]["0xa"]["leaves"]) == 3, out["by_source"]["0xa"]
