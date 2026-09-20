@@ -4443,10 +4443,15 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_defuse_text` (1 pair x 8 bogus values), measured.
     # 4936 -> 4944 (#795 round-6 review): the class listing's non-class artifact
     # share was read `or 0` inside its own conditional and was therefore
-    # discovered by nothing; routing it through `_nonnegative_count` makes it
-    # ONE more discovered read (1 pair x 8 bogus values), measured by diffing
+    # discovered by nothing; the listing now ASKS about it, so it is ONE more
+    # discovered read (1 pair x 8 bogus values), measured by diffing
     # `_runtime_population()`. The listing's other five newly-choked numbers
     # were already discovered reads, so they add nothing here.
+    # Cause corrected in round 7 after measuring it: it is the
+    # `_field_skewed("artifact_count")` branch that discovers the key, not the
+    # `_nonnegative_count` routing -- reverting only the routing leaves this
+    # sweep at 4944. The NUMBER was measured truth either way; the stated
+    # reason was not, which is the same defect as a count nobody read.
     assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
 
 
