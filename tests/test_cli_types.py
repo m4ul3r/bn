@@ -493,8 +493,12 @@ def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
     that counts chunks reports chunks and the assertion still holds. With a
     budget of 256 KiB against a 8192-byte cap, byte-counting refuses after
     ~9 KiB while chunk-counting would need 8192 chunks = 8 MiB, so it never
-    refuses at all: the writer's budget runs out, the drain reaches EOF and
-    DISPATCHES the input, and the rc assertion below goes red.
+    refuses at all: the writer's budget runs out with the write end still
+    held open below, the drain sits on the unpatched 30s idle bound waiting
+    for a producer that has nothing left to send, and the 10s hang guard
+    fires. Red either way; naming the wrong mechanism here is how a later
+    edit "fixes" the cell by patching the clock and silently removes the
+    only thing that makes the mutant observable.
     """
     monkeypatch.setattr(bn.cli, "_FIFO_CHUNK", 1024)
     monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 8192)
