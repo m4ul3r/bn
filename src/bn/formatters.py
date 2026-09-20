@@ -5836,9 +5836,24 @@ def _render_class_list_text(value: Any) -> str:
         # number in this renderer the round-6 repair walked past, in the very
         # renderer that repair was filed against. Raw, it printed a flag as a
         # quantity and a container as a Python repr, undisclosed, at rc 0.
+        #
+        # Read inside a per-ROW capture, the same way the struct-batch card
+        # reads a per-ENTRY one: `_field_skewed` answers for the WHOLE render,
+        # so a single malformed row made every LATER row state `?` for a count
+        # that read perfectly -- the fabricated reading this choke point exists
+        # to end, pointed the other way, and position-dependent besides. Then
+        # re-record, so the render's boundary note still names the field.
+        token = _SKEWED_FIELDS.set([])
+        try:
+            methods = _stated_count(rec, "method_count")
+            row_unreadable = list(_SKEWED_FIELDS.get() or ())
+        finally:
+            _SKEWED_FIELDS.reset(token)
+        for key in row_unreadable:
+            _record_skew(key)
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
-            f"methods={_stated_count(rec, 'method_count')}  {vt}  "
+            f"methods={methods}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )

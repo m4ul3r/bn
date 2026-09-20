@@ -4441,17 +4441,26 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # MEASURED by diffing `_runtime_population()` rather than carried over.
     # 4928 -> 4936 (#797): `hints` is one more discovered read on
     # `_render_defuse_text` (1 pair x 8 bogus values), measured.
-    # 4936 -> 4944 (#795 round-6 review): the class listing's non-class artifact
-    # share was read `or 0` inside its own conditional and was therefore
-    # discovered by nothing; the listing now ASKS about it, so it is ONE more
-    # discovered read (1 pair x 8 bogus values), measured by diffing
-    # `_runtime_population()`. The listing's other five newly-choked numbers
-    # were already discovered reads, so they add nothing here.
-    # Cause corrected in round 7 after measuring it: it is the
-    # `_field_skewed("artifact_count")` branch that discovers the key, not the
-    # `_nonnegative_count` routing -- reverting only the routing leaves this
-    # sweep at 4944. The NUMBER was measured truth either way; the stated
-    # reason was not, which is the same defect as a count nobody read.
+    # 4936 -> 4944 (#795 round-6 review): ONE more discovered `(renderer, key)`
+    # pair -- `(_render_class_list_text, artifact_count)` -- 1 pair x 8 bogus
+    # values. The NUMBER has been measured truth throughout; the CAUSE beside
+    # it was asserted twice and measured neither time, which is the same defect
+    # as a count nobody read. Round 9 measured it, by mutating this tree and
+    # re-running this one sweep:
+    #     HEAD                                                     4944
+    #     `elif _field_skewed("artifact_count")` branch deleted    4944
+    #     `_nonnegative_count(value, "artifact_count")` deleted    4936
+    #     both deleted                                             4936
+    #     the whole `--count` branch reverted to its pre-#795
+    #       spelling (`art = value.get("artifact_count") or 0`)    4944
+    # What that measures, and all it measures: the pair is discovered by
+    # READING the key off the payload, in either spelling, and by nothing
+    # else. `_field_skewed` reads the ambient skew set and never touches the
+    # payload, so it cannot enter a key into a population derived by observing
+    # payload lookups -- round 7's stated cause is false. Round 6's is too:
+    # the `or 0` spelling it called "discovered by nothing" measures 4944 on
+    # this tree. Which earlier edit moved the number off 4936 is NOT measured
+    # here, so no claim is made about it.
     assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
 
 
@@ -5000,6 +5009,28 @@ def test_the_class_listing_reads_its_count_and_every_cardinality_through_the_cho
     assert "malformed method_count field" in row(True), row(True)
     boxed_row = row({"n": 1})
     assert "{" not in boxed_row and "}" not in boxed_row, boxed_row
+
+    # ...and ONE malformed row is ONE malformed row. The skew recorder is
+    # render-WIDE by design (the boundary note names every field the render
+    # could not use), so routing a PER-ROW count through it made the first bad
+    # row decide every LATER row's count: rows that read perfectly printed
+    # `methods=?` because of a sibling. That is a position-dependent wrong
+    # answer -- the same fabricated reading (#683) the choke point exists to
+    # end, pointed the other way -- and the single note cannot say which row
+    # was actually unreadable, so the rows have to say it themselves.
+    mixed = render({"items": [{"name": "A", "method_count": {"n": 1}},
+                              {"name": "B", "method_count": 5},
+                              {"name": "C", "method_count": 7}], "total": 3})
+    assert "methods=5" in mixed and "methods=7" in mixed, mixed
+    assert mixed.count("methods=?") == 1, mixed
+    # ...while the render still DISCLOSES that one row was unreadable.
+    assert "malformed method_count field" in mixed, mixed
+    # Order must not decide it either: the bad row last reads the same.
+    trailing = render({"items": [{"name": "B", "method_count": 5},
+                                 {"name": "C", "method_count": 7},
+                                 {"name": "A", "method_count": {"n": 1}}], "total": 3})
+    assert trailing.count("methods=?") == 1, trailing
+    assert "methods=5" in trailing and "methods=7" in trailing, trailing
 
     # (d) A share the run never asked to fold out stays silent even when the
     # payload spells it wrong. Reading it BEFORE the gate that decides whether

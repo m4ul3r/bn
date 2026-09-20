@@ -1688,86 +1688,48 @@ def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
         assert listing.split("\n! malformed")[0] != quiet_listing, (dropped, listing)
 
 
-class _ProbedValue(int):
-    """An integer that also answers mapping reads, recording the path taken.
+# Every `text_renderer=` this module installs, and what this guard pins about
+# each one. An ENUMERATED inventory, deliberately.
+#
+# Eight review rounds went into a DERIVED version of this guard making the
+# universal claim "no renderer this module installs reads a count raw", through
+# three successive derivations -- a `*_count_text` name suffix, a source scan
+# for `.get("literal")`, then an observational probe harness that drove each
+# renderer with a recording payload. Each derivation was walked past by one
+# more renderer shape, and that is not a defect in any single round's work: the
+# claim is universal over a registry assembled at import time out of arbitrary
+# callables, and no derivation is total over that.
+#
+# So the claim is narrowed to what can actually be proven. This inventory is
+# the claim, and it stays load-bearing because a renderer installed WITHOUT a
+# classification is a FAILURE here, not a silent pass.
+#
+# Two classifications, nothing else:
+#   * a tuple of payload key PATHS -- this renderer STATES a count read off
+#     each of them, and each is driven over the shapes a raw read gets wrong.
+#   * `_COVERED_IN_FORMATTERS` -- this renderer IS `bn.formatters.<label>`,
+#     checked by identity, and its counts are covered by that module's
+#     differential, mirror and raise sweeps.
+_COVERED_IN_FORMATTERS = "covered by tests/test_cli_formatters.py"
 
-    Being an `int` subclass is what lets a renderer format it, compare it and
-    hand it to a count helper while the probe is still watching; answering
-    `.get`/`[]`/`in`/`len` is what lets a NESTED read be recorded too."""
-
-    def __new__(cls, seen, path, number):
-        value = int.__new__(cls, number)
-        value._seen, value._path = seen, path
-        return value
-
-    def _child(self, key):
-        self._seen.add(self._path + (key,))
-        return _ProbedValue(self._seen, self._path + (key,), int(self))
-
-    def get(self, key, default=None):
-        return self._child(key)
-
-    def __getitem__(self, key):
-        return self._child(key)
-
-    def __contains__(self, key):
-        return True
-
-    def __iter__(self):
-        return iter(())
-
-    def __len__(self):
-        return 0
-
-
-class _ProbedPayload(dict):
-    """A payload that records every key path a renderer actually reads.
-
-    A `dict` subclass, because every renderer here opens with
-    `isinstance(value, dict)`."""
-
-    def __init__(self, seen, number):
-        super().__init__()
-        self._seen, self._number = seen, number
-
-    def _child(self, key):
-        self._seen.add((key,))
-        return _ProbedValue(self._seen, (key,), self._number)
-
-    def get(self, key, default=None):
-        return self._child(key)
-
-    def __getitem__(self, key):
-        return self._child(key)
-
-    def __contains__(self, key):
-        return True
-
-    def keys(self):
-        return ()
-
-    def items(self):
-        return ()
-
-
-def _observed_key_paths(renderer):
-    """The payload key paths a renderer READS, observed by driving it.
-
-    Every previous version of this harvest parsed the renderer's source for
-    a `.get("literal")`-shaped read, and every review round found the next
-    count line spelled just outside whatever the parser matched: a key held
-    in a module constant, a key one level down, a key reached through an
-    imported helper. Asking the renderer instead of reading it ends that
-    class -- a key it looks at is recorded however the lookup is spelled,
-    and a key it never looks at could not be probed anyway."""
-    seen: set = set()
-    try:
-        renderer(_ProbedPayload(seen, 4242))
-    except Exception:
-        # Partial observation is still observation: the paths reached before
-        # the renderer gave up are real reads, and they are probed below.
-        pass
-    return seen
+_MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
+    "_exports_count_text": (("count",),),
+    "_go_functions_count_text": (("count",),),
+    "_imports_count_text": (("count",), ("self_defined_excluded",)),
+    "_sections_count_text": (("count",),),
+    "_strings_count_text": (("count",), ("filtered",)),
+    "_render_data_symbols_text": _COVERED_IN_FORMATTERS,
+    "_render_data_vars_text": _COVERED_IN_FORMATTERS,
+    "_render_function_bundle_text": _COVERED_IN_FORMATTERS,
+    "_render_go_functions_summary_text": _COVERED_IN_FORMATTERS,
+    "_render_go_functions_text": _COVERED_IN_FORMATTERS,
+    "_render_imports_summary_text": _COVERED_IN_FORMATTERS,
+    "_render_name_address_list_text": _COVERED_IN_FORMATTERS,
+    "_render_py_exec_text": _COVERED_IN_FORMATTERS,
+    "_render_read_text": _COVERED_IN_FORMATTERS,
+    "_render_sections_text": _COVERED_IN_FORMATTERS,
+    "_render_strings_text": _COVERED_IN_FORMATTERS,
+}
 
 
 def _payload_at(path, value):
@@ -1778,37 +1740,17 @@ def _payload_at(path, value):
     return placed
 
 
-def _defining_module(renderer):
-    """The module a renderer belongs to, or None when it cannot be told.
-
-    `functools.partial` and friends carry no `__module__` of their own, and
-    a renderer whose home cannot be established has to fail CLOSED rather
-    than drop out of the population unnoticed."""
-    module = getattr(renderer, "__module__", None)
-    if module is None:
-        module = getattr(getattr(renderer, "func", None), "__module__", None)
-    return module
-
-
 def _installed_text_renderers(module):
-    """Every `text_renderer=` a module installs, resolved to a CALLABLE.
+    """Every `text_renderer=` a module installs, as `{label: callable or None}`.
 
-    The population has to be the renderers themselves rather than their
-    spellings, which is the whole lesson of #795's review history: this guard
-    selected first on two hand-named functions, then on a `*_count_text` name
-    suffix, then on that suffix plus a refusal for any lambda whose source
-    contained the substring `count`. Each of those is a spelling test, and
-    each was walked past by the next count line that spelled itself
-    differently.
-
-    A `lambda` is not actually unprobeable -- it is only unNAMEable.
-    Compiling the expression in its own module's namespace yields the same
-    callable the registry installs, so it is probed like any other, and a
-    lambda that correctly DELEGATES to a choke-point renderer passes instead
-    of being refused for its shape. Returns `(label, callable)` pairs for the
-    renderers this module DEFINES; one imported from `bn.formatters` is
-    already covered by that module's own differential, mirror and raise
-    sweep."""
+    The registry is assembled at import time, so the population is read out of
+    the module's AST: a `text_renderer=` keyword anywhere in the file, resolved
+    to the object it names. `A if flag else B` installs both. A lambda is not
+    unprobeable, only unNAMEable -- compiling its expression in the module's
+    own namespace yields the same callable the registry installs. Anything else
+    (a call, a `functools.partial`, an attribute chain) resolves to `None`
+    under its source text as the label, which is enough for the inventory to
+    demand a classification for it."""
     import ast
     import inspect
     import pathlib
@@ -1826,47 +1768,30 @@ def _installed_text_renderers(module):
             try:
                 fn = eval(compile(expression, "<text_renderer>", "eval"),
                           vars(module))
-            except Exception:                  # closes over a local: unprobeable
+            except Exception:                  # closes over a local
                 fn = None
             return [(ast.unparse(node), fn)]
         return [(ast.unparse(node), None)]
 
-    installed = []
+    installed = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "text_renderer":
-            installed.extend(resolve(node.value))
-    # Unprobeable means "no callable came back" or "a callable whose home
-    # module cannot be established". One that resolves fine and simply lives
-    # in `bn.formatters` is neither, and is covered there.
-    unresolved = [label for label, fn in installed
-                  if not callable(fn) or _defining_module(fn) is None]
-    mine = [(label, fn) for label, fn in installed
-            if callable(fn) and _defining_module(fn) == module.__name__]
-    return mine, unresolved
+            installed.update(resolve(node.value))
+    return installed
 
 
-def _count_baseline(renderer, path):
-    """The well-formed shape this renderer states a count FROM, if it does.
+def _states_a_count(renderer, path):
+    """Does this renderer's rendering CHANGE with the number at `path`?
 
-    `int` for a line that states a counter, `list` for one that states
-    `len(<rows>)`. Decided by driving the renderer, so a number formatted,
-    truncated or mapped through a lookup before printing still counts: the
-    rendering merely has to CHANGE with the value."""
+    Decided by driving the renderer, so a number formatted, truncated or mapped
+    through a lookup before printing still answers yes: the rendering merely
+    has to move with the value."""
     try:
         stated, nudged = (renderer(_payload_at(path, 4242)),
                           renderer(_payload_at(path, 4243)))
-        if isinstance(stated, str) and ("4242" in stated or stated != nudged):
-            return "int"
     except Exception:
-        pass
-    try:
-        three, four = (renderer(_payload_at(path, [None] * 3)),
-                       renderer(_payload_at(path, [None] * 4)))
-        if isinstance(three, str) and three != four:
-            return "list"
-    except Exception:
-        pass
-    return None
+        return False
+    return isinstance(stated, str) and ("4242" in stated or stated != nudged)
 
 
 def test_every_count_line_this_module_installs_reads_through_the_choke_point_795():
@@ -1878,47 +1803,80 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
     module is reached by no differential, no mirror and no raise sweep. This
     module's count lines were all written that way.
 
-    Neither the population, the selection, nor the key harvest is a spelling
-    any more, because every spelling-shaped version of this guard was walked
-    past by the next count line. Every installed renderer is resolved to the
-    callable the registry installs; the keys it reads are OBSERVED by driving
-    it with a payload that records each lookup, at any depth and however the
-    key is written; and it is a count line if its rendering is sensitive to
-    that number. Whatever answers yes is driven over the shapes a raw read
-    gets wrong -- and a renderer that RAISES on one of them fails here too,
-    because costing the caller a whole render is the other half of #619.
+    What this PROVES, which is the enumerated inventory above and not a
+    universal claim over the registry:
+
+    * every renderer this module installs is classified, and the two sets
+      agree EXACTLY -- a renderer added to the registry without being
+      classified fails here, and so does one removed or renamed;
+    * every renderer classified as stating a count still states it, off the
+      key the inventory names -- a count line deleted, or re-pointed at a
+      different payload key, fails here;
+    * every such count line refuses the four shapes a raw read gets wrong: a
+      flag rendered as a quantity, a numeric string silently dropped, a float
+      truncated into a count, a container interpolated as a Python repr;
+    * every renderer classified as living in `bn.formatters` IS that module's
+      object, by identity -- so the classification cannot be used to excuse a
+      locally-defined renderer from being probed.
+
+    What it does NOT cover, stated rather than implied:
+
+    * the keys are DECLARED, not derived. A listed renderer that states a
+      SECOND count off a key its entry does not name is not probed.
+    * a count stated only in the presence of a SIBLING key. Each probe payload
+      holds the probed key alone, so such a line renders its count-free branch;
+      this guard reports the declared key as no longer stated rather than
+      probing that count.
+    * a renderer classified `_COVERED_IN_FORMATTERS` is TRUSTED to be covered
+      there. This checks the object's identity, not that the other module's
+      sweeps reach its counts.
+    * only counter-shaped count lines are in the inventory today. One stating
+      `len(<rows>)` would fail the "still states a count" assertion rather than
+      being probed in a shape of its own.
+    * nothing is inferred from a renderer's `__module__`. Round 8's guard
+      claimed to fail CLOSED on a callable whose home module could not be told
+      and did not -- `functools.partial(...).__module__` is `'functools'`,
+      never `None`, so the fallback behind that claim was dead code. It is
+      deleted rather than repaired into a third mechanism: a partial, like any
+      expression that is not a name, a conditional or a lambda, resolves to its
+      source text with no callable, and the inventory demands a classification
+      for it that it can satisfy neither way -- not a count (nothing to probe),
+      not `bn.formatters`' (identity fails).
     """
+    from bn import formatters
     from bn.commands import misc
 
-    renderers, unresolved = _installed_text_renderers(misc)
-    # The honest remainder of the old lambda refusal: something this harness
-    # cannot turn into a callable it can place, so no probe can reach it.
-    assert not unresolved, (
-        "these installed renderers cannot be resolved to a probeable "
-        f"callable, so no guard can see what they render: {unresolved}")
+    installed = _installed_text_renderers(misc)
+    assert set(installed) == set(_MISC_TEXT_RENDERERS), (
+        "the `text_renderer=` registry and this inventory disagree, which is "
+        "the failure this guard exists for -- an unclassified renderer is not "
+        "a silent pass. Classify it: the payload key paths whose counts it "
+        f"states, or {_COVERED_IN_FORMATTERS!r}.\n"
+        f"  installed but unclassified: "
+        f"{sorted(set(installed) - set(_MISC_TEXT_RENDERERS))}\n"
+        f"  classified but not installed: "
+        f"{sorted(set(_MISC_TEXT_RENDERERS) - set(installed))}")
 
-    stated = []
-    for label, renderer in renderers:
-        for path in sorted(_observed_key_paths(renderer)):
-            kind = _count_baseline(renderer, path)
-            if kind is None:
-                continue
+    for label, classification in sorted(_MISC_TEXT_RENDERERS.items()):
+        renderer = installed[label]
+        if classification == _COVERED_IN_FORMATTERS:
+            assert renderer is getattr(formatters, label, None), (
+                f"{label} is classified as covered by bn.formatters, but that "
+                "is not the object this module installs")
+            continue
+        assert callable(renderer), (
+            f"{label} is classified as stating a count, but no callable could "
+            "be resolved for it, so nothing here can probe what it renders")
+
+        for path in classification:
             where = (label, ".".join(path))
-            stated.append(where)
+            assert _states_a_count(renderer, path), where + (
+                "is classified as stating a count read off this key, but its "
+                "rendering does not move with the number there: the count line "
+                "was removed, or re-pointed at another payload key",)
 
             def render(value, _r=renderer, _p=path):
                 return _r(_payload_at(_p, value))
-
-            if kind == "list":
-                # A count stated as `len(<rows>)` cannot be probed with an
-                # integer at all, and the shape that harms it is a payload
-                # that is COUNTABLE but wrong: `len()` of a mapping is its
-                # key count and `len()` of a string is its length, so either
-                # renders as a confident row count nobody has.
-                rows = render([None] * 3)
-                assert render({"a": 1, "b": 2, "c": 3}) != rows, where
-                assert render("abc") != rows, where
-                continue
 
             zero = render(0)
 
@@ -1949,15 +1907,6 @@ def test_every_count_line_this_module_installs_reads_through_the_choke_point_795
             unreadable = render({"n": 1})
             assert "{" not in unreadable and "}" not in unreadable, where + (unreadable,)
             assert unreadable != zero, where + (unreadable,)
-
-    # ...and the derivation cannot quietly degrade into probing nothing. The
-    # five historical count lines are a FLOOR, not the filter: one of them
-    # ceasing to state its number is a surface that changed behaviour, and a
-    # SIXTH line is caught by the probe above whatever it is called.
-    assert stated, "no installed renderer states a count, so this proves nothing"
-    assert {label for label, _path in stated} >= {
-        "_exports_count_text", "_go_functions_count_text", "_imports_count_text",
-        "_sections_count_text", "_strings_count_text"}, sorted(stated)
 
 
 def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
