@@ -177,6 +177,34 @@ def _cap_excerpt_lines(lines: list[str], excerpt: dict[str, Any]) -> list[str]:
     return capped
 
 
+def _attach_callsite_excerpts(bv, page_rows: list[dict[str, Any]]) -> None:
+    """Fill ``decompile_excerpt`` on the rows of the RETURNED PAGE, in place (#792).
+
+    The excerpt is the only callsite field that costs a whole-function
+    decompilation, so it is a PAGE projection, not a scan-time one. `_callsites`
+    scans until it holds ``offset + limit + 1`` rows to answer the paging
+    contract, so building the excerpt while scanning paid a render for every
+    caller the `--offset`/`--limit` window then discarded -- the population-wide
+    per-row work #814 forbids. Here the cost is bounded by the page the caller
+    asked for, and one render still serves every row of the same caller.
+
+    Rows carrying no ``_excerpt_fn`` (their HLIL statement localized, or they
+    came from a test double) are left exactly as they are.
+    """
+    renders: dict[int, tuple[list[str], list[int]]] = {}
+    for row in page_rows:
+        func = row.pop("_excerpt_fn", None)
+        if func is None:
+            continue
+        start = int(func.start)
+        render = renders.get(start)
+        if render is None:
+            render = renders[start] = _callsite_decompile_render(bv, func)
+        row["decompile_excerpt"] = _callsite_decompile_excerpt(
+            render, int(row["call_addr"], 16), start
+        )
+
+
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
                                stub_addrs: frozenset[int] = frozenset(),
                                variadic_hint: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -203,7 +231,6 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         for target in callee_addresses:
             code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
-    decompiled_render: tuple[list[str], list[int]] | None = None
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
         # Count tail-branch references too (a `b`/branch into the sink rendered
@@ -288,14 +315,15 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
             rows[-1]["callee_variadic"] = variadic_hint
         if hlil_statement is None:
             # #792: the statement is null (with a reason), but the callsite is
-            # still visible in the decompilation. Decompiling the body is a
-            # per-FUNCTION cost, so it is rendered at most once and only when a
-            # row actually needs it.
-            if decompiled_render is None:
-                decompiled_render = _callsite_decompile_render(bv, func)
-            rows[-1]["decompile_excerpt"] = _callsite_decompile_excerpt(
-                decompiled_render, call_addr, int(func.start)
-            )
+            # still visible in the decompilation. Rendering that body is by far
+            # the most expensive thing this row can carry, so the row only
+            # RECORDS which function would have to be rendered and
+            # `_attach_callsite_excerpts` fills the excerpt for the returned page
+            # -- the same transient-handle convention `_fn` uses for the function
+            # listing, and the same reason (#814): a scan that reads
+            # `offset + limit + 1` rows must not pay a whole-function
+            # decompilation for the rows paging then drops.
+            rows[-1]["_excerpt_fn"] = func
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
 
@@ -531,11 +559,13 @@ def _callsites(
                 "callee_symbol_only": callee_symbol_only,
             }
         )
+        _attach_callsite_excerpts(bv, result["items"])
         return result
 
     if scan_truncated:
         assert limit is not None
         page = rows[offset:offset + limit]
+        _attach_callsite_excerpts(bv, page)
         return {
             "kind": "callsites",
             "items": page,
@@ -566,6 +596,7 @@ def _callsites(
             "callee_symbol_only": callee_symbol_only,
         }
     )
+    _attach_callsite_excerpts(bv, result["items"])
     return result
 
 

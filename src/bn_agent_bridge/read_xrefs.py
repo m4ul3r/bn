@@ -112,10 +112,13 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
     # rejecting those would discard a real answer. Only an address that is BOTH
     # unmapped AND ref-less is the typo case (#374 follow-up).
     #
-    # #815: the guard runs INSIDE the builder, on the ref lists it already read
-    # for the response. Probing here first (`bool(list(get_code_refs(...)) or
-    # list(get_data_refs(...)))`) materialised both lists a second time -- a
-    # high-fan-in symbol paid for its whole ref set twice per call.
+    # #815: the guard runs INSIDE the builder, on the SAME UNFILTERED ref lists
+    # it reads for the response. Probing here first (`bool(list(get_code_refs(...))
+    # or list(get_data_refs(...)))`) materialised both lists a second time -- a
+    # high-fan-in symbol paid for its whole ref set twice per call. The builder
+    # keys the guard on BN's unfiltered code refs, not on the #284-filtered /
+    # #286-unioned list it renders, so the set of addresses this rejects is
+    # exactly the set the probe rejected.
     return _drop_legacy_ref_arrays(
         _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit,
                           fn_pointer_scan=fn_pointer_scan,
@@ -270,20 +273,32 @@ def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:
     return _adrp_pagebase_is_spurious(il, following, int(address))
 
 
+def _code_refs_once(bv, address: int) -> tuple[list, list]:
+    """``(all_refs, genuine_refs)`` for *address*, from ONE read of the ref list.
+
+    Both populations come back because they answer different questions and the
+    list may only be read once (#815): *genuine_refs* is what the response
+    RENDERS (#284 drops spurious adrp page-base materializations for a
+    page-aligned target), while *all_refs* is what the #374 mapped-address guard
+    must key on -- an address BN holds ANY ref for exists, whatever the #284
+    filter later decides about how to render those refs."""
+    get_code_refs = getattr(bv, "get_code_refs", None)
+    if not callable(get_code_refs):
+        return [], []
+    try:
+        raw = list(get_code_refs(int(address)))
+    except Exception:
+        return [], []
+    if int(address) & 0xFFF:
+        return raw, raw
+    return raw, [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
+
+
 def _genuine_code_refs(bv, address: int) -> list:
     """Code refs to *address*, with spurious adrp page-base materializations
     dropped when *address* is page-aligned (#284). Non-page-aligned targets
     cannot be an adrp page base, so their refs pass through untouched."""
-    get_code_refs = getattr(bv, "get_code_refs", None)
-    if not callable(get_code_refs):
-        return []
-    try:
-        raw = list(get_code_refs(int(address)))
-    except Exception:
-        return []
-    if int(address) & 0xFFF:
-        return raw
-    return [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
+    return _code_refs_once(bv, int(address))[1]
 
 
 def _code_ref_count(bv, address: int) -> int:
@@ -544,14 +559,28 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
                       require_refs_or_mapped: bool = False) -> dict[str, Any]:
     code_refs = []
     data_refs = []
-    # Drop spurious adrp page-base materializations for a page-aligned target
-    # (#284); non-page-aligned targets pass through unchanged.
-    raw_code_refs = _genuine_code_refs(bv, address)
+    # One read of each ref list, two consumers (#815). `all_code_refs` is BN's
+    # unfiltered population; `genuine_code_refs` has spurious adrp page-base
+    # materializations dropped for a page-aligned target (#284) and is what the
+    # response renders.
+    all_code_refs, genuine_code_refs = _code_refs_once(bv, address)
+    get_data_refs = getattr(bv, "get_data_refs", None)
+    raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
+    if require_refs_or_mapped and not all_code_refs and not raw_data_refs:
+        # #374: an address BN holds no ref of ANY kind for must still be mapped
+        # to be a legitimate "0 callers" answer; an unmapped one is a typo and is
+        # rejected. Keyed on the UNFILTERED lists, exactly the population the
+        # pre-#815 probe in `_xrefs` read: a page-aligned address whose only code
+        # refs are #284-spurious adrp page bases IS an address BN holds refs for,
+        # and must keep answering `0` rather than turning into "not mapped".
+        _require_mapped_address(bv, int(address))
     # #286: an exported function's intra-lib callers reference its same-name PLT
     # stub, not the body. Union the stub(s)' callers into the body's xrefs so a
-    # hot exported function isn't reported as having zero code callers.
-    raw_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, raw_code_refs)
-    for ref in sorted(raw_code_refs, key=lambda item: int(item.address)):
+    # hot exported function isn't reported as having zero code callers. Run after
+    # the guard: a stub's callers are extra refs to RENDER, never the evidence
+    # that the queried address itself exists.
+    genuine_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, genuine_code_refs)
+    for ref in sorted(genuine_code_refs, key=lambda item: int(item.address)):
         fn = getattr(ref, "function", None)
         caller = (
             {"address": hex(int(fn.start)), "name": str(fn.name)}
@@ -571,13 +600,6 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
                 ),
             }
         )
-    get_data_refs = getattr(bv, "get_data_refs", None)
-    raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
-    if require_refs_or_mapped and not raw_code_refs and not raw_data_refs:
-        # #374 / #815: an address with NO refs at all must still be mapped to be a
-        # legitimate "0 callers" answer. The check lives here, after the two ref
-        # lists the response is built from, so those lists are read once.
-        _require_mapped_address(bv, int(address))
     for ref_addr in sorted(raw_data_refs):
         ref_addr = int(ref_addr)
         functions = ctx._functions_containing(bv, ref_addr)

@@ -298,7 +298,10 @@ def _control_flow_batches(call_addr: int) -> list[tuple[int, str]]:
 
 
 def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch):
+    """The excerpt is a field of the callsites PAGE, so it is read through the op
+    that pages, not through the per-function row builder."""
     bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
     call_addr = 0x5000b0
     callee = _FakeFunction(0x5a10, "send_status")
     caller = _FakeFunction(0x500000, "handle_reply")
@@ -321,8 +324,10 @@ def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch)
         instruction_lengths={call_addr: 4},
     )
     _install_fake_pseudo_c(monkeypatch, bridge, caller, [_control_flow_batches(call_addr)])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = bridge.read_listing._callsites_within_function(None, bv, callee, caller, context=1)
+    rows = _callsites_items(instance, None, "send_status",
+                            within_identifiers=["handle_reply"], context=1)
 
     assert len(rows) == 1
     row = rows[0]
@@ -405,6 +410,91 @@ def test_callsite_excerpt_caps_a_long_line_792(monkeypatch):
     assert f"... [+{len(lines[1]) - 240} chars]" in capped[0]
     assert excerpt["truncated_lines"] == 1
     assert all(len(line) <= 240 + 40 for line in excerpt["lines"])
+
+
+def _null_statement_population(count: int, callee_addr: int = 0x5A10):
+    """*count* callers of one callee, each with exactly one callsite whose HLIL
+    statement cannot be localized -- so every row of every caller wants the
+    #792 excerpt, and the number of renders is a clean measure of the work."""
+    callers, refs, disasm, lengths = [], [], {}, {}
+    for index in range(count):
+        start = 0x500000 + index * 0x1000
+        call_addr = start + 0x10
+        caller = _FakeFunction(start, f"handler_{index:02d}")
+        caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+        caller.arch = _FakeArch(lengths={call_addr: 4})
+        # No HLIL for the LLIL call -> `hlil_statement` null, reason
+        # `no_hlil_mapping`: the #792 shape, on every caller.
+        caller.low_level_il = [[_FakeLLILInstruction(call_addr, _FakeConstPtr(callee_addr))]]
+        callers.append(caller)
+        refs.append(_FakeCodeRef(call_addr, caller))
+        disasm[call_addr] = "bl 0x5a10"
+        lengths[call_addr] = 4
+    callee = _FakeFunction(callee_addr, "send_status")
+    bv = _FakeBV(functions=[callee, *callers], code_refs={callee_addr: refs},
+                 disassembly=disasm, instruction_lengths=lengths)
+    return bv, callers
+
+
+def _counting_decompile_text(monkeypatch, bridge, rendered: list[int]):
+    """Replace the pseudo-C renderer with one that records WHICH function it was
+    asked to render. Counting renders is the only way to see this contract: the
+    returned page is byte-identical before and after the fix."""
+    def _render(bv, func, addresses=False):
+        rendered.append(int(func.start))
+        return f"{hex(int(func.start) + 0x10)}        send_status(fd, &buf);"
+
+    monkeypatch.setattr(bridge.read_listing.il_format, "_decompile_text", _render)
+
+
+def test_callsite_excerpt_renders_only_the_returned_page_792(monkeypatch):
+    """#792 review: the excerpt costs a whole-function decompilation, so it must
+    be a PAGE projection (#814), not scan-time work. A callsites read scans the
+    caller set until it holds `offset + limit + 1` rows; rendering while scanning
+    paid one whole-function decompile for every caller the `--offset`/`--limit`
+    window then discarded."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=4)
+
+    # The page itself is unchanged: the whole caller set was scanned (exact
+    # `total`), and the window holds the last four callers' rows.
+    assert result["total"] == 12 and result["scan_truncated"] is False
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09", "handler_10", "handler_11"]
+    assert all(row["hlil_statement"] is None for row in result["items"])
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    # The WORK is page-bounded: one render per caller ON THE PAGE. Before the
+    # fix this was one per caller SCANNED (all 12).
+    assert rendered == [caller.start for caller in callers[8:12]], rendered
+    # The transient handle never reaches a consumer.
+    assert all("_excerpt_fn" not in row for row in result["items"])
+
+
+def test_callsite_excerpt_page_projection_holds_on_a_truncated_scan_792(monkeypatch):
+    """The early-exit page (`scan_truncated`) is a second, hand-sliced return
+    path: it must project the excerpt onto its own page and drop the transient
+    too, or a live Function object leaks into the row."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=2)
+
+    assert result["scan_truncated"] is True and result["total"] is None
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09"]
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    assert all("_excerpt_fn" not in row for row in result["items"])
+    assert rendered == [caller.start for caller in callers[8:10]], rendered
 
 
 def _rendered_lines(bridge, monkeypatch, batches):

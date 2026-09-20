@@ -95,6 +95,48 @@ def test_xrefs_raw_address_reads_the_ref_lists_once_815(monkeypatch):
     assert data_reads == [0x402000], data_reads
 
 
+def test_xrefs_guard_keys_on_bn_refs_not_on_the_284_filtered_list_815(monkeypatch):
+    """The #374 guard rejects an address BN holds NO ref for; it must not reject
+    one whose refs the #284 adrp filter merely declined to RENDER.
+
+    A page-aligned address is exactly where the two populations differ: BN records
+    every `adrp xN, <page>` as a code ref to the page base, and #284 drops the ones
+    whose paired offset is nonzero. Such an address is one BN holds refs for -- the
+    pre-#815 probe (`bool(list(get_code_refs(...)) or ...)`) saw them and answered a
+    clean `0`. Keying the guard on the FILTERED list instead turns that same read
+    into `Address ... is not mapped`, which is a different answer to the same
+    question (#815 must not change #374's semantics)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    page_base = 0x438000
+    adrp = _adrp("x0", page_base, 0)
+    # `adrp x0, 0x438000` / `add x0, x0, #0x350` -> the real referent is
+    # 0x438350, so the ref to the page base is spurious and #284 drops it.
+    adrp.il_basic_block = [adrp, _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0x350)]), 1)]
+    caller = _FakeFunction(0x401010, "caller")
+    caller.get_low_level_il_at = lambda address: adrp
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={page_base: [_FakeCodeRef(0x401014, caller)]},
+        data_refs={},
+        disassembly={0x401014: "adrp x0, #0x438000"},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401014: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda address: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Precondition: BN really does hold a code ref for this address, and #284
+    # really does filter it out -- otherwise the test proves nothing.
+    assert len(list(bv.get_code_refs(page_base))) == 1
+    assert bridge.read_xrefs._genuine_code_refs(bv, page_base) == []
+
+    result = instance._xrefs(None, hex(page_base))
+
+    assert result["kind"] == "xrefs"
+    assert result["code_ref_count"] == 0 and result["total"] == 0
+
+
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
     """A MAPPED address with zero refs must remain a clean total:0 result -- only
     the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
