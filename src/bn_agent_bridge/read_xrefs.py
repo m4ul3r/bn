@@ -273,7 +273,7 @@ def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:
     return _adrp_pagebase_is_spurious(il, following, int(address))
 
 
-def _code_refs_once(bv, address: int) -> tuple[list, list]:
+def _code_refs_once(bv, address: int, *, propagate_read_errors: bool = False) -> tuple[list, list]:
     """``(all_refs, genuine_refs)`` for *address*, from ONE read of the ref list.
 
     Both populations come back because they answer different questions and the
@@ -281,13 +281,26 @@ def _code_refs_once(bv, address: int) -> tuple[list, list]:
     RENDERS (#284 drops spurious adrp page-base materializations for a
     page-aligned target), while *all_refs* is what the #374 mapped-address guard
     must key on -- an address BN holds ANY ref for exists, whatever the #284
-    filter later decides about how to render those refs."""
+    filter later decides about how to render those refs.
+
+    With *propagate_read_errors* a read that FAILED raises instead of reading as
+    an empty list. The #374 guard keys on this list, and a failed enumeration is
+    not evidence of "no refs": downgrading it to `[]` would answer a mapped
+    address with the false-negative `0 callers` that #374 exists to prevent. The
+    probe this function replaced read the list unguarded on that path, so the
+    failure surfaced as an error; every other caller keeps the swallow, which is
+    a rendering decision (show the refs we could read) rather than an answer."""
     get_code_refs = getattr(bv, "get_code_refs", None)
     if not callable(get_code_refs):
+        if propagate_read_errors:
+            raise RuntimeError(
+                f"This view cannot enumerate code references for {hex(int(address))}")
         return [], []
     try:
         raw = list(get_code_refs(int(address)))
     except Exception:
+        if propagate_read_errors:
+            raise
         return [], []
     if int(address) & 0xFFF:
         return raw, raw
@@ -562,8 +575,11 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     # One read of each ref list, two consumers (#815). `all_code_refs` is BN's
     # unfiltered population; `genuine_code_refs` has spurious adrp page-base
     # materializations dropped for a page-aligned target (#284) and is what the
-    # response renders.
-    all_code_refs, genuine_code_refs = _code_refs_once(bv, address)
+    # response renders. On the guarded (literal-address) path a read that FAILED
+    # raises rather than reading as "no refs", because that is the population the
+    # #374 guard decides on: `0 callers` must mean BN said so.
+    all_code_refs, genuine_code_refs = _code_refs_once(
+        bv, address, propagate_read_errors=require_refs_or_mapped)
     get_data_refs = getattr(bv, "get_data_refs", None)
     raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
     if require_refs_or_mapped and not all_code_refs and not raw_data_refs:
