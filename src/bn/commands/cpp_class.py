@@ -17,11 +17,11 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                   help="Include name-only clusters (possible namespaces) and every "
                        "class/struct/union in the view's USER type container (what "
                        "`types declare` writes -- not types Binary Ninja imported), "
-                       "unfiltered, so the rows are exactly the names `class show` "
-                       "resolves; BN's C parser registers an anonymous typedef's body "
-                       "as a second type (`typedef struct { ... } T;` yields `T` and "
-                       "`_T`), and that half lists too. Not just RTTI/ctor-confirmed "
-                       "classes"),
+                       "with no filtering by the shape of a name; --query/--no-stl/"
+                       "--no-vendor still narrow these rows and each reports what it "
+                       "hid. BN's C parser registers an anonymous typedef's body as a "
+                       "second type (`typedef struct { ... } T;` yields `T` and `_T`), "
+                       "and that half lists too. Not just RTTI/ctor-confirmed classes"),
                arg("--no-stl", action="store_true", default=False, dest="no_stl",
                    help="Hide standard-library / ABI-runtime classes (std::, __gnu_cxx::, __cxxabiv1::, reserved-id internals) so domain classes surface"),
                arg("--no-vendor", action="store_true", default=False, dest="no_vendor",

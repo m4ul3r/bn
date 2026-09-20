@@ -4278,7 +4278,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
     # #675.2: the class card's `notes` read adds two discovered positions to the same sweep. 4896 + 24 = 4920.
     # #675.2 (#907 review r3): the card's canonical `type` read adds two more discovered positions, plus the nested `layout`/`decl` reads it opens under them. 4920 + 16 = 4936.
-    assert swept == 4936, f"the raise sweep ran {swept} renders, not 4936"
+    # #907 review r5: `_render_class_list_text` now reads `include_all` to decide whether `(--all to show)` is still actionable advice -- one new discovered key on the classes payload. 4936 + 8 = 4944.
+    assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4435,7 +4436,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     #
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426, + 8 (#675.2's two `notes` positions) = 1434.
     # #675.2 (#907 review r3): the card's canonical `type` read and the `layout`/`decl` reads under it. 1434 + 6 = 1440.
-    assert checked == 1440, f"the mirror ran {checked} renders, not 1440"
+    # #907 review r5: `_render_class_list_text` now reads `include_all` to decide whether `(--all to show)` is still actionable advice -- one new discovered key on the classes payload, x 2 benign payloads. 1440 + 2 = 1442.
+    assert checked == 1442, f"the mirror ran {checked} renders, not 1442"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8065,3 +8067,13 @@ def test_render_class_list_text_discloses_declared_types_folded_out_675():
     skewed = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": "lots"})
     assert "? user-declared class types (--all to show)" in skewed
+
+    # ... but the ADVICE is only advice when it is still actionable. An `--all`
+    # run whose declared set could not be read still has to state the unknown,
+    # and telling the reader to pass the flag they just passed reads as a
+    # different, unsatisfied suggestion (#907 review rounds 4 and 5).
+    skewed_all = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0,
+        "include_all": True, "declared_suppressed": "lots"})
+    assert "? user-declared class types" in skewed_all
+    assert "(--all to show)" not in skewed_all, skewed_all

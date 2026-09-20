@@ -3070,6 +3070,105 @@ def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
             in _render_class_list_text(default))
 
 
+def test_a_declared_class_is_not_SHADOWED_by_a_same_leaf_RTTI_class_675(monkeypatch):
+    """`class show` resolves over BOTH halves at once, not the registry first.
+
+    Resolving the registry alone and falling back to the declared half only on a
+    MISS let an RTTI class in ANY namespace swallow every bare-leaf query. A user
+    who declared `Session` in a view whose binary exposes `net::Session` got the
+    RTTI card back, `ambiguous` unset and nothing disclosed, while
+    `class list --all` listed and counted the declaration the card could no
+    longer reach -- the two surfaces disagreeing about which names exist, which
+    is the one thing round 5's contract forbids (#907 review round 5).
+
+    One namespace puts the resolver's documented exact-match-first rule in
+    charge: an exact declared name beats a registry LEAF match, and a genuine
+    leaf collision across the two halves is AMBIGUOUS and shows both rather than
+    silently picking one."""
+    bv = _declared_bv(Session=_DeclaredType(name="Session"))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    # The listing carries both: the RTTI `net::Session` and the declared `Session`.
+    rows = {r["name"]: r["confidence"]
+            for r in read_class._class_list(ctx, None, include_all=True)["items"]}
+    assert rows.get("Session") == "declared-only", rows
+    assert rows.get("net::Session") == "rtti", rows
+
+    # ... and the exact name the user declared reaches the declaration, not the
+    # RTTI class that merely shares its leaf.
+    shown = read_class._class_show(ctx, None, "Session")
+    assert shown.get("ambiguous") is not True, shown
+    assert shown["name"] == "Session", shown["name"]
+    assert shown["confidence"] == "declared-only", shown["confidence"]
+
+    # A QUALIFIED declaration sharing only the leaf is a real collision: both
+    # halves answer, and the card says so instead of picking one.
+    bv2 = _declared_bv(**{"app::Session": _DeclaredType(name="app::Session")})
+    ctx2 = _declared_ctx(monkeypatch, bv2)
+    amb = read_class._class_show(ctx2, None, "Session")
+    assert amb.get("ambiguous") is True, amb
+    assert sorted(m["name"] for m in amb["matches"]) == ["app::Session", "net::Session"]
+    # Each half still answers under its own exact name.
+    assert read_class._class_show(
+        ctx2, None, "app::Session")["confidence"] == "declared-only"
+    assert read_class._class_show(
+        ctx2, None, "net::Session")["confidence"] == "rtti"
+
+
+def test_an_RTTI_card_discloses_a_declared_set_it_could_not_read_675(monkeypatch):
+    """The round-4 rule -- a match is not a licence to stop disclosing -- applies
+    to the REGISTRY-match path too.
+
+    It was implemented only on the declared-match path, so a query that landed on
+    an RTTI class returned a confident card while `class list` printed
+    `? user-declared class types` about the very same view at the very same
+    moment. Whether the reader is told depends on which half answered, which is
+    exactly the disagreement the disclosure exists to prevent (#907 review
+    round 5)."""
+    from bn.formatters import _render_class_show_text
+
+    class _ExplodingContainer:
+        @property
+        def types(self):
+            raise RuntimeError("the type container is no longer valid")
+
+    bv = _declared_bv()
+    bv.user_type_container = _ExplodingContainer()
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    # The listing states the unknown.
+    assert read_class._class_list(
+        ctx, None, include_all=True)["declared_suppressed"] == "unreadable"
+    # So the card must not present itself as the whole answer.
+    shown = read_class._class_show(ctx, None, "net::Session")
+    assert shown["confidence"] == "rtti"
+    assert any("could not be read" in note for note in shown.get("notes") or []), shown
+    assert "could not be read" in _render_class_show_text(shown)
+
+    # A same-LEAF declaration whose own kind cannot be read discloses on the
+    # RTTI card the leaf query lands on, too.
+    class _Unreadable:
+        name = "other::Session"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct other::Session"
+
+    bv2 = _declared_bv(**{"other::Session": _Unreadable()})
+    ctx2 = _declared_ctx(monkeypatch, bv2)
+    leaf = read_class._class_show(ctx2, None, "Session")
+    assert leaf["confidence"] == "rtti" and leaf["name"] == "net::Session"
+    assert any("could not be read" in note for note in leaf.get("notes") or []), leaf
+    # A fully qualified query names one class and discloses nothing.
+    exact = read_class._class_show(ctx2, None, "net::Session")
+    assert not any("could not be read" in note
+                   for note in exact.get("notes") or []), exact
+
+
 def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675(monkeypatch):
     """A match is not a licence to stop disclosing.
 

@@ -1666,57 +1666,64 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     # reimplemented. A miss needs the full registry anyway, because the suggestion
     # hint is drawn from every class name (#413).
     registry = _build_class_registry(ctx, bv)
-    matches = _resolve_class_names(registry, name)
+    # #675.2: the RTTI/symbol half is blind to a class the user DECLARED -- it has
+    # no `_ZTV`/`_ZTI` symbol and no demangled method to cluster -- so the declared
+    # half is read here too. ONE live reading: the records and the type objects
+    # their facts come from.
+    #
+    # Resolved over ONE namespace holding BOTH halves, never the registry first.
+    # Resolving the registry alone and consulting the declared set only on a MISS
+    # let an RTTI class in ANY namespace swallow every bare-leaf query: a user who
+    # declared `Thing` in a view whose binary exposes `ns::Thing` got the RTTI card
+    # back with `ambiguous` unset and nothing disclosed, while `class list --all`
+    # listed and counted the declaration that card could no longer reach -- the two
+    # surfaces disagreeing about which names exist, which is the one thing the
+    # declared half exists to prevent. One namespace puts the resolver's documented
+    # exact-match-first rule in charge instead: an exact declared name beats a
+    # registry LEAF match, and a genuine leaf collision across the halves is
+    # AMBIGUOUS and shows both (#907 review round 5).
+    #
+    # This costs the declared read on every show, including one the registry
+    # answers. That is the price of the two surfaces describing one population:
+    # `class list` already pays it per call, the container is the user's own
+    # declarations rather than the view's type table, and the expensive per-record
+    # facts (`_declared_size`, `ctx._type_entry`) stay drill-downs on a record
+    # actually handed out.
+    declared_set = _declared_types(bv)
+    declared_types = declared_set.types if declared_set is not None else {}
+    declared = _declared_type_records(declared_types)
+    # A name BOTH halves carry keeps its RTTI record: the declared one adds no
+    # evidence to a class that already has a vtable, exactly as the listing dedups
+    # it (`name not in registry`).
+    candidates = {**declared, **registry}
+    matches = _resolve_class_names(candidates, name)
+    # Whether this query ALSO reaches a declaration whose kind could not be
+    # established. Resolved over the same namespace PLUS the unreadable names, so
+    # the exact-match-first rule decides who discloses: a fully qualified name
+    # resolves to itself and says nothing, while a bare leaf that also reaches an
+    # unreadable sibling must. The unreadable names cannot SELECT a card -- there
+    # is no record behind them -- so they are resolved for disclosure only.
+    unreadable_names = set(declared_set.unreadable) if declared_set else set()
+    unreadable_here = [
+        match for match in _resolve_class_names(
+            dict.fromkeys([*candidates, *unreadable_names], {}), name)
+        if match in unreadable_names
+    ]
+    # A match is not a licence to stop disclosing, and WHICH half answered must
+    # not decide whether the reader is told: the listing prints
+    # `? user-declared class types` about this very view at this very moment, so a
+    # card that presents itself as the whole answer contradicts it. Both the
+    # whole-set failure and the single unreadable declaration reach every returned
+    # record, RTTI or declared (#907 review rounds 4 and 5).
+    if declared_set is None:
+        disclosure = ("the view's declared types could not be read, so this card"
+                      " is not the whole answer")
+    elif unreadable_here:
+        disclosure = (f"{len(unreadable_here)} further declaration(s) of this name"
+                      " could not be read, so this card is not the whole answer")
+    else:
+        disclosure = None
     if not matches:
-        # #675.2: before the miss message, fall back to the view's declared CLASS
-        # types -- the RTTI/symbol half is blind to a class the user DECLARED,
-        # which has no `_ZTV`/`_ZTI` symbol and no demangled method to cluster.
-        # ONE live reading (records and type objects both), resolved by the same
-        # name resolution as the registry, so a declared `ns::Widget` still
-        # answers a bare `Widget` query. The declared records come back as they
-        # were built: `_enrich`'s RTTI drill-downs (vtable layout, bases,
-        # instances) are precisely what the note says this view has no evidence
-        # for, so running them would only decorate a miss.
-        declared_set = _declared_types(bv)
-        declared_types = declared_set.types if declared_set is not None else {}
-        declared = _declared_type_records(declared_types)
-        declared_matches = _resolve_class_names(declared, name)
-        # Whether this query ALSO reaches a declaration whose kind could not be
-        # established. Resolved over ONE namespace holding both the readable and
-        # the unreadable names, so the resolver's exact-match-first rule decides
-        # it: a fully qualified `ns::Widget` resolves to itself and discloses
-        # nothing, while the bare leaf `Widget` reaches both and must. A match is
-        # not a licence to stop disclosing -- the listing said
-        # `? user-declared class types` about this very set, so a card that
-        # presented itself as the whole answer contradicted it (#907 review r4).
-        unreadable_names = set(declared_set.unreadable) if declared_set else set()
-        unreadable_here = [
-            match for match in _resolve_class_names(
-                dict.fromkeys([*declared, *unreadable_names], {}), name)
-            if match in unreadable_names
-        ]
-        if declared_matches:
-            records = []
-            for match in declared_matches:
-                rec = declared[match]
-                type_obj = declared_types.get(match)
-                if type_obj is not None:
-                    rec["size"] = _declared_size(type_obj)
-                    # The canonical `types` entry for the declaration (decl,
-                    # layout, members) -- a SHOW-only drill-down, exactly as the
-                    # vtable layout and object size are, and for the same reason:
-                    # `_type_entry` walks and renders the members, which is
-                    # affordable for the one class being shown and not for a
-                    # listing (see `_declared_type_records`).
-                    rec["type"] = ctx._type_entry(match, type_obj)
-                if unreadable_here:
-                    rec["notes"].append(
-                        f"{len(unreadable_here)} further declaration(s) of this name"
-                        " could not be read, so this card is not the whole answer")
-                records.append(rec)
-            if len(records) == 1:
-                return records[0]
-            return {"ambiguous": True, "query": name, "matches": records}
         # A failed read is not an absent class: the miss says what it could not
         # read instead of asserting a "No class named" this call has no standing
         # to assert (#907 review). The message is byte-identical to the one it
@@ -1742,7 +1749,29 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
             f"Run `bn class list` (add --all for name-only clusters) to discover "
             f"available classes.{unreadable}",
         )
-    enriched = [_enrich(ctx, bv, registry[m]) for m in matches]
-    if len(enriched) == 1:
-        return enriched[0]
-    return {"ambiguous": True, "query": name, "matches": enriched}
+    records = []
+    for match in matches:
+        if match in registry:
+            rec = _enrich(ctx, bv, registry[match])
+        else:
+            # A declared record comes back as it was BUILT: `_enrich`'s RTTI
+            # drill-downs (vtable layout, bases, instances) are precisely what
+            # its note says this view has no evidence for, so running them would
+            # only decorate the card.
+            rec = declared[match]
+            type_obj = declared_types.get(match)
+            if type_obj is not None:
+                rec["size"] = _declared_size(type_obj)
+                # The canonical `types` entry for the declaration (decl, layout,
+                # members) -- a SHOW-only drill-down, exactly as the vtable
+                # layout and object size are, and for the same reason:
+                # `_type_entry` walks and renders the members, which is
+                # affordable for the one class being shown and not for a listing
+                # (see `_declared_type_records`).
+                rec["type"] = ctx._type_entry(match, type_obj)
+        if disclosure:
+            rec.setdefault("notes", []).append(disclosure)
+        records.append(rec)
+    if len(records) == 1:
+        return records[0]
+    return {"ambiguous": True, "query": name, "matches": records}

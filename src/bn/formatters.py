@@ -5641,8 +5641,13 @@ def _render_class_list_text(value: Any) -> str:
         # and every type BN itself imported when it said "declared class type"
         # (#907 review). What it counts is what `--all` adds: the class types this
         # view's USER declared.
+        # `(--all to show)` is ADVICE, so it is printed only while it is still
+        # actionable. An `--all` run whose declared set could not be read still
+        # states the unknown, and telling the reader to pass the flag they just
+        # passed reads as a different, unsatisfied suggestion (#907 review r5).
         hidden_parts.append(
-            f"{stated} user-declared class type{'s' if ds != 1 else ''} (--all to show)")
+            f"{stated} user-declared class type{'s' if ds != 1 else ''}"
+            + ("" if value.get("include_all") else " (--all to show)"))
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
