@@ -9075,7 +9075,7 @@ def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
     # #812's headline defect, bridge end: the per-callsite row now carries its
     # OWN blocking-frontier count, derived from the canonical
     # BLOCKING_LEAF_KINDS. The CLI used to recompute the "(N frontier)" marker
-    # by counting one hard-coded kind (`unmodeled_callee`) out of the eleven
+    # by counting one hard-coded kind (`unmodeled_callee`) out of the ten
     # that block a claim, so a callsite whose frontier was a coarse store, a
     # pointer escape or an unresolved indirect call counted ZERO and the marker
     # vanished -- silently, on the row a reader uses to pick which callsite to
