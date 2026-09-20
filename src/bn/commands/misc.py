@@ -477,20 +477,21 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         data = bytes.fromhex(hex_payload)
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
-    # #827 item 4 review: the bridge caps an over-long read and says so in the
-    # payload (`capped` / `requested_length` / `note`). The hex renderer prints
-    # that note, but THIS path returns the bytes themselves -- and a dump quietly
-    # shorter than the window the caller asked for is the "bounded read that reads
-    # as the whole window" failure the note exists to prevent, on the one path
-    # documented for piping a blob into another tool. Disclose on stderr (stdout
-    # IS the payload) and carry both fields into the --out summary.
-    capped_fields: dict[str, Any] = {}
-    if isinstance(result, dict) and result.get("capped"):
-        capped_fields = {
-            "capped": True,
-            "requested_length": result.get("requested_length"),
-        }
-        note = str(result.get("note") or f"capped at {len(data)} bytes")
+    # #827 item 4 review: the bridge marks a PARTIAL read in the payload
+    # (`capped` and/or `short_read`, plus `requested_length` and a `note`). The
+    # hex renderer prints that note, but THIS path returns the bytes themselves
+    # -- and a dump quietly shorter than the window the caller asked for is the
+    # "bounded read that reads as the whole window" failure the note exists to
+    # prevent, on the one path documented for piping a blob into another tool.
+    # Both markers, not just the cap: a short read is the same dump with the
+    # same consequence, and disclosing one of the two taught a reader that
+    # silence here means a complete window. Disclose on stderr (stdout IS the
+    # payload) and carry the markers into the --out summary.
+    partial_fields: dict[str, Any] = {}
+    if isinstance(result, dict) and (result.get("capped") or result.get("short_read")):
+        partial_fields = {key: True for key in ("capped", "short_read") if result.get(key)}
+        partial_fields["requested_length"] = result.get("requested_length")
+        note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
         print(f"note: {note}", file=sys.stderr)
     if args.out:
         from ..output import write_bytes_result
@@ -499,7 +500,7 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             data,
             out_path=args.out,
             fmt=args.format,
-            summary={"kind": "bytes", "address": address, "length": len(data), **capped_fields},
+            summary={"kind": "bytes", "address": address, "length": len(data), **partial_fields},
         )
         sys.stdout.write(result.rendered)
     else:

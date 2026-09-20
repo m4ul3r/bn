@@ -1251,9 +1251,10 @@ def _function_name_summary(bv) -> dict[str, int]:
     # reason on one surface while suppressing it on the other, with the two
     # agreeing on every number -- the shape where a reader concludes the larger
     # count is a phantom rather than an unresolved conflict (#757 review).
-    functions, collapsed_starts, unresolved_starts = read_listing._collapse_duplicate_starts(
-        functions
-    )
+    # This summary counts EVERY retained record (it has no row filter of its
+    # own), so the counts are taken against the whole kept population.
+    functions, collapse = read_listing._collapse_duplicate_starts(functions)
+    collapsed_starts, unresolved_starts = collapse.counts(functions)
     total = len(functions)
     named = imported = 0
     imported_obj_names: set[str] = set()

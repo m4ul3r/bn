@@ -8142,3 +8142,34 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     assert _disclosed(bogus_text, "duplicate_starts_collapsed"), bogus_text
     assert "duplicate starts: ?" not in bogus_text, bogus_text
     assert "1 start address(es)" not in bogus_text, bogus_text
+
+
+def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757():
+    """The collapse note is an ADDITION to the listing, never a substitute for
+    the empty-list marker.
+
+    `_render_function_list_text` returned the note INSTEAD of the body when the
+    body was the bare `none`, borrowing the paging footer's replace-the-marker
+    rule from `_render_paged_list_text` -- but a footer states the emptiness
+    ("showing 0 of 15") and this note does not. An empty listing that carried
+    `duplicate_starts_collapsed` therefore rendered as a single
+    `// duplicate starts: ...` line with nothing saying the list was empty, so a
+    reader was handed the alarm and no answer.
+    """
+    from bn import formatters
+
+    # No total to footer against, so the body IS the bare empty-list marker --
+    # the one shape where the note used to replace it.
+    empty = {"kind": "functions", "items": [],
+             "duplicate_starts_collapsed": 1}
+    text = formatters._render_function_list_text(empty)
+    assert text.splitlines()[0] == "none", text
+    assert "duplicate starts" in text, text
+
+    # ...and the same for an envelope whose total is an honest zero (no paging
+    # happened, so `_paging_footer` has nothing to say either).
+    zero_total = {"kind": "functions", "items": [], "total": 0, "returned": 0,
+                  "offset": 0, "has_more": False, "duplicate_starts_unresolved": 2}
+    zero_text = formatters._render_function_list_text(zero_total)
+    assert zero_text.splitlines()[0] == "none", zero_text
+    assert "2 start address(es) left with duplicate records" in zero_text, zero_text

@@ -298,8 +298,9 @@ def test_function_listing_collapses_duplicate_start_addresses_757(monkeypatch):
     assert counted["count"] == counted["total"] == 3
     assert counted["duplicate_starts_collapsed"] == 1
 
-    # `function search` collapses the population BEFORE matching, so the phantom
-    # twin cannot match as a second row with the conflicting size.
+    # `function search` collapses the MATCHED population before building any
+    # row, so the phantom twin cannot reach the page as a second row with the
+    # conflicting size.
     searched = instance._search_functions("active", "widget_poll")
     assert searched["total"] == 1 and searched["returned"] == 1
     assert searched["items"][0]["size"] == 96
@@ -590,6 +591,91 @@ def test_function_search_scopes_duplicate_starts_to_the_matched_population_757(m
     assert twin["total"] == 1 and twin["returned"] == 1
     assert twin["duplicate_starts_collapsed"] == 1
     assert twin["items"][0]["size"] == 96
+
+
+def test_duplicate_start_counts_describe_the_filtered_population_757(monkeypatch):
+    """...and the SAME scoping rule has to survive the row filters.
+
+    The collapse was scoped to the matched population one command over, then
+    counted BEFORE `--min-size` / `--named` dropped rows -- so `function list
+    --min-size 1000 --count` on a view with one duplicated start answered
+    `count 0, total 0` beside `duplicate_starts_collapsed: 1`, and `function
+    search <q> --min-size 1000 --count` reproduced it. That is the exact
+    total-0-with-collapse shape the search fix removed, and the one
+    `_disclose_collapsed_starts`' own docstring says cannot happen: a key whose
+    contract is "this many of the rows you got were merged" cannot be satisfied
+    by rows the answer does not contain. The counts are measured against the
+    RETAINED population now, whichever filter shaped it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        # the conflicting pair: same start, both size_known, 96 bytes are real
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=4),
+    ]
+    _view(monkeypatch, instance, functions)
+
+    # A floor above every extent: no collapsed address is in the answer.
+    counted = instance._list_functions(None, min_size=1000, count_only=True)
+    assert counted["count"] == counted["total"] == 0
+    assert "duplicate_starts_collapsed" not in counted
+    listed = instance._list_functions(None, min_size=1000)
+    assert listed["total"] == 0 and listed["items"] == []
+    assert "duplicate_starts_collapsed" not in listed
+
+    # One command over, the same shape through the matched population.
+    searched = instance._search_functions("active", "widget_poll", min_size=1000,
+                                          count_only=True)
+    assert searched["total"] == 0
+    assert "duplicate_starts_collapsed" not in searched
+
+    # A floor the RETAINED record clears keeps the disclosure: the collapse is
+    # still why that address is one row rather than two.
+    kept = instance._list_functions(None, min_size=64, count_only=True)
+    assert kept["total"] == 1 and kept["duplicate_starts_collapsed"] == 1
+    kept_search = instance._search_functions("active", "widget_poll", min_size=64)
+    assert kept_search["total"] == 1 and kept_search["duplicate_starts_collapsed"] == 1
+
+
+def test_duplicate_start_counts_follow_the_named_filter_757(monkeypatch):
+    """The other row filter on `function list`, and the UNRESOLVED half.
+
+    `--named` partitions the population after the collapse, so a collapse among
+    the auto-named rows was disclosed on the `--named` answer that contains none
+    of them. And an unresolved group only stays unresolved while MORE THAN ONE
+    of its records survives -- a filter that leaves one record at that address
+    leaves no conflict in the answer to report.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    functions = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=96),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=4),
+    ]
+    _view(monkeypatch, instance, functions)
+
+    named = instance._list_functions(None, named=True, count_only=True)
+    assert named["total"] == 1                       # widget_init only
+    assert "duplicate_starts_collapsed" not in named
+    unnamed = instance._list_functions(None, named=False, count_only=True)
+    assert unnamed["total"] == 1 and unnamed["duplicate_starts_collapsed"] == 1
+
+    # The unresolved half: the unsized twin is what `--min-size` drops, so the
+    # answer holds one record at that address and no conflict to disclose.
+    unsized = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "widget_poll"),  # extent unreadable
+    ]
+    _view(monkeypatch, instance, unsized)
+    whole = instance._list_functions(None, count_only=True)
+    assert whole["duplicate_starts_unresolved"] == 1
+    filtered = instance._list_functions(None, min_size=64, count_only=True)
+    assert filtered["total"] == 1
+    assert "duplicate_starts_unresolved" not in filtered
 
 
 def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):

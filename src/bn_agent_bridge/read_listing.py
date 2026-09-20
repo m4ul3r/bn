@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     import binaryninja as bn  # noqa: F401  (kept for parity / future use)
@@ -892,8 +892,42 @@ def _duplicate_extent_key(fn) -> tuple[int, int]:
     return (1 if known else 0, size if known else -1)
 
 
-def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int, int]:
-    """Keep ONE record per start address, and count the addresses that had more.
+class _StartCollapse(NamedTuple):
+    """Which start addresses the #757 collapse touched, as the RECORDS it kept.
+
+    Records rather than counts, because the counts cannot be fixed until the
+    caller has finished filtering: `function list --min-size`/`--named` and
+    `function search --min-size` drop rows AFTER the collapse runs, and a count
+    taken before them describes a population the answer does not contain (#757
+    review). Holding the objects also keeps every `id()` below unique for the
+    lifetime of the tuple -- nothing here can be freed and its address reused.
+    """
+
+    #: the retained record of each address whose duplicates were merged
+    collapsed: tuple[Any, ...]
+    #: every record of each address whose extents could not be ranked
+    unresolved: tuple[tuple[Any, ...], ...]
+
+    def counts(self, retained: list[Any]) -> tuple[int, int]:
+        """``(collapsed, unresolved)`` for the rows *retained* still holds.
+
+        A collapsed address counts while its surviving record is in the answer:
+        that row IS one row instead of two because of the merge. An unresolved
+        address counts only while MORE THAN ONE of its records survives -- the
+        key states that an address is still carrying duplicates, and a filter
+        that leaves one record there has left no conflict to report.
+        """
+        live = {id(fn) for fn in retained}
+        collapsed = sum(1 for fn in self.collapsed if id(fn) in live)
+        unresolved = sum(
+            1 for group in self.unresolved
+            if sum(1 for fn in group if id(fn) in live) > 1
+        )
+        return collapsed, unresolved
+
+
+def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartCollapse]:
+    """Keep ONE record per start address, and record the addresses that had more.
 
     BN can hold several Function records for a single start address (an
     overlapping or duplicated definition), and their sizes DISAGREE while both
@@ -905,11 +939,13 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int, in
     address that had more than one record is reported so the collapse is
     disclosed rather than silent.
 
-    Returns ``(kept, collapsed, unresolved)``. A group whose members are all
-    sized collapses, and its larger extent wins. A group where any extent is
-    UNREADABLE cannot be ordered by that rule at all, so it is left standing
-    and counted in ``unresolved`` -- the issue's own second answer ("or report
-    the conflict"), and the only option that cannot promote a phantom.
+    Returns ``(kept, collapse)``. A group whose members are all sized collapses,
+    and its larger extent wins. A group where any extent is UNREADABLE cannot be
+    ordered by that rule at all, so it is left standing and recorded as
+    ``unresolved`` -- the issue's own second answer ("or report the conflict"),
+    and the only option that cannot promote a phantom. The caller turns
+    *collapse* into the two published counts with `_StartCollapse.counts`, once
+    it knows which rows its answer kept.
 
     Cheap by construction: addresses with a single record (every address on a
     well-formed target) are never sized -- the extent read happens only inside a
@@ -929,26 +965,27 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], int, in
             key = fn
         grouped.setdefault(key, []).append(fn)
     if len(grouped) == len(functions):
-        return functions, 0, 0
-    collapsed = 0
-    unresolved = 0
+        return functions, _StartCollapse((), ())
+    collapsed: list[Any] = []
+    unresolved: list[tuple[Any, ...]] = []
     kept: list[Any] = []
     for group in grouped.values():
         if len(group) == 1:
             kept.append(group[0])
             continue
         if all(_extent_known(fn) for fn in group):
-            collapsed += 1
-            kept.append(max(group, key=_duplicate_extent_key))
+            winner = max(group, key=_duplicate_extent_key)
+            collapsed.append(winner)
+            kept.append(winner)
             continue
         # "Keep the larger extent" is undefined when a record's extent cannot be
         # read at all: choosing the record that happens to state a size lets a
         # stub-shaped phantom outvote a real body the view would not size -- the
         # exact confusion #757 was filed for. The issue's other accepted answer
         # is "report the conflict", so the group is left intact and disclosed.
-        unresolved += 1
+        unresolved.append(tuple(group))
         kept.extend(group)
-    return kept, collapsed, unresolved
+    return kept, _StartCollapse(tuple(collapsed), tuple(unresolved))
 
 
 def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
@@ -966,13 +1003,16 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     retained row carries the LARGER extent or the conflict was left standing.
 
     SCOPING, because the two listing commands disagreed about it (#757 review):
-    the counts describe the population the caller collapses, which must be the
-    population its ``total`` is derived from. `function list` collapses the
-    address-filtered population it then counts; `function search` collapses the
-    MATCHED population, so a query that matches nothing reports no collapse
-    rather than the collapse of rows the answer never contained. A caller that
-    collapses one population and counts another reintroduces exactly that
-    mismatch, one command over.
+    the counts describe the rows the answer CONTAINS, which is the population
+    its ``total`` is derived from -- so they are taken from
+    `_StartCollapse.counts` against the retained rows, never from the collapse
+    pass itself. `function search` collapses the MATCHED population, so a query
+    that matches nothing reports no collapse; and both commands recount after
+    ``--min-size`` / ``--named``, so a floor that drops every collapsed address
+    reports none. Counting at the collapse instead published
+    ``duplicate_starts_collapsed: 1`` beside ``total: 0`` -- a key whose own
+    contract (this many of the rows you got were merged) no retained row can
+    satisfy.
     """
     if collapsed:
         result["duplicate_starts_collapsed"] = collapsed
@@ -1081,7 +1121,7 @@ def _list_functions(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
+    functions, collapse = _collapse_duplicate_starts(
         list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
     )
     if min_size is not None:
@@ -1101,6 +1141,11 @@ def _list_functions(
             if not is_imported_function(fn)
             and (not is_auto_function_name(str(getattr(fn, "name", "") or ""))) == named
         ]
+    # The counts are taken HERE, after every row filter, so they describe the
+    # population `total` is measured on (#757 review). Taken at the collapse
+    # instead, `--min-size 1000` on a view whose every extent is smaller
+    # answered `count 0, total 0` beside `duplicate_starts_collapsed: 1`.
+    collapsed_starts, unresolved_starts = collapse.counts(functions)
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
@@ -1292,9 +1337,7 @@ def _search_functions(
             # sizes and materializes every match.
             matched_functions.append(fn)
             displays[id(fn)] = display
-    matched_functions, collapsed_starts, unresolved_starts = _collapse_duplicate_starts(
-        matched_functions
-    )
+    matched_functions, collapse = _collapse_duplicate_starts(matched_functions)
     matched = [(fn, displays[id(fn)]) for fn in matched_functions]
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
@@ -1305,6 +1348,8 @@ def _search_functions(
             (fn, display) for fn, display in matched
             if (il_format._function_size(fn) or 0) >= min_size
         ]
+    # After `--min-size`, for the same reason `_list_functions` recounts there.
+    collapsed_starts, unresolved_starts = collapse.counts([fn for fn, _ in matched])
     if count_only:
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized

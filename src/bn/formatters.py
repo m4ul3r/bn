@@ -2138,10 +2138,14 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     # `--offset`/`--limit` slicing and sits after the paging footer -- the same
     # placement `_render_name_address_list_text` gives `self_defined_excluded`
     # (#883 item 4).
+    #
+    # APPENDED, never substituted. `_render_paged_list_text` replaces a `none`
+    # body with its footer because the footer STATES the emptiness ("showing 0
+    # of 15"); this note does not, so borrowing that rule rendered an empty
+    # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
+    # beside it (#757 review).
     note = _duplicate_starts_note(value)
-    if not note:
-        return body
-    return note if body == "none" else f"{body}\n{note}"
+    return body if not note else f"{body}\n{note}"
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
