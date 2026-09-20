@@ -4145,6 +4145,91 @@ def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_8
     assert "callee_arity_note" not in call
 
 
+# BN's maximum confidence (`binaryninja.core.max_confidence`). Any positive value
+# is a determination; the constant is spelled out so the fixture reads as the API
+# it models rather than as a magic number.
+_MAX_CONFIDENCE = 255
+
+
+class _VarargsFlag:
+    """BN's `BoolWithConfidence` for `Type.has_variable_arguments`.
+
+    Two facts, not one: `value` is what analysis currently holds and `confidence`
+    is whether analysis ever DETERMINED it. `confidence == 0` means BN never
+    settled the question -- and because the object is truthy by its VALUE, a
+    consumer that writes `bool(flag)` reads "never determined" as a firm "not
+    variadic". That is the exact shape this fixture exists to express: the
+    previous fixture could only set a plain `True`, so the undetermined case --
+    the one that produced the false demotions -- had no test at all.
+    """
+
+    def __init__(self, value, confidence):
+        self.value = bool(value)
+        self.confidence = int(confidence)
+
+    def __bool__(self):
+        return self.value
+
+
+def _with_varargs_flag(bv, flag, *, address=0x401100):
+    """Put *flag* on the callee's recovered prototype, as BN's type does."""
+    bv.get_function_at(address).type.has_variable_arguments = flag
+    return bv
+
+
+@pytest.mark.parametrize(
+    ("flag", "demotes"),
+    [
+        (_VarargsFlag(True, _MAX_CONFIDENCE), False),
+        (_VarargsFlag(False, _MAX_CONFIDENCE), True),
+        (_VarargsFlag(False, 0), False),
+    ],
+    ids=["variadic-determined", "not-variadic-determined", "never-determined"],
+)
+def test_the_witness_speaks_only_where_bn_determined_the_varargs_flag_882(
+    monkeypatch, flag, demotes,
+):
+    """#882 AC1, the measured false-demotion class: a varargs callee BN never
+    MARKED as varargs.
+
+    All three callees below have the same body -- the SysV register-save-area
+    prologue, which spills every integer argument register straight from its
+    incoming value. Those spills are genuine version-0 reads, so def-use soundness
+    does not help here: the only thing separating "this callee consumes six
+    arguments" from "this callee is a printf-style helper saving its varargs" is
+    the varargs flag, and BN attaches a CONFIDENCE to that flag precisely because
+    it often has not determined it. Reading the zero-confidence `False` as a firm
+    "not variadic" demoted 72 of 1242 rows on an unmutated image.
+
+    So the witness speaks only for the middle case, where BN actually decided the
+    callee is not variadic. A determination that was never made is not a licence
+    to guess -- and it must not invent the note either, because a false note is
+    the same false claim in prose.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["fmt"])
+    _with_varargs_flag(bv, flag)
+    # The register save area: `mov [rsp+N], rdx/rcx/r8/r9...`, every argument
+    # register read at version 0.
+    _with_ssa(bv, *[_SSARead(0x401100 + i * 4, _ssa_var(i)) for i in range(6)])
+
+    card = instance._function_evidence("active", "probe_device", context=0)
+    call = card["calls"][0]
+
+    if demotes:
+        assert call["argument_confidence"] == "inferred"
+        assert call["callee_under_recovered"] is True
+        assert call["callee_read_arity"] == 6
+        assert call["declared_arity"] == 1
+    else:
+        assert call["argument_confidence"] == "authoritative"
+        assert "callee_under_recovered" not in call
+        assert "callee_read_arity" not in call
+        assert "callee_arity_note" not in call
+        assert not any("NOTE" in w for w in card["warnings"])
+
+
 def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(monkeypatch):
     """The witness's own false-positive guard. A compiler routinely reuses a
     caller-saved argument register as scratch, and a CALL gives it a new value --
