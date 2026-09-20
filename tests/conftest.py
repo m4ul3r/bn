@@ -633,16 +633,21 @@ def fake_transport(monkeypatch):
     Each recorded call is ONE dict describing the request the CLI built: `op`,
     `params` and `target`, plus every keyword `bn.cli.send_request` accepts --
     `timeout`, `default_timeout`, `connect_retries`, `instance_id`,
-    `spawn_missing_named`, `resolved`, `idle_probe` -- and any further kwarg
-    verbatim. Recorded in full rather than only op/params/target (#787): a fake
-    that drops the routing kwargs cannot catch a routing regression, so a test
-    could assert the op while the CLI sent the call to the wrong INSTANCE, with
-    the wrong spawn policy, or without the `resolved` flag a shrinking end-to-end
-    budget depends on -- and the suite stayed green.
+    `spawn_missing_named`, `resolved`, `idle_probe`. Recorded in full rather
+    than only op/params/target (#787): a fake that drops the routing kwargs
+    cannot catch a routing regression, so a test could assert the op while the
+    CLI sent the call to the wrong INSTANCE, with the wrong spawn policy, or
+    without the `resolved` flag a shrinking end-to-end budget depends on -- and
+    the suite stayed green.
 
-    The signature mirrors the real one, so the recorded values are the ones the
-    real call would bind: `timeout=None` means the CLI left timeout resolution to
-    `send_request` (it does on every primary call), not that the fake defaulted.
+    The signature is the real one's parameter for parameter, with NO `**kwargs`
+    catch-all: a recorder more forgiving than the function it replaces accepts a
+    call the live `send_request` raises TypeError on, so a handler shipping a
+    misspelled or removed routing kwarg would pass the mocked suite and break
+    against a real bridge. Because it binds identically, the recorded values are
+    the ones the real call would bind: `timeout=None` means the CLI left timeout
+    resolution to `send_request` (it does on every primary call), not that the
+    fake defaulted.
     """
     def install(results=None, *, default=None):
         results = results or {}
@@ -652,7 +657,7 @@ def fake_transport(monkeypatch):
                               default_timeout=DEFAULT_REQUEST_TIMEOUT,
                               connect_retries=4, instance_id=None,
                               spawn_missing_named=False, resolved=False,
-                              idle_probe=False, **kwargs):
+                              idle_probe=False):
             calls.append({
                 "op": op,
                 "params": params,
@@ -664,7 +669,6 @@ def fake_transport(monkeypatch):
                 "spawn_missing_named": spawn_missing_named,
                 "resolved": resolved,
                 "idle_probe": idle_probe,
-                **kwargs,
             })
             if op in results:
                 return results[op]

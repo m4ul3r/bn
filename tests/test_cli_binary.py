@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import types
@@ -819,6 +820,35 @@ def test_load_text_renders_notes(fake_transport, tmp_path, capsys):
     assert f"loaded: {bndb}" in stdout
     assert "note: loaded" in stdout
     assert "--no-bndb" in stdout
+
+
+def test_fake_transport_is_no_more_forgiving_than_the_real_send_request(fake_transport):
+    """#787: the recorder must bind EXACTLY like the `send_request` it replaces.
+
+    The real function declares no `**kwargs`, so a call carrying a keyword it
+    does not name -- a misspelling, or one a refactor removed -- is a TypeError
+    against a live bridge. A recorder with a catch-all swallows that call and
+    the mocked suite stays green, which is the blindness #787 set out to remove
+    one level down: the fake itself would be the reason a broken call shape
+    ships. Pinned as parameter-for-parameter equality, so a routing kwarg added
+    to the real signature must also reach the recorder, and the recorder can
+    never accept a shape the real call rejects.
+    """
+    # Captured BEFORE install(), while `bn.cli.send_request` is still the real
+    # function the fixture is about to shadow.
+    real = inspect.signature(bn.cli.send_request)
+    fake_transport({"sections": {"ok": True, "result": []}})
+    fake = inspect.signature(bn.cli.send_request)
+
+    def shape(sig):
+        return [(p.name, p.kind, p.default) for p in sig.parameters.values()]
+
+    assert shape(fake) == shape(real)
+
+    with pytest.raises(TypeError, match="timeuot"):
+        real.bind("sections", timeuot=5)
+    with pytest.raises(TypeError, match="timeuot"):
+        bn.cli.send_request("sections", timeuot=5)
 
 
 def test_load_opts_into_spawn_missing_named(fake_transport, tmp_path):

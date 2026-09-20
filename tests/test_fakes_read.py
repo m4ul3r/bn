@@ -105,11 +105,34 @@ def test_fake_bv_get_segment_at_honours_an_explicit_extent():
 def test_fake_bv_segment_without_a_seeded_extent_covers_only_its_base_byte():
     """A `segments={addr: seg}` with no blob behind it has no extent the fake can
     honestly claim, so it covers the byte it was seeded at and nothing wider --
-    a segment query must never invent coverage the view was not given."""
-    bv = _FakeBV(segments={0x401000: _FakeSegment(readable=True)})
-    assert bv.get_segment_at(0x401000) is not None
-    assert bv.get_segment_at(0x401001) is None
-    assert bv.get_segment_at(0x400FFF) is None
+    a segment query must never invent coverage the view was not given.
+
+    Measured against a blob-backed sibling in the SAME view, because the
+    one-byte answer only means something as a COMPUTED extent: a lookup with no
+    range awareness at all -- keying the base address alone -- returns exactly
+    these Nones by accident, while also answering None for the blob-backed
+    segment's interior. Widths are therefore read off both segments at once.
+    `is_valid_offset` shares those extents, so the bare segment maps one byte
+    and nothing past it, with no memory blob involved.
+    """
+    bv = _FakeBV(
+        memory={0x401000: b"\x90" * 0x20},
+        segments={
+            0x401000: _FakeSegment(readable=True, executable=True),
+            0x402000: _FakeSegment(readable=True),
+        },
+    )
+    backed = bv.get_segment_at(0x401000)
+    bare = bv.get_segment_at(0x402000)
+    assert backed is not None and bare is not None and backed is not bare
+
+    assert bv.get_segment_at(0x401010) is backed   # inside the seeded blob
+    assert bv.get_segment_at(0x401020) is None     # one past the blob
+
+    assert bv.get_segment_at(0x402001) is None     # the bare one: its byte only
+    assert bv.get_segment_at(0x401FFF) is None     # nothing before it, either
+    assert bv.is_valid_offset(0x402000) is True    # that byte IS mapped
+    assert bv.is_valid_offset(0x402001) is False   # and nothing beyond it
 
 
 def test_fake_bv_function_body_and_mappedness_use_one_span_rule():
