@@ -1664,6 +1664,88 @@ def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
     assert "Total strings: 0" not in unreadable
 
 
+def _count_keys_read(fn_node):
+    """The payload keys one count renderer reads, from its own source.
+
+    Derived rather than listed, so a renderer that grows a third counter is
+    probed on it without anyone remembering to extend a table."""
+    import ast
+
+    keys = set()
+    for node in ast.walk(fn_node):
+        if not isinstance(node, ast.Call):
+            continue
+        called = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+        if called == "get" and node.args:
+            arg = node.args[0]
+        elif called in ("_count_field", "_stated_count") and len(node.args) > 1:
+            arg = node.args[1]
+        elif called == "_field_skewed" and node.args:
+            arg = node.args[0]
+        else:
+            continue
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            keys.add(arg.value)
+    return keys
+
+
+def test_every_count_line_this_module_installs_reads_through_the_choke_point_795():
+    """One count contract, on every `--count` line this module renders (#619).
+
+    `bn.formatters` keeps the reading honest for the renderers that live there,
+    and the probe population in `tests/test_cli_formatters.py` is derived from
+    that module -- so a `text_renderer=` DEFINED in a command module is reached
+    by no differential, no mirror and no raise sweep. Both of this module's
+    count lines were written that way, and #795 fixed only one of them: the
+    sibling one function below still tested its counter with `isinstance(int)`,
+    which is the same second decider with all three of the same failure modes.
+
+    So the guard is derived from the module rather than aimed at one function:
+    every locally-defined renderer the registry installs whose name states a
+    count is driven over the three shapes a raw read gets wrong, on every key
+    its own source reads.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from bn.commands import misc
+
+    tree = ast.parse(pathlib.Path(inspect.getfile(misc)).read_text(encoding="utf-8"))
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, ast.FunctionDef)}
+    installed = {inner.id
+                 for node in ast.walk(tree)
+                 if isinstance(node, ast.keyword) and node.arg == "text_renderer"
+                 for inner in ast.walk(node.value)
+                 if isinstance(inner, ast.Name) and inner.id in functions}
+    counters = sorted(name for name in installed if name.endswith("_count_text"))
+    assert counters == ["_imports_count_text", "_strings_count_text"], (
+        f"the count lines this module installs are {counters}; a new one is a "
+        "new surface that states a number, so add it in the same commit")
+
+    for name in counters:
+        renderer = getattr(misc, name)
+        keys = _count_keys_read(functions[name])
+        assert len(keys) >= 2, (name, keys)     # a headline and its qualifier
+
+        # (a) A bool is not a count. `bool` IS an `int`, so a raw read prints
+        # the flag as a quantity -- the one shape that reads as data.
+        flagged = renderer({key: True for key in keys})
+        assert "True" not in flagged, (name, flagged)
+
+        # (b) A numeric string IS a count, and states the same line the integer
+        # spelling does. A raw `isinstance(int)` silently drops the whole
+        # qualifier for a producer that spells its counts as text.
+        assert renderer({key: "7" for key in keys}) == renderer({key: 7 for key in keys}), name
+
+        # (c) A container is disclosed, never interpolated into the line as a
+        # raw Python repr, and never fabricated into a confident 0.
+        unreadable = renderer({key: {"n": 1} for key in keys})
+        assert "{" not in unreadable and "}" not in unreadable, (name, unreadable)
+        assert ": 0" not in unreadable, (name, unreadable)
+
+
 def test_estimate_output_preflights_the_raw_bytes_read_796(fake_transport, capsys):
     """#796: `read --encoding bytes` is a SECOND emit path, and it must preflight
     like the first one.
@@ -1988,7 +2070,7 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
     assert emitted, "no probe reached an emit path at all"
 
 
-def test_the_output_reference_documents_the_estimate_preflight_796():
+def test_the_output_reference_documents_the_estimate_preflight_796(monkeypatch):
     """#796: the preflight has to be discoverable where an agent looks for it.
 
     The issue's own repro grepped `src/`, `skills/`, `README.md` and
@@ -1999,10 +2081,14 @@ def test_the_output_reference_documents_the_estimate_preflight_796():
     envelope keys, and the reading reference's "bound the read" guidance, which
     is where a reader is already being told to slice.
 
-    The envelope half is derived from the envelope this CLI actually emits, so
+    The envelope half is derived from the envelopes this CLI actually emits, so
     the reference cannot drift from the payload the next time a key is added.
+    All THREE envelopes are drained, because a key that only one of them
+    carries is exactly the one a hand-kept list forgets: the spill threshold is
+    conditional (`spill_token_limit` appears only when `BN_SPILL_TOKENS` is
+    armed), and the raw-byte preflight is a second payload kind.
     """
-    from bn.output import estimate_output_result
+    from bn.output import estimate_bytes_result, estimate_output_result
 
     root = Path(bn.cli.__file__).resolve().parents[2]
     runtime = (root / "skills" / "bn" / "reference" / "runtime.md").read_text(encoding="utf-8")
@@ -2015,9 +2101,19 @@ def test_the_output_reference_documents_the_estimate_preflight_796():
         "the reading reference tells an agent to bound a large read but never "
         "names the flag that measures one first")
 
-    envelope = estimate_output_result({"items": [], "total": 0}, fmt="json",
-                                      rerun_hint="rerun with --limit").artifact
-    undocumented = sorted(key for key in envelope if f"`{key}`" not in runtime)
+    envelopes = [estimate_output_result({"items": [], "total": 0}, fmt="json",
+                                        rerun_hint="rerun with --limit").artifact]
+    monkeypatch.setenv("BN_SPILL_TOKENS", "40000")
+    envelopes.append(estimate_output_result({"items": [], "total": 0}, fmt="json",
+                                            rerun_hint="rerun with --limit").artifact)
+    envelopes.append(estimate_bytes_result(b"AAAA", fmt="json",
+                                           summary={"kind": "bytes"},
+                                           rerun_hint="rerun with --length").artifact)
+    assert "spill_token_limit" in envelopes[1], (
+        "the armed envelope no longer carries the conditional key this guard "
+        "exists to reach")
+    undocumented = sorted({key for envelope in envelopes for key in envelope
+                           if f"`{key}`" not in runtime})
     assert not undocumented, (
         f"the estimate envelope carries keys the reference never states: "
         f"{undocumented}")

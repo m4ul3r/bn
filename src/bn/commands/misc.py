@@ -140,11 +140,26 @@ def _strings(args: argparse.Namespace) -> int:
     return rc
 
 
+@_discloses
 def _imports_count_text(value: Any) -> str:
-    line = f"Total imports: {value.get('count', 0)}"
-    excluded = value.get("self_defined_excluded")
-    if isinstance(excluded, int) and excluded > 0:
+    """The `imports --count` line, with the filter's excluded-count tail.
+
+    The sibling `_strings_count_text` is modelled on this line, and #795's
+    round-2 review found the model was the defective one: `isinstance(int)` is a
+    SECOND decider over a question the count choke point already answers, and it
+    gets all three of the same shapes wrong. `bool` IS an `int`, so
+    `self_defined_excluded: true` rendered "(True self-defined excluded)" -- a
+    flag printed as a quantity; a producer that spells counts as text dropped
+    the tail entirely; and the headline was interpolated raw, so a container
+    landed in the line as a Python repr. Both numbers go through the choke
+    point, under the boundary that discloses what it could not read (#619)."""
+    line = f"Total imports: {_stated_count(value, 'count')}"
+    excluded = _count_field(value, "self_defined_excluded")
+    if excluded:
         line += f" ({excluded} self-defined excluded)"
+    elif _field_skewed("self_defined_excluded"):
+        line += ("\n// the payload's self-defined-excluded count is not a number "
+                 "that can be read (use --format json)")
     return line
 
 
