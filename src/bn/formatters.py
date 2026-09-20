@@ -381,6 +381,13 @@ def _is_failed_status(row: Any) -> bool:
 # `_render_paged_list_text` and `_render_name_address_list_text` compare a body
 # against the marker to decide whether a footer or note stands alone, so the
 # marker is a shared value rather than a literal each site spells out.
+#
+# Two renders stay outside it on purpose, and both say MORE than "empty": the
+# init-array line names the authoritative reason an ELF has no constructors
+# (#448) and the callsites line under a partial caller scan states what was
+# actually established rather than claiming absence (#816). A reasoned absence
+# is a different fact from an empty result, so it does not wear the empty
+# result's clothes.
 _EMPTY_RESULT = "(none)"
 
 
@@ -1013,7 +1020,7 @@ def _render_comment_text(value: Any) -> str:
         # Single-comment form (`comment get <addr>`): the payload IS the comment,
         # a document rather than a row, so its own newlines are the content and
         # stay raw -- same as the decompile/IL/type-layout text renderers (#771).
-        return comment if comment else "(no comment)"
+        return comment if comment else _empty_result("comment")
     return _render_fallback_text(value)
 
 
@@ -1143,7 +1150,7 @@ def _render_close_text(value: Any) -> str:
         return _render_fallback_text(value)
     closed = _field_list(value, "closed")
     if not closed:
-        return "no binaries closed"
+        return _empty_result("binaries closed")
 
     def _row(entry: Any) -> tuple[str, bool]:
         if isinstance(entry, dict):
@@ -1276,7 +1283,7 @@ def _render_session_status_text(value: Any) -> str:
         return _render_fallback_text(value)
     items = _field_list(value, "items")
     if not items:
-        return "no load jobs"
+        return _empty_result("load jobs")
     lines = []
     for item in items:
         if not isinstance(item, dict):
@@ -3917,7 +3924,7 @@ def _render_taint_models_text(value: Any) -> str:
         lines.append("")
         lines.append("overlays: " + ", ".join(
             str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
-    return "\n".join(lines) if lines else "no models match the filter"
+    return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
 def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
@@ -4177,7 +4184,7 @@ def _render_data_vars_text(value: Any) -> str:
         if row.get("sec"):
             cells.append(f"[{row['sec']}]")
         lines.append("  ".join(cells))
-    body = "\n".join(lines) if lines else "none"
+    body = "\n".join(lines) if lines else _EMPTY_RESULT
     if value.get("has_more"):
         hint = ""
         # Through the choke point: a container-shaped address on the LAST row

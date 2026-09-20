@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+from pathlib import Path
 
 import pytest
 
@@ -101,13 +103,38 @@ def test_update_writes_valid_json_atomically(project):
 def test_atomic_write_fsyncs_the_pin_before_the_rename(project, monkeypatch):
     """#824: close() flushes to the OS, not to the disk. The sticky pin is the one
     piece of state a fresh process trusts without re-deriving it, so a torn write
-    is a wrong target rather than a missing one."""
-    synced = []
+    is a wrong target rather than a missing one.
+
+    The guarantee is an ORDER, not a count: the pin's own bytes must be on disk
+    *before* the rename publishes them. A bare `assert os.fsync was called` is
+    satisfied by the post-rename directory fsync alone, so it stays green with
+    the pre-rename `fh.flush()`/`os.fsync(fd)` deleted -- which is exactly the
+    crash window this test exists to close. Each fsync is therefore labelled by
+    the kind of fd it was handed, and the rename is recorded between them.
+    """
+    events: list[str] = []
     real_fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    real_replace = Path.replace
+
+    def spy_fsync(fd):
+        events.append("fsync:dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync:file")
+        return real_fsync(fd)
+
+    def spy_replace(self, target):
+        events.append("replace")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(Path, "replace", spy_replace)
 
     state = session_state.update(target="t.bndb")
 
-    assert synced, "the sticky pin must be fsynced before the atomic replace"
+    assert "fsync:file" in events, (
+        "the pin's own bytes must be fsynced, not just its directory: " f"{events}"
+    )
+    assert "replace" in events, events
+    assert events.index("fsync:file") < events.index("replace"), (
+        "the fsync must precede the rename that publishes the pin: " f"{events}"
+    )
     assert state["target"] == "t.bndb"
     assert json.loads(session_state_path().read_text())["target"] == "t.bndb"

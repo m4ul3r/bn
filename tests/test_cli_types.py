@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import bn.cli
 import pytest
@@ -165,7 +167,9 @@ def test_types_declare_file_failures_are_structured_refusals_754(
 
 def test_types_declare_refuses_a_fifo_instead_of_hanging(fake_transport, capsys, tmp_path):
     """#864: `--file <fifo>` blocked forever with no output and no envelope; the
-    shared reader refuses the kind instead of reading it."""
+    shared reader refuses the one FIFO shape that cannot terminate -- nobody is
+    writing and nothing is buffered -- and says which of the two it is, because
+    "not a regular file" would also condemn the process substitutions below."""
     fifo = tmp_path / "decl.h"
     os.mkfifo(fifo)
     calls = fake_transport()
@@ -176,8 +180,61 @@ def test_types_declare_refuses_a_fifo_instead_of_hanging(fake_transport, capsys,
     assert [call["op"] for call in calls] == []
     captured = capsys.readouterr()
     assert "FIFO" in captured.err
+    assert "no writer" in captured.err
     assert str(fifo) in captured.err
     assert "Traceback" not in captured.err
+
+
+def _declare_ok():
+    return {"types_declare": {"ok": True, "result": {"preview": False, "success": True,
+                                                     "results": [{"status": "verified"}]}}}
+
+
+def test_types_declare_reads_a_buffered_process_substitution(fake_transport):
+    """#864 asked the decision to cover process substitution; a blanket
+    non-regular refusal answers it by deleting it. A shell hands `<(printf ...)`
+    over as /dev/fd/N -- a FIFO whose bytes are already buffered and whose
+    writer has exited -- and that read terminated on base, so refusing it is a
+    regression, not a guardrail."""
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"struct P { int hp; };")
+    os.close(write_fd)
+    try:
+        rc = bn.cli.main(
+            ["types", "declare", "--target", "active", "--file", f"/dev/fd/{read_fd}"])
+    finally:
+        os.close(read_fd)
+
+    assert rc == 0
+    assert calls[-1]["op"] == "types_declare"
+    assert calls[-1]["params"]["declaration"] == "struct P { int hp; };"
+
+
+def test_types_declare_waits_for_a_running_process_substitution_writer(fake_transport):
+    """The other half of the same shape: `<(sleep 1; gen)` has a writer attached
+    but no first byte yet, so the non-blocking probe sees EAGAIN rather than
+    EOF. Refusing on "nothing buffered yet" would break every generator that is
+    not instantaneous; the read waits for the writer it can see."""
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+
+    def _write_late():
+        time.sleep(0.05)
+        os.write(write_fd, b"struct Q { int a; };")
+        os.close(write_fd)
+
+    writer = threading.Thread(target=_write_late)
+    writer.start()
+    try:
+        rc = bn.cli.main(
+            ["types", "declare", "--target", "active", "--file", f"/dev/fd/{read_fd}"])
+    finally:
+        writer.join(timeout=10)
+        os.close(read_fd)
+
+    assert rc == 0
+    assert calls[-1]["params"]["declaration"] == "struct Q { int a; };"
 
 
 def test_types_declare_dev_null_still_reaches_the_op(fake_transport):

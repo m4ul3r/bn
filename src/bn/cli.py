@@ -1456,19 +1456,25 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str) -> None
 
 
 def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
-    """Read a CLI text-input file that must terminate.
+    """Read a CLI text-input file whose read is guaranteed to terminate.
 
-    A FIFO with no writer makes ``Path.read_text`` block forever: no output, no
-    envelope, no timeout -- the worst failure an agent-facing CLI can produce,
-    and one the caller cannot even see in a log (#864). #754/#855 refused a
-    directory by name and wrapped the read; this is that refusal extended to
-    every non-regular input, so the --file / --script / manifest / --models /
-    --resolve-map readers state the rule once instead of five times.
+    ``open(fifo, O_RDONLY)`` does not return until a writer appears, so a FIFO
+    with none made ``Path.read_text`` block forever: no output, no envelope, no
+    timeout -- the worst failure an agent-facing CLI can produce, and one the
+    caller cannot even see in a log (#864). #754/#855 refused a directory by
+    name and wrapped the read; this states the rule once for the --file /
+    --script / manifest / --models / --resolve-map readers instead of five
+    times.
 
-    The null device stays the one deliberate exception: ``--file /dev/null`` is
-    a legitimate "empty input" spelling that #855's scope note protects, which
-    is exactly why a blanket ``is_file()`` guard is wrong. Devices that can
-    block or stream (``/dev/zero``, a FIFO, a socket) are refused by kind.
+    The rule is about what can BLOCK, not about file kind. #864 asked the
+    decision to cover process substitution explicitly, and a blanket
+    non-regular refusal answers it by deleting it: ``--file <(cmd)`` is handed
+    over as ``/dev/fd/N``, which stats as a FIFO whose writer is running and
+    therefore cannot hang. It is read by `_read_fifo_text`, which never blocks
+    in ``open``. ``--file /dev/null`` stays the "empty input" spelling #855's
+    scope note protects. Everything else non-regular -- a socket, a block
+    device, a streaming character device like ``/dev/zero`` -- is refused by
+    kind, because nothing bounds those reads.
     """
     try:
         st = path.stat()
@@ -1478,16 +1484,75 @@ def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
     if stat.S_ISDIR(st.st_mode):
         raise BridgeError(_with_hint(f"{what} is a directory: {path}", hint))
+    if stat.S_ISFIFO(st.st_mode):
+        return _read_fifo_text(path, what=what)
     if not stat.S_ISREG(st.st_mode) and not _is_null_device(path):
-        raise BridgeError(
+        raise BridgeError(_with_hint(
             f"{what} is not a regular file ({_file_kind(st.st_mode)}): {path}. "
-            "A FIFO or device can block a read forever, so it is refused instead "
-            "of hung on; write the input to a regular file first"
-            + (f" or {hint.rstrip('.')}" if hint else "")
-        )
+            "A device can stream without end, so it is refused instead of read "
+            "until it stops; write the input to a regular file, or stream it in "
+            "through a process substitution (`<(cmd)`) or /dev/stdin", hint))
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+
+
+# One page: the FIFO drain below reads in whole chunks rather than byte-wise,
+# and the first of them is also the probe that decides whether a writer exists.
+_FIFO_CHUNK = 1 << 16
+
+
+def _read_fifo_text(path: Path, *, what: str) -> str:
+    """Read a FIFO to EOF without ever blocking in ``open`` (#864).
+
+    Opening ``O_NONBLOCK`` returns at once and turns the hang into a question
+    the first read answers:
+
+    * EOF immediately -- no writer is attached and nothing is buffered, so
+      there is nothing to wait for. That is the ``mkfifo``-with-nobody case the
+      issue measured at rc=124, and it is refused rather than reported as an
+      empty input: "deliberately empty" is spelled ``/dev/null``. A process
+      substitution whose writer exited without writing is indistinguishable
+      from it at this point and is refused the same way.
+    * ``EAGAIN`` -- a writer IS attached and simply has not produced its first
+      byte yet. That is the ordinary process-substitution shape
+      (``--file <(sleep 1; gen)``), so the drain waits for it.
+
+    Past the first read the pace belongs to the caller's own writer, exactly as
+    it does for ``cat <(cmd)``, so the rest is an ordinary blocking read: a
+    wall-clock cap here would fail a slow but correct generator, which is a new
+    wrong answer rather than a fix for the old one.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    chunks: list[bytes] = []
+    try:
+        try:
+            first = os.read(fd, _FIFO_CHUNK)
+        except BlockingIOError:
+            first = None
+        if first == b"":
+            raise BridgeError(
+                f"{what} is a FIFO with no writer attached and nothing buffered: "
+                f"{path}. Reading it would have blocked forever, so it is refused "
+                "instead of hung on; pass a regular file, /dev/null for empty "
+                "input, or a process substitution whose writer is running"
+            )
+        if first is not None:
+            chunks.append(first)
+        os.set_blocking(fd, True)
+        while chunk := os.read(fd, _FIFO_CHUNK):
+            chunks.append(chunk)
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
 
 
@@ -1510,9 +1575,12 @@ def _is_null_device(path: Path) -> bool:
 
 
 def _file_kind(mode: int) -> str:
-    """Name a non-regular file type for the refusal message (#864)."""
-    if stat.S_ISFIFO(mode):
-        return "FIFO"
+    """Name a non-regular file type for the by-kind refusal message (#864).
+
+    No FIFO row: a FIFO never reaches the by-kind refusal -- `read_text_input`
+    routes it to `_read_fifo_text`, which decides on the writer rather than on
+    the kind, and names the kind in its own message.
+    """
     if stat.S_ISSOCK(mode):
         return "socket"
     if stat.S_ISBLK(mode):

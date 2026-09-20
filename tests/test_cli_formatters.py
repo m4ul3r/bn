@@ -7996,18 +7996,54 @@ def test_close_single_entry_carries_the_unsaved_marker():
 
 def test_empty_results_use_one_vocabulary():
     """#824: renderers disagreed between "none", "no targets" and "(no tags)" for
-    the same state; every empty result comes from _empty_result now."""
+    the same state; every empty result comes from _empty_result now.
+
+    The rows below are the whole population of "nothing to show" renders, not a
+    sample: a partial sweep is what left `data vars` printing a bare `none` next
+    to a `data symbols` page printing `(none)` for the identical state, so the
+    sibling pair is asserted EQUAL rather than each against its own literal.
+    The two reasoned-absence lines (#448 init arrays, #816 callsites under a
+    partial caller scan) say more than "empty" and are deliberately not this
+    vocabulary -- their own tests pin them.
+    """
     from bn.formatters import (
+        _render_close_text,
         _render_comment_list_text,
+        _render_comment_text,
+        _render_data_symbols_text,
+        _render_data_vars_text,
+        _render_local_list_text,
+        _render_session_list_text,
+        _render_session_status_text,
         _render_tag_get_text,
+        _render_tag_list_text,
         _render_tag_types_text,
+        _render_taint_models_text,
         _render_target_list_text,
     )
 
     assert _render_comment_list_text([]) == "(none)"
     assert _render_tag_types_text({"tag_types": []}) == "(none)"
+    assert _render_tag_list_text([]) == "(none)"
     assert _render_tag_get_text({}) == "(no tags)"
     assert _render_target_list_text({"items": []}) == "(no targets)"
+    assert _render_session_list_text({"items": []}) == "(no sessions)"
+    assert _render_local_list_text(
+        {"function": {"name": "parse", "address": "0x1000"}, "locals": []}
+    ).endswith("(no locals)")
+
+    # The four the first pass missed. `comment get <addr>` on an empty comment
+    # is the issue's own evidence row, and the models listing is the one it
+    # enumerated by name.
+    assert _render_comment_text({"comment": ""}) == "(no comment)"
+    assert _render_close_text({"closed": []}) == "(no binaries closed)"
+    assert _render_session_status_text({"items": []}) == "(no load jobs)"
+    assert _render_taint_models_text({}) == "(no models matching the filter)"
+
+    # Same state, two sibling reads: an empty window and an empty page must not
+    # read differently, which is precisely what the partial sweep introduced.
+    assert _render_data_vars_text({"items": []}) == _render_data_symbols_text({"items": []})
+    assert _render_data_vars_text({"items": []}) == "(none)"
 
 
 def test_record_table_renderer_falls_back_on_a_non_dict():
