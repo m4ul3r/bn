@@ -3616,20 +3616,40 @@ def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
       * no `is_valid_offset` at all, and
       * an `is_valid_offset` that raises
     are the two shapes of "the view cannot answer".
+
+    #888's stated observable is one layer up -- the read OP answers a clean
+    zero rather than raising -- so `tag get` is driven over the same two views
+    as well: a caller-side change that starts rejecting an indeterminate probe
+    would otherwise break the #374 contract with the helper-level pins still
+    green.
     """
     import importlib
 
     _shared = importlib.import_module("bn_agent_bridge._shared")
     read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    read_tags = importlib.import_module("bn_agent_bridge.read_tags")
 
     class _NoAnswer:
         """A view with no `is_valid_offset`; its 1-byte read also fails."""
         def read(self, addr, length):
             raise RuntimeError("cannot read")
 
+        def get_functions_containing(self, addr):
+            return []
+
+        def get_tags_at(self, addr, auto=False):
+            return []
+
     class _RaisingAnswer(_NoAnswer):
         def is_valid_offset(self, addr):
             raise RuntimeError("core error")
+
+    class _Ctx:
+        def __init__(self, bv):
+            self._bv = bv
+
+        def _resolve_view(self, selector):
+            return self._bv
 
     for bv in (_NoAnswer(), _RaisingAnswer()):
         label = type(bv).__name__
@@ -3639,6 +3659,9 @@ def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
         assert _shared._require_mapped_address(bv, 0x1000) is None, label
         # STRICT: answers False, i.e. treats "cannot tell" as "not mapped".
         assert read_decompile._address_is_mapped(bv, 0x1000) is False, label
+        # The op the permissive policy exists for: a clean zero, not a raise.
+        assert read_tags._get_tags(_Ctx(bv), None, "0x1000", None) == {
+            "address": "0x1000", "tags": [], "count": 0}, label
 
 
 def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
@@ -3717,7 +3740,7 @@ def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
     assert ctx._supports_thumb_pointer_tags(_WideView("linux-armv7")) is False
 
 
-def test_variadic_text_marks_the_count_as_heuristic_and_omits_a_firm_one_886():
+def test_variadic_text_marks_the_count_with_the_stated_confidence_886():
     """#827 item 6 / #886: the variadic count's confidence must reach TEXT, and
     must read as a claim about the COUNT.
 
@@ -3726,22 +3749,26 @@ def test_variadic_text_marks_the_count_as_heuristic_and_omits_a_firm_one_886():
     `expected >= N argument(s)` in the same voice as the recovered facts beside
     it -- JSON-only disclosure, the #883 shape. #886 asks specifically that the
     marker read as "this count is a heuristic" rather than as a hedge on the
-    whole finding, which is why it is spelled `count: <confidence>`.
+    whole finding, which is why it is spelled `count: <confidence>` and sits
+    directly after the verdict token it qualifies.
 
-    Four states are pinned, because the marker shipped with NONE of them:
-    reverting the render site left every selected variadic test green, so
-    deleting the marker was invisible to CI.
-      * a hedging confidence renders, and names the count as its subject;
-      * the card's FIRM word (`authoritative` -- the same spelling the sibling
-        `arguments: (hlil authoritative)` line renders) is OMITTED, because
-        bracketing a hedge onto facts the payload calls firm contradicts the
-        payload;
-      * an UNRECOGNISED word still renders: the renderer cannot claim a word
-        it does not know means "corroborated", and dropping it would be the
-        silent absence this marker exists to close;
+    Pinned here, because the marker shipped with NONE of it -- reverting the
+    render site left every selected variadic test green, so deleting the
+    marker was invisible to CI:
+      * the EXACT line, so neither the `count:` spelling nor the marker's
+        placement can drift away from the wording #886 asked for;
+      * a FIRM word renders too, and is never omitted: `count: authoritative`
+        states the count is authoritative, which is not a hedge. An earlier
+        cut omitted it, which made a payload that calls the count firm render
+        byte-identically to one that said nothing about it;
+      * a payload that stated NOTHING renders no marker, and must not collide
+        with either of the above;
       * a present-but-UNREADABLE confidence is disclosed by the render
         boundary rather than dropped, which is the whole reason the field is
-        read through `_text_value` and not an inline isinstance (#619).
+        read through `_text_value` and not an inline isinstance (#619);
+      * a whitespace-only word is `_text_value`'s PRESENT-AND-EMPTY case --
+        no word was stated -- so it renders no marker rather than an empty
+        `[count:    ]`.
     """
     from bn.formatters import _render_function_evidence_text
 
@@ -3751,22 +3778,39 @@ def test_variadic_text_marks_the_count_as_heuristic_and_omits_a_firm_one_886():
                         "variadic": {"is_variadic": True, **variadic}}]}
         )
 
-    under = {"under_recovered": True,
-             "warning": "imported variadic call `f` under-recovered in HLIL: "
-                        "recovered 1 of an expected >= 3 argument(s)"}
+    def variadic_line(variadic: dict) -> str:
+        return [ln for ln in render(variadic).splitlines()
+                if ln.startswith("  variadic: ")][0]
+
+    warning = ("imported variadic call `f` under-recovered in HLIL: "
+               "recovered 1 of an expected >= 3 argument(s)")
+    under = {"under_recovered": True, "warning": warning}
     fmt = {"callee": "f", "format_string": "%s%d", "format_conversions": 2}
 
-    # Both rendered branches carry the marker, and both drop to the bare line
-    # when the payload never stated a confidence.
+    # The exact line, both branches: `count:` names the subject, and the marker
+    # sits on the verdict/callee token, not trailing the sentence after it.
+    assert variadic_line({**under, "confidence": "heuristic"}) == (
+        f"  variadic: UNDER-RECOVERED [count: heuristic] — {warning}")
+    assert variadic_line({**fmt, "confidence": "heuristic"}) == (
+        "  variadic: f [count: heuristic] format='%s%d' conversions=2")
+
+    # A firm word is rendered, not omitted -- and the three states stay
+    # distinguishable, which omitting the firm one destroyed.
     for payload in (under, fmt):
-        assert "[count: heuristic]" in render({**payload, "confidence": "heuristic"})
-        assert "[count:" not in render(payload)
+        firm = variadic_line({**payload, "confidence": "authoritative"})
+        assert "[count: authoritative]" in firm, firm
+        silent = variadic_line(payload)
+        assert "[count:" not in silent, silent
+        assert firm != silent != variadic_line({**payload, "confidence": "heuristic"})
 
-    firm = render({**under, "confidence": "authoritative"})
-    assert "[count:" not in firm and "authoritative" not in firm, firm
-    assert "variadic: UNDER-RECOVERED —" in firm, firm
+    # An unrecognised word is the payload's to state; the renderer relays it.
+    assert "[count: medium]" in variadic_line({**under, "confidence": "medium"})
 
-    assert "[count: medium]" in render({**under, "confidence": "medium"})
-
+    # Present but unreadable: no marker, but the boundary says the field was
+    # there and could not be used.
     skewed = render({**under, "confidence": {"level": "heuristic"}})
     assert "[count:" not in skewed and "malformed confidence field" in skewed, skewed
+
+    # Whitespace-only states no word: no empty marker, and no skew claimed.
+    blank = render({**under, "confidence": "   "})
+    assert "[count:" not in blank and "malformed" not in blank, blank
