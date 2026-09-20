@@ -1522,6 +1522,15 @@ _FIFO_CHUNK = 1 << 16
 # hang is the whole defect #864 reports. Generous enough to cover any realistic
 # generator's startup, short enough that the answer is a diagnosis.
 _FIFO_IDLE_TIMEOUT = 30.0
+# ...and how long it will wait in TOTAL, however steadily the bytes arrive. The
+# idle bound above diagnoses a stalled producer, but on its own it is not a
+# termination guarantee: one byte inside every idle window resets it forever,
+# so the read never returns and #864's measured symptom -- rc=124, no output,
+# no envelope -- comes back from a third direction. These readers take a
+# declaration, a script, a manifest or a model map: small documents, not data
+# streams, so a bound this generous cannot cut off a correct producer, and it
+# is what makes "the read terminates" true rather than nearly true.
+_FIFO_TOTAL_TIMEOUT = 300.0
 
 
 def _read_fifo_text(path: Path, *, what: str) -> str:
@@ -1539,6 +1548,10 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
       alone is NOT a refusal: it just means the writer has nothing ready yet,
       which is the ordinary ``--file <(sleep 1; gen)`` shape, so the drain
       waits for it.
+    * **A writer that never stops** -- a producer emitting one byte inside
+      every idle window keeps the idle bound alive indefinitely, so the drain
+      is bounded by `_FIFO_TOTAL_TIMEOUT` as well. Without it the read has no
+      termination guarantee at all, only a fast answer for the stalled case.
     * **A writer that delivers nothing at all** -- refused on the DELIVERED
       BYTE COUNT, never on which state the first probe happened to catch.
       Whether the writer had already exited (the probe sees EOF) or was still
@@ -1563,15 +1576,33 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
     waiter.register(fd, select.POLLIN)
     chunks: list[bytes] = []
     delivered = 0
+    started = time.monotonic()
     try:
         while True:
+            left = _FIFO_TOTAL_TIMEOUT - (time.monotonic() - started)
+            if left <= 0:
+                raise BridgeError(
+                    f"{what} is a FIFO still delivering after "
+                    f"{_FIFO_TOTAL_TIMEOUT:g}s ({delivered} byte(s) so far): "
+                    f"{path}. The wait for each next byte is bounded, but a "
+                    "producer that says something inside every one of those "
+                    "windows would stream without end, so the read is bounded "
+                    "in total too; what arrived is discarded rather than used "
+                    "as if it were the whole input. Write the input to a "
+                    "regular file"
+                )
             try:
                 chunk = os.read(fd, _FIFO_CHUNK)
             except BlockingIOError:
                 # A writer is attached with nothing ready. Wait for it, but not
                 # forever: an unbounded wait here reproduces the reported
                 # symptom exactly, just from the writer's side of the pipe.
-                if not waiter.poll(_FIFO_IDLE_TIMEOUT * 1000):
+                if not waiter.poll(min(_FIFO_IDLE_TIMEOUT, left) * 1000):
+                    if left <= _FIFO_IDLE_TIMEOUT:
+                        # The total bound ran out first, not the idle one --
+                        # the loop head names it rather than reporting a
+                        # writer that never actually went quiet.
+                        continue
                     raise BridgeError(
                         f"{what} is a FIFO whose writer went quiet for "
                         f"{_FIFO_IDLE_TIMEOUT:g}s after {delivered} byte(s): "

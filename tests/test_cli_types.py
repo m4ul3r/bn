@@ -359,10 +359,12 @@ def test_types_declare_refuses_a_fifo_whose_writer_is_attached_but_silent(
 
 def test_a_slow_but_steady_producer_is_not_cut_off_by_the_idle_bound(
         fake_transport, monkeypatch):
-    """The bound is on IDLE time, not on total duration. A generator that takes
-    longer overall than the bound but never goes quiet for that long must read
-    in full -- a total-duration cap would turn a correct slow producer into a
-    new wrong answer."""
+    """The idle bound is on IDLE time. A generator that takes longer overall
+    than that bound but never goes quiet for it must read in full -- an idle
+    bound tight enough to cut off a correct slow producer would trade #864's
+    hang for a new wrong answer. The TOTAL bound the sibling below pins is the
+    termination guarantee, and it is deliberately far too generous to fire for
+    any real producer of a declaration, script, manifest or model map."""
     monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
     calls = fake_transport(_declare_ok())
     read_fd, write_fd = os.pipe()
@@ -384,6 +386,55 @@ def test_a_slow_but_steady_producer_is_not_cut_off_by_the_idle_bound(
 
     assert rc == 0
     assert calls[-1]["params"]["declaration"] == "struct R { int a; };"
+
+
+def test_an_endless_dribble_is_refused_rather_than_read_without_end(
+        fake_transport, capsys, monkeypatch):
+    """The idle bound is a diagnosis, not the termination guarantee. A producer
+    that emits one byte inside every idle window resets that bound forever, so
+    the read never returns -- #864's measured symptom (rc=124, zero output, no
+    envelope) reached from a third direction, and the one shape for which
+    `read_text_input`'s "guaranteed to terminate" claim was false. The drain is
+    bounded in total as well, so an endless producer gets a structured refusal
+    naming what it delivered instead of never answering at all.
+
+    The writer here is never idle for the idle bound, so only a total bound can
+    end this read: with the idle bound alone this cell hangs, and the hang
+    guard turns that into a red assertion rather than a stalled suite.
+    """
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    monkeypatch.setattr(bn.cli, "_FIFO_TOTAL_TIMEOUT", 1.0)
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    stop = threading.Event()
+
+    def _dribble_without_end():
+        while not stop.is_set():
+            try:
+                os.write(write_fd, b".")
+            except OSError:
+                return
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=_dribble_without_end, daemon=True)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        stop.set()
+        writer.join(timeout=10)
+        os.close(write_fd)
+        os.close(read_fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    # Names the total bound and that bytes DID arrive: the idle-bound
+    # refusal's "went quiet" would be a false description of this producer.
+    assert "still delivering" in captured.err
+    assert "went quiet" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 _FD_SETSIZE = 1024
