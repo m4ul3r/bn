@@ -2802,20 +2802,38 @@ class TaintEngine:
         cursor_ids = self._chain_identities(ssaf, right)
         if not cursor_ids or not self._chain_identities(ssaf, left):
             return None
-        # The SAME cursor must index the destination -- that is what makes this a
-        # residual chunk rather than an unrelated subtraction. Both operands get
-        # the same bounded chain walk, for the same reason: on real MLIL the
-        # address arithmetic and the subtraction each live behind their own
-        # variable, and at -O0 behind SEVERAL copies. Cross-dogfood measured the
-        # real shapes -- `rsi#2 -> rcx_1#2 -> ADD` on the destination and
-        # `rdx_1#2 -> n#2 -> rax_3#6(SUB)` on the length at -O0, and an
-        # `MLIL_SX` sitting between the operand and the SUB whenever the length
+        # The SAME cursor must OFFSET the destination at UNIT STRIDE -- that is
+        # what makes this a residual chunk rather than an unrelated subtraction,
+        # and it is the entire basis of the sentence the caller attaches
+        # ("the cumulative extent is bounded by `total`"). That sentence is the
+        # identity `cursor + (total - cursor) == total`, so it needs an ADD whose
+        # one operand IS the cursor:
+        #
+        # * a SCALED index (`&staging + (cursor << 2)`, an array of >1-byte
+        #   elements) writes `cursor*stride + (total - cursor)` bytes, which
+        #   exceeds `total` for any nonzero cursor;
+        # * a pointer LOADED from a table the cursor indexes
+        #   (`dst = [&table + cursor]`) is not offset by the cursor at all -- the
+        #   cursor picks WHICH buffer, so `total` says nothing about the extent.
+        #
+        # Testing "the cursor appears among the destination chain's reads" admits
+        # both, and then the disclosure asserts a bound that does not hold and
+        # sends the triager to the wrong question. Requiring the ADD rejects both
+        # structurally: a scale sits in a SHL/MUL whose operand chain does not
+        # resolve to the cursor, and a load is not an ADD.
+        #
+        # The chain walk stays, for the reason it was added: on real MLIL the
+        # address arithmetic lives behind its own variable, and at -O0 behind
+        # SEVERAL copies. Cross-dogfood measured `rsi#2 -> rcx_1#2 -> ADD` on the
+        # destination and `rdx_1#2 -> n#2 -> rax_3#6(SUB)` on the length at -O0,
+        # plus an `MLIL_SX` between the operand and the SUB whenever the length
         # is written `int n` (read takes size_t, so the widening is always
-        # there). A single hop found 2 of 6 real variants; the chain walk sees
-        # through copies and width extensions alike.
+        # there). A single hop found 2 of 6 real variants.
         for expr in self._def_chain(ssaf, params[dest_idx]):
-            for r in expr_reads(expr):
-                if self._chain_identities(ssaf, r) & cursor_ids:
+            if op_name(expr) != "MLIL_ADD":
+                continue
+            for side in (getattr(expr, "left", None), getattr(expr, "right", None)):
+                if self._chain_identities(ssaf, side) & cursor_ids:
                     return str(left), str(right)
         return None
 

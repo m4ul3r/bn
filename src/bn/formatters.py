@@ -3894,7 +3894,11 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             nfront = br.get("frontier")
             if bleaves:
                 desc += f"; {len(bleaves)} leaf(s)"
-                if isinstance(nfront, int) and nfront:
+                # `isinstance(True, int)` is True in Python, so a bridge that
+                # sent a FLAG where a count belongs rendered "(True frontier)":
+                # a number-shaped claim made out of a boolean. Excluded, so an
+                # unreadable value degrades to no marker like every other shape.
+                if isinstance(nfront, int) and not isinstance(nfront, bool) and nfront:
                     desc += f" ({nfront} frontier)"
             lines.append(f"  {addr}: {desc}")
 

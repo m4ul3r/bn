@@ -287,9 +287,12 @@ def _present_models(bv, models, want_callsites):
                     # is called but nothing about WHAT the call looks like, so
                     # triaging a callsite queue cost a `bn disasm` round-trip per
                     # row. `disasm` is the key the sibling address-row emitters
-                    # already use (read_xrefs, read_evidence) -- reusing the name
-                    # and the guarded call keeps one contract, not a second
-                    # spelling of the same field.
+                    # already use -- `read_xrefs` on its ref rows and `seam` on
+                    # its call-context row -- so reusing the name and the guarded
+                    # call keeps one contract rather than a second spelling of
+                    # the same field. (`read_evidence` is NOT one of them: its
+                    # `il_format._disasm_entry` returns {address, text}, a
+                    # different shape under a different key.)
                     slot["callsites"].append(
                         {"address": a, "function": fname, "kind": kind,
                          "disasm": _disasm_at(bv, ai)})

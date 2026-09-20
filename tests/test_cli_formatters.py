@@ -8083,11 +8083,15 @@ def test_per_source_frontier_marker_ignores_an_unreadable_count_812():
     # rather than interpolating a string into a "(N frontier)" claim.
     from bn.formatters import _render_taint_text
     payload = _per_source_frontier_payload()
-    payload["by_source"]["0x14"]["frontier"] = "lots"
-    row = next(ln.strip() for ln in _render_taint_text(payload).splitlines()
-               if ln.startswith("  0x14"))
-    assert row == "0x14: no sinks; 3 leaf(s)", row
-    assert "lots" not in row
+    # A bool is the one that got through: `isinstance(True, int)` is True in
+    # Python, so a bridge that sent a FLAG where a count belongs used to render
+    # "(True frontier)" -- a number-shaped claim made out of a boolean.
+    for bad in ("lots", True, 1.5, None, [2]):
+        payload["by_source"]["0x14"]["frontier"] = bad
+        row = next(ln.strip() for ln in _render_taint_text(payload).splitlines()
+                   if ln.startswith("  0x14"))
+        assert row == "0x14: no sinks; 3 leaf(s)", (bad, row)
+        assert "frontier)" not in row, (bad, row)
 
 
 def test_backward_text_renders_the_completeness_gate_812():
@@ -8280,13 +8284,26 @@ def test_taint_forward_threads_the_iteration_budget_to_the_bridge_812(fake_trans
     assert _run([])["max_iters"] == 256
 
 
-def test_taint_forward_refuses_a_zero_iteration_budget_812():
+def test_taint_forward_refuses_a_zero_iteration_budget_812(fake_transport, capsys):
     # An iteration budget of 0 analyses nothing, so the floor is 1 and the
     # argparse error must say "iterations" -- the shared `_depth_int` validator
     # would have blamed "depth", naming a different flag than the one that was
-    # wrong.
+    # wrong. Both halves are asserted: exit 2 alone stays green when the label
+    # reverts, and the label alone would not catch a floor of 0.
+    #
+    # `fake_transport({})` refuses every op, so if the validator ever stops
+    # rejecting, this fails loudly on an unexpected dispatch instead of falling
+    # through to a real bridge. The rejection happens during parsing, so at HEAD
+    # the stub is never consulted.
+    fake_transport({})
     with pytest.raises(SystemExit) as exc:
         bn.cli.main(["taint", "forward", "-f", "handler", "--source", "param:0",
                      "--target", "active", "--max-iters", "0"])
     assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "iterations must be an integer >= 1, got 0" in err, err
+    # The label, not the flag name: argparse echoes the whole usage line, which
+    # legitimately contains `--max-depth`. What must not appear is the other
+    # validator's message blaming the wrong quantity.
+    assert "depth must be an integer" not in err, err
 

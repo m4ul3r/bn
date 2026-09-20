@@ -8414,7 +8414,7 @@ def _two_recv_callsites():
 
 
 def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
-                         copy_hops: int = 0):
+                         copy_hops: int = 0, dest_shape: str = "unit"):
     """fill(fd, cap): dst = &staging + progress; n = cap - progress;
     read(fd, dst, n).
 
@@ -8437,6 +8437,19 @@ def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
     * ``copy_hops`` -- extra copy indirections on both operands, the -O0 shape
       (measured: ``rsi#2 -> rcx_1#2 -> ADD`` and ``rdx_1#2 -> n#2 -> SUB``).
       A one-hop resolver finds neither.
+    * ``dest_shape`` -- what the cursor actually indexes. ``"unit"`` is the real
+      idiom, ``&staging + cursor`` at unit stride, where the cumulative extent
+      identity `cursor + (total - cursor) == total` holds. The other two are the
+      shapes that must NOT be claimed as residual chunks, because in both the
+      write extent is NOT bounded by ``total``:
+        - ``"scaled"``: ``&staging + (cursor << 2)`` -- an array of 4-byte
+          elements. The cursor is an ELEMENT index, so the byte extent is
+          `cursor*4 + (total - cursor)`, which exceeds `total` for any
+          `cursor > 0`.
+        - ``"table_load"``: ``[&table + cursor]`` -- the destination pointer is
+          LOADED from a pointer table the cursor indexes. The cursor never
+          offsets the destination at all; it selects which buffer is written,
+          so `total` says nothing about how far the write reaches.
 
     The destination is a FIXED stack array -- precisely what this engine cannot
     size, which is why the finding must survive rather than be downgraded."""
@@ -8447,9 +8460,29 @@ def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
     sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
                 left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
                 right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
-    addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
-                      left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
-                      right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    if dest_shape == "scaled":
+        # &staging + (progress#1 << 2), the shift INLINE in the ADD -- the
+        # spelling a real lifter emits for `uint32_t staging[]`, and the one
+        # that defeated the first matcher: `expr_reads` on the ADD still yields
+        # `progress#1` even though nothing adds the cursor to the base.
+        addr_expr = FExpr("MLIL_ADD", "&staging + (progress#1 << 2)", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_LSL", "progress#1 << 2", reads=[prog1],
+                                      left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                                      right=FExpr("MLIL_CONST", "2", constant=2)))
+    elif dest_shape == "table_load":
+        # dst = [&table + progress#1]: the cursor selects a pointer OUT of a
+        # table; it is not an offset into the thing being written.
+        table = FVar("table", typ="void*[0x40]")
+        addr_expr = FExpr(
+            "MLIL_LOAD_SSA", "[&table + progress#1]", reads=[prog1],
+            src=FExpr("MLIL_ADD", "&table + progress#1", reads=[prog1],
+                      left=FExpr("MLIL_ADDRESS_OF", "&table", src=table),
+                      right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1])))
+    else:
+        addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
     instrs: list = []
     addr = 0x18
 
@@ -8637,6 +8670,54 @@ def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape
     # ...and the shape is disclosed so the reader knows the one thing to check.
     assert sink.get("length_shape") == "residual_chunk", sink
     assert "capacity" in (sink.get("detail") or "")
+    # The PR body's delivered/refused table sells the total/cursor expressions as
+    # part of the disclosure, so they are pinned too: `_make_finding`'s allow-list
+    # is explicit, and a field dropped from it would otherwise vanish silently
+    # while this test stayed green on `length_shape` alone.
+    assert sink.get("residual_total") == "cap#0", sink
+    assert sink.get("residual_cursor") == "progress#1", sink
+
+
+@pytest.mark.parametrize("dest_shape,why", [
+    ("scaled",
+     "the cursor is an ELEMENT index into a 4-byte-element array, so the byte "
+     "extent is cursor*4 + (total - cursor) and exceeds total for any cursor > 0"),
+    ("table_load",
+     "the destination pointer is LOADED from a table the cursor indexes, so the "
+     "cursor is not an offset into the thing being written at all"),
+], ids=["scaled_index", "pointer_table_load"])
+def test_residual_chunk_refuses_a_destination_the_cursor_does_not_offset_791(
+        models, dest_shape, why):
+    # The disclosure's whole value is the sentence it attaches: "the loop's
+    # cumulative extent is bounded by `total`, so the one thing to check is the
+    # destination's capacity against total". That sentence is only TRUE when the
+    # cursor offsets the destination at UNIT STRIDE -- it is the identity
+    # `cursor + (total - cursor) == total`.
+    #
+    # The matcher used to accept any destination whose def chain merely READ the
+    # cursor somewhere, which is satisfied by a scaled index and by a pointer
+    # load the cursor indexes. In both, `why` above, so the disclosure asserted
+    # a bound that does not hold and pointed the triager at the wrong question --
+    # worse than saying nothing, because it reads as analysis.
+    #
+    # The finding itself must SURVIVE: the class is the answer, the shape claim
+    # was the error. Suppressing the sink here would be the false negative this
+    # engine treats as its worst outcome.
+    func = _residual_chunk_func(dest_shape=dest_shape)
+    result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
+        func, [te.parse_locator("param:1")],
+        enabled_sink_classes={"recv_overflow"})
+    reads = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "read"]
+    assert len(reads) == 1, result["reached_sinks"]
+    sink = reads[0]["sink"]
+    assert sink["class"] == "overflow_len", sink
+    assert sink.get("length_shape") is None, (why, sink)
+    assert sink.get("residual_total") is None, sink
+    assert sink.get("residual_cursor") is None, sink
+    # And no prose remnant of the withdrawn claim -- a detail that still says
+    # "bounded by" would mislead exactly as much as the structured field.
+    assert "residual chunk" not in (sink.get("detail") or ""), sink
+    assert "cumulative extent" not in (sink.get("detail") or ""), sink
 
 
 def test_reconstruct_path_discloses_a_dropped_phi_parent_827(models):
@@ -8814,28 +8895,48 @@ def test_unconditional_root_behind_a_later_phi_parent_is_still_tagged_827(models
 
 
 def test_unconditional_tag_does_not_fire_without_an_injected_root_827(models):
-    # The must-not-fire twin: the walk now visits EVERY parent, so a join with
-    # no injected ancestor anywhere in its provenance must still attribute the
-    # finding to the declared --source. A walk that returned True on any join
-    # would erase source attribution from every phi-joined finding in the
-    # binary, which is the same information loss in the other direction.
+    # The must-not-fire twin. A walk that answered True on ANY multi-parent join
+    # would erase --source attribution from every phi-joined finding in the
+    # binary -- the same information loss as the under-tagging bug, in the other
+    # direction.
+    #
+    # The fixture must therefore reach the walk, and that is not automatic:
+    # `_rooted_at_unconditional` opens with `if not unconditional_roots: return
+    # False`, so a function with NO always-unsafe call short-circuits before the
+    # traversal and the twin proves nothing (measured: with the walk mutated to
+    # `return True` on any join, 876 tests across the taint-touching files stayed
+    # green). So `gets(&other)` is present -- it populates `unconditional_roots`
+    # and forces the early-return open -- while `other` flows nowhere near the
+    # strcpy, whose provenance is a join of the declared --source with a copy of
+    # itself. Two tainted parents, no injected ancestor: the attribution must
+    # survive.
     fd = FVar("fd")
     dst = FVar("dst", typ="char[0x40]")
+    other = FVar("other", typ="char[0x40]")
     fd0 = FSSA(fd, 0)
     v1, x1 = FSSA(FVar("v"), 1), FSSA(FVar("x"), 1)
     instrs = [
-        FInstr(0, 0x14, "MLIL_SET_VAR_SSA", "v#1 = fd#0", reads=[fd0], writes=[v1],
+        # Populates unconditional_roots with a node nothing below reads.
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&other)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&other", src=other)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "v#1 = fd#0", reads=[fd0], writes=[v1],
                src=FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])),
-        FInstr(1, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
+        FInstr(2, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
                reads=[fd0, v1], writes=[x1]),
-        FInstr(2, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
                dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
                params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
                        FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
     ]
     func = FFunc("join_clean", 0x10, FSSAFunc(instrs), params=[fd])
-    result = te.TaintEngine(FBV({0x401090: "strcpy"}), models).forward(
+    result = te.TaintEngine(FBV({0x401070: "gets", 0x401090: "strcpy"}), models).forward(
         func, [te.parse_locator("param:0")])
+    # The guard that makes this test non-vacuous: the gets() sink fired, which is
+    # the observable proof that `unconditional_roots` is non-empty and the walk
+    # was actually entered rather than short-circuited.
+    assert [s for s in result["reached_sinks"]
+            if s["sink"]["callee"] == "gets"], result["reached_sinks"]
     strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
     assert len(strcpy_sinks) == 1, result["reached_sinks"]
     assert strcpy_sinks[0]["signature"]["source"] == "param:0", strcpy_sinks[0]["signature"]
