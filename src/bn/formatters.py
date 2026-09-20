@@ -2107,8 +2107,12 @@ def _duplicate_starts_note(value: Any, *, total_key: str = "total") -> str:
     The wording states WHOLE ADDRESSES, which is what the keys count:
     `collapsed` is the number of start addresses whose records were merged (the
     larger extent kept) -- NOT a number of dropped records, which the payload
-    never states -- and `unresolved` the addresses where BN holds another record
-    whose extent could not be read, so NO record could be chosen there.
+    never states -- and `unresolved` the addresses whose records the extents
+    could not rank, so NO record could be chosen there. The unresolved half
+    names the finding and not one of its causes: BN holding a record whose
+    extent cannot be read is one way to get there, two records claiming the
+    SAME extent is the other, and a clause naming only the first is false on
+    the second (#757 review round 9).
 
     The unresolved half used to read "left with duplicate records (an extent was
     unreadable, so none was dropped)". Both clauses describe the ANSWER, and the
@@ -2156,8 +2160,8 @@ def _duplicate_starts_note(value: Any, *, total_key: str = "total") -> str:
     unresolved = _count_field(value, "duplicate_starts_unresolved")
     if unresolved:
         parts.append(
-            f"{unresolved} start address(es) hold another record whose extent "
-            "could not be read, so no record was chosen there"
+            f"{unresolved} start address(es) hold records their extents could "
+            "not rank, so no record was chosen there"
         )
     if not parts:
         return ""

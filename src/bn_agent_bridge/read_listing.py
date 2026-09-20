@@ -874,18 +874,15 @@ def _filtered_functions(
     return functions
 
 
-def _extent_known(fn) -> bool:
-    """Whether this record's extent can be read at all (#757 review)."""
-    size = il_format._function_size(fn)
-    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
-
-
 def _duplicate_extent_key(fn) -> tuple[int, int]:
     """Order two records that claim the SAME start address by extent (#757).
 
-    Only consulted for a group whose every member has a readable extent
-    (see `_collapse_duplicate_starts`), so the readable-size preference here is
-    a tiebreak among comparable records, not a substitute for comparison.
+    ``(extent is readable, extent)``, so an unreadable extent sorts below every
+    readable one and the caller can tell readable from unreadable off the key
+    without sizing the record twice. The key ORDERS; it does not by itself
+    choose: a group collapses only where every key is readable and exactly one
+    of them is the maximum, because two records of equal extent are not ranked
+    by extent at all (see `_collapse_duplicate_starts`).
     """
     size = il_format._function_size(fn)
     known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
@@ -964,18 +961,19 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartC
     rows assert ``size_known: true`` -- so a size-sorted triage or a "small
     function = stub" heuristic reads whichever record sorted first as fact, per
     address, with no round trip that could tell the two apart (#757). One
-    address is one function here: the record with the LARGER extent is retained
-    (the real body; the phantom is the smaller, stub-shaped one), and every
-    address that had more than one record is reported so the collapse is
-    disclosed rather than silent.
+    address is one function here ONLY where the extents settle it: the record
+    with the strictly LARGER extent is retained (the real body; the phantom is
+    the smaller, stub-shaped one), and every address that had more than one
+    record is reported so the collapse is disclosed rather than silent.
 
-    Returns ``(kept, collapse)``. A group whose members are all sized collapses,
-    and its larger extent wins. A group where any extent is UNREADABLE cannot be
-    ordered by that rule at all, so it is left standing and recorded as
-    ``unresolved`` -- the issue's own second answer ("or report the conflict"),
-    and the only option that cannot promote a phantom. The caller turns
-    *collapse* into the two published counts with `_StartCollapse.counts`, once
-    it knows which rows its answer kept.
+    Returns ``(kept, collapse)``. A group collapses when every member's extent
+    is readable AND one of them is strictly the largest. Any other group is
+    left standing and recorded as ``unresolved`` -- the issue's own second
+    answer ("or report the conflict"), and the only option that cannot promote
+    a phantom. Two groups reach it: one where an extent is UNREADABLE, and one
+    where the largest extent is SHARED. The caller turns *collapse* into the
+    two published counts with `_StartCollapse.counts`, once it knows which rows
+    its answer kept.
 
     Cheap by construction: addresses with a single record (every address on a
     well-formed target) are never sized -- the extent read happens only inside a
@@ -1007,16 +1005,25 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartC
         if len(group) == 1:
             kept.append(group[0])
             continue
-        if all(_extent_known(fn) for fn in group):
-            winner = max(group, key=_duplicate_extent_key)
+        extents = [_duplicate_extent_key(fn) for fn in group]
+        widest = max(extents)
+        if all(readable for readable, _ in extents) and extents.count(widest) == 1:
+            winner = group[extents.index(widest)]
             collapsed.append(winner)
             kept.append(winner)
             continue
-        # "Keep the larger extent" is undefined when a record's extent cannot be
-        # read at all: choosing the record that happens to state a size lets a
-        # stub-shaped phantom outvote a real body the view would not size -- the
-        # exact confusion #757 was filed for. The issue's other accepted answer
-        # is "report the conflict", so the group is left intact and disclosed.
+        # "Keep the larger extent" does not name a record in two cases, and
+        # both of them silently picked one anyway. An extent that cannot be
+        # read at all is the first: choosing the record that happens to state a
+        # size lets a stub-shaped phantom outvote a real body the view would
+        # not size -- the exact confusion #757 was filed for. Equal extents are
+        # the second: `max` returns the FIRST maximum, and the population
+        # arrives `(start, name)`-ordered, so the survivor of a tie was chosen
+        # by NAME -- alphabetical order deciding which of two conflicting
+        # records a reader is shown, while the row said `collapsed` and the
+        # text note said the larger extent was kept (#757 review round 9).
+        # The issue's other accepted answer is "report the conflict", so the
+        # group is left intact and disclosed in both cases.
         unresolved.append(tuple(group))
         kept.extend(group)
     return kept, _StartCollapse(tuple(collapsed), tuple(unresolved))
@@ -1026,10 +1033,12 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
                                unresolved: int = 0) -> dict[str, Any]:
     """Attach the #757 duplicate-start counts, when there were any.
 
-    ``duplicate_starts_collapsed`` counts addresses where the larger extent was
-    kept; ``duplicate_starts_unresolved`` counts addresses where BN holds
-    another record whose extent could not be read, so the issue's rule could not
-    be applied and NO record was chosen there (see `_collapse_duplicate_starts`).
+    ``duplicate_starts_collapsed`` counts addresses where one record's extent
+    was strictly the largest and that record was kept;
+    ``duplicate_starts_unresolved`` counts addresses where the extents could
+    not rank the records -- BN holds one whose extent cannot be read, or two
+    that claim the SAME extent -- so NO record was chosen there (see
+    `_collapse_duplicate_starts`).
     Both are present only when non-zero, so the common envelope keeps the key
     set every consumer already parses (the ``got_collapsed`` /
     ``self_defined_excluded`` convention in ``read_misc._imports``). A caller

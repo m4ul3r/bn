@@ -1291,8 +1291,9 @@ def _function_name_summary(bv) -> dict[str, int]:
     if unresolved_starts:
         # The other half, on the same block: `function list` discloses this and
         # `target info` did not, so an agent comparing the two read an unresolved
-        # conflict as a plain duplicate -- "the larger extent won" -- when no
-        # extent could be compared at all and both records are still live.
+        # conflict as a plain duplicate -- "the larger extent won" -- when the
+        # extents ranked nothing (one unreadable, or two the same) and both
+        # records are still live.
         summary["duplicate_starts_unresolved"] = unresolved_starts
     return summary
 

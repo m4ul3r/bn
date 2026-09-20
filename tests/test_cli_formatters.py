@@ -8121,7 +8121,7 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     both = {**collapsed, "duplicate_starts_unresolved": 2}
     text = formatters._render_function_list_text(both)
     assert "1 start address(es) carried duplicate function records" in text, text
-    assert "2 start address(es) hold another record whose extent" in text, text
+    assert "2 start address(es) hold records their extents could not rank" in text, text
     assert "no record was chosen there" in text, text
     # ...and the two halves do not read as one alarm: the collapsed part never
     # says nothing was chosen, which is the whole difference between them.
@@ -8201,11 +8201,12 @@ def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
     row that is not in the listing, and told nothing was dropped when the filter
     dropped exactly the record the conflict is about.
 
-    What IS always true when the key fires is the finding itself: BN holds
-    another record at that address whose extent could not be read, so no record
-    could be chosen -- the row shown was not picked on extent, which is
-    precisely what the collapsed half's "the larger extent was kept" promises
-    and this half cannot.
+    What IS always true when the key fires is the finding itself: the extents
+    at that address ranked nothing -- BN holds another record whose extent
+    cannot be read, or two records claim the same extent -- so no record could
+    be chosen, and the row shown was not picked on extent, which is precisely
+    what the collapsed half's "the larger extent was kept" promises and this
+    half cannot.
     """
     from bn import formatters
 
