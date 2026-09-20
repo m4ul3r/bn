@@ -2789,3 +2789,78 @@ def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
     full = read_class._class_list(ctx, None, include_all=True)
     assert [row["name"] for row in full["items"]
             if row["confidence"] == "declared-only"] == ["Widget"]
+
+
+def test_one_unreadable_declared_type_does_not_take_down_class_list_675(monkeypatch):
+    """The kind test runs over the view's WHOLE type table on a read path, so a
+    type whose `type_class` cannot be read must cost that ONE row and nothing
+    else. Unguarded it propagates out of the enumeration and `class list` --
+    including the RTTI half, which has no stake in the declared types -- raises
+    instead of answering."""
+    class _Unreadable:
+        name = "Poisoned"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct Poisoned"
+
+    bv = _declared_bv(Widget=_DeclaredType(), Poisoned=_Unreadable())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    declared = [row["name"] for row in listing["items"]
+                if row["confidence"] == "declared-only"]
+    assert declared == ["Widget"], declared
+    # The RTTI half of the same listing still answers.
+    assert [row["name"] for row in listing["items"]
+            if row["confidence"] == "rtti"], listing["items"]
+
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "Poisoned")
+    assert err.value.status == "unknown_class"
+
+
+def test_the_declared_type_table_is_read_ONCE_per_call_675(monkeypatch):
+    """The kind filter made the enumeration do real work per entry -- it follows
+    each typedef chain -- so the records and the type objects their rows take a
+    size from must come from ONE reading. Two readings cost the view's whole type
+    table twice on every `class list` and every `class show` miss, and let a
+    record be paired with a type object from a different moment of a live view.
+
+    Nothing functional fails when this regresses, which is exactly why it is
+    counted (the sibling `..._width_is_read_only_for_a_record_that_is_returned`
+    exists for the same reason)."""
+    class _CountingTypes(dict):
+        reads = 0
+
+    class _CountingBV:
+        def __init__(self, inner, types_):
+            self._inner = inner
+            self._types = types_
+
+        @property
+        def types(self):
+            type(self._types).reads += 1
+            return self._types
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    table = _CountingTypes(Widget=_DeclaredType())
+    _CountingTypes.reads = 0
+    bv = _CountingBV(_make_registry_bv(), table)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    read_class._class_list(ctx, None, include_all=True)
+    assert _CountingTypes.reads == 1, (
+        f"`class list` read the view's type table {_CountingTypes.reads} times")
+
+    _CountingTypes.reads = 0
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["size"] == {"value": "0x10", "source": "declared_type"}
+    assert _CountingTypes.reads == 1, (
+        f"`class show`'s miss path read the type table {_CountingTypes.reads} times")

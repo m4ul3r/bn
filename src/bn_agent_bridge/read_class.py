@@ -458,21 +458,30 @@ def _is_class_type(bv, name: str, type_obj) -> bool:
     fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
 
     Fails CLOSED on every reading that does not state a structure kind -- an
-    absent ``type_class``, and an alias whose chain cannot be followed (an
-    unresolvable target, a cycle, too many hops). A class surface must not
-    report a type AS a class on the strength of a read that failed; the honest
-    answer there is the unknown-class miss."""
-    _, target, reason = _follow_typedef(bv, name, type_obj)
-    if reason is not None:
-        return False
-    tc = getattr(target, "type_class", None)
-    if tc is None:
-        return False
+    absent ``type_class``, an alias whose chain cannot be followed (an
+    unresolvable target, a cycle, too many hops), and a kind that cannot be read
+    at all. A class surface must not report a type AS a class on the strength of
+    a read that failed; the honest answer there is the unknown-class miss.
+
+    The read is guarded because this runs over the view's WHOLE type table on a
+    read path: an exception from one type's ``type_class`` would otherwise take
+    down the entire `class list`, where before it could at worst contribute one
+    bogus row (:func:`_declared_size` guards its width read for the same
+    reason)."""
     try:
-        return int(tc) == _STRUCTURE_TYPE_CLASS
-    except (TypeError, ValueError):
-        pass
-    return "Structure" in str(getattr(tc, "name", None) or tc)
+        _, target, reason = _follow_typedef(bv, name, type_obj)
+        if reason is not None:
+            return False
+        tc = getattr(target, "type_class", None)
+        if tc is None:
+            return False
+        try:
+            return int(tc) == _STRUCTURE_TYPE_CLASS
+        except (TypeError, ValueError):
+            pass
+        return "Structure" in str(getattr(tc, "name", None) or tc)
+    except Exception:
+        return False
 
 
 def _declared_types(bv) -> dict[str, Any]:
@@ -511,9 +520,16 @@ def _declared_size(type_obj) -> dict[str, Any] | None:
     return {"value": hex(width), "source": "declared_type"} if width > 0 else None
 
 
-def _declared_type_records(ctx, bv) -> dict[str, dict[str, Any]]:
-    """``{name: ClassRecord}`` for the view's declared CLASS types (#675.2) --
-    whatever :func:`_declared_types` admits, and nothing else.
+def _declared_type_records(declared: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``{name: ClassRecord}`` for *declared* -- one :func:`_declared_types`
+    reading of the view, and nothing else (#675.2).
+
+    Takes the mapping rather than the view because both callers need the type
+    objects too (for the size a returned record states), and the kind filter now
+    does real work per entry: re-enumerating here made every `class list` and
+    every `class show` miss pay for the view's type table twice. One reading also
+    means the records and the type objects a caller pairs them with cannot come
+    from two different moments of a live view.
 
     Every record is in the class registry's shape, so one renderer and one JSON
     consumer read both halves of the lens, and every record carries
@@ -525,9 +541,7 @@ def _declared_type_records(ctx, bv) -> dict[str, dict[str, Any]]:
     canonical ``ctx._type_entry`` -- which walks and renders a type's members --
     are drill-downs the CALLERS attach to a record they return (a show's matches:
     both; a listing's page rows: the size), exactly as the vtable layout and
-    object size are drill-downs on the RTTI side. ``ctx`` is unused today, kept
-    for the callers' uniform ``(ctx, bv)`` seam shape, as in
-    :func:`_build_class_registry`."""
+    object size are drill-downs on the RTTI side."""
     return {
         name: {
             "name": name,
@@ -541,7 +555,7 @@ def _declared_type_records(ctx, bv) -> dict[str, dict[str, Any]]:
             "confidence": _DECLARED_CONFIDENCE,
             "notes": [_DECLARED_TYPE_NOTE],
         }
-        for name in _declared_types(bv)
+        for name in declared
     }
 
 
@@ -732,13 +746,14 @@ def _class_list(
     # evidence, and `--all` (the gate that admits non-RTTI clusters) is what
     # surfaces the rest.
     needle = query.lower() if query else None
+    # ONE live reading of the view's declared class types: the records below and
+    # the type objects their returned rows take a size from (`_declared_size`)
+    # both come from it.
+    declared_types = _declared_types(bv)
     declared_only = [
-        rec for name, rec in _declared_type_records(ctx, bv).items()
+        rec for name, rec in _declared_type_records(declared_types).items()
         if name not in registry and (needle is None or needle in name.lower())
     ]
-    # The type objects behind the declared rows, for the size their ROWS state --
-    # read once here and consulted for the returned page only (`_declared_size`).
-    declared_types = _declared_types(bv) if declared_only else {}
     candidates = []
     library_suppressed = 0
     vendor_suppressed = 0
@@ -1462,18 +1477,19 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     registry = _build_class_registry(ctx, bv)
     matches = _resolve_class_names(registry, name)
     if not matches:
-        # #675.2: before the miss message, fall back to the view's DEFINED types --
-        # the RTTI/symbol half is blind to a class the user DECLARED, which has no
-        # `_ZTV`/`_ZTI` symbol and no demangled method to cluster. Read LIVE and
-        # resolved by the same name resolution as the registry, so a declared
-        # `ns::Widget` still answers a bare `Widget` query. The declared records
-        # come back as they were built: `_enrich`'s RTTI drill-downs (vtable
-        # layout, bases, instances) are precisely what the note says this view has
-        # no evidence for, so running them would only decorate a miss.
-        declared = _declared_type_records(ctx, bv)
+        # #675.2: before the miss message, fall back to the view's declared CLASS
+        # types -- the RTTI/symbol half is blind to a class the user DECLARED,
+        # which has no `_ZTV`/`_ZTI` symbol and no demangled method to cluster.
+        # ONE live reading (records and type objects both), resolved by the same
+        # name resolution as the registry, so a declared `ns::Widget` still
+        # answers a bare `Widget` query. The declared records come back as they
+        # were built: `_enrich`'s RTTI drill-downs (vtable layout, bases,
+        # instances) are precisely what the note says this view has no evidence
+        # for, so running them would only decorate a miss.
+        declared_types = _declared_types(bv)
+        declared = _declared_type_records(declared_types)
         declared_matches = _resolve_class_names(declared, name)
         if declared_matches:
-            declared_types = _declared_types(bv)
             records = []
             for match in declared_matches:
                 rec = declared[match]
