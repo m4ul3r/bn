@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import select
 import stat
 import sys
 import time
@@ -1469,12 +1470,25 @@ def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
     The rule is about what can BLOCK, not about file kind. #864 asked the
     decision to cover process substitution explicitly, and a blanket
     non-regular refusal answers it by deleting it: ``--file <(cmd)`` is handed
-    over as ``/dev/fd/N``, which stats as a FIFO whose writer is running and
-    therefore cannot hang. It is read by `_read_fifo_text`, which never blocks
-    in ``open``. ``--file /dev/null`` stays the "empty input" spelling #855's
-    scope note protects. Everything else non-regular -- a socket, a block
-    device, a streaming character device like ``/dev/zero`` -- is refused by
-    kind, because nothing bounds those reads.
+    over as ``/dev/fd/N``, which stats as a FIFO. It is read by
+    `_read_fifo_text`, which never blocks in ``open`` and bounds the wait for
+    each next byte. ``--file /dev/null`` stays the "empty input" spelling
+    #855's scope note protects. Everything else non-regular -- a socket, a
+    block device, a streaming character device like ``/dev/zero`` -- is refused
+    by kind, because nothing bounds those reads.
+
+    The other half of #864's question, ``--file -``: it is NOT a spelling this
+    CLI gives a meaning to. ``-`` is a path like any other and is reported as a
+    missing file, which is the honest answer -- inventing a dash convention
+    here would give one reader a stdin spelling its four siblings do not share.
+    ``/dev/stdin`` and ``<(cmd)`` are the streaming spellings, both FIFOs, both
+    read by the bounded path above, and the by-kind refusal names them.
+
+    Every refusal here raises `BridgeError`, which is the same structured error
+    envelope at rc 2 that #754 established for the directory case at this very
+    call site -- the `invalid_request` status at rc 3 belongs to the mutation
+    preflight, which these readers run BEFORE, not inside, so matching it here
+    would make the input refusal claim a preflight it never reached.
     """
     try:
         st = path.stat()
@@ -1498,31 +1512,43 @@ def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
 
 
-# One page: the FIFO drain below reads in whole chunks rather than byte-wise,
-# and the first of them is also the probe that decides whether a writer exists.
+# One page: the FIFO drain below reads in whole chunks rather than byte-wise.
 _FIFO_CHUNK = 1 << 16
+# How long the drain will wait for the NEXT byte before it gives up. An idle
+# bound, not a total one: a producer that streams slowly but steadily resets it
+# on every chunk and is never cut off, while one that says nothing at all for
+# this long is indistinguishable from hung to the caller -- and an invisible
+# hang is the whole defect #864 reports. Generous enough to cover any realistic
+# generator's startup, short enough that the answer is a diagnosis.
+_FIFO_IDLE_TIMEOUT = 30.0
 
 
 def _read_fifo_text(path: Path, *, what: str) -> str:
-    """Read a FIFO to EOF without ever blocking in ``open`` (#864).
+    """Drain a FIFO to EOF under a bound, and refuse an empty one (#864).
 
-    Opening ``O_NONBLOCK`` returns at once and turns the hang into a question
-    the first read answers:
+    Three distinct ways a FIFO read hangs, and what each gets:
 
-    * EOF immediately -- no writer is attached and nothing is buffered, so
-      there is nothing to wait for. That is the ``mkfifo``-with-nobody case the
-      issue measured at rc=124, and it is refused rather than reported as an
-      empty input: "deliberately empty" is spelled ``/dev/null``. A process
-      substitution whose writer exited without writing is indistinguishable
-      from it at this point and is refused the same way.
-    * ``EAGAIN`` -- a writer IS attached and simply has not produced its first
-      byte yet. That is the ordinary process-substitution shape
-      (``--file <(sleep 1; gen)``), so the drain waits for it.
-
-    Past the first read the pace belongs to the caller's own writer, exactly as
-    it does for ``cat <(cmd)``, so the rest is an ordinary blocking read: a
-    wall-clock cap here would fail a slow but correct generator, which is a new
-    wrong answer rather than a fix for the old one.
+    * **No writer attached** -- ``open(fifo, O_RDONLY)`` does not return until
+      one appears. That is the rc=124-with-no-envelope hang the issue measured.
+      ``O_NONBLOCK`` makes the open return at once.
+    * **A writer attached but silent** (``mkfifo f; sleep 60 > f &``, or a
+      stalled upstream behind ``--file /dev/stdin``) -- the same invisible hang
+      from the other side, so the wait for each next byte is bounded by
+      `_FIFO_IDLE_TIMEOUT` and the timeout is a structured refusal. ``EAGAIN``
+      alone is NOT a refusal: it just means the writer has nothing ready yet,
+      which is the ordinary ``--file <(sleep 1; gen)`` shape, so the drain
+      waits for it.
+    * **A writer that delivers nothing at all** -- refused on the DELIVERED
+      BYTE COUNT, never on which state the first probe happened to catch.
+      Whether the writer had already exited (the probe sees EOF) or was still
+      attached and then exited without writing (the probe sees ``EAGAIN``) is
+      pure scheduling; deciding on that would accept or refuse the same
+      ``--file <(cmd)`` at random. An empty pipe is refused rather than read as
+      empty input because it cannot be told apart from a producer that never
+      ran -- a ``<(gen)`` whose command was missing or died looks exactly like
+      one that chose to emit nothing, and accepting it turns a failed generator
+      into a successful no-op mutation. ``/dev/null`` is the unambiguous
+      spelling for "deliberately empty" and keeps working.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -1530,26 +1556,38 @@ def _read_fifo_text(path: Path, *, what: str) -> str:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
     chunks: list[bytes] = []
     try:
-        try:
-            first = os.read(fd, _FIFO_CHUNK)
-        except BlockingIOError:
-            first = None
-        if first == b"":
-            raise BridgeError(
-                f"{what} is a FIFO with no writer attached and nothing buffered: "
-                f"{path}. Reading it would have blocked forever, so it is refused "
-                "instead of hung on; pass a regular file, /dev/null for empty "
-                "input, or a process substitution whose writer is running"
-            )
-        if first is not None:
-            chunks.append(first)
-        os.set_blocking(fd, True)
-        while chunk := os.read(fd, _FIFO_CHUNK):
+        while True:
+            try:
+                chunk = os.read(fd, _FIFO_CHUNK)
+            except BlockingIOError:
+                # A writer is attached with nothing ready. Wait for it, but not
+                # forever: an unbounded wait here reproduces the reported
+                # symptom exactly, just from the writer's side of the pipe.
+                if not select.select([fd], [], [], _FIFO_IDLE_TIMEOUT)[0]:
+                    raise BridgeError(
+                        f"{what} is a FIFO whose writer sent nothing for "
+                        f"{_FIFO_IDLE_TIMEOUT:g}s: {path}. A writer that is "
+                        "attached but silent blocks the read forever, so the "
+                        "wait is bounded and refused rather than hung on; write "
+                        "the input to a regular file, or use a producer that "
+                        "streams"
+                    ) from None
+                continue
+            if not chunk:
+                break
             chunks.append(chunk)
     except OSError as exc:
         raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
     finally:
         os.close(fd)
+    if not chunks:
+        raise BridgeError(
+            f"{what} is a FIFO that delivered no data: {path}. An empty pipe "
+            "cannot be told apart from a producer that never ran, so it is "
+            "refused instead of read as an empty input; pass a regular file, "
+            "/dev/null if you meant empty input, or a process substitution that "
+            "actually writes"
+        )
     try:
         return b"".join(chunks).decode("utf-8")
     except UnicodeDecodeError as exc:

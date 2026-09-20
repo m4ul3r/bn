@@ -7998,10 +7998,12 @@ def test_empty_results_use_one_vocabulary():
     """#824: renderers disagreed between "none", "no targets" and "(no tags)" for
     the same state; every empty result comes from _empty_result now.
 
-    The rows below are the whole population of "nothing to show" renders, not a
-    sample: a partial sweep is what left `data vars` printing a bare `none` next
-    to a `data symbols` page printing `(none)` for the identical state, so the
-    sibling pair is asserted EQUAL rather than each against its own literal.
+    The rows below are every render that once spelled the empty state its own
+    way -- the ones that share `_EMPTY_RESULT` by construction are not listed,
+    because the shared constant is what makes them agree. A partial sweep is
+    what left `data vars` printing a bare `none` next to a `data symbols` page
+    printing `(none)` for the identical state, so the sibling pair is asserted
+    EQUAL rather than each against its own literal.
     The two reasoned-absence lines (#448 init arrays, #816 callsites under a
     partial caller scan) say more than "empty" and are deliberately not this
     vocabulary -- their own tests pin them.
