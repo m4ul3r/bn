@@ -2829,13 +2829,47 @@ class TaintEngine:
         # plus an `MLIL_SX` between the operand and the SUB whenever the length
         # is written `int n` (read takes size_t, so the widening is always
         # there). A single hop found 2 of 6 real variants.
+        # The ADD must be `base + cursor` with the cursor applied EXACTLY ONCE to
+        # an otherwise opaque base. `any ADD with the cursor as an operand` is
+        # not enough, because the other operand can itself carry arithmetic:
+        #   (&buf + hdrlen) + cursor -> extent is `hdrlen + total`
+        #   (&buf + cursor)  + cursor -> extent is `total + cursor` (stride 2)
+        # In both, a destination that genuinely holds `total` bytes still
+        # overflows, so the sentence would send the reader to the wrong question.
+        # "Opaque" is deliberately broad -- an address-of, a const pointer, a
+        # malloc return, a bare pointer parameter all qualify -- because the
+        # extent identity holds for ANY base the cursor offsets once. Only
+        # further arithmetic in the base disqualifies it.
         for expr in self._def_chain(ssaf, params[dest_idx]):
             if op_name(expr) != "MLIL_ADD":
                 continue
-            for side in (getattr(expr, "left", None), getattr(expr, "right", None)):
-                if self._chain_identities(ssaf, side) & cursor_ids:
+            sides = (getattr(expr, "left", None), getattr(expr, "right", None))
+            for i, side in enumerate(sides):
+                if not (self._chain_identities(ssaf, side) & cursor_ids):
+                    continue
+                if self._is_opaque_base(ssaf, sides[1 - i]):
                     return str(left), str(right)
         return None
+
+    # Ops that make a pointer operand something other than a plain base: any of
+    # them means the cursor is not the only displacement applied.
+    _BASE_DISQUALIFYING_OPS = frozenset({
+        "MLIL_ADD", "MLIL_SUB", "MLIL_LSL", "MLIL_LSR", "MLIL_ASR",
+        "MLIL_MUL", "MLIL_MULU_DP", "MLIL_MULS_DP", "MLIL_ADD_OVERFLOW",
+    })
+
+    def _is_opaque_base(self, ssaf: Any, expr: Any) -> bool:
+        """Whether *expr* is a pointer base carrying no displacement of its own.
+
+        The non-cursor half of a residual-chunk destination. A base reached
+        through copies and width extensions still counts (that is what
+        ``_def_chain`` sees through); one computed by further address arithmetic
+        does not, because then the write extent is that displacement PLUS the
+        chunk rather than the chunk alone."""
+        if expr is None:
+            return False
+        return not any(op_name(e) in self._BASE_DISQUALIFYING_OPS
+                       for e in self._def_chain(ssaf, expr))
 
     def _def_chain(self, ssaf: Any, expr: Any, limit: int = 8) -> list[Any]:
         """*expr* and the expressions it resolves to through pure SSA copies and

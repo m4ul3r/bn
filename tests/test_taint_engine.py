@@ -8479,6 +8479,48 @@ def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
             src=FExpr("MLIL_ADD", "&table + progress#1", reads=[prog1],
                       left=FExpr("MLIL_ADDRESS_OF", "&table", src=table),
                       right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1])))
+    elif dest_shape == "extra_offset":
+        # (&staging + hdrlen) + progress#1: a second, non-constant offset sits
+        # between the base and the cursor, so the cumulative extent is
+        # `hdrlen + total`, not `total`.
+        hdr1 = FSSA(FVar("hdrlen"), 1)
+        addr_expr = FExpr(
+            "MLIL_ADD", "(&staging + hdrlen#1) + progress#1", reads=[hdr1, prog1],
+            left=FExpr("MLIL_ADD", "&staging + hdrlen#1", reads=[hdr1],
+                       left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                       right=FExpr("MLIL_VAR_SSA", "hdrlen#1", reads=[hdr1])),
+            right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "add_add":
+        # (&staging + progress#1) + progress#1: stride 2 spelled as add-add, so
+        # the extent is `total + cursor`.
+        addr_expr = FExpr(
+            "MLIL_ADD", "(&staging + progress#1) + progress#1", reads=[prog1],
+            left=FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                       left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                       right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1])),
+            right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "swapped":
+        # progress#1 + &staging -- the same unit-stride idiom with the operands
+        # the other way round. MUST still be claimed.
+        addr_expr = FExpr("MLIL_ADD", "progress#1 + &staging", reads=[prog1],
+                          left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                          right=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging))
+    elif dest_shape == "heap_base":
+        # buf#1 = malloc(cap); buf#1 + progress#1 -- an OPAQUE base (a call
+        # return, not an address-of) at unit stride. MUST still be claimed: the
+        # identity holds for any base the cursor offsets once.
+        heap1 = FSSA(FVar("buf"), 1)
+        addr_expr = FExpr("MLIL_ADD", "buf#1 + progress#1", reads=[heap1, prog1],
+                          left=FExpr("MLIL_VAR_SSA", "buf#1", reads=[heap1]),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "sub_dest":
+        # &staging - progress#1: the cursor DISPLACES the base downward, so the
+        # write runs backwards out of the buffer and `total` bounds nothing. Its
+        # only job here is to pin the `op_name(expr) != "MLIL_ADD"` guard, which
+        # a later simplification could drop without any other case noticing.
+        addr_expr = FExpr("MLIL_SUB", "&staging - progress#1", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
     else:
         addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
                           left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
@@ -8640,7 +8682,10 @@ def test_forward_run_params_echo_the_configured_knobs_812(models):
     {"widen_len": True},                 # `int n = cap - progress` -> SX before the SUB
     {"copy_hops": 2},                    # -O0: several copies on both operands
     {"widen_len": True, "copy_hops": 2},  # both at once
-], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied"])
+    {"dest_shape": "swapped"},           # cursor + base, operands the other way
+    {"dest_shape": "heap_base"},         # an OPAQUE base (a malloc return), unit stride
+], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied",
+        "swapped_operands", "opaque_heap_base"])
 def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape):
     # #791 asked for the chunked-read residual (`n = cap - progress;
     # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
@@ -8685,7 +8730,18 @@ def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape
     ("table_load",
      "the destination pointer is LOADED from a table the cursor indexes, so the "
      "cursor is not an offset into the thing being written at all"),
-], ids=["scaled_index", "pointer_table_load"])
+    ("extra_offset",
+     "a second non-constant offset sits between the base and the cursor, so the "
+     "cumulative extent is hdrlen + total, not total -- a destination that holds "
+     "exactly total bytes still overflows"),
+    ("add_add",
+     "the cursor is added TWICE (stride 2 spelled add-add), so the extent is "
+     "total + cursor"),
+    ("sub_dest",
+     "the cursor is SUBTRACTED from the base, so the write runs backwards out "
+     "of the buffer and total bounds nothing"),
+], ids=["scaled_index", "pointer_table_load", "extra_offset", "cursor_added_twice",
+        "subtracting_destination"])
 def test_residual_chunk_refuses_a_destination_the_cursor_does_not_offset_791(
         models, dest_shape, why):
     # The disclosure's whole value is the sentence it attaches: "the loop's
@@ -8994,3 +9050,51 @@ def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
     # The row's own leaf list is untouched -- `frontier` is an added count, not
     # a filter, so a reader can still see the non-blocking row it excluded.
     assert len(out["by_source"]["0xa"]["leaves"]) == 3, out["by_source"]["0xa"]
+
+
+def test_forward_attributed_union_keeps_the_unread_callee_disclosure_811(models):
+    # #811's structural marker has to survive the ATTRIBUTED path, which is the
+    # DEFAULT whenever a single ret/arg source spreads over several callsites --
+    # so it is the shape most runs actually take. The union recomputes stats
+    # from the per-callsite results, and an omission there would answer as
+    # though every callee body was read while one was not: exactly the honesty
+    # gap #811 exists to close, in the path a user hits first.
+    #
+    # Canned per-callsite runs through the `_forward_run` seam, because the
+    # question is whether the UNION carries the field forward, not whether a
+    # synthetic callee can be made unreadable twice.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run(incomplete):
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0,
+                      "truncated": False,
+                      "analysis_incomplete": bool(incomplete),
+                      "analysis_incomplete_functions": list(incomplete)},
+            "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    # Callsite A read everything; callsite B could not read `helper_b`. The union
+    # must report the hole -- an OR, not the first run's answer.
+    runs = iter([_run([]), _run(["helper_b"])])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["stats"]["analysis_incomplete"] is True, out["stats"]
+    assert out["stats"]["analysis_incomplete_functions"] == ["helper_b"], out["stats"]
+    # ...and the gate must act on it: a clean per-callsite run said all-clear,
+    # and the union may not inherit that claim over an unread body.
+    diag = out.get("diagnostics") or {}
+    assert diag.get("analysis_incomplete") is True, diag
+    assert diag.get("safe_to_report_all_clear") is False, diag
+    assert "could not be analysed" in (diag.get("all_clear_reason") or ""), diag

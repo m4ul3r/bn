@@ -310,8 +310,11 @@ def test_present_callsites_carry_one_line_of_context_794():
     # #794: the row answered {address, function, kind}, which says WHERE a
     # modeled sink is called but nothing about WHAT the call looks like, so
     # triaging a callsite queue cost a `bn disasm` round-trip per row. The key
-    # is `disasm`, matching the sibling address-row emitters (read_xrefs /
-    # read_evidence) rather than inventing a second spelling for one field.
+    # is `disasm`, matching the sibling address-row emitters that actually use
+    # it -- `read_xrefs` on its ref rows and `seam` on its call-context row --
+    # rather than inventing a second spelling for one field. (`read_evidence` is
+    # NOT one of them: `il_format._disasm_entry` returns {address, text} under a
+    # different key. An earlier version of this comment cited it and was wrong.)
     class _BVDisasm(_BVTriage):
         def get_disassembly(self, a):
             return {0x5010: "call    system", 0x2000: "jmp     qword [rip+0x2f1a]"}.get(a, "")
