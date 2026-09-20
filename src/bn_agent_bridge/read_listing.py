@@ -933,6 +933,28 @@ class _StartCollapse(NamedTuple):
         )
         return collapsed, unresolved
 
+    def markers(self) -> dict[int, str]:
+        """``{id(record): "collapsed" | "unresolved"}`` for the rows to label.
+
+        The two counts say how many ADDRESSES a whole answer touched, which is
+        not locatable: under ``--sort size`` the unsized record of an
+        unresolved pair sorts to 0 and its sized twin to its extent, so the two
+        records of one start land far apart or on different pages, and a
+        reader holding either row cannot tell that its ``size_known: true``
+        never won a comparison. The marker rides with the ROW instead, so it
+        survives every sort and window, and it answers the one question an
+        envelope list of affected addresses cannot: WHICH record at that
+        address was picked on extent.
+
+        Empty on a clean view (both tuples are empty), so a listing that
+        collapsed nothing pays nothing and publishes no new key.
+        """
+        marks = {id(fn): "collapsed" for fn in self.collapsed}
+        for group in self.unresolved:
+            for fn in group:
+                marks[id(fn)] = "unresolved"
+        return marks
+
 
 def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartCollapse]:
     """Keep ONE record per start address, and record the addresses that had more.
@@ -1015,14 +1037,21 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     why -- and whether the retained row carries the LARGER extent or was never
     ranked at all.
 
-    SCOPING, because the two listing commands disagreed about it twice (#757
-    review): the counts describe the rows the answer CONTAINS, and they are
-    taken from `_StartCollapse.counts` against those rows, never from the
-    collapse pass. The collapse itself runs on the WHOLE address-filtered
-    population in both commands -- `function search` included, so the query is
-    not a collapse boundary and cannot hand back the phantom twin by naming it.
-    An address counts while any record of it survives, through ``--min-size``,
-    ``--named`` and the query alike.
+    SCOPING -- ONE rule, because the two listing commands disagreed about it
+    twice and the prose disagreed with the code a third time (#757 review):
+    the counts describe the population ``total`` reports, and they are taken
+    from `_StartCollapse.counts` against exactly that population, never from
+    the collapse pass. Every ROW FILTER is inside the scope (an address counts
+    while any record of it survives ``--min-size``, ``--named`` and the query
+    alike, and leaves the counts with its last record); PAGING is outside it
+    (``--offset``/``--limit`` slice the answer after the counts are taken, so a
+    window can legitimately carry a count for an address none of its rows
+    holds -- which is why the text note names the total it counted against,
+    and why the per-row `_StartCollapse.markers` label exists for the rows
+    that ARE in front of the reader). The collapse itself runs on the WHOLE
+    address-filtered population in both commands -- `function search`
+    included, so the query is not a collapse boundary and cannot hand back a
+    merged-away record by naming it.
 
     The two shapes that rule exists to refuse: counting at the collapse
     published ``duplicate_starts_collapsed: 1`` beside ``total: 0``, a key no
@@ -1095,7 +1124,8 @@ def _order_function_population(
 _NO_SIZE = object()
 
 
-def _function_list_row(fn, *, display_name: str | None = None, size: Any = _NO_SIZE) -> dict[str, Any]:
+def _function_list_row(fn, *, display_name: str | None = None, size: Any = _NO_SIZE,
+                       duplicate_start: str | None = None) -> dict[str, Any]:
     """Build ONE ``function list`` / ``function search`` row (#814).
 
     Called once per RETURNED row, never per filtered function. Everything else a
@@ -1105,6 +1135,12 @@ def _function_list_row(fn, *, display_name: str | None = None, size: Any = _NO_S
     population-wide projection. ``search`` passes the ``display_name`` it already
     computed while matching (it is a match key there), and ``--sort size`` passes
     the size the ordering pass already read; both otherwise stay deferred.
+
+    ``duplicate_start`` labels the row when its start address carried more than
+    one record (`_StartCollapse.markers`): ``"collapsed"`` on the record that
+    won on extent, ``"unresolved"`` on every record of an address that could
+    not be ranked. Absent -- not null -- on a row that was never part of a
+    collision, so a clean listing keeps the key set it always had (#757).
     """
     row = {
         "name": fn.name,
@@ -1116,6 +1152,8 @@ def _function_list_row(fn, *, display_name: str | None = None, size: Any = _NO_S
         row["display_name"] = display_name
     if size is not _NO_SIZE:
         row["size"] = size
+    if duplicate_start is not None:
+        row["duplicate_start"] = duplicate_start
     return row
 
 
@@ -1178,13 +1216,17 @@ def _list_functions(
     # projection, then drops.
     sizes = _order_function_population(functions, sort, reverse)
     start, stop = read_misc._page_window(len(functions), offset=offset, limit=limit)
+    # Per-row labels for the collided records, built once for the page. Empty
+    # dict on a clean view, so this costs nothing where nothing collided.
+    marks = collapse.markers()
     items = [
         # #653.4's `imported`/`auto_named` are page projections, NOT full-set
         # fields: `is_imported_function` is a per-function `fn.symbol` lookup,
         # the same cost #639 moved off the filtered set. Computing them here
         # would hand back most of that win. The --named/--unnamed FILTER above
         # reads the live Function directly, so it is unaffected.
-        _function_list_row(fn, size=sizes[id(fn)] if sort == "size" else _NO_SIZE)
+        _function_list_row(fn, size=sizes[id(fn)] if sort == "size" else _NO_SIZE,
+                           duplicate_start=marks.get(id(fn)))
         for fn in functions[start:stop]
     ]
     result = read_misc._paged_envelope(
@@ -1376,11 +1418,15 @@ def _search_functions(
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
+    # Same per-row labels as `function list`: one record of a collided start
+    # must not read differently depending on which command returned it.
+    marks = collapse.markers()
     items = [
         _function_list_row(
             fn,
             display_name=display,
             size=sizes[id(fn)] if sort == "size" else _NO_SIZE,
+            duplicate_start=marks.get(id(fn)),
         )
         for fn, display in matched[start:stop]
     ]

@@ -4345,7 +4345,12 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `_render_function_list_text` in both its demangled and undemangled probe
     # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
     # carried over from a comment.
-    assert swept == 4984, f"the raise sweep ran {swept} renders, not 4984"
+    # #757 review round 5: 4984 + 32 -- FOUR more discovered (renderer, ctx)
+    # pairs, 8 bogus values each. The same two duplicate-start counts are now
+    # read by `_render_target_summary` (the note sits under the function count
+    # it modifies) and therefore by `_render_target_info_text`, which composes
+    # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
+    assert swept == 5016, f"the raise sweep ran {swept} renders, not 5016"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4512,7 +4517,11 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # `function list` / `--count` probe forms), x 2 benign payloads each. A
     # well-formed count must not draw a "malformed" note, which is what this
     # mirror checks. Measured by diffing the population.
-    assert checked == 1449, f"the mirror ran {checked} renders, not 1449"
+    # #757 review round 5: 1449 + 8 -- the same FOUR discovered pairs the raise
+    # sweep gained (the two duplicate-start counts now read by
+    # `_render_target_summary` and by `_render_target_info_text` composing it),
+    # x 2 benign payloads each. Measured by diffing the population.
+    assert checked == 1457, f"the mirror ran {checked} renders, not 1457"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8219,3 +8228,79 @@ def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
         {"items": [], "duplicate_starts_collapsed": 1})
     assert "the larger extent was kept" in collapsed_only, collapsed_only
     assert "no record was chosen" not in collapsed_only, collapsed_only
+
+
+def test_the_duplicate_starts_note_scopes_its_counts_to_the_whole_answer_757():
+    """The note states WHICH population it counted, once, and it is not the page.
+
+    Both halves were written as claims about the answer in front of the reader
+    -- "the larger extent was kept", "no record was chosen there" -- while the
+    counts are taken against the filtered population `total` reports, before
+    `--offset`/`--limit`. On a window holding none of the counted addresses
+    that reads as a statement about the rows on screen, which is the same
+    clause-describes-the-answer defect the unresolved half already lost once.
+    Naming the denominator fixes both halves at once: the reader can see that
+    7 is not the 3 rows in front of them.
+    """
+    from bn import formatters
+
+    paged = {"kind": "functions",
+             "items": [{"name": "fn_0", "address": "0x402000"},
+                       {"name": "fn_1", "address": "0x402010"},
+                       {"name": "fn_2", "address": "0x402020"}],
+             "total": 7, "returned": 3, "offset": 3, "has_more": True,
+             "duplicate_starts_collapsed": 1, "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(paged)
+    # The scope is stated ONCE, names the population, and says it is not the page.
+    assert text.count("not only the rows shown") == 1, text
+    assert "all 7 function(s) this answer reports" in text, text
+    # ...and both halves keep their own distinct finding under it.
+    assert "the larger extent was kept" in text, text
+    assert "no record was chosen there" in text, text
+
+    # `--count` has no rows at all, and the same sentence still reads true
+    # against the number it is printed beside.
+    counted = formatters._render_function_count_text(
+        {"kind": "functions", "count": 7, "total": 7, "duplicate_starts_collapsed": 1})
+    assert "all 7 function(s) this answer reports" in counted, counted
+
+    # An envelope with no total to count against states the scope without
+    # inventing a denominator -- never a fabricated "0 functions".
+    bare = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "not only the rows shown" in bare, bare
+    assert "function(s) this answer reports" not in bare, bare
+
+
+def test_a_duplicate_start_row_is_labelled_in_text_757():
+    """The per-row marker reaches the TEXT face, like every other #757
+    disclosure on this PR.
+
+    `duplicate_start` on the row is what tells a reader holding one row of a
+    `--sort size` page that its size never won a comparison; publishing it in
+    JSON only would rebuild the JSON-only disclosure the whole change removes.
+    An unknown value still prints rather than being dropped, so a marker added
+    to the bridge cannot go invisible here.
+    """
+    from bn import formatters
+
+    rows = [
+        {"name": "widget_poll", "address": "0x401014", "size": 96,
+         "basic_block_count": 3, "duplicate_start": "collapsed"},
+        {"name": "tick_stub", "address": "0x401100", "size": 0,
+         "basic_block_count": 0, "duplicate_start": "unresolved"},
+        {"name": "widget_init", "address": "0x401000", "size": 28,
+         "basic_block_count": 1},
+    ]
+    text = formatters._render_name_address_rows(rows)
+    poll, stub, init = text.splitlines()
+    assert poll.endswith("[duplicate start: kept on extent]"), poll
+    assert stub.endswith("[duplicate start: not ranked]"), stub
+    assert "duplicate start" not in init, init
+    # The size column still renders, so the marker qualifies the size rather
+    # than replacing it.
+    assert "(96 bytes, 3 blocks)" in poll, poll
+    # A value this renderer does not know about is shown verbatim, not dropped.
+    unknown = formatters._render_name_address_rows(
+        [{"name": "fn", "address": "0x401200", "duplicate_start": "shadowed"}])
+    assert unknown.endswith("[duplicate start: shadowed]"), unknown

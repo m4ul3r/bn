@@ -15,6 +15,7 @@ Two halves, both required by the issue:
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -795,6 +796,58 @@ def test_target_info_publishes_the_unresolved_duplicate_starts_757(monkeypatch):
     assert "duplicate_starts_collapsed" not in summary
 
 
+def test_target_info_text_discloses_the_duplicate_start_collapse_757(monkeypatch):
+    """`target info` is the command every agent runs first, and its TEXT face
+    printed a post-collapse function count with nothing saying so.
+
+    This change made `_function_name_summary` collapse duplicated starts, so
+    the number in `functions: N functions (...)` is no longer BN's record
+    count -- and the note that explains the difference was wired only into
+    `function list` and `--count`. A text reader therefore saw a silently
+    smaller number on the first command they run, which is exactly the
+    JSON-only disclosure the rest of this change removes.
+
+    Measured end to end: the count and the note both come from the one
+    collapse, so neither can drift from the other.
+    """
+    from bn.commands.binary import _render_target_info_text_with_annotations
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub", total_bytes=4),     # ranked, merged
+        _FakeFunction(0x401100, "widget_tick", total_bytes=64),
+        _FakeFunction(0x401100, "tick_stub"),                    # extent unreadable
+    ])
+    summary = bridge._function_name_summary(bv)
+    # Five BN records, four functions: the number the text face prints.
+    assert summary["function_count"] == 4
+    text = _render_target_info_text_with_annotations(
+        {"selector": "svc", "arch": "x86_64", **summary})
+
+    assert "functions: 4 functions (4 named, 0 auto-named)" in text, text
+    note = [line for line in text.splitlines() if "duplicate starts" in line]
+    assert len(note) == 1, text
+    # Immediately under the count it qualifies, not appended after the whole card.
+    assert text.splitlines().index(note[0]) == text.splitlines().index(
+        next(line for line in text.splitlines() if "functions: 4 functions" in line)) + 1, text
+    assert "1 start address(es) carried duplicate function records" in note[0], note
+    assert "the larger extent was kept" in note[0], note
+    assert "no record was chosen there" in note[0], note
+    # The denominator is the count printed above it, so the two cannot disagree.
+    assert "all 4 function(s) this answer reports" in note[0], note
+
+    # A view with no collapse renders exactly as it did before -- no standing
+    # alarm on every `target info`.
+    clean_bv = _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28)])
+    clean = _render_target_info_text_with_annotations(
+        {"selector": "svc", "arch": "x86_64", **bridge._function_name_summary(clean_bv)})
+    assert "duplicate" not in clean, clean
+
+
 def test_annotation_summary_omits_the_dropped_key_when_nothing_was_dropped_793(monkeypatch):
     """`symbol_exclusions_dropped` follows the convention of its two siblings in
     this module (`callers_dropped`, `duplicate_starts_collapsed`): the key exists
@@ -854,6 +907,104 @@ def test_records_with_an_unreadable_start_are_never_grouped_together_757(monkeyp
     assert "duplicate_starts_collapsed" not in summary
 
 
+def test_duplicate_start_rows_carry_their_own_marker_757(monkeypatch):
+    """A row of a duplicated start says so ON THE ROW, not only in a count.
+
+    The unresolved disclosure was an address-less COUNT, and the sized twin it
+    counts still publishes `size_known: true` with nothing on it: under
+    `--sort size` the unsized record sorts to 0 and the sized one to its extent,
+    so the two records of one start land far apart -- or on different pages --
+    and a reader holding either row has no way to tell it was never ranked. The
+    count says "one address somewhere in this answer", which is not locatable.
+
+    A per-row marker was chosen over an envelope list of the affected
+    addresses: it is bounded (one short string on the rows that have one, none
+    otherwise), it rides with the row through every `--sort`/`--offset`, and it
+    answers the question the address list cannot -- WHICH of two rows at one
+    address was picked on extent.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub", total_bytes=4),     # ranked, dropped
+        _FakeFunction(0x401100, "widget_tick", total_bytes=64),
+        _FakeFunction(0x401100, "tick_stub"),                    # extent unreadable
+    ])
+
+    listed = instance._list_functions(None)
+    marks = {row["address"]: row.get("duplicate_start") for row in listed["items"]}
+    # The plain address says nothing; the merged one says it won on extent; the
+    # unranked pair says, on BOTH of its rows, that nothing was ranked there.
+    assert marks["0x401000"] is None, marks
+    assert marks["0x401014"] == "collapsed", marks
+    unranked = [row for row in listed["items"] if row["address"] == "0x401100"]
+    assert len(unranked) == 2, unranked
+    assert {row["duplicate_start"] for row in unranked} == {"unresolved"}, unranked
+    # The sized twin still reports a real size -- the marker is what says that
+    # size did not win a comparison.
+    sized = [row for row in unranked if row["size"] == 64]
+    assert sized and sized[0]["size_known"] is True, unranked
+
+    # The shape the count alone cannot serve: `--sort size` separates the pair
+    # across pages, and each page still carries the marker on its own row.
+    first = instance._list_functions(None, sort="size", limit=2)
+    last = instance._list_functions(None, sort="size", offset=2, limit=2)
+    assert [row.get("duplicate_start") for row in first["items"]] == ["unresolved", None], first["items"]
+    assert [row.get("duplicate_start") for row in last["items"]] == ["unresolved", "collapsed"], last["items"]
+
+    # `function search` hands back the same row, so the marker cannot be a
+    # listing-only field.
+    searched = instance._search_functions("active", "tick_stub")
+    assert searched["items"][0]["duplicate_start"] == "unresolved", searched["items"]
+    # A clean view carries no marker at all: absent, not a null column.
+    _view(monkeypatch, instance, [_FakeFunction(0x401000, "widget_init", total_bytes=28)])
+    assert "duplicate_start" not in instance._list_functions(None)["items"][0]
+
+
+def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeypatch):
+    """ONE scoping rule, and paging is not part of it.
+
+    The counts are taken after every ROW FILTER (`--min-size`, `--named`, the
+    query) and before paging, so they describe the population `total` reports.
+    `--offset`/`--limit` therefore cannot move them: a window holding none of
+    the counted addresses still carries the disclosure, which is the case the
+    note's "the larger extent was kept" wording read as a claim about the rows
+    on screen.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401000, "poll_stub", total_bytes=4),     # collapses
+        _FakeFunction(0x401100, "widget_tick", total_bytes=64),
+        _FakeFunction(0x401100, "tick_stub"),                    # unresolved
+    ] + [_FakeFunction(0x402000 + i * 0x10, f"fn_{i}", total_bytes=32) for i in range(4)])
+
+    whole = instance._list_functions(None)
+    assert whole["total"] == 7
+    assert whole["duplicate_starts_collapsed"] == 1
+    assert whole["duplicate_starts_unresolved"] == 1
+
+    # A window that contains NEITHER counted address: same two counts, same
+    # total, and not one row of either duplicated start.
+    page = instance._list_functions(None, offset=3, limit=3)
+    assert [row["address"] for row in page["items"]] == ["0x402000", "0x402010", "0x402020"]
+    assert page["total"] == 7
+    assert page["duplicate_starts_collapsed"] == 1
+    assert page["duplicate_starts_unresolved"] == 1
+    assert all("duplicate_start" not in row for row in page["items"]), page["items"]
+
+    # `function search` pages the same way, and the counts follow `total` there
+    # too rather than the window.
+    searched = instance._search_functions("active", "", offset=4, limit=2)
+    assert [row["address"] for row in searched["items"]] == ["0x402010", "0x402020"]
+    assert searched["total"] == 7
+    assert searched["duplicate_starts_collapsed"] == 1
+    assert searched["duplicate_starts_unresolved"] == 1
+
+
 def _duplicate_starts_bullet() -> str:
     """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`."""
     reference = (Path(__file__).resolve().parent.parent
@@ -864,31 +1015,143 @@ def _duplicate_starts_bullet() -> str:
     raise AssertionError("reading.md carries no duplicate-start bullet")
 
 
-def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
-    """The reference has to say what the payload does.
+def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
+    """Every fact the reference bullet claims, READ OFF the bridge.
 
-    The bullet told a reader that `unresolved` addresses "still carry more than
-    one record", which is the rule the counting fix replaced: the count follows
-    the ADDRESS into a filtered answer, where that address appears exactly once
-    because the filter dropped its twin. An agent reconciling
-    `duplicate_starts_unresolved: 1` against `total: 1` under that sentence
-    concludes the payload is self-inconsistent, or that a row is missing. The
-    envelope the bullet must describe is measured here rather than assumed, so
-    the two cannot drift apart again without this going red.
+    The bullet has to describe two structurally different outcomes -- a start
+    whose records can be ranked (one wins on extent) and one whose records
+    cannot (none is chosen, every record stays) -- plus how the two counts
+    behave under a row filter and under paging. Each is measured here and
+    returned, so the prose check below compares wording against behaviour
+    instead of against a fixed substring list.
+    """
+    # RESOLVED: both extents readable, so the pair can be ranked.
+    resolved_pop = [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub", total_bytes=4),
+    ]
+    _view(monkeypatch, instance, resolved_pop)
+    resolved = instance._list_functions(None)
+    resolved_rows = [r for r in resolved["items"] if r["address"] == "0x401014"]
+    dropped_named = instance._search_functions("active", "poll_stub")
+
+    # UNRESOLVED: one extent unreadable, so the rule cannot pick a record.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
+        _FakeFunction(0x401014, "poll_stub"),          # extent unreadable
+    ])
+    unresolved = instance._list_functions(None)
+    unresolved_rows = [r for r in unresolved["items"] if r["address"] == "0x401014"]
+    twin_named = instance._search_functions("active", "poll_stub")
+    kept = instance._list_functions(None, min_size=64, count_only=True)
+    gone = instance._list_functions(None, min_size=1000, count_only=True)
+
+    # PAGED: a window that contains NONE of the counted addresses.
+    _view(monkeypatch, instance, resolved_pop + [
+        _FakeFunction(0x402000 + i * 0x10, f"fn_{i}", total_bytes=32) for i in range(4)
+    ])
+    paged = instance._list_functions(None, offset=3, limit=2)
+
+    return {
+        "envelopes": (resolved, unresolved, paged, kept, gone),
+        "rows": tuple(resolved["items"]) + tuple(unresolved["items"]),
+        # A ranked start answers with ONE row, and it is the larger extent.
+        "resolved_is_one_row": len(resolved_rows) == 1 and resolved_rows[0]["size"] == 96,
+        # The record it dropped is gone from the other command too.
+        "dropped_is_unreachable": dropped_named["total"] == 0,
+        # An unranked start answers with EVERY record it has...
+        "unresolved_keeps_all": len(unresolved_rows) == 2,
+        # ...and naming the record that was never ranked returns it.
+        "unranked_twin_reachable": twin_named["total"] == 1,
+        # `--offset`/`--limit` do not move the counts: this page carries the
+        # disclosure while holding none of the addresses it counts.
+        "counts_survive_paging": (
+            paged.get("duplicate_starts_collapsed") == 1
+            and all(row["address"] != "0x401014" for row in paged["items"])
+        ),
+        # A row filter that leaves one record of the address keeps the count...
+        "filter_keeps_the_count": (
+            kept["total"] == 1 and kept.get("duplicate_starts_unresolved") == 1
+        ),
+        # ...and one that removes every record of it takes the count with them.
+        "filter_drops_the_count": "duplicate_starts_unresolved" not in gone,
+    }
+
+
+def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
+    """The reference has to say what the payload does -- checked against a
+    MEASURED envelope, not against a substring allow-list.
+
+    Three review rounds each deleted one over-claim from this bullet and shipped
+    its mirror image, because the guard here was three `in bullet` checks plus
+    one absence check: prose that was plainly false about the unresolved case
+    still passed it, so nothing ever caught the replacement (#757 review round
+    4). Every claim below is now PAIRED with the measurement that decides
+    whether it is true, and asserted as `(phrase in bullet) is measured` -- so
+    the bullet cannot state a rule the bridge does not hold, cannot omit one it
+    does, and cannot quote a number no envelope carries. Change the collapse
+    rule and the required and forbidden sets swap, which is the point.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    _view(monkeypatch, instance, [
-        _FakeFunction(0x401014, "widget_poll", total_bytes=96),
-        _FakeFunction(0x401014, "poll_stub"),      # extent unreadable
-    ])
-
-    filtered = instance._list_functions(None, min_size=64, count_only=True)
-    assert filtered["total"] == 1 and filtered["duplicate_starts_unresolved"] == 1
-
+    m = _measure_duplicate_start_behaviour(bridge, instance, monkeypatch)
     bullet = _duplicate_starts_bullet()
-    assert "still carry more than one record" not in bullet, bullet
-    # The rule that measurement establishes, stated in the reference: the counts
-    # describe the rows the answer contains, through every row filter.
-    assert "--min-size" in bullet and "--named" in bullet, bullet
-    assert "no record was chosen" in bullet, bullet
+
+    claims = (
+        ("a ranked start answers with one row carrying the larger extent",
+         m["resolved_is_one_row"], "ONE row carrying the larger extent"),
+        ("the record the collapse dropped cannot be named back",
+         m["dropped_is_unreachable"], "naming it returns nothing"),
+        ("an unranked start keeps every record it has",
+         m["unresolved_keeps_all"], "ALL of that address's records stay in the answer"),
+        ("the record that was never ranked is still reachable by name",
+         m["unranked_twin_reachable"], "naming either returns it"),
+        # The mirror image of the line above, decided by the SAME measurement:
+        # round 4 shipped exactly this sentence while the search returned the
+        # twin, and the old substring guard stayed green.
+        ("the unranked twin can never be returned by naming it",
+         not m["unranked_twin_reachable"], "can never be returned by naming it"),
+        ("every duplicated address answers with exactly one row",
+         m["resolved_is_one_row"] and not m["unresolved_keeps_all"],
+         "each address answers with one row"),
+        ("the counts describe the rows the answer contains",
+         not m["counts_survive_paging"], "describe the rows the answer contains"),
+        ("the counts are unaffected by --offset/--limit",
+         m["counts_survive_paging"], "NOT affected by `--offset`/`--limit`"),
+        ("a filter that removes every record of an address removes its count",
+         m["filter_drops_the_count"], "removes its count with it"),
+        ("an address that keeps one record stays counted",
+         m["filter_keeps_the_count"], "`duplicate_starts_unresolved: 1` beside `total: 1`"),
+    )
+    for what, measured, phrase in claims:
+        verb = "must state" if measured else "must NOT state"
+        assert (phrase in bullet) is measured, (
+            f"reading.md {verb} that {what} -- measured={measured}, "
+            f"phrase={phrase!r}\n{bullet}")
+
+    # Every disclosure key the bridge actually emits is named, so a new one
+    # cannot ship undocumented.
+    envelope_keys = {k for env in m["envelopes"] for k in env
+                     if k.startswith("duplicate_start")}
+    assert envelope_keys, "no envelope carried a duplicate-start disclosure"
+    for key in sorted(envelope_keys):
+        assert key in bullet, (key, bullet)
+    # ...and so is the per-row marker, with every value it takes.
+    row_keys = {k for row in m["rows"] for k in row if k.startswith("duplicate_start")}
+    assert row_keys, "no returned row carries a per-row duplicate-start marker"
+    for key in sorted(row_keys):
+        assert f"`{key}`" in bullet, (key, bullet)
+    markers = {row[key] for row in m["rows"] for key in row_keys if key in row}
+    assert markers, "the per-row marker took no value"
+    for marker in sorted(markers):
+        assert f'"{marker}"' in bullet, (marker, bullet)
+
+    # Any number the bullet states about the envelope has to be one an envelope
+    # carries: a worked example is where this prose drifts first.
+    for key, stated in re.findall(r"`?([a-z_]+)`?: (\d+)", bullet):
+        if not any(key in env for env in m["envelopes"]):
+            continue
+        assert any(env.get(key) == int(stated) for env in m["envelopes"]), (
+            f"reading.md states `{key}: {stated}`, which no measured envelope holds")
