@@ -50,8 +50,8 @@ bn function create <address> [--preview]
 bn types [--query <q>]
 bn types show <name>
 bn struct show <name>
-bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangled symbols + RTTI
-bn class show <Name>                                  # one class: methods, vtable, size, bases, instances
+bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangled symbols + RTTI (+ declared class types under --all)
+bn class show <Name>                                  # one class: methods, vtable, size, bases, instances; falls back to a declared class type
 bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
 bn exports [--count]                                 # public exported symbols (contrast `imports`)

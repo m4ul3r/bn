@@ -2372,6 +2372,7 @@ _NON_CLASS_DECLARED_KINDS = (
     ("row_t", 7, "char [16]"),                       # ArrayTypeClass
     ("op_t", 8, "int32_t (void*)"),                  # FunctionTypeClass
     ("Flags", "EnumerationTypeClass", "enum Flags"),  # the string-typed spelling
+    ("Nameless", None, "?"),                          # states no kind at all
 )
 
 
@@ -2864,3 +2865,115 @@ def test_the_declared_type_table_is_read_ONCE_per_call_675(monkeypatch):
     assert shown["size"] == {"value": "0x10", "source": "declared_type"}
     assert _CountingTypes.reads == 1, (
         f"`class show`'s miss path read the type table {_CountingTypes.reads} times")
+
+
+class _AliasTo:
+    """A NamedTypeReference, the shape BN registers for `typedef struct {...} T;`.
+
+    Carries NO width and NO members of its own -- that is the whole point of the
+    handle: the facts live on the target it resolves to."""
+    type_class = 11             # NamedTypeReferenceClass
+    width = 0
+
+    def __init__(self, target, decl="typedef struct _W W"):
+        self._target = target
+        self._decl = decl
+
+    def target(self, bv):
+        return self._target
+
+    def __str__(self):
+        return self._decl
+
+
+class _StructBody:
+    """The auto-named struct body behind an anonymous typedef."""
+    type_class = 4
+
+    def __init__(self, width=0x30, name="_W", members=()):
+        self.width = width
+        self.name = name
+        self.members = list(members)
+
+    def __str__(self):
+        return f"struct {self.name}"
+
+
+def test_a_declared_alias_reports_the_STRUCTURE_it_resolves_to_675(monkeypatch):
+    """A declaration's facts live on the structure, not on the alias handle.
+
+    `typedef struct { ... } W;` registers `W` as a NamedTypeReference, which
+    states no members and no width of its own. Admitting the alias (right) while
+    building its record from the alias (wrong) produced a card that could not
+    show the class the user asked for: `kind: named_type_ref`, no members, and
+    `size: null` beside a body 0x30 wide -- and the reference clause this PR adds
+    for exactly this input promises the object size and the canonical `types`
+    entry (#907 review). `read_types`' struct reader resolves the same way
+    (#674); one convention, not two."""
+    body = _StructBody(width=0x30, members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+    bv = _declared_bv(W=_AliasTo(body))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "W")
+
+    assert out["name"] == "W" and out["confidence"] == "declared-only"
+    assert out["size"] == {"value": "0x30", "source": "declared_type"}, out["size"]
+    entry = out["type"]
+    assert entry["kind"] != "named_type_ref", entry
+    assert entry.get("members"), entry
+    # The listing row states the same width, from the same resolution.
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "W")
+    assert row["size"] == {"value": "0x30", "source": "declared_type"}, row["size"]
+
+
+def test_an_unreadable_type_TABLE_is_disclosed_not_reported_as_zero_675(monkeypatch):
+    """A view whose type container raises must not take `class list` down, and
+    must not answer `0 declared class types` either.
+
+    Before this PR nothing in `class list` touched the type table, so a raising
+    one could not affect it at all; with the kind filter reading every entry, an
+    unguarded table read propagated a raw RuntimeError out of BOTH the listing
+    (RTTI half included, which has no stake in the declared types) and the
+    `class show` miss path (#907 review). A flattened `0` would be just as wrong
+    the other way: the renderer prints nothing for it, which is the "the lens
+    never saw your class" reading #675.2 exists to remove -- so the counter
+    states the unknown and the text says `?`."""
+    from bn.formatters import _render_class_list_text
+
+    class _RaisingTypes:
+        def __init__(self, inner):
+            self._inner = inner
+
+        @property
+        def types(self):
+            raise RuntimeError("the type container is no longer valid")
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    class _RaisingItems(dict):
+        def items(self):
+            raise RuntimeError("the type table cannot be enumerated")
+
+    for label, bv in (("raising property", _RaisingTypes(_make_registry_bv())),
+                      ("raising items()", _declared_bv())):
+        if label == "raising items()":
+            bv.types = _RaisingItems(Widget=_DeclaredType())
+        ctx = _declared_ctx(monkeypatch, bv)
+
+        listing = read_class._class_list(ctx, None)
+        assert listing["declared_suppressed"] == "unreadable", label
+        assert "? declared class types (--all to show)" in _render_class_list_text(
+            listing), label
+        # The RTTI half of the same listing still answers.
+        assert listing["total"], f"{label}: the RTTI half went down with it"
+        assert read_class._class_list(
+            ctx, None, count_only=True)["declared_suppressed"] == "unreadable", label
+
+        # A miss must not claim the name is absent on a read it could not make.
+        with pytest.raises(read_class.OperationFailure) as err:
+            read_class._class_show(ctx, None, "Widget")
+        assert err.value.status == "unknown_class", label
+        assert "could not be read" in str(err.value), label

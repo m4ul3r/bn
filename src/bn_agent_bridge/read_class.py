@@ -434,6 +434,12 @@ def _no_instances() -> dict[str, Any]:
     }
 
 
+# The value `declared_suppressed` carries when the view's type table could not be
+# read: a STATED unknown, which `_stated_count` renders as `?`, rather than a `0`
+# indistinguishable from a real "no declared classes here" (#619, #907 review).
+_DECLARED_UNREADABLE = "unreadable"
+
+
 # #675.2 / #907 review: WHICH declared types are classes. `bv.types` is the
 # view's WHOLE type table -- enums, scalars, pointers, arrays, function
 # prototypes and typedef aliases sit in it alongside structures -- so an
@@ -451,17 +457,28 @@ def _no_instances() -> dict[str, Any]:
 _STRUCTURE_TYPE_CLASS = 4       # binaryninja.TypeClass.StructureTypeClass
 
 
-def _is_class_type(bv, name: str, type_obj) -> bool:
-    """True if *type_obj* declares a C++ class type (``class``/``struct``/``union``).
+def _class_type_target(bv, name: str, type_obj):
+    """The STRUCTURE a declaration resolves to -- *type_obj* itself when it is
+    one, the followed target when it is an alias for one -- or ``None`` when the
+    declaration is not a C++ class type at all.
 
-    Duck-typed over BN's ``TypeClass`` IntEnum and the plain string the unit
-    fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
+    Kind test duck-typed over BN's ``TypeClass`` IntEnum and the plain string the
+    unit fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
 
-    Fails CLOSED on every reading that does not state a structure kind -- an
-    absent ``type_class``, an alias whose chain cannot be followed (an
-    unresolvable target, a cycle, too many hops), and a kind that cannot be read
-    at all. A class surface must not report a type AS a class on the strength of
-    a read that failed; the honest answer there is the unknown-class miss.
+    The TARGET rather than the alias, because that is the handle a declaration's
+    facts live on: a NamedTypeReference states no members and no width of its
+    own, so a card built from the alias rendered
+    ``kind: named_type_ref ... size=0x0`` for a 0x30-wide class and could not show
+    the class the user asked about (#907 review). ``read_types``' struct reader
+    resolves the same way, for the same reason (#674) -- one convention for which
+    handle carries a declaration's facts. The record keeps the DECLARED name; the
+    entry's own ``decl`` discloses the underlying body.
+
+    Fails CLOSED on every reading that does not reach a structure -- an absent
+    ``type_class``, an alias whose chain cannot be followed (an unresolvable
+    target, a cycle, too many hops), and a kind that cannot be read at all. A
+    class surface must not report a type AS a class on the strength of a read
+    that failed; the honest answer there is the unknown-class miss.
 
     The read is guarded because this runs over the view's WHOLE type table on a
     read path: an exception from one type's ``type_class`` would otherwise take
@@ -471,21 +488,23 @@ def _is_class_type(bv, name: str, type_obj) -> bool:
     try:
         _, target, reason = _follow_typedef(bv, name, type_obj)
         if reason is not None:
-            return False
+            return None
         tc = getattr(target, "type_class", None)
         if tc is None:
-            return False
+            return None
         try:
-            return int(tc) == _STRUCTURE_TYPE_CLASS
+            is_structure = int(tc) == _STRUCTURE_TYPE_CLASS
         except (TypeError, ValueError):
-            pass
-        return "Structure" in str(getattr(tc, "name", None) or tc)
+            is_structure = "Structure" in str(getattr(tc, "name", None) or tc)
+        return target if is_structure else None
     except Exception:
-        return False
+        return None
 
 
-def _declared_types(bv) -> dict[str, Any]:
-    """``{name: type_obj}`` for the view's declared CLASS types -- the LIVE read.
+def _declared_types(bv) -> dict[str, Any] | None:
+    """``{declared name: the structure carrying its facts}`` for the view's
+    declared CLASS types -- the LIVE read -- or ``None`` when the view's type
+    table could not be READ AT ALL.
 
     One function owns the enumeration AND the kind filter, so every consumer of
     the declared half reads the same, current view (see the block comment above
@@ -493,12 +512,25 @@ def _declared_types(bv) -> dict[str, Any]:
     listing's rows, its hidden count and `class show`'s fallback all resolve
     here, which is what stopped the count from counting the type table while the
     rows were something else (#907 review). Filtering a caller instead would
-    re-split them on the next change."""
+    re-split them on the next change.
+
+    ``None`` is distinct from ``{}`` on purpose. An unreadable type table must not
+    report as zero declared classes: `0` reads as "the lens looked and found
+    none", which is the exact blindness #675.2 exists to remove, so the callers
+    disclose it instead (`? declared class types` on the listing, and a miss that
+    does not claim the name is absent). Guarded here rather than per entry
+    because a raising ``types`` property or ``items()`` took `class list` down
+    whole -- the RTTI half included, which has no stake in the declared types."""
+    try:
+        entries = list((getattr(bv, "types", None) or {}).items())
+    except Exception:
+        return None
     declared: dict[str, Any] = {}
-    for key, type_obj in list((getattr(bv, "types", None) or {}).items()):
+    for key, type_obj in entries:
         name = str(key)
-        if _is_class_type(bv, name, type_obj):
-            declared[name] = type_obj
+        target = _class_type_target(bv, name, type_obj)
+        if target is not None:
+            declared[name] = target
     return declared
 
 
@@ -748,10 +780,14 @@ def _class_list(
     needle = query.lower() if query else None
     # ONE live reading of the view's declared class types: the records below and
     # the type objects their returned rows take a size from (`_declared_size`)
-    # both come from it.
+    # both come from it. `None` means the table could not be read -- disclosed
+    # through the counter, never flattened to "no declared classes" (#907
+    # review), so the listing prints `? declared class types` and the RTTI half
+    # still answers.
     declared_types = _declared_types(bv)
+    declared_unreadable = declared_types is None
     declared_only = [
-        rec for name, rec in _declared_type_records(declared_types).items()
+        rec for name, rec in _declared_type_records(declared_types or {}).items()
         if name not in registry and (needle is None or needle in name.lower())
     ]
     candidates = []
@@ -798,6 +834,12 @@ def _class_list(
             continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
+    if declared_unreadable:
+        # The disclosure choke point for a counter that could not be measured:
+        # `_stated_count` renders a non-int as `?`, so the header says
+        # `? declared class types (--all to show)` instead of a fabricated `0`
+        # (#619's rule, #907's unreadable-table finding).
+        declared_suppressed = _DECLARED_UNREADABLE
     # `total` counts candidates AFTER the confidence + --no-stl filters but before
     # paging, so it reflects what this query actually surfaced.
     total = len(candidates)
@@ -1487,7 +1529,7 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
         # instances) are precisely what the note says this view has no evidence
         # for, so running them would only decorate a miss.
         declared_types = _declared_types(bv)
-        declared = _declared_type_records(declared_types)
+        declared = _declared_type_records(declared_types or {})
         declared_matches = _resolve_class_names(declared, name)
         if declared_matches:
             records = []
@@ -1507,11 +1549,19 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
             if len(records) == 1:
                 return records[0]
             return {"ambiguous": True, "query": name, "matches": records}
+        # An unreadable type table is not an absent class: the miss says what it
+        # could not read instead of asserting a "No class named" this call has no
+        # standing to assert (#907 review). The message is byte-identical to the
+        # one it has always emitted whenever the table read fine.
+        unreadable = (
+            " The view's declared types could not be read, so a declared class"
+            " of this name is not ruled out." if declared_types is None else ""
+        )
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "
             f"Run `bn class list` (add --all for name-only clusters) to discover "
-            f"available classes.",
+            f"available classes.{unreadable}",
         )
     enriched = [_enrich(ctx, bv, registry[m]) for m in matches]
     if len(enriched) == 1:
