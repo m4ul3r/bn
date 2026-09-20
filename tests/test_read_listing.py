@@ -1169,24 +1169,29 @@ def _render_duplicate_starts_bullet(m: dict) -> str:
     so this stops deriving it from prose: the entry's operative content is
     produced HERE, out of the measurement, and the file has to match.
 
-    The trade is stated rather than papered over. This closes doc-side drift of
-    any shape (a clause, a comma, a continuation line, a whole new sentence)
-    and every rename of a published key or marker, because those are
-    interpolated. It does NOT close an author who edits this template and the
-    reference together -- nothing can. What makes that survivable is the size
-    of the claim: the entry says what a duplicated start does to the ROWS and
-    to the COUNTS and stops, so this template is short enough to read, and a
-    sentence in it with no measured value beside it is visible on sight.
+    The trade is stated rather than papered over.
+
+    Closed: doc-side drift of any shape -- a clause, a comma, a continuation
+    line, a whole new sentence -- because the file must EQUAL this render; a
+    rename of any published key or per-row marker, because those are
+    interpolated out of the envelope; and a change to either number the entry
+    states, because those are interpolated too (writing "2 rows" here is
+    impossible without the bridge returning two).
+
+    Not closed: an author who edits this template and the reference together.
+    Nothing can close that -- rounds 3-6 escalated a prose-derived guard five
+    times trying. The two facts rendered as a word rather than a number (which
+    extent wins, whether every unranked record survives) are where that would
+    land. What makes it survivable is the size of the claim: the entry says
+    what a duplicated start does to the ROWS and to the COUNTS and stops, so
+    this template is short enough to read whole, and a sentence in it with no
+    measured value beside it is visible on sight.
     """
     keys = " / ".join(f"`{k}`" for k in m["count_keys"])
     markers = " or ".join(f'`"{v}"`' for v in m["markers"])
     row_key = " / ".join(f"`{k}`" for k in m["row_keys"])
-    rows = "ONE row" if m["ranked_rows"] == 1 else f"{m['ranked_rows']} rows"
-    extent = ("the one carrying the larger extent"
-              if m["ranked_kept_size"] == max(m["ranked_group_sizes"])
-              else "the one carrying the smaller extent")
-    dropped = ("nothing" if m["ranked_dropped_hits"] == 0
-               else f"{m['ranked_dropped_hits']} row(s)")
+    extent = ("larger" if m["ranked_kept_size"] == max(m["ranked_group_sizes"])
+              else "smaller")
     stays = ("every record of that address stays in the answer"
              if m["unranked_rows"] == m["unranked_records"]
              else f"only {m['unranked_rows']} of its {m['unranked_records']} "
@@ -1198,10 +1203,11 @@ def _render_duplicate_starts_bullet(m: dict) -> str:
         "- **Duplicate function start addresses collapse, and the collapse is "
         "disclosed (#757).** Binary Ninja can hold more than one Function record "
         "for one start address, with sizes that disagree, so `function list` and "
-        f"`function search` collapse them. **Ranked** (every extent readable): the "
-        f"address answers with {rows}, {extent}, and naming a record the collapse "
-        f"dropped returns {dropped}. **Unranked** (any extent unreadable): no "
-        f"record is chosen, so {stays} and {named}. Each returned row of a "
+        "`function search` collapse them. **Ranked** (every extent readable): the "
+        f"address answers with exactly {m['ranked_rows']} row, the one carrying "
+        f"the {extent} extent, and naming a record the collapse dropped returns "
+        f"{m['ranked_dropped_hits']} rows. **Unranked** (any extent unreadable): "
+        f"no record is chosen, so {stays} and {named}. Each returned row of a "
         f"duplicated start carries {row_key}, {markers}. The counts {keys} count "
         "ADDRESSES, not dropped records, over the whole filtered answer `total` "
         "reports, and are unchanged by `--offset`/`--limit` -- so a page can "
