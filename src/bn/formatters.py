@@ -5796,16 +5796,23 @@ def _render_class_list_text(value: Any) -> str:
         hidden_parts.append(f"{th} thunk{'s' if th != 1 else ''}")
     elif _field_skewed("thunks_suppressed"):
         hidden_parts.append("? thunks")
-    lib = _nonnegative_count(value, "library_suppressed")
-    if value.get("no_stl") and lib:
-        hidden_parts.append(f"{lib} library/STL")
-    elif value.get("no_stl") and _field_skewed("library_suppressed"):
-        hidden_parts.append("? library/STL")
-    ven = _nonnegative_count(value, "vendor_suppressed")
-    if value.get("no_vendor") and ven:
-        hidden_parts.append(f"{ven} vendored")
-    elif value.get("no_vendor") and _field_skewed("vendor_suppressed"):
-        hidden_parts.append("? vendored")
+    # These two are read INSIDE their gate, not before it. A share the run
+    # never asked to fold out is a number this line was never going to print,
+    # so reading it early recorded a skew and drew a `! malformed` note about
+    # a value with nothing in the `hidden:` tail to act on -- a disclosure
+    # pointing at nothing, which is its own kind of wrong number.
+    if value.get("no_stl"):
+        lib = _nonnegative_count(value, "library_suppressed")
+        if lib:
+            hidden_parts.append(f"{lib} library/STL")
+        elif _field_skewed("library_suppressed"):
+            hidden_parts.append("? library/STL")
+    if value.get("no_vendor"):
+        ven = _nonnegative_count(value, "vendor_suppressed")
+        if ven:
+            hidden_parts.append(f"{ven} vendored")
+        elif _field_skewed("vendor_suppressed"):
+            hidden_parts.append("? vendored")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
@@ -5825,9 +5832,13 @@ def _render_class_list_text(value: Any) -> str:
         # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
         # methods and no vtable) so it doesn't read as a domain class.
         art_s = "  [artifact: non-class RTTI]" if rec.get("artifact") else ""
+        # The row's method count is STATED, so `_stated_count` -- the one
+        # number in this renderer the round-6 repair walked past, in the very
+        # renderer that repair was filed against. Raw, it printed a flag as a
+        # quantity and a container as a Python repr, undisclosed, at rc 0.
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
-            f"methods={rec.get('method_count', 0)}  {vt}  "
+            f"methods={_stated_count(rec, 'method_count')}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )

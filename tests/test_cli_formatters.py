@@ -3895,9 +3895,12 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # now, and the non-class artifact share plus the three suppressed shares
     # through `_nonnegative_count`, because a cardinality cannot be negative.
     # Six more (renderer, key) pairs this differential now covers, measured.
-    assert len(sites) == 29, (
+    # 29 -> 30 (#795 round-7 review): the per-ROW method count in the same
+    # renderer -- the one number the round-6 repair walked past -- now reads
+    # through `_stated_count` too. One more (renderer, key) pair, measured.
+    assert len(sites) == 30, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 29. The number is the size of the covered set: a "
+        "count helper, not 30. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3964,6 +3967,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # are checked above.
         "_render_class_list_text(artifact_count) [count not stated in this context]",
         "_render_class_list_text(count) [count not stated in this context]",
+        # #795 round-7 review: a ROW-level key. This differential fills every
+        # harvested key on the top-level payload, and nothing there reaches a
+        # row, so the pair is skipped by the HARNESS rather than by the
+        # renderer -- which DOES state it, pinned in the named test above.
+        "_render_class_list_text(method_count) [count not stated in this context]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # #795 round-3 review: same harness cut as the strings pair below --
@@ -4124,7 +4132,11 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # beside it, and the three suppressed shares in the `hidden:` tail. The
 # headline now reads through `_stated_count` and the four cardinalities
 # through `_nonnegative_count`, so all six spellings are deliberately GONE.
-_RAW_COUNT_SPELLINGS = 39
+# 39 -> 38 (#795 round-7 review): the SEVENTH number in that renderer, the
+# per-ROW method count, which the round-6 repair walked past -- it rendered a
+# flag as a quantity and a container as a Python repr, undisclosed, in the
+# very renderer the round-6 major was filed against. Now `_stated_count`.
+_RAW_COUNT_SPELLINGS = 38
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -4970,6 +4982,32 @@ def test_the_class_listing_reads_its_count_and_every_cardinality_through_the_cho
         body = negative.split("\n! malformed")[0]
         assert body != render({**rest, key: 0}), (key, body)
         assert "?" in body, (key, body)
+
+    # (c) The per-ROW method count is a stated number too, and it was the one
+    # number in this renderer the round-6 repair walked past -- in the very
+    # renderer that repair was filed against.
+    def row(method_count):
+        return render({"items": [{"name": "Probe", "method_count": method_count}],
+                       "total": 1})
+
+    assert "methods=3" in row(3) and row("3") == row(3)
+    assert "methods=True" not in row(True), row(True)
+    assert "malformed method_count field" in row(True), row(True)
+    boxed_row = row({"n": 1})
+    assert "{" not in boxed_row and "}" not in boxed_row, boxed_row
+
+    # (d) A share the run never asked to fold out stays silent even when the
+    # payload spells it wrong. Reading it BEFORE the gate that decides whether
+    # to state it recorded a skew on a run with nothing in the `hidden:` tail
+    # to act on, so the reader got a malformed-field note about a number the
+    # command was never going to print.
+    for gate, key in (("no_stl", "library_suppressed"),
+                      ("no_vendor", "vendor_suppressed")):
+        ungated = render({"items": [], key: {"n": 1}})
+        assert "malformed" not in ungated, (key, ungated)
+        assert ungated == render({"items": [], key: 7}), (key, ungated)
+        # ...and with the gate on, the same payload IS disclosed.
+        assert "?" in render({"items": [], gate: True, key: {"n": 1}}), key
 
 
 def test_class_show_renders_a_declared_but_unnamed_base_instead_of_dropping_it():
