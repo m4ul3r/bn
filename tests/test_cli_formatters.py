@@ -4441,12 +4441,13 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # MEASURED by diffing `_runtime_population()` rather than carried over.
     # 4928 -> 4936 (#797): `hints` is one more discovered read on
     # `_render_defuse_text` (1 pair x 8 bogus values), measured.
-    # 4936 -> 4944 (#795 round-6 review): ONE more discovered `(renderer, key)`
-    # pair -- `(_render_class_list_text, artifact_count)` -- 1 pair x 8 bogus
-    # values. The NUMBER has been measured truth throughout; the CAUSE beside
-    # it was asserted twice and measured neither time, which is the same defect
-    # as a count nobody read. Round 9 measured it, by mutating this tree and
-    # re-running this one sweep:
+    # 4936 -> 4944: ONE more discovered `(renderer, key)` pair --
+    # `(_render_class_list_text, artifact_count)` -- 1 pair x 8 bogus values.
+    # NO branch commit is credited, because two were and both are refuted.
+    # The number has been measured truth throughout; the CAUSE beside it was
+    # asserted twice and measured neither time, which is the same defect as a
+    # count nobody read. Round 9 measured what IS measurable, by mutating this
+    # tree and re-running this one sweep:
     #     HEAD                                                     4944
     #     `elif _field_skewed("artifact_count")` branch deleted    4944
     #     `_nonnegative_count(value, "artifact_count")` deleted    4936
@@ -4454,13 +4455,16 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     #     the whole `--count` branch reverted to its pre-#795
     #       spelling (`art = value.get("artifact_count") or 0`)    4944
     # What that measures, and all it measures: the pair is discovered by
-    # READING the key off the payload, in either spelling, and by nothing
+    # READING the key off the payload, in EITHER spelling, and by nothing
     # else. `_field_skewed` reads the ambient skew set and never touches the
     # payload, so it cannot enter a key into a population derived by observing
-    # payload lookups -- round 7's stated cause is false. Round 6's is too:
-    # the `or 0` spelling it called "discovered by nothing" measures 4944 on
-    # this tree. Which earlier edit moved the number off 4936 is NOT measured
-    # here, so no claim is made about it.
+    # payload lookups -- round 7's stated cause ("the `_field_skewed` branch
+    # discovers the key") is false. Round 6's ("the `or 0` spelling was
+    # discovered by nothing, the listing now ASKS about it") is false the same
+    # way: that spelling is a payload read, it was on this branch continuously
+    # from the base, and it measures 4944 here. So this row records the pair
+    # and the measurement, and attributes the +8 to no commit at all. If the
+    # number moves again, MEASURE it -- do not reason about it.
     assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
 
 
