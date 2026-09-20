@@ -3550,12 +3550,20 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
         # #827 item 1: the bridge follows ONE predecessor per step, so a value
         # defined at a branch join has provenance this chain does not show. The
         # count of unfollowed parents is the only half of item 1 this change
-        # delivers, and a JSON-only disclosure delivers it to nobody reading the
-        # default text view -- the same asymmetry #810 fixed for the truncation
-        # verdict, and the convention the sibling disclosures in this PR
-        # (analysis_incomplete, the per-callsite frontier) already follow.
+        # delivers, and a JSON-only disclosure delivered it to nobody reading
+        # text at all -- the same asymmetry #810 fixed for the truncation
+        # verdict. It rides the rendered SSA path, which is a `--full` detail,
+        # so unlike this PR's two sibling disclosures (analysis_incomplete, the
+        # per-callsite frontier) it is NOT on the compact default view: the
+        # chain it qualifies is not printed there either, and annotating a step
+        # the reader cannot see would disclose nothing.
+        #
+        # A count of 0, an absent key, an unreadable value and a NEGATIVE count
+        # all render nothing. A fabricated disclosure is the same defect as a
+        # missing one, and a negative reads as a number while stating a thing no
+        # count can mean.
         _alt = _count_field(step, "alternate_parents")
-        if _alt:
+        if _alt > 0:
             out.append(
                 f"        <- joins {_alt} other tainted parent(s) not shown "
                 "(this is one of several provenance paths)")
@@ -3910,8 +3918,10 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                 # `isinstance(True, int)` is True in Python, so a bridge that
                 # sent a FLAG where a count belongs rendered "(True frontier)":
                 # a number-shaped claim made out of a boolean. Excluded, so an
-                # unreadable value degrades to no marker like every other shape.
-                if isinstance(nfront, int) and not isinstance(nfront, bool) and nfront:
+                # unreadable value degrades to no marker like every other shape
+                # -- as does a NEGATIVE count, which reads as a number and
+                # states a thing no count can mean.
+                if isinstance(nfront, int) and not isinstance(nfront, bool) and nfront > 0:
                     desc += f" ({nfront} frontier)"
             lines.append(f"  {addr}: {desc}")
 

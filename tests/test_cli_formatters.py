@@ -8071,7 +8071,7 @@ def _per_source_frontier_payload():
 
 def test_per_source_frontier_marker_uses_the_bridge_count_812():
     # #812's headline defect, CLI end: this marker used to be recomputed here by
-    # counting ONE hard-coded leaf kind (`unmodeled_callee`) out of the eleven
+    # counting ONE hard-coded leaf kind (`unmodeled_callee`) out of the ten
     # that block a claim, so a callsite whose frontier was a coarse store or a
     # pointer escape printed no marker at all -- on the row a reader uses to
     # choose which callsite to triage. The count is now the bridge's, computed
@@ -8096,8 +8096,11 @@ def test_per_source_frontier_marker_ignores_an_unreadable_count_812():
     payload = _per_source_frontier_payload()
     # A bool is the one that got through: `isinstance(True, int)` is True in
     # Python, so a bridge that sent a FLAG where a count belongs used to render
-    # "(True frontier)" -- a number-shaped claim made out of a boolean.
-    for bad in ("lots", True, 1.5, None, [2]):
+    # "(True frontier)" -- a number-shaped claim made out of a boolean. A
+    # NEGATIVE count is the same defect one step further along: it is readable
+    # as a number and says a thing no count can mean, so "(-3 frontier)" would
+    # be a fabricated disclosure that survived every shape check above it.
+    for bad in ("lots", True, 1.5, None, [2], -3):
         payload["by_source"]["0x14"]["frontier"] = bad
         row = next(ln.strip() for ln in _render_taint_text(payload).splitlines()
                    if ln.startswith("  0x14"))
@@ -8342,10 +8345,11 @@ def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
     # The linear step must NOT be annotated -- an unconditional marker would be
     # a permanent false alarm on every ordinary chain.
     assert joined.count("not shown") == 1, joined
-    # A count of 0, an absent key, and an unreadable value all render nothing:
-    # this is a disclosure, so a fabricated one is the same defect as a missing
-    # one.
-    for bad in (0, None, "two", True):
+    # A count of 0, an absent key, an unreadable value and a NEGATIVE count all
+    # render nothing: this is a disclosure, so a fabricated one is the same
+    # defect as a missing one, and "joins -3 other tainted parent(s)" is
+    # fabricated in the one direction a numeric check still admits.
+    for bad in (0, None, "two", True, -3):
         step = {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(...)"}
         if bad is not None:
             step["alternate_parents"] = bad
