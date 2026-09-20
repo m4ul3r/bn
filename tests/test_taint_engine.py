@@ -8950,6 +8950,15 @@ def test_backward_result_carries_a_completeness_gate_812(process_func, models):
     diag = result.get("diagnostics") or {}
     assert diag, result.keys()
     assert "safe_to_report_complete_slice" in diag, diag
+    # ...and its VALUE, end to end. Round 5's falsification lens disabled the
+    # blocking-leaf branch in `backward_diagnostics` so a curtailed slice
+    # answered `true`, and 1237 tests across every taint-touching file stayed
+    # green, because this test asserted only that the key EXISTS. A gate whose
+    # value nothing checks is a claim, not a gate.
+    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    assert diag["safe_to_report_complete_slice"] is True, diag
+    assert not [lf for lf in result["leaves"]
+                if lf.get("kind") in BLOCKING_LEAF_KINDS], result["leaves"]
     # Forward's key must NOT appear on a backward result -- that was the whole
     # reason for a separate name.
     assert "safe_to_report_all_clear" not in diag, diag
@@ -8958,6 +8967,95 @@ def test_backward_result_carries_a_completeness_gate_812(process_func, models):
     # `max_iters` bounds the forward fixpoint only; echoing it on a backward run
     # is how the "raise --max-iters" advice reached runs it could never fix.
     assert "max_iters" not in result["run_params"], result["run_params"]
+
+
+def test_backward_completeness_gate_is_a_decision_not_a_key_812():
+    # The decision table behind `safe_to_report_complete_slice`, pinned value by
+    # value. Every branch below was reachable with nothing asserting its answer:
+    # with the blocking-leaf branch disabled, a slice that abandoned caller
+    # sites at the ascent cap claimed completeness and the text view printed
+    # "complete slice (may-analysis, not a proof)" -- the exact false claim #812
+    # exists to withhold -- while the whole taint suite stayed green.
+    from bn_agent_bridge import taint_result as tr
+
+    # The clean walk is the ONLY shape allowed to claim completeness.
+    clean = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1)
+    assert clean["safe_to_report_complete_slice"] is True, clean
+    assert "no frontier leaf" in clean["complete_slice_reason"], clean
+
+    # A blocking frontier leaf means the def-chain was not followed to every
+    # origin, and the reason must name the kind so the reader knows which.
+    curtailed = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}], [], sinks_seeded=1, slices=1)
+    assert curtailed["safe_to_report_complete_slice"] is False, curtailed
+    assert "caller_sites_truncated" in curtailed["complete_slice_reason"], curtailed
+
+    # A non-blocking leaf kind must NOT withhold it -- the gate discriminates on
+    # the canonical vocabulary, not on "a leaf exists".
+    benign = tr.backward_diagnostics(
+        [{"kind": "arg_dropped_partial"}], [], sinks_seeded=1, slices=1)
+    assert benign["safe_to_report_complete_slice"] is True, benign
+
+    # Truncation withholds it on its own, with the cause named rather than the
+    # generic frontier sentence.
+    cut = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, truncated=True,
+                                  truncation_cause=["caller_cap"])
+    assert cut["safe_to_report_complete_slice"] is False, cut
+    assert "truncated" in cut["complete_slice_reason"], cut
+
+    # Nothing seeded means nothing was walked: an empty slice list is a seeding
+    # outcome, not an exhaustive answer.
+    unseeded = tr.backward_diagnostics([], [], sinks_seeded=0, slices=0)
+    assert unseeded["safe_to_report_complete_slice"] is False, unseeded
+    assert "no sink seeded" in unseeded["complete_slice_reason"], unseeded
+
+
+def test_backward_next_action_names_the_unseeded_sink_before_the_empty_slice_812():
+    # The second unpinned branch of the same function. With nothing seeded there
+    # are also no slices, so without this precedence the generic "the sink
+    # seeded but no slice was produced" line fires and contradicts this block's
+    # own reason ("no sink seeded, so nothing was walked") -- two lines of one
+    # diagnostic disagreeing about whether a sink seeded at all.
+    from bn_agent_bridge import taint_result as tr
+
+    unseeded = tr.backward_diagnostics([], [], sinks_seeded=0, slices=0)
+    assert "no sink seeded" in unseeded["next_action"], unseeded
+    assert "the sink seeded but no slice" not in unseeded["next_action"], unseeded
+    # Both lines of the block must tell the same story about the seed.
+    assert "no sink seeded" in unseeded["complete_slice_reason"], unseeded
+
+    # The empty-slice line still answers for the case it actually describes.
+    seeded = tr.backward_diagnostics([], [], sinks_seeded=1, slices=0)
+    assert "the sink seeded but no slice was produced" in seeded["next_action"], seeded
+
+
+def test_truncation_hint_names_the_caller_cap_rather_than_a_depth_cutoff_812():
+    # The backward-only truncation cause. Without its own branch it fell through
+    # to the generic "depth/recursion cutoff" string, which names the wrong knob:
+    # no depth or recursion bound was hit, the caller ascent stopped at its
+    # per-site cap with callers unexamined. The branch shipped pinned by nothing
+    # -- disabling it left 726 tests green across all four taint test files --
+    # so the remediation could regress silently at the moment it matters most.
+    from bn_agent_bridge import taint_result as tr
+
+    hint = tr._truncation_hint(["caller_cap"])
+    assert "caller ascent" in hint, hint
+    assert "per-site cap" in hint, hint
+    # It must not offer either depth knob: neither bound was reached.
+    assert "--max-depth" not in hint and "--max-iters" not in hint, hint
+    assert hint != "depth/recursion cutoff"
+
+    # The generic fallback still answers for a cause this table does not know,
+    # and the two forward causes keep their own (different) remediations.
+    assert tr._truncation_hint(["an_unknown_cause"]) == "depth/recursion cutoff"
+    assert "--max-iters" in tr._truncation_hint(["fixpoint_exhausted"])
+    assert "--max-depth" in tr._truncation_hint(["max_depth"])
+
+    # And it reaches the consumer: a truncated backward run quotes it verbatim
+    # in the reason a reader sees, rather than deriving a second wording.
+    diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, truncated=True,
+                                   truncation_cause=["caller_cap"])
+    assert hint in diag["complete_slice_reason"], diag
 
 
 def _phi_join_of_source_and_unconditional_func():
