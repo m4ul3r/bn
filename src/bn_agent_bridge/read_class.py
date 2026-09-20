@@ -466,13 +466,16 @@ _STRUCTURE_TYPE_CLASS = 4       # binaryninja.TypeClass.StructureTypeClass
 
 # `binaryninja.NamedTypeReferenceClass` values that NAME a C++ class type:
 # ClassNamedTypeClass, StructNamedTypeClass, UnionNamedTypeClass. An alias BN
-# cannot resolve still states the kind it references, and on BN 6.1
-# `typedef struct { ... } T;` is exactly that case: the anonymous body is not
-# registered under a name, so `target(bv)` is None while the reference itself
-# reads `struct _T T` with StructNamedTypeClass -- measured. Refusing on an
-# unresolvable target alone would therefore drop the single most common way a
-# declared class reaches a view, while `typedef enum { ... } M;` (EnumNamedType-
-# Class, target also None) must still be refused.
+# cannot resolve still states the kind it references, and that is not a rare
+# shape: measured on BN 6.1, `typedef struct { ... } T;` DOES register its
+# anonymous body (as `_T`) so the plain spelling resolves, but the NAMESPACED
+# one -- `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of
+# None while the reference itself states StructNamedTypeClass, as does any
+# alias whose body is defined without it. Refusing on an unresolvable target
+# alone would therefore drop a common way a declared class reaches a view,
+# while `typedef enum { ... } M;` (EnumNamedTypeClass, target also None) must
+# still be refused. (An earlier version of this comment claimed the anonymous
+# body is NEVER registered; that was refuted live -- #907 review rounds 3/4.)
 _CLASS_NAMED_TYPE_CLASSES = frozenset({2, 3, 4})
 _CLASS_NAMED_TYPE_PREFIXES = ("Class", "Struct", "Union")
 # `EnumNamedTypeClass`. The remaining spellings -- `Unknown` (0) and `Typedef`
@@ -594,47 +597,71 @@ def _user_declared_entries(bv) -> list[tuple[str, Any]] | None:
     return [(str(entry[0]), entry[1]) for entry in entries.values()]
 
 
-def _anonymous_body_names(entries: list[tuple[str, Any]]) -> set[str]:
-    """The names BN's C parser generated for an anonymous typedef BODY, among
-    *entries*.
+# BN's own spelling for a type with no name of its own, e.g. the element type of
+# `typedef struct { ... } A[4];`.
+_BN_ANONYMOUS_NAME = re.compile(r"^anonymous_\d+$")
+
+
+def _scope_and_leaf(name: str) -> tuple[str, str]:
+    """*name* split at its last TOP-LEVEL ``::`` into (qualifier, leaf)."""
+    idx = _last_toplevel_scope(name)
+    return (name[:idx + 2], name[idx + 2:]) if idx is not None else ("", name)
+
+
+def _generated_body_names(entries: list[tuple[str, Any]]) -> frozenset[str]:
+    """The entry names BN GENERATED rather than the user writing them.
 
     `typedef struct { ... } T;` parses to TWO types -- the alias `T` and a body
-    the parser names `_T` -- and the declare path defines every parsed name, so
-    the user's single declaration puts both in the user type container. Reported
-    as peers they doubled `N user-declared class types` against what the user
-    typed and added a class row for a name they never wrote: the
-    `<Class>::VTable` artifact-peer family the population rewrite exists to
-    remove, arriving through the user container instead of `bv.types` (#907
-    review round 3). Measured live: `types declare 'typedef struct { ... } T;'`
-    reports `count 2, defined_types {_T, T}`, and `T.name` reads `_T`.
+    BN names `_T` -- and the declare path defines every parsed name, so one
+    declaration puts both in the user type container. Reported as peers they
+    doubled `N user-declared class types` against what the user typed and added
+    a class row for a name they never wrote: the `<Class>::VTable` artifact-peer
+    family the population rewrite exists to remove, arriving through the user
+    container instead of `bv.types` (#907 review round 3).
 
-    PROVENANCE, not name shape: a name qualifies only when another entry in the
-    SAME container is a reference pointing AT it and is spelled exactly without
-    the leading underscore -- the two halves the parser emits together. That
-    keeps `struct Body {...}; typedef struct Body Alias;` intact (the alias names
-    `Body`, not `_Body`, so neither half is a companion), which is the commonest
-    hand-written pair. It does fold away a body a user named `_X` and aliased as
-    `X` in the same view: indistinguishable by construction, and the class is
-    still reported in full under `X`.
+    Matched on the NAME BN generates, where BN puts it. A rule that instead
+    followed the alias's own reference caught only the plain declarator, and
+    round 4 measured four escapes from it, each shipping the peer row again:
+    `typedef struct { ... } *P;` hides `_P` behind a POINTER, `... A[4];` hides
+    BN's `anonymous_0` behind an ARRAY, a NAMESPACED declaration spells the body
+    `n::_Q` (underscore at the LEAF, not on the qualified name), and
+    re-declaring the alias ORPHANS the body so nothing references it at all.
+    None of those is reachable by resolution, which is the point: this test does
+    not resolve anything.
 
-    Reading `.name` is guarded per entry because BN raises ``NotImplementedError``
-    for it on a structure -- the majority of entries here."""
+    Scope-aware, so `other::Scoped` is not read as the partner of `n::_Scoped`,
+    and a lone `struct _Private;` with no `Private` beside it keeps its row.
+
+    It cannot tell BN's `_T` from a `struct _X { ... };` a user hand-wrote
+    beside `typedef struct _X X;` -- the GLib/GTK idiom -- because nothing in
+    the container distinguishes them (measured: no BN attribute differs). That
+    is why this is a LISTING rule only: the name stays fully resolvable by
+    `class show`, so folding a row never becomes an asserted absence (#907
+    review round 4)."""
+    leaves: dict[str, set[str]] = {}
+    for name, _ in entries:
+        scope, leaf = _scope_and_leaf(name)
+        leaves.setdefault(scope, set()).add(leaf)
     generated: set[str] = set()
-    for name, type_obj in entries:
-        try:
-            referenced = str(type_obj.name)
-        except Exception:
-            continue
-        if referenced == f"_{name}":
-            generated.add(referenced)
-    return generated
+    for name, _ in entries:
+        scope, leaf = _scope_and_leaf(name)
+        if _BN_ANONYMOUS_NAME.match(leaf) or (
+                leaf.startswith("_") and leaf[1:] in leaves[scope]):
+            generated.add(name)
+    return frozenset(generated)
 
 
 class _DeclaredSet(NamedTuple):
-    """What the view's USER declarations came to: the class types, and the
-    declarations whose KIND could not be established."""
+    """What the view's USER declarations came to.
+
+    ``types`` is every declared class type, keyed by the name it is declared
+    under -- ``class show`` resolves against all of it. ``generated`` is the
+    subset BN spelled rather than the user (see :func:`_generated_body_names`),
+    which the LISTING and its count leave out so one declaration is one row.
+    ``unreadable`` names the declarations whose kind could not be established."""
 
     types: dict[str, Any]
+    generated: frozenset[str]
     unreadable: tuple[str, ...]
 
 
@@ -658,28 +685,30 @@ def _declared_types(bv) -> _DeclaredSet | None:
     because a raising container took `class list` down whole -- the RTTI half
     included, which has no stake in the declared types.
 
-    ``unreadable`` carries the same distinction one level down, for the
-    declarations whose own kind could not be established: they are neither
-    classes nor proven absences, so they are named rather than swallowed (see
+    ``generated`` and ``unreadable`` carry the two distinctions one level down.
+    A generated name is still a declared class type and still resolves -- only
+    the LISTING leaves it out, so one declaration is one row without any
+    surface claiming the name is absent. An unreadable declaration is neither a
+    class nor a proven absence, so it is named rather than swallowed (see
     :func:`_class_type_target`)."""
     try:
         entries = _user_declared_entries(bv)
         if entries is None:
             return None
-        generated = _anonymous_body_names(entries)
+        generated = _generated_body_names(entries)
     except Exception:
         return None
     declared: dict[str, Any] = {}
     unreadable: list[str] = []
     for name, type_obj in entries:
-        if name in generated:
-            continue
         target = _class_type_target(bv, name, type_obj)
         if target is _UNREADABLE_DECLARATION:
             unreadable.append(name)
         elif target is not None:
             declared[name] = target
-    return _DeclaredSet(declared, tuple(unreadable))
+    return _DeclaredSet(declared,
+                        frozenset(n for n in generated if n in declared),
+                        tuple(unreadable))
 
 
 def _declared_size(type_obj) -> dict[str, Any] | None:
@@ -937,9 +966,16 @@ def _class_list(
     declared_set = _declared_types(bv)
     declared_types = declared_set.types if declared_set is not None else {}
     declared_unmeasurable = declared_set is None or bool(declared_set.unreadable)
+    # A name BN GENERATED for a declaration's body is not a second class: one
+    # declaration is one row, and one count. It stays in `declared_types`, so
+    # `class show` still resolves it -- folding a row must never become an
+    # asserted absence about a name the rule could not prove BN wrote (#907
+    # review round 4).
+    generated = declared_set.generated if declared_set is not None else frozenset()
     declared_only = [
         rec for name, rec in _declared_type_records(declared_types).items()
-        if name not in registry and (needle is None or needle in name.lower())
+        if name not in registry and name not in generated
+        and (needle is None or needle in name.lower())
     ]
     candidates = []
     library_suppressed = 0
@@ -1694,6 +1730,20 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
         declared_types = declared_set.types if declared_set is not None else {}
         declared = _declared_type_records(declared_types)
         declared_matches = _resolve_class_names(declared, name)
+        # Whether this query ALSO reaches a declaration whose kind could not be
+        # established. Resolved over ONE namespace holding both the readable and
+        # the unreadable names, so the resolver's exact-match-first rule decides
+        # it: a fully qualified `ns::Widget` resolves to itself and discloses
+        # nothing, while the bare leaf `Widget` reaches both and must. A match is
+        # not a licence to stop disclosing -- the listing said
+        # `? user-declared class types` about this very set, so a card that
+        # presented itself as the whole answer contradicted it (#907 review r4).
+        unreadable_names = set(declared_set.unreadable) if declared_set else set()
+        unreadable_here = [
+            match for match in _resolve_class_names(
+                dict.fromkeys([*declared, *unreadable_names], {}), name)
+            if match in unreadable_names
+        ]
         if declared_matches:
             records = []
             for match in declared_matches:
@@ -1708,6 +1758,10 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
                     # affordable for the one class being shown and not for a
                     # listing (see `_declared_type_records`).
                     rec["type"] = ctx._type_entry(match, type_obj)
+                if unreadable_here:
+                    rec["notes"].append(
+                        f"{len(unreadable_here)} further declaration(s) of this name"
+                        " could not be read, so this card is not the whole answer")
                 records.append(rec)
             if len(records) == 1:
                 return records[0]

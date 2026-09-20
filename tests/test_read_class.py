@@ -3001,61 +3001,109 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
                   if r["confidence"] == "declared-only") == ["C", "T"]
 
 
-def test_the_parsers_anonymous_body_is_not_a_PEER_of_its_own_typedef_675(monkeypatch):
-    """One `typedef struct { ... } T;` is ONE declared class, under the name the
-    user wrote.
+def test_one_declaration_is_one_ROW_whatever_the_declarator_675(monkeypatch):
+    """One declaration is ONE row, and the row is the name the user wrote.
 
-    BN's C parser gives the anonymous body a generated name of its own -- `_T` --
-    and the declare path defines EVERY parsed name, so the user's single
-    declaration puts TWO entries in the user type container. Measured live
-    through the CLI: `types declare 'typedef struct { ... } T;'` reported
-    `count 2, defined_types {_T, T}`, `class list` then said
-    `hidden: 2 user-declared class types` for one declaration and `--all` listed
-    `T` and `_T` as peers of identical width. That is the `<Class>::VTable`
-    artifact-peer family the population rewrite exists to remove, arriving
-    through the user container instead of `bv.types` (#907 review round 3).
+    BN's C parser gives an anonymous body a generated name of its own and the
+    declare path defines EVERY parsed name, so one `typedef struct { ... } T;`
+    puts TWO entries in the user type container. Measured live: `types declare`
+    reported `count 2, defined_types {_T, T}` and `--all` listed both as peers
+    of identical width -- the `<Class>::VTable` artifact-peer family the
+    population rewrite exists to remove, arriving through the user container
+    (#907 review round 3).
 
-    The companion is identified by PROVENANCE, not by name shape alone: an entry
-    is dropped only when another entry in the SAME container is a reference whose
-    `.name` points at it AND is spelled exactly without the leading underscore --
-    i.e. the two halves the parser emits together."""
+    A rule keyed on the ALIAS's own reference caught only the plain declarator.
+    Measured live at round 4, the parser emits the same companion where no
+    followable reference reaches it: `typedef struct { ... } *P;` registers
+    `_P` behind a POINTER, `typedef struct { ... } A[4];` registers BN's own
+    `anonymous_0` behind an ARRAY, a NAMESPACED declaration spells it
+    `n::_Q` (underscore at the LEAF, not on the qualified name), and
+    re-declaring the alias ORPHANS the body so nothing references it at all.
+    Each escaped and rendered a peer class the user never wrote.
+
+    So the rule is the name BN generates, matched where BN puts it: an entry
+    whose leaf is `_<L>` beside a same-scope entry whose leaf is `<L>`, or
+    BN's own `anonymous_<N>`. It needs no resolution, which is what every
+    escape above had in common."""
     from bn.formatters import _render_class_list_text
 
-    body = _StructBody(width=0xc, name="_T", members=[
-        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
-    bv = _declared_bv(T=_AliasTo(body, decl="struct _T T"), _T=body,
-                      Widget=_DeclaredType())
+    def body(name, width=0xc):
+        return _StructBody(width=width, name=name, members=[
+            types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+
+    plain, pointed, arrayed = body("_T"), body("_P", 0x4), body("anonymous_0", 0x4)
+    qualified, orphan_body = body("n::_Q", 0x8), body("_T1", 0x8)
+    bv = _declared_bv(**{
+        # the plain declarator: alias -> its own generated body
+        "T": _AliasTo(plain, decl="struct _T T"), "_T": plain,
+        # a POINTER declarator: nothing resolvable reaches `_P`
+        "P": _DeclaredKind("P", 6, "struct _P *", width=8), "_P": pointed,
+        # an ARRAY declarator, under BN's own anonymous spelling
+        "A": _DeclaredKind("A", 7, "struct anonymous_0 [4]", width=0x10),
+        "anonymous_0": arrayed,
+        # NAMESPACED: BN puts the underscore on the LEAF
+        "n::Q": _AliasTo(qualified, decl="struct n::_Q n::Q"), "n::_Q": qualified,
+        # an ORPHANED body: its alias was re-declared onto a named struct
+        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan_body,
+        "Widget": _DeclaredType(),
+    })
     ctx = _declared_ctx(monkeypatch, bv)
 
     declared = sorted(r["name"] for r in
                       read_class._class_list(ctx, None, include_all=True)["items"]
                       if r["confidence"] == "declared-only")
-    assert declared == ["T", "Widget"], (
-        f"the parser's own companion is not a class the user declared: {declared}")
+    assert declared == ["T", "T1", "Widget", "n::Q"], (
+        f"a name BN generated is not a class the user declared: {declared}")
 
     default = read_class._class_list(ctx, None)
-    assert default["declared_suppressed"] == 2, default["declared_suppressed"]
-    assert ("2 user-declared class types (--all to show)"
+    assert default["declared_suppressed"] == 4, default["declared_suppressed"]
+    assert ("4 user-declared class types (--all to show)"
             in _render_class_list_text(default))
 
-    # The name the user wrote still carries the body's facts...
+    # The name the user wrote carries the body's facts.
     assert read_class._class_show(ctx, None, "T")["size"] == {
         "value": "0xc", "source": "declared_type"}
-    # ...and the generated name answers no class card of its own.
-    with pytest.raises(read_class.OperationFailure) as err:
-        read_class._class_show(ctx, None, "_T")
-    assert err.value.status == "unknown_class"
+
+
+def test_a_generated_name_is_off_the_LISTING_but_never_an_asserted_absence_675(monkeypatch):
+    """Folding a name out of the rows is not the same claim as "no such class".
+
+    The leaf rule cannot tell BN's generated `_T` from a `struct _X { ... };`
+    the user hand-wrote beside `typedef struct _X X;` -- the GLib/GTK idiom --
+    because the two are byte-identical in the container (measured: no BN
+    attribute distinguishes them). Answering `class show _X` with
+    `No class named '_X'` therefore fabricated an absence about a declaration
+    the user HAD made, which is the "a suppressed read rendering as a fact"
+    pattern this PR exists to remove (#907 review round 4).
+
+    So the rule is a LISTING rule only: one body is one row, under the name
+    that is not the generated spelling, and every declared name still resolves
+    on `class show`. Nothing the user declared becomes unreachable, and one
+    declaration still counts once."""
+    hidden = _StructBody(width=0x8, name="_X", members=[
+        types.SimpleNamespace(offset=0, name="u", type="int32_t")])
+    bv = _declared_bv(**{"_X": hidden, "X": _AliasTo(hidden, decl="struct _X X")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = [r["name"] for r in
+                read_class._class_list(ctx, None, include_all=True)["items"]
+                if r["confidence"] == "declared-only"]
+    assert declared == ["X"], declared
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
+
+    shown = read_class._class_show(ctx, None, "_X")
+    assert shown["confidence"] == "declared-only"
+    assert shown["size"] == {"value": "0x8", "source": "declared_type"}
 
 
 def test_a_body_the_user_named_is_not_mistaken_for_a_parser_companion_675(monkeypatch):
-    """The companion rule needs BOTH halves the parser emits, so a struct the
-    user named and aliased separately keeps its own row.
+    """The leaf rule fires on the UNDERSCORE spelling BN generates, so a struct
+    the user named and aliased separately keeps its own row.
 
     `struct Body { ... }; typedef struct Body Alias;` puts two entries in the
-    container too, but the alias references `Body`, not `_Body`, so neither is
-    the parser's anonymous companion and the lens reports both. Dropping every
-    alias target instead would delete the commonest hand-written declaration
-    pair."""
+    container too, but neither leaf is the other's with an underscore in front,
+    so the lens reports both. Dropping every alias target instead would delete
+    the commonest hand-written declaration pair."""
     body = _StructBody(width=0x8, name="Body", members=[
         types.SimpleNamespace(offset=0, name="a", type="int32_t")])
     bv = _declared_bv(Body=body, Alias=_AliasTo(body, decl="struct Body Alias"))
@@ -3066,6 +3114,87 @@ def test_a_body_the_user_named_is_not_mistaken_for_a_parser_companion_675(monkey
                       if r["confidence"] == "declared-only")
     assert declared == ["Alias", "Body"], declared
     assert read_class._class_list(ctx, None)["declared_suppressed"] == 2
+
+
+def test_a_lone_underscore_declaration_keeps_its_row_675(monkeypatch):
+    """`_<L>` is only a generated spelling when the `<L>` it was generated FOR
+    is in the same scope. A view holding `struct _Private { ... };` and nothing
+    called `Private` has one declaration, and it lists."""
+    bv = _declared_bv(**{"_Private": _DeclaredType(name="_Private"),
+                         "n::_Scoped": _DeclaredType(name="n::_Scoped"),
+                         # same leaf, DIFFERENT scope -- not this one's partner
+                         "other::Scoped": _DeclaredType(name="other::Scoped")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = sorted(r["name"] for r in
+                      read_class._class_list(ctx, None, include_all=True)["items"]
+                      if r["confidence"] == "declared-only")
+    assert declared == ["_Private", "n::_Scoped", "other::Scoped"], declared
+
+
+def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675(monkeypatch):
+    """A match is not a licence to stop disclosing.
+
+    The per-declaration unreadable channel reached only the MISS path, so a leaf
+    query that DID match one declaration answered a single confident card while
+    another declaration resolving to the same query could not be read at all --
+    the listing said `? user-declared class types` about the very same set at
+    the very same moment (#907 review round 4). The two surfaces must agree:
+    the card carries the unknown as a note rather than presenting itself as the
+    whole answer."""
+    from bn.formatters import _render_class_show_text
+
+    class _Unreadable:
+        name = "other::Widget"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct other::Widget"
+
+    bv = _declared_bv(**{"ns::Widget": _DeclaredType(name="ns::Widget"),
+                         "other::Widget": _Unreadable()})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["name"] == "ns::Widget"
+    assert any("could not be read" in note for note in shown["notes"]), shown["notes"]
+    assert "could not be read" in _render_class_show_text(shown)
+
+    # A query that reaches no unreadable declaration carries no such note.
+    clean = read_class._class_show(ctx, None, "ns::Widget")
+    assert not any("could not be read" in note for note in clean["notes"]), clean["notes"]
+
+
+def test_a_width_that_cannot_be_READ_states_no_size_675(monkeypatch):
+    """The sibling of the zero-width rule, on the branch that made the guard
+    exist: a `width` read that RAISES states no size.
+
+    Unpinned, replacing the guard's `return None` with a size envelope left the
+    targeted suite green, so a handle whose width could not be read could begin
+    asserting an object size for a class whose layout is simply unknown (#907
+    review round 4)."""
+    class _UnreadableWidth(_DeclaredType):
+        # Deliberately not `super().__init__(...)`: that assigns `self.width`,
+        # which this class shadows with the raising property (the shape
+        # `_CountingDeclaredType` uses for the same reason).
+        def __init__(self):
+            self.name = "Widget"
+
+        @property
+        def width(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+    bv = _declared_bv(Widget=_UnreadableWidth())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    assert read_class._class_show(ctx, None, "Widget")["size"] is None
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "Widget")
+    assert row["size"] is None, row["size"]
 
 
 def test_an_artifact_shaped_DECLARATION_is_listed_and_shown_as_one_set_675(monkeypatch):
