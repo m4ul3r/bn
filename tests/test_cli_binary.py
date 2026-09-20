@@ -254,6 +254,43 @@ def test_target_summary_text_shows_analysis_progress_when_active():
     assert "analysis progress:" not in initial
 
 
+def test_target_info_command_text_carries_the_annotation_block(fake_transport, capsys):
+    """#793 through the COMMAND, not the renderer.
+
+    `_render_target_info_text_with_annotations` composes the #793 block onto
+    the shared summary, and the test below pins that composition -- but every
+    reference to it in the suite called it directly, so the one line that puts
+    it in front of a user (`text_renderer=` on the `target info` handler) was
+    unpinned: pointing it back at `_render_target_info_text` left the whole
+    CLI suite green while the block silently vanished from the command
+    (#793 review round 9). This drives `bn target info` end to end.
+    """
+    fake_transport({
+        "list_targets": {"ok": True,
+                         "result": [{"target_id": "123:1:7", "selector": "svc"}]},
+        "target_info": {
+            "ok": True,
+            "result": {
+                "selector": "svc", "arch": "x86_64", "function_count": 4,
+                "existing_annotations": {
+                    "comments": 2, "function_comments": 1, "user_symbols": 3,
+                    "analyst_symbols": 0, "placeholder_symbols": 0,
+                    "analysis_cache_restored": True,
+                    "provenance_hint": "a prior session wrote these",
+                },
+            },
+        },
+    })
+
+    rc = bn.cli.main(["target", "info", "--format", "text"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "existing annotations" in output, output
+    assert "comments=2" in output and "user-symbols=3" in output, output
+    assert "a prior session wrote these" in output, output
+
+
 def test_target_info_text_renders_existing_annotations():
     """#793: `target info` text carries the annotation counts + provenance hint
     the JSON always had, composed onto the shared target summary (never into

@@ -1005,17 +1005,29 @@ def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeyp
     assert searched["duplicate_starts_unresolved"] == 1
 
 
-def _duplicate_starts_bullet() -> str:
-    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`.
+def _entry_region(lines: list[str], index: int) -> str:
+    """The markdown list item beginning at *index*: that line and everything
+    printed before the next one opens.
 
-    Everything between this list item's first line and the line that opens the
-    NEXT one. Three narrower rules have already been defeated: the first line
-    only (round 6), stopping at the first blank or `#`-prefixed line (round
-    7), and stopping at a real ATX heading, which let `###### note: <lie>` sit
+    Three narrower rules have already been defeated -- the first line only
+    (round 6), stopping at the first blank or `#`-prefixed line (round 7), and
+    stopping at a real ATX heading, which let `###### note: <lie>` sit
     directly under the entry and outside the compared region (round 8). A
     reader sees whatever is printed between the two bullets, so whatever is
-    printed between the two bullets IS the entry.
+    printed between the two bullets IS the entry. Split out of the reader
+    below so the rule itself can be pinned on input the reference does not
+    have to contain (round 9: reverting it left the guard green).
     """
+    region = [lines[index]]
+    for nxt in lines[index + 1:]:
+        if nxt.startswith("- "):
+            break
+        region.append(nxt)
+    return "\n".join(region)
+
+
+def _duplicate_starts_bullet() -> str:
+    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`."""
     reference = (Path(__file__).resolve().parent.parent
                  / "skills" / "bn" / "reference" / "reading.md")
     lines = reference.read_text(encoding="utf-8").splitlines()
@@ -1025,12 +1037,7 @@ def _duplicate_starts_bullet() -> str:
     assert len(starts) == 1, (
         "more than one line of reading.md names the disclosure key, so the "
         f"entry is no longer identifiable: lines {[i + 1 for i in starts]}")
-    entry = [lines[starts[0]]]
-    for nxt in lines[starts[0] + 1:]:
-        if nxt.startswith("- "):
-            break
-        entry.append(nxt)
-    return "\n".join(entry)
+    return _entry_region(lines, starts[0])
 
 
 def _publishes_duplicate_starts(payload) -> bool:
@@ -1113,15 +1120,24 @@ def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
 
 
 def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
-    """The duplicate-start contract, READ OFF the bridge.
+    """The duplicate-start contract, READ OFF the bridge, over EVERY shape
+    review has found this entry wrong about.
 
     Two things, because they are the two a reader has to get right: what a
     duplicated start does to the ROWS, and what it does to the COUNTS. The
     reference entry is RENDERED from this dict by
-    `_render_duplicate_starts_bullet`, so every identifier, marker and number
-    in the prose comes from a live envelope instead of from a phrase someone
-    typed beside one.
+    `_render_duplicate_starts_bullet`.
+
+    The populations below are the measurement's whole claim surface, and
+    three review rounds in a row filed a blocker because a clause generalised
+    off ONE of them: distinct names, then a single `--min-size` threshold.
+    Every shape here has to satisfy the SAME two invariants -- ranked keeps
+    one record carrying the largest extent, unranked keeps them all -- and
+    the entry states only those, with nothing per-shape and no count of rows.
     """
+    def _rows_at(env, address="0x401014"):
+        return [r for r in env["items"] if r["address"] == address]
+
     # RANKED: every extent readable, so the group can be ordered by extent.
     ranked_pop = [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
@@ -1130,8 +1146,26 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
     ]
     _view(monkeypatch, instance, ranked_pop)
     ranked = instance._list_functions(None)
-    ranked_rows = [r for r in ranked["items"] if r["address"] == "0x401014"]
-    dropped_named = instance._search_functions("active", "poll_stub")
+    ranked_rows = _rows_at(ranked)
+
+    # RANKED, SHARED NAME: #757's own reported shape -- both records carry the
+    # loader-assigned name, so nothing about NAMES can be claimed here.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=96),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=4),
+    ])
+    same_name = instance._list_functions(None)
+    same_name_rows = _rows_at(same_name)
+
+    # RANKED, TIED EXTENTS: the survivor still carries the largest extent in
+    # the group; which of the tied records it is, is not a claim.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "tie_a", total_bytes=64),
+        _FakeFunction(0x401014, "tie_b", total_bytes=64),
+    ])
+    tied = instance._list_functions(None)
+    tied_rows = _rows_at(tied)
 
     # UNRANKED: one extent unreadable, so the rule cannot pick a record. THREE
     # records, so the prose may not describe the group as a pair.
@@ -1143,42 +1177,41 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
     ]
     _view(monkeypatch, instance, unranked_pop)
     unranked = instance._list_functions(None)
-    unranked_rows = [r for r in unranked["items"] if r["address"] == "0x401014"]
-    named_back = tuple(instance._search_functions("active", row["name"])["total"]
-                       for row in unranked_rows)
+    unranked_rows = _rows_at(unranked)
     # A row filter that leaves ONE record of the address, and one that leaves
     # none of them: the counts count addresses, so only the second drops.
     kept = instance._list_functions(None, min_size=64, count_only=True)
     gone = instance._list_functions(None, min_size=1000, count_only=True)
-    # ...and a row filter narrows the ROWS too, which the entry's row clauses
-    # therefore may not state unconditionally: under the same filter this
-    # address keeps one of its three records, and the filtered-out names stop
-    # answering (#757 review round 8).
+    # A row filter narrows the ROWS too, and by HOW MUCH depends entirely on
+    # the threshold -- 64 leaves one record of this address, 16 leaves two.
+    # The entry therefore says a filter narrows and says no number (#757
+    # review rounds 8 and 9).
     filtered = instance._list_functions(None, min_size=64)
-    filtered_rows = [r for r in filtered["items"] if r["address"] == "0x401014"]
-    filtered_named_hits = tuple(
-        instance._search_functions("active", fn.name, min_size=64)["total"]
-        for fn in unranked_pop if fn.start == 0x401014 and fn.total_bytes is None)
+    filtered_rows = _rows_at(filtered)
+    loosely_filtered_rows = _rows_at(instance._list_functions(None, min_size=16))
 
-    # SAME NAME: #757's own reported shape -- both records at the start carry
-    # the loader-assigned name, so "naming the dropped record" answers with
-    # the RETAINED one. A clause generalised off the distinct-name fixture
-    # alone is false here (#757 review round 8).
-    same_name_pop = [
-        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+    # UNRANKED, EVERY EXTENT UNREADABLE: still unranked, still all kept.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "sizeless_a"),
+        _FakeFunction(0x401014, "sizeless_b"),
+    ])
+    sizeless = instance._list_functions(None)
+    sizeless_rows = _rows_at(sizeless)
+
+    # UNRANKED, SHARED NAME: the other half of the shape #757 reports.
+    _view(monkeypatch, instance, [
         _FakeFunction(0x401014, "sub_401014", total_bytes=96),
-        _FakeFunction(0x401014, "sub_401014", total_bytes=4),
-    ]
-    _view(monkeypatch, instance, same_name_pop)
-    same_name = instance._list_functions(None)
-    same_name_rows = [r for r in same_name["items"] if r["address"] == "0x401014"]
-    shared_name_hits = instance._search_functions("active", "sub_401014")["total"]
+        _FakeFunction(0x401014, "sub_401014"),
+    ])
+    unranked_same_name = instance._list_functions(None)
+    unranked_same_name_rows = _rows_at(unranked_same_name)
 
     # PAGED: a window holding none of the counted addresses.
     _view(monkeypatch, instance, ranked_pop + [
         _FakeFunction(0x402000 + i * 0x10, f"fn_{i}", total_bytes=32) for i in range(4)
     ])
     paged = instance._list_functions(None, offset=3, limit=2)
+    paged_rows = _rows_at(paged)
 
     collided = _duplicate_start_faces(bridge, instance, monkeypatch, [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
@@ -1191,10 +1224,23 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
     ])
 
-    envelopes = (ranked, unranked, same_name, kept, gone, filtered, paged,
+    envelopes = (ranked, same_name, tied, unranked, sizeless, unranked_same_name,
+                 kept, gone, filtered, paged,
                  *(payload for payload, _ in collided.values()))
-    row_keys = {k for env in (ranked, unranked) for row in env["items"]
+    row_keys = {k for env in envelopes for row in env.get("items", ())
                 for k in row if k.startswith("duplicate_start")}
+    # Every RANKED shape: one row survives, and it carries the largest extent
+    # its group held. Every UNRANKED shape: nothing is dropped.
+    ranked_shapes = (
+        ("distinct names", ranked_rows, (96, 4)),
+        ("shared name", same_name_rows, (96, 4)),
+        ("tied extents", tied_rows, (64, 64)),
+    )
+    unranked_shapes = (
+        ("three records, one unsized", unranked_rows, 3),
+        ("every extent unreadable", sizeless_rows, 2),
+        ("shared name", unranked_same_name_rows, 2),
+    )
     return {
         # Every key any measured envelope carries, so the render's backticked
         # vocabulary can be checked against the payload rather than a list.
@@ -1204,35 +1250,36 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
              if k.startswith("duplicate_starts_")})),
         "row_keys": tuple(sorted(row_keys)),
         "markers": tuple(sorted(
-            {row[k] for env in (ranked, unranked) for row in env["items"]
+            {row[k] for env in envelopes for row in env.get("items", ())
              for k in row_keys if k in row})),
         # Which marker each case puts on its rows, so the entry can say what
         # the two values MEAN without the mapping being a phrase.
         "ranked_marker": ranked_rows[0].get("duplicate_start") if ranked_rows else None,
         "unranked_marker": ({row.get("duplicate_start") for row in unranked_rows}
                             or {None}).pop(),
-        "ranked_rows": len(ranked_rows),
-        "ranked_kept_size": ranked_rows[0]["size"] if ranked_rows else None,
-        "ranked_group_sizes": tuple(sorted(
-            fn.total_bytes for fn in ranked_pop if fn.start == 0x401014)),
+        # ONE row survives every ranked shape, carrying that group's largest
+        # extent -- reported per shape so a failure names the shape.
+        "ranked_keeps_one_largest": tuple(
+            (label, len(rows) == 1 and bool(rows) and rows[0]["size"] == max(sizes))
+            for label, rows, sizes in ranked_shapes),
+        # NOTHING is dropped from any unranked shape.
+        "unranked_keeps_all": tuple(
+            (label, len(rows) == records) for label, rows, records in unranked_shapes),
         "ranked_extents_all_readable": all(
             fn.total_bytes is not None for fn in ranked_pop if fn.start == 0x401014),
         "unranked_extents_all_readable": all(
             fn.total_bytes is not None for fn in unranked_pop if fn.start == 0x401014),
-        "ranked_dropped_hits": dropped_named["total"],
-        "same_name_rows": len(same_name_rows),
-        "shared_name_hits": shared_name_hits,
-        "unranked_records": sum(1 for fn in unranked_pop if fn.start == 0x401014),
+        # A row filter and a page each narrow what the collapse kept, and by
+        # how much is a property of the filter, not of the collapse: the two
+        # thresholds below leave different numbers of the SAME group.
+        "narrowing": tuple(sorted({len(filtered_rows), len(loosely_filtered_rows),
+                                   len(paged_rows)})),
         "unranked_rows": len(unranked_rows),
-        "unranked_named_hits": named_back,
-        "filtered_rows": len(filtered_rows),
-        "filtered_named_hits": filtered_named_hits,
         "kept_total": kept["total"],
         "kept_count": kept.get("duplicate_starts_unresolved"),
         "gone_count": gone.get("duplicate_starts_unresolved"),
         "paged_count": paged.get("duplicate_starts_collapsed"),
-        "paged_holds_a_counted_address": any(row["address"] == "0x401014"
-                                             for row in paged["items"]),
+        "paged_holds_a_counted_address": bool(paged_rows),
         # The target-info face has to be the COMMAND's composed card, not the
         # shared summary renderer: only the command's adds the #793 block.
         "target_info_face_is_the_command_card": (
@@ -1248,109 +1295,97 @@ def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
 
 
 #: The only backticked tokens the rendered entry may name that are NOT keys
-#: an envelope carries: the two commands that collapse, and the three row /
-#: page flags. A hand-written constant is itself an editable surface -- the
-#: residual below names it -- so it is kept to tokens the payload cannot
-#: supply, and everything else the entry backticks is checked against the
-#: envelope.
+#: an envelope carries: the two commands that collapse, and the two paging
+#: flags the counts ignore. A hand-written constant is itself an editable
+#: surface -- the residual below names it -- so it is kept to tokens the
+#: payload cannot supply, and everything else the entry backticks is checked
+#: against the envelope.
 _RENDER_VOCABULARY = frozenset({
-    "function list", "function search", "--offset", "--limit", "--min-size",
+    "function list", "function search", "--offset", "--limit",
 })
 
-#: Identifier-shaped words (snake_case) anywhere in the render, backticked or
-#: not. Round 8 shipped an invented `duplicate_starts_phantom` past a
-#: backtick-only vocabulary check by simply not quoting it.
-_IDENTIFIER_TOKEN = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+#: Identifier-shaped words anywhere in the render, quoted or not:
+#: snake_case, kebab-case and camelCase alike. Round 8 shipped an invented
+#: `duplicate_starts_phantom` past a backtick-only check by not quoting it,
+#: and round 9 shipped `duplicateStartsPhantom` and
+#: `duplicate-starts-phantom` past a snake_case-only one. The render is also
+#: required to be ASCII, which is what closes the homoglyph spelling.
+_IDENTIFIER_TOKEN = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+\b|\b[a-z]+[A-Z][A-Za-z0-9]*\b")
 
 
 def _render_duplicate_starts_bullet(m: dict) -> str:
     """The reference entry, RENDERED from the measured envelope.
 
-    Six review rounds pinned this bullet against phrases -- three substring
-    checks, then a paired claim inventory, then sentence completeness, then a
-    residue rule, then byte equality against a hand-written constant. Each one
-    was defeated by prose that sat where the current rule did not look, and the
-    last one by editing the prose and its own constant together. A guard
-    derived from prose cannot catch prose the author also wrote into the guard,
-    so this stops deriving it from prose: the entry's operative content is
-    produced HERE, out of the measurement, and the file has to match.
+    Six review rounds pinned this bullet against phrases -- substring checks,
+    a paired claim inventory, sentence completeness, a residue rule, byte
+    equality against a hand-written constant -- and each was defeated by prose
+    that sat where the current rule did not look. A guard derived from prose
+    cannot catch prose the author also wrote into the guard, so this stops
+    deriving it from prose: the entry's operative content is produced HERE,
+    out of the measurement, and the reference has to match.
 
-    The trade is stated exactly, because over-claiming is what this entry
-    keeps being reviewed for and rounds 7 and 8 both over-claimed here.
+    Rounds 7, 8 and 9 then each filed a blocker on the SAME defect one level
+    in: a clause generalised from the fixtures behind it. "Naming a dropped
+    record returns 0 rows" was true only of records with distinct names;
+    "under a size floor an unranked address keeps the 1 record that passes"
+    was true only of one threshold. Both were repairs that ADDED a specific,
+    quantified clause, and both became the next round's blocker.
 
-    Closed: doc-side drift of any shape. Everything printed between this list
-    item's first line and the next item -- a comma, a continuation line, a
-    lazy `#757`-style line, an indented paragraph, a real `###### heading` --
-    is inside the compared region and must EQUAL this render.
+    So the entry states no per-shape quantity at all. What is left is the two
+    invariants that hold on every shape measured above -- ranked keeps one
+    record and it carries the group's largest extent, unranked keeps them all
+    -- plus the marker, the counts and the disclosure. It says nothing about
+    naming (records at one address can share a name), nothing about how much
+    a filter or a page leaves (a property of the filter, not the collapse),
+    and no number other than the issue's.
 
-    Closed: identifiers and numbers. Every snake_case token in the render,
-    quoted or not, must be a key an envelope carries or a marker a row
-    carries; every backticked token must be that or one of the five command
-    and flag names in `_RENDER_VOCABULARY`; every number must be one the
-    measurement supplied. An invented key, a forged marker and an unmeasured
-    count are unwritable here.
+    The trade, stated exactly:
 
-    NOT closed, and nothing closes it. Three editable surfaces, in descending
-    order of how likely they are to be edited by accident:
+    Closed -- doc-side drift of any shape, because everything printed between
+    this list item and the next must EQUAL this render; and every identifier,
+    marker and number in the render, because those are checked against the
+    measurement (snake_case, kebab-case, camelCase and non-ASCII spellings
+    alike, and the only permitted number is the issue's).
 
-    * this template plus the reference, in plain English drawn from measured
-      vocabulary -- a hedge, a contradicting parenthetical, a verbless clause,
-      a false claim about a command the entry names, a false count written as
-      a WORD, a claim true of the fakes and false of the engine, or a
+    NOT closed, and nothing closes it. Three editable surfaces:
+
+    * this template plus the reference, edited together in plain English
+      drawn from measured vocabulary -- a hedge, a contradicting
+      parenthetical, a verbless clause, a false count written as a WORD, or a
       consistent DELETION of a true clause;
-    * `_RENDER_VOCABULARY` itself: adding one token re-admits the gloss it
-      excludes;
-    * the measured POPULATION. Every universal clause here is generalised
-      from the fixtures above, so a clause is only as true as the shapes they
-      cover. Round 8 found exactly this: "naming a dropped record returns 0
-      rows" was true only because that fixture's records had distinct names.
-      The fixtures now cover distinct names, a shared name, a three-record
-      unranked group and a row-filtered answer; a shape they miss is the next
-      place this entry will be wrong.
-
-    Rounds 3-6 escalated a prose-derived guard five times trying to close the
-    first of those and each escalation was defeated; the operator's ruling was
-    to stop escalating and cut the claim instead. What makes the residual
-    survivable is size: the entry says what a duplicated start does to the
-    ROWS and to the COUNTS and stops, so this template is short enough to read
-    whole and a sentence in it with no measured value beside it is visible on
-    sight.
+    * `_RENDER_VOCABULARY`, four tokens the payload cannot supply;
+    * the measured POPULATION. Every clause here is checked against the
+      shapes measured above (ranked with distinct names, with a shared name,
+      with tied extents; unranked with three records, with every extent
+      unreadable, with a shared name; filtered at two thresholds; paged;
+      clean) and is true of each. A shape none of them covers is where this
+      entry would be wrong next -- which is the argument for it claiming as
+      little as it now does.
     """
     keys = " / ".join(f"`{k}`" for k in m["count_keys"])
     row_key = " / ".join(f"`{k}`" for k in m["row_keys"])
-    extent = ("larger" if m["ranked_kept_size"] == max(m["ranked_group_sizes"])
-              else "smaller")
-    stays = ("every record of that address stays in the answer"
-             if m["unranked_rows"] == m["unranked_records"]
-             else f"only {m['unranked_rows']} of its {m['unranked_records']} "
-                  "records stay in the answer")
-    named = ("naming any of them returns it"
-             if set(m["unranked_named_hits"]) == {1}
-             else "naming one of them returns nothing")
+    kept_one = ("keeps one record, the one carrying the largest extent in the group"
+                if all(ok for _, ok in m["ranked_keeps_one_largest"])
+                else "does not reduce the address to a single record")
+    keeps_all = ("keeps them all, because nothing can be ranked"
+                 if all(ok for _, ok in m["unranked_keeps_all"])
+                 else "still drops records")
     return (
         "- **Duplicate function start addresses collapse, and the collapse is "
         "disclosed (#757).** Binary Ninja can hold more than one Function record "
         "for one start address, with sizes that disagree, so `function list` and "
-        "`function search` collapse them. Before any row filter narrows the "
-        "answer: **Ranked** (every extent readable) — the address contributes "
-        f"exactly {m['ranked_rows']} row, the one carrying the {extent} extent, "
-        f"and a name only a dropped record carried returns "
-        f"{m['ranked_dropped_hits']} rows, while a name the group shares still "
-        f"returns the {m['shared_name_hits']} retained row. **Unranked** (any "
-        f"extent unreadable) — no record is chosen, so {stays} and {named}. A "
-        "row filter applies on top of that and narrows the rows as well as the "
-        f"total: under `--min-size` an unranked address keeps the "
-        f"{m['filtered_rows']} record that passes and a filtered-out name "
-        f"answers with {m['filtered_named_hits'][0]} rows. Each returned row of "
-        f"a duplicated start carries {row_key} — "
-        f'`"{m["ranked_marker"]}"` on the row a ranked address kept, '
-        f'`"{m["unranked_marker"]}"` on every row of an address nothing could '
-        f"be ranked at. The counts {keys} count ADDRESSES, not dropped records, "
-        "over the whole filtered answer reports, and are unchanged by "
+        f"`function search` collapse them. Where every extent at that address is "
+        f"readable the collapse {kept_one}; where any extent is unreadable it "
+        f"{keeps_all}. Whatever it kept is then narrowed by the row filters and "
+        "the page like any other row. Each surviving row of such an address "
+        f"carries {row_key} — `\"{m['ranked_marker']}\"` where a record won on "
+        f"extent, `\"{m['unranked_marker']}\"` where nothing could be ranked. "
+        f"The counts {keys} count ADDRESSES, not dropped records, over the whole "
+        "filtered answer `total` reports, and are unchanged by "
         "`--offset`/`--limit` — so a page can disclose an address none of its "
         "rows holds — and are absent when zero. A payload that publishes them "
-        "never reaches a text face that is silent about them, so no card reads "
-        "clean while its own answer discloses."
+        "never reaches a text face that is silent about them."
     )
 
 
@@ -1365,38 +1400,50 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     reproduced the end state of that arms race -- a plainly false, token-free
     clause shipped GREEN when the entry and its pin were edited consistently.
 
-    The answer is not a sixth rule. It is a smaller claim: the entry states
-    only what a duplicated start does to the ROWS and to the COUNTS, and the
-    surface-by-surface, placement and ordering prose is gone. What is left is
-    asserted against the bridge below -- across four populations, because
-    round 8 showed a clause generalised off ONE fixture (records with
-    distinct names) shipping false for the shape the issue actually reports
-    (records sharing the loader name) -- and then RENDERED, so the entry and
-    the bridge cannot disagree.
+    The answer is not a sixth rule. It is a smaller claim, twice reduced: the
+    entry states only the two invariants that hold on EVERY shape measured
+    above -- ranked keeps one record and it carries the group's largest
+    extent, unranked keeps them all -- plus the marker, the counts and the
+    disclosure. Rounds 7, 8 and 9 each filed a blocker on a clause that was
+    true only of the fixture behind it (distinct names; one size threshold),
+    so the entry now carries no per-shape quantity, no claim about naming,
+    and no number but the issue's. The `_entry_region` rule, the publication
+    predicate and the command-composed summary face are each pinned here too,
+    because reverting them was invisible.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     m = _measure_duplicate_start_disclosure(bridge, instance, monkeypatch)
 
-    # --- THE ROWS -------------------------------------------------------
-    # Ranked: one row survives and it is the larger extent.
+    # --- THE REGION RULE ------------------------------------------------
+    # Everything printed between this list item and the next one, whatever it
+    # looks like: a heading, a lazy `#` line, a blank line, an indented
+    # paragraph. Pinned on synthetic input because the reference contains
+    # none of them, which is why reverting the rule was invisible (round 9).
+    sample = ["- entry duplicate_starts_unresolved", "###### note: lie",
+              "#757 lazy continuation", "", "  indented paragraph", "- next"]
+    assert _entry_region(sample, 0) == "\n".join(sample[:5])
+
+    # --- THE ROWS, ON EVERY MEASURED SHAPE -------------------------------
+    # Ranked (every extent readable): one row survives and it carries the
+    # group's largest extent -- with distinct names, with a shared name, and
+    # on a tie.
     assert m["ranked_extents_all_readable"], m
-    assert m["ranked_rows"] == 1, m
-    assert m["ranked_kept_size"] == max(m["ranked_group_sizes"]), m
-    # A name only a dropped record carried is gone...
-    assert m["ranked_dropped_hits"] == 0, m
-    # ...but a name the group SHARES still answers, with the retained row.
-    assert m["same_name_rows"] == 1, m
-    assert m["shared_name_hits"] == 1, m
-    # Unranked: nothing is chosen, so every record stays and each is reachable.
+    assert all(ok for _, ok in m["ranked_keeps_one_largest"]), (
+        "a ranked shape did not reduce to one row carrying the largest extent",
+        m["ranked_keeps_one_largest"])
+    # Unranked (any extent unreadable): nothing is dropped -- three records,
+    # every extent unreadable, and a shared name.
     assert not m["unranked_extents_all_readable"], m
-    assert m["unranked_records"] > 2, "the group must not be a pair"
-    assert m["unranked_rows"] == m["unranked_records"], m
-    assert set(m["unranked_named_hits"]) == {1}, m
-    # A row filter narrows the ROWS too, so the two cases above are claims
-    # about an unfiltered answer and the entry has to say so.
-    assert m["filtered_rows"] == 1, m
-    assert set(m["filtered_named_hits"]) == {0}, m
+    assert all(ok for _, ok in m["unranked_keeps_all"]), (
+        "an unranked shape lost a record", m["unranked_keeps_all"])
+    assert m["unranked_rows"] > 2, "the unranked group must not be a pair"
+    # How much a row filter or a page leaves is a property of THAT filter,
+    # not of the collapse: the same group answers with different counts under
+    # two thresholds and a window, which is why the entry states none of them.
+    assert len(m["narrowing"]) > 1, (
+        "the filtered/paged shapes all left the same number of rows, so the "
+        "entry's refusal to state one is unmeasured", m["narrowing"])
     # Each surviving row says which case it is in, with both values in play.
     assert m["row_keys"] == ("duplicate_start",), m
     assert m["markers"] == ("collapsed", "unresolved"), m
@@ -1432,13 +1479,17 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
 
     # --- THE REFERENCE IS THAT MEASUREMENT, RENDERED --------------------
     expected = _render_duplicate_starts_bullet(m)
-    # Identifiers: every snake_case token in the render, QUOTED OR NOT, has to
-    # be a key an envelope carries or a marker a row carries. A backtick-only
-    # check let an invented key ship unquoted (#757 review round 8).
+    # ASCII only: a homoglyph spelling of a measured token would otherwise
+    # walk past every check below (round 9).
+    assert expected.isascii() or all(
+        ord(c) < 128 or c in "—" for c in expected), expected
+    # Identifiers: every identifier-shaped token in the render -- snake_case,
+    # kebab-case or camelCase, quoted or not -- has to be a key an envelope
+    # carries or a marker a row carries.
     measured_names = m["envelope_keys"] | set(m["row_keys"]) | set(m["markers"])
-    assert set(_IDENTIFIER_TOKEN.findall(expected)) <= measured_names, (
-        "the rendered entry names identifiers no measured envelope or row "
-        f"carries: {sorted(set(_IDENTIFIER_TOKEN.findall(expected)) - measured_names)}"
+    invented = set(_IDENTIFIER_TOKEN.findall(expected)) - measured_names
+    assert not invented, (
+        f"the rendered entry names identifiers nothing produced: {sorted(invented)}"
         f"\n{expected}")
     # ...and every backticked token is one of those or a declared command/flag.
     backticked = set(re.findall(r"`([^`]+)`", expected))
@@ -1447,29 +1498,18 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
     assert not unexplained, (
         f"the rendered entry backticks tokens nothing produced: {sorted(unexplained)}"
         f"\n{expected}")
-    # Numbers: only ones the measurement supplied, plus the issue number.
-    assert set(re.findall(r"\d+", expected)) == {
-        "757",                                   # the issue this entry answers
-        str(m["ranked_rows"]), str(m["ranked_dropped_hits"]),
-        str(m["shared_name_hits"]), str(m["filtered_rows"]),
-        str(m["filtered_named_hits"][0]),
-    }, expected
-    # The two mappings the render turns a measurement into WORDS -- which
-    # marker belongs to which case, and which extent the collapse keeps --
-    # are pinned against the measurement, because inverting either is
-    # invisible to every assertion above.
-    assert f'`"{m["ranked_marker"]}"` on the row a ranked address kept' in expected
-    assert f'`"{m["unranked_marker"]}"` on every row of an address' in expected
+    # Numbers: the issue's, and nothing else. Every per-shape quantity this
+    # entry used to state became the next round's blocker.
+    assert set(re.findall(r"\d+", expected)) == {"757"}, expected
+    # The mappings the render turns a measurement into WORDS are pinned
+    # against the measurement, because inverting one is invisible otherwise.
+    assert f'`"{m["ranked_marker"]}"` where a record won on extent' in expected
+    assert f'`"{m["unranked_marker"]}"` where nothing could be ranked' in expected
     assert m["ranked_marker"] != m["unranked_marker"], m
-    kept_the_larger = m["ranked_kept_size"] == max(m["ranked_group_sizes"])
-    assert ("carrying the larger extent" in expected) is kept_the_larger, expected
-    assert ("carrying the smaller extent" in expected) is not kept_the_larger, expected
-    # ...and each case's lead-in carries its own defining condition, so the
-    # two cannot be swapped while the rest still reads true.
-    assert ("**Ranked** (every extent readable)" in expected) is (
-        m["ranked_extents_all_readable"]), expected
-    assert ("**Unranked** (any extent unreadable)" in expected) is (
-        not m["unranked_extents_all_readable"]), expected
+    assert ("keeps one record, the one carrying the largest extent" in expected) is (
+        all(ok for _, ok in m["ranked_keeps_one_largest"])), expected
+    assert ("keeps them all" in expected) is (
+        all(ok for _, ok in m["unranked_keeps_all"])), expected
 
     assert _duplicate_starts_bullet() == expected, (
         "skills/bn/reference/reading.md's duplicate-start entry is not what the "
