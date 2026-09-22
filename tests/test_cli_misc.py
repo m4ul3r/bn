@@ -1695,11 +1695,12 @@ def test_data_vars_builds_request_and_renders_rows(fake_transport, capsys):
         "data_vars": {
             "ok": True,
             "result": {"kind": "data_vars", "has_more": False, "items": [
-                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 42, "sec": ".data"},
-                {"a": "0x2004", "n": "g_handler", "t": "char*", "w": 4,
-                 "p": "0x5000", "ps": "on_message", "sec": ".data"},
-                {"a": "0x2008", "n": "", "t": "char*", "w": 4,
-                 "p": "0x6000", "pstr": "hello", "sec": ".data"},
+                {"address": "0x2000", "name": "", "type": "int32_t", "width": 4,
+                 "value": 42, "section": ".data"},
+                {"address": "0x2004", "name": "g_handler", "type": "char*", "width": 4,
+                 "pointer": "0x5000", "pointer_symbol": "on_message", "section": ".data"},
+                {"address": "0x2008", "name": "", "type": "char*", "width": 4,
+                 "pointer": "0x6000", "pointer_string": "hello", "section": ".data"},
             ]},
         },
     })
@@ -1721,7 +1722,8 @@ def test_data_vars_forwards_limit_and_notes_truncation(fake_transport, capsys):
         "data_vars": {
             "ok": True,
             "result": {"kind": "data_vars", "has_more": True, "items": [
-                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 1},
+                {"address": "0x2000", "name": "", "type": "int32_t", "width": 4,
+                 "value": 1},
             ]},
         },
     })
@@ -1752,12 +1754,111 @@ def test_data_symbols_lists_address_name_pairs(fake_transport, capsys):
 
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "data_symbols"]
-    # Unbounded by default: the index build wants every data global in one call.
-    assert calls[1]["params"] == {"offset": 0, "limit": None}
+    # #682 item 1: PAGED like every sibling list read. This command used to
+    # hand-roll --limit/--offset with default=None, i.e. build and serialize
+    # every data symbol in the view by default; the page is the default now.
+    assert calls[1]["params"] == {"offset": 0, "limit": 100}
     out = capsys.readouterr().out
     assert "0x2000  g_state" in out
     assert "0x2010  g_table" in out
-    assert "showing" not in out  # nothing truncated: no paging footer
+    assert "showing" not in out  # the whole population fit the page
+
+
+def test_data_symbols_text_says_a_default_page_is_a_page(fake_transport, capsys):
+    # The default page must not read like the complete set: a 1284-symbol view
+    # whose first 100 came back has to show the total and a way to the rest.
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 1284, "offset": 0, "limit": 100,
+                       "returned": 2, "has_more": True, "items": [
+                           {"a": "0x2000", "n": "g_state"},
+                           {"a": "0x2010", "n": "g_table"},
+                       ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "symbols"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"offset": 0, "limit": 100}
+    out = capsys.readouterr().out
+    assert "showing 2 of 1284" in out
+    assert "--offset 2" in out
+
+
+def test_data_symbols_explicit_large_limit_asks_for_the_whole_set(fake_transport, capsys):
+    # "Let a caller who wants the full set ask for it": a limit past the total
+    # is forwarded verbatim -- not clamped, not an error -- and the whole
+    # population renders with no page footer.
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 3, "offset": 0, "limit": 1000000,
+                       "returned": 3, "has_more": False, "items": [
+                           {"a": "0x2000", "n": "g_state"},
+                           {"a": "0x2010", "n": "g_table"},
+                           {"a": "0x2020", "n": "g_pool"},
+                       ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "symbols", "--limit", "1000000"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"offset": 0, "limit": 1000000}
+    out = capsys.readouterr().out
+    assert "g_state" in out and "g_table" in out and "g_pool" in out
+    assert "showing" not in out
+
+
+def test_data_symbols_out_uncaps_the_page(fake_transport, capsys, tmp_path, monkeypatch):
+    # The other explicit full-set path, and the one #165 exists for: --out
+    # writes the COMPLETE body, so _effective_limit must not cap it at 100.
+    # Omitting `limit` no longer expresses that: the OP defaults to a 100-row
+    # page now (#682 item 1, so the lens pays a page rather than the whole
+    # build under the read lock), so the uncap has to be asked for --
+    # `limit: "all"` is that request. Deliberately not `limit: 0`, which
+    # already means "the schema, not the rows" across this repo's helpers.
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 1, "offset": 0, "limit": None,
+                       "returned": 1, "has_more": False,
+                       "items": [{"a": "0x2000", "n": "g_state"}]},
+        },
+    })
+    out_path = tmp_path / "syms.json"
+
+    rc = bn.cli.main(["data", "symbols", "--out", str(out_path), "--format", "json"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"offset": 0, "limit": "all"}
+    assert json.loads(out_path.read_text())["total"] == 1
+
+
+def test_data_symbols_offset_past_the_end_still_discloses_the_total(fake_transport, capsys):
+    # #682 item 4, which must KEEP working through the new default page: an
+    # over-shot offset is an empty page, not an empty view, and the total has
+    # to survive so the reader can re-page.
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 1284, "offset": 2000, "limit": 100,
+                       "returned": 0, "has_more": False, "items": []},
+        },
+    })
+
+    rc = bn.cli.main(["data", "symbols", "--offset", "2000"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"offset": 2000, "limit": 100}
+    out = capsys.readouterr().out
+    assert "1284" in out and "2000" in out and "past the end" in out
 
 
 def test_data_symbols_pages_and_prints_a_resume_footer(fake_transport, capsys):

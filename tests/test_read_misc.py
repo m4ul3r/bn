@@ -1504,26 +1504,26 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
 
     assert result["kind"] == "data_vars"
     assert result["has_more"] is False
-    rows = {row["a"]: row for row in result["items"]}
+    rows = {row["address"]: row for row in result["items"]}
     # Half-open window: 0x1000 (before) and 0x3000 (== end) excluded, lo included.
     assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
 
     scalar = rows["0x2000"]
-    assert scalar["t"] == "int32_t" and scalar["w"] == 4 and scalar["v"] == 42
-    assert scalar["sec"] == ".data"
+    assert scalar["type"] == "int32_t" and scalar["width"] == 4 and scalar["value"] == 42
+    assert scalar["section"] == ".data"
 
     to_sym = rows["0x2004"]
-    assert to_sym["n"] == "g_handler"
-    assert to_sym["p"] == "0x5000" and to_sym["ps"] == "on_message"
+    assert to_sym["name"] == "g_handler"
+    assert to_sym["pointer"] == "0x5000" and to_sym["pointer_symbol"] == "on_message"
 
     to_str = rows["0x2008"]
-    assert to_str["p"] == "0x6000" and to_str["pstr"] == "hello"
-    assert "ps" not in to_str
+    assert to_str["pointer"] == "0x6000" and to_str["pointer_string"] == "hello"
+    assert "pointer_symbol" not in to_str
 
     # A pointer ARRAY contains '*' but is not a pointer: it must keep all
-    # elements visible (no p/ps/v collapse to the first slot).
+    # elements visible (no pointer/pointer_symbol/value collapse to the first slot).
     arr = rows["0x2010"]
-    assert arr["w"] == 16 and "p" not in arr and "v" not in arr
+    assert arr["width"] == 16 and "pointer" not in arr and "value" not in arr
 
     # The sharp case: a ONE-element pointer array is pointer-WIDE and its text
     # carries a '*', so a width+text heuristic collapses it to its first
@@ -1531,10 +1531,11 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
     # them. Its slot is mapped and would decode to 0x5000/on_message if the
     # decode were still text-driven.
     arr1 = rows["0x2018"]
-    assert arr1["w"] == 4 and "p" not in arr1 and "ps" not in arr1 and "v" not in arr1
+    assert (arr1["width"] == 4 and "pointer" not in arr1
+            and "pointer_symbol" not in arr1 and "value" not in arr1)
 
     wide = rows["0x2020"]
-    assert "v" not in wide
+    assert "value" not in wide
 
 
 def test_data_vars_row_survives_a_throwing_symbol_or_section_accessor(monkeypatch):
@@ -1556,11 +1557,11 @@ def test_data_vars_row_survives_a_throwing_symbol_or_section_accessor(monkeypatc
 
     result = instance._data_vars(None, start="0x2000", end="0x3000")
 
-    rows = {row["a"]: row for row in result["items"]}
+    rows = {row["address"]: row for row in result["items"]}
     # Every var is still listed, and still typed -- only the decoration is gone.
     assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
-    assert rows["0x2000"]["t"] == "int32_t" and rows["0x2000"]["w"] == 4
-    assert rows["0x2000"]["n"] == "" and "sec" not in rows["0x2000"]
+    assert rows["0x2000"]["type"] == "int32_t" and rows["0x2000"]["width"] == 4
+    assert rows["0x2000"]["name"] == "" and "section" not in rows["0x2000"]
 
 
 def test_data_vars_seeks_window_instead_of_scanning_all_vars(monkeypatch):
@@ -1594,7 +1595,7 @@ def test_data_vars_has_more_is_honest_at_the_cap(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     capped = instance._data_vars(None, start="0x2000", end="0x3000", limit=2)
-    assert [r["a"] for r in capped["items"]] == ["0x2000", "0x2004"]
+    assert [r["address"] for r in capped["items"]] == ["0x2000", "0x2004"]
     assert capped["has_more"] is True
 
     # Exactly limit rows left in the window: nothing was truncated.
@@ -1617,7 +1618,7 @@ def test_data_vars_rejects_empty_window_and_bad_limit(monkeypatch):
 
 def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
     # A pointer var whose slot bytes are unmapped must still produce a row
-    # (address/type/width), just without the p/ps/pstr decoration.
+    # (address/type/width), just without the pointer/pointer_symbol/pointer_string decoration.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     ptr_t = _FakeType("char*", width=4, type_class="PointerTypeClass")
@@ -1628,8 +1629,8 @@ def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
 
     result = instance._data_vars(None, start="0x2000", end="0x2100")
 
-    assert [r["a"] for r in result["items"]] == ["0x2000"]
-    assert "p" not in result["items"][0]
+    assert [r["address"] for r in result["items"]] == ["0x2000"]
+    assert "pointer" not in result["items"][0]
 
 
 def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
@@ -1655,11 +1656,11 @@ def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = {row["a"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["items"]}
+    rows = {row["address"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["items"]}
 
-    assert rows["0x2000"]["v"] == 0xF0000000   # NOT -268435456
-    assert rows["0x2004"]["v"] == -1           # genuinely signed: -1, not 0xffffffff
-    assert rows["0x2008"]["v"] == 0xF0000000
+    assert rows["0x2000"]["value"] == 0xF0000000   # NOT -268435456
+    assert rows["0x2004"]["value"] == -1          # genuinely signed: -1, not 0xffffffff
+    assert rows["0x2008"]["value"] == 0xF0000000
 
 
 # --- data_symbols: named DataSymbol listing (promoted out of py_exec) --------
@@ -1684,12 +1685,236 @@ def test_data_symbols_lists_named_data_symbols_only(monkeypatch):
         {"a": "0x2000", "n": "g_state"},
         {"a": "0x2010", "n": "g_table"},
     ]
-    # Paging is opt-in: the default call returns the WHOLE set, because the
-    # consumer builds a goto/search index in one shot and a silent default cap
-    # would drop exactly the renamed globals this read exists to keep visible.
-    assert result["limit"] is None
+    # #682 item 1: the DEFAULT is a bounded page AT THE OP, not only on the
+    # CLI. The issue's lock half is about the caller it names -- the
+    # out-of-tree lens, which calls this op with no params at all -- so a
+    # default of "the whole set" left exactly that consumer building and
+    # serializing every row under the read lock. A caller that genuinely
+    # wants the whole set now asks for it explicitly with `limit="all"`.
+    assert result["limit"] == 100
     assert result["total"] == 2 and result["returned"] == 2
     assert result["has_more"] is False
+
+
+class _CountingDataSym:
+    """A DataSymbol whose `address` AND `name` reads are counted.
+
+    `_data_symbols` reads `address` exactly once per materialized row (to render
+    it) and never in the named-symbol filter, so that count IS the number of rows
+    this read built -- the measurement `_FakeStringRef.type_reads` makes for
+    `strings` (#814).
+
+    `name` is the other half of the in-lock cost, and the one the op's docstring
+    makes a claim about: the population must be SCANNED for the honest `total`
+    (BN has no count-only API), so `name` is read once per symbol to filter, plus
+    once more per row actually built. Counting it is what keeps "the remaining
+    in-lock cost on the page path is that scan" a measured statement rather than
+    an assertion -- a second pass over the population would double it while every
+    row-count assertion stayed green."""
+
+    def __init__(self, address: int, name: str):
+        self._address = address
+        self._name = name
+        self.type = sys.modules["binaryninja"].SymbolType.DataSymbol
+        self.address_reads = 0
+        self.name_reads = 0
+
+    @property
+    def name(self):
+        self.name_reads += 1
+        return self._name
+
+    @property
+    def address(self):
+        self.address_reads += 1
+        return self._address
+
+
+def test_data_symbols_builds_rows_for_the_page_only_682(monkeypatch):
+    # #682 item 1, the lock half. This op used to construct a row (address ->
+    # hex, plus name) for EVERY data symbol before slicing the page, so the
+    # default read held the read lock for the whole build. A page must now build
+    # the window only. The scan of the population for the honest `total` stays --
+    # BN hands back the symbol list in one call and there is no count-only API,
+    # so `name` is still read per symbol -- but no row is built outside it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    syms = [_CountingDataSym(0x2000 + i * 8, f"g_{i}") for i in range(3000)]
+    bv = _FakeBV(symbols=syms)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._data_symbols(None, limit=25)
+
+    assert page["total"] == 3000
+    assert page["returned"] == 25 and page["has_more"] is True
+    assert page["items"][0] == {"a": "0x2000", "n": "g_0"}
+    built = sum(s.address_reads for s in syms)
+    assert built <= 26, f"{built} row(s) materialized for a 25-row page of 3000 data symbols"
+
+
+def test_data_symbols_default_read_builds_the_page_only_682(monkeypatch):
+    # #682 item 1's lock half AT THE CALLER THE ISSUE NAMES. The issue's
+    # complaint is that this op "holds the read lock for the full build on a
+    # large target -- a mild inversion of the thesis the op was added under (it
+    # exists so lens reads *stop* blocking other clients)", and its remedy is
+    # "paged=True, and let the lens ask for the full set explicitly". The lens
+    # passes NO limit, so bounding only the CLI leaves that caller paying the
+    # whole build under the lock. The PARAMLESS read must build the page only.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    syms = [_CountingDataSym(0x2000 + i * 8, f"g_{i}") for i in range(3000)]
+    bv = _FakeBV(symbols=syms)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._data_symbols(None)
+
+    assert page["total"] == 3000
+    assert page["limit"] == 100 and page["returned"] == 100
+    assert page["has_more"] is True
+    built = sum(s.address_reads for s in syms)
+    assert built <= 101, (
+        f"{built} row(s) materialized for a default read of 3000 data symbols; "
+        f"the caller #682 names pays that build under the read lock")
+
+
+def test_data_symbols_default_bound_holds_on_every_page_682(monkeypatch):
+    # A CHARACTERIZATION test: the op already behaved this way when this test
+    # was written, so it closes a coverage gap rather than pinning new
+    # behaviour. It earns its place on the mutations it kills, quoted in the
+    # PR: a bound scoped to `offset == 0`, a window taken over the raw symbol
+    # list, an unfiltered `total`, and a second pass over the population.
+    #
+    # The default is a property of the READ, not of the first page. A caller
+    # paging its index sends `offset` and keeps letting the op choose the page
+    # size, so a bound scoped to `offset == 0` would hand that caller the whole
+    # unbounded tail from page two on -- the same lock inversion #682 names,
+    # one call later.
+    #
+    # The population also carries UNNAMED symbols, interleaved: the window is
+    # taken over the NAMED population (the one `total` counts), so a window
+    # computed over the raw symbol list would short the page while `has_more`
+    # still promised a remainder.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    named = [_CountingDataSym(0x2000 + i * 16, f"g_{i}") for i in range(3000)]
+    unnamed = [_CountingDataSym(0x2008 + i * 16, "") for i in range(3000)]
+    population = [s for pair in zip(named, unnamed) for s in pair]
+    bv = _FakeBV(symbols=population)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._data_symbols(None, offset=500)
+
+    assert page["total"] == 3000                      # named only
+    assert page["limit"] == 100 and page["returned"] == 100
+    assert page["offset"] == 500 and page["has_more"] is True
+    assert page["items"][0] == {"a": hex(0x2000 + 500 * 16), "n": "g_500"}
+    assert page["items"][-1] == {"a": hex(0x2000 + 599 * 16), "n": "g_599"}
+    built = sum(s.address_reads for s in population)
+    assert built <= 101, (
+        f"{built} row(s) materialized for a default read at offset 500 of 3000 "
+        f"data symbols; the default bounds the first page only")
+    # The scan is the remaining in-lock cost the op's docstring claims, so its
+    # SIZE is pinned too: one `name` read per symbol to filter, plus one per
+    # row actually built. A second pass over the population doubles this while
+    # every row count above stays green.
+    scanned = sum(s.name_reads for s in population)
+    assert scanned <= len(population) + 100, (
+        f"{scanned} name read(s) over a {len(population)}-symbol population; "
+        f"the page path must scan it once, not repeatedly")
+
+
+def test_data_symbols_explicit_whole_set_request_682(monkeypatch):
+    # The escape hatch the issue asks for: "let the lens ask for the full set
+    # explicitly". `limit="all"` is that request over the wire, and the
+    # envelope echoes it as the established no-cap `limit: null` rather than
+    # as a page of some size.
+    #
+    # NOT `limit=0`: this repo already gives a caller-visible zero the
+    # OPPOSITE meaning -- "asks for the schema, not the rows"
+    # (skills/bn-kernel/SKILL.md), which the client layers turn into a
+    # one-row wire probe precisely because every op refuses a zero limit.
+    # One wire value meaning "the cheapest possible read" everywhere else and
+    # "the most expensive possible read" here is the trap this op's whole
+    # default exists to remove. A token cannot be reached by int() coercion
+    # either, so no malformed limit can fall into it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    syms = [_CountingDataSym(0x2000 + i * 8, f"g_{i}") for i in range(250)]
+    bv = _FakeBV(symbols=syms)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    whole = instance._data_symbols(None, limit="all")
+
+    assert whole["returned"] == 250 and whole["total"] == 250
+    assert whole["limit"] is None and whole["has_more"] is False
+    assert whole["items"][-1] == {"a": hex(0x2000 + 249 * 8), "n": "g_249"}
+
+
+def test_data_symbols_zero_and_near_miss_limits_stay_refused_682(monkeypatch):
+    # The uncap is one exact token. Every numeric limit keeps the contract the
+    # rest of the bridge documents (`limit >= 1`), so a zero stays the refusal
+    # the schema-probe convention relies on, and a near-miss token is refused
+    # by NAME rather than by a generic "must be an integer" that hides which
+    # word was meant.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(5)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    for spelling in (0, "0", 0.4, 0.0, False, -1, [], "abc"):
+        with pytest.raises(bridge.OperationFailure):
+            instance._data_symbols(None, limit=spelling)
+
+    with pytest.raises(bridge.OperationFailure, match='"all"'):
+        instance._data_symbols(None, limit="ALL")
+
+    # ...and an ordinary coercible page size still pages.
+    assert instance._data_symbols(None, limit="2")["returned"] == 2
+
+
+def test_data_symbols_limit_past_the_total_is_not_an_error_682(monkeypatch):
+    # "Let a caller who wants the full set ask for it": a limit larger than the
+    # population clamps to the population instead of erroring or padding, and it
+    # is echoed back so the envelope stays honest about what was asked.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(5)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    whole = instance._data_symbols(None, limit=1000000)
+
+    assert whole["limit"] == 1000000 and whole["returned"] == 5
+    assert whole["total"] == 5 and whole["has_more"] is False
+    assert [s["n"] for s in whole["items"]] == [f"g_{i}" for i in range(5)]
+
+
+def test_data_symbols_offset_past_the_end_discloses_the_total_682(monkeypatch):
+    # #682 item 4, which must keep working now that the CLI defaults to a page:
+    # an over-shot offset is an EMPTY PAGE, not an empty view, and the true
+    # total has to survive so the reader can re-page (the text renderer turns
+    # this into "none (offset N is past the end; M total)").
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(4)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    over = instance._data_symbols(None, offset=2000, limit=100)
+
+    assert over["items"] == [] and over["returned"] == 0
+    assert over["total"] == 4 and over["offset"] == 2000
+    assert over["has_more"] is False
 
 
 def test_data_symbols_pages_on_demand_with_an_honest_total(monkeypatch):
@@ -1713,8 +1938,13 @@ def test_data_symbols_pages_on_demand_with_an_honest_total(monkeypatch):
     assert [s["n"] for s in tail["items"]] == ["g_3", "g_4"]
     assert tail["has_more"] is False
 
+    # A NEGATIVE limit and a negative offset stay refused rather than
+    # silently dropping the tail via slice math. A ZERO limit is refused
+    # too -- the whole-set escape hatch is the token `limit="all"`, not a
+    # zero (#682 item 1); that half is pinned by
+    # test_data_symbols_zero_and_near_miss_limits_stay_refused_682.
     with pytest.raises(bridge.OperationFailure):
-        instance._data_symbols(None, limit=0)
+        instance._data_symbols(None, limit=-1)
     with pytest.raises(bridge.OperationFailure):
         instance._data_symbols(None, offset=-1)
 

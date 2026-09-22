@@ -844,19 +844,53 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
 
 
 _DATA_VARS_DEFAULT_LIMIT = 400
+# The standard on-screen page every sibling list read defaults to (`cli.py`'s
+# `_effective_limit`). Applied HERE, not only on the CLI, so the op's own
+# default bounds a direct bridge caller too (#682 item 1).
+_DATA_SYMBOLS_DEFAULT_LIMIT = 100
+# ...and the explicit way past it. A TOKEN, deliberately not a number: a
+# caller-visible `limit=0` already means "the schema, not the rows" across
+# this repo's collection helpers (skills/bn-kernel/SKILL.md), which the client
+# layers turn into a one-row wire probe precisely because every op refuses a
+# zero limit. Spelling "everything" as the same value that means "as close to
+# nothing as a page can get" is a trap, and no numeric limit below 1 is free
+# of it. A word also cannot be produced by int() coercion, so no malformed
+# limit falls into the unbounded read.
+_DATA_SYMBOLS_ALL = "all"
 
 
 def _is_pointer_type(type_, type_text: str) -> bool:
     """Whether *type_* is a single pointer, for the data-var decode.
 
-    BN's ``type_class`` is authoritative when reachable, and it is needed in
-    BOTH directions. It confirms a typedef'd pointer whose declaration text
-    carries no ``*``; more importantly it DENIES a one-element pointer array --
-    ``void (*[0x1])()`` renders with a ``*`` and its width equals one pointer,
-    so the old ``"*" in text and width == psz`` test collapsed it to its first
-    element and hid that it was an array at all. Falls back to the rendered
-    text only when the enum isn't reachable, mirroring ``read_evidence``'s
-    pointer heuristic.
+    BN's ``type_class`` is authoritative whenever it is reachable, and the
+    reason is the DENIAL it makes: a one-element pointer array --
+    ``void (*[0x1])()`` -- renders with a ``*`` and its width equals one
+    pointer, so the old ``"*" in text and width == psz`` test collapsed it to
+    its first element and hid that it was an array at all. The enum class is
+    ``ArrayTypeClass`` there, so it says no.
+
+    What it does NOT do (#682 item 4, correcting this docstring): confirm a
+    typedef'd pointer whose declaration text carries no ``*``. A typedef is
+    modeled as a ``NamedTypeReferenceType``, whose ``type_class`` is
+    ``NamedTypeReferenceClass`` -- not ``PointerTypeClass`` -- so wherever the
+    enum decides, it DENIES the typedef.
+
+    The enum decides only when BOTH halves of the check below are in hand:
+    ``bn.TypeClass.PointerTypeClass`` resolves (the whole attribute chain --
+    a ``TypeClass`` namespace lacking that member raises and counts as
+    missing, which is what the ``try`` is for) AND this type object exposes a
+    ``type_class``. Missing EITHER one drops through to the rendered text,
+    and on that path a typedef is judged by its text like anything else --
+    as is the one-element pointer array, so the denial above is unavailable
+    there too. On a build where both halves are in hand (the normal case) the
+    typedef is denied, the var is listed with its address, name, type text
+    and width, and it simply carries no decoded ``pointer``: the intended
+    conservative behaviour, not an accident of the check.
+
+    Note this is NOT the composition ``read_evidence`` uses: there the
+    rendered text is the default and ``type_class`` may only ADD a pointer
+    verdict, so a typedef'd pointer can never be denied by the enum. Here the
+    enum wins outright, which is what makes the array denial possible.
     """
     try:
         pointer_class = bn.TypeClass.PointerTypeClass
@@ -912,10 +946,16 @@ def _type_is_signed(type_) -> bool:
 
 
 def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
-    """One typed data variable as a compact row: `a`ddress, symbol `n`ame,
-    `t`ype, `w`idth, plus a decoded scalar `v`alue or -- for a single
-    pointer-sized pointer -- the target `p` (with `ps` symbol or `pstr` ASCII
-    preview) and the containing `sec`tion."""
+    """One typed data variable as a row: `address`, `name` (symbol), `type`,
+    `width`, plus a decoded scalar `value` or -- for a single pointer-sized
+    pointer -- the `pointer` target (with `pointer_symbol`, or the
+    `pointer_string` ASCII preview when the target has no symbol) and the
+    containing `section`.
+
+    Key spelling (#682 item 2): spelled out rather than the old one- and
+    two-letter wire form (`a`/`n`/`t`/`w`/`v`/`p`/`ps`/`pstr`/`sec`), which is
+    opaque to the models that read this JSON without the reference open.
+    """
     addr = int(dv.address)
     type_ = dv.type
     try:
@@ -933,32 +973,32 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
         sym = None
     type_text = str(type_)
     row: dict[str, Any] = {
-        "a": hex(addr),
-        "n": sym.name if sym else "",
-        "t": type_text,
-        "w": width,
+        "address": hex(addr),
+        "name": sym.name if sym else "",
+        "type": type_text,
+        "width": width,
     }
     try:
         secs = bv.get_sections_at(addr)
     except Exception:  # noqa: BLE001 - same: the section is decoration
         secs = None
     if secs:
-        row["sec"] = secs[0].name
+        row["section"] = secs[0].name
     is_pointer = _is_pointer_type(type_, type_text)
     try:
         # Every read below is explicitly signed/unsigned: bv.read_int defaults to
         # sign=True, so leaving it implicit renders unsigned data as negative.
         if is_pointer and width == psz:
-            row["p"] = hex(bv.read_int(addr, psz, sign=False))
-            tsym = bv.get_symbol_at(int(row["p"], 16))
+            row["pointer"] = hex(bv.read_int(addr, psz, sign=False))
+            tsym = bv.get_symbol_at(int(row["pointer"], 16))
             if tsym:
-                row["ps"] = tsym.name
+                row["pointer_symbol"] = tsym.name
             else:
-                preview = bv.get_ascii_string_at(int(row["p"], 16), 4)
+                preview = bv.get_ascii_string_at(int(row["pointer"], 16), 4)
                 if preview:
-                    row["pstr"] = preview.value[:48]
+                    row["pointer_string"] = preview.value[:48]
         elif not is_pointer and 0 < width <= 8 and _is_scalar_type(type_, type_text):
-            row["v"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
+            row["value"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
     except Exception:
         pass  # unmapped slot: the row still lists the var, just undecorated
     return row
@@ -1006,18 +1046,55 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     """Every *named* DataSymbol as address + name -- includes internal symbols
     the exports list omits, so a renamed data global stays addressable.
 
-    Paging is OPT-IN: `limit=None` returns the whole set, because the primary
-    consumer builds a goto/search index over every data global in one call and
-    a silent default cap would drop exactly the renamed globals this read
-    exists to keep addressable. `offset`/`limit` are there so an oversized
-    view can still be walked in bounded pages, and the envelope reports the
-    true `total` either way.
+    Paged by DEFAULT, at this op and not only on the CLI (#682 item 1): an
+    omitted `limit` is a 100-row page, exactly like every sibling list read.
+    The issue's lock half is about the caller it names -- the out-of-tree lens
+    calls this op with no params at all -- so a whole-set default left that
+    consumer building and serializing a row for every data global while
+    holding the read lock, the inversion of the thesis the read-locked lens
+    ops were added under. A caller that genuinely wants the whole set now asks
+    for it: `limit="all"` is the explicit uncap, and the envelope echoes it as
+    the established no-cap `limit: null`. The token is deliberately NOT `0`
+    -- a caller-visible zero already means "the schema, not the rows" across
+    this repo's collection helpers, which the client layers turn into a
+    one-row wire probe precisely because the ops refuse a zero limit -- and
+    being a word, it is also unreachable by int() coercion, so a malformed
+    `"0"`/`0.4`/`false` stays refused instead of falling into an unbounded
+    read. A page larger than the population is the other honest way to the
+    whole set; the token is the way that needs no guess.
 
-    The container stays `syms` (not the `items` of the paged list ops) because
-    it is an established client contract; the paging metadata is additive.
+    The out-of-tree index build must move to that request, and until it does
+    it sees the first page -- a consumer break registered in
+    `tests/test_wire_consumer_contract.py`'s KNOWN_BREAKS as
+    `("data_symbols", "request:limit=all")`, where the contract test reads
+    the registered request back and exercises it.
+
+    An OVERSIZED page is not an error: the window clamps to the population, so
+    `limit` > total returns the whole set and an `offset` past the end returns
+    an empty page with the true `total` still visible (#682 item 4).
+
+    Rows are built for the returned WINDOW only (#682 item 1): a page no longer
+    constructs a dict and serializes it for every symbol in the view. The
+    population still has to be scanned for the honest `total` -- BN hands back
+    the symbol list in one call and there is no count-only API -- so the
+    remaining in-lock cost on the page path is that scan, not the build.
     """
     offset = _validate_count(offset, label="offset", minimum=0)
-    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    if limit is None:
+        limit = _DATA_SYMBOLS_DEFAULT_LIMIT
+    elif isinstance(limit, str) and not limit.lstrip("+-").isdigit():
+        # A word, so it is meant as the token rather than as a count: say
+        # which word, instead of letting `_validate_count` answer "must be an
+        # integer" to a caller who was reaching for the documented spelling.
+        if limit != _DATA_SYMBOLS_ALL:
+            raise OperationFailure(
+                "invalid_request",
+                f'limit must be a count >= 1 or "{_DATA_SYMBOLS_ALL}" for the '
+                f"whole set, got {limit!r}",
+            )
+        limit = None
+    else:
+        limit = _validate_count(limit, label="limit", minimum=1)
     bv = ctx._resolve_view(selector)
     sym_type = getattr(getattr(bn, "SymbolType", None), "DataSymbol", None)
     if sym_type is None:
@@ -1029,15 +1106,19 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     # flattened into an empty list, making a real BN error indistinguishable
     # from "this binary has no data symbols" -- the silent-empty failure mode.
     symbols = bv.get_symbols_of_type(sym_type)
+    named = [sym for sym in symbols if getattr(sym, "name", "")]
+    start, stop = _page_window(len(named), offset=offset, limit=limit)
     syms = [
-        {"a": hex(int(sym.address)), "n": sym.name}
-        for sym in symbols
-        if getattr(sym, "name", "")
+        # `a`/`n` stay terse on purpose: #682 item 2 names the `cfg` line/edge
+        # keys and the `data vars` row keys, and this row pair is a separate,
+        # older contract the out-of-tree lens decodes by name.
+        {"a": hex(int(sym.address)), "n": sym.name} for sym in named[start:stop]
     ]
     # #275: `items` is the universal data container and `kind` the discriminator.
     # This used to hand-roll a byte-identical envelope under the name `syms`,
     # which every generic consumer (and the paging footer) has to special-case.
-    return _paged_list_result(syms, offset=offset, limit=limit, kind="data_symbols")
+    return _paged_envelope(kind="data_symbols", items=syms, total=len(named),
+                           offset=offset, limit=limit)
 
 
 def _ascii_render(data: bytes) -> str:

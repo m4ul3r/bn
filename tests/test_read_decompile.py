@@ -3384,8 +3384,8 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
     blocks = result["blocks"]
     assert [b["start"] for b in blocks] == ["0x401000", "0x401010"]
     assert blocks[0]["insns"] == [
-        {"a": "0x401000", "t": "cmp eax, 0x0"},
-        {"a": "0x401004", "t": "je 0x401010"},
+        {"address": "0x401000", "text": "cmp eax, 0x0"},
+        {"address": "0x401004", "text": "je 0x401010"},
     ]
     # #682 item 3: a null-target edge is NOT emitted as a row. It would have
     # to carry `to: null`, and bn-tui types that field `pub to: String` with
@@ -3394,7 +3394,7 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
     # EMPTY view with no error. The shape is also unreachable on BN 6.1.
     # The unresolved target is reported on the BLOCK instead, where the
     # disclosure is additive and no consumer breaks.
-    assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    assert blocks[0]["edges"] == [{"to": "0x401010", "branch_type": "TrueBranch"}]
     assert blocks[0]["undetermined_edges"] is True
     assert blocks[1]["edges"] == []
     assert "undetermined_edges" not in blocks[1]
@@ -3402,11 +3402,13 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
 
 def test_cfg_edge_rows_stay_exactly_two_keys_for_a_strict_consumer_682(monkeypatch):
     # Must-not-fire twin for #682 item 3, repointed at the contract that
-    # actually matters. bn-tui decodes an edge as `{to: String, k: String}`
-    # with `to` non-optional, so the edge row must never grow a key that
-    # changes its shape and must never carry a non-string `to` -- the whole
-    # reason the unresolved case moved to the block. Assert the row's exact
-    # key set rather than the absence of one name a later change could rename.
+    # actually matters. A strict consumer (bn-tui) decodes an edge as
+    # `{to: String, <kind>: String}` with `to` non-optional, so the edge row
+    # must never grow a key that changes its shape and must never carry a
+    # non-string `to` -- the whole reason the unresolved case moved to the
+    # block. Assert the row's exact key set rather than the absence of one
+    # name a later change could rename: #682 item 2 renamed the kind key to
+    # `branch_type`, which is a change this assertion is meant to notice.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, _fn = _cfg_asm_bv()
@@ -3416,7 +3418,7 @@ def test_cfg_edge_rows_stay_exactly_two_keys_for_a_strict_consumer_682(monkeypat
 
     for block in result["blocks"]:
         for edge in block["edges"]:
-            assert set(edge) == {"to", "k"}, edge
+            assert set(edge) == {"to", "branch_type"}, edge
             assert isinstance(edge["to"], str), edge
 
 
@@ -3562,9 +3564,9 @@ def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
     blocks = result["blocks"]
     # Both blocks' first lines sit at 0x401000; starts stay distinct IL indexes.
     assert [b["start"] for b in blocks] == ["0x0", "0x2"]
-    assert blocks[0]["edges"] == [{"to": "0x2", "k": "FalseBranch"}]
-    assert blocks[0]["insns"][0]["a"] == "0x401000"
-    assert blocks[1]["insns"][0]["a"] == "0x401000"
+    assert blocks[0]["edges"] == [{"to": "0x2", "branch_type": "FalseBranch"}]
+    assert blocks[0]["insns"][0]["address"] == "0x401000"
+    assert blocks[1]["insns"][0]["address"] == "0x401000"
 
 
 def test_cfg_hlil_view_uses_hlil_function(monkeypatch):
@@ -3579,7 +3581,7 @@ def test_cfg_hlil_view_uses_hlil_function(monkeypatch):
 
     assert result["view"] == "hlil"
     assert result["blocks"][0]["start"] == "0x0"
-    assert result["blocks"][0]["insns"] == [{"a": "0x401000", "t": "return 0"}]
+    assert result["blocks"][0]["insns"] == [{"address": "0x401000", "text": "return 0"}]
 
 
 def test_cfg_il_unavailable_degrades_to_empty_blocks_with_warning(monkeypatch):
