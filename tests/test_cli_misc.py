@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1624,6 +1625,145 @@ def test_fifo_file_input_is_refused_not_hung(fake_transport, capsys, tmp_path, a
     assert str(fifo) in captured.err
     assert "Traceback" not in captured.err
 
+
+def test_read_bytes_encoding_discloses_a_capped_read_827(fake_transport, capsys, tmp_path):
+    """#827 item 4 review: the bridge caps an over-long read and says so in the
+    payload, but the raw-bytes path consumed only `hex` -- so `--encoding bytes`
+    handed back a short dump with no marker on the one path documented for
+    piping a blob into another tool. The hex renderer printed the note; this
+    path did not."""
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "length": 4, "hex": "41424344", "ascii": "ABCD",
+            "capped": True, "requested_length": 200000,
+            "note": "capped at 100000 bytes (requested 200000)",
+        }},
+    })
+
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "200000", "--encoding", "bytes"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == "ABCD"
+    assert "capped at 100000 bytes (requested 200000)" in captured.err
+
+    # The --out envelope carries the same two fields, so a saved blob is not
+    # indistinguishable from a complete dump either.
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "200000", "--encoding", "bytes",
+                      "--out", str(tmp_path / "dump.bin"), "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["capped"] is True
+    assert payload["summary"]["requested_length"] == 200000
+
+
+
+_READING_REFERENCE = (
+    Path(__file__).resolve().parent.parent / "skills" / "bn" / "reference" / "reading.md"
+)
+
+
+def _bn_read_bullet() -> str:
+    """The `bn read` entry of `skills/bn/reference/reading.md`, whole."""
+    for line in _READING_REFERENCE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("- `bn read "):
+            return line
+    raise AssertionError("reading.md carries no `bn read` bullet")
+
+
+def test_read_bytes_encoding_discloses_a_short_read_too_827(fake_transport, capsys, tmp_path):
+    """The cap's disclosure rule, applied to the other partial read.
+
+    `--encoding bytes` writes the payload to stdout, so a dump quietly shorter
+    than the window the caller asked for reads as the whole window -- the
+    failure the note exists to prevent, and the stated reason the capped read
+    discloses itself on stderr here. A SHORT read is the same dump with the same
+    consequence (the documented use is piping the blob into another tool), and
+    it was disclosed on the hex face only. Both partial cases carry the bridge's
+    own `note`, so both are reported.
+    """
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "length": 4, "hex": "41424344", "ascii": "ABCD",
+            "short_read": True, "requested_length": 16,
+            "note": "short read: requested 16 bytes, only 4 mapped from 0x1000",
+        }},
+    })
+
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "16", "--encoding", "bytes"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == "ABCD"                      # stdout is still only the payload
+    assert "short read: requested 16 bytes, only 4 mapped" in captured.err
+
+    # ...and the --out summary says it too, so a saved blob is not
+    # indistinguishable from a complete dump either.
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "16", "--encoding", "bytes",
+                      "--out", str(tmp_path / "dump.bin"), "--format", "json"])
+
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["short_read"] is True
+    assert summary["requested_length"] == 16
+    assert "capped" not in summary                     # the other marker is not invented
+
+    # A bridge that marks the read partial but sends no `requested_length`
+    # leaves the key OUT rather than writing a literal null: the summary states
+    # what the caller asked for, and a null there is a length claim nobody made
+    # (and the documented pairing of the marker with `requested_length` would
+    # read as satisfied by it).
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "hex": "41424344", "short_read": True,
+            "note": "short read: only 4 mapped from 0x1000",
+        }},
+    })
+    rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                      "--length", "16", "--encoding", "bytes",
+                      "--out", str(tmp_path / "partial.bin"), "--format", "json"])
+    assert rc == 0
+    thin = json.loads(capsys.readouterr().out)["summary"]
+    assert thin["short_read"] is True
+    assert "requested_length" not in thin, thin
+
+
+def test_reading_reference_documents_the_read_cap_the_bridge_enforces_827(fake_transport, capsys):
+    """The `bn read` reference against the command as it now behaves.
+
+    Two drifts, both introduced by the cap: the bullet described the read as
+    "raw bytes from the mapped view" with the short read as its ONLY partial
+    case, so an agent asking for a window over the cap is told nothing about the
+    ceiling it will silently hit; and it stated the `short_read`/`note` marker is
+    not visible under `--encoding bytes`, which the disclosure on that path
+    makes false. The cap VALUE is read from the constant, so moving the ceiling
+    without moving the doc reds this.
+    """
+    from bn_agent_bridge import read_misc
+
+    bullet = _bn_read_bullet()
+    assert str(read_misc._READ_MAX) in bullet, bullet
+    assert "`capped" in bullet, bullet
+
+    # What the CLI actually writes on the bytes path, measured here rather than
+    # assumed, because it is what the bullet may not deny.
+    fake_transport({
+        "read": {"ok": True, "result": {
+            "address": "0x1000", "length": 4, "hex": "41424344", "ascii": "ABCD",
+            "capped": True, "requested_length": 200000,
+            "note": "capped at 100000 bytes (requested 200000)",
+        }},
+    })
+    assert bn.cli.main(["read", "--target", "active", "--address", "0x1000",
+                        "--length", "200000", "--encoding", "bytes"]) == 0
+    assert capsys.readouterr().err.startswith("note: ")
+
+    assert re.search(r"\b(?:not|never)\b[^.]*\bvisible\b", bullet, re.I) is None, bullet
 
 # --- #823: `bn spill gc` ---------------------------------------------------
 

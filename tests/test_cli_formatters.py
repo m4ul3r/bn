@@ -3879,17 +3879,42 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    # 19 -> 20 (#675.2): declared_suppressed joins the count-helper census.
-    # 20 -> 25 (#812): backward diagnostics adds five counters.
-    # 25 -> 26 (#827): alternate_parents is a disclosure count.
-    # 26 -> 33 (#823): spill GC adds five headline and two row counts.
+    # 19 -> 24 (#793): `_render_target_info_annotations_text` reads five counts
+    # (`comments`, `function_comments`, `user_symbols`, `analyst_symbols`,
+    # `placeholder_symbols`) through `_stated_count`, so an unreadable counter
+    # prints `?` on the line rather than a confident `0`.
+    # 24 -> 26 (#818 review): `_render_go_rename_text`'s "nothing to do" line now
+    # states `skipped_interior_pc` and `skipped_already_named` -- the two skip
+    # buckets `go rename` used to drop silently, which is what let that line
+    # explain "1848 defined at pcln addresses, 0 already user-named, nothing to
+    # do" with no way to reconcile it. Both live behind the zero-candidate
+    # branch, so both are in the skipped set below by name.
+    # 26 -> 28 (#883 item 4): `_duplicate_starts_note` reads the #757
+    # `duplicate_starts_collapsed` / `duplicate_starts_unresolved` counts through
+    # `_count_field` to state them in the `function list` text face. It is a
+    # fragment helper, not a payload renderer, so both pairs join the skipped set
+    # below by name with their own test.
+    # #812: `_render_backward_diagnostics` adds five
+    # counters through `_count_field` -- `sinks_seeded`/`slices` off the
+    # diagnostics block and `unresolved`/`coarse_memory`/`dropped_callers` off
+    # its frontier. They are counts in a block whose entire purpose is to
+    # withhold a completeness claim, so a fabricated zero there reads as
+    # "nothing was dropped" -- exactly the reassurance the block exists to
+    # refuse. Routed through the helper rather than `get(k, 0)` so the residue
+    # census stays put and these five join the covered set instead.
+    # #827 item 1: `_render_taint_path` adds `alternate_parents`
+    # through `_count_field`. It is a count in a DISCLOSURE line, so a
+    # fabricated zero would silently delete the disclosure and a fabricated
+    # number would invent one; both are worse than the marker being absent.
+    # #907 adds the declared_suppressed count to this combined population.
+    # #823: spill GC adds five headline and two row counts
     # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
     # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
     # are the headline's numbers; the two row reads are nested, which is why
     # they are named in the skipped set below rather than silently dropped.
-    assert len(sites) == 33, (
+    assert len(sites) == 42, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 33. A "
+        "count helper, not 42. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3943,6 +3968,16 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     assert sorted(not_stated) == [
         "_blast_radius_line(referenced) [not a payload renderer]",
         "_blast_radius_line(reflowed) [not a payload renderer]",
+        # #883 item 4: the `function list` duplicate-start line is its own
+        # fragment helper too -- `function list` and `--count` each concatenate
+        # it, so neither boundary owns the read. Covered by name in
+        # `test_function_list_text_discloses_the_duplicate_start_collapse_883`,
+        # which drives the real payload and asserts that an unreadable count
+        # states no number while the enclosing boundary names the field.
+        "_duplicate_starts_note(duplicate_starts_collapsed) [not a payload "
+        "renderer]",
+        "_duplicate_starts_note(duplicate_starts_unresolved) [not a payload "
+        "renderer]",
         "_operation_row_text(count) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
@@ -3963,6 +3998,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "context]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
+        # The same branch for the #818 skip buckets: the recorded context opens
+        # the detail branch (`go_renamed_candidates` readable and non-zero), and
+        # an interior-PC / already-carried-the-name count can only be stated on
+        # the zero-candidate line. Covered by name in
+        # `test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read`,
+        # which drives that branch and asserts the `?` refusal for a count no
+        # value reads out of.
+        "_render_go_rename_text(skipped_already_named) [count not stated in this "
+        "context]",
+        "_render_go_rename_text(skipped_interior_pc) [count not stated in this "
+        "context]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
@@ -3971,25 +4017,32 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
-        # `_render_spill_gc_text` (#823). `removed_count`/`reclaimed_bytes` are
-        # stated on the branch a NON-dry sweep takes, and the probe payload
-        # carries no `dry_run` flag at all; `bytes`/`files` are read off each
-        # candidate ROW, one level below anything a top-level probe reaches.
-        # All four are driven on the real shapes by
-        # `test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823`
-        # (`tests/test_output.py`), which asserts `?` in the body a caller acts
-        # on rather than a fabricated number.
+        # `_render_spill_gc_text` (#823): two reads are nested in candidate
+        # rows, and two live on the non-dry branch the probe does not open.
         "_render_spill_gc_text(bytes) [count not stated in this context]",
         "_render_spill_gc_text(files) [count not stated in this context]",
         "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
         "_render_spill_gc_text(removed_count) [count not stated in this context]",
-        # #827 item 1: gated behind a truthiness check, so an unreadable value
-        # drops the disclosure clause entirely rather than stating `?`. That is
-        # the intended behaviour -- a disclosure built out of a value nobody can
-        # read is not a disclosure -- and it is asserted directly in
-        # `test_taint_path_discloses_a_phi_join_in_the_text_view_827`, which
-        # sweeps 0 / absent / a string / a bool.
+        # #827 item 1: an unreadable alternate-parent count suppresses the
+        # disclosure clause. The dedicated taint-path test covers that branch.
         "_render_taint_path(alternate_parents) [count not stated in this context]",
+        # The same nested reason for the #793 renderer: its five counts also live
+        # under `existing_annotations`, so a top-level probe cannot open the gate
+        # that states them. Covered by name in
+        # `test_target_info_text_renders_existing_annotations`, which drives the
+        # real nested payload and asserts the `?` refusal for a count no value
+        # reads out of.
+        "_render_target_info_annotations_text(analyst_symbols) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(comments) [count not stated in "
+        "this context]",
+        "_render_target_info_annotations_text(function_comments) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(placeholder_symbols) [count not "
+        "stated in this context]",
+        "_render_target_info_annotations_text(user_symbols) [count not stated "
+        "in this context]",
+
     ], sorted(not_stated)
 
 
@@ -4042,7 +4095,12 @@ def test_the_go_rename_nothing_to_do_line_never_states_a_count_it_could_not_read
     readable = nothing_to_do()
     assert "(7 defined at pcln addresses, 2 already user-named)" in readable, readable
 
-    for key in ("defined_count", "skipped_user_named"):
+    for key in ("defined_count", "skipped_user_named", "skipped_interior_pc",
+                "skipped_already_named"):
+        # The last two only render when the bridge reported the bucket, and a
+        # bucket it reported in a shape no count reads must reach the line as
+        # `?` -- an unreadable skip count rendered as a real 0 would put the
+        # envelope's two-totals defect back on the one line a caller stops on.
         refused = nothing_to_do(**{key: "lots"})
         body = refused.split("\n! malformed")[0]
         assert "? " in body or "(? " in body, (key, refused)
@@ -4313,8 +4371,15 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    # Combined #874 and #907 renderer population: 1272 measured cases.
-    assert checked == 1272, f"the differential ran {checked} cases, not 1272"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
+    # #793: `_render_target_info_annotations_text` adds the
+    # `existing_annotations` container (6 malformed shapes probed on it) to the
+    # same discovered population. Measured.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds twelve more cases for the taint diagnostic containers.
+    # #907 adds 24 cases for its class-list container reads.
+    assert checked == 1278, f"the differential ran {checked} cases, not 1278"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4359,8 +4424,33 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # Combined #874 and #907 renderer population: 5080 measured renders.
-    assert swept == 5080, f"the raise sweep ran {swept} renders, not 5080"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
+    # #793: 4896 + 8 -- `_render_target_info_annotations_text` reads the
+    # `existing_annotations` container (8 bogus values x 1 render). Measured.
+    # #818 review: 4904 + 32 -- FOUR more discovered (renderer, ctx) pairs, 8
+    # bogus values each: `_render_go_functions_summary_text` reads `note` and
+    # `start_match_count` (the summary view carries the rebase note and the
+    # START-match counter now) and `_render_go_rename_text` reads the two new
+    # skip buckets. Measured on the rebased tree by diffing the population.
+    # #883 item 4: 4936 + 48 -- SIX more discovered (renderer, ctx) pairs, 8 bogus
+    # values each: `_duplicate_starts_collapsed` and `_duplicate_starts_unresolved`
+    # are read by `_render_function_count_text` and by
+    # `_render_function_list_text` in both its demangled and undemangled probe
+    # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
+    # carried over from a comment.
+    # #757 review round 5: 4984 + 32 -- FOUR more discovered (renderer, ctx)
+    # pairs, 8 bogus values each. The same two duplicate-start counts are now
+    # read by `_render_target_summary` (the note sits under the function count
+    # it modifies) and therefore by `_render_target_info_text`, which composes
+    # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
+    # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
+    # under the digest's own function count (1 renderer x 2 keys x 8).
+    # Measured by diffing the population, not carried over from a comment.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 56 malformed probes for its taint diagnostic reads.
+    # #907 adds 48 malformed probes for its class-list reads.
+    assert swept == 5216, f"the raise sweep ran {swept} renders, not 5216"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4515,8 +4605,29 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # Combined #874 and #907 renderer population: 1482 measured renders.
-    assert checked == 1482, f"the mirror ran {checked} renders, not 1482"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
+    # #793: 1426 + 3 -- the new target-info annotation renderer reads
+    # `existing_annotations` in three probed contexts. Measured.
+    # #818 review: 1429 + 8 -- the same four discovered pairs the raise sweep
+    # `_render_go_functions_summary_text`'s `note` / `start_match_count`
+    # and `_render_go_rename_text`'s two skip buckets), x 2 benign payloads each.
+    # Measured on the rebased tree by diffing the population.
+    # #883 item 4: 1437 + 12 -- the same SIX discovered pairs the raise sweep
+    # gained (`_duplicate_starts_note`'s two counts across the three
+    # `function list` / `--count` probe forms), x 2 benign payloads each. A
+    # well-formed count must not draw a "malformed" note, which is what this
+    # mirror checks. Measured by diffing the population.
+    # #757 review round 5: 1449 + 8 -- the same FOUR discovered pairs the raise
+    # sweep gained (the two duplicate-start counts now read by
+    # `_render_target_summary` and by `_render_target_info_text` composing it),
+    # x 2 benign payloads each. Measured by diffing the population.
+    # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
+    # gained, x 2 benign payloads each. Measured by diffing the population.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 16 benign probes for those reads.
+    # #907 adds 16 benign probes for those reads.
+    assert checked == 1517, f"the mirror ran {checked} renders, not 1517"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -8225,6 +8336,235 @@ def test_record_table_renderer_falls_back_on_a_non_dict():
 
     assert "not-a-dict" in _render_record_table_text(["not-a-dict"])
 
+
+def test_function_list_text_discloses_the_duplicate_start_collapse_883():
+    """#883 item 4: the #757 collapse counts were JSON-only on this command.
+
+    `duplicate_starts_collapsed` / `duplicate_starts_unresolved` reached the JSON
+    envelope and no text renderer, so a text-mode reader saw a shorter list with
+    nothing saying why. Both keys are published ONLY when something collapsed, so
+    the line appears exactly when it is true and a clean view is unchanged.
+
+    Pinned on the surfaces a `function list` reader actually gets: the listing,
+    `--count`, and a SLICED page -- the keys ride the envelope, not a row, so a
+    page that shows 2 of 15 still has to say the 15 are 16 records collapsed.
+    """
+    from bn import formatters
+
+    # The listing: rows for the retained record, the collapse counts beside them.
+    collapsed = {"items": [{"name": "sub_401000", "address": "0x401000"}],
+                 "total": 15, "returned": 1, "offset": 0, "has_more": True,
+                 "duplicate_starts_collapsed": 1}
+    out = formatters._render_function_list_text(collapsed)
+    assert "0x401000  sub_401000" in out, out
+    assert "duplicate starts" in out and "1 start address(es) carried duplicate" in out, out
+    assert "larger extent was kept" in out, out
+
+    # --count is where the collapse is most deceptive: the count IS the collapsed
+    # count, so "Total functions: 15" alone invited a reader to compare it with a
+    # raw record count and conclude the view lost a row.
+    counted = {"kind": "functions", "count": 15, "total": 15,
+               "duplicate_starts_collapsed": 1}
+    count_text = formatters._render_function_count_text(counted)
+    assert count_text.startswith("Total functions: 15"), count_text
+    assert "split across 1 start address(es)" not in count_text    # no invented wording
+    assert "duplicate starts" in count_text and "larger extent was kept" in count_text, count_text
+
+    # Both keys, and the UNRESOLVED half has to be distinguishable from the
+    # collapse: one says a record WAS chosen (its extent won), the other that
+    # none could be.
+    both = {**collapsed, "duplicate_starts_unresolved": 2}
+    text = formatters._render_function_list_text(both)
+    assert "1 start address(es) carried duplicate function records" in text, text
+    assert "2 start address(es) hold records their extents could not rank" in text, text
+    assert "no record was chosen there" in text, text
+    # ...and the two halves do not read as one alarm: the collapsed part never
+    # says nothing was chosen, which is the whole difference between them.
+    collapsed_only = formatters._render_function_list_text(collapsed)
+    assert "no record was chosen" not in collapsed_only, collapsed_only
+
+    # A SLICED page (the keys are on the envelope, not on the rows).
+    sliced = {**collapsed, "returned": 2, "offset": 5, "has_more": True}
+    sliced_text = formatters._render_function_list_text(sliced)
+    assert "// showing 2 of 15" in sliced_text, sliced_text
+    assert "duplicate starts" in sliced_text, sliced_text
+
+    # A clean view publishes NEITHER key, so nothing is added -- the differential
+    # that keeps this line from reading as a standing alarm.
+    clean = {"items": [{"name": "sub_401000", "address": "0x401000"}],
+             "total": 1, "returned": 1, "offset": 0, "has_more": False}
+    assert "duplicate" not in formatters._render_function_list_text(clean)
+    assert formatters._render_function_count_text(
+        {"kind": "functions", "count": 1, "total": 1}) == "Total functions: 1"
+
+    # An explicit zero is "nothing collapsed", not a broken count.
+    zeroed = {**collapsed, "duplicate_starts_collapsed": 0,
+              "duplicate_starts_unresolved": 0}
+    assert "duplicate" not in formatters._render_function_list_text(zeroed)
+
+    # A present-but-unreadable count: the line never invents a number for it, and
+    # the renderer's own boundary names the malformed field -- the contract this
+    # module gives every count it cannot read (`self_defined_excluded` included),
+    # so the reader learns the key was there without a fabricated count beside a
+    # fabricated silence.
+    bogus = {**collapsed, "duplicate_starts_collapsed": "many"}
+    bogus_text = formatters._render_function_list_text(bogus)
+    assert _disclosed(bogus_text, "duplicate_starts_collapsed"), bogus_text
+    assert "duplicate starts: ?" not in bogus_text, bogus_text
+    assert "1 start address(es)" not in bogus_text, bogus_text
+
+
+def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757():
+    """The collapse note is an ADDITION to the listing, never a substitute for
+    the empty-list marker.
+
+    `_render_function_list_text` returned the note INSTEAD of the body when the
+    body was the bare empty marker, borrowing the paging footer's replace-the-marker
+    rule from `_render_paged_list_text` -- but a footer states the emptiness
+    ("showing 0 of 15") and this note does not. An empty listing that carried
+    `duplicate_starts_collapsed` therefore rendered as a single
+    `// duplicate starts: ...` line with nothing saying the list was empty, so a
+    reader was handed the alarm and no answer.
+    """
+    from bn import formatters
+
+    # No total to footer against, so the body IS the bare empty-list marker --
+    # the one shape where the note used to replace it.
+    empty = {"kind": "functions", "items": [],
+             "duplicate_starts_collapsed": 1}
+    text = formatters._render_function_list_text(empty)
+    assert text.splitlines()[0] == formatters._EMPTY_RESULT, text
+    assert "duplicate starts" in text, text
+
+    # ...and the same for an envelope whose total is an honest zero (no paging
+    # happened, so `_paging_footer` has nothing to say either).
+    zero_total = {"kind": "functions", "items": [], "total": 0, "returned": 0,
+                  "offset": 0, "has_more": False, "duplicate_starts_unresolved": 2}
+    zero_text = formatters._render_function_list_text(zero_total)
+    assert zero_text.splitlines()[0] == formatters._EMPTY_RESULT, zero_text
+    assert "2 start address(es)" in zero_text and "extent" in zero_text, zero_text
+
+
+def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
+    """The note has to survive the answer it is printed beside.
+
+    `duplicate_starts_unresolved` counts an address for as long as a record of
+    it is in the answer, so a `--min-size` / `--named` answer carries the key
+    with ONE row at that address -- its twin was dropped by the filter. The
+    sentence said "left with duplicate records ... so none was dropped", and
+    both halves of that are false there: the reader is sent looking for a second
+    row that is not in the listing, and told nothing was dropped when the filter
+    dropped exactly the record the conflict is about.
+
+    What IS always true when the key fires is the finding itself: the extents
+    at that address ranked nothing -- BN holds another record whose extent
+    cannot be read, or two records claim the same extent -- so no record could
+    be chosen, and the row shown was not picked on extent, which is precisely
+    what the collapsed half's "the larger extent was kept" promises and this
+    half cannot.
+    """
+    from bn import formatters
+
+    # The shape a filtered answer has: ONE row at the disclosed address.
+    filtered = {"kind": "functions", "items": [{"name": "widget_poll", "address": "0x401014"}],
+                "total": 1, "returned": 1, "offset": 0, "has_more": False,
+                "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(filtered)
+    # The claims that answer refutes: a second row is here, and nothing went.
+    assert "none was dropped" not in text, text
+    assert "left with duplicate records" not in text, text
+    # ...and the claim it supports: nothing could be chosen at that address.
+    assert "no record was chosen" in text, text
+    assert "extent" in text, text
+
+    count_text = formatters._render_function_count_text(
+        {"kind": "functions", "count": 1, "total": 1, "duplicate_starts_unresolved": 1})
+    assert count_text.startswith("Total functions: 1"), count_text
+    assert "none was dropped" not in count_text, count_text
+    assert "no record was chosen" in count_text, count_text
+
+    # The two halves still read differently -- the collapsed one is the only
+    # one that may say a record was kept for its extent.
+    collapsed_only = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "the larger extent was kept" in collapsed_only, collapsed_only
+    assert "no record was chosen" not in collapsed_only, collapsed_only
+
+
+def test_the_duplicate_starts_note_scopes_its_counts_to_the_whole_answer_757():
+    """The note states WHICH population it counted, once, and it is not the page.
+
+    Both halves were written as claims about the answer in front of the reader
+    -- "the larger extent was kept", "no record was chosen there" -- while the
+    counts are taken against the filtered population `total` reports, before
+    `--offset`/`--limit`. On a window holding none of the counted addresses
+    that reads as a statement about the rows on screen, which is the same
+    clause-describes-the-answer defect the unresolved half already lost once.
+    Naming the denominator fixes both halves at once: the reader can see that
+    7 is not the 3 rows in front of them.
+    """
+    from bn import formatters
+
+    paged = {"kind": "functions",
+             "items": [{"name": "fn_0", "address": "0x402000"},
+                       {"name": "fn_1", "address": "0x402010"},
+                       {"name": "fn_2", "address": "0x402020"}],
+             "total": 7, "returned": 3, "offset": 3, "has_more": True,
+             "duplicate_starts_collapsed": 1, "duplicate_starts_unresolved": 1}
+    text = formatters._render_function_list_text(paged)
+    # The scope is stated ONCE, names the population, and says it is not the page.
+    assert text.count("not only the rows shown") == 1, text
+    assert "all 7 function(s) this answer reports" in text, text
+    # ...and both halves keep their own distinct finding under it.
+    assert "the larger extent was kept" in text, text
+    assert "no record was chosen there" in text, text
+
+    # `--count` has no rows at all, and the same sentence still reads true
+    # against the number it is printed beside.
+    counted = formatters._render_function_count_text(
+        {"kind": "functions", "count": 7, "total": 7, "duplicate_starts_collapsed": 1})
+    assert "all 7 function(s) this answer reports" in counted, counted
+
+    # An envelope with no total to count against states the scope without
+    # inventing a denominator -- never a fabricated "0 functions".
+    bare = formatters._render_function_list_text(
+        {"items": [], "duplicate_starts_collapsed": 1})
+    assert "not only the rows shown" in bare, bare
+    assert "function(s) this answer reports" not in bare, bare
+
+
+def test_a_duplicate_start_row_is_labelled_in_text_757():
+    """The per-row marker reaches the TEXT face, like every other #757
+    disclosure on this PR.
+
+    `duplicate_start` on the row is what tells a reader holding one row of a
+    `--sort size` page that its size never won a comparison; publishing it in
+    JSON only would rebuild the JSON-only disclosure the whole change removes.
+    An unknown value still prints rather than being dropped, so a marker added
+    to the bridge cannot go invisible here.
+    """
+    from bn import formatters
+
+    rows = [
+        {"name": "widget_poll", "address": "0x401014", "size": 96,
+         "basic_block_count": 3, "duplicate_start": "collapsed"},
+        {"name": "tick_stub", "address": "0x401100", "size": 0,
+         "basic_block_count": 0, "duplicate_start": "unresolved"},
+        {"name": "widget_init", "address": "0x401000", "size": 28,
+         "basic_block_count": 1},
+    ]
+    text = formatters._render_name_address_rows(rows)
+    poll, stub, init = text.splitlines()
+    assert poll.endswith("[duplicate start: kept on extent]"), poll
+    assert stub.endswith("[duplicate start: not ranked]"), stub
+    assert "duplicate start" not in init, init
+    # The size column still renders, so the marker qualifies the size rather
+    # than replacing it.
+    assert "(96 bytes, 3 blocks)" in poll, poll
+    # A value this renderer does not know about is shown verbatim, not dropped.
+    unknown = formatters._render_name_address_rows(
+        [{"name": "fn", "address": "0x401200", "duplicate_start": "shadowed"}])
+    assert unknown.endswith("[duplicate start: shadowed]"), unknown
 
 # ---------------------------------------------------------------------------
 # #812 / #811 / #805: the four taint renderings the census counters above only
