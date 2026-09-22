@@ -80,7 +80,11 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# Defined in `wire_limits` (symlinked from `bn/`, like `paths`/`version`) so
+# the `batch apply` preflight that warns BEFORE sending and the handler that
+# refuses on arrival read ONE number rather than two copies of it (#769): a
+# client guessing low would refuse requests the bridge would have accepted.
+from .wire_limits import MAX_REQUEST_BYTES  # noqa: F401 - re-exported
 
 # Idle reaper: cap the watcher poll interval so a long BN_IDLE_TIMEOUT doesn't
 # leave a stale process lingering far past its deadline, while a short timeout
@@ -626,7 +630,11 @@ class TargetManager:
         for row in self.refresh():
             if row.get("view_id") == own:
                 continue
-            if row.get("filename") == path or row.get("database_path") == path:
+            # #869: identity, not spelling. A raw `==` missed a save landing
+            # on a file another target has open under a symlinked directory,
+            # while the reference states the disclosure unconditionally.
+            if _same_file(row.get("filename"), path) or \
+                    _same_file(row.get("database_path"), path):
                 return {
                     "target_id": row.get("target_id"),
                     "selector": row.get("selector"),
@@ -1061,6 +1069,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         )
         if identity is not None:
             response = {**response, "bridge_identity": dict(identity)}
+        # #825 item 2: echo the request's `id` (forward-compat). It was already
+        # threaded to this method for cancel tracking and disconnect logging but
+        # never emitted, so a client could not correlate a response with the
+        # request that produced it from the body alone. The current transport is
+        # one request per connection, so nothing NEEDS it today -- which is
+        # exactly why it is cheap to add now and expensive to retrofit once a
+        # multiplexing client exists. Emitted only when the request supplied
+        # one, so a request without an `id` keeps its byte-identical response.
+        if request_id is not None:
+            response = {**response, "id": request_id}
         for attempt in (1, 2):
             try:
                 return json.dumps(response, sort_keys=True, default=str).encode("utf-8")
@@ -2714,6 +2732,69 @@ class BinaryNinjaBridge:
         else:
             out = filename + ".bndb"
 
+        # #867: REFUSE before the write, rather than disclosing after it.
+        #
+        # A save landing on a file another target already has open makes the
+        # two targets one database from that moment -- BN dedups views by
+        # file -- so a later `session restart` returns one target for both and
+        # the instance comes back with fewer targets than it had (measured
+        # 2 -> 1, rc 0). #857 made that DISCLOSED; the collapse itself
+        # survived, and disclosure after an irreversible write is the weaker
+        # half of the pair.
+        #
+        # Refusing costs nothing the caller cannot recover: nothing is
+        # written, so no annotation is lost and the two ways out are one
+        # command away. The alternative considered and rejected was to keep
+        # the save and have restart reopen the re-homed target from its own
+        # binary -- that preserves the COUNT by bringing the target back as
+        # raw bytes with its analysis gone, which is the silent-data-loss
+        # shape #753 exists to stop.
+        #
+        # Best-effort in the same direction as the post-write disclosure: a
+        # probe that cannot answer must not block a legitimate save, so only
+        # a POSITIVE match refuses. The post-write disclosure stays as the
+        # backstop for the window between this check and the write.
+        try:
+            collision = self.targets.open_target_for_path(out, exclude=bv)
+        except Exception:  # noqa: BLE001 - an unanswerable probe refuses nothing
+            collision = None
+        if collision:
+            raise OperationFailure(
+                "invalid_request",
+                f"save refused: {out} is already open as target "
+                f"{collision.get('selector')!r} ({collision.get('target_id')}). "
+                "Saving here would make the two targets one database, so a "
+                "later `session restart` would return one target for both. "
+                "Save elsewhere with --path, or close the other target first.",
+                requested={"path": out},
+                observed={"collides_with_open_target": collision,
+                          "request_sent": True, "written": False},
+            )
+
+        # #889c finding 1: decide OWNERSHIP BEFORE THE WRITE.
+        #
+        # `_is_own_database_destination` asks "is this destination the
+        # target's own database", and #869 made it answer by file identity so
+        # a hard-linked spelling of the sibling is recognised. But it was
+        # evaluated AFTER `create_database`, and that write REPLACES the
+        # destination's inode (measured: sibling 2 links -> destination 1 new
+        # link) -- so by the time the gate ran, the hard link no longer shared
+        # an inode with anything and the gate answered False. `database_path`
+        # went unrecorded and the next `session restart` reopened the STALE
+        # database: the #753 silent-drop shape, reached through a spelling and
+        # surviving the identity fix because the identity was gone by then.
+        #
+        # The pre-write moment is the only one where the question is
+        # answerable, so the answer is captured here and consumed after. Both
+        # candidate destinations are decided now: the primary, and the cache
+        # path the read-only fallback may write instead.
+        own_primary = _is_own_database_destination(out, filename)
+        try:
+            own_cache = _is_own_database_destination(
+                str(_cache_bndb_path(filename)), filename)
+        except Exception:  # noqa: BLE001 - no cache path is not ownership
+            own_cache = False
+
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
             if make_parent:
@@ -2805,7 +2886,9 @@ class BinaryNinjaBridge:
             # raw bytes: the round-2 fix defeated by its companion guard, both
             # added in one commit, and invisible because the test's fake did not
             # re-home the way BN does (#857 review round 3).
-            if _is_own_database_destination(saved, filename):
+            # The CACHE branch: consume the decision taken before the write
+            # (#889c finding 1), because the write replaced the inode.
+            if own_cache:
                 self.targets.note_database(bv, saved)
             _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
@@ -2858,7 +2941,7 @@ class BinaryNinjaBridge:
         # that target fail to reload and vanish. That is the identity move
         # `_restore_filename` exists to prevent, deferred one step to restart
         # (#857 round-4 regression, introduced by this change).
-        if _is_own_database_destination(saved, filename):
+        if own_primary:
             self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
         _disclose_open_target_collision(self.targets, bv, saved, result)
@@ -3234,6 +3317,9 @@ class BinaryNinjaBridge:
 
     def _decompile(self, *a, **k):
         return read_decompile._decompile(self.ctx, *a, **k)
+
+    def _decompile_batch(self, *a, **k):
+        return read_decompile._decompile_batch(self.ctx, *a, **k)
 
     def _function_info(self, *a, **k):
         return read_decompile._function_info(self.ctx, *a, **k)
@@ -4401,6 +4487,25 @@ def _bind_decompile(bridge, params, target):
     )
 
 
+@op("decompile_batch", lock="read",
+    escalation=lambda p: _validate_bool(p.get("force_analysis"), label="force_analysis", default=False))
+def _bind_decompile_batch(bridge, params, target):
+    identifiers = params.get("identifiers")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise BridgeError("decompile_batch requires a non-empty `identifiers` list")
+    return bridge._decompile_batch(
+        target,
+        identifiers,
+        addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
+        force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
+        include_annotations=_validate_bool(
+            params.get("include_annotations"),
+            label="include_annotations",
+            default=False,
+        ),
+    )
+
+
 @op("il", lock="read")
 def _bind_il(bridge, params, target):
     return bridge._il(target, params["identifier"], str(params.get("view", "hlil")), _validate_bool(params.get("ssa"), label="ssa", default=False))
@@ -4958,6 +5063,42 @@ READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
+
+def _same_file(a: str | None, b: str | None) -> bool:
+    """Do *a* and *b* name the same FILE, rather than the same spelling?
+
+    Two decisions in this module used to be made on a path's spelling while
+    the question was about the file (#869), and each missed a different
+    aliasing form: the collision probe compared raw strings, so a symlinked
+    spelling of an already-open database was not disclosed; the own-database
+    gate resolved symlinks but not HARD links, so an explicit save through a
+    hard link of the target's own sibling recorded no `database_path` and the
+    next `session restart` reopened the raw bytes -- the silent-data-loss
+    shape #753 exists to stop, reached by a different spelling.
+
+    Identity first (`os.path.samefile`, which is inode+device and therefore
+    sees both forms), and the string compare kept ONLY as a fast path that
+    can add an answer and never remove one: a destination that does not exist
+    yet -- the normal case for a save -- has no inode to compare, and
+    `samefile` raises there rather than answering False. Degrading to the
+    spelling is the same "answer only what the evidence supports" rule
+    `socket_evidence` applies when `/proc` cannot see a socket.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        if Path(a).expanduser().resolve() == Path(b).expanduser().resolve():
+            return True
+    except Exception:  # noqa: BLE001 - an unresolvable path is not a match
+        pass
+    try:
+        return os.path.samefile(a, b)
+    except Exception:  # noqa: BLE001 - absent/unstattable: no identity evidence
+        return False
+
+
 def _is_own_database_destination(saved: str, filename: str) -> bool:
     """Is *saved* this target's OWN database, rather than an export elsewhere?
 
@@ -4978,12 +5119,14 @@ def _is_own_database_destination(saved: str, filename: str) -> bool:
     """
     if not saved or not filename:
         return False
+    # #869: identity, not spelling. `.resolve()` alone sees a symlink and not
+    # a HARD link, so a save through a hard link of the sibling looked like
+    # an export and recorded nothing.
+    if _same_file(saved, filename + ".bndb"):
+        return True
     try:
-        written = Path(saved).expanduser().resolve()
-        if written == Path(filename + ".bndb").expanduser().resolve():
-            return True
-        return written == _cache_bndb_path(filename).expanduser().resolve()
-    except Exception:  # noqa: BLE001 - an unresolvable path is simply not ours
+        return _same_file(saved, str(_cache_bndb_path(filename)))
+    except Exception:  # noqa: BLE001 - an unresolvable cache path is not ours
         return False
 
 
@@ -4994,6 +5137,21 @@ def _disclose_open_target_collision(targets, bv, saved: str, result: dict) -> No
     the collision probe did. Both a structured key and a rendered note, because
     the harm is that a later `session restart` silently returns fewer targets
     than it had, and an agent needs to see that at save time (#857 round 4).
+
+    WHY THIS SURVIVED #867, which refuses a colliding destination outright:
+    the pre-write refusal tests the REQUESTED path, and the read-only cache
+    fallback writes somewhere else -- a destination chosen only after the
+    primary write has already failed. Extending the refusal there was
+    considered and deliberately rejected: the fallback exists so annotations
+    are NOT lost on a read-only mount, so refusing at that point could
+    destroy the work it was invented to save. Verified live (#867 pass,
+    detail 3) -- the disclosure fires, the save lands, and the `--path`
+    export still carries the annotations.
+
+    So this is the BACKSTOP, not a leftover: it covers the fallback
+    destination and the window between the pre-write check and the write.
+    A future reader seeing "the refusal did not fire here" should not
+    reach for the obvious fix without reading the paragraph above.
     """
     try:
         other = targets.open_target_for_path(saved, exclude=bv)

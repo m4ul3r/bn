@@ -1014,3 +1014,62 @@ def test_gc_discloses_a_non_canonical_day_name_823(tmp_path):
     assert report["candidate_count"] == 0 and report["removed_count"] == 0
     assert (odd / "keep.txt").read_text() == "someone else's data"
     assert unrelated.exists()
+
+
+def test_estimate_output_result_measures_without_writing_796(tmp_path, monkeypatch):
+    """#796: the preflight estimate reports the size of the payload the caller
+    WOULD have received, and produces no artifact.
+
+    #409's AC1 was "bound the next read"; only its second half shipped (a
+    spilled/`--out` envelope names the size AFTER the payload was produced), so
+    the one question asked BEFORE paying for a large read had no answer. The
+    number is a measurement of the same rendering the spill threshold compares --
+    not an estimate of the raw JSON -- because a text read and a JSON read of the
+    same result cost different amounts.
+    """
+    from bn.output import estimate_output_result, render_value
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {"kind": "functions", "items": [f"0x401000 sub_{i:06d}" for i in range(200)],
+               "total": 200}
+
+    res = estimate_output_result(payload, fmt="json", rerun_hint="--limit N or --offset M")
+
+    # The size is the RENDERED payload's, exactly -- the same string (and so the
+    # same number) the spill threshold would have compared.
+    rendered = render_value(payload, "json")
+    assert res.token_count == _token_count(rendered)
+    envelope = json.loads(res.rendered)
+    assert envelope["estimated"] is True and envelope["ok"] is True
+    assert envelope["tokens"] == res.token_count
+    assert envelope["bytes"] == len(rendered.encode("utf-8"))
+    assert envelope["tokenizer"] == "estimate"
+    assert envelope["rerun"] == "--limit N or --offset M"
+    assert envelope["summary"]["count"] == 200 and envelope["summary"]["total"] == 200
+    # The slicing knob an agent acts on is stated, and NOTHING was written: no
+    # path, no spill day-directory, and the result cannot read as a spill.
+    assert "artifact_path" not in envelope and "spilled" not in envelope
+    assert res.spilled is False
+    assert not (tmp_path / "spills").exists()
+
+    # Unarmed BN_SPILL_TOKENS: no threshold to compare against, so none is stated
+    # rather than a fabricated one.
+    assert "spill_token_limit" not in envelope
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1000")
+    armed = json.loads(estimate_output_result(payload, fmt="json").rendered)
+    assert armed["spill_token_limit"] == 1000
+    assert armed["tokens"] > 1000          # ...and this read WOULD have spilled
+
+
+def test_estimate_output_result_text_envelope_is_the_artifact_shape_796():
+    """Text mode states it in the same `key: value` shape a spill envelope uses,
+    with `estimated: true` in place of `spilled`/`path` -- a reader must be able
+    to tell a preflight from an artifact at a glance."""
+    from bn.output import estimate_output_result
+
+    out = estimate_output_result({"items": ["a", "b"], "total": 2}, fmt="text").rendered
+
+    assert out.startswith("ok: true\nestimated: true\n")
+    fields = _parse_envelope(out)
+    assert fields["format"] == "text"
+    assert int(fields["tokens"]) > 0 and int(fields["bytes"]) > 0
+    assert "path" not in fields and "spilled" not in fields

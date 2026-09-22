@@ -1865,7 +1865,12 @@ def _code_row(index):
     return {"index": index, "entry_address": hex(0x9010 + index * 8),
             "value": hex(value), "readable": True, "plausible": True,
             "target": {"status": "function", "normalized": hex(value),
-                       "function": {"name": f"m{index}", "address": hex(value)}}}
+                       # The producer ALWAYS writes `exact_start`; omitting it
+                       # here meant every scan test fed the ABSENT-key state,
+                       # so the twin named for exact starts did not build one
+                       # (#901/#821 review). The name now matches the fixture.
+                       "function": {"name": f"m{index}", "address": hex(value),
+                                    "exact_start": True}}}
 
 
 def _data_row(index, value=0xA100):
@@ -2358,7 +2363,11 @@ def test_render_class_list_text_warns_when_quick_loaded():
     out = _render_class_list_text(listing)
     assert out.startswith("WARNING: target is quick-loaded; class list is partial.")
     assert "bn refresh" in out
-    assert "classes: 1 shown of 1" in out
+    # #770: the count line states the PAGE and the shared `_paging_footer` states
+    # the total -- this complete page (returned == total, has_more False) adds no
+    # footer, so the header is a bare `classes: 1`, the same shape the --count
+    # line below prints.
+    assert "classes: 1" in out and "shown of" not in out
 
     count = _render_class_list_text({
         "kind": "classes", "count": 1, "total": 1, "artifact_count": 0,
@@ -2369,6 +2378,110 @@ def test_render_class_list_text_warns_when_quick_loaded():
     full = _render_class_list_text({**listing, "analysis_state": "full", "partial": False})
     assert "WARNING" not in full
 
+
+# --- #821: an interior code pointer ends the vtable scan -------------------
+
+
+def _slot(status, *, exact_start=None, kind=None):
+    """A `_normalize_code_pointer`-shaped target, as the scan consumes it."""
+    target = {"status": status}
+    if status == "function":
+        entry = {"name": "fn", "address": "0x401000"}
+        if exact_start is not None:
+            entry["exact_start"] = exact_start
+        target["function"] = entry
+    if kind is not None:
+        target["context"] = {"kind": kind}
+    return target
+
+
+def test_an_interior_code_pointer_is_not_a_vtable_slot_821():
+    # #821: the normalizer reports `function` for an INTERIOR address too --
+    # a data word that happens to equal a mid-function PC -- with
+    # `exact_start: False`. `_slot_is_code` never consulted it, so such a
+    # word was accepted as a slot and the scan ran past the real end of the
+    # table until some later word happened to terminate it. A vtable slot
+    # points at a function ENTRY.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function", exact_start=False)) is False
+
+
+def test_an_entry_point_pointer_is_still_a_vtable_slot_821():
+    # Must-not-fire twin, and the one that matters: the ordinary case is an
+    # exact function start, which is what a vtable is made of. A guard that
+    # ended the scan here would empty every vtable in the binary.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function", exact_start=True)) is True
+
+
+def test_a_function_hit_without_interiority_evidence_still_counts_821():
+    # Tri-state, the rule applied everywhere else today: only an AFFIRMATIVE
+    # `exact_start: False` terminates. An entry that does not carry the key
+    # says nothing about interiority, and ending a scan on absent evidence
+    # would silently truncate a table read through any producer that does
+    # not compute it.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("function")) is True
+    assert _slot_is_code({"status": "function"}) is True
+    assert _slot_is_code({"status": "function", "function": None}) is True
+
+
+def test_the_non_function_code_path_is_unchanged_821():
+    # The #205 behaviour this sits beside: a code-classified address is a
+    # slot, a mapped-but-not-code pointer is not. The #821 gate must not
+    # reach either.
+    from bn_agent_bridge.read_class import _slot_is_code
+    assert _slot_is_code(_slot("mapped", kind="code")) is True
+    assert _slot_is_code(_slot("mapped", kind="data")) is False
+    assert _slot_is_code(_slot("unmapped")) is False
+
+
+def _interior_code_row(index):
+    """A row whose word lands INSIDE a function -- the shape the normalizer
+    produces for a data word that merely equals a mid-function PC. Real
+    producer shape: `exact_start: False` plus the `delta` from the entry."""
+    value = 0x400000 + index * 8
+    return {"index": index, "entry_address": hex(0x9010 + index * 8),
+            "value": hex(value), "readable": True, "plausible": True,
+            "target": {"status": "function", "normalized": hex(value),
+                       "function": {"name": "m0", "address": "0x400000",
+                                    # `offset`, not `delta`: seam.py computes
+                                    # `delta` as a LOCAL and writes it out as
+                                    # `entry["offset"]`. The first cut carried a
+                                    # key no producer emits (#901/#821 review).
+                                    "exact_start": False, "offset": "0x8"}}}
+
+
+def test_the_scan_terminates_on_an_interior_pointer_821():
+    """#821 filed the SCAN, not the predicate.
+
+    The four `_slot_is_code` tests beside this one prove the predicate and
+    cannot observe the termination: `_code_row` -- the builder behind every
+    `_vtable_layout` case in this file -- emits a `function` entry with no
+    `exact_start` key, so every scan test exercises only the ABSENT-key
+    state. Deleting the loop's call to `_slot_is_code` leaves all four green.
+    Right logic, wrong entry point (#901 review).
+
+    The contract is the slot LIST and the COUNT: base accepted the interior
+    word and ran on to the data boundary, reporting slots [0,1,2] and
+    `total: 3` -- an exact total containing a fabricated slot, which is the
+    number an agent actually reads.
+    """
+    rows = [_code_row(0), _interior_code_row(1), _code_row(2), _data_row(3)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+
+    assert [s["index"] for s in layout["slots"]] == [0]
+    assert layout["total"] == 1
+
+
+def test_the_scan_does_not_over_terminate_on_exact_starts_821():
+    """Must-not-fire twin at the SCAN level: an ordinary all-entry-point
+    table must be unaffected, or the guard empties every vtable."""
+    rows = [_code_row(0), _code_row(1), _code_row(2), _data_row(3)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+
+    assert [s["index"] for s in layout["slots"]] == [0, 1, 2]
+    assert layout["total"] == 3
 
 # --- #675.2: the DECLARED-type fallback for `class list` / `class show` -------
 #

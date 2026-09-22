@@ -35,6 +35,7 @@ from .paths import (
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 from .socket_evidence import path_has_bound_socket
+from .wire_limits import batch_apply_max_bytes
 
 
 class BridgeError(RuntimeError):
@@ -1383,6 +1384,21 @@ def _send_request_to_instance(
         payload["idle_probe"] = True
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
+    if op == "batch_apply":
+        # The manifest alone cannot predict the wire size: the request id,
+        # resolved bridge identity and JSON-escaped target join it here. Check
+        # the actual line before opening a socket, so an oversized batch gets
+        # a structured local refusal instead of the bridge's bare error.
+        max_bytes = batch_apply_max_bytes()
+        if max_bytes is not None and len(encoded) > max_bytes:
+            raise BridgeError(
+                f"batch apply request is {len(encoded)} bytes, over the "
+                f"{max_bytes}-byte limit; no request was sent",
+                status="invalid_request",
+                requested={"request_bytes": len(encoded),
+                           "max_request_bytes": max_bytes},
+                observed={"request_sent": False},
+            )
     # BN_REQUEST_TIMEOUT is one end-to-end budget, applied exactly once. A caller
     # that already resolved it (send_request, or a paginating Client.collect) hands
     # down the *remaining* slice; re-resolving here would restore the full env
