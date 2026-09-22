@@ -10,12 +10,14 @@ from typing import Any, Callable, Iterator, Sequence
 from .target_hint import open_target_lines, target_row
 from .transport import BridgeError
 
-# "rollback_failed" = an op succeeded but the batch revert that should have
-# undone it failed, so the view may be left modified -- a real failure. A
-# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
-# "internal_error" = an unexpected engine bug (distinct from an unsupported
-# request); still a failure, so exit codes/rendering flag it (#122).
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed", "internal_error"}
+# FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
+# module symlinked into the bridge package, and re-exported here. Two owners is
+# how #777 happened: this module classified the statuses while the BRIDGE
+# produced them from its own narrower inline copy, so a `_verify_*` raising
+# anything outside that copy would silently skip the revert-on-failure path.
+# Re-exported under this name because CLAUDE.md documents it here and tests pin
+# `bn.formatters.FAILED_MUTATION_STATUSES`.
+from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
@@ -381,6 +383,13 @@ def _is_failed_status(row: Any) -> bool:
 # `_render_paged_list_text` and `_render_name_address_list_text` compare a body
 # against the marker to decide whether a footer or note stands alone, so the
 # marker is a shared value rather than a literal each site spells out.
+#
+# Two renders stay outside it on purpose, and both say MORE than "empty": the
+# init-array line names the authoritative reason an ELF has no constructors
+# (#448) and the callsites line under a partial caller scan states what was
+# actually established rather than claiming absence (#816). A reasoned absence
+# is a different fact from an empty result, so it does not wear the empty
+# result's clothes.
 _EMPTY_RESULT = "(none)"
 
 
@@ -1013,7 +1022,7 @@ def _render_comment_text(value: Any) -> str:
         # Single-comment form (`comment get <addr>`): the payload IS the comment,
         # a document rather than a row, so its own newlines are the content and
         # stay raw -- same as the decompile/IL/type-layout text renderers (#771).
-        return comment if comment else "(no comment)"
+        return comment if comment else _empty_result("comment")
     return _render_fallback_text(value)
 
 
@@ -1143,7 +1152,7 @@ def _render_close_text(value: Any) -> str:
         return _render_fallback_text(value)
     closed = _field_list(value, "closed")
     if not closed:
-        return "no binaries closed"
+        return _empty_result("binaries closed")
 
     def _row(entry: Any) -> tuple[str, bool]:
         if isinstance(entry, dict):
@@ -1276,7 +1285,7 @@ def _render_session_status_text(value: Any) -> str:
         return _render_fallback_text(value)
     items = _field_list(value, "items")
     if not items:
-        return "no load jobs"
+        return _empty_result("load jobs")
     lines = []
     for item in items:
         if not isinstance(item, dict):
@@ -1618,6 +1627,60 @@ def _render_instance_gc_text(value: Any) -> str:
         f"{regs} dead registr{'y' if regs == '1' else 'ies'} "
         f"({live} live instance{'' if live == 1 else 's'} kept)"
     )
+
+
+@_discloses
+def _render_spill_gc_text(value: Any) -> str:
+    """Render the `spill gc` reclamation summary (#823).
+
+    Every count here is STATED rather than coerced: "reclaimed 0 day(s)" from
+    an unreadable counter is byte-identical to a real zero, and it is the
+    reading a caller acts on -- `_stated_count` prints `?` instead (#619).
+
+    The ACTION is the other thing that must not be inferred. A dry run and a
+    real sweep carry the same candidate rows, so an unreadable `dry_run` flag
+    prints `?` through the flag choke point rather than falling back to the
+    destructive-looking half (`has_more: "false"` is the same shape, one
+    command over).
+    """
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    candidates = _stated_count(value, "candidate_count")
+    candidate_bytes = _stated_count(value, "candidate_bytes")
+    removed = _stated_count(value, "removed_count")
+    reclaimed = _stated_count(value, "reclaimed_bytes")
+    kept = _stated_count(value, "kept_count")
+    dry_run = _flag_field(value, "dry_run")
+    if dry_run is True:
+        head = (f"spill gc: dry run, {candidates} day(s) would be reclaimed "
+                f"({candidate_bytes} bytes), {kept} kept")
+    elif dry_run is False:
+        # Candidates vs removed, because the two differ exactly when a removal
+        # failed -- which is reported per row below, not folded into a count.
+        head = (f"spill gc: reclaimed {removed} of {candidates} candidate day(s) "
+                f"({reclaimed} bytes), {kept} kept")
+    else:
+        head = (f"spill gc: ? dry run unknown -- {candidates} candidate day(s) "
+                f"({candidate_bytes} bytes), {kept} kept")
+    lines = [head]
+    for row in _row_list(value, "candidates"):
+        # `_stated_count` for the row counters too: they are PRINTED, so an
+        # unreadable one must not appear as a real 0 beside the day it belongs
+        # to (`0 bytes` on a day that holds a decompile is the fabricated-zero
+        # harm with a footnote, exactly as the headline would be).
+        files = _stated_count(row, "files")
+        lines.append(f"  {_escape_control_chars(row.get('day', '?'))}  "
+                     f"{_stated_count(row, 'bytes')} bytes  "
+                     f"{files} file{'' if files == '1' else 's'}")
+    for row in _row_list(value, "skipped"):
+        reason = _text_value(row, "reason") or "?"
+        lines.append("  left alone: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({reason})")
+    for row in _row_list(value, "errors"):
+        detail = _text_value(row, "error") or "?"
+        lines.append("  failed: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({detail})")
+    return "\n".join(lines)
 
 
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
@@ -2587,11 +2650,42 @@ def _render_function_evidence_text(value: Any) -> str:
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
+            #
+            # #827 item 6: both lines below are derived from an ABI+format
+            # HEURISTIC -- `read_evidence` stamps the diagnostic
+            # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
+            # that stamp reached JSON only. A text reader saw "expected >= N
+            # argument(s)" in the same authoritative voice the recovered facts on
+            # this card use, with nothing saying the count came from counting
+            # conversion specifiers in a string literal. Print the marker the
+            # payload already carries rather than inventing a second vocabulary.
+            #
+            # Spelled `count: <confidence>` because #886 asks for a marker that
+            # reads as "this COUNT is a heuristic". That spelling is also why
+            # there is NO omission rule: `[count: authoritative]` STATES the
+            # count is authoritative, so printing a firm word does not hedge it,
+            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
+            # hedged the whole finding. An earlier cut omitted the marker for the
+            # firm word instead, and that made a payload CALLING the count firm
+            # render byte-identically to one that said nothing about it -- the
+            # silent absence this marker exists to close, on a branch no producer
+            # in this repo can even reach.
+            #
+            # Read through `_text_value`, not an inline isinstance: a bare shape
+            # test DROPS a present-but-unreadable confidence with nothing
+            # rendered and nothing recorded, so the line comes out
+            # byte-identical to a payload that never carried the field -- the
+            # same defect again. `_text_value` already treats PRESENT-AND-EMPTY
+            # as a real "no text here" answer; a whitespace-only word is that
+            # answer with padding, so it is stripped to nothing rather than
+            # rendered as `[count:    ]`, a marker with no word in it.
+            _conf = (_text_value(variadic, "confidence") or "").strip()
+            _mark = f" [count: {_conf}]" if _conf else ""
             if variadic.get("under_recovered") and variadic.get("warning"):
-                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+                lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:
                 lines.append(
-                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"  variadic: {variadic.get('callee', '?')}{_mark} "
                     f"format={variadic['format_string']!r} "
                     f"conversions={variadic.get('format_conversions')}"
                 )
@@ -2810,7 +2904,7 @@ def _render_record_table_text(value: Any) -> str:
     lines = [
         f"record table @ {value.get('address', '<unknown>')}  "
         f"record-size: {value.get('record_size', '?')}  "
-        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or '(none)'}"
+        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or _EMPTY_RESULT}"
     ]
     for warning in _field_list(value, "warnings"):
         lines.append(f"warning: {warning}")
@@ -3577,6 +3671,32 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
         out.append(line)
         if reason:
             out.append(f"        <- {reason}")
+        # #827 item 1: the bridge follows ONE predecessor per step, so a value
+        # defined at a branch join has provenance this chain does not show. The
+        # count of unfollowed parents is the only half of item 1 this change
+        # delivers, and a JSON-only disclosure delivered it to nobody reading
+        # text at all -- the same asymmetry #810 fixed for the truncation
+        # verdict. It rides the rendered SSA path, which is a `--full` detail,
+        # so unlike this PR's two sibling disclosures (analysis_incomplete, the
+        # per-callsite frontier) it is NOT on the compact default view: the
+        # chain it qualifies is not printed there either, and annotating a step
+        # the reader cannot see would disclose nothing.
+        #
+        # A count of 0, an absent key, an unreadable value, a NEGATIVE count and
+        # a value merely COERCIBLE to one all render nothing. A fabricated
+        # disclosure is the same defect as a missing one, and `_count_field`
+        # reads a float or a numeric string AS a number by design -- right for
+        # the counters it serves, wrong here, where "1.5 parents" and a string
+        # spelled like a count are claims the bridge never made. The raw value
+        # decides, exactly as it does for the sibling frontier marker; the
+        # helper still runs so a present-but-unreadable key is recorded as skew
+        # for the enclosing boundary to disclose (#619).
+        _count_field(step, "alternate_parents")
+        _alt = step.get("alternate_parents")
+        if isinstance(_alt, int) and not isinstance(_alt, bool) and _alt > 0:
+            out.append(
+                f"        <- joins {_alt} other tainted parent(s) not shown "
+                "(this is one of several provenance paths)")
     return out
 
 
@@ -3688,9 +3808,26 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     out.append(
         f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
         f"produced {diag.get('tainted_values', 0)} tainted value(s)")
+    # #805/#812: a per-callsite attributed union has no single last use, so the
+    # scalar is deliberately null there and `last_use_by_source` carries the
+    # real answer per callsite. Rendering only the scalar would print "seed did
+    # not propagate" for a run where it propagated from every callsite -- the
+    # union's null means AMBIGUOUS, not ABSENT, and the two must not share a
+    # line. Fall through to the genuine "<none>" only when neither is present.
+    _lu_by_src = _field_dict(diag, "last_use_by_source")
     if lu:
         _reason = f" ({lu['reason']})" if lu.get("reason") else ""
         out.append(f"  last propagated use: {lu.get('label', '?')} @ {lu.get('address', '?')}{_reason}")
+    elif any(_lu_by_src.values()):
+        out.append("  last propagated use: differs per source callsite --")
+        for _addr, _u in _lu_by_src.items():
+            _ud = _as_dict(_u)
+            if _ud:
+                _r = f" ({_ud['reason']})" if _ud.get("reason") else ""
+                out.append(
+                    f"    {_addr}: {_ud.get('label', '?')} @ {_ud.get('address', '?')}{_r}")
+            else:
+                out.append(f"    {_addr}: <none — this callsite did not propagate>")
     else:
         out.append("  last propagated use: <none — seed did not propagate>")
     out.append(
@@ -3714,6 +3851,45 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     return out
 
 
+def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
+    """Compact completeness diagnostic for a backward taint slice (#812).
+
+    The backward sibling of :func:`_render_forward_diagnostics`. Its gate is
+    ``safe_to_report_complete_slice``, NOT ``safe_to_report_all_clear``: backward
+    starts at a sink and walks toward origins, so it never answers forward's
+    "no sink was reached" question, and rendering it under that name would put
+    forward's meaning on a different claim."""
+    if not isinstance(diag, dict):
+        return []
+    fr = _field_dict(diag, "frontier")
+    out = ["diagnostics:"]
+    # Counts go through the count helpers, not a raw `.get(k, 0)`: a key that is
+    # PRESENT but holds an unreadable shape must be disclosed, never rendered as
+    # a fabricated zero (#619/#866). That matters more here than almost anywhere
+    # -- a zero in this block reads as "nothing dropped, nothing unresolved",
+    # which is exactly the reassurance the block exists to withhold. The two
+    # headline counters a caller acts on use `_stated_count`, so an unreadable
+    # one renders `?` inline rather than a number the reader would trust.
+    out.append(
+        f"  walked: {_stated_count(diag, 'sinks_seeded')} seeded sink(s), "
+        f"{_stated_count(diag, 'slices')} slice(s)")
+    _fr = (f"  frontier: {_stated_count(fr, 'unresolved')} unresolved, "
+           f"{_stated_count(fr, 'coarse_memory')} coarse-memory")
+    _dropped = _count_field(fr, "dropped_callers")
+    if _dropped:
+        _fr += f", {_dropped} dropped-caller-site(s)"
+    out.append(_fr)
+    if "safe_to_report_complete_slice" in diag:
+        gate = diag.get("safe_to_report_complete_slice")
+        out.append(f"  safe_to_report_complete_slice: {'true' if gate else 'false'}"
+                   + (" (may-analysis, not a proof)" if gate else ""))
+        if diag.get("complete_slice_reason"):
+            out.append(f"    reason: {diag['complete_slice_reason']}")
+    if diag.get("next_action"):
+        out.append(f"  next: {diag['next_action']}")
+    return out
+
+
 @_discloses
 def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
@@ -3727,6 +3903,21 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = _field_list(value, "reached_sinks")
         lines.append(_taint_forward_verdict(value))
+        # #811: a callee whose body could not be read is a coverage hole that
+        # survives INTO a run with findings, where no diagnostics block is
+        # attached at all -- so leaving it JSON-only would hide it in exactly
+        # the case a reader is most likely to stop reading early. Printed right
+        # under the verdict it qualifies, naming the functions so the reader
+        # knows which region the result does not speak for.
+        _stats = _field_dict(value, "stats")
+        if _stats.get("analysis_incomplete"):
+            _incomplete = [str(f) for f in _field_list(_stats, "analysis_incomplete_functions")]
+            lines.append(
+                "  NOTE: analysis incomplete -- "
+                + (f"{len(_incomplete)} callee body/bodies could not be read "
+                   f"({', '.join(_incomplete)})" if _incomplete
+                   else "a callee body could not be read")
+                + "; their contents were never examined")
         diagnostics = _field_dict(value, "diagnostics")
         if not findings and diagnostics:
             lines.extend(_render_forward_diagnostics(diagnostics))
@@ -3818,6 +4009,15 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
             for s in unseeded:
                 lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
+        # #812: backward's completeness gate, rendered for every backward run
+        # that carries one. Leaving it JSON-only would repeat the asymmetry #810
+        # fixed for the truncation verdict -- a text reader could not tell a
+        # slice that reached every origin from one that abandoned caller sites
+        # at the cap or bottomed out at an unresolved field load.
+        bdiag = _field_dict(value, "diagnostics")
+        if bdiag:
+            lines.append("")
+            lines.extend(_render_backward_diagnostics(bdiag))
 
     by_source = _field_dict(value, "by_source")
     if direction == "forward" and by_source:
@@ -3835,9 +4035,24 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     for s in bsinks)
             else:
                 desc = "no sinks"
-            nfront = sum(1 for l in bleaves if isinstance(l, dict) and l.get("kind") == "unmodeled_callee")
+            # #812: the frontier count is computed by the bridge against the
+            # canonical blocking-leaf vocabulary and carried on the row. It used
+            # to be recomputed here against one hard-coded kind, which reported
+            # zero for the other NINE of the ten canonical blocking kinds and
+            # dropped the marker. Absent (a bridge
+            # older than this CLI) -> show no marker rather than a number this
+            # side cannot derive correctly.
+            nfront = br.get("frontier")
             if bleaves:
-                desc += f"; {len(bleaves)} leaf(s)" + (f" ({nfront} frontier)" if nfront else "")
+                desc += f"; {len(bleaves)} leaf(s)"
+                # `isinstance(True, int)` is True in Python, so a bridge that
+                # sent a FLAG where a count belongs rendered "(True frontier)":
+                # a number-shaped claim made out of a boolean. Excluded, so an
+                # unreadable value degrades to no marker like every other shape
+                # -- as does a NEGATIVE count, which reads as a number and
+                # states a thing no count can mean.
+                if isinstance(nfront, int) and not isinstance(nfront, bool) and nfront > 0:
+                    desc += f" ({nfront} frontier)"
             lines.append(f"  {addr}: {desc}")
 
     leaves = _field_list(value, "leaves")
@@ -3917,7 +4132,7 @@ def _render_taint_models_text(value: Any) -> str:
         lines.append("")
         lines.append("overlays: " + ", ".join(
             str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
-    return "\n".join(lines) if lines else "no models match the filter"
+    return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
 def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
@@ -3942,7 +4157,13 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
         fn = c.get("function") or "?"
         kind = c.get("kind")
         tag = f" [{kind}]" if kind and kind != "app_caller" else ""
-        out.append(f"      {c.get('address')}  {fn}{tag}")
+        # #794: append the one-line disassembly the bridge now carries per row.
+        # Address + function says WHERE the modeled sink is called; without the
+        # instruction a reader still had to `bn disasm` every row to triage the
+        # queue. Omitted when empty so a view that cannot disassemble (or a
+        # bridge older than this CLI) renders exactly the previous row.
+        dis = str(c.get("disasm") or "").strip()
+        out.append(f"      {c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
     return out
 
 
@@ -4177,7 +4398,7 @@ def _render_data_vars_text(value: Any) -> str:
         if row.get("sec"):
             cells.append(f"[{row['sec']}]")
         lines.append("  ".join(cells))
-    body = "\n".join(lines) if lines else "none"
+    body = "\n".join(lines) if lines else _EMPTY_RESULT
     if value.get("has_more"):
         hint = ""
         # Through the choke point: a container-shaped address on the LAST row
@@ -4426,8 +4647,29 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # internal noise and moves out of the default line.
         declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
+        # #890 obs 2: the #778 disclosure was JSON-only, so a text-mode reader
+        # of a MIXED declare saw `verified` and was never told the prototype
+        # or variable in the same source went unapplied -- the same family as
+        # #883 and #887 item 6. The types really were defined, so the row
+        # stays a success; it just stops being silent about the rest.
+        unapplied = _field_dict(item, "unapplied_prototypes")
+        extra = ""
+        if unapplied:
+            parts = []
+            for kind in ("functions", "variables"):
+                # Read through the choke point, not a bare isinstance: a
+                # `functions` that arrives malformed would otherwise be
+                # skipped and render BYTE-IDENTICALLY to a clean declare --
+                # telling a reader nothing was unapplied on exactly the
+                # payload that said otherwise. #619's boundary discloses it.
+                entries = _field_list(unapplied, kind)
+                if entries:
+                    listed = ", ".join(str(name) for name in entries)
+                    parts.append(f"{kind}: {listed}")
+            if parts:
+                extra = f"  [unapplied -- {'; '.join(parts)}]"
         if names:
-            return f"types_declare {', '.join(names)}"
+            return f"types_declare {', '.join(names)}{extra}"
         # No names, so the COUNT is the whole claim -- and it may only be stated
         # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
         # listing printed "types_declare 0 types", which reads as a declare that

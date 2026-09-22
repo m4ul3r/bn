@@ -387,6 +387,33 @@ def test_mutation_rollback_settle_still_runs_under_exclusive_lock(monkeypatch):
     assert seen[1] is True   # drift-restore settle: exclusive, carved out
 
 
+def test_target_info_reads_one_target_snapshot_775(monkeypatch):
+    """#775: `target info` resolved the view (which refreshes) and then refreshed
+    AGAIN, taking two samples of GUI state. That is not a redundant rebuild --
+    a load or close landing between them lets the resolved view and the record
+    describing it come from different samples, so the command can report a
+    record for a target the listing it returns no longer contains. One call, one
+    snapshot, both halves from the same sample."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/sample.bndb")
+    calls: list[str] = []
+
+    def _counting_refresh(*a, **k):
+        calls.append("refresh")
+        return [{"active": True, "target_id": "t1", "view_id": "v1", "selector": "sample"}]
+
+    # Deliberately NOT stubbing resolve_with_snapshot: the point is to count how
+    # many snapshots the real code path takes.
+    monkeypatch.setattr(instance.targets, "refresh", _counting_refresh)
+    monkeypatch.setattr(instance.targets, "_default_view", lambda targets: bv)
+
+    instance._target_info("active")
+
+    assert calls == ["refresh"], f"expected exactly one snapshot, got {len(calls)}"
+
+
 def test_target_info_surfaces_analysis_progress(monkeypatch):
     """#321: target info exposes pollable analysis phase/counts so a large-target
     analysis can be watched instead of guessing whether the bridge is wedged."""
@@ -397,6 +424,10 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
         state=types.SimpleNamespace(name="AnalyzeState"), count=1112, total=1939
     )
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` now takes ONE snapshot -- the view and the target
+    # listing come from the same `refresh()` -- so stub that seam too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     info = instance._target_info("active")
@@ -442,6 +473,10 @@ def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
     )
     bv = _FakeBV(symbols=[imported_function, imported_data])
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` now takes ONE snapshot -- the view and the target
+    # listing come from the same `refresh()` -- so stub that seam too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     info = instance._target_info("active")
@@ -464,6 +499,10 @@ def test_target_info_surfaces_image_base(monkeypatch):
     bv.start = 0x400000
     bv.entry_point = 0x40B180
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` now takes ONE snapshot -- the view and the target
+    # listing come from the same `refresh()` -- so stub that seam too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     info = instance._target_info("active")
@@ -525,6 +564,10 @@ def test_target_info_surfaces_the_pointer_format(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()  # default fake arch: 4-byte, no endianness attribute
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` now takes ONE snapshot -- the view and the target
+    # listing come from the same `refresh()` -- so stub that seam too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     info = instance._target_info("active")
@@ -537,6 +580,8 @@ def test_target_info_surfaces_the_pointer_format(monkeypatch):
     be = _FakeBV(arch=_FakeArch(name="ppc64", address_size=8))
     be.endianness = _Endianness.BigEndian
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: be)
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (be, []))
 
     info = instance._target_info("active")
 
@@ -5238,6 +5283,11 @@ def test_empty_collections_still_declare_their_row_fields(monkeypatch, op, param
     def empty_view(selector):
         if op == "callsites":
             return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        if op == "xrefs":
+            # The queried address must be MAPPED: an empty page is only a real
+            # answer for an address that exists, and the #374 gate now rejects an
+            # unmapped one by default (#783).
+            return _FakeBV(memory={int(params["identifier"], 16): b"\x90"})
         return _FakeBV()
 
     monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
@@ -5396,6 +5446,11 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
     def empty_view(selector):
         if kind == "callsites":
             return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        if kind == "xrefs":
+            # Mapped but ref-less: the #374 gate rejects an unmapped address by
+            # default now (#783), and a zero-hit page is only a real answer for
+            # an address the view actually holds.
+            return _FakeBV(memory={int(op_params["identifier"], 16): b"\x90"})
         return _FakeBV()
 
     monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, arg, command, read_text_input
+from ..cli import (
+    _call,
+    _depth_int,
+    _int_at_least,
+    arg,
+    command,
+    decode_json_input,
+    read_text_input,
+)
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -15,7 +22,15 @@ from ..formatters import (
     _render_values_text,
     _resolution_note,
 )
-from ..transport import BridgeError
+
+
+# #812: the fixpoint remediation string ("raise --max-iters", taint_result.py
+# _truncation_hint / the formatters truncation clause) named a flag that did not
+# exist, so a truncated run told the user to do something impossible. Built here
+# rather than beside `_depth_int` in cli.py so the label reads "iterations"
+# instead of "depth" in the argparse error -- an iteration budget of 0 analyses
+# nothing, so the floor is 1.
+_iters_int = _int_at_least(1, "iterations")
 
 
 def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -55,20 +70,37 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     resolved = Path(path).expanduser()
     if not flag and not resolved.exists():
         return
-    try:
-        params["user_models"] = json.loads(
-            read_text_input(resolved, what=f"{source} file"))
-    except ValueError as exc:
-        # #864: the shared reader already refused a missing, unreadable or
-        # blocking path by name (a FIFO here hung with no envelope at all), so
-        # what reaches this wrap is a malformed JSON body. #669's silent-degrade
-        # above keeps an env-sourced missing file out of here entirely.
-        raise BridgeError(f"could not read {source} {path}: {exc}") from None
+    # #864: the shared reader already refused a missing, unreadable or blocking
+    # path by name (a FIFO here hung with no envelope at all), and the shared
+    # decoder refuses a body the parser cannot take -- malformed, nested past
+    # its stack, or too large to build. #669's silent-degrade above keeps an
+    # env-sourced missing file out of here entirely.
+    params["user_models"] = decode_json_input(
+        read_text_input(resolved, what=f"{source} file"),
+        refusal=f"could not read {source} {path}")
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
     params["user_models_path"] = str(resolved)
     params["user_models_via"] = source
+
+
+def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
+    """Read `--resolve-map <file>` into ``params['resolve_map']`` (#824).
+
+    Forward and backward taint each carried a byte-identical copy of this
+    read/refuse policy. One copy now, mirroring the `_add_user_models`
+    precedent above: a change to how the file is read or how a bad one is
+    refused cannot land on one direction and silently miss the other.
+    """
+    if not args.resolve_map:
+        return
+    # #864: the shared reader refuses a directory/FIFO/device by kind -- a FIFO
+    # here blocked forever with no envelope -- and the shared decoder refuses a
+    # body the parser cannot take.
+    params["resolve_map"] = decode_json_input(
+        read_text_input(Path(args.resolve_map), what="--resolve-map file"),
+        refusal=f"could not read --resolve-map {args.resolve_map}")
 
 
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
@@ -162,6 +194,11 @@ _SINK_LOCATOR_HELP = (
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural recursion depth into callees (default: 8; "
                       "0 = intraprocedural only)"),
+             arg("--max-iters", dest="max_iters", type=_iters_int, default=256,
+                 help="Max intra-function fixpoint iterations before the walk is "
+                      "reported unconverged (default: 256). Raise when a result "
+                      "reports truncation_cause fixpoint_exhausted; the configured "
+                      "value is echoed back in run_params."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
@@ -186,18 +223,11 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "function": args.function,
         "sources": list(args.sources),
         "max_depth": int(args.max_depth),
+        "max_iters": int(args.max_iters),
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(
-                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
-        except ValueError as exc:
-            # #864: the shared reader refuses a directory/FIFO/device by kind --
-            # a FIFO here blocked forever with no envelope; what reaches this
-            # wrap is malformed JSON.
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,
@@ -239,15 +269,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "sinks": list(args.sinks),
         "max_depth": int(args.max_depth),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(
-                read_text_input(Path(args.resolve_map), what="--resolve-map file"))
-        except ValueError as exc:
-            # #864: the shared reader refuses a directory/FIFO/device by kind --
-            # a FIFO here blocked forever with no envelope; what reaches this
-            # wrap is malformed JSON.
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}") from None
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,

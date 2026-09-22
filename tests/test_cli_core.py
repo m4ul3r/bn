@@ -8,6 +8,11 @@ import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+# The #864 FIFO readers are split across test modules; the stall guard is
+# imported from the one holding the larger group rather than copied, because
+# two copies of a hang guard drift and the stale one is the copy nobody is
+# looking at when the reader regresses.
+from test_cli_types import _must_not_hang
 
 
 def test_spill_warns_about_pipe_trap_when_stdout_is_a_pipe(monkeypatch, capsys):
@@ -368,6 +373,213 @@ def test_max_depth_validator_says_depth_not_index(capsys):
     _, err = capsys.readouterr()
     assert "depth must be an integer >= 0" in err
     assert "index must be" not in err
+
+
+def test_both_taint_directions_share_one_resolve_map_policy(monkeypatch, capsys, tmp_path):
+    """#824 item 4: taint forward and taint backward each carried their own
+    byte-identical copy of the --resolve-map read/refuse policy, so an edit to
+    how that file is parsed or refused lands on one direction and silently
+    misses the other. One copy now (`_add_resolve_map`, mirroring the
+    `_add_user_models` precedent the issue names), and this pins the THREE
+    observable consequences a divergence would break: the same file parses to
+    the same param, a bad one is refused before the wire with the same
+    message, and -- the one that regular files cannot see -- a stream is
+    bounded and refused the same way in both directions.
+
+    That third case is what makes this cell load-bearing. The first two
+    compare two byte-identical copies, so they are green at the branch point
+    and stay green when a direction is re-inlined with the pre-fix unbounded
+    `Path(...).read_text()`: same parse, same message, one direction now
+    hanging forever. Only a stream separates them."""
+    good = tmp_path / "rmap.json"
+    good.write_text(json.dumps({"0x401000": ["0x401100"]}), encoding="utf-8")
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not json", encoding="utf-8")
+
+    seen: list[dict] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(params or {})
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "sample"}]}
+        assert op == "taint", f"unexpected op: {op}"
+        return {"ok": True, "result": {"direction": params["direction"],
+                                       "function": {"name": "f", "address": "0x1"},
+                                       "sources": [], "sinks": [], "slices": [],
+                                       "reached_sinks": [], "leaves": [],
+                                       "assumptions": [], "soundness": "x"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    directions = (
+        ["taint", "forward", "-f", "dispatch", "--source", "param:1"],
+        ["taint", "backward", "-f", "emit", "--sink", "arg:send:1"],
+    )
+
+    parsed = []
+    for tail in directions:
+        seen.clear()
+        assert bn.cli.main([*tail, "--resolve-map", str(good), "--target", "active"]) == 0
+        parsed.append(seen[-1].get("resolve_map"))
+    assert parsed[0] == parsed[1] == {"0x401000": ["0x401100"]}
+
+    capsys.readouterr()
+    refusals = []
+    for tail in directions:
+        seen.clear()
+        assert bn.cli.main([*tail, "--resolve-map", str(bad), "--target", "active"]) == 2
+        assert seen == []  # refused before the wire, both directions
+        refusals.append(capsys.readouterr().err.replace(str(bad), "<map>"))
+    assert "could not read --resolve-map" in refusals[0]
+    assert refusals[0] == refusals[1]
+
+    # A regular file cannot tell the two directions apart on the dimension
+    # that actually matters: whether the read goes through the BOUNDED shared
+    # reader. Re-inlining the pre-fix `Path(...).read_text()` into one
+    # direction keeps every assertion above green while that direction blocks
+    # forever on a stream -- #864's rc=124 with no envelope in one taint
+    # direction and a structured refusal in the other, from one flag. So the
+    # parity is asserted on a FIFO too, under the hang guard, which is also
+    # what makes this cell red at the branch point rather than green there.
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    fifo = tmp_path / "stream.json"
+    os.mkfifo(fifo)
+    # A write-only open of a FIFO fails with ENXIO while no reader is attached,
+    # so hold one open for the duration; the writer the reader under test finds
+    # is attached and silent either way.
+    keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    silent_writer = os.open(fifo, os.O_WRONLY)
+    streamed = []
+    try:
+        for tail in directions:
+            seen.clear()
+            with _must_not_hang():
+                rc = bn.cli.main([*tail, "--resolve-map", str(fifo), "--target", "active"])
+            assert rc == 2
+            assert seen == []  # bounded and refused before the wire, both ways
+            streamed.append(capsys.readouterr().err.replace(str(fifo), "<map>"))
+    finally:
+        os.close(silent_writer)
+        os.close(keep_reader)
+
+    assert "went quiet" in streamed[0]
+    assert streamed[0] == streamed[1]
+
+
+def _json_nested_past_the_decoder(tmp_path):
+    """A JSON document `json.loads` refuses, at a depth MEASURED not guessed.
+
+    The decoder gives up on a deeply nested document with `RecursionError`
+    when its scanner exhausts the interpreter's stack, and the depth that
+    takes is a property of the build's stack size -- around 100k arrays
+    here, more on a host configured with a larger one. A hardcoded depth
+    would decode cleanly there and leave the cell below green without ever
+    staging the shape it exists to pin, so the depth is found by doubling
+    until the decoder actually refuses. Every document tried is far inside
+    the reader's 64 MiB input limit, which is the whole point: bounding the
+    READ does not bound the PARSE.
+    """
+    depth = 100_000
+    while depth <= 3_200_000:
+        document = "[" * depth + "]" * depth
+        try:
+            json.loads(document)
+        except RecursionError:
+            path = tmp_path / "nested.json"
+            path.write_text(document, encoding="utf-8")
+            return path
+        depth *= 2
+    raise AssertionError(
+        "no nesting depth under 3.2M overflowed this build's JSON decoder, so "
+        "the shape under test could not be staged")
+
+
+@pytest.mark.parametrize("argv", [
+    ["taint", "forward", "-f", "dispatch", "--source", "param:1", "--resolve-map"],
+    ["taint", "backward", "-f", "emit", "--sink", "arg:send:1", "--resolve-map"],
+    ["taint", "models", "--models"],
+    ["batch", "apply"],
+])
+def test_a_json_input_the_decoder_refuses_answers_with_an_envelope(
+        monkeypatch, capsys, tmp_path, argv):
+    """#864 one call downstream of the reader it hardened. `read_text_input`
+    guarantees no input SHAPE leaves it except as a structured envelope; the
+    decode on the very next line reintroduced the escape for input
+    STRUCTURE. `json.loads` raises `ValueError` for a malformed document --
+    which every one of these readers already wrapped -- but `RecursionError`
+    for one nested past its scanner's stack, and that is a `RuntimeError`, so
+    it escaped as a raw traceback at rc 1 with empty stdout: #864's measured
+    symptom exactly, from a fifth direction.
+
+    The document is ~400 KB, so the 64 MiB cap the reader now enforces is
+    nowhere near it -- a bound on how much text is READ is not a bound on
+    what PARSING it costs, and only this cell can tell the two apart.
+
+    All four spellings, because the rule is shared and a per-site handler is
+    how three of them came to leak identically: the cross-direction parity
+    cell above cannot see this defect, since both directions leak the same
+    way.
+    """
+    nested = _json_nested_past_the_decoder(tmp_path)
+    seen: list[str] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(op)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "sample"}]}
+        raise AssertionError(f"reached the wire with an undecodable input: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([*argv, str(nested), "--target", "active"])
+
+    assert rc == 2
+    assert seen == []  # refused before the wire, like every other bad input
+    err = capsys.readouterr().err
+    assert "nested too deeply" in err
+    assert "Traceback" not in err
+    assert "RecursionError" not in err
+
+
+def test_a_json_input_too_large_to_build_answers_with_an_envelope(
+        monkeypatch, capsys, tmp_path):
+    """The decoder's other non-`ValueError`. `MemoryError` leaves
+    `json.loads` for a document whose object graph does not fit even though
+    its TEXT was inside the reader's limit -- the decoded form is several
+    times the bytes it came from -- and it is no more a `ValueError` than
+    the `RecursionError` above, so it escaped the same way.
+
+    Forced rather than provoked, for the reason the reader's own memory cell
+    gives: a genuine allocation failure is the one thing a test cannot stage
+    reliably, and what needs pinning is the handler, not the allocator. The
+    stub replaces the decoder in the CLI module's namespace only, so nothing
+    else in the process loses its JSON.
+    """
+    def boom(raw):
+        raise MemoryError
+
+    monkeypatch.setattr(bn.cli, "json", types.SimpleNamespace(loads=boom))
+    document = tmp_path / "rmap.json"
+    document.write_text('{"0x401000": ["0x401100"]}', encoding="utf-8")
+    seen: list[str] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(op)
+        raise AssertionError(f"reached the wire with an undecodable input: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["taint", "forward", "-f", "dispatch", "--source", "param:1",
+                      "--resolve-map", str(document), "--target", "active"])
+
+    assert rc == 2
+    assert seen == []
+    err = capsys.readouterr().err
+    assert "did not fit in memory while being parsed" in err
+    assert "Traceback" not in err
+    assert "MemoryError" not in err
 
 
 def test_entries_validator_hex_aware_and_rejects_zero(capsys):

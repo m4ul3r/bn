@@ -28,7 +28,10 @@ def _list_tag_types(ctx, selector: str | None) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
     types = [_tag_type_entry(tt) for tt in bv.tag_types.values()]
     types.sort(key=lambda t: t["name"])
-    return {"tag_types": types, "count": len(types)}
+    # #819: the #275 discriminator. Unpaged (every tag type is returned), so no
+    # paging quad -- `tag_types` is the container the renderer reads and `count`
+    # its size, matching the presence-tier `{kind, count}` shape.
+    return {"kind": "tag_types", "tag_types": types, "count": len(types)}
 
 
 def _tag_entry(tag, *, scope: str, address: int | None, function: str | None) -> dict[str, Any]:
@@ -56,7 +59,7 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
             _tag_entry(t, scope="function", address=None, function=fn.name)
             for t in fn.get_function_tags(auto=False)
         ]
-        return {"function": fn.name, "address": hex(int(fn.start)),
+        return {"kind": "tags_at", "function": fn.name, "address": hex(int(fn.start)),
                 "tags": tags, "count": len(tags)}
 
     if address is None:
@@ -75,7 +78,12 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
     # (parity with comment get / xrefs, #374).
     if not tags:
         _require_mapped_address(bv, addr)
-    return {"address": hex(addr), "tags": tags, "count": len(tags)}
+    # #819: the same #275 discriminator as the function branch above -- `tags` is
+    # the container the renderer reads, `count` its size. Deliberately NOT `tags`,
+    # which the PAGED `tag list` already claims for an `items`-shaped payload: one
+    # `kind` naming two shapes is the silent-null failure #275 exists to stop, so
+    # the scoped read gets its own discriminator.
+    return {"kind": "tags_at", "address": hex(addr), "tags": tags, "count": len(tags)}
 
 
 def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, Any]]:
@@ -118,6 +126,14 @@ def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, An
         funcs = bv.get_functions_containing(addr)
         fname = funcs[0].name if funcs else None
         push(_tag_entry(t, scope="data", address=addr, function=fname))
+    # #827 item 7: with no --function and no --data this is a WHOLE-VIEW
+    # sweep -- every function, its function tags and its address tags. That is
+    # the correct answer for "tags at all scopes" and is deliberately not
+    # capped here (the caller pages the result), but it is the one read on this
+    # surface whose cost scales with the binary rather than the answer, so the
+    # narrowing flags are documented beside the command in
+    # skills/bn/reference/reading.md rather than left for a user to discover on
+    # a large target.
     if not data_only:
         for fn in list(bv.functions):
             for t in fn.get_function_tags(auto=False):

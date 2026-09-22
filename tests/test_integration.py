@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -230,6 +231,77 @@ class TestMultiInstance:
             assert Path(save_path).exists()
         finally:
             _session_stop(inst_id)
+
+    def test_concurrent_mutations_in_two_sessions_stay_isolated(self, tmp_path):
+        """Two sessions mutating AT THE SAME TIME, each into its own copy (#785).
+
+        The concurrent-mutation harness lives in `tests/stress/` and is run by
+        hand; inside pytest the only concurrency was single-view (concurrent reads
+        during one mutation), so nothing exercised two bridges writing at once.
+        Each session renames the same symbol in its OWN copy of the same fixture,
+        with both subprocesses released from a barrier so the writes genuinely
+        overlap. Both must land -- no cross-instance serialization stall, no
+        routing of one session's mutation into the other -- and neither marker may
+        be visible in the other session, which is the isolation claim under
+        concurrency rather than under a sequential listing.
+        """
+        copy_a = tmp_path / "twin_a"
+        copy_b = tmp_path / "twin_b"
+        for copy in (copy_a, copy_b):
+            shutil.copyfile(HELLO_BINARY, copy)
+            copy.chmod(0o755)
+
+        info_a = _session_start(str(copy_a))
+        try:
+            info_b = _session_start(str(copy_b))
+            try:
+                id_a, id_b = info_a["instance_id"], info_b["instance_id"]
+                assert id_a != id_b
+
+                listing = json.loads(
+                    _bn("--instance", id_a, "function", "list", "--format", "json").stdout)
+                items = listing.get("items") if isinstance(listing, dict) else listing
+                symbol = items[0]["name"]
+                # The copies are byte-identical, so the same symbol exists in both
+                # and each session must rename only its own.
+                marker_a, marker_b = "TWO_SESSION_ALPHA", "TWO_SESSION_BETA"
+
+                start = threading.Barrier(2)
+                renamed: dict[str, subprocess.CompletedProcess[str]] = {}
+
+                def mutate(instance_id: str, marker: str) -> None:
+                    start.wait(timeout=30.0)
+                    renamed[marker] = _bn(
+                        "--instance", instance_id, "rename", symbol, marker,
+                        "--format", "json")
+
+                writers = [threading.Thread(target=mutate, args=(id_a, marker_a)),
+                           threading.Thread(target=mutate, args=(id_b, marker_b))]
+                for writer in writers:
+                    writer.start()
+                for writer in writers:
+                    writer.join(timeout=_SESSION_START_TIMEOUT)
+                    assert not writer.is_alive(), "a concurrent mutation never returned"
+
+                for marker, result in renamed.items():
+                    assert result.returncode == 0, f"{marker}: {result.stdout}\n{result.stderr}"
+
+                def names_in(instance_id: str, query: str) -> list[str]:
+                    found = _bn("--instance", instance_id, "function", "search", query,
+                                "--format", "json")
+                    assert found.returncode == 0, f"{query}: {found.stdout}\n{found.stderr}"
+                    payload = json.loads(found.stdout)
+                    rows = payload.get("items") if isinstance(payload, dict) else payload
+                    return [row["name"] for row in rows]
+
+                assert names_in(id_a, marker_a) == [marker_a]
+                assert names_in(id_a, marker_b) == []
+                assert names_in(id_b, marker_b) == [marker_b]
+                assert names_in(id_b, marker_a) == []
+            finally:
+                _session_stop(id_b)
+        finally:
+            _session_stop(id_a)
 
 
 class TestSavePathIdentity:
