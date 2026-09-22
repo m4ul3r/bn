@@ -377,6 +377,32 @@ def _is_failed_status(row: Any) -> bool:
     return _text_value(row, "status") in FAILED_MUTATION_STATUSES
 
 
+# #824: the empty-result vocabulary. Every text renderer with nothing to show
+# returns the same shape -- parenthesized, lowercase, naming the noun it can
+# name -- instead of the previous mix of "none", "no targets" and "(no tags)".
+# `_render_paged_list_text` and `_render_name_address_list_text` compare a body
+# against the marker to decide whether a footer or note stands alone, so the
+# marker is a shared value rather than a literal each site spells out.
+#
+# Two renders stay outside it on purpose, and both say MORE than "empty": the
+# init-array line names the authoritative reason an ELF has no constructors
+# (#448) and the callsites line under a partial caller scan states what was
+# actually established rather than claiming absence (#816). A reasoned absence
+# is a different fact from an empty result, so it does not wear the empty
+# result's clothes.
+_EMPTY_RESULT = "(none)"
+
+
+def _empty_result(noun: str | None = None) -> str:
+    """The one empty-result line (#824): ``(no <noun>)``, or ``(none)``.
+
+    A renderer that knows what is missing names it; one that merely found an
+    empty list says ``(none)`` -- the generic form the paged-list helpers detect
+    so a footer is not glued onto an empty body.
+    """
+    return _EMPTY_RESULT if noun is None else f"(no {noun})"
+
+
 def _discloses(fn: Callable[..., str] | None = None, *,
                prefix: bool = False) -> Callable[..., str]:
     """Append the skew disclosure for every container this text renderer coerced
@@ -389,7 +415,7 @@ def _discloses(fn: Callable[..., str] | None = None, *,
     "truncated @depth N" clause and reads as complete, and a forward-taint view
     prints "NO modeled sink reached" -- a security all-clear -- from an unusable
     payload. Wrapping the whole render covers EVERY return path, including the
-    early ones ("none", "no sessions", the no-possible-values return) that a
+    early ones (_EMPTY_RESULT, the no-possible-values return) that a
     per-branch line misses, and draining a recorded set rather than re-reading
     declared keys means there is no key list to drift from the code (#619).
 
@@ -877,7 +903,7 @@ def _render_local_list_text(value: Any) -> str:
         for item in malformed:
             lines.append(f"  {item!r}")
     if not params and not locals_only and not malformed:
-        lines.extend(["", "no locals"])
+        lines.extend(["", _empty_result("locals")])
     return _resolution_note(value) + "\n".join(lines)
 
 
@@ -985,7 +1011,7 @@ def _render_comment_text(value: Any) -> str:
             # escaping as the address rows below (#771).
             lines.append(f"[doc] {_escape_control_chars(doc)}")
         if not comments and not doc:
-            return "(no comment)"
+            return _empty_result("comment")
         lines.extend(
             f"{c.get('address', '?')}  {_escape_control_chars(c.get('comment', ''))}"
             for c in comments if isinstance(c, dict)
@@ -996,7 +1022,7 @@ def _render_comment_text(value: Any) -> str:
         # Single-comment form (`comment get <addr>`): the payload IS the comment,
         # a document rather than a row, so its own newlines are the content and
         # stay raw -- same as the decompile/IL/type-layout text renderers (#771).
-        return comment if comment else "(no comment)"
+        return comment if comment else _empty_result("comment")
     return _render_fallback_text(value)
 
 
@@ -1009,7 +1035,7 @@ def _render_comment_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
     lines = []
     for item in value:
         if not isinstance(item, dict):
@@ -1037,7 +1063,7 @@ def _render_tag_types_text(value: Any) -> str:
         return _render_fallback_text(value)
     types = _field_list(value, "tag_types")
     if not types:
-        return "none"
+        return _EMPTY_RESULT
     lines = []
     for t in types:
         if not isinstance(t, dict):
@@ -1058,7 +1084,7 @@ def _render_tag_get_text(value: Any) -> str:
         return _render_fallback_text(value)
     tags = _field_list(value, "tags")
     if not tags:
-        return "(no tags)"
+        return _empty_result("tags")
     return "\n".join(_render_tag_row(t) for t in tags if isinstance(t, dict))
 
 
@@ -1086,7 +1112,7 @@ def _render_tag_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
     return "\n".join(_render_tag_row(t) for t in value if isinstance(t, dict))
 
 
@@ -1126,7 +1152,7 @@ def _render_close_text(value: Any) -> str:
         return _render_fallback_text(value)
     closed = _field_list(value, "closed")
     if not closed:
-        return "no binaries closed"
+        return _empty_result("binaries closed")
 
     def _row(entry: Any) -> tuple[str, bool]:
         if isinstance(entry, dict):
@@ -1137,8 +1163,12 @@ def _render_close_text(value: Any) -> str:
     unsaved_any = any(unsaved for _, unsaved in rows)
 
     if len(rows) == 1:
+        # #824: the marker belongs to the ROW, not to the listing form. The
+        # single-entry branch dropped the one fact a reader needs when `bn
+        # close` discarded edits, while the multi-entry branch printed it.
         path, unsaved = rows[0]
-        lines = [f"closed: {path}"]
+        marker = "  [unsaved changes discarded]" if unsaved else ""
+        lines = [f"closed: {path}{marker}"]
     else:
         lines = ["closed:"]
         for path, unsaved in rows:
@@ -1255,7 +1285,7 @@ def _render_session_status_text(value: Any) -> str:
         return _render_fallback_text(value)
     items = _field_list(value, "items")
     if not items:
-        return "no load jobs"
+        return _empty_result("load jobs")
     lines = []
     for item in items:
         if not isinstance(item, dict):
@@ -1300,7 +1330,7 @@ def _render_session_list_text(value: Any) -> str:
         return _render_fallback_text(value)
     instances = _field_list(value, "items", "instances")
     if not instances:
-        return "no sessions"
+        return _empty_result("sessions")
     lines = []
     for item in instances:
         if not isinstance(item, dict):
@@ -1497,7 +1527,7 @@ def _render_target_list_text(value: Any) -> str:
     if not isinstance(items, list):
         return _render_fallback_text(value)
     if not items:
-        return "no targets"
+        return _empty_result("targets")
     return "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
@@ -1529,7 +1559,7 @@ def _render_target_choices(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
     return "\n".join(open_target_lines(value, row=_render_target_choice))
 
 
@@ -1660,7 +1690,7 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
 
     lines = []
     for item in value:
@@ -1713,7 +1743,7 @@ def _render_name_address_list_text(value: Any) -> str:
             f"// {excluded} self-defined export(s) excluded "
             "(this module's own symbols modeled as import veneers / GOT slots)"
         )
-        body = note if body == "none" else f"{body}\n{note}"
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
 
 
@@ -2009,7 +2039,7 @@ def _render_paged_list_text(
     footer = _paging_footer(value, items, page_unreadable)
     if footer is None:
         return body
-    return footer if body == "none" else f"{body}\n\n{footer}"
+    return footer if body == _EMPTY_RESULT else f"{body}\n\n{footer}"
 
 
 _QUICK_PARTIAL_WARNING = (
@@ -2864,10 +2894,17 @@ def _render_virtual_call_text(value: Any) -> str:
 def _render_record_table_text(value: Any) -> str:
     """#455: render a mixed-record dispatch table -- one block per record, each
     field labeled fn / data / scalar / null so a scalar isn't read as a bad slot."""
+    if not isinstance(value, dict):
+        # #824: the same gate its siblings carry (_render_pointer_table_text,
+        # _render_message_lens_text). Unreachable through the CLI today -- the
+        # one caller gates before dispatching on kind -- but the renderer is
+        # reachable for internal callers, and a bare list died with
+        # AttributeError on the first `.get` instead of falling back.
+        return _render_fallback_text(value)
     lines = [
         f"record table @ {value.get('address', '<unknown>')}  "
         f"record-size: {value.get('record_size', '?')}  "
-        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or '(none)'}"
+        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or _EMPTY_RESULT}"
     ]
     for warning in _field_list(value, "warnings"):
         lines.append(f"warning: {warning}")
@@ -3258,7 +3295,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
                 "no callsites found among the callers examined; the caller scan was "
                 f"incomplete ({caller_scan_note}), so absence is not established"
             )
-        return "no callsites found"
+        return _empty_result("callsites")
 
     blocks = []
     for row in value:
@@ -3364,7 +3401,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         )
         body = f"{body}\n\n{note}" if body else note
     if not blocks and not body:
-        body = "no callsites found"
+        body = _empty_result("callsites")
     return body
 
 
@@ -4095,7 +4132,7 @@ def _render_taint_models_text(value: Any) -> str:
         lines.append("")
         lines.append("overlays: " + ", ".join(
             str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
-    return "\n".join(lines) if lines else "no models match the filter"
+    return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
 def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
@@ -4181,7 +4218,7 @@ def _render_type_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
 
     lines = []
     for item in value:
@@ -4237,7 +4274,7 @@ def _render_strings_rows(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
 
     lines = []
     for item in value:
@@ -4283,7 +4320,7 @@ def _render_sections_rows(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return _EMPTY_RESULT
 
     lines = []
     for item in value:
@@ -4361,7 +4398,7 @@ def _render_data_vars_text(value: Any) -> str:
         if row.get("sec"):
             cells.append(f"[{row['sec']}]")
         lines.append("  ".join(cells))
-    body = "\n".join(lines) if lines else "none"
+    body = "\n".join(lines) if lines else _EMPTY_RESULT
     if value.get("has_more"):
         hint = ""
         # Through the choke point: a container-shaped address on the LAST row
@@ -4387,7 +4424,7 @@ def _render_data_symbols_text(value: Any) -> str:
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `syms`
     if not syms:
-        return "none"
+        return _EMPTY_RESULT
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
         for sym in syms)

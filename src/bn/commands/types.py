@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, arg, command, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     _render_function_count_text,
     _render_type_info_text,
@@ -94,20 +94,11 @@ def _types_declare(args: argparse.Namespace) -> int:
             )
     source_path = None
     if args.file is not None:
-        if not args.file.exists():
-            raise BridgeError(f"Declaration file not found: {args.file}")
-        # `exists()` is true for a directory, so the read below used to die with a
-        # raw IsADirectoryError -- exit 1, no envelope, the only shape in this
-        # command family that was not a structured refusal (#754). Reject the
-        # directory by name rather than everything non-regular: /dev/null is a
-        # character device that reads as an empty declaration, and that path is a
-        # working refusal the sibling cases already cover.
-        if args.file.is_dir():
-            raise BridgeError(f"Declaration file is a directory: {args.file}")
-        try:
-            declaration = args.file.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise BridgeError(f"Declaration file could not be read: {args.file}: {exc}") from exc
+        # #864: the shared reader for CLI text inputs. It keeps #754's directory
+        # refusal (and /dev/null as the deliberate empty-input exception) and
+        # extends it to the shapes that could only hang: a FIFO with no writer
+        # made `read_text` block forever, with no output and no envelope.
+        declaration = read_text_input(args.file, what="Declaration file")
         source_path = str(args.file)
     elif args.stdin:
         declaration = sys.stdin.read()

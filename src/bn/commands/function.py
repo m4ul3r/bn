@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     disclosure_boundary,
     _render_call_descriptors_text,
@@ -82,9 +82,14 @@ def _function_list(args: argparse.Namespace) -> int:
         params["min_size"] = args.min_size
     if getattr(args, "named", None) is not None:
         params["named"] = bool(args.named)
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: send offset even at 0, like every sibling paged handler (strings,
+    # tag list, types) -- a param the CLI omits reads as a handshake difference
+    # at the bridge for no gain.
+    params["offset"] = args.offset
     if args.count:
+        # #768: --sort/--reverse/--limit/--offset beside --count were dropped
+        # without a word; refuse them by name instead.
+        _refuse_count_only_slices(args, command="function list")
         params["count_only"] = True
         return _call(
             args,
@@ -94,10 +99,10 @@ def _function_list(args: argparse.Namespace) -> int:
             text_renderer=_render_function_count_text,
             stem="function-count",
         )
-    # Bridge-authoritative paging: send the real limit/offset (not the generic
-    # +1 page_limit) so the bridge returns the page WITH the true total, which
-    # the renderer surfaces (#59). The bridge envelope is {functions, total, ...}.
-    # _effective_limit defaults to 100 but uncaps for --out full-body export (#165).
+    # Bridge-authoritative paging: send the real limit/offset so the bridge
+    # returns the page WITH the true total, which the renderer surfaces (#59).
+    # The bridge envelope is {functions, total, ...}. _effective_limit defaults
+    # to 100 but uncaps for --out full-body export (#165).
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -169,6 +174,9 @@ def _function_search(args: argparse.Namespace) -> int:
     if getattr(args, "min_size", None) is not None:
         params["min_size"] = args.min_size
     if args.count:
+        # #768: same refusal as `function list` -- a count has no order and no
+        # page, so these flags could only be ignored.
+        _refuse_count_only_slices(args, command="function search")
         params["count_only"] = True
         return _call(
             args,
@@ -185,8 +193,8 @@ def _function_search(args: argparse.Namespace) -> int:
             regex_hint_query=query,
             regex_fallback_query=query,
         )
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, matching `function list` and the other paged reads.
+    params["offset"] = args.offset
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -546,8 +554,8 @@ def _xrefs(args: argparse.Namespace) -> int:
         # offset/limit so a hot field respects --limit/--offset instead of spilling.
         field_params: dict[str, Any] = {"field": field_spec}
         field_limit = _effective_limit(args)
-        if args.offset:
-            field_params["offset"] = args.offset
+        # #824: unconditional, like the sibling paged reads.
+        field_params["offset"] = args.offset
         if field_limit is not None:
             field_params["limit"] = field_limit
         return _call(
@@ -572,8 +580,9 @@ def _xrefs(args: argparse.Namespace) -> int:
         params["fn_pointer_scan"] = True
     limit = _effective_limit(args)
     if args.format != "text":
-        if args.offset:
-            params["offset"] = args.offset
+        # #824: the branch is what gates paging here (text mode fetches the full
+        # set by design); inside it, offset goes out even at 0 like its siblings.
+        params["offset"] = args.offset
         if limit is not None:
             params["limit"] = limit
 
@@ -630,14 +639,14 @@ def _xrefs(args: argparse.Namespace) -> int:
 
 def _load_within_identifiers(path: Path) -> list[str]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
+        # #864: one reader for every CLI text input -- a FIFO here would block
+        # forever with no envelope, and the shared reader refuses it by kind.
+        text = read_text_input(path, what="--within-file")
+    except BridgeError as exc:
         raise BridgeError(
-            "--within-file must be a UTF-8 text file with one function "
-            f"identifier per line; got a binary file: {path}"
-        ) from exc
-    except OSError as exc:
-        raise BridgeError(f"could not read --within-file {path}: {exc}") from exc
+            f"{exc}; --within-file must be a UTF-8 text file with one function "
+            "identifier per line"
+        ) from None
     identifiers = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -684,8 +693,8 @@ def _callsites(args: argparse.Namespace) -> int:
         "context": args.context,
         "caller_static": bool(args.caller_static),
     }
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, like the sibling paged reads.
+    params["offset"] = args.offset
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -721,8 +730,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"identifier": args.identifier, "context": args.context}
     if args.limit is not None:
         params["limit"] = args.limit
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, like the sibling paged reads.
+    params["offset"] = args.offset
     if args.address_window:
         params["address_window"] = args.address_window
     return _call(
@@ -753,8 +762,8 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"identifier": args.identifier, "fn_pointer_scan": True}
     limit = _effective_limit(args)
     if args.format != "text":
-        if args.offset:
-            params["offset"] = args.offset
+        # #824: offset goes out even at 0 inside the paging branch.
+        params["offset"] = args.offset
         if limit is not None:
             params["limit"] = limit
     return _call(
