@@ -1,461 +1,69 @@
 ---
 name: bn-kernel
-description: "Use OMP's retained Python kernel for high-volume Binary Ninja reads through bn. Trigger for list-shaped, multi-function, grep-like, or locally filtered analysis where full rows or decompilation should remain in Python variables instead of the transcript."
+description: "Use OMP's retained Python kernel for large Binary Ninja reads through bn when rows should stay in Python rather than the transcript. Bind a bridge instance and target explicitly; use the bn CLI for lifecycle and mutations."
 ---
 
 # bn-kernel
 
-Use this skill for high-volume reads that benefit from OMP's retained Python state. Use the `bn` skill for bridge/session lifecycle, small one-off reads, command discovery, and mutations.
+Use this skill for list-shaped, multi-function, or locally filtered reads in an OMP retained Python kernel. Use `bn` for bridge lifecycle, one-off reads, command discovery, and verified mutations. If no retained Python eval runtime is available, use the direct CLI and bound output with `--limit`, `--lines`, or `--out`.
 
-## First cell: import from this installed skill
+## Bootstrap and bind
 
-Resolve `<skill-dir>` to the **absolute directory shown when this skill loads**, then run:
+In the first eval cell, use the absolute directory of this installed skill:
 
 ```python
 from pathlib import Path
-
 skill_dir = Path("<absolute-installed-skill-dir>")
 exec((skill_dir / "bootstrap.py").read_text(encoding="utf-8"))
 ```
 
-The bootstrap is idempotent: rerun it after an eval-kernel exit/reset. Every run
-prints `reused` or `reloaded`, the absolute source path, and its source hash. It
-removes foreign `bn_kernel` source roots from `sys.path`, puts this source first,
-evicts stale modules/bytecode, and validates required API signatures. Always set
-the absolute `skill_dir`; an exec context with neither `skill_dir` nor `__file__`
-fails with that exact recovery instruction instead of a `NameError`. It cannot
-preserve an in-flight cell when a sibling kills the shared Python process; true
-crash isolation requires a per-subagent OMP kernel.
-
-## Bind explicitly
-
-Never rely on sticky instance or target pins. `<target-selector>` is the exact
-selector shown by `bn -i <instance> target list` (normally a basename, or the
-bridge's disambiguated selector when names collide). Bind both and assert the
-observed target before trusting any rows:
+Rerun bootstrap after a kernel reset. It prints whether the source was reused or reloaded, plus its path and hash. Bind both selectors and confirm the observed loaded file before trusting data:
 
 ```python
-s = bn_kernel.session(instance="analysis-1", target="<target-selector>")
-await s.assert_target("<stem-or-basename-or-absolute-loaded-path>", timeout=30)
-s.backend
+s = bn_kernel.session(instance="analysis-1", target="<selector-from-target-list>")
+await s.assert_target("<expected-loaded-basename-or-absolute-path>")
 ```
 
-The registry lives under the bridge's cache dir, read from **this kernel's**
-environment — fixed when the kernel started, so an `export BN_CACHE_DIR=...` in
-the shell that started the bridge is invisible here. `bn session start` looks
-like it worked while `session()` keeps answering "No bridge instance found with
-id: ...", and the remedy that message prints is the command you already ran.
-Pass the dir explicitly; it is applied process-wide (before the native client
-resolves its socket, so the last explicit value wins):
+`assert_target` accepts a stem, exact basename, or strict absolute loaded path. A sidecar or cached `.bndb` may be the actual loaded file, so use `bn -i analysis-1 target list` rather than guessing from the original raw path. If the shell that started `bn` used a different `BN_CACHE_DIR`, pass `cache_dir=` to `session()`; a retained kernel does not inherit later shell exports. For a clean benchmark or from-scratch dogfood input, call `await s.assert_unannotated()` before interpreting the rows. `allow_contaminated=True` explicitly permits known annotations; symbol-name exclusions are heuristic, not proof of an untouched database.
+
+Keep large rows inside a function and return a bounded summary:
 
 ```python
-s = bn_kernel.session(instance="analysis-1", target="<target-selector>",
-                      cache_dir="/path/that/bn/session/start/used")  # default ~/.cache/bn
-```
-
-A stem-only check such as `assert_target("sample")` accepts either
-`sample.bin` or `sample.bndb`. A basename check such as
-`assert_target("sample.bndb")` must match the loaded basename. An absolute path
-is strict and must name the actual loaded file: if sibling-BNDB preference
-loaded `/x/sample.bndb` for `/x/sample.bin`, assert the `.bndb` path.
-
-A target restored from the read-only-mount cache is open as
-`<basename>.<16 hex digest>.bndb`, and the stem rule strips that digest exactly
-once, so `assert_target("netsvcd")` accepts `netsvcd.3f9c1d0a77bb4e20.bndb`;
-the full basename and the absolute cache path accept it too. Within a
-cache-restored name the digest strip is not compounded with an extension
-strip, so a `sample.bin` binary cached as `sample.bin.<16 hex digest>.bndb` is
-asserted by `sample.bin` and not by `sample` -- the same rule `bn -t` applies
-to that name. The plain stem rule in the paragraph above is unchanged and is
-deliberately laxer than `bn -t` for an ordinary (non-cache) basename.
-
-> **Concurrent sibling task agents:** OMP currently shares one retained eval
-> namespace across those siblings. Module globals can be rebound between cells.
-> Ordinary inactive `Session` objects may be retained for inspecting `.last` and
-> still emit cross-binding warnings. `scoped()` fails closed only on a foreign
-> concurrently active scope, callback reuse for another target, or overlapping
-> use of the same callback. Give each target a fresh, uniquely named `async def`.
-
-```python
-async def analyze_cell(bound):
-    await bound.assert_target("<expected-basename-or-absolute-path>")
-    await bound.assert_unannotated()  # required for clean benchmark/dogfood inputs
+async def inspect(bound):
+    await bound.assert_target("<expected-loaded-basename>")
     rows = await bound.functions(limit=5000)
-    large = [row for row in rows if row.get("size", 0) >= 4096]
-    return len(rows), bn_kernel.brief(large, "name", "address", "size", n=10)
+    return len(rows), bn_kernel.brief(rows, "name", "address", n=8)
 
-count, preview = await bn_kernel.scoped(
-    analyze_cell,
-    instance="analysis-1",
-    target="<target-selector>",
-)
-print(count)
-print(preview)
+count, sample = await bn_kernel.scoped(
+    inspect, instance="analysis-1", target="<selector-from-target-list>")
 ```
 
-`scoped()` keeps the session and bulk rows function-local, refuses returning its
-Session, and fails closed on foreign active scopes or callback-binding reuse.
-Sequential scopes may coexist with inactive retained Sessions. Do not return bulk
-collections into shared globals; process isolation remains a harness requirement.
+In OMP setups where ordinary sibling task agents share one retained eval namespace, globals can be rebound between cells. `bn_kernel.scoped(callback, instance=..., target=...)` binds a fresh callback scope and refuses overlapping foreign scopes, but cannot isolate an in-flight cell from a sibling killing the shared process. Use isolated kernel processes for concurrent retained reads; otherwise use direct `bn -i ... -t ...` CLI commands. Check the current harness's isolation before relying on a particular agent-launch API.
 
-## Own and reap every headless bridge
+## Reads and result shape
 
-A workflow that starts a headless bridge owns that exact instance until it stops,
-unless the exact duplicate-ID rejection below proves the bridge already existed.
-Every agent-owned spawn command must begin exactly as shown:
+Curated helpers include `info`, `functions`, `search`, `function_info`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `strings`, `imports`, and `sections`. They validate response shapes on both native and CLI backends; malformed or truncated payloads raise rather than becoming empty results. List helpers return rows; inside a scoped callback, `bound.last.payload` holds the complete envelope, including `total`, `has_more`, and `row_fields` when available. `last` is cleared after a failed request. A policy refusal from `assert_unannotated()` is the exception: it retains the successful orientation digest for inspection.
+
+`brief()` takes a list of row mappings, not the envelope or text. Row fields vary by collection; use `bound.last.row_fields` or inspect a row before naming columns. Addresses are hex strings, so use `int(row["address"], 0)` for arithmetic. Prefer `0x` for address inputs: a bare decimal address can resolve to a containing function and is disclosed under `resolved_from` with its offset.
+
+`limit=0` on a curated collection is a one-request schema probe that returns no rows. `row_fields` can be absent for an empty, undeclared kind; ask for a real row instead. A page with `total=None` is not zero findings. For high-fan-in `callsites`, check `total_lower_bound`, `caller_scan_truncated`, and `caller_scan_note` before claiming caller coverage. `strings()` defaults to 100 rows; pass `limit=None` for all rows. `callsites()` defaults to 100 rows. `decompile()` omits stored annotation bodies by default; use `include_annotations=True` only after a contamination decision. Skipped function analysis requires `force_analysis=True` and may be expensive.
+
+A read's `timeout=` is one end-to-end budget, including pagination. Native reads default to 120 seconds. `BN_REQUEST_TIMEOUT` changes the default; `0`, `none`, or `off` disables it. Avoid unlimited collections when the bridge cannot determine a total. `BN_BACKEND=auto|cli|native` selects the backend; an explicit non-auto `backend=` wins. `await s.help("evidence")` is local CLI help, while `await s.run("capabilities", unwrap=False)` returns the registry catalog. `Session.run()` uses the CLI artifact path even if curated reads use the native backend. Use it for generic commands and the `bn` skill's verification loop for any mutation.
+
+## Own only what you start
+
+A workflow that starts a headless bridge should name a unique instance, arm a positive idle timeout as a crash fallback, and stop that exact instance on every reachable exit:
 
 ```bash
-BN_IDLE_TIMEOUT=3600 bn session start /path/to/binary --instance-id worker
+BN_IDLE_TIMEOUT=3600 bn session start /path/to/sample.bin --instance-id analysis-1
+bn -i analysis-1 target close <selector-returned-by-bridge>  # if a target opened
+bn session stop analysis-1                               # attempt even if close failed
 ```
 
-For an agent-owned or ambiguously started bridge, begin every lifecycle response
-with `BN_IDLE_TIMEOUT=3600 bn session start <target> --instance-id <instance-id>`.
-This includes cleanup-only questions after success, failure, or timeout; use the
-known path and ID when supplied and keep `<target>` only when the path is unknown.
-Omit the spawn line only for the confirmed non-ownership collision below or when
-the user explicitly selected another positive idle timeout; merely describing an
-idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
+The exact duplicate-ID error means you did not acquire ownership; leave that existing bridge alone. A timed-out or otherwise failed start has uncertain ownership because its child may have registered later, so attempt `bn session stop <your-unique-id>`. Never use `bn close --all` for cleanup of an owned target; it can close unrelated GUI tabs. Cleanup-only work begins with the exact close/stop commands, not with a new start. `BN_IDLE_TIMEOUT` is optional for an existing user-owned bridge and does not replace normal cleanup for one you own.
 
-`BN_IDLE_TIMEOUT` is opt-in: unset means no idle reaper. A positive number of
-seconds arms headless idle shutdown; the agent-owned spawn above uses `3600`
-(one hour). A deliberate alternative timeout must be positive; never use `0`,
-`none`, or `off` for an agent-owned bridge. With it enabled, the reaper starts
-after preload, resets after completed **work**, and never fires during an
-in-flight request or active load job. Discovery is not work: `bn session list`
-and `bn doctor` issue a real per-instance request, and that traffic belongs to
-whoever ran the command rather than to the bridge's owner, so both declare
-themselves liveness probes and do **not** restart the window (they are still
-counted in flight, so a probe can never be reaped mid-response). The
-distinction is the caller's declared intent, not the op: your own
-`bn target list` issues the same `list_targets` and does keep the bridge alive.
-Without that exemption, one agent's routine listing kept another agent's
-orphaned bridge alive indefinitely -- which is the whole point of the next
-sentence. Only an enabled reaper provides the fallback after the owning
-agent/process dies; it does not replace normal cleanup.
-
-On every reachable exit, close only the exact selector returned by the bridge
-when a target opened. Never infer it from a path or basename; a basename is valid
-when the bridge returned it as the selector. Then always stop the exact owned
-instance even if start, load, analysis, or target close failed:
-
-```bash
-bn -i worker target close <target-selector>  # when a target opened
-bn session stop worker                       # always attempt this exact owned ID
-```
-
-Run `session stop` even when the close command fails; a linear close/stop list
-must state this guarantee or use a `finally`/trap equivalent. Only the exact
-`Bridge instance already exists with id: <instance-id>` start error proves the
-workflow never acquired ownership: do not close a target or stop that pre-existing
-instance. A timed-out or otherwise failed start is uncertain ownership because
-its child may have registered after the harness stopped waiting, so attempt to
-stop the unique ID unconditionally. Do not first poll, list, or test whether it
-registered, and do not assume absence means no process exists. Never compensate
-with `bn close --all` (it closes every open target in the instance, including
-GUI tabs bn never loaded), sticky pins, or another agent's instance.
-
-## Parallel bn-kernel subagents
-
-When two or more concurrent children will use bn-kernel, launch them from an
-Eval cell with bare `agent()` calls collected by `wait()`. Eval-agent children
-receive independent retained kernels on current OMP releases; ordinary `task`
-children inherit one eval session and can overwrite globals/modules or kill
-sibling cells. A direct-CLI-only fleet may still use an ordinary task batch.
-Measured: three children spawned with bare `agent()` received three distinct
-kernel processes and each reported an empty foreign-globals probe.
-
-Give every child a self-contained assignment, a unique bridge instance and
-target, and require a bounded summary rather than returning its Session or bulk
-rows:
-
-```python
-lifecycle = (
-    "Start your unique headless bridge with the exact BN_IDLE_TIMEOUT=3600 "
-    "assignment on its spawn command. Unless the exact duplicate-ID error proves "
-    "you never acquired ownership, on every reachable exit close its exact target "
-    "if opened, then always stop its exact instance even if start, load, analysis, "
-    "or target close fails; every other failed or timed-out start is ambiguous. "
-)
-
-def assignment(label, instance):
-    return (
-        f"Use bn-kernel. Analyze target {label} via instance {instance} and its "
-        "exact selector. Use direct bn only for lifecycle, keep state "
-        "function-local with scoped(), and return a bounded summary. "
-    )
-
-handles = [
-    agent(assignment("A", "bnk-a") + lifecycle, label="A"),
-    agent(assignment("B", "bnk-b") + lifecycle, label="B"),
-    agent(assignment("C", "bnk-c") + lifecycle, label="C"),
-]
-results = wait(handles, timeout=1320, raise_errors=False)
-```
-
-`wait()` is a **synchronous** barrier: `await wait(...)` raises
-`TypeError: 'list' object can't be awaited`. `raise_errors=False` keeps a
-failed child's error in its slot instead of losing the whole wave. When the
-number of children is not fixed, use `workpool()` and push items into it
-instead of building a handle list.
-
-Each child retains cleanup responsibility for its exact target and instance and
-returns only after attempting that exact teardown on every reachable exit. This
-is the required current workaround for parallel retained-kernel analysis; it does
-not replace explicit binding, `assert_target()`, or `assert_unannotated()`. If
-ordinary task children gain per-agent retained-kernel isolation in a future OMP
-release, either launch path becomes safe.
-
-`BN_BACKEND=auto|cli|native` selects the default backend; invalid values fail
-before client construction. An explicit non-`auto` `backend=` argument wins over
-a valid environment default.
-
-Both backends are POSIX-only and Linux-first, like `bn` itself: the bridge speaks
-`AF_UNIX`, its peer check needs `SO_PEERCRED`, and the CLI backend hands the child
-`bn` its artifact through `/proc/self/fd` (falling back to `/dev/fd`) plus
-`pass_fds`. There is no Windows path.
-
-Native reads are bounded to 120 seconds by default. Every curated expensive read
-accepts `timeout=`: `info`, `assert_target`, `assert_unannotated`, `functions`,
-`search`, `function_info`, `decompile`, `disasm`, `il`, `xrefs`, `callsites`,
-`strings`, `imports`, and `sections`. Collection timeouts apply to the whole
-multi-page/fallback operation. `BN_REQUEST_TIMEOUT` overrides that budget and is
-applied exactly once as one end-to-end deadline: every page of a collection gets
-the shrinking remainder, never a fresh copy of the full value, and the child `bn`
-is told the remainder so bridge-side cancellation is not scheduled off a budget
-the collection already spent. The documented `0`/`none`/`off` spelling disables
-the deadline; a collection with no `limit=`, no deadline, and a `total=null` page
-that still claims `has_more` is then refused as intrinsically unbounded rather
-than paged forever. Unknown keywords raise `TypeError` rather than
-becoming silent bridge filters. Timeout errors report the requested end-to-end
-budget and retain the `bn -i NAME target info` analysis-progress guidance.
-
-Prefer these curated helpers for list-shaped and common reads:
-
-- `await s.info(verbose=False)` exposes `function_count`, `import_symbol_count` (the exact `imports` row count), and `imported_function_count` (callable imported targets); do not compare the latter two as if they were the same population. It requires the canonical `target_info` shape rather than "some mapping", so another payload cannot answer every one of those questions with a silent "absent": `filename` and `basename` must be present as strings or null; `function_count`, `named_function_count`, `unnamed_function_count` and `imported_function_count` must be present non-negative integers; `import_symbol_count` must be present and either a non-negative integer or `null` (the bridge uses `null` when the imports count fails).
-- `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope. Address/name/size sorts are ascending; pass `reverse=True` for descending/largest-first. Search matches function names/display names only. Regex-shaped zero hits disclose `regex_fallback=True|False` on both backends; `"."` is treated as the all-names regex even when literal dots exist, invalid regex-like input raises, and `exact=True` forces a literal.
-- `await s.function_info(identifier, blocks=False)` returns flattened `name`, `address`, `size`, `size_known`, and `imported`; `blocks=True` adds `blocks`. Raw identity remains under `s.last.payload['function']`.
-- `await s.decompile(identifier)` returns the non-empty text string with inherited global address, function-local address, and function-doc annotation bodies redacted from standalone and inline/trailing `//` comments when the complete comment body matches a stored annotation line (ignoring surrounding whitespace). Code, quoted/escaped literals, address gutters, and unrelated comments are preserved. This is not arbitrary-text scrubbing: block comments and differently rendered bodies are not redacted. Use `include_annotations=True` only after an explicit contamination decision; it retains all rendered bodies, while the payload's legacy `comments` map contains global address comments only. Skipped placeholders raise and direct you to `force_analysis=True`.
-- `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise.
-- `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
-- `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero. When the CALLER ENUMERATION itself was truncated (budget exhausted before all callers were found), `caller_scan_truncated` is `true` and `caller_scan_note` gives the machine-readable reason; in that case the caller list is a lower bound and an empty or short result is NOT proof there are no callers (#816). `total` is monotone across a collection's pages: a `None` page can be followed by a page with the exact integer once the caller scan completes, so a long `callsites` collection can legitimately end with a determined total after starting with null ones -- but an already-determined total never reverts to null or changes to a different int.
-- `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed** on malformed payloads: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. `existing_annotations` also carries `analyst_symbols` and `placeholder_symbols` when the bridge reports them -- optional, so a bridge predating the split still passes, and validated the same way when present. `provenance_hint` keys on `analyst_symbols`, and the refusal keys on `comments` + `function_comments` **and** on `analyst_symbols` when present; `placeholder_symbols` and the raw `user_symbols` never refuse on their own. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
-
-The symbol classification is not proof of an untouched database. In
-`existing_annotations`, `symbol_exclusions` samples the excluded non-auto symbols
-as `{name, address, reason}` (`address` is null if unreadable); like every other
-sample in that block it is capped at 20 rows, `placeholder_symbols` remains the
-exact number of excluded symbols, and `symbol_exclusions_dropped` states how many
-the cap left out -- so the sample is never to be read as the whole set.
-`reason="debug_info"` means an exact imported name-and-address match and takes
-precedence over `reason="name_shape"`, the loader/engine-name heuristic. This
-includes bare `init`/`fini`, `dest`, and `destr`/`compar` with optional hexadecimal
-suffixes, alongside existing placeholder families. Ordinary analyst renames and
-comments still refuse, but an analyst rename matching an excluded name shape
-**may remain undetected**. An internal symbol namespace does not prove loader
-origin: user renames can carry it too. `symbol_exclusion_limitations` discloses
-this fallback in the payload. The older `*_locations` samples remain bounded;
-`locations_truncated` refers to those samples, not to `symbol_exclusions`, which
-carries its own dropped count.
-The `comments` count includes global and function-local address comments, even
-when both stores have entries at the same address; local sample rows also name
-their function. `function_comments` counts function-doc comments separately.
-
-Every collection and text helper validates **after** the backend branch, so `cli`
-and `native` enforce the same shape: malformed, nested, or silently truncated
-payloads raise instead of returning an empty/list/dict/`None` shape that can be
-misread as “no findings.”
-
-Paged reads also require each page to publish an integer `offset` equal to the one
-requested, and hold `total` to a **monotone** contract: `null` means "not
-determined yet" (a capped scan, e.g. high-fan-in `callsites`) and an integer means
-"determined", so `null`→int is a legal refinement, while int→`null` and a changed
-int are rejected as bridge drift. Progress is otherwise tracked by the caller's own
-arithmetic, so a bridge that ignores pagination would silently return duplicate rows.
-
-**`limit=0` asks for the schema, not the rows.** Passing `limit=0` to a curated
-collection helper (or to `Session.all()` / `bn.Client.collect()`) performs exactly
-ONE real request and returns no rows. The bridge enforces `limit >= 1`, so on the
-wire this is an internal one-row **probe** at your requested `offset`; the probed
-row is validated through the normal page contract and then discarded. It is never
-returned to you and never lands in `s.last.value`. The envelope you get back
-reports `returned=0` and `limit=0`, keeps the bridge-owned `kind`, `total` and
-`row_fields`, and reports `has_more=true` whenever the probe found a row — from a
-zero-row position, that row alone proves more exists at this offset.
-
-`Result` projects the common probe verdicts directly:
-
-```python
-s.last.returned   # 0
-s.last.has_more   # True when the probe found a row
-```
-
-`s.last.payload` remains the complete envelope and is authoritative for fields
-without a `Result` convenience property.
-
-`row_fields` may legitimately be **absent** from a `limit=0` envelope: the bridge
-derives it from a declared schema or from an actual row, so an *empty* collection
-of a kind it does not pre-declare has neither source. The pre-declared kinds are
-`functions`, `strings`, `imports`, `exports`, `sections`, `xrefs` and `callsites`;
-an empty `types`, `tags`, `comments` or similar read can come back without it.
-A `row_fields` that IS present is always validated as a list of strings. Treat
-absence as "no schema available yet", not as an error — ask for a real row instead.
-
-This is a programmatic-only shape. Wire-level `bn <paged command> --limit 0` stays
-rejected at parse time (exit 2), because the bridge would reject a zero limit and
-the CLI declines to round-trip to that error.
-
-**Row keys differ per collection, and you never have to guess.** `functions`
-rows key on `address`/`size`, `sections` on `start`/`end`/`length`, `callsites`
-nest `callee`/`containing_function`. Collection payloads carry the key list in
-band, including on a **zero-hit** page for any pre-declared kind — exactly when
-there is no row to read the schema off (the caveat above applies: an empty page of
-a kind the bridge does not pre-declare has no schema to publish):
-
-```python
-rows = await s.sections(limit=None)
-s.last.row_fields          # ['name', 'start', 'end', 'length', 'semantics']
-print(bn_kernel.brief(rows, *s.last.row_fields[:3]))
-```
-
-`brief()` accepts only a sequence of row mappings; pass
-`s.last.payload['items']` (or the returned row list), never the payload dict or
-plain text. A column this row omits renders `-`: the bridge must declare keys
-only some rows carry (`function_pointer`, `callee_variadic`, `provenance`), so
-`brief(rows, *s.last.row_fields)` is the intended idiom and a sparse column is
-normal. A request naming no column the rows have at all raises a `KeyError` that
-**lists the row's actual top-level keys**, and adds dotted-path guidance
-(`brief(rows, "callee.name", "call_addr")`, or `"callee.*"` for the whole nested
-mapping) only when that row really does nest mappings.
-
-Curated address fields are canonical hexadecimal strings (`"0x401000"`), not
-integers. Use `int(row["address"], 0)` for arithmetic; do not call `hex()` on
-an address returned by bn-kernel. This holds for `functions.address`,
-`sections.start`/`end`, `callsites.call_addr`, and containment's
-`requested_address` alike.
-
-**Bare-decimal addresses, one disclosure shape.** Every containment-enabled read
-(`decompile`, `function_info`, `il`, `disasm`, `cfg`, `proto get`, `local list`,
-`structured_il`, `defuse`, `resolved_calls`, `possible_values`, `evidence
-function`) accepts a decimal address and discloses it identically under
-`s.last.payload['resolved_from']`:
-
-```json
-{"requested_address": "0x401010", "offset": "+0x10", "input_format": "decimal"}
-```
-
-`requested_address` is always normalized to hex. A non-zero `offset` means the
-address landed **inside** a function and the read answered for the container; an
-exact bare-decimal start is still disclosed, with `offset: "+0x0"`, so a
-digit-only token can never be silently mistaken for a symbol name. Exact `0x`
-starts and function names carry no `resolved_from` at all, and text mode says
-exactly what the JSON says. Prefer `0x`.
-
-**`s.last is None` after a failed operation.** A raise never leaves the previous
-read's rows behind as `last`: request failures, mid-pagination failures, function
-row-contract and callsite-attribution rejections, invalid regex-like queries, and
-timeouts all clear it on both backends. So `s.last` is only ever the result of
-the operation that just succeeded — but for the same reason it is *not* a
-diagnostic channel for a failure: read the raised `BnError` for that. The one
-deliberate exception is a policy refusal over a payload that genuinely
-succeeded: `assert_unannotated()` raises on contamination and **keeps** the
-orientation digest in `s.last`, which is what you need to decide whether to pass
-`allow_contaminated=True`.
-
-## Generic commands and mutations
-
-Discover command-family grammar in-band before guessing arguments:
-
-```python
-print(await s.help("evidence"))          # concise by default
-print(await s.help("evidence", full=True))
-print(await s.help("search"))            # maps to `function search`
-catalog = await s.run("capabilities", unwrap=False)
-payload = await s.run("evidence", "orient", unwrap=False)
-```
-
-`help()` makes no bridge request. Use `full=True` only for the expanded grammar;
-use `capabilities` when code needs a machine-readable catalog. `Session.run()`
-always uses the CLI artifact path, even when `s.backend == 'native'`. Before any
-mutation/save escape hatch, call `await s.assert_target("<expected>")` and follow
-the `bn` skill's preview, verification, readback, and save loop.
-
-Use the CLI for lifecycle — bridge start/stop, load polling, and target close all
-live there, not in the kernel. For large BNDBs, queue loading instead of tying it
-to a single command budget:
-
-```bash
-BN_IDLE_TIMEOUT=3600 bn session start /path/to/large.bndb --instance-id worker --detach
-JOB=<job_id from the start output>
-bn -i worker session status "$JOB" --format json   # one job: machine verdict
-bn -i worker session status                        # every job: collection
-bn -i worker target list                           # selector once terminal
-```
-
-**Poll on the job, not on the collection.** `session status <job-id>` returns
-`kind: "load_job"` with top-level `job_id`, `state`
-(`queued|running|complete|failed`), `terminal`, `succeeded`, the canonical record
-under `job`, and `status_command`. Loop on
-`terminal == false`; do **not** re-derive terminality from the state string, and
-do not read `succeeded` as a failure while it is `null` (non-terminal means
-unknown, not failed). `succeeded` is `true` for `complete` and `false` for
-`failed`. An unknown job id is a loud error, not an empty result. Omitting the id
-returns the population collection (`kind: "load_jobs"`, `items`, `count`) with no
-`terminal`/`succeeded` — one verdict over many jobs would be a lie — and its items
-are the raw job records, which carry no `status_command`.
-
-`status_command` is the exact command to re-run, but only a bridge that has an
-instance id can name itself on a fresh command line. Any headless bridge does
-(that is what `--instance-id` sets, and the detached-start flow above always
-sets it). A GUI-loaded bridge does not: it has no unambiguous CLI selector, so it
-publishes `status_command: null` instead of a command that cannot address it. The
-key is always present, so `null` is distinguishable from a missing field. On
-`null`, poll through the client or connection you already have bound to that
-bridge, or treat the command as unavailable — do not synthesize one.
-
-Poll from **bash**, never from an eval cell wait loop: an eval cell that blocks on
-a load burns the harness cell timeout and can take the retained kernel with it.
-
-```bash
-bn -i worker target close <selector>   # close exactly that target
-bn session stop worker                 # then drop the bridge
-```
-
-The stop attempt is unconditional for an owned instance: run it even if target
-close fails. The exact duplicate-ID start error proves non-ownership, so do not
-close or stop that pre-existing instance. Any other failed or timed-out start
-still triggers an exact stop attempt because registration may have completed
-after the caller stopped waiting.
-
-`bn target close <selector>` is the explicit single-target close (the same
-implementation as `bn close -t <selector>`, including the unsaved-analysis
-warning). It takes no path and no `--all`, so it cannot widen into closing
-everything; `bn close --all` is the deliberate spelling for that -- including
-GUI tabs `bn` never loaded. Close the target, then stop the instance.
-
-## Load cost and memory
-
-Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop every owned instance deterministically as soon as its work ends. One-hour idle reaping is a crash fallback only for a headless bridge started with `BN_IDLE_TIMEOUT=3600` (another positive value changes the idle interval); unset means no idle reaper.
-
-For high-fanout cold starts, the orchestration tool's command timeout must exceed
-`BN_SPAWN_TIMEOUT`; otherwise the harness can kill `bn session start` while its
-new-session child continues registering. On a heavily loaded host, set a larger
-spawn budget (for example `BN_SPAWN_TIMEOUT=180`) and give the surrounding tool a
-strictly larger timeout. That assignment is additive to the required
-`BN_IDLE_TIMEOUT=3600` on the same agent-owned spawn, never a substitute for it.
-It changes the registration budget, not the detached load-job budget; continue
-polling the exact job separately. In a 16-way dogfood
-run, every start and load succeeded with that budget, but two start commands took
-more than 30 seconds (maximum 34.3 seconds).
-
-## OMP harness escalation
-
-The skill can detect and contain foreign bindings, but it cannot make one shared
-Python process safe for sibling task agents. A sibling exit 130 can still destroy
-other agents' in-flight state. OMP owners must provide per-subagent kernel
-processes or namespaces; do not weaken `scoped()`/`assert_target()` to work around
-that harness boundary.
+For large loads, use `bn session start ... --detach` and poll the returned job with `bn -i <id> session status <job-id> --format json`. Poll the named job's `terminal` field from a shell; do not block an eval cell waiting for analysis. Once terminal, take the returned selector, perform reads, close that target, and stop the owned instance.
 
 ## Accuracy boundary
 
-HLIL and decompilation can distort access width, conditional guards, loop-invariant bounds, and shift/accumulator structure. Before making any bounds, overflow, or off-by-one claim, confirm the relevant instructions with `await s.disasm(identifier)`; pseudo-C alone is insufficient.
+HLIL can distort access width, guards, and loop bounds. Before making an overflow or off-by-one claim, confirm the relevant instructions with `await s.disasm(identifier)` and the `bn-vr` methodology.

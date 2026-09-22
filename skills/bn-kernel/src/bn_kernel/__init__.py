@@ -525,33 +525,18 @@ _CACHE_DIGEST_CHARS = frozenset("0123456789abcdef")
 
 
 def _target_name_candidates(observed_basename: str) -> set[str]:
-    """Every spelling of *observed_basename* a stem-only check may name.
+    """Names accepted by ``assert_target`` for the observed loaded basename.
 
-    The bridge's own resolver (`TargetManager._matches_record`) strips a
-    trailing `.<16 hex>` from a `.bndb` basename, because a target saved on a
-    read-only mount restores from the global cache DB `_cache_bndb_path` names
-    `<basename>.<16 hex path digest>.bndb`. This guard was stricter than the
-    tool it guards: `Path("netsvcd.3f9c1d0a77bb4e20.bndb").stem` keeps the
-    digest, so the documented `assert_target("netsvcd")` refused a target the
-    bridge resolves fine (#733 F3). The DIGEST strip is bounded in both
-    directions: applied ONCE, exactly like the bridge, so a name whose own tail
-    is 16 hex characters is not peeled twice; and no further than the bridge,
-    so a `netsvcd.backup` binary caches as `netsvcd.backup.<16 hex>.bndb` and
-    is asserted as `netsvcd.backup`, never as `netsvcd`.
-
-    The plain-`Path.stem` candidate on the next line is PRE-EXISTING and is
-    deliberately broader than `_matches_record`: `assert_target("sample")`
-    accepts a `sample.bin` target that `bn -t sample` does not resolve. That
-    laxity is the documented stem-check contract (`SKILL.md`, "Bind
-    explicitly"), it predates this helper, and #733 F3 was the opposite
-    complaint -- so it is left exactly as it was rather than tightened here.
+    A cached database is named ``<basename>.<16 hex>.bndb``. Strip that digest
+    once, matching the bridge selector. Keep the ordinary ``Path.stem`` check,
+    which also lets ``sample`` assert an ordinary ``sample.bin`` view.
     """
     candidates = {observed_basename, Path(observed_basename).stem}
     if observed_basename.endswith(".bndb"):
         core = observed_basename[: -len(".bndb")]
         stem, dot, digest = core.rpartition(".")
         if dot and len(digest) == 16 and set(digest) <= _CACHE_DIGEST_CHARS:
-            candidates.add(stem)                  # `netsvcd`, or `sample.bin`
+            candidates.add(stem)                  # `sample`, or `sample.bin`
     return {name for name in candidates if name}
 
 

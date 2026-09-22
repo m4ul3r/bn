@@ -1,353 +1,93 @@
 # bn reference — runtime
 
-Target selection, sticky pins, instance/target resolution order, sessions/headless, output & spill, py exec, troubleshooting, quirks, install for the `bn` skill. See `../SKILL.md` for the map.
+Use this reference for target routing, headless sessions, quick loads, output, and the Python escape hatch. Use `bn help <group>` for current flag grammar.
 
-## 1. Workflow & target selection
-
-1. Discover targets:
-
-   ```bash
-   bn target list
-   ```
-
-   The `[N]` prefix is the view id; you can pass `-t N`. If no bridge is running, any command auto-starts one.
-
-2. Pick a target:
-   - Single open BinaryView: omit `-t`.
-   - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
-   - `-t/--target` and `-i/--instance` work **before or after** the subcommand, and for two-level commands they are also accepted **between the group and the leaf**. Prefer the short forms (`-t`, `-i`). Use a pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
-
-     ```bash
-     bn -i myid -t pam_qnx.so.2 decompile main      # at root (preferred for agents)
-     bn decompile main -i myid -t pam_qnx.so.2      # after the leaf
-     bn bundle -i myid -t pam_qnx.so.2 function main  # between group and leaf (two-level)
-     ```
-
-   - Use `-t active` only when you explicitly want to follow the GUI selection.
-
-3. (Optional) Pin sticky defaults — useful for a **single** agent/shell running many commands against the same instance/target. **Do not** use sticky pins under multi-agent fan-out (see HARD rule below).
-
-   ```bash
-   bn instance use <id>          # pin -i/--instance for this project
-   bn target use <selector>       # pin -t for this project
-   bn instance clear              # clear pinned instance
-   bn target clear                # clear pinned target
-   ```
-
-   Resolution order:
-   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > sole live instance > unique live instance associated with the current project > auto-spawn — except `session stop`, which never falls back to a sticky pin (a bare `bn session stop` under a pinned project errors rather than silently stopping the pinned instance; pass `-i`/`--instance-id` or rely on `BN_INSTANCE`). Associations are private registry metadata under `~/.cache/bn/instances/`; if two sessions are associated with one project, bare commands fail closed and require `-i`.
-   - **Target:** CLI `-t/--target` > env `BN_TARGET` > sticky > single-open auto-pick. `BN_TARGET` and the sticky pin are both **ambient** — the caller did not name them on this command line — and two guarantees follow from that. An explicit-but-**empty** value from EITHER source (`export BN_TARGET=$SEL`, or `bn target use "$SEL"`, where `SEL` was never assigned) is not a selector — it is the *absence* of one — so it is never forwarded to the bridge, in the request envelope or in a payload, and it is judged **where it would be used** rather than before dispatch. A command that resolves its target from the ambient default — including a bare destructive `bn close` — is **refused** before anything is sent, naming the source and its own remedy (unset the export, or `bn target clear`), rather than collapsing to the focused GUI tab or the single-open auto-pick. A command that reaches for no target never meets that refusal and runs exactly as it would with the variable unset — `bn load <path>` (it *creates* the target), `bn close --all`, `bn close <path>`, `bn save`, `bn batch apply` (the manifest says what to act on, with or without a `"target"` of its own), and the `--all-instances` / `--all-targets` surveys, which read every target by construction — and that list is a consequence of where the check lives, not an exemption table, so a stale shell variable can never take the load, the cleanup verb or the whole-fleet read away from you. That is a guarantee about a **broken** default only: a *valid* ambient selector is still consumed by most of that list — `bn load`, `bn save`, and a `bn batch apply` whose manifest names no target of its own all forward it as the request target — so an exported `BN_TARGET` does decide which analysis database a bare `bn save` overwrites. Pass `-t` on that command, or unset the export, when that is not what you mean. A batch manifest whose `"target"` equals the selected instance id uses that instance's single open target and ignores any ambient target. A **bare destructive `bn close` ignores both ambient sources**, so with a selector exported (or pinned) and no `-t`, no path and no `--all`, it still closes the single open target or refuses with the open-target list — it never tears down the ambient one. Name it with `-t <sel>`, a path, or `--all` to close anything else.
-
-   Env `BN_INSTANCE` / `BN_TARGET` are optional **single-agent** convenience. Both beat the sticky pin and lose to the explicit flag — but they are **not** interchangeable with the flags, and not with each other. `BN_INSTANCE` is explicit-equivalent: a bare `bn session stop` honours it and shuts that bridge down, exactly as `-i` would. `BN_TARGET` is **ambient**: a bare destructive `bn close` ignores it (as it ignores the sticky pin) and a bare read under `--all-instances` still surveys every target rather than treating the export as a chosen one. Where you need the export to mean "this exact target, no survey, close this one", pass `-t` on that command. They are safe for fan-out only when each agent owns its own process environment — that is the point, since a sticky pin is one file shared by every shell on the machine. **Do not** rely on them where concurrent agents *share* a process env: it is clobberable there just like a pin, so pass `-i` and `-t` on every command instead.
-
-   State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
-
-   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass **`-i/--instance` and `-t/--target`** explicitly on **every** command — or export `BN_INSTANCE` / `BN_TARGET` in the agent's **own** process environment, which is per-process-tree and so cannot be read or overwritten by a sibling agent — and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent, then the short flags:
-   >
-   > ```bash
-   > bn session start /path/to/binary --instance-id dogfood-1   # spawn naming
-   > bn -i dogfood-1 -t <sel> decompile main
-   > bn -i dogfood-1 -t <sel> xrefs main
-   > ```
-   >
-   > Note: global **`-i/--instance` is routing**, not spawn naming. `bn -i foo session start …` is rejected because it previously minted a random instance while looking named. Use `bn session start /path/to/binary --instance-id foo`.
-   >
-   > `session start` prints the loaded target's selector (`target: <sel>   (pass -t <sel>; id …)`), so a fan-out agent does **not** need a follow-up `bn target list` just to learn what to pass to `-t` (#653).
-
-## 2. Sessions & headless
-
-The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
+## Target and instance selection
 
 ```bash
-bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
-bn session start /path/to/binary [--instance-id <id>]   # synchronous preload
-bn session start /path/to/large.bndb --instance-id <id> --detach
-bn session status [<job-id>] [-i <id>]   # queued/running/complete/failed
-bn session list [-i <id>]                # all running instances, or filter one
-bn session restart <id>                  # tear down and respawn that bridge, reopening every target as the same file
-bn instance list                         # registered instances and their sockets
-bn instance find <path-or-subname>       # every instance with a matching OPEN BINARY, not an instance-id lookup
-bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
-bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
-bn refresh                               # promote a --quick view to full analysis (see "Quick load" below)
-bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
-bn exports [list]                         # public exported symbols
-bn help [family]                          # concise index; advertises capabilities
-bn capabilities --format json             # machine-readable full index, derived from the command registry
-bn instance gc                            # reap dead instance cache residue
-bn spill gc --dry-run                     # inspect the spill-cache days a sweep would reclaim
+bn target list
+bn instance list
+bn instance find <path-or-subname>
+bn instance gc
+bn target close <selector>
+bn close -t <selector>
+bn close --all
+bn save
+bn refresh
 ```
 
-`bn spill gc` reclaims the artifact cache below (`<cache>/spills/YYYYMMDD/`), one whole day directory at a time — the unit the spill writer names, so a day is all-or-nothing. With no flags it removes the day directories past the retention window (`BN_SPILL_RETENTION_DAYS`, default 14) — exactly what the first spill of a process prunes, only earlier and inspectable; `--older-than <DAYS>` (`30` or `30d`) sets that window for the run, and `--max-bytes <N>` adds a second bound that evicts the OLDEST surviving days until the day directories hold at most `N` bytes (decimal or `0x..`), which is how a wide retention window stays inside a disk budget. `--dry-run` builds the whole report and removes nothing. The JSON summary separates candidates from what was actually removed (`candidate_count`/`candidate_bytes`, `removed`/`removed_count`/`reclaimed_bytes`, `kept_count`/`kept_bytes`, `total_bytes`, `dry_run`); a day-named entry that is a symlink or not a directory is never touched and is listed under `skipped` with its reason, and a removal that failed appears under `errors` rather than being counted as reclaimed.
+One open target can be selected implicitly. With several open targets, pass `-t <selector>` from `bn target list`; selectors include the returned selector, view or target id, and an unambiguous filename/path. `-i <instance>` selects a bridge. Put these flags before or after a command; explicit flags take precedence over ambient defaults.
 
-`bn session stop <id>` deliberately refuses the sticky-pin fallback other commands use: a bare `bn session stop` with no positional id, no `-i/--instance`, and no `BN_INSTANCE` errors instead of stopping whatever instance the project happens to be pinned to. Pass the id explicitly (positional, `-i/--instance`, or `BN_INSTANCE`) to stop a specific bridge.
-
-When multiple bridge instances exist, flagless `bn load <path>` refuses ambient project/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
-
-`bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket, and the `.last_used` sidecar written beside them) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs, `.last_used` sidecars and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`logs_removed`, `sockets_removed`, `last_used_removed`, `registries_purged`; `--format json` for the counts).
-
-A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (neither does any other destructive op since #688 — `save`, `batch apply`, `go rename` and `py exec` all refuse a bare/`active` target while several are open), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
-
-Blast radius: a bare, path, or `--all` close resolves against **every open target**, not only the ones `bn load` opened — on a GUI bridge that includes tabs you opened in the UI (#613). `bn close /proj/loader.bndb` matches a GUI tab's filename, and `bn close --all` tears those tabs down too. Because all three spellings decide what to destroy from a count of open tabs, they refuse outright when the UI walk cannot enumerate every tab (a UI query raised mid-walk, so the count may be silently short). `bn close -t <selector>` resolves by name rather than by count, so it keeps working and is the escape hatch the refusal names.
-
-`unsaved` and `engine_modified` are reported on the READ path too, so "will stopping this bridge discard work?" needs no destructive call: `target info` and every `target list` row carry both (text flags the target `[unsaved]` and prints `unsaved: yes|no` / `engine modified: yes|no`), and `bn session list` aggregates them per instance as `unsaved_targets` — or `unsaved_targets_unavailable` naming why a bridge could not be asked, never a fabricated `0`. `bn close` reports the same two fields for each closed view as `{path, unsaved, engine_modified}`. Each `target list` row also carries **`database_path`**: the `.bndb` that backs that view's analysis when it is not the file `filename` names — which happens after a save, since a save restores the live filename to the original path (persistence, not an identity move) — and `null` when no separate database backs it, so "no database" is distinguishable from "database unknown" without inspecting paths. `session restart` reads it to reopen the right file (#753). `unsaved` is the sole persistence/cleanliness signal: it means a committed bn mutation was not saved and is the only condition that triggers the discard warning. `engine_modified` is Binary Ninja's broader analysis/cache bit; it can be true after a strictly read-only session and must not be interpreted as user mutation.
-
-**`session status <job-id>` JSON contract.** Naming a job returns the single-job
-shape, so a polling agent never has to index `items[0]` or re-derive terminality
-from the state string:
-
-```json
-{
-  "kind": "load_job",
-  "job_id": "<hex>",
-  "state": "queued|running|complete|failed",
-  "terminal": false,
-  "succeeded": null,
-  "job": { "job_id": "...", "state": "...", "path": "...", "created_at": "...",
-           "started_at": null, "finished_at": null, "error": null, "result": null },
-  "status_command": "bn -i <id> session status <job-id>",
-  "items": [ { "...": "the same job record" } ],
-  "count": 1
-}
-```
-
-`terminal` is true only for `complete`/`failed`. `succeeded` is `true` for
-`complete`, `false` for `failed`, and **`null` while non-terminal** — a `false`
-there would read as "the load failed" and make a poll loop tear down a healthy
-bridge. The poll loop is `terminal == false` → sleep → re-run `status_command`
-**when it is non-null**; a `null` means this bridge cannot be named on a fresh
-command line, so keep polling through the client or connection you already have
-bound to it, or treat the command as unavailable. Only a bridge started with an
-instance id (`--instance-id`, i.e. any headless bridge) can publish the exact
-re-runnable command; a GUI-loaded bridge has no unambiguous CLI selector, so it
-publishes `status_command: null` rather than a command that cannot address it.
-The key is always present, so `null` and "field missing" stay distinguishable.
-An unknown job id is an **error**, not an empty result, so a typo cannot spin a
-status loop until its own deadline. Omitting the job id keeps the population
-collection (`kind: "load_jobs"`, `items`, `count`) with no `terminal`/`succeeded`
-verdict, because one verdict over many jobs would be a lie, and whose items are
-the raw job records without a `status_command` of their own. Text mode prints
-`<job-id>  <state>  <path>`, plus a `poll:` line naming the exact command while
-the job is still running and a command is available.
-
-**`bn target close <selector>`** closes exactly the target that selector names.
-It is the discoverable spelling of `bn close -t <selector>` and delegates to the
-same implementation, so unsaved warnings, selector resolution, and the refusal to
-forward the volatile `active` literal are identical. It accepts no path and no
-`--all`, so it can never widen into closing everything; an empty selector is an
-error. Use `bn close --all` when you really do mean every open target,
-including GUI tabs bn did not load.
+Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 
 ```bash
-bn save                                  # saves to <filename>.bndb
-bn save /path/to/output.bndb             # explicit path (positional)
-bn save --path /path/to/output.bndb      # --path is an accepted alias for the positional
+bn instance use <id>
+bn target use <selector>
+bn instance clear
+bn target clear
 ```
 
-> **Selectors survive a save — unless the save says otherwise.** Binary Ninja rebinds the in-memory view's filename to whatever `.bndb` it writes, but a save is persistence, not an identity move, so the bridge restores the original filename afterwards and your `-t foo` keeps resolving (#256/#285). The one exception is reported rather than left to be discovered: if that restore fails, the result carries `rehomed: true` and a note saying where the view is now homed, and only then can the basename selector have moved. Targeting the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`) is still the robust habit for post-save commands.
+Sticky pins are shared by agents working under one project root. In concurrent work sharing a project or process environment, pass `-i` and `-t` explicitly and do not change shared pins. An agent with a genuinely private process environment can use its own `BN_INSTANCE` and `BN_TARGET`; they still lose to explicit flags. `bn session start` uses `--instance-id` to *name a new bridge*; global `-i` routes to an existing one.
 
-`bn load <raw>` and `bn session start <raw> [...]` auto-prefer a sibling `<raw>.bndb` when one exists, so saved annotations come back without you having to retype the `.bndb` suffix. The CLI prints which file was actually opened:
+## Sessions and analysis state
 
 ```bash
-$ bn load /path/to/foo.so
-loaded: /path/to/foo.so.bndb
-note: loaded /path/to/foo.so.bndb instead of /path/to/foo.so (use --no-bndb to skip)
+bn load /path/to/sample.bin
+bn session start /path/to/sample.bin --instance-id analysis-1
+bn session start /path/to/large.bndb --instance-id analysis-1 --detach
+bn session status <job-id> -i analysis-1 --format json
+bn session list
+bn session restart analysis-1
+bn session stop analysis-1
+bn close
 ```
 
-Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exists. Passing a path that already ends in `.bndb` skips the lookup. The same `--no-bndb` flag works on `bn session start`.
+A headless start owns an instance that should be stopped when work ends. Set a positive `BN_IDLE_TIMEOUT` on an agent-owned start as a crash fallback (`BN_IDLE_TIMEOUT=3600` gives one hour); unset means no idle reaper. The command reports the loaded target selector. For long analysis, `--detach` registers a bridge and returns a load-job id. Poll that id: `terminal: false` means keep waiting; on terminal, `succeeded` is true or false. A no-id `session status` lists jobs, not one verdict. `status_command` is null when the bridge cannot name itself in a fresh CLI invocation. Stop an exact owned instance even if its target close fails; a timed-out start may have registered after the caller stopped waiting. Leave a pre-existing instance alone when start returns the exact duplicate-ID error.
 
-> **Global BNDB cache (read-only mounts).** Auto-prefer isn't limited to a *sibling* `.bndb`. When the target's directory is not writable (a read-only firmware mount), a prior `bn save` falls back to a **global content-hash-keyed cache** at `~/.cache/bn/bndb/<stem>.<hash>.bndb` (override the cache root with `BN_CACHE_DIR`). A later `bn load <raw>` / `bn session start <raw>` **auto-restores from that cache** — carrying every prior rename/comment — and prints `note: restored cached database …; pass --no-bndb to load the raw bytes`. Two consequences for a "recover names on an unknown binary" task: (1) the view can come back **already annotated** from an earlier run, so you can't tell your recovery from a previous one — check the note (or `--no-bndb`) before claiming a clean slate; (2) a multi-MB target that "loads in seconds" is a **cache hit, not a fast cold analysis** — don't read it as a timing/perf observation. Use `--no-bndb` for a pristine, un-annotated analysis.
+A saved `.bndb` may be preferred over adjacent raw bytes. On a read-only source mount, `bn save` can use a content-hash cache under `BN_CACHE_DIR` (default `~/.cache/bn`); a later load can restore its annotations. Use `--no-bndb` when the task requires raw-byte analysis without prior names/comments. A save normally preserves the live target selector; if the response reports `rehomed: true`, get the new selector from `bn target list`.
 
-`bn load` blocks until analysis completes (`update_analysis_and_wait()`). Full loads can take seconds to minutes under contention; do not rely on a fixed load time. Each headless bridge can consume hundreds of MB, and a large/complex BNDB may be OOM-killed. Bound fan-out concurrency, monitor RSS with `bn session list`, and stop unused instances promptly.
-
-**Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
-
-- Ready immediately: `bn sections`, `bn imports`, the symbol table, `bn target list` / `bn target info` (flagged `[not analyzed]`, JSON `analysis_state: "quick"`).
-- `bn strings` **errors** until `bn refresh` (it refuses with a "Strings are not available … Run `bn refresh`" directive rather than return an empty list that reads as "no strings").
-- **Partial** until `bn refresh`: `bn function list` / `bn function search` (only entry-point + symbol functions exist pre-analysis; the count grows after refresh), and `bn decompile` / `bn il` / `bn disasm` across the binary.
-- **Hard-error** until `bn refresh` (they refuse rather than return a misleading empty result): `bn xrefs`, `bn callsites`, `bn function info`, `bn taint`.
-
-Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
-
-**Every op that ANSWERS on a quick view should say so in its own envelope; these do.** `analysis_state` (`"quick"` / `"full"`) plus `partial` (bool) ride on the result of `function list`/`search` and its `--count`, `decompile`, `evidence function`, `types` (and `--count`) and `class list` (and `--count`) — one shape from one helper, so a consumer reads `partial: true` once and treats that answer as incomplete. Answering on a quick view is *not* the same as carrying this field: `il`, `class show`, `disasm` and `evidence init`/`table` also answer on a quick view and do not carry it, so bound "is this answer complete?" by the field, never by the fact that a command answered. Text mode prefixes the same statement — `WARNING: target is quick-loaded; <what> is partial.` followed by the `bn refresh` directive — for every op in that list **except `types --count`**: its count-only renderer is a per-command one-liner rather than the shared prefix helper, so it still prints its bare total even though its envelope does carry `partial: true`. Do not read that bare total as a complete one. The hard-error rows below carry no such field because they refuse instead. Note `decompile`'s `analysis_skipped` is a **different, per-function** flag (BN declined to analyze *this* function on an analyzed view) — it is `false` on a quick view, so it can never stand in for the view-level state.
-
-**Quick-mode capability matrix.** Per-command behavior on a `--quick` / `--no-analysis` view. A **hard-error** row refuses with a `--quick` directive — that is a capability boundary, **NOT** absence of results; never read it as "nothing found." Distinguish `bn decompile <fn> --force-analysis` (analyzes one *existing* function in place — works on a quick view) from `bn function create` (materializes a *missing* function — refused on quick, see #479).
-
-| Command | Quick-mode behavior |
-|---|---|
-| `sections`, `imports` | **quick-safe** — container is parsed at load |
-| `target info` / `target list` | **quick-safe** — flagged `[not analyzed]` / `analysis_state:"quick"` |
-| `strings` | **hard-error until `bn refresh`** (string set isn't built) |
-| `function list` / `search` | **partial** — only entry-point + symbol functions exist; count grows after refresh; carries `partial: true` |
-| `decompile`, `il` | **partial** — render only already-analyzed functions, which on a quick view is unresolved-name Pseudo-C; `decompile` carries `partial: true` (`il` does not yet). `bn decompile <fn> --force-analysis` analyzes one function in place (the flag is on `decompile` only), after which `il` works on it |
-| `disasm <fn>` | **partial** (needs the function) · `disasm <addr> --linear N` — **quick-safe** (raw linear decode, no function required) |
-| `xrefs`, `callsites`, `function info`, `taint` | **hard-error until `bn refresh`** (`require_analysis`) |
-| `trace` | **function-specific** — needs the containing function's MLIL; `--force-analysis` that function first, else refresh |
-| `types` / `--count` | **partial** — lists the types the loader parsed; analysis-defined types (and the type set analysis would synthesize) are missing, so both carry `partial: true`. The **`--count` TEXT path alone** prints its bare total with no warning (its renderer lives in the command module, not the shared prefix helper) — read the field, not the line |
-| `class list` / `show` | **answers, partial** — from demangled symbols + RTTI/defined types present at load (method-body xrefs and analysis-derived methods still need analysis); `class list` carries `partial: true` (`show` does not yet) |
-| `evidence init` / `table` | **quick-safe** — read raw memory / `.init_array` / symbols |
-| `evidence function` | **partial** — reads one function's call ABI; needs that function analyzed; carries `partial: true` |
-| `function create --preview` | **hard-error until `bn refresh`** — refused on quick even in preview (#479); all batch mutations refuse identically |
-
-After `bn refresh` (or `--force-analysis` on a single function) every row promotes to full behavior; branch on `analysis_state`, not on an empty or errored result.
-
-`-i/--instance` is accepted on every subcommand (short form **`-i <id>`** preferred for agents; long form `--instance`; env `BN_INSTANCE` as single-agent convenience only). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both. Global `-i` does **not** replace `--instance-id` for spawn naming.
-
-**Private project associations.** `bn session start` associates the new bridge with the canonical project root of the caller (nearest `.git`, otherwise cwd); each successful `bn load` does the same. Associations live only in the owner-private, atomically written instance registry under `~/.cache/bn/instances/`—`bn` never writes routing files or edits Git metadata in the checkout. With multiple live bridges, a unique registry association lets a bare command resolve from the project; two matching sessions are an explicit ambiguity and require `-i`. Explicit `-i`, `BN_INSTANCE`, and sticky pins still win. Clean stop or crash-registry cleanup removes the association with the registry, and restart preserves the original roots without associating the restart command's cwd.
-
-**Restart reopens the same database, never a substitute (#753).** A restart reloads each target from the database that actually backs its analysis when one does — the row's `database_path` — and otherwise from the file the view *is*, always with the sidecar preference **off**, so the file is NAMED rather than guessed at. Both halves matter: a target that was saved has its analysis and annotations in a sibling (or cache) `.bndb` while `bv.file.filename` still reports the raw file, because a save restores the live filename on purpose — reopening the raw bytes there discards the save silently. This holds for **both** save destinations: the adjacent sibling, and the global cache copy a read-only mount forces (`bn save` reports `saved to the cache instead`), where it matters most because such a mount can never grow an adjacent `.bndb` and the cache copy is the only place that analysis exists. A target opened raw via `--no-bndb` therefore comes back raw instead of silently becoming its `.bndb`, and a restart no longer collapses targets by substituting a sidecar it merely inferred. One collapse shape remains and is not fixable by path choice: if a target's save LANDS on a file another target already has open, the two are one database from that moment (BN dedups views by file), so a restart returns one target for both. That is disclosed at save time — the save result carries `collides_with_open_target` and prints `also open as target …` — so close one first if you need them separate. `--quick` is likewise preserved. Since `bn doctor` prints `session restart` as the remedy for a stale bridge, the remedy must not change which database your subsequent reads are about.
-
-**Stopping is identity-checked and atomically signalled (#694).** `session start` cleanup, `session stop` and `session restart` first ask the bridge to shut down over the socket. Only if that fails do they signal the registry's pid, and then only through a **pinned** process: the pid is pinned with `os.pidfd_open`, its identity verified through that pin, and every signal of the `SIGTERM` → wait → `SIGKILL` escalation sent through the same pin. Pinning is what makes it safe — a pidfd holds a reference to the kernel's process record, so the pid cannot be recycled while the pin is held and the signal can never land on a different process. A `/proc` check followed by `os.kill` could not offer that: the verified process can exit and its pid be reused between the two steps.
-
-Identity is `(boot id, pid, process start time)`. Start times count from boot, so they are unique only *within* a boot while registries live in a persistent cache (`~/.cache/bn`); without the kernel boot id an old registry could falsely match a brand-new process after a reboot. A registry written under a different boot id is therefore treated as positively stale, and one that records no identity — or only half of one, e.g. written by an older bridge — is **never** proven.
-
-When the pid cannot be proven, or the interpreter provides no pidfd (availability is a property of the CPython build, not just the kernel — the interpreters `uv` installs have no `os.pidfd_open`), the command **refuses to signal at all**, names the pid, and tells you to confirm with `ps -p <pid>` and stop it by hand. That is deliberate: there is no safe non-atomic fallback. The `SIGKILL` escalation is gated identically, and teardown convergence treats a recycled pid as gone rather than escalating against it.
-
-**Unreachable bridges are hidden, not advertised.** The bridge binds its socket *before* writing its registry, so "registry, no socket" is never a live bridge starting up. Such an entry is dropped from normal discovery — `bn session list`, instance resolution and every request path — because nothing can be dispatched to it; if its owner is dead or unproven the record is purged outright, and it is purged as soon as a proven owner exits. While that owner is alive the record survives for **lifecycle lookups only**: `session stop` / `session restart` resolve it (marked `unreachable`) so the live process still holding memory can be stopped, and spawn collision detection consults it too, so a new bridge can never reuse that instance id, bind over its socket path and orphan the process. Recovering an unreachable/socket-less bridge this way exits **1** rather than 0 whenever the teardown and respawn succeed: `session restart` cannot list its open targets before teardown (there is no socket to ask), so `reload_capture_failed` is always set even when the respawn under the same id fully succeeds. A scripted recovery loop that keys on the exit code alone will read that success as a failure — check `restarted` / `reload_capture_failed` in the JSON result instead, since `restarted: true` with `reload_capture_failed: true` is a fully successful recovery of a target-less bridge, not an error. That JSON check only applies when teardown could signal the process at all: where the pid cannot be pinned (no pidfd, as with this project's own `uv`-installed interpreters — see above), the restart refuses to signal and exits **2** instead, with no result payload to check.
-
-An explicit-but-empty selector is always an error, never "everything": `bn session list -i ''` (e.g. an unset shell variable) is rejected instead of silently listing every session, the same doctrine `bn session stop ""` and `bn close -t ""` already follow.
-
-**Fan-out (`--all-instances` / `--all-targets`).** Whole-target **read survey** commands (`imports`, `sections`, `strings`, `exports`, `types`, `function list`/`search`, `class list`, `go functions`, `target info`, `evidence orient`) accept `--all-instances` (run across **every running bridge instance**) and `--all-targets` (run across **every target open in an instance**); combine them for every instance × target. The result is one `{kind: "fanout", instances: […]}` aggregate (text: a section per (instance, target) via the command's own renderer; JSON for machine use). Without `--all-targets`, each instance resolves its own target by the normal rule — an explicit `-t` applies to all, otherwise the per-instance implicit single target; an instance with no/ambiguous target becomes an `ok:false` row rather than failing the whole command (the command exits non-zero only if **every** result failed). It's an explicit allow-list (the `fanout=True` command flag), **not** every text command — mutations and side-effecting commands (`save`/`close`/`refresh`/`py exec`/`load`) never get it, so a write can't be fanned. Per-function reads (`decompile`/`xrefs`/…) aren't fannable either (their identifier wouldn't resolve in another instance). Use it for cross-instance / cross-target surveys instead of a shell `for` loop. The per-(instance, target) reads run **concurrently** (bounded worker pool), so a slow instance no longer serializes the rest; each row carries `duration_ms` and the aggregate includes a `slow_rows` summary (text: a `slowest:` line) so a long survey reads as progress, not a wedge (#417).
-
-Requests time out after 600s by default; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). Invalid values fail before instance selection or spawning. Full synchronous `load`/`refresh` defaults to 3600s, but genuinely large BNDBs can exceed any practical foreground budget. Prefer `session start --detach`, poll `session status`, then read the selector from `target list`; a failed detached job preserves its error in bridge state. Bridge registration has its **own** budget, separate from the request budget: 60s by default, `BN_SPAWN_TIMEOUT=<positive-seconds>` to change it, capped by whatever is left of the request deadline. That applies to an auto-started bridge too, so a child that never registers fails in its spawn budget instead of holding an ordinary request for the full 600s (or a load/refresh for 3600s) (#694). Registration failures are recorded in the instance log.
-
-**Headless idle shutdown (opt-in).** `BN_IDLE_TIMEOUT=<positive-seconds>` makes the bridge shut down after that much idle time. The default is **off**: unset, empty/whitespace, `0`, `none`, or `off` means no idle reaper. Agent-owned spawn commands use `BN_IDLE_TIMEOUT=3600 bn session start ...` for a one-hour crash fallback; set it on the bridge's spawn command, not on later read requests. The idle clock starts after preload and resets after completed **work** -- not after every request: a caller-declared liveness probe is exempt, see below. An in-flight request or a queued/running load job prevents shutdown. Invalid values fail loudly. This does not replace explicit target close and instance stop on every reachable exit.
-
-> **Which requests count (#756).** Work resets the clock; *discovery does not*. `bn session list` and `bn doctor` issue a real per-instance request, and on a host running several agents that traffic belongs to whoever ran the command — not to the bridge's owner. Those two declare themselves liveness probes, so they are still counted as in-flight (never reaped mid-response) but do **not** restart the window; without that, one agent's routine listing kept another agent's orphaned bridge alive indefinitely, which is what made the crash fallback unreliable. The distinction is the caller's declared intent, not the op: the owner's own `bn target list` issues the same `list_targets` and does keep the bridge alive. `bn instance list` was already round-trip-free and never affected the clock either way.
-
-**Very large binaries (~100k+ functions).** Use detached start rather than a background shell: the bridge registers before analysis, `session status` survives the initiating CLI process, and the completed job returns target selectors or a retained error. `--quick` helps raw/container triage but cannot remove analysis already stored in a pre-analyzed BNDB. While a target is open, `target info` carries pollable `analysis_progress` and reads remain responsive during `refresh`.
-
-## 3. Output & context
-
-Defaults:
-
-- Read commands → `--format text`.
-- Mutations → a compact **text status line**; the full audit payload is opt-in via `--verbose` or an explicit `--format json`, and `--out` writes it to a file instead of stdout (envelope on stdout). `--summary` forces the compact `mutation_summary` envelope under any format. A mutation result never spills, so the status is never swapped for a spill envelope — but the default is TEXT, so parse it as JSON only under `--format json`, and bound a large detail with `--out`.
-- Setup and export commands → `--format json`.
-- `--format ndjson` is available where it makes sense.
-- `--out <path>` writes the full body to disk and returns an envelope on stdout.
-- `--estimate-output` reports how big this command's output **would** be instead of printing or writing it (#796). Mutually exclusive with `--out`.
-
-**Spill envelopes (opt-in).** Nothing is written to disk unless `BN_SPILL_TOKENS` names a positive token count. With it set, output over that threshold (~3 bytes/token heuristic) is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
-
-- `ok` — request status.
-- `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
-- `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<cache>/spills/YYYYMMDD/<stem>-HHMMSS-<pid>-<rand>.<json|ndjson|txt>` (cache dir defaults to `~/.cache/bn`, override with `BN_CACHE_DIR`).
-- `format` — `json`, `ndjson`, or `text`.
-- `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity. `sha256` is the digest of **this artifact's bytes**, not of the binary.
-- `target`, `instance` — **provenance**: which target and bridge instance produced the artifact (#653). Check them before trusting a `--out` file you didn't just write: two agents sharing a scratchpad both wrote `fns.json`, and one silently read the other's list — a different target, a different binary — with nothing in the file making that detectable.
-- `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
-- `spill_token_limit` — the threshold that tripped (so you can see how far over you went).
-- `rerun` — the **command-specific slicing knob** to bound the next read (e.g. `--limit`/`--offset` for lists, `--lines` for `disasm`/`il`, `--address-window` for `evidence function`), so you re-run bounded instead of blind.
-
-**Size preflight — `--estimate-output` (#796).** The question you ask *before* paying for a large read: how big is this going to be, and which flag slices it. The read still runs (only the bridge knows the payload), but nothing reaches stdout except the measurement, and **nothing is written to disk** — no spill artifact, no `--out` file, no path in the envelope. It is advertised only on the read commands that render a payload; a mutation or a side-effecting command (`save`/`close`/`load`/`refresh`/`py exec`) refuses it the way argparse refuses any unknown option, so it can never replace an outcome with a byte count. The envelope reuses the spill keys above plus one of its own:
-
-- `estimated` — always `true`; this is what tells a consumer the envelope is a preflight and **not** the data (there is no `items`, no `path`, no `sha256`).
-- `format`, `bytes`, `tokens`, `tokenizer`, `summary` — as above, measured on the rendering you would have received under this `--format`. `read --encoding bytes` is measured as the raw byte payload it would have written, and reports `format: bytes`.
-- `spill_token_limit` — stated only when `BN_SPILL_TOKENS` is armed, so "would this have spilled?" is a comparison you make rather than a claim this tool makes.
-- `rerun` — the same command-specific slicing knob the spill envelope names.
+`--quick` skips the full analysis pass. Sections and imports are useful immediately; function listings/searches are partial, strings can refuse, and xrefs, callsites, and taint need analysis. Check `analysis_state` and run `bn refresh` before using these reads for a complete survey. `decompile --force-analysis` can analyze one existing function; it does not replace full target analysis or create a missing function.
 
 ```bash
-bn function list --estimate-output            # estimated: true, tokens: …, rerun: --limit/--offset
-bn read <addr> --length 0x100000 --encoding bytes --estimate-output   # format: bytes, bytes: 1048576
+bn session start /path/to/sample.bin --instance-id triage-1 --quick
+bn -i triage-1 target info
+bn -i triage-1 refresh
 ```
 
-**Choosing the spill point (#409).** Spill is armed by you, not by a default:
-- **No threshold (default)** — unset, empty, non-numeric, zero and negative all mean **no spill**: the full payload goes to stdout and the *consuming* agent/Harness bounds what is read. A typo can never silently re-arm disk output.
-- **Slicing note (any mode)** — a read that does NOT spill but is over **10 000** estimated tokens prints a `note:` on stderr naming this command's own slicing flag (below). The flag is derived from the command's own parser, so it is one that command accepts — and for a mutation it is `--summary`, which keeps the status parseable. Nothing lands on disk and no envelope replaces the data. It stays on when a threshold is armed above the payload, so a large-but-fitting read is never silent.
-- **Threshold** — `BN_SPILL_TOKENS=<tokens>` (e.g. `40000`) arms the spill at that size for a bigger/smaller context budget.
-- **Near-spill note (threshold armed)** — a read that *fits* but lands within 20 % of the configured threshold prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively. That warning replaces the slicing note for that read, so one read never draws two notes.
+## Output and artifacts
 
-**Reading a large payload back.** With no spill, a command whose stdout you *capture* (rather than pipe) can be truncated by your own tool wrapper mid-payload — a truncated JSON body does not parse. Recover with the wrapper's artifact, or avoid it: pipe into `jq`/`grep` (the stream is complete), or take the data with `--out FILE` / `--limit` / `--lines`.
+Read commands default to text. Mutations default to a compact **text status line**; use `--format json --summary` for parseable status, `--verbose` for detailed diffs, and `--out FILE` to write full detail away from stdout. Setup/export commands may default to JSON. Always parse the format requested, not the command's historical default.
 
-**Spill retention (#591).** Spill artifacts are a cache, not a record: `bn` keeps the last **14** day-directories under `<cache>/spills/` and removes older ones on the first spill of a process (a measured dogfood cache had reached 1.0 GB / 4187 files with no prune path). Set `BN_SPILL_RETENTION_DAYS=0` to keep everything for an engagement whose artifacts must survive, or to any day count to shorten the window; a garbage value falls back to 14 rather than to "forever". Anything in the spill root that is not a `YYYYMMDD` directory is never touched. Copy an artifact you need to keep out of the cache with `--out`. Reclaim the cache on demand — before the next spill, and inspectably — with `bn spill gc` (see §2).
-
-**Pipe trap (correctness — opt-in only).** When output spills (`BN_SPILL_TOKENS` armed), a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill. **The default inverts the trap**: a pipe receives the real data, but a *captured* large payload is truncated by the consumer wrapper (head + tail), so `jq` over the capture fails mid-object — pipe it, or take it with `--out`/`--limit`/`--lines`.
-
-> **`xrefs` text is display-capped (not just spilled).** For a hot symbol with thousands of callers, `bn xrefs <sym>` text output caps the body at the first 100 caller groups per section (the on-screen page) — the total-count header line (`xrefs to 0x… (N code, M data)`) stays accurate, but the body is truncated, so `bn xrefs <sym> | grep -c` / `| wc -l` undercounts. When stdout is a pipe and the body was capped, `bn` prints a `note:` on stderr naming the true totals. To get the full set, use `--out FILE` (writes every ref), `--format json` (paged, honest `total`), or bump `--limit`.
-
-Slicing knobs to avoid spilling in the first place:
+`BN_SPILL_TOKENS` opt-in spills an oversized *read* to an artifact and puts an envelope on stdout. When a command is piped, the downstream `jq`/`rg`/`grep` may then see only the envelope. Without spill, a pipe receives full output, although a capturing wrapper may truncate it. Bound with `--limit`, `--lines`, or `--out`, and read stderr for slicing and spill notes. `--estimate-output` runs the read without emitting its body. Its envelope has `ok`, `estimated`, `format`, `bytes`, `tokens`, `tokenizer`, `summary`, and a command-specific `rerun` hint; `spill_token_limit` is present when a spill threshold is armed.
 
 ```bash
-bn decompile <fn> --lines 40:80         # 1-indexed inclusive; prints "// lines 40-80 of N"
-bn xrefs <fn-or-addr> --limit 20        # cap text output
-bn function info <fn>                    # compact by default
-bn function info <fn> --verbose          # full params + locals
+bn decompile parse_record --lines 20:45
+bn function list --limit 100 --format json
+bn strings --out /tmp/bn-strings.json
+bn xrefs memcpy --estimate-output
+bn spill gc --dry-run
 ```
 
-`--lines START:END` works on `decompile`, `il`, `disasm`, and `function structured-il` (text mode only — it errors on `--format json`). A `START` past the last line is treated as an error: the command exits non-zero with a stderr diagnostic (not a `//` comment on stdout), so a scripted consumer can tell an out-of-range slice apart from a real result.
+`--out` writes an artifact and prints a small envelope. JSON envelopes identify `artifact_path`, `format`, `bytes`, `sha256`, and the source `target`/`instance`; check provenance before consuming a shared file. A text `xrefs` view may cap displayed caller groups even without a spill; use `--format json`, `--limit`, or `--out` for counts. `--lines START:END` is 1-indexed, inclusive, and text-only on decompile, IL, disasm, and structured IL. An out-of-range window errors rather than returning an empty answer. `bn spill gc` reclaims cached spill days; `--out` artifacts are caller-owned.
 
-Pagination: `--limit` / `--offset` on list commands.
-
-
-## 8. Python escape hatch
-
-Reach for `bn py exec` only when built-in commands are awkward — arbitrary BinaryView introspection or operations the bridge does not expose. Built-ins are preferred because they are verified, cache-friendly, and integrate with the preview/verify loop.
+## Discovery and troubleshooting
 
 ```bash
-bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+bn help evidence
+bn capabilities --format json
+bn doctor
+bn plugin install
+bn skill install
 ```
 
-Multiline snippets via stdin with a quoted heredoc:
+`bn capabilities` is the registry-derived command catalog. Use `bn doctor` when discovery, installation, or bridge connectivity is wrong; stale plugin code requires restarting the bridge or GUI. `bn plugin install` and `bn skill install` install the local bridge and skill links. `bn instance gc` removes dead registry residue, not live bridges.
+
+## Python escape hatch
 
 ```bash
 bn py exec --stdin <<'PY'
-out = []
-for f in bv.functions:
-    if 0x416000 <= f.start < 0x41C000:
-        out.append((f.start, f.symbol.short_name))
-out.sort()
-print("\n".join(f"{addr:#x} {name}" for addr, name in out))
+print(bv.arch.name)
 PY
 ```
 
-Shell rules:
-
-- Quote the delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
-- Keep the closing `PY` on its own line with no indentation or trailing whitespace.
-- `--script <file>` for code on disk; `--code` for true one-liners.
-- Materialize Binary Ninja iterators (`f.hlil.instructions`, etc.) with `list(...)` instead of assuming random-access behavior.
-
-The exec environment includes `bn`, `binaryninja`, `bv`, and `result`.
-
-`py exec` always returns `stdout` and `result`. `result` is JSON-serialized when possible; if not, the CLI returns `repr(result)` and a non-fatal entry in `warnings`. If your script writes a JSON artifact, it is surfaced under `artifact`.
-
-> **Exclusive write lock + unsandboxed.** `py exec` runs under the bridge's **exclusive write lock**, so a long-running snippet blocks **every** other op (reads and writes) on a shared bridge until it returns — don't park slow scripts on a bridge other agents are using. It also runs **unsandboxed** with full `bv` / `binaryninja` access (it can mutate or write to disk). Keep snippets short on shared bridges, and for raw byte reads prefer the dedicated `bn read` (read-locked, parallel-safe) instead of a `py exec` that calls `bv.read(...)`.
-
-## 9. Troubleshooting
-
-Run `bn doctor` only when something is wrong — commands fail unexpectedly, targets don't appear, or the bridge seems unresponsive:
-
-```bash
-bn doctor
-bn plugin install                        # install the in-process BN plugin
-bn skill install                         # install the agent skill files
-```
-
-It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), the Binary Ninja engine each bridge is driving (`binary ninja: <core version> (build <id>)`, so a BN major upgrade is visible rather than inferred), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).
-
-## 10. Known quirks
-
-- **`types declare` verification failures.** The source-parser path handles most declarations, but a stubborn one may roll back with `verification_failed`. Workaround: define the struct directly via `bn py exec` using `StructureBuilder`, then re-run `bn types show`:
-
-  ```bash
-  bn py exec --stdin <<'PY'
-  from binaryninja import types as bntypes
-  s = bntypes.StructureBuilder.create()
-  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.void()), "vtable")
-  s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False), 0x20), "pad_04")
-  s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
-  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1, sign=False)), "m_fileBuf")
-  s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
-  bv.define_user_type("MyStruct", bntypes.Type.structure_type(s))
-  print("defined MyStruct")
-  PY
-  ```
-
-- **Stale bridge.** If `bn doctor` reports `stale: loaded plugin code does not match installed plugin file`, restart Binary Ninja (GUI or headless) to pick up the updated bridge. Commands behave unpredictably with stale code.
-
-- **No targets ⇒ no `py exec`.** `bn py exec` requires at least one open BinaryView. If `bn load` is still running or the target isn't ready yet, `py exec` errors with "No BinaryView targets are open".
-
-## 11. Skill install
-
-`bn skill install` is idempotent. It links/copies the bundled skills into `~/.claude/skills/` and, when `~/.codex/` exists, also into `~/.codex/skills/`. Honors `CLAUDE_HOME` / `CODEX_HOME`. Use `--mode copy` for standalone copies, `--dest <path>` for a single explicit destination, and `--force` to overwrite. Restart your agent to pick up renamed or newly added skills.
+Use `py exec` when a built-in read or verified mutation cannot express the task. It runs with an exclusive write lock and unsandboxed Binary Ninja/Python access, so even a read snippet blocks other clients and can mutate the view. Prefer `bn read`, `data vars`, and `data symbols` for common raw/data reads. Keep scripts bounded, verify any changes, and save intentionally.
