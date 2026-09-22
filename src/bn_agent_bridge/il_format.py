@@ -597,10 +597,18 @@ def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
 
 
 def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = True):
-    """Recursively format HLIL tree with proper indentation."""
+    """Recursively format HLIL tree with proper indentation.
+
+    Every operation name is read through ``_il_op_name`` (#827 item 5), which is
+    what that helper exists for: an instruction whose ``operation`` is a bare
+    STRING -- rather than an object with a ``.name`` -- raised AttributeError
+    here, mid-tree, and the caller (`_function_text`) swallowed it into the flat
+    ``il.instructions`` fallback, so a whole tree silently rendered as the
+    inferior listing instead of the tree the view actually had.
+    """
     lines = []
     pad = "    " * indent
-    op = ins.operation.name
+    op = _il_op_name(ins)
 
     BODY_INDENT = "    "
     if addresses:
@@ -630,7 +638,7 @@ def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = Tr
         lines.append(f"{NO_PREFIX}{pad}{{")
         lines.extend(_format_hlil_tree(ins.true, indent + 1, addresses=addresses))
         false_branch = ins.false
-        false_op = false_branch.operation.name
+        false_op = _il_op_name(false_branch)
         if false_op == "HLIL_NOP":
             lines.append(f"{NO_PREFIX}{pad}}}")
         elif false_op == "HLIL_IF":
@@ -664,7 +672,7 @@ def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = Tr
         for case in ins.cases:
             lines.extend(_format_hlil_tree(case, indent + 1, addresses=addresses))
         default = getattr(ins, "default", None)
-        if default is not None and default.operation.name != "HLIL_NOP":
+        if default is not None and _il_op_name(default) != "HLIL_NOP":
             lines.append(f"{NO_PREFIX}{pad}    default:")
             lines.extend(_format_hlil_tree(default, indent + 2, addresses=addresses))
         lines.append(f"{NO_PREFIX}{pad}}}")

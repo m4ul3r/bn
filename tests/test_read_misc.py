@@ -921,6 +921,56 @@ def test_read_short_read_returns_mapped_bytes_with_note(monkeypatch):
     assert "0x1000" in result["note"]
 
 
+def test_read_caps_a_pathological_length_and_says_so_827(monkeypatch):
+    # #827 item 4: the only gate on a raw read was `length < 0`, so a raw-socket
+    # client (or `py exec`) could ask for the whole address space and have the
+    # bridge allocate it with nothing to stop it -- while the linear-disassembly
+    # sibling caps at `_LINEAR_DISASM_MAX`. The cap must be REPORTED: a bounded
+    # dump that renders like the whole window is the failure mode the note
+    # exists to prevent.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # `raising=False` on purpose: pre-fix there is no `_READ_MAX`, and the red
+    # this test must produce is the CAP MISSING FROM THE ANSWER, not a missing
+    # attribute in its own setup. Renaming the constant still fails later (the
+    # request below would then not be capped at all).
+    monkeypatch.setattr(bridge.read_misc, "_READ_MAX", 8, raising=False)
+    bv = _FakeBV(memory={0x1000: b"\x41" * 64})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "0x1000", 1000)
+
+    assert result["capped"] is True
+    assert result["length"] == 8                    # clamped to the cap
+    assert result["requested_length"] == 1000       # the caller's own number
+    assert "capped at 8 bytes (requested 1000)" in result["note"]
+
+    # At the ceiling exactly, nothing fires: the guard does not change the answer
+    # to an ordinary read.
+    at_cap = instance._read(None, "0x1000", 8)
+    assert "capped" not in at_cap and "note" not in at_cap
+    assert at_cap["length"] == 8
+
+
+def test_read_cap_composes_with_a_short_read_827(monkeypatch):
+    # A capped request that ALSO runs off the mapping reports both facts on one
+    # note, and `requested_length` stays the caller's original number rather than
+    # collapsing to whichever bound fired first.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge.read_misc, "_READ_MAX", 8, raising=False)
+    bv = _FakeBV(memory={0x1000: b"\x42" * 4})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "0x1000", 9)
+
+    assert result["capped"] is True and result["short_read"] is True
+    assert result["length"] == 4
+    assert result["requested_length"] == 9
+    assert "capped at 8 bytes (requested 9)" in result["note"]
+    assert "short read" in result["note"]
+
+
 # --- imports --summary ---
 
 
