@@ -2817,7 +2817,7 @@ def _render_record_table_text(value: Any) -> str:
     lines = [
         f"record table @ {value.get('address', '<unknown>')}  "
         f"record-size: {value.get('record_size', '?')}  "
-        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or '(none)'}"
+        f"ptr-fields: {', '.join(str(p) for p in _field_list(value, 'ptr_fields')) or _EMPTY_RESULT}"
     ]
     for warning in _field_list(value, "warnings"):
         lines.append(f"warning: {warning}")

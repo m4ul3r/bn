@@ -8050,6 +8050,81 @@ def test_empty_results_use_one_vocabulary():
     assert _render_data_vars_text({"items": []}) == "(none)"
 
 
+def test_every_generic_empty_render_uses_the_shared_marker():
+    """#909: census every use of the marker and every literal that bypasses it.
+
+    The empty cases exercise the rendered result, while the source scan catches
+    a newly added renderer that spells its own ``none`` before it can be added
+    to this table. A diagnostic sentence such as ``none (offset ... is past the
+    end)`` states a reason and is not an empty-result token.
+    """
+    import ast
+
+    from bn import formatters
+
+    module = ast.parse(inspect.getsource(formatters))
+    marker_uses = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+        and any(isinstance(child, ast.Name) and child.id == "_EMPTY_RESULT"
+                and isinstance(child.ctx, ast.Load) for child in ast.walk(node))
+    }
+    page = {"items": [], "total": 0, "offset": 0, "returned": 0,
+            "limit": 50, "has_more": False}
+    cases = {
+        "_empty_result": ((), {}),
+        "_render_comment_list_text": (([],), {}),
+        "_render_tag_types_text": (({"tag_types": []},), {}),
+        "_render_tag_list_text": (([],), {}),
+        "_render_target_choices": (([],), {}),
+        "_render_name_address_rows": (([],), {}),
+        "_render_name_address_list_text": ((page,), {}),
+        "_render_paged_list_text": ((page, "items", formatters._render_name_address_rows), {}),
+        "_render_type_list_text": ((page,), {}),
+        "_render_strings_rows": (([],), {}),
+        "_render_sections_rows": (([],), {}),
+        "_render_data_vars_text": ((page,), {}),
+        "_render_data_symbols_text": ((page,), {}),
+    }
+    assert marker_uses == cases.keys() | {"_render_record_table_text"}, (
+        "The shared empty marker has a new caller: add an empty payload and "
+        "assert what that renderer prints")
+    for name, (args, kwargs) in cases.items():
+        assert getattr(formatters, name)(*args, **kwargs) == formatters._EMPTY_RESULT, name
+
+    # One renderer uses the same marker inside a labeled row, so its empty
+    # field is covered separately from the whole-result cases above.
+    assert f"ptr-fields: {formatters._EMPTY_RESULT}" in formatters._render_record_table_text(
+        {"address": "0x1000", "record_size": 8, "ptr_fields": [], "items": []})
+
+    def raw_empty_literals(tree):
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            value = node.value.lower()
+            if (value in {"none", "(none)"}
+                    or re.fullmatch(r"\(no [^)]+\)", value)
+                    or (re.fullmatch(r"no [a-z][\w -]*", value)
+                        and isinstance(parents.get(node), (ast.Return, ast.IfExp)))):
+                found.append((node.lineno, node.value))
+        return found
+
+    definitions = [node for node in module.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "_EMPTY_RESULT"
+                           for target in node.targets)]
+    assert len(definitions) == 1
+    assert definitions[0].value.value == "(none)"
+    assert raw_empty_literals(module) == [(definitions[0].lineno, formatters._EMPTY_RESULT)], (
+        "An empty token bypasses _EMPTY_RESULT/_empty_result")
+    # The scan itself must reject the shape that drifted in the integration
+    # tree, including a new branch that returns a named empty token directly.
+    for spelling in ("none", "(none)", "(no targets)", "no targets"):
+        probe = ast.parse(f"def added_renderer(value):\n    return {spelling!r}\n")
+        assert raw_empty_literals(probe) == [(2, spelling)]
+
+
 def test_record_table_renderer_falls_back_on_a_non_dict():
     """#824: its siblings gate on isinstance(dict); without one the first `.get`
     raised AttributeError out of a renderer internal callers can reach."""
