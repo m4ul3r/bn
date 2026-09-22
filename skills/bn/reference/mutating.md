@@ -1,450 +1,97 @@
 # bn reference — mutating
 
-Mutation surface (preview→verify→save) + bundles for the `bn` skill. See `../SKILL.md` for the map.
+Use this reference when changing a BNDB. Mutations verify their requested state; a saved `.bndb` is the durable artifact. `bundle function` is a read/export command in `reference/reading.md`.
 
-## 6. Mutation flow
+## Mutation loop and commands
 
-The mutation surface is built around a four-step safety loop: **preview → live-verify → read back → save**.
-
-### Step 1 — preview first
+Preview when the operation supports a reversible preview, apply, read back, and save. A first `proto set` on a function without a user prototype **cannot** be previewed: setting it pins Binary Ninja's `has_user_type` flag, which cannot be cleared. Apply that change live only when intended, then check `proto get` and its callers. A later change to an existing user prototype can be previewed.
 
 ```bash
-bn types declare "typedef struct Player { int hp; } Player;" --preview
-bn types declare --file /path/to/win32_min.h --preview
-bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
-bn symbol rename sub_401000 player_update --preview   # `bn rename sub_401000 player_update` is a top-level alias (locals: `bn local rename`; struct fields: `bn struct field rename`)
-bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
-bn comment set --address 0x401000 "explain this" --preview
-bn function create 0x401000 --preview
+bn symbol rename sub_401000 parse_record --preview
+bn proto get parse_record
+bn proto set parse_record 'int parse_record(char *buf, int len)'
+bn local list parse_record --format json
+bn local rename parse_record <local_id> record_len --preview
+bn local retype parse_record <local_id> uint32_t --preview
+bn types declare 'struct Record { uint32_t length; };' --preview
+bn data retype 0x404000 'Record[8]' --preview
+bn struct field set Record 0x4 flags uint32_t --preview
+bn struct field rename Record flags options --preview
+bn struct field delete Record options --preview
+bn function create 0x402000 --preview
+bn comment set --address 0x402010 'length comes from header' --preview
+bn comment delete --address 0x402010 --preview
+bn tag type create audit_note --icon A --preview
+bn tag add 0x402010 --type audit_note --data 'review bound' --preview
+bn tag remove 0x402010 --type audit_note --preview
+bn tag type remove audit_note --preview
+bn go rename --preview
+bn batch apply -t <selector> /tmp/changes.json --preview
+bn save
 ```
 
-Preview applies → refreshes analysis → captures decompile diffs → reverts. Inspect:
+Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only**. It is idempotent and safe to re-run.
 
-- `results` — per-op outcome and observed state.
-- `affected_types` — type-level layout diffs.
-- `affected_functions` — for the first few changed functions, also includes `before_excerpt` / `after_excerpt` HLIL snippets near the first change.
-
-A no-op edit reports `changed: false` ("No effective change detected").
-
-### Step 2 — live writes are verified
+For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
 Per-op statuses:
 
-- `verified` — change applied and read back as requested.
-- `noop` — already in the requested state. For `types declare`, the named types must resolve in the live database; parsing no named types is `invalid_request`, with the reason in `first_error` and the default status output, not a successful no-op. That refusal covers a **partial** drop too: the parser silently discards a declaration whose name collides with a built-in type, so `struct uint32_t { int x; }; struct cfg_t { int y; };` would otherwise apply one type, drop the other, and report success. Each top-level declaration that defines a type — a `struct`/`union`/`enum`/`class` body (with `static`/`extern`/`extern "C"`/`__attribute__((…))` prefixes, however they nest) or a `typedef` — is re-parsed on its own; when one of those defines no named type, the whole request is refused (`dropped_declarations` names it) and nothing is applied. A definition whose tag comes from a macro expansion is not visible to a declaration-text check, so it is not covered.
-- `unsupported` — operation not supported on this object.
-- `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the operation was refused: a bad field *value*, a missing required field, an ambiguous operation target, or conflicting options. Local semantic preflights (before sending), the bridge's pre-apply checks, and apply-time refusals all exit 3 on mutation commands. Anything already applied in the mutation/batch is reverted. An unknown op kind is `unsupported` and likewise exit 3. Only these mutation boundaries classify failure statuses as exit 3; read/resolver errors remain exit 2 (#625/#716/#744).
-- `reverted` — the op applied, then a *later* op in the same batch failed and the whole batch was rolled back. **Not a failure** — it is not in the failed-status set and does not count toward `failed=` — but the change is gone; resubmit it once the failing op is fixed. A genuine `noop` op keeps its `noop` status through a rollback (it changed nothing, so there was nothing to undo).
-- `not_attempted` — the op was submitted but never ran, because an earlier op in the batch failed and the batch was rolled back. **Not a failure** either, for the same reason: stamping these would turn one bad op into N and inflate the failure count a control loop reads. A failed batch returns one row **per submitted op**, in submission order, each echoing its own `requested`, so a consumer reconciles the manifest against the results without re-reading what it sent.
-- `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
-- `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
+- `verified` — requested change applied and read back.
+- `noop` — the requested state already existed.
+- `unsupported` — this operation is unavailable for the object.
+- `verification_failed` — readback disagreed; the batch attempts rollback.
+- `invalid_request` — semantic request refusal, including an invalid field value.
+- `reverted` — an earlier successful sibling was undone after a later batch failure; not itself a failed status.
+- `not_attempted` — a later sibling was never run after a batch failure; not itself a failed status.
+- `rollback_failed` — restore failed; the view may contain some changes.
+- `internal_error` — unexpected apply failure; rollback is attempted.
 
-#### Refusal versus request/bridge failure
+A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2; a local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
 
-| Boundary | Exit | Meaning |
-|---|---|---|
-| CLI operation preflight | 3 | Nothing sent. Missing/conflicting comment or tag locations, empty rename names, missing/conflicting declaration sources, and a parsed manifest object missing an `ops` array are `invalid_request`. |
-| CLI argument parser or handled file/document/routing error | 2 | Invalid flags/choices, missing declaration files, manifest I/O errors converted to `BridgeError`, empty batch-manifest stdin, invalid manifest JSON, a non-object manifest, or missing/ambiguous instance/target routing. This does not classify unhandled I/O exceptions as exit 2. These are not operation refusals. |
-| Bridge mutation refusal | 3 | A failed mutation status; consult the result for rollback and observed state. |
-| Read operation or bridge/transport fault | 2 | Read refusals stay read errors. An unreachable bridge or a bridge error without a failed mutation status is not proof that a write did or did not land. |
+## Output and compact status
 
-Pre-send operation refusals reuse the structured error envelope, not a fabricated
-apply/rollback result. With `--format json` (or `ndjson`), for example:
-
-```json
-{"ok": false, "status": "invalid_request", "error": "comment set needs a location: an address (positional or --address) or --function", "observed": {"request_sent": false}}
-```
-
-The explanation is also printed to stderr (including under `--format text`).
-`observed.request_sent: false` distinguishes this local refusal from an error
-received from the bridge. `comment get` and `tag get` use the same location
-checks as their mutation siblings but remain read errors (exit 2, no mutation
-status). For batch input, document parsing must succeed first: invalid JSON or
-a non-object document stays exit 2; an object whose `ops` field is missing or
-not an array is an operation-level `invalid_request` (exit 3), before any send.
-
-### Output shape — compact by default, detail on request
-
-Mutations print a **one-line status summary** by default:
-
-```
-mutation: committed  changed=71  verified=71  noop=0  failed=0  dirty_after=True
-```
-
-That is ~225 bytes. The full audit payload — every per-op diff, `requested`,
-`observed`, `before_*` field — is the single largest source of avoidable token burn
-in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cost
-261 KB / 87k tokens), so it is **opt-in**:
-
-| You want | Pass |
-|---|---|
-| the status line (default) | *nothing* |
-| full detail, human-readable | `--verbose` (alias `--diffs`) |
-| full JSON envelope (`results[]`, `affected_functions[]`) | `--format json` |
-| the compact status as JSON | `--format json --summary` (alias `--quiet`) |
-| full detail written to a file | `--out detail.json` (stdout keeps a small envelope) |
-
-`--format` picks the medium; `--verbose`/`--summary` pick the detail level. No
-combination changes how the outcome is CLASSIFIED (each classifies the same
-full result, before anything is rendered):
-0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a
-response this CLI cannot classify at all) / 3 a mutation status `verification_failed`,
-`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
-unmeasured success (`measured: false` — applied but unverifiable; see
-"Unmeasured mutations").
-
-An output flag cannot reclassify the outcome, but it CAN fail to deliver, and
-that is the divergence. The classification is made before any output is
-produced, so a combination asking for output this CLI cannot deliver
-reports the documented `2` instead — an `--out` destination it cannot write, or
-a reply too deeply nested for `--format json`/`ndjson` to serialize. The
-default status line prints named fields and never walks such a reply, so a
-verified reply exits `0` there. The divergence moves in a single direction: an
-undeliverable output replaces the code with 2 and can never turn a failed or an
-unmeasured mutation into a clean zero. But do NOT read that backwards: on this
-path a 2 is also the code for a bridge this CLI could not reach, a reply it
-could not classify at all, and a flag value rejected before anything was sent.
-Two things are NOT in that list. An operation-level refusal: on a mutation it
-is exit 3, as the boundary table above says (not an argparse, input-document,
-or routing error). And a reply carrying ONE field this CLI cannot read: that
-field is refused and disclosed by name, a verdict is still derived from the
-rest, and the run exits 3 or 4 accordingly.
-So a 2 alone does not tell you whether the write landed; the stderr line names
-which of them it was, and when it names the delivery step, re-read the view
-rather than re-issuing the mutation.
+Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation result never swaps its status for a spill envelope; with `--out`, stdout is an artifact envelope rather than the mutation status.
 
 ### Compact status keys
 
-The compact status — the default text line, and the object returned by
-`--format json --summary` — is a stable schema. Every key below is always
-present except `prototype_user_type_residue`, which is emitted only when it is
-true:
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true:
 
 | key | meaning |
 |---|---|
-| `kind` | always `"mutation_summary"` — how a consumer tells a compact status apart from a full mutation envelope |
-| `ok` / `success` | mirrors the read-command envelope (`ok` is always present, unlike the full result) |
-| `committed` | true for any non-preview mutation that reached apply — including an all-noop |
-| `preview` | true when `--preview` was requested |
-| `measured` | **false** when the counts below could not be derived. Four causes reach it: the op reported no `results[]` rows to derive them from; a field they are derived from arrived in a shape no value reads out of and was refused rather than read as a zero; an op that reports through its own counters did not state the one its summary measures from; or its failure rows and its own failure counter disagree. `first_error` names the cause in words — see "Unmeasured mutations" |
-| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]` (or, for `go rename`, from its own counters); `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false`. A count is **also** `null` on a `measured` envelope when the counter it is read from was never STATED: `measured` answers for the one counter the summary measures from, and a count the payload did not carry is not a zero. `failed_count` is the exception and is stated anyway, because `results[]` answers the same question — an empty row list beside an absent counter is a `0` the rows established, and rows that contradict the counter make the whole summary unmeasured instead. `op_count` is a literal count of what the op could see rather than a derived one, so it stays stated either way — never read it as a batch size, and never branch on it to tell a measured run from an unmeasured one, because it can be `0` or non-zero under both. On a `results[]`-derived summary it is the number of rows. On `go rename` it is the candidates plus the **scan-time** user-named skips — **not** every function the op considered. The scan sorts each of the `defined_count` rows into four buckets, and the other two (`skipped_already_named`, a function that already carries the recovered name; `skipped_interior_pc`, a pcln address no function STARTS at) are disclosed as their own keys and are **not** in `op_count`, so it does not reconcile with the `defined_count` in the same envelope — on a re-run of an already-renamed view it collapses toward `0` while the op still considered the whole table. The published `skipped_user_named` folds the apply-time skips in, so `candidates + skipped_user_named` over-counts; the summary subtracts `skipped_changed_during_apply` to get back to the scan-time figure. `changed_count` is **also** `null` when a FAILED revert left an unknown number of changes live — see "A revert that failed" below. The two `null` cases are **not** disjoint: a run can be unmeasured *and* a failed revert, so read `measured` to tell them apart, never the `null` alone |
-| `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
-| `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
-| `dirty_after` | `true` iff the BNDB was left modified and needs `bn save` before closing |
-| `prototype_user_type_residue` | present and `true` only when a reverted `proto set` on an AUTO function left an unclearable `has_user_type` override behind; the view is modified even though the prototype value round-tripped, so `dirty_after` is `true` too |
+| `kind` | `mutation_summary` |
+| `ok` / `success` | classified operation outcome |
+| `committed` | whether live apply reached commit, including all-noop |
+| `preview` | whether preview was requested |
+| `measured` | false when result rows or required counters cannot establish counts |
+| `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
+| `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
+| `rolled_back` | true/false when restore was attempted, null when none was needed |
+| `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
+| `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
+| `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 
-#### A revert that failed makes `changed_count` unknown
+`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. A cleanly completed revert establishes `changed_count: 0`; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
-`changed_count` is what is LIVE in the view when the call returns. When the
-revert itself failed (`committed: false`, `rolled_back: false`), an unknown
-subset of the applied changes is still live and the exact number is derivable
-from nothing the bridge reports — so `changed_count` is `null`. Read that
-`null` as "unknown", never as "nothing landed": `0` is the "nothing changed,
-don't save" verdict, and this state reports `dirty_after: true` beside it. The
-default text line carries the same two facts as `mutation: rollback failed …
-changed=None … dirty_after=True`.
+## Batch apply
 
-`measured` normally stays `true` here, because the counters and the failure
-rows DID read — what is unknown is the live delta, not the measurement. It is
-not guaranteed, though: a failed revert whose envelope is *also* unreadable or
-missing the counter its summary reports from is unmeasured as well, and then
-every derived count is `null` for that reason instead. So a `null`
-`changed_count` means "unknown" either way, and `measured` is what tells you
-which.
-
-This is a rule of the compact-status schema itself, so it holds for **every**
-mutation, whichever way that op measures: the `results[]`-derived summary every
-op gets by default, and `go rename`'s own-counter summary alike. A `--preview`
-whose non-journaled restore failed is the plainest case — it verified every op
-and still left the view modified, so it reports `changed_count: null`, not the
-plan it verified.
-
-The `--preview` variant counts the same way, because it is the same live state —
-a preview whose revert failed has really renamed the view. A preview that
-FAILED and reverted cleanly is the other case: it reports `changed_count: 0`,
-since the op is all-or-nothing and a live run of that state commits nothing. Its
-`verified_count` is how far the apply got before the failure, not what would
-land — `go rename`'s detail view states it as `0 would rename (N verified before
-the failure …)`.
-
-`go rename --verbose` does not state a count for what is live in this state
-either. It says `an unknown number of the renames this run applied are still
-live` rather than `0 renamed` / `0 would rename`, because the compact face of
-that same payload says `changed=None`. It names no apply failure and directs
-no re-run: the banner above it says the view may be left modified, so "fix it
-and run again" is the wrong instruction there.
-
-It states no denominator either. The number it *can* report is what VERIFIED,
-and a row whose rename was written and then failed readback is also left
-modified by a revert that did not complete — so "N applied" is not a figure
-this op can put on it. The line reports `(N verified, M failed, S skipped)` and
-leaves the total unstated.
-
-Under **version skew** the two faces of a failed revert are not
-interchangeable, and the detail view is the weaker one. All four cases below
-were measured on `go rename` in that state, against ONE payload: 2 candidates,
-4 published skips (3 scan-time, 1 apply-time), 1 failure row and a revert that
-did not complete — which un-skewed reports `op_count: 5`, `changed_count: null`,
-`measured: true`, `dirty_after: true`.
-
-* the verified counter is **absent** — the compact face is unmeasured (every
-  derived count `null`), while the detail view falls back to
-  `candidates − failure rows` and prints a number the envelope never reported;
-* the verified counter is **unreadable** — the compact face is unmeasured, and
-  the detail view prints `?` rather than a number;
-* the **candidate** counter is **unreadable** — the compact face is unmeasured
-  and both faces disclose the field by name; the detail view states no count at
-  all ("cannot say what this run did");
-* the **candidate** counter is **absent** — the detail view returns early on
-  its "nothing to do — no auto-named (`sub_*`) Go functions to rename" line,
-  which reads as a clean no-op over a view the compact face of the same payload
-  reports as `rollback failed` / `changed=None` / `dirty_after: true`. This is
-  the one cell where the compact face stays `measured: true`; its `changed`
-  and `dirty_after` are still right, and the detail line is not.
-
-In the first three the compact face REFUSES, so believe it — though only the
-first has the detail view deriving a confident number against it; in the second
-and third the detail view refuses too, with `?` and by naming the field. The
-fourth is the exception in both directions: neither face refuses, the compact
-face's `changed` and `dirty_after` are still right while its `op_count` quietly
-shrinks with the missing counter (5 to 3 on the payload above — and to the same
-3 when that counter is *unreadable* rather than absent, where at least
-`measured` goes `false`), and the detail line is simply wrong. So `measured`
-and `dirty_after` are the keys to branch on; the text line and `op_count` are
-not.
-
-The neighbouring state differs in **what the revert can establish**. On a
-revert that **completed**, `changed_count: 0` needs no counter at all: the
-revert is what established that nothing landed, so the summary stays
-`measured: true` with `dirty_after: false`. It establishes nothing about how
-many rows verified BEFORE the failure — so an absent `go_verified_count` there
-reports `verified_count: null`, not `0`, and an absent `skipped_user_named`
-reports `noop_count: null` the same way. The detail view still derives its own
-figure from `candidates − failure rows` in that cell, so it prints a number
-where the compact face refuses: believe the compact face here too.
-
-**A failed preview revert may or may not carry a failure row — read both.** The
-bridge computes `rolled_back` whenever the run was a preview **or** something
-failed, so `rolled_back: false` on a preview occurs in two shapes: `results: []`
-beside `go_failed_count: 0` (every rename verified and only the revert failed),
-and a populated `results[]` beside a nonzero counter (a rename failed *and* the
-revert that followed did not complete). The rows are listed under the line in
-both, so do not stop parsing `results[]` because the state is a failed revert.
-
-#### Unmeasured mutations
-
-Every shipped mutation is measurable one of two ways: it populates `results[]`,
-or — like `go rename`, the one op that reports through its own counters — it
-registers a compact summary that counts those counters instead.
-`test_mutation_summary_wiring.py` statically enforces that pairing for every
-`_mutate`-routed op, so a mutation with nothing to count means a bridge older
-or newer than this CLI, or a wiring regression that slipped the sweep.
-
-There is a second way to arrive here, and it does not need a missing
-measurement source: one that arrived UNREADABLE. A count is only read through a
-choke point that refuses a field it cannot use and discloses it by name, rather
-than answering `0` — a fabricated zero is indistinguishable from a real one, and
-on a bulk rename a zero is the "nothing changed, don't save" verdict that
-discards the batch. So a counter or a row status in a shape no value reads out
-of leaves the derived counts exactly as unknown as an empty `results[]` does,
-and is reported the same way. That applies to `go rename` too: registering its
-own summary makes it count from a different SOURCE, not measured by guarantee.
-
-Either way, the compact summary cannot derive real counts, and says so:
-
-```
-mutation: committed  changed=None  verified=None  noop=None  failed=None  dirty_after=True
-warning: unmeasured -- this op reported no results[] rows; the changed/verified/noop/failed
-counts above are UNKNOWN. dirty_after is reported True as a fail-safe, not confirmed. Do not
-assume nothing changed: read the view back (e.g. `bn target info` or a targeted readback) and
-`bn save` before closing.
-first_error: unmeasured: this op reported no results[] rows, ...
-```
-
-...with the cause named: `this op reported no results[] rows` when there was
-nothing to count, `this op's own counters could not be read` when a counter was
-refused, and a `! malformed <field> field` line naming each field that was.
-
-`dirty_after` is deliberately reported `true` here rather than `null`: `null` is
-falsy under every truthiness check a control loop actually writes (`jq 'if
-.dirty_after then'`, `if summary["dirty_after"]:`, `if (!s.dirty_after)
-close()`), so it would read identically to a confirmed clean no-op and a naive
-consumer would discard real work. Check `measured` (or just read `dirty_after`,
-which fails safe on its own) before trusting a `0`-looking status line as a
-confirmed no-op.
-
-An unmeasured **live** success also changes the exit code: it is **`4`**
-("applied but unverifiable"), so a script that only checks `$?` sees that the
-write could not be confirmed instead of reading it as a clean success. `4` is
-distinct from `3` (a failure — a status in `FAILED_MUTATION_STATUSES`, which
-still wins if both apply) and from `0` (a verified or measured all-`noop` run).
-It is not a new failure mode: the mutation did apply, so read the view back and
-`bn save` before closing. The rule is keyed on `measured: false`, not on the
-kind of call, so an unmeasured `--preview` is `4` as well — there the write was
-reverted, and what could not be confirmed is what *would* have landed.
-
-**A mutation result never spills.** A read that spills is recoverable (re-read the
-artifact); an atomic write whose result is unparseable is not — the agent's model of
-the BNDB silently desyncs from the BNDB. So even with `BN_SPILL_TOKENS` armed and the
-detail payload over it, stdout keeps the parseable status and the detail goes to an
-artifact named in `detail_artifact_path` (plus a stderr note).
-
-**Read that status in the format that produces it.** The default mutation output is
-TEXT (`mutation: committed changed=200 …`), so `json.loads(stdout)` is only
-meaningful under `--format json`/`--verbose`. `--out` is the one mode that REPLACES
-the status with an artifact envelope (`artifact_path`, `bytes`, `sha256`, `tokens` —
-no `changed_count`), so it is not how you keep a parseable result; `--summary` is —
-it forces the compact `kind: mutation_summary` envelope under any format, and it is
-also what a spilled mutation falls back to (#645). A `--verbose`/`--format json`
-detail large enough for the consuming wrapper to truncate is bounded with `--out`.
-
-### Step 3 — read back
+Use `batch apply` for related writes that should verify and revert as one unit. Give it a concrete selector; a CLI `-t` wins over a manifest `"target"`. Do not use `"target": "active"` in a multi-target headless manifest. A quoted heredoc keeps comments literal:
 
 ```bash
-bn proto get <fn>
-bn struct show <name>
-bn types show <name>
-bn decompile <fn>
-bn refresh                                # if BN still shows stale presentation
-```
-
-### Locals — prefer `local_id` over names
-
-```bash
-bn local list <fn>
-bn local rename <fn> <local_id|name> <new_name>
-bn local retype <fn> <local_id|name> <new_type>
-```
-
-`bn local list` text output splits params and locals into compact `name  type` rows. JSON entries carry `name`, `type`, `storage`, `index`, `identifier`, `source_type`, `is_parameter`, and **`local_id`** — a stable handle that survives re-analysis. Reach for `local_id` whenever Binary Ninja might rebuild the variable list.
-
-`bn local list` includes the register/flag locals HLIL actually renders (`rsi_1`, `rdx_3`, loop counters, the success flag), so they can be renamed and retyped like stack vars. Their **auto-generated names drift** across re-analysis — a `proto set` or `local retype` can re-render `rcx` as `result` — while the `local_id` is invariant. So for these especially, capture the `local_id` from `bn local list --format json` and pass **that** (not the on-screen name) to `local rename` / `local retype`; a name you saw earlier may no longer resolve after an intervening re-analysis.
-
-### Comments
-
-```bash
-bn comment set 0x401000 "explain this"            # positional address = alias for --address
-bn comment set --address 0x401000 "explain this"
-bn comment set --function player_update "explain this"
-bn comment delete 0x401000
-bn comment delete --function player_update
-```
-
-`comment set/get/delete` take the address either positionally (`bn comment set 0x401000 "..."`) or via `--address`; `--function` attaches a function-level comment instead. Exactly one of address / `--function` is required. The **comment text is a positional argument** — `bn comment set --address 0x.. "text"`; there is **no `--comment` flag** (the natural `--comment "text"` fails with an argparse error).
-
-### Tags
-
-```bash
-bn tag add 0x401000 --type Important --data "len unchecked" [--preview]
-bn tag add --function player_update --type Bookmarks --data "entry point"
-bn tag remove --id <tag-id>                        # ids come from `bn tag list --format json`
-bn tag remove 0x401000 --type Important
-bn tag type create my_sink --icon <glyph>
-bn tag type remove my_sink
-```
-
-Tags are the "remember this spot" annotation path — a **bookmark is just
-`--type Bookmarks`** — and they run the standard preview→verify loop. A custom
-type must exist (`tag type create`, a mutation) before `tag add` can use it, and
-each call takes exactly one location: an address (positional or `--address`) or
-`--function`, never both. Reads (`bn tag list/get/types`) are in `reading.md`.
-
-### Go names — apply what `.gopclntab` recovered
-
-```bash
-bn go functions --summary                          # read side: what would be renamed
-bn go rename [--preview]                           # apply; no positional args
-```
-
-`bn go rename` is the bulk mutation that writes the names `bn go functions`
-recovered from `.gopclntab` into the database. It renames **auto-named
-`sub_*`/`nullsub_*` functions only** — an already-named function is left alone
-and counted as a `noop` — so it is idempotent and safe to re-run. It takes the
-standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`,
-`--out`) and nothing else.
-
-It is the one mutation whose bridge result reports the work through its **own
-counters** rather than a `results[]` row per rename (that array carries only the
-failure rows), so it registers its own compact summary to count them. The status
-line and exit codes are therefore the same as every other mutation: it reports
-`measured: true` when those six counters read and agree with the failure rows,
-so a clean run whose counters read is exit `0` — and a counter that arrives
-unreadable is disclosed by name and the run is the unmeasured `4`, exactly as an
-empty `results[]` would be on any other op. Its own summary is a different
-measurement SOURCE, not an exemption from measurement. Its two rollback states
-follow the same rule as every other mutation — see "A revert that failed makes
-`changed_count` unknown": a preview that failed and reverted cleanly reports
-`changed_count: 0` (all-or-nothing, so a live run of that state commits
-nothing), and a revert that did not complete reports `changed_count: null` with
-`dirty_after: true`.
-
-### Data variables — bind a recovered type to an address
-
-```bash
-bn types declare 'struct cmd_help_entry { char* desc; char* usage; };'
-bn data retype 0x460000 'cmd_help_entry[257]' [--preview]
-```
-
-`bn data retype <addr> <type>` types a **data variable** through the standard
-mutation loop — `--preview`, live verification by reading back
-`bv.get_data_var_at(addr).type`, and the usual `verified` / `noop` /
-`verification_failed` statuses. Before this, struct-typing a recovered global table
-(a routine RE move) had no first-class path at all: `types declare` defines the
-struct but cannot apply it, `symbol rename --kind data` renames without typing, and
-`struct field set` edits a *type*, not a variable's binding — so the only way
-through was `bn py exec`, i.e. no preview, no readback, no batch atomicity, no audit
-trail.
-
-Declare named types first: an undeclared type name is a clean `invalid_request`
-pointing at `types declare`, and an unmapped address is rejected rather than typed
-into nowhere. The matching batch op is `data_retype` (`address`, `new_type`), which
-composes atomically with the `types_declare` that defines the struct — the natural
-pairing, since the two are almost always applied together.
-
-### Struct field edits
-
-```bash
-bn struct field set Player 0x308 flags uint32_t [--no-overwrite]
-bn struct field rename Player old_name new_name
-bn struct field delete Player <field_name>     # NOTE: takes the field name, not an offset
-```
-
-### Bulk mutations — batch manifest
-
-For large rename/retype/comment runs, use `bn batch apply` with a JSON manifest. Significantly faster than firing individual commands.
-
-**Primary form — pipe the manifest on stdin with a quoted heredoc** (`-` means "read stdin"). The quoted delimiter (`<<'BN_EOF'`) makes the whole payload literal, so comments with quotes, apostrophes, `$`, backticks, or parens need no escaping — and there is no temp file to write or clean up:
-
-```bash
-bn batch apply -t <selector> - <<'BN_EOF'
+bn batch apply -t <selector> --preview - <<'BN_EOF'
 {"ops": [
-  {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
-  {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
-  {"op": "set_comment", "address": "0x401040", "comment": "len isn't checked; attacker-controlled (see $r0)"}
+  {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "parse_record"},
+  {"op": "set_comment", "address": "0x401020", "comment": "length is validated by caller"}
 ]}
 BN_EOF
 ```
 
-Pass the target with `-t <selector>` (the same selector every other command takes). Do **not** put `"target": "active"` in the manifest — `active` does not resolve under multi-target headless (the mode fan-out agents run in). A concrete `"target"` in the manifest is allowed, but a CLI `-t` always wins over it (#366).
+The manifest must be an object with an `ops` array. Validation runs before apply; a missing field or an unknown op refuses the batch. Do not write the same key twice in one batch: each op is verified against the final state, so a later write would invalidate the earlier op's result. Large batches hold the exclusive write lock; split a manifest that exceeds the default 5000-op or 32 MiB request limits.
 
-Add `--preview` before the `-` to diff without committing: `bn batch apply --preview - <<'BN_EOF' ... BN_EOF`.
-
-The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
-
-A manifest over **5000 ops**, or whose serialized request would exceed the bridge's hard 32 MiB wire limit, is refused before anything is sent (`invalid_request`, exit 3, `observed.request_sent: false`). A batch that large holds the write lock for its whole run and reverts as **one** unit, so a single failure discards every sibling. Split it, or raise the op-count ceiling with `BN_BATCH_APPLY_MAX_OPS=<n>` (`0` disables). `BN_BATCH_APPLY_MAX_BYTES=<n>` can set a **lower** byte ceiling; `0` restores the hard limit and cannot make an oversized request valid. The transport measures the actual request after resolving the target and bridge, so manifest indentation does not count against it. File and FIFO manifest input also has an independent 64 MiB source-file cap.
-
-#### Batch op kinds and their required fields
-
-This table is the whole manifest surface. It is asserted against
-`mutation_engine.REQUIRED_FIELDS` / `REQUIRED_ONE_OF` by
-`test_mutating_reference_documents_every_batch_op`, so it cannot drift from the
-code. Field names are **not** mutually consistent across ops (`local_retype` takes
-`variable` where `rename_symbol` takes `identifier`) — read the row, don't guess.
+### Batch op kinds and required fields
 
 | `op` | required fields | one of | interactive equivalent |
 |---|---|---|---|
-| `rename_symbol` | `identifier`, `new_name` | — | `bn rename` / `bn symbol rename` |
+| `rename_symbol` | `identifier`, `new_name` | — | `bn symbol rename` |
 | `set_comment` | `comment` | `function` \| `address` | `bn comment set` |
 | `delete_comment` | — | `function` \| `address` | `bn comment delete` |
 | `set_prototype` | `identifier`, `prototype` | — | `bn proto set` |
@@ -461,43 +108,4 @@ code. Field names are **not** mutually consistent across ops (`local_retype` tak
 | `tag_type_create` | `name`, `icon` | — | `bn tag type create` |
 | `tag_type_remove` | `name` | — | `bn tag type remove` |
 
-Optional fields read by the handlers: `kind` on `rename_symbol`
-(`auto`/`function`/`data`), `overwrite_existing` and `type_name` (an accepted alias
-for `struct_name`) on the `struct_field_*` ops, `source_path` on `types_declare`.
-
-Rules:
-
-- The manifest must be a dict with an `"ops"` key (not a bare list).
-- **Every op is validated before ANY is applied.** A missing required field or a bad
-  field *value* is a clean `invalid_request` naming the op *index* — with a "did you
-  mean" hint — and an unrecognized op kind is `unsupported`; either way exit 3, and a
-  typo in op 13 no longer rolls back 12 good ops.
-- **One write per key.** Every op is verified against the batch's END state, so a
-  manifest that writes the same key twice (two `set_comment`s on one address, a
-  `set_comment` plus a `delete_comment`) can never verify: op 0 would be judged
-  against op 1's value. Such a manifest is rejected up front, naming both indices.
-  Split them across two batches — last-write-wins is not expressible in one.
-- `rolled_back` is **always** present in the result (`false` when committed), so a
-  parser written against a preview or a failure doesn't `KeyError` on the happy path.
-- Supply the target with `-t <selector>` (recommended), or a concrete `"target"` in the manifest; a CLI `-t` wins over the manifest value (#366). Without either it fails with `Unknown target selector: None`. Do not use `"target": "active"` — it doesn't resolve under multi-target headless.
-- All ops are verified — a single failure reverts the entire batch.
-- `--preview` shows diffs without committing.
-- Use a unique heredoc sentinel (`BN_EOF`) so a line in a comment can't accidentally close the payload. Empty or malformed stdin yields a clean error, not a traceback.
-
-### Step 4 — save before close
-
-Annotations live in the `.bndb`. Always save before closing — `bn close` warns when unsaved mutations are about to be discarded (see §2).
-
-## 7. Bundles
-
-Use bundles when you want a reusable artifact instead of pasting long output into context:
-
-```bash
-bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
-```
-
-With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the bundle to stdout.
-
-The bundle's `decompile` field is annotation-redacted by default, exactly as `bn decompile` renders it — the artifact is meant to be shareable, so inherited comment bodies are not inlined into the code it carries. Pass `--include-annotations` to keep them, mirroring the same flag on `bn decompile`.
-
-The `comments` map is a separate, labelled section and is **not** gated: it is the bundle's documented place for annotations. If you are handing the artifact to someone who should not see analyst notes, drop that key (`jq 'del(.comments)'`) — the rendered code carries none.
+Optional fields include `kind` for symbol rename, `overwrite_existing` or `type_name` for struct fields, and `source_path` for declarations. The table names the operation's real field names; they differ across commands. The same preview, verification, readback, and save rules apply to the batch.
