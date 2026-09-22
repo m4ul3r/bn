@@ -1161,6 +1161,80 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_types_declare_row_names_the_implicit_include_root_825():
+    # #825 item 3: a `--file` declaration parses with the header's PARENT
+    # DIRECTORY as an implicit include root. It was derivable from
+    # requested.source_path but never stated, so the interesting case was
+    # invisible: a declare that only succeeded because a sibling header was
+    # found, or that picked a shadowing sibling over the expected one.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "include_root": "/proj/include",
+    })
+    assert "packet_header" in out
+    assert "/proj/include" in out
+
+
+def test_types_declare_row_for_an_inline_declare_names_no_root_825():
+    # Must-not-fire twin: an inline declaration has no file and therefore no
+    # implicit root, so the ordinary row must be byte-identical to before.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+    })
+    assert out == "types_declare packet_header"
+
+
+def test_render_cfg_undetermined_block_is_named_not_a_silent_dead_end_682():
+    # #682 item 3, live half: a block whose successors BN could not resolve
+    # has NO edges, so without a line of its own it renders exactly like a
+    # genuine dead end -- a `jmp rax` reading as "returns here".
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({
+        "function": {"name": "dispatch", "address": "0x401000"},
+        "view": "asm",
+        "blocks": [{
+            "start": "0x401000",
+            "insns": [{"a": "0x401000", "t": "jmp rax"}],
+            "edges": [],
+            "undetermined_edges": True,
+        }],
+    })
+    assert "<undetermined>" in out
+
+
+def test_render_cfg_real_dead_end_block_gets_no_undetermined_line_682():
+    # Must-not-fire twin: a `ret` block genuinely has no successors.
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({
+        "function": {"name": "leaf", "address": "0x401000"},
+        "view": "asm",
+        "blocks": [{"start": "0x401000",
+                    "insns": [{"a": "0x401000", "t": "ret"}], "edges": []}],
+    })
+    assert "undetermined" not in out
+
+
+def test_render_data_symbols_empty_page_past_the_end_discloses_the_total():
+    # #682 item 4: a bare "none" reads as "this view has no data symbols".
+    # The case that actually produces it -- an --offset past the end -- then
+    # hides the real total and gives the reader nothing to re-page from.
+    from bn.formatters import _render_data_symbols_text
+    out = _render_data_symbols_text({"items": [], "total": 1284, "offset": 2000})
+    assert "1284" in out and "2000" in out
+    assert "past the end" in out
+
+
+def test_render_data_symbols_genuinely_empty_view_stays_bare_none():
+    # Must-not-fire twin: a view with NO data symbols is not an over-shot page,
+    # so it must not grow a spurious "past the end" note.
+    from bn.formatters import _EMPTY_RESULT, _render_data_symbols_text
+    assert _render_data_symbols_text({"items": [], "total": 0, "offset": 0}) == _EMPTY_RESULT
+
+
 def test_types_declare_text_row_discloses_unapplied_prototypes_890():
     # #890 obs 2: the #778 disclosure reached JSON only, so a text-mode reader
     # of a MIXED declare was told `verified` and never told that the function
@@ -1205,6 +1279,21 @@ def test_types_declare_text_row_omits_an_empty_unapplied_bucket_890():
     assert "functions: parse_frame" in out
     assert "variables" not in out
 
+
+def test_types_declare_text_row_keeps_include_root_and_unapplied_note():
+    """A file declaration can both resolve a sibling and leave a prototype unapplied."""
+    from bn.formatters import _operation_row_text
+
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "include_root": "/proj/include",
+        "unapplied_prototypes": {"functions": ["parse_frame"], "variables": []},
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "packet_header" in out
+    assert "include root: /proj/include" in out
+    assert "unapplied -- functions: parse_frame" in out
 
 def test_the_disclosure_reaches_an_early_return_path():
     # The whole point of declaring the coerced keys per renderer instead of
@@ -1893,6 +1982,21 @@ _PROBE_EXCLUSIONS = {
         "takes its page key and its item renderer as REQUIRED parameters, so the "
         "field it reads is an argument rather than a property of the module, and "
         "every caller reaches it through a renderer that is itself probed"),
+    "_stated_count": (
+        "takes-more-than-a-payload",
+        "takes the payload AND the key as required parameters, so the field it "
+        "reads is an argument rather than a property of the module. It returns "
+        "the count as a STRING for a caller's own headline, or `?` when the key "
+        "was present in a shape no count reads out of -- the fabricated-zero "
+        "case is STATED by the return value, so a caller cannot splice a "
+        "plausible number it never read"),
+    "_text_value": (
+        "takes-more-than-a-payload",
+        "payload AND key are both required, same as its `_field_list` / "
+        "`_field_dict` siblings. It is the accessor the #619 invariant tells "
+        "renderers to use INSTEAD of an inline shape test, so excluding it is "
+        "not a hole: the guard that matters fires on the renderer calling it, "
+        "which is itself probed"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
@@ -3960,9 +4064,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # are the headline's numbers; the two row reads are nested, which is why
     # they are named in the skipped set below rather than silently dropped.
     # #795 adds eleven further CLI count reads to this combined population.
-    assert len(sites) == 53, (
+    # #889 adds the data-symbol total read; its offset read was already covered.
+    assert len(sites) == 54, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 53. A "
+        "count helper, not 54. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4553,8 +4658,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # Combined #873 and #879 renderer population; remeasured below.
-    assert swept == 5264, f"the raise sweep ran {swept} renders, not 5264"
+    # Combined #873, #879 and #889 renderer population; remeasured below.
+    assert swept == 5280, f"the raise sweep ran {swept} renders, not 5280"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4709,8 +4814,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # Combined #873 and #879 renderer population; remeasured below.
-    assert checked == 1530, f"the mirror ran {checked} renders, not 1530"
+    # Combined #873, #879 and #889 renderer population; remeasured below.
+    assert checked == 1534, f"the mirror ran {checked} renders, not 1534"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7434,7 +7539,8 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
+    # #825's include_root and #890's unapplied_prototypes both join the row.
+    assert len(keys) == 12, f"the op row reads {sorted(keys)}, not 12 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7461,12 +7567,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # #877/#890 adds the unapplied_prototypes field to the op row: 11 keys,
-    # 2178 rendered and 1298 checked on this merged tree.
-    assert (rendered, checked) == (2178, 1298), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
-        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 880 "
+    # Measured with both keys: 2376 renders, 1408 examined after the readable
+    # container carve-out. The two sizes are separate coverage claims.
+    assert (rendered, checked) == (2376, 1408), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2376, and "
+        f"CHECKED {checked} of them, not 1408. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips 968 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a

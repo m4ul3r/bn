@@ -97,6 +97,44 @@ def _remove_created_function(ctx, bv, addr: int) -> bool:
     return bv.get_function_at(addr) is None
 
 
+def _containing_function_rows(bv, addr: int) -> list[dict[str, str]]:
+    """Functions that already CONTAIN *addr*, excluding one starting there.
+
+    Read before a create, because afterwards the address is itself a
+    function start and `get_functions_containing` reports the new one. A
+    view that cannot answer discloses nothing rather than guessing (#675
+    item 14).
+    """
+    try:
+        return [
+            {"name": str(fn.name), "address": hex(int(fn.start))}
+            for fn in (bv.get_functions_containing(addr) or [])
+            if int(getattr(fn, "start", addr)) != addr
+        ]
+    except Exception:  # noqa: BLE001 - no evidence is not a claim
+        return []
+
+
+def _with_overlap_note(row: dict, overlapped: list[dict[str, str]]) -> dict:
+    """Add the overlap disclosure to a create row, if there is one.
+
+    ONE builder for both create paths, so the two cannot state the same
+    fact differently -- the same reason the duplicate-start note is shared
+    across its three surfaces.
+    """
+    if not overlapped:
+        return row
+    listed = ", ".join(f"{o['name']} @ {o['address']}" for o in overlapped)
+    row = dict(row)
+    row["overlaps"] = overlapped
+    row["note"] = (
+        f"this address is inside {listed}, so the view now has two "
+        f"overlapping functions; that is legitimate when BN over-extended "
+        f"the neighbour, and a mistake if the address was wrong"
+    )
+    return row
+
+
 def _function_create(ctx, selector: str | None, address, preview: bool, *, exclusive=None):
     """Create a function at *address*, verify it, and revert if asked or failed.
 
@@ -128,6 +166,18 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
         addr = _parse_address(address)
         requested = {"op": "function_create", "address": hex(addr)}
 
+        # #675 item 14: capture the CONTAINING functions before the create --
+        # afterwards this address IS a function start and the answer changes.
+        # A create at a mid-function address reported `verified` and said
+        # nothing, leaving two overlapping functions with no trace in the
+        # result. Disclosed, not refused: creating a function BN missed
+        # inside a neighbour it over-extended is ordinary RE work.
+        #
+        # BOTH create paths need this. `bn function create` runs here;
+        # `batch apply` runs `mutation_engine._op_function_create`. Patching
+        # only the one I found first left the command under test unchanged,
+        # which the live run caught.
+        overlapped = _containing_function_rows(bv, addr)
         existing = bv.get_function_at(addr)
         if existing is not None:
             return {
@@ -293,13 +343,13 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
                 "committed": committed,
                 "message": message,
                 "results": [
-                    {
+                    _with_overlap_note({
                         "op": "function_create",
                         "status": op_status,
                         "address": hex(addr),
                         "function": function_name,
                         "requested": requested,
-                    }
+                    }, overlapped)
                 ],
                 "affected_functions": [
                     {

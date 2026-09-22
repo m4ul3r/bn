@@ -35,6 +35,8 @@ Per-op statuses:
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
 - `invalid_request` — the operation was refused: a bad field *value*, a missing required field, an ambiguous operation target, or conflicting options. Local semantic preflights (before sending), the bridge's pre-apply checks, and apply-time refusals all exit 3 on mutation commands. Anything already applied in the mutation/batch is reverted. An unknown op kind is `unsupported` and likewise exit 3. Only these mutation boundaries classify failure statuses as exit 3; read/resolver errors remain exit 2 (#625/#716/#744).
+- `reverted` — the op applied, then a *later* op in the same batch failed and the whole batch was rolled back. **Not a failure** — it is not in the failed-status set and does not count toward `failed=` — but the change is gone; resubmit it once the failing op is fixed. A genuine `noop` op keeps its `noop` status through a rollback (it changed nothing, so there was nothing to undo).
+- `not_attempted` — the op was submitted but never ran, because an earlier op in the batch failed and the batch was rolled back. **Not a failure** either, for the same reason: stamping these would turn one bad op into N and inflate the failure count a control loop reads. A failed batch returns one row **per submitted op**, in submission order, each echoing its own `requested`, so a consumer reconciles the manifest against the results without re-reading what it sent.
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
 
@@ -326,6 +328,8 @@ Pass the target with `-t <selector>` (the same selector every other command take
 Add `--preview` before the `-` to diff without committing: `bn batch apply --preview - <<'BN_EOF' ... BN_EOF`.
 
 The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
+
+A manifest over **5000 ops**, or whose serialized request would exceed the bridge's hard 32 MiB wire limit, is refused before anything is sent (`invalid_request`, exit 3, `observed.request_sent: false`). A batch that large holds the write lock for its whole run and reverts as **one** unit, so a single failure discards every sibling. Split it, or raise the op-count ceiling with `BN_BATCH_APPLY_MAX_OPS=<n>` (`0` disables). `BN_BATCH_APPLY_MAX_BYTES=<n>` can set a **lower** byte ceiling; `0` restores the hard limit and cannot make an oversized request valid. The transport measures the actual request after resolving the target and bridge, so manifest indentation does not count against it. File and FIFO manifest input also has an independent 64 MiB source-file cap.
 
 #### Batch op kinds and their required fields
 

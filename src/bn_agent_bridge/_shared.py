@@ -9,11 +9,23 @@ import cycle). This module imports ONLY stdlib + binaryninja -- never bridge.
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import re
 import traceback
 from pathlib import Path
 from typing import Any
+
+# The directories whose code counts as "ours" for error attribution (#825
+# item 1). Both packages, because `bn/` supplies symlinked modules (paths,
+# version, proc_identity, socket_evidence, target_hint) that execute under
+# the bridge and raise the same deliberate RuntimeErrors. Resolved once, and
+# realpath'd so the symlinked modules match under either name.
+_PROJECT_ROOTS: tuple[str, ...] = tuple(
+    os.path.realpath(str(_root))
+    for _root in {Path(__file__).resolve().parent,
+                  Path(__file__).resolve().parent.parent / "bn"}
+)
 
 try:
     import binaryninja as bn
@@ -231,6 +243,38 @@ def _format_ambiguous_symbol_error(identifier: Any, matches: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _raised_inside_this_project(exc: BaseException) -> bool:
+    """Was *exc* raised by OUR code, or did it escape from a library?
+
+    `RuntimeError` and `ValueError` are on the user-facing whitelist because
+    the bridge raises them DELIBERATELY to report bad input and missing
+    targets -- 77 and 16 sites respectively, so the alternative (a dedicated
+    `BridgeUserError`) is a 93-callsite migration. The cost of the whitelist
+    is that a LIBRARY `RuntimeError` inherits the same trust: a
+    ``dictionary changed size during iteration`` escaping `json.dumps` was
+    relayed verbatim, reading exactly like a message the bridge composed for
+    the user (#825 item 1).
+
+    The discriminator is where the raise happened, which the traceback
+    already records: walk to the DEEPEST frame -- the one that raised -- and
+    ask whether its file is inside this project. Deepest, not outermost,
+    because every such exception passes through bridge frames on the way out.
+    """
+    tb = exc.__traceback__
+    if tb is None:
+        # No traceback means the exception was constructed but never raised
+        # (a test building one directly, or a re-serialized payload). There
+        # is nothing to attribute, so keep the historical reading.
+        return True
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    try:
+        origin = os.path.realpath(tb.tb_frame.f_code.co_filename)
+    except Exception:  # noqa: BLE001 - an unattributable frame is not a verdict
+        return True
+    return any(origin.startswith(root) for root in _PROJECT_ROOTS)
+
+
 def _serialize_error(exc: BaseException) -> str:
     """Render an exception for the user-facing error field.
 
@@ -240,11 +284,19 @@ def _serialize_error(exc: BaseException) -> str:
     verbatim. Anything outside that whitelist is treated as an unexpected bug and
     prefixed with ``internal error:`` plus its class name so callers can tell the
     difference without us leaking raw Python class names into normal errors.
+
+    #825 item 1: membership of the whitelist is necessary but NOT sufficient.
+    A `RuntimeError` that escaped a library is not an actionable message the
+    bridge composed, so it is triaged like any other unexpected bug. See
+    `_raised_inside_this_project`. `OperationFailure` is exempt: the bridge
+    is the only thing that constructs one, so its origin is never in doubt.
     """
 
     # OperationFailure subclasses RuntimeError, so it is already covered by the
     # tuple below; it is listed explicitly to document the intent.
-    if isinstance(exc, USER_FACING_ERRORS):
+    if isinstance(exc, OperationFailure):
+        return str(exc)
+    if isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc):
         return str(exc)
     return f"internal error: {type(exc).__name__}: {exc}"
 

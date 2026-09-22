@@ -10,7 +10,9 @@ import json
 import os
 import socket
 import threading
+import types
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1289,3 +1291,359 @@ def test_close_binary_forgets_dirty_view_on_close(monkeypatch):
 
     assert instance.targets.is_dirty(bv) is False
     module._headless_views.clear()
+
+
+# --- #869: decide by file identity, not by path spelling --------------------
+#
+# Driven against the REAL filesystem rather than a mock, because the whole
+# defect is that `==` and `.resolve()` answer differently from the kernel:
+# a mock that returns whatever the test wants cannot show that.
+
+
+def test_own_database_gate_recognises_a_hard_link_to_its_own_sibling_869(
+        monkeypatch, tmp_path):
+    # #869 item 2: the gate resolved symlinks but NOT hard links, so an
+    # explicit `bn save` through a hard link of the target's own sibling
+    # recorded no `database_path` -- and the next `session restart` reopened
+    # the raw bytes even though that inode held the saved analysis. That is
+    # the silent-data-loss shape #753 exists to stop, reached by a spelling.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "target"
+    binary.write_bytes(b"\x7fELF")
+    sibling = tmp_path / "target.bndb"
+    sibling.write_bytes(b"BNDB")
+    hard = tmp_path / "hardlink.bndb"
+    os.link(sibling, hard)
+    assert os.path.samefile(sibling, hard)          # premise, from the kernel
+
+    assert module._is_own_database_destination(str(sibling), str(binary)) is True
+    assert module._is_own_database_destination(str(hard), str(binary)) is True
+
+
+def test_own_database_gate_still_refuses_a_genuine_export_869(
+        monkeypatch, tmp_path):
+    # Must-not-fire twin, and the reason the gate exists at all: recording an
+    # export would move the target's restart identity onto a copy. A distinct
+    # file with its own inode is NOT the target's database, however similarly
+    # it is named.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "target"
+    binary.write_bytes(b"\x7fELF")
+    (tmp_path / "target.bndb").write_bytes(b"BNDB")
+    export = tmp_path / "target.bndb.copy"
+    export.write_bytes(b"BNDB")
+    assert not os.path.samefile(tmp_path / "target.bndb", export)
+
+    assert module._is_own_database_destination(str(export), str(binary)) is False
+
+
+def test_own_database_gate_answers_for_a_destination_that_does_not_exist_869(
+        monkeypatch, tmp_path):
+    # The normal save case: the destination has no inode yet, so `samefile`
+    # RAISES rather than answering False. The spelling fast path has to carry
+    # it -- this is why the string compare is kept as something that can only
+    # ADD an answer, never remove one.
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "fresh"
+    binary.write_bytes(b"\x7fELF")
+    assert not (tmp_path / "fresh.bndb").exists()
+
+    assert module._is_own_database_destination(
+        str(tmp_path / "fresh.bndb"), str(binary)) is True
+
+
+def test_same_file_degrades_to_false_without_identity_evidence_869(monkeypatch):
+    # Degrade-safely, the rule `socket_evidence` applies: two paths that
+    # neither match as strings nor exist to be stat'd yield no evidence of
+    # sameness, so the answer is False rather than a guess.
+    module = _load_bridge(monkeypatch)
+    assert module._same_file("/nope/a.bndb", "/nope/b.bndb") is False
+    assert module._same_file("", "/nope/b.bndb") is False
+    assert module._same_file(None, None) is False
+
+
+# --- #867: refuse a save whose destination is another OPEN target ----------
+
+
+def _collision_bridge(monkeypatch, tmp_path, collision):
+    """A bridge whose single view saves for real, with the collision probe
+    answering *collision*. Uses the suite's own `_SaveBV` and `targets.resolve`
+    seam, i.e. the wiring every other save test uses."""
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    bv = _SaveBV(str(tmp_path / "target"), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: collision)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+    monkeypatch.setattr(instance.targets, "note_database", lambda _bv, _p: None)
+    return module, instance, bv
+
+
+def test_save_refuses_a_destination_another_target_has_open_867(monkeypatch, tmp_path):
+    # #867: the save used to LAND and then disclose. Both rows then name one
+    # database, and `session restart` returns one target for both -- measured
+    # 2 -> 1 at rc 0. Disclosure after an irreversible write is the weaker
+    # half; refusing costs nothing the caller cannot recover.
+    other = {"target_id": "t:2", "selector": "other.bndb",
+             "filename": str(tmp_path / "other")}
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, other)
+    dest = tmp_path / "target.bndb"
+
+    with pytest.raises(module.OperationFailure) as excinfo:
+        instance._save_database(None, str(dest))
+
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    # It must name BOTH ways out, or the refusal is a wall.
+    assert "--path" in excinfo.value.message
+    assert "close the other target" in excinfo.value.message
+    # And nothing may have been written -- that is the whole point of moving
+    # the check ahead of the write.
+    assert not dest.exists()
+    assert bv.created_with is None
+
+
+def test_save_without_a_collision_still_writes_867(monkeypatch, tmp_path):
+    # Must-not-fire twin: the ordinary save is the common path and must be
+    # untouched by the new refusal.
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    assert result["saved"] is True
+    assert dest.exists()
+
+
+def test_save_proceeds_when_the_collision_probe_cannot_answer_867(
+        monkeypatch, tmp_path):
+    # Degrade-safely, the same direction the post-write disclosure already
+    # takes: a probe that RAISES has no evidence of a collision, and must not
+    # block a legitimate save. Only a positive match refuses.
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+
+    def _boom(path, *, exclude):
+        raise RuntimeError("target map unavailable")
+
+    monkeypatch.setattr(instance.targets, "open_target_for_path", _boom)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    assert result["saved"] is True
+    assert dest.exists()
+
+
+# --- #867/#857: the post-write disclosure is the BACKSTOP, and it must fire --
+#
+# Round 1 blocker: when the two #857 disclosure tests were rewritten into #867
+# refusal tests, the disclosure lost ALL positive coverage -- stubbing
+# `_disclose_open_target_collision` to a bare `return` left the save-related
+# files green (579 in this file alone), because the only surviving reference
+# was the must-not-fire negative. The two destinations the PRE-WRITE refusal
+# provably cannot cover are the ones asserted below.
+
+
+def test_the_read_only_cache_fallback_destination_is_disclosed_867(
+        monkeypatch, tmp_path):
+    """The refusal tests the REQUESTED path; the fallback writes somewhere else.
+
+    A binary on a read-only mount cannot grow an adjacent `.bndb`, so the save
+    lands in the writable cache (#214/#318) -- a destination chosen only AFTER
+    the primary write failed, and therefore never seen by the pre-write check.
+    If that cache copy is itself open as a target (an agent that loaded it to
+    resume earlier work), the two targets are one database from this moment and
+    `session restart` returns one row for both.
+
+    Extending the refusal here was considered and rejected in
+    `_disclose_open_target_collision`'s own docstring: the fallback exists so
+    annotations are NOT lost on a read-only mount. So disclosure is the only
+    protection this destination has, and this is the test that says so.
+
+    Drives the REAL `open_target_for_path` through `_collect_open_views_state`
+    rather than a lambda, so the probe's own identity matching is exercised
+    against a genuine second view instead of being assumed.
+    """
+    from _bridge_fakes import _SaveBV
+    raw = tmp_path / "ro" / "svc"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    cache_dest = str(module._cache_bndb_path(str(raw)))
+
+    class _ROSaveBV(_SaveBV):
+        def create_database(self, out: str):
+            self.created_with = out
+            if out == str(raw) + ".bndb":
+                return False          # BN's "wrote nothing" on the RO mount
+            Path(out).write_text("bndb")
+            return True
+
+    bv = _ROSaveBV(str(raw), result=True, write=True)
+    other = _SaveBV(cache_dest, result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(
+        module, "_collect_open_views_state", lambda strict=False: ([bv, other], True))
+    instance.targets.refresh()
+
+    result = instance._save_database(None, None)
+
+    # The premise: the primary really did fail and the cache really was used,
+    # so the destination under test is one the pre-write check never saw.
+    assert result["fallback"] is True, result
+    assert result["path"] == cache_dest
+    assert not (tmp_path / "ro" / "svc.bndb").exists()
+
+    collision = result.get("collides_with_open_target")
+    assert collision, (
+        "the cache fallback landed on a file another target has open and said "
+        "nothing -- the one destination the #867 refusal cannot cover")
+    assert collision["filename"] == cache_dest
+    assert "also open as target" in result["note"]
+    assert "session restart" in result["note"]
+
+
+def test_a_collision_opened_after_the_pre_write_check_is_disclosed_867(
+        monkeypatch, tmp_path):
+    """The other uncovered destination: the check-to-write WINDOW.
+
+    `_save_database` probes, then writes. A target opened on that file in
+    between passes the check and still collapses the two targets, because the
+    collapse is a property of the file after the write, not of the check. The
+    refusal cannot close this -- it is a race, not a missing test -- so the
+    post-write disclosure is what makes it visible, and nothing asserted that.
+
+    The probe answers None once (the pre-write check) and then names the other
+    target, which is exactly what a concurrent `bn load` looks like from here.
+    """
+    module, instance, bv = _collision_bridge(monkeypatch, tmp_path, None)
+    other = {"target_id": "t:2", "selector": "late.bndb",
+             "filename": str(tmp_path / "target.bndb")}
+    answers = [None, other]
+
+    def _probe(path, *, exclude):
+        return answers.pop(0) if answers else other
+
+    monkeypatch.setattr(instance.targets, "open_target_for_path", _probe)
+    dest = tmp_path / "target.bndb"
+
+    result = instance._save_database(None, str(dest))
+
+    # The premise: the pre-write check passed (nothing was refused) and the
+    # write really landed, so only a post-write disclosure can carry the fact.
+    assert result["saved"] is True
+    assert dest.exists()
+    assert answers == [], "both probe points must have been reached"
+
+    assert result.get("collides_with_open_target") == other
+    assert "also open as target" in result["note"]
+    assert "'late.bndb'" in result["note"]
+
+
+def test_the_degraded_rehomed_save_discloses_its_collision_too_867(
+        monkeypatch, tmp_path):
+    """The THIRD disclosure callsite, and round 2 left it uncovered.
+
+    A save whose `create_database` re-homes the live view and whose restore
+    then fails returns a degraded `rehomed` success. Its own comment says the
+    disclosure must be unconditional there, because that branch wrote a real
+    file and can land on another open target exactly like the clean one --
+    and deleting the call left both bridge test files fully green (322
+    passed), which is the same "declared load-bearing, covered by nothing"
+    shape as the original blocker.
+
+    The note assertion is the part that matters: the degraded branch already
+    SET a note, so the disclosure has to append to it. A disclosure that
+    overwrote it would tell the caller their database collides while hiding
+    that their live target is still homed at the copy.
+    """
+    from _bridge_fakes import _RestoreFailSaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "svc"
+    binary.write_bytes(b"\x7fELF")
+    dest = tmp_path / "export.bndb"
+    other = {"target_id": "t:3", "selector": "export.bndb",
+             "filename": str(dest)}
+    answers = [None, other]
+
+    bv = _RestoreFailSaveBV(str(binary))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: answers.pop(0) if answers else other)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+
+    result = instance._save_database(None, str(dest))
+
+    # The premise: this is really the DEGRADED branch, not the clean one.
+    assert result["rehomed"] is True
+    assert result["saved"] is True
+    assert answers == [], "both probe points must have been reached"
+
+    assert result.get("collides_with_open_target") == other
+    assert "also open as target" in result["note"]
+    assert "could not restore" in result["note"], (
+        "the disclosure must APPEND to the degradation note, not replace it")
+
+
+def test_save_through_a_hard_link_records_the_database_despite_inode_replacement_869(
+        monkeypatch, tmp_path):
+    """#889c finding 1: the identity fix was evaluated at the wrong MOMENT.
+
+    `create_database` REPLACES the destination's inode, so a gate that runs
+    after the write compares a brand-new file against the sibling and answers
+    False -- `database_path` goes unrecorded and the next `session restart`
+    reopens the STALE database. That is the #753 silent-drop shape surviving
+    the #869 identity fix, because the identity was gone by the time it was
+    asked about.
+
+    The double REPLACES the inode the way BN does, rather than truncating in
+    place: a `write_bytes` double preserves the link and would make this test
+    pass against the broken code. The producer's behaviour is the test.
+    """
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+
+    binary = tmp_path / "svc"
+    binary.write_bytes(b"\x7fELF")
+    sibling = tmp_path / "svc.bndb"
+    sibling.write_bytes(b"OLD")
+    hard = tmp_path / "hard.bndb"
+    os.link(sibling, hard)
+    assert os.path.samefile(sibling, hard)
+    before = os.stat(hard).st_ino
+
+    from pathlib import Path as _P
+
+    class _InodeReplacingBV(_SaveBV):
+        def create_database(self, out: str):
+            self.created_with = out
+            # unlink-then-create: a NEW inode, exactly what was measured live
+            _P(out).unlink(missing_ok=True)
+            _P(out).write_bytes(b"NEW")
+            return True
+
+    bv = _InodeReplacingBV(str(binary), result=True, write=True)
+    noted = {}
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "open_target_for_path",
+                        lambda path, *, exclude: None)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda _bv: None)
+    monkeypatch.setattr(instance.targets, "note_database",
+                        lambda _bv, path: noted.__setitem__("path", path))
+
+    result = instance._save_database(None, str(hard))
+
+    assert result["saved"] is True
+    # The premise of the finding: the write really did replace the inode, so a
+    # post-write identity check could not have recognised this destination.
+    assert os.stat(hard).st_ino != before
+    assert not os.path.samefile(hard, sibling)
+    # And the database is recorded anyway, because the decision was taken
+    # while the identity still existed.
+    assert noted.get("path") == str(hard)
