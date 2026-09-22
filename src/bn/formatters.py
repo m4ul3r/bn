@@ -1627,6 +1627,60 @@ def _render_instance_gc_text(value: Any) -> str:
     )
 
 
+@_discloses
+def _render_spill_gc_text(value: Any) -> str:
+    """Render the `spill gc` reclamation summary (#823).
+
+    Every count here is STATED rather than coerced: "reclaimed 0 day(s)" from
+    an unreadable counter is byte-identical to a real zero, and it is the
+    reading a caller acts on -- `_stated_count` prints `?` instead (#619).
+
+    The ACTION is the other thing that must not be inferred. A dry run and a
+    real sweep carry the same candidate rows, so an unreadable `dry_run` flag
+    prints `?` through the flag choke point rather than falling back to the
+    destructive-looking half (`has_more: "false"` is the same shape, one
+    command over).
+    """
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    candidates = _stated_count(value, "candidate_count")
+    candidate_bytes = _stated_count(value, "candidate_bytes")
+    removed = _stated_count(value, "removed_count")
+    reclaimed = _stated_count(value, "reclaimed_bytes")
+    kept = _stated_count(value, "kept_count")
+    dry_run = _flag_field(value, "dry_run")
+    if dry_run is True:
+        head = (f"spill gc: dry run, {candidates} day(s) would be reclaimed "
+                f"({candidate_bytes} bytes), {kept} kept")
+    elif dry_run is False:
+        # Candidates vs removed, because the two differ exactly when a removal
+        # failed -- which is reported per row below, not folded into a count.
+        head = (f"spill gc: reclaimed {removed} of {candidates} candidate day(s) "
+                f"({reclaimed} bytes), {kept} kept")
+    else:
+        head = (f"spill gc: ? dry run unknown -- {candidates} candidate day(s) "
+                f"({candidate_bytes} bytes), {kept} kept")
+    lines = [head]
+    for row in _row_list(value, "candidates"):
+        # `_stated_count` for the row counters too: they are PRINTED, so an
+        # unreadable one must not appear as a real 0 beside the day it belongs
+        # to (`0 bytes` on a day that holds a decompile is the fabricated-zero
+        # harm with a footnote, exactly as the headline would be).
+        files = _stated_count(row, "files")
+        lines.append(f"  {_escape_control_chars(row.get('day', '?'))}  "
+                     f"{_stated_count(row, 'bytes')} bytes  "
+                     f"{files} file{'' if files == '1' else 's'}")
+    for row in _row_list(value, "skipped"):
+        reason = _text_value(row, "reason") or "?"
+        lines.append("  left alone: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({reason})")
+    for row in _row_list(value, "errors"):
+        detail = _text_value(row, "error") or "?"
+        lines.append("  failed: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({detail})")
+    return "\n".join(lines)
+
+
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
     """Render a BARE list of name/address rows (imports, function pages). With
     ``demangle``, show the demangled ``display_name`` instead of the raw name so

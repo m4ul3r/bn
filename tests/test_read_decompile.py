@@ -1684,6 +1684,10 @@ def test_preload_binary_marks_quick_views_for_honesty(monkeypatch, tmp_path):
     instance = bridge.BinaryNinjaBridge()
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
     info = instance._target_info("active")
     assert info["analyzed"] is False and info["analysis_state"] == "quick"
@@ -2487,6 +2491,10 @@ def test_target_info_reports_quick_analysis_state(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     bridge._quick_loaded_views.add(bv)
@@ -2508,6 +2516,10 @@ def test_target_info_reports_unanalyzed_state_for_raw_bndb(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     bridge._unanalyzed_views.add(bv)
