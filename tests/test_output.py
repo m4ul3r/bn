@@ -697,3 +697,320 @@ def test_an_armed_threshold_above_the_payload_still_draws_the_note(tmp_path, mon
     res = write_output_result(payload, fmt="json", out_path=None, stem="functions")
     assert res.spilled is False
     assert res.near_spill is True and res.truncation_risk is False
+
+
+# --- #823: `bn spill gc` (and the hardening it shares with the write path) ---
+
+
+def _tree_bytes(path: Path) -> int:
+    """Independent byte measure of a directory tree, so the report's own number
+    is never the thing that checks itself."""
+    return sum(entry.stat().st_size for entry in path.rglob("*") if entry.is_file())
+
+
+def _no_rmtree(monkeypatch, output, *, error: OSError | None = None) -> list[str]:
+    """Replace the removal primitive output.py reaches, recording every path.
+
+    A local stand-in rather than a patch of the shared ``shutil`` module: the
+    assertion under test is which paths are HANDED to the remover, and with a
+    stand-in nothing else in the session can be deleted by a bug in the code
+    being tested. With *error*, every call raises it -- the shape a removal that
+    lost a race (or hit a busy mount) presents.
+    """
+    calls: list[str] = []
+
+    class _Rmtree:
+        @staticmethod
+        def rmtree(path, *args, **kwargs):
+            calls.append(str(path))
+            if error is not None:
+                raise error
+
+    monkeypatch.setattr(output, "shutil", _Rmtree)
+    return calls
+
+
+def test_gc_never_hands_a_symlinked_day_to_rmtree_823(tmp_path, monkeypatch):
+    """The pre-#823 loop tested ``entry.is_dir()``, which FOLLOWS a symlink, so a
+    symlink named as an old day was passed to ``shutil.rmtree`` and survived
+    only because rmtree refuses symlinks and the ``OSError`` was swallowed -- a
+    refusal nobody asked for and nobody could see.
+
+    The spy is the assertion: "the target survived" passes on the old code too,
+    because rmtree is what refused it. What must not happen is the call.
+    """
+    from datetime import date
+
+    import bn.output as output
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("someone else's data")
+    link = tmp_path / "20260101"                      # ancient, and a symlink
+    link.symlink_to(outside, target_is_directory=True)
+    calls = _no_rmtree(monkeypatch, output)
+
+    # The write path's sweep first: it is the one that used to hand the symlink
+    # over, and the stand-in does not raise, so a call is visible as a removal.
+    assert output._prune_old_spill_days(tmp_path, date(2026, 9, 15)) == []
+    assert calls == []
+
+    report = output.gc_spills(root=tmp_path, today=date(2026, 9, 15), dry_run=False)
+
+    assert calls == []
+    assert link.is_symlink() and (outside / "keep.txt").read_text() == "someone else's data"
+    assert report["removed_count"] == 0 and report["candidate_count"] == 0
+    assert report["skipped"] == [{"path": str(link), "reason": "symlink"}]
+
+
+def test_gc_leaves_a_plain_file_named_as_a_day_823(tmp_path):
+    """A plain FILE called ``20260101`` used to disappear through
+    ``entry.is_dir()`` without a trace, so the gc could not tell "nothing to do"
+    from "something with a day's name is here and is not a day directory". It is
+    now a disclosed refusal, and the file is untouched."""
+    from datetime import date
+
+    import bn.output as output
+
+    loose = tmp_path / "20260101"
+    loose.write_text("someone else's file")
+
+    report = output.gc_spills(root=tmp_path, today=date(2026, 9, 15))
+
+    assert report["skipped"] == [{"path": str(loose), "reason": "not a directory"}]
+    assert report["candidate_count"] == 0 and report["removed_count"] == 0
+    assert report["kept_count"] == 0 and report["total_bytes"] == 0
+    assert loose.read_text() == "someone else's file"
+
+
+def test_gc_removes_the_stale_day_and_reports_reclaimed_bytes_823(tmp_path, monkeypatch):
+    """The other half of the hardening: the real stale day directory still goes,
+    and the summary states what it freed instead of a bare count -- candidates
+    vs removed, bytes reclaimed, and what was kept."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    monkeypatch.delenv("BN_SPILL_RETENTION_DAYS", raising=False)
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=30))
+    fresh = _make_day(tmp_path, today - timedelta(days=1))
+
+    report = output.gc_spills(root=tmp_path, today=today)
+
+    assert not stale.exists() and fresh.exists()
+    assert report["kind"] == "spill_gc" and report["dry_run"] is False
+    assert report["root"] == str(tmp_path) and report["older_than_days"] == 14
+    assert report["removed_count"] == 1 and report["candidate_count"] == 1
+    assert report["reclaimed_bytes"] == _tree_bytes(fresh)
+    assert report["candidate_bytes"] == report["reclaimed_bytes"]
+    assert [row["day"] for row in report["removed"]] == [stale.name]
+    assert report["removed"][0]["files"] == 1
+    assert report["kept_count"] == 1 and report["kept_bytes"] == _tree_bytes(fresh)
+    # `total_bytes` is the eligible days as INSPECTED, so it is the two numbers
+    # that partition them: what was reclaimed plus what stayed.
+    assert report["total_bytes"] == report["candidate_bytes"] + report["kept_bytes"]
+
+
+def test_gc_dry_run_reports_candidates_without_removing_823(tmp_path):
+    """``--dry-run`` is the inspect half of the request: the whole report --
+    which days, how many bytes, what stays -- with nothing removed and
+    ``reclaimed_bytes`` left at 0, because nothing was reclaimed."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=30))
+    fresh = _make_day(tmp_path, today - timedelta(days=1))
+
+    report = output.gc_spills(root=tmp_path, today=today, dry_run=True)
+
+    assert report["dry_run"] is True
+    assert stale.exists() and fresh.exists()
+    assert report["candidate_count"] == 1 and report["removed_count"] == 0
+    assert report["removed"] == [] and report["reclaimed_bytes"] == 0
+    assert report["candidate_bytes"] == _tree_bytes(stale)
+    assert report["candidates"][0]["path"] == str(stale)
+    assert report["kept_count"] == 1 and report["kept_bytes"] == _tree_bytes(fresh)
+
+
+def test_gc_max_bytes_evicts_the_oldest_days_beyond_the_cap_823(tmp_path, monkeypatch):
+    """``--max-bytes`` is a second bound, not a replacement for the window: on
+    its own the age pass decides, and with a cap the OLDEST surviving days join
+    the candidates until the day directories fit -- which is what lets an
+    engagement with a wide retention window still hold the root to a budget."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=30))
+    (stale / "big.bin").write_bytes(b"x" * 400)
+    older_fresh = _make_day(tmp_path, today - timedelta(days=2))
+    (older_fresh / "big.bin").write_bytes(b"x" * 400)
+    fresh = _make_day(tmp_path, today - timedelta(days=1))
+    (fresh / "big.bin").write_bytes(b"x" * 400)
+    cap = _tree_bytes(fresh) + 1
+
+    without_cap = output.gc_spills(root=tmp_path, today=today, dry_run=True)
+    assert [row["day"] for row in without_cap["candidates"]] == [stale.name]
+
+    report = output.gc_spills(root=tmp_path, today=today, max_bytes=cap, dry_run=True)
+
+    # Oldest first, and the cap is what pulled the still-inside-the-window day in.
+    assert [row["day"] for row in report["candidates"]] == [stale.name, older_fresh.name]
+    assert report["kept_count"] == 1 and report["kept_bytes"] == _tree_bytes(fresh)
+    assert report["candidate_bytes"] == _tree_bytes(stale) + _tree_bytes(older_fresh)
+    assert report["max_bytes"] == cap and stale.exists() and older_fresh.exists()
+
+
+def test_gc_reports_a_failed_removal_instead_of_counting_it_823(tmp_path, monkeypatch):
+    """Candidates and removed are separate numbers because they differ exactly
+    when a removal FAILED: a day that survived a failed removal must not be
+    reported as reclaimed space, nor silently folded into "kept"."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    stale = _make_day(tmp_path, today - timedelta(days=30))
+    _no_rmtree(monkeypatch, output, error=OSError("resource busy"))
+
+    report = output.gc_spills(root=tmp_path, today=today)
+
+    assert stale.exists()
+    assert report["candidate_count"] == 1 and report["removed_count"] == 0
+    assert report["reclaimed_bytes"] == 0 and report["removed"] == []
+    assert report["errors"] == [{"path": str(stale), "error": "resource busy"}]
+    assert report["kept_count"] == 0
+
+
+def test_gc_window_defaults_to_the_env_retention_and_the_flag_overrides_it_823(
+    tmp_path, monkeypatch
+):
+    """The default window has to be the one the write path prunes with, or a bare
+    ``bn spill gc`` and the next spill would disagree about what is stale. The
+    flag overrides it in both directions, including over
+    ``BN_SPILL_RETENTION_DAYS=0`` (keep-everything), which is the documented way
+    to pin a cache -- an explicit request to reclaim must still be able to."""
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    five = _make_day(tmp_path, today - timedelta(days=5))
+    two = _make_day(tmp_path, today - timedelta(days=2))
+
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "3")
+    windowed = output.gc_spills(root=tmp_path, today=today, dry_run=True)
+    assert windowed["older_than_days"] == 3
+    assert [row["day"] for row in windowed["candidates"]] == [five.name]
+
+    monkeypatch.setenv("BN_SPILL_RETENTION_DAYS", "0")
+    pinned = output.gc_spills(root=tmp_path, today=today, dry_run=True)
+    assert pinned["older_than_days"] == 0 and pinned["candidate_count"] == 0
+    widened = output.gc_spills(root=tmp_path, today=today, older_than_days=1, dry_run=True)
+    assert widened["older_than_days"] == 1
+    assert [row["day"] for row in widened["candidates"]] == [five.name, two.name]
+
+
+def test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823():
+    """An unreadable counter must print `?` in the BODY, not a real number: a
+    `0` there is the #683 fabricated-zero harm wearing a footnote that arrives
+    after the line a caller acts on.
+
+    Named coverage for the four `_render_spill_gc_text` pairs the count
+    differential in `tests/test_cli_formatters.py` lists as not-stated: its
+    probe payload carries no `dry_run` flag (so the branch that states
+    `removed_count`/`reclaimed_bytes` never opens) and no candidate ROW (so
+    `bytes`/`files`, read one level down, are never reached). The real shapes
+    are driven here instead.
+    """
+    from bn.formatters import _render_spill_gc_text
+
+    row = {"day": "20260101", "path": "/cache/spills/20260101",
+           "bytes": "many", "files": "many"}
+
+    sweep = _render_spill_gc_text({
+        "kind": "spill_gc", "dry_run": False, "candidates": [row],
+        "candidate_count": 1, "candidate_bytes": 10,
+        "removed_count": "many", "reclaimed_bytes": "many", "kept_count": 0,
+    })
+    assert "spill gc: reclaimed ? of 1 candidate day(s) (? bytes), 0 kept" in sweep
+    assert "  20260101  ? bytes  ? files" in sweep
+    assert " 0 bytes" not in sweep and "reclaimed 0 of" not in sweep
+
+    dry = _render_spill_gc_text({
+        "kind": "spill_gc", "dry_run": True, "candidates": [row],
+        "candidate_count": "many", "candidate_bytes": "many", "kept_count": 0,
+    })
+    assert "spill gc: dry run, ? day(s) would be reclaimed (? bytes), 0 kept" in dry
+
+    # ...and the flag that separates "would be" from "was": `"maybe"` is the
+    # shape a raw truthiness test reads as a real yes.
+    unknown = _render_spill_gc_text({
+        "kind": "spill_gc", "dry_run": "maybe",
+        "candidate_count": 2, "candidate_bytes": 10, "kept_count": 1,
+    })
+    assert unknown.startswith("spill gc: ? dry run unknown -- ")
+
+
+def test_gc_max_bytes_spares_the_current_day_823(tmp_path):
+    """A cap is a request to shrink the cache, never to delete the directory
+    the spill writer is still appending to: the size pass must stop at TODAY,
+    or `--max-bytes 0` reaps the live day -- the same footgun `--older-than 0`
+    is refused at parse time to prevent.
+
+    The consequence of the refusal is stated in the report rather than implied:
+    a cap below the live day's own bytes leaves `kept_bytes > max_bytes`.
+    """
+    from datetime import date, timedelta
+
+    import bn.output as output
+
+    today = date(2026, 9, 15)
+    live = _make_day(tmp_path, today)
+    (live / "big.bin").write_bytes(b"x" * 400)
+    old = _make_day(tmp_path, today - timedelta(days=30))
+
+    report = output.gc_spills(root=tmp_path, today=today, max_bytes=0)
+
+    assert [row["day"] for row in report["candidates"]] == [old.name]
+    assert live.exists() and not old.exists()
+    assert report["kept_count"] == 1 and report["kept_bytes"] == _tree_bytes(live)
+    assert report["kept_bytes"] > report["max_bytes"] == 0
+
+    # Same root, dry run: the live day is not a candidate even with nothing left
+    # but a cap of zero to satisfy.
+    dry = output.gc_spills(root=tmp_path, today=today, max_bytes=0, dry_run=True)
+    assert [row["day"] for row in dry["candidates"]] == []
+    assert dry["kept_bytes"] == _tree_bytes(live)
+
+
+def test_gc_discloses_a_non_canonical_day_name_823(tmp_path):
+    """`202611` parses as 2026-01-01 under `%Y%m%d` and is not a name the writer
+    (which always calls `strftime`) can produce. It was already refused, but
+    SILENTLY -- so the report could not distinguish "nothing here" from "here is
+    a day-shaped name this command will not touch", while a symlink and a plain
+    file each got a reason.
+
+    A name that is not day-shaped at all stays silent on purpose: `notes` makes
+    no claim about a spill day, which is the line #618 draws.
+    """
+    from datetime import date
+
+    import bn.output as output
+
+    odd = tmp_path / "202611"
+    odd.mkdir()
+    (odd / "keep.txt").write_text("someone else's data")
+    unrelated = tmp_path / "notes"
+    unrelated.mkdir()
+
+    report = output.gc_spills(root=tmp_path, today=date(2026, 9, 15))
+
+    assert report["skipped"] == [{"path": str(odd), "reason": "non-canonical day name"}]
+    assert report["candidate_count"] == 0 and report["removed_count"] == 0
+    assert (odd / "keep.txt").read_text() == "someone else's data"
+    assert unrelated.exists()

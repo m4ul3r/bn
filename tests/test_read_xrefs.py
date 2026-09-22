@@ -21,11 +21,14 @@ from _bridge_fakes import *  # noqa: F401,F403
 def test_xrefs_rejects_unmapped_raw_address(monkeypatch):
     """A raw address that isn't mapped is a typo/stale value, not a real
     '0 callers' result; reject it (like read/decompile, exit 2) instead of
-    returning a false-negative empty xref set with exit 0 (#374)."""
+    returning a false-negative empty xref set with exit 0 (#374).
+
+    No `is_valid_offset` patch: the view maps only its function's entry byte, so
+    0xdeadbeef is unmapped by DEFAULT (#783)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x401000, "caller")])
-    bv.is_valid_offset = lambda addr: False
+    assert bv.is_valid_offset(0xDEADBEEF) is False
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     with pytest.raises(RuntimeError, match="not mapped"):
         instance._xrefs(None, "0xdeadbeef")
@@ -36,7 +39,11 @@ def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
     refs FOR must still return those refs, never be rejected as 'not mapped'
     (#374 follow-up). The canonical case is 0x0, the placeholder BN records for
     unresolved indirect-call sites -- rejecting it would discard the real
-    'where are the unresolved indirect calls' answer."""
+    'where are the unresolved indirect calls' answer.
+
+    The unmapped-ness is asserted rather than patched: refs are NOT a mapping
+    record, so the default has to say 0x0 is invalid or this test would pass
+    vacuously (#783)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     caller = _FakeFunction(0x401000, "caller")
@@ -46,7 +53,7 @@ def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
         sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
         segments={0x401010: _FakeSegment(readable=True, executable=True)},
     )
-    bv.is_valid_offset = lambda addr: False  # 0x0 is never a valid offset
+    assert bv.is_valid_offset(0x0) is False  # 0x0 is never a valid offset
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     result = instance._xrefs(None, "0x0")
     assert result["kind"] == "xrefs"
@@ -54,10 +61,162 @@ def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
     assert result["total"] == 1
 
 
+def test_xrefs_raw_address_reads_the_ref_lists_once_815(monkeypatch):
+    """#815: the raw-address path probed both ref lists for emptiness and then the
+    builder re-read them for the response, so a high-fan-in symbol's ref set was
+    materialised twice per call. The #374 mapped-address guard now runs on the
+    lists the builder already read, so each list is read exactly once."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401010, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x402000: [_FakeCodeRef(0x401010, caller)]},
+        data_refs={0x402000: [0x401100]},
+        sections={".rodata": _FakeSection(".rodata", 0x402000, 0x403000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    code_reads: list[int] = []
+    data_reads: list[int] = []
+    real_code_refs = bv.get_code_refs
+    real_data_refs = bv.get_data_refs
+
+    def counting_code_refs(address):
+        code_reads.append(int(address))
+        return real_code_refs(address)
+
+    def counting_data_refs(address):
+        data_reads.append(int(address))
+        return real_data_refs(address)
+
+    bv.get_code_refs = counting_code_refs
+    bv.get_data_refs = counting_data_refs
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "0x402000")
+
+    # The answer itself is unchanged...
+    assert result["code_ref_count"] == 1 and result["data_ref_count"] == 1
+    # ...and each ref list was read ONCE (twice before the fix, for code).
+    assert code_reads == [0x402000], code_reads
+    assert data_reads == [0x402000], data_reads
+
+
+def test_xrefs_guard_keys_on_bn_refs_not_on_the_284_filtered_list_815(monkeypatch):
+    """The #374 guard rejects an address BN holds NO ref for; it must not reject
+    one whose refs the #284 adrp filter merely declined to RENDER.
+
+    A page-aligned address is exactly where the two populations differ: BN records
+    every `adrp xN, <page>` as a code ref to the page base, and #284 drops the ones
+    whose paired offset is nonzero. Such an address is one BN holds refs for -- the
+    pre-#815 probe (`bool(list(get_code_refs(...)) or ...)`) saw them and answered a
+    clean `0`. Keying the guard on the FILTERED list instead turns that same read
+    into `Address ... is not mapped`, which is a different answer to the same
+    question (#815 must not change #374's semantics)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    page_base = 0x438000
+    adrp = _adrp("x0", page_base, 0)
+    # `adrp x0, 0x438000` / `add x0, x0, #0x350` -> the real referent is
+    # 0x438350, so the ref to the page base is spurious and #284 drops it.
+    adrp.il_basic_block = [adrp, _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0x350)]), 1)]
+    caller = _FakeFunction(0x401010, "caller")
+    caller.get_low_level_il_at = lambda address: adrp
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={page_base: [_FakeCodeRef(0x401014, caller)]},
+        data_refs={},
+        disassembly={0x401014: "adrp x0, #0x438000"},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401014: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda address: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Precondition: BN really does hold a code ref for this address, and #284
+    # really does filter it out -- otherwise the test proves nothing.
+    assert len(list(bv.get_code_refs(page_base))) == 1
+    assert bridge.read_xrefs._genuine_code_refs(bv, page_base) == []
+
+    result = instance._xrefs(None, hex(page_base))
+
+    assert result["kind"] == "xrefs"
+    assert result["code_ref_count"] == 0 and result["total"] == 0
+
+
+def test_xrefs_literal_address_never_turns_a_failed_ref_read_into_zero_callers_815(monkeypatch):
+    """A ref enumeration that FAILED is not evidence of "no refs".
+
+    #374 exists to stop a read answering a false-negative `0 callers`, and the
+    guard decides on BOTH ref lists: if the read that produced one of them was
+    swallowed into `[]`, a MAPPED address answers a confident `total: 0` for a
+    binary BN could not enumerate. The probe #815 removed read both lists
+    unguarded on this path, so the failure surfaced as an error -- that must
+    survive the fold into the builder, for each list and for each way a view can
+    be unable to answer (the reader raising, and no reader at all)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def _raise(address):
+        raise RuntimeError("BN ref enumeration failed")
+
+    def _use(reader: str, mode: str, *, code_refs=None):
+        bv = _FakeBV(
+            functions=[_FakeFunction(0x401000, "caller")],
+            code_refs=code_refs or {},
+            sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+            segments={0x401234: _FakeSegment(readable=True, executable=True)},
+        )
+        # MAPPED, so the #374 guard is not what would save this read.
+        bv.is_valid_offset = lambda address: True
+        setattr(bv, reader, _raise if mode == "raises" else None)
+        monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # No code refs, so each list in turn is the evidence the guard decides on.
+    for reader, kind in (("get_code_refs", "code"), ("get_data_refs", "data")):
+        _use(reader, "raises")
+        with pytest.raises(RuntimeError, match="enumeration failed"):
+            instance._xrefs(None, "0x401234")
+
+        _use(reader, "absent")
+        with pytest.raises(RuntimeError, match=f"cannot enumerate {kind} references"):
+            instance._xrefs(None, "0x401234")
+
+
+def test_xrefs_unreadable_data_refs_still_answer_an_address_with_code_refs_815(monkeypatch):
+    """The mirror of the rule above, and its limit: a list the guard never
+    consults must not be able to refuse the read.
+
+    The probe #815 removed was `bool(list(code_refs) or list(data_refs))`, whose
+    `or` short-circuits: with code refs in hand it never touched the data reader,
+    so a view that cannot enumerate data refs still answered. Propagating a data
+    read failure in that branch would invent a refusal base did not have -- and
+    would split the answer by how the identifier was spelled, since the name path
+    is unguarded."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401010, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x401234: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda address: True
+    bv.get_data_refs = None
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "0x401234")
+
+    assert result["code_ref_count"] == 1 and result["data_ref_count"] == 0
+    assert result["total"] == 1
+
+
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
     """A MAPPED address with zero refs must remain a clean total:0 result -- only
     the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
-    address (#374)."""
+    address (#374). 0x5000 is inside the .rodata section, so it is mapped by
+    DEFAULT (#783)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(
@@ -66,7 +225,7 @@ def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
         sections={".rodata": _FakeSection(".rodata", 0x5000, 0x7000)},
         segments={0x5000: _FakeSegment(readable=True)},
     )
-    bv.is_valid_offset = lambda addr: True
+    assert bv.is_valid_offset(0x5000) is True
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     result = instance._xrefs(None, "0x5000")
     assert result["kind"] == "xrefs"

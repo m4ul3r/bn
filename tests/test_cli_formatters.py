@@ -1148,6 +1148,51 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_types_declare_text_row_discloses_unapplied_prototypes_890():
+    # #890 obs 2: the #778 disclosure reached JSON only, so a text-mode reader
+    # of a MIXED declare was told `verified` and never told that the function
+    # prototype and variable in the same source went unapplied.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {
+            "functions": ["parse_frame"],
+            "variables": ["g_session_count"],
+        },
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "packet_header" in out
+    assert "unapplied" in out
+    assert "parse_frame" in out and "g_session_count" in out
+
+
+def test_types_declare_text_row_stays_bare_for_a_types_only_declare_890():
+    # Must-not-fire twin: an ordinary types-only declaration carries no
+    # unapplied buckets and must read exactly as it did before.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+    })
+    assert out == "types_declare packet_header"
+
+
+def test_types_declare_text_row_omits_an_empty_unapplied_bucket_890():
+    # A declare that could not bind a FUNCTION says so without inventing an
+    # empty "variables:" clause -- the disclosure names what happened, not
+    # every bucket it checked.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {"functions": ["parse_frame"], "variables": []},
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "functions: parse_frame" in out
+    assert "variables" not in out
+
+
 def test_the_disclosure_reaches_an_early_return_path():
     # The whole point of declaring the coerced keys per renderer instead of
     # appending a line per branch: several renderers bail out BEFORE their
@@ -3847,9 +3892,15 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # `_count_field` to state them in the `function list` text face. It is a
     # fragment helper, not a payload renderer, so both pairs join the skipped set
     # below by name with their own test.
-    assert len(sites) == 28, (
+    # #823 adds seven spill-gc counter reads to the same measured population.
+    # `_render_spill_gc_text` states five top-level counters
+    # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
+    # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
+    # are the headline's numbers; the two row reads are nested, which is why
+    # they are named in the skipped set below rather than silently dropped.
+    assert len(sites) == 35, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 28. The number is the size of the covered set: a "
+        "count helper, not 35. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3938,6 +3989,12 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # `_render_spill_gc_text` (#823): two reads are nested in candidate
+        # rows, and two live on the non-dry branch the probe does not open.
+        "_render_spill_gc_text(bytes) [count not stated in this context]",
+        "_render_spill_gc_text(files) [count not stated in this context]",
+        "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
+        "_render_spill_gc_text(removed_count) [count not stated in this context]",
         # The same nested reason for the #793 renderer: its five counts also live
         # under `existing_annotations`, so a top-level probe cannot open the gate
         # that states them. Covered by name in
@@ -3954,6 +4011,7 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "stated in this context]",
         "_render_target_info_annotations_text(user_symbols) [count not stated "
         "in this context]",
+
     ], sorted(not_stated)
 
 
@@ -4286,7 +4344,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #793: `_render_target_info_annotations_text` adds the
     # `existing_annotations` container (6 malformed shapes probed on it) to the
     # same discovered population. Measured.
-    assert checked == 1218, f"the differential ran {checked} cases, not 1218"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # The combined population has 1242 cases (six more for #890).
+    assert checked == 1242, f"the differential ran {checked} cases, not 1242"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4353,7 +4414,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
     # under the digest's own function count (1 renderer x 2 keys x 8).
     # Measured by diffing the population, not carried over from a comment.
-    assert swept == 5032, f"the raise sweep ran {swept} renders, not 5032"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # The combined population has 5112 renders.
+    assert swept == 5112, f"the raise sweep ran {swept} renders, not 5112"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4526,7 +4590,10 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # x 2 benign payloads each. Measured by diffing the population.
     # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
     # gained, x 2 benign payloads each. Measured by diffing the population.
-    assert checked == 1461, f"the mirror ran {checked} renders, not 1461"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # The combined population has 1485 renders.
+    assert checked == 1485, f"the mirror ran {checked} renders, not 1485"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7151,7 +7218,8 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
+    # #890 obs 2: `_operation_row_text` now reads the `unapplied_prototypes` container and its nested `functions`/`variables` lists, so a text reader of a mixed declare is told what went unapplied. Three new discovered reads, and these derived populations grow with them. The row reads one more top-level key than before.
+    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7178,9 +7246,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert (rendered, checked) == (1980, 1188), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
-        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
+    # #890 obs 2: the row now reads `unapplied_prototypes` (and its nested
+    # `functions`/`variables`), so both sizes grow with the new key: the
+    # rendered population 1980 -> 2178 and the checked subset 1188 -> 1298.
+    assert (rendered, checked) == (2178, 1298), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
+        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
         "different claims: the carve-out for a readable container skips 792 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
@@ -7278,8 +7349,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4572 + 108 (#823) = 4680.
+    assert swept == 4680, (
+        f"the element sweep ran {swept} renders, not 4680 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

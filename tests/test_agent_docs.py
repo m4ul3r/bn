@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -657,6 +658,363 @@ def test_cli_layout_names_every_top_level_module():
         "CLI_LAYOUT_INTERNAL_MODULES skips modules src/bn no longer has: "
         f"{stale}. Every other exemption in this file stale-fails; a skip list "
         "that outlives its subject silently shrinks what this guard covers"
+    )
+
+
+# The Conventions bullet in CLAUDE.md is the rule this guard enforces, so the
+# guard READS it instead of restating it: a rule mirrored into Python here is a
+# rule the doc can quietly contradict, which is the exact defect #826 reports.
+# Three properties make the reading load-bearing. The bullet is located by
+# SECTION, so a correct copy elsewhere cannot vouch for a stale one where an
+# agent actually looks. Each clause is matched on the RULE it states rather
+# than on a keyword, so a bullet that names a different naming scheme cannot
+# stand in for the one the tree follows. And each clause is required exactly
+# when the registry holds a command of that shape, so a clause can neither be
+# struck from the doc nor outlive its subject. The reach ends at polarity: a
+# clause carrying its own wording intact but negated around it still reads as
+# stated, which no rewrite of a rule into a different rule does.
+_CONVENTIONS_HEADING = "## Conventions"
+_HANDLER_BULLET_PREFIX = "- Command handlers are named"
+_HANDLER_BULLET_PATTERN = "`_<group>_<subcommand>()`"
+_DOC_TOPLEVEL_CLAUSE = re.compile(r"top-level command keeps its bare verb")
+_DOC_ALIAS_CLAUSE = re.compile(r"alias keeps the name of the path it aliases")
+_DOC_HANDLER_EXCEPTION = re.compile(r"`([a-z][\w -]*)` is `(_\w+)`")
+# An example handler name is a claim about the tree exactly like the rule it
+# illustrates, so the citations are checked against the registry too.
+_DOC_CITED_HANDLER = re.compile(r"`(_\w+)`")
+
+
+class _DocumentedRules(NamedTuple):
+    grouped: bool
+    top_level: bool
+    alias: bool
+    exceptions: dict[str, str]
+    cited: set[str]
+
+
+def _prefixed(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith(_HANDLER_BULLET_PREFIX)]
+
+
+def _handler_convention_bullets(text: str) -> tuple[list[str], list[str]]:
+    """Handler-naming bullets under `## Conventions`, and the same anywhere in *text*.
+
+    Returning both is what lets the guard reject a SECOND copy: taking the
+    first prefixed line in the file would let a correct bullet inserted
+    anywhere else stand in for a stale one in the section an agent reads.
+    """
+    lines = text.splitlines()
+    if _CONVENTIONS_HEADING not in lines:
+        return [], _prefixed(lines)
+    section: list[str] = []
+    for line in lines[lines.index(_CONVENTIONS_HEADING) + 1:]:
+        if line.startswith("## "):
+            break
+        section.append(line)
+    return _prefixed(section), _prefixed(lines)
+
+
+def _documented_rules(bullet: str) -> _DocumentedRules:
+    """What the bullet states, clause by clause."""
+    return _DocumentedRules(
+        grouped=_HANDLER_BULLET_PATTERN in bullet,
+        top_level=bool(_DOC_TOPLEVEL_CLAUSE.search(bullet)),
+        alias=bool(_DOC_ALIAS_CLAUSE.search(bullet)),
+        exceptions=dict(_DOC_HANDLER_EXCEPTION.findall(bullet)),
+        cited=set(_DOC_CITED_HANDLER.findall(bullet)),
+    )
+
+
+def _clause_coverage(
+    handlers: dict[str, str], rules: _DocumentedRules
+) -> tuple[list[str], list[str]]:
+    """(command shapes the registry has that the bullet no longer documents,
+    rules the bullet documents that the registry holds no subject for).
+
+    A module-level helper rather than a table inside the test, so dropping a
+    row is itself pinnable: a row silently deleted would leave that command
+    shape unchecked with every other guard green, which is the reported defect
+    one level up.
+    """
+    clauses = (
+        ("grouped `_<group>_<subcommand>` commands",
+         any(" " in path for path in handlers), rules.grouped),
+        ("top-level bare-verb commands",
+         any(" " not in path for path in handlers), rules.top_level),
+        ("aliased commands",
+         len(set(handlers.values())) < len(handlers), rules.alias),
+    )
+    return (
+        [label for label, present, stated in clauses if present and not stated],
+        [label for label, present, stated in clauses if stated and not present],
+    )
+
+
+def _expected_handler_name(path: str) -> str:
+    """`_<group>_<subcommand>` for a grouped path, the bare verb for a top-level one."""
+    return "_" + "_".join(word.replace("-", "_") for word in path.split())
+
+
+def _naming_violations(
+    handlers: dict[str, str], documented: dict[str, str], alias_rule: bool
+) -> list[str]:
+    """Registered paths whose handler name the documented rule does not allow.
+
+    The alias exemption is granted to the ALIASING path only -- a path whose
+    handler is named after a DIFFERENT path of the same handler, which is what
+    "keeps the name of the path it aliases" means. Exempting every path of a
+    multi-path handler instead would let an aliased handler be renamed to
+    anything at all and stay green.
+    """
+    paths_by_handler: dict[str, set[str]] = {}
+    for path, name in handlers.items():
+        paths_by_handler.setdefault(name, set()).add(path)
+    violations = []
+    for path, name in sorted(handlers.items()):
+        expected = _expected_handler_name(path)
+        if name == expected:
+            continue
+        if documented.get(path) == name:
+            continue
+        if alias_rule and any(
+            _expected_handler_name(other) == name
+            for other in paths_by_handler[name] - {path}
+        ):
+            continue
+        violations.append(f"{path!r} -> {name!r}, expected {expected!r}")
+    return violations
+
+
+def _registered_handler_names() -> dict[str, str]:
+    """Registered command path -> handler function name, from the live registry.
+
+    Importing `bn.commands` is what POPULATES `_COMMANDS` -- the `@command`
+    decorators run at import -- so the registry is empty without it and a sweep
+    over it would check nothing.
+    """
+    import bn.cli
+
+    import bn.commands  # noqa: F401 -- importing the package registers its commands
+
+    return {
+        " ".join(spec["path"]): spec["handler"].__name__ for spec in bn.cli._COMMANDS
+    }
+
+
+def test_command_handlers_follow_the_documented_naming_convention():
+    """The Conventions bullet names the handler of each command, so a handler
+    that does not follow it is an agent's grep for the implementation coming
+    back empty.
+
+    Every clause is read out of the bullet and applied to the registry, so the
+    two halves of the claim fail together: strike a clause and the command
+    shape it covers is left undocumented; rename a handler and the registry
+    stops matching what the bullet says.
+    """
+    handlers = _registered_handler_names()
+    assert handlers, "the @command registry is empty, so nothing was checked"
+    in_section, anywhere = _handler_convention_bullets(_doc_text())
+    assert len(in_section) == 1, (
+        f"CLAUDE.md's {_CONVENTIONS_HEADING} section must carry exactly one "
+        f"handler-naming bullet -- this guard reads the rule from it, so "
+        f"without it nothing is enforced. Found: {in_section}"
+    )
+    assert anywhere == in_section, (
+        "a second handler-naming bullet sits outside "
+        f"{_CONVENTIONS_HEADING}: {[line for line in anywhere if line not in in_section]}. "
+        "Two copies is how the section an agent reads goes stale while a guard "
+        "reads the other one"
+    )
+    strays = {
+        path.relative_to(REPO).as_posix(): copies
+        for path in AGENT_FACING_DOCS
+        if path != CLAUDE_MD and (copies := _prefixed(_doc_text(path).splitlines()))
+    }
+    assert not strays, (
+        f"another agent-facing doc states the handler-naming rule: {strays}. The "
+        "rule lives in one place so an agent cannot read a contradicting second "
+        "copy, and only CLAUDE.md's copy is checked against the registry"
+    )
+    bullet = in_section[0]
+    rules = _documented_rules(bullet)
+    undocumented, stale = _clause_coverage(handlers, rules)
+    assert not undocumented, (
+        f"the registry has {undocumented} but the bullet no longer states the "
+        f"rule for them, so nothing checks their handler names. The bullet "
+        f"reads: {bullet!r}"
+    )
+    assert not stale, (
+        f"the bullet documents {stale} while the registry holds none: a rule is "
+        "only true while it has a subject"
+    )
+    violations = _naming_violations(handlers, rules.exceptions, rules.alias)
+    assert not violations, (
+        "these registered commands break the naming rule CLAUDE.md's Conventions "
+        f"bullet documents: {violations}. The bullet reads: {bullet!r}"
+    )
+    for path, name in sorted(rules.exceptions.items()):
+        assert handlers.get(path) == name, (
+            f"the bullet's naming exception {path!r} is `{name}`, but the registry "
+            f"has {handlers.get(path)!r}: an exemption is only true while it has "
+            "a subject"
+        )
+    unknown = sorted(rules.cited - set(handlers.values()))
+    assert not unknown, (
+        f"the bullet cites handler names the registry does not have: {unknown}. "
+        "An example is a claim about the tree exactly like the rule it illustrates"
+    )
+
+
+def test_the_alias_exemption_covers_only_the_aliasing_path():
+    """#826: the exemption belongs to an alias PATH, not to its handler.
+
+    Pinned against a synthetic registry because the live one holds no
+    counter-example: while every alias is well-named, "exempt the whole handler"
+    and "exempt only the aliasing path" agree. They disagree the moment an
+    aliased handler is renamed, and that is the case the wider form waved
+    through for both of the registry's aliases.
+    """
+    aliased = {"symbol rename": "_symbol_rename", "rename": "_symbol_rename"}
+    assert _naming_violations(aliased, {}, True) == []
+    renamed = {"symbol rename": "_rename_symbol", "rename": "_rename_symbol"}
+    assert _naming_violations(renamed, {}, True) == [
+        "'rename' -> '_rename_symbol', expected '_rename'",
+        "'symbol rename' -> '_rename_symbol', expected '_symbol_rename'",
+    ], "a multi-path handler that follows the rule on NO path must not be exempt"
+    assert _naming_violations(aliased, {}, False) == [
+        "'rename' -> '_symbol_rename', expected '_rename'"
+    ], "the alias exemption must come from the documented bullet, not the guard"
+
+
+# A synthetic bullet stating all three rules, and for each clause the exact
+# text to strike plus the DIFFERENT rules it is rewritten into, each written
+# in the clause's OWN vocabulary. The rewrites are the load-bearing half: the
+# clause's words survive them, so only a matcher reading the RULE reports the
+# clause absent. A matcher loosened to any word the rewrites carry reports the
+# clause present and reds -- which is why a clause needs one rewrite per word
+# form it can be reduced to (`alias` and `aliases` are two). Words that occur
+# ONLY inside the operative phrase cannot be covered this way: a rewrite
+# carrying them would state the rule again. Loosening a matcher to one of
+# those stays green, which is bounded -- the doc must still spell the rule out
+# for the guard to read it as stated.
+_PARSER_BULLET = (
+    "- Command handlers are named `_<group>_<subcommand>()` (e.g., "
+    "`_function_list`); a top-level command keeps its bare verb "
+    "(`_decompile`) — `help` is `_help_index`, and a command that is an "
+    "alias keeps the name of the path it aliases (`rename` is `_symbol_rename`)"
+)
+_CLAUSE_PINS = (
+    ("grouped", "`_<group>_<subcommand>()`",
+     ("`<group>::<subcommand>()`", "`_<group>-<subcommand>()`")),
+    ("top_level",
+     "; a top-level command keeps its bare verb (`_decompile`)",
+     ("; a top-level command is prefixed `_top_` (`_top_decompile`)",
+      "; a top-level command keeps its group prefix, never its bare verb"
+      " (`_top_decompile`)")),
+    ("alias",
+     ", and a command that is an alias keeps the name of the path it aliases "
+     "(`rename` is `_symbol_rename`)",
+     (", and an alias command is named `_alias_<path>` (`_alias_rename`)",
+      ", and command aliases are forbidden in this CLI")),
+)
+
+
+def test_the_bullet_parser_reads_each_rule_not_a_keyword():
+    """#826: a clause must be recognised by the RULE it states.
+
+    `alias` appearing in a clause that says something else about aliases used
+    to license the alias exemption, and the top-level clause was not read at
+    all, so striking it from the doc was invisible to every guard. Every
+    clause is pinned by striking it and by rewriting it into other rules that
+    keep its vocabulary, so a matcher cannot loosen towards a keyword -- in
+    either the clause's singular or its plural form -- and stay green.
+    """
+    rules = _documented_rules(_PARSER_BULLET)
+    assert (rules.grouped, rules.top_level, rules.alias) == (True, True, True)
+    assert rules.exceptions == {"help": "_help_index", "rename": "_symbol_rename"}
+    assert rules.cited == {
+        "_function_list", "_decompile", "_help_index", "_symbol_rename"
+    }
+    assert {field for field, _, _ in _CLAUSE_PINS} == {
+        field for field in _DocumentedRules._fields
+        if field not in ("exceptions", "cited")
+    }, (
+        "every clause `_documented_rules` reports needs an anti-loosening pin; "
+        "a row dropped from _CLAUSE_PINS silently removes one"
+    )
+    for field, clause, other_rules in _CLAUSE_PINS:
+        assert clause in _PARSER_BULLET, (
+            f"the {field} pin no longer quotes its own clause, so all of its "
+            "mutations are no-ops"
+        )
+        struck = _documented_rules(_PARSER_BULLET.replace(clause, ""))
+        assert getattr(struck, field) is False, (
+            f"striking the {field} clause must stop it counting as documented"
+        )
+        for other_rule in other_rules:
+            reworded = _documented_rules(_PARSER_BULLET.replace(clause, other_rule))
+            assert getattr(reworded, field) is False, (
+                f"a bullet stating a DIFFERENT {field} rule must not read as "
+                f"stating this one just by reusing its words: {other_rule!r}"
+            )
+
+
+def test_a_naming_exception_is_a_path_handler_pair_not_any_backticked_pair():
+    """#826: the Conventions list is dense with backticked prose.
+
+    A matcher that harvested every `x` is `y` pair would grant an exemption
+    the bullet never gave, and the exempted path's handler could then be named
+    anything at all.
+    """
+    with_prose = _PARSER_BULLET + "; the default `--format` is `text` for reads"
+    assert _documented_rules(with_prose).exceptions == {
+        "help": "_help_index", "rename": "_symbol_rename"
+    }, "only a `path` is `_handler` pair is a naming exception"
+
+
+def test_every_command_shape_in_the_registry_must_be_a_documented_rule():
+    """#826: the coverage wiring, not just the parser that feeds it.
+
+    A clause row dropped from `_clause_coverage` would leave that command
+    shape unchecked while every other guard stayed green -- the same defect
+    one level up from an unread clause.
+    """
+    every_shape = {"function list": "_function_list", "decompile": "_decompile",
+                   "symbol rename": "_symbol_rename", "rename": "_symbol_rename"}
+    all_stated = _DocumentedRules(True, True, True, {}, set())
+    assert _clause_coverage(every_shape, all_stated) == ([], [])
+    for field in ("grouped", "top_level", "alias"):
+        undocumented, stale = _clause_coverage(
+            every_shape, all_stated._replace(**{field: False})
+        )
+        assert len(undocumented) == 1 and not stale, (
+            f"a registry holding every command shape must report the {field} "
+            "rule undocumented the moment the bullet stops stating it"
+        )
+    undocumented, stale = _clause_coverage(
+        {"function list": "_function_list"}, all_stated
+    )
+    assert undocumented == [] and len(stale) == 2, (
+        "a rule the registry has no subject for must be reported stale"
+    )
+
+
+def test_the_guard_reads_the_conventions_section_not_the_first_match():
+    """#826: a correct copy elsewhere must not vouch for a stale section bullet."""
+    doc = (
+        "# Title\n\n- Command handlers are named `correct`\n\n"
+        "## Conventions\n\n- Command handlers are named `stale`\n\n"
+        "## Next\n\n- Command handlers are named `other`\n"
+    )
+    in_section, anywhere = _handler_convention_bullets(doc)
+    assert in_section == ["- Command handlers are named `stale`"], (
+        "the bullet must be taken from the section an agent reads"
+    )
+    assert len(anywhere) == 3, "the doc-wide sweep must see every copy"
+    assert _handler_convention_bullets(
+        "# Title\n\n- Command handlers are named `x`\n"
+    ) == ([], ["- Command handlers are named `x`"]), (
+        "a bullet with no Conventions section at all is not in the section"
     )
 
 

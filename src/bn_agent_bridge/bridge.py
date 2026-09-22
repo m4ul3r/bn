@@ -482,6 +482,33 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
     return _collect_open_views_state(strict=strict)[0]
 
 
+class _PinnedViewContext:
+    """A ``BridgeContext`` whose ``_resolve_view`` answers with a view the caller
+    ALREADY resolved (#775).
+
+    A handler that has resolved its view and then calls a read helper taking a
+    *selector* makes that helper resolve again -- and `resolve()` rebuilds the
+    target snapshot, so the second answer is a fresh sample of GUI state. With a
+    concurrent load/close the helper can then read a DIFFERENT view than the one
+    its caller is describing: `target info` reporting view A's identity beside
+    view B's import count. Pinning the view makes the composed read part of the
+    caller's single sample. Everything else delegates, so the helper sees a
+    normal context.
+    """
+
+    __slots__ = ("_ctx", "_bv")
+
+    def __init__(self, ctx: Any, bv: Any):
+        self._ctx = ctx
+        self._bv = bv
+
+    def _resolve_view(self, selector: str | None):
+        return self._bv
+
+    def __getattr__(self, name: str):
+        return getattr(self._ctx, name)
+
+
 def _path_components(path: str) -> tuple[str, ...]:
     if not path:
         return ()
@@ -884,6 +911,21 @@ class TargetManager:
             return result
 
     def resolve(self, selector: str | None):
+        return self.resolve_with_snapshot(selector)[0]
+
+    def resolve_with_snapshot(self, selector: str | None):
+        """``(view, targets)`` from ONE ``refresh()``.
+
+        #775: a caller that needs both the resolved view AND the target listing
+        used to call `resolve()` (which refreshes internally) and then
+        `refresh()` again, taking TWO snapshots of GUI state. That is not a
+        perf wart -- a load or close landing between them makes the two
+        disagree, so `target info` could resolve against one set of open
+        targets and then describe a different one, reporting a record for a
+        target the final listing no longer contains. Both answers now come from
+        the same sample. `resolve()` is the one-value shim so no existing caller
+        changes, and the matching logic has exactly one implementation.
+        """
         targets = self.refresh()
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
@@ -892,7 +934,7 @@ class TargetManager:
             active = self._default_view(targets)
             if active is None:
                 raise RuntimeError(_format_no_active_target_error(targets))
-            return active
+            return active, targets
 
         with self._lock:
             matches: list[tuple[TargetRecord, Any]] = []
@@ -912,7 +954,7 @@ class TargetManager:
             raise RuntimeError(
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
             )
-        return matches[0][1]
+        return matches[0][1], targets
 
     def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
         """Gate a destructive op that named no target, and pin what it may act on.
@@ -2823,9 +2865,14 @@ class BinaryNinjaBridge:
         return result
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
-        bv = self.targets.resolve(selector)
+        # #775: ONE snapshot for both halves. This used to resolve (which
+        # refreshes) and then refresh again, so a load/close landing between the
+        # two calls let the resolved view and the record describing it come from
+        # different samples of GUI state -- an inconsistent answer, not just a
+        # redundant rebuild.
+        bv, targets = self.targets.resolve_with_snapshot(selector)
         record = None
-        for item in self.targets.refresh():
+        for item in targets:
             if item["active"] and selector in (None, "", "active"):
                 record = item
                 break
@@ -2838,7 +2885,11 @@ class BinaryNinjaBridge:
         try:
             import_symbol_count = int(
                 read_misc._imports(
-                    self.ctx,
+                    # #775: the view this call already resolved, not a fresh
+                    # resolve -- otherwise the count is read from a second
+                    # snapshot and can describe a different target than the rest
+                    # of this answer.
+                    _PinnedViewContext(self.ctx, bv),
                     selector,
                     count_only=True,
                 ).get("count", 0)
@@ -4056,7 +4107,22 @@ class BinaryNinjaBridge:
             # renames/types/locals (#606). Identity check, not falsy: a clean result
             # with no rolled_back key (rolled_back is None) must be unchanged, and a
             # clean rollback (rolled_back True) leaves the view as before.
-            rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
+            #
+            # #772: scoped to the NOT-committed case this was written for. A
+            # COMMITTED batch also reports `rolled_back: False` -- correctly, since
+            # nothing was rolled back -- so an all-noop commit tripped this clause
+            # and dirtied a view where every op was already in the requested state,
+            # making `bn close` warn about unsaved changes that do not exist. A
+            # committed batch's real changes are already covered by
+            # `committed_change` above, so nothing is lost by excluding it here.
+            # Deliberately NOT narrowed by "some op is verified": the ops a failed
+            # rollback leaves live are stamped `rollback_failed`/`reverted`, never
+            # `verified`, so keying on that would silently reopen #606.
+            rollback_left_state = (
+                isinstance(result, dict)
+                and not result.get("committed")
+                and result.get("rolled_back") is False
+            )
             # An unclearable has_user_type override (a proto set on an AUTO function
             # that had to be reverted) leaves the view modified even though the
             # prototype value round-tripped. It now also flips rolled_back to False,

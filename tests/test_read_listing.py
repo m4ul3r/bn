@@ -1152,6 +1152,8 @@ def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
     bv = _view(monkeypatch, instance, population)
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
     listing = instance._list_functions(None)
     counted = instance._list_functions(None, count_only=True)
     searched = instance._search_functions("active", "")
@@ -1181,6 +1183,34 @@ def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
         # assumed, because the entry's claim is over every text face.
         "json fallback": (info, formatters._render_fallback_text(info)),
     }
+
+
+def test_target_and_orient_share_one_duplicate_start_note_900(monkeypatch):
+    """The first-contact text faces use the same disclosure as function list."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    faces = _duplicate_start_faces(bridge, instance, monkeypatch, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=96),
+        _FakeFunction(0x401000, "init_stub", total_bytes=4),
+        _FakeFunction(0x401100, "widget_poll", total_bytes=48),
+    ])
+    notes = []
+    for surface in ("function list", "target info", "evidence orient"):
+        payload, rendered = faces[surface]
+        assert payload["duplicate_starts_collapsed"] == 1
+        found = [line.strip() for line in rendered.splitlines()
+                 if "// duplicate starts" in line]
+        assert len(found) == 1, (surface, rendered)
+        notes.append(found[0])
+    assert notes[0] == notes[1] == notes[2]
+
+    clean = _duplicate_start_faces(bridge, instance, monkeypatch, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=96),
+    ])
+    for surface in ("function list", "target info", "evidence orient"):
+        payload, rendered = clean[surface]
+        assert "duplicate_starts_collapsed" not in payload
+        assert "// duplicate starts" not in rendered
 
 
 def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
@@ -1568,3 +1598,244 @@ def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_75
         "bridge measures. This entry is GENERATED from the measurement above -- "
         "do not hand-edit it and do not add a sentence to it; replace the line "
         "with:\n\n" + expected)
+
+# --- #792: a callsite whose HLIL statement cannot be localized ---------------
+#
+# `hlil_statement: null` + a reason code is the honest answer for one row, but it
+# left the row with no readable context on the JSON surface: `bn decompile
+# <caller>` plainly renders the call, yet nothing in the row said so. The row now
+# carries a bounded decompiled excerpt around the callsite.
+#
+# The render is in CONTROL-FLOW order, not address order (#792 review): a real
+# pseudo-C body emits switch cases out of sequence and puts the FUNCTION START on
+# the closing brace, so a body whose LINES happen to be address-sorted is a straw
+# fixture -- it cannot catch an anchor rule that assumes monotonic addresses. Every
+# fixture below therefore places the callsite line before an epilogue and ends with
+# a brace carrying the function-entry address.
+
+def _control_flow_batches(call_addr: int) -> list[tuple[int, str]]:
+    """The repro's render shape: out-of-order addresses, a callsite line, a body
+    tail, an epilogue, and a closing brace that carries the FUNCTION START."""
+    return [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),        # header @ func start
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),                     # control flow, not address order
+        (0x500050, "        send_ack(fd);"),
+        (call_addr, "    send_status(fd, &buf);"),             # the callsite, exact address
+        (0x5000b8, "    if (buf == 0) {"),
+        (0x5000c0, "        goto out;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),                 # epilogue
+        (0x5000e8, "    no return;"),
+        (0x500000, "}"),                                       # closing brace @ func start
+    ]
+
+
+def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch):
+    """The excerpt is a field of the callsites PAGE, so it is read through the op
+    that pages, not through the per-function row builder."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    call_addr = 0x5000b0
+    callee = _FakeFunction(0x5a10, "send_status")
+    caller = _FakeFunction(0x500000, "handle_reply")
+    caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+    caller.arch = _FakeArch(lengths={call_addr: 4})
+    block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock", address=call_addr,
+                                 expr_index=9, instr_index=9)
+    # A statement whose rendered text is a whole-function-sized blob: the
+    # localization layer refuses it as non-local (#557) -- the shape this issue's
+    # repro reports on a real AArch64 handler.
+    blob = _FakeHLILInstruction("send_status(\n" + "x" * 300 + "\n)",
+                                class_name="HighLevelILCall", parent=block,
+                                address=call_addr, expr_index=11, instr_index=11)
+    caller.low_level_il = [[
+        _FakeLLILInstruction(call_addr, _FakeConstPtr(0x5a10), hlils=[blob]),
+    ]]
+    bv = _FakeBV(
+        functions=[callee, caller],
+        disassembly={call_addr: "bl 0x5a10"},
+        instruction_lengths={call_addr: 4},
+    )
+    _install_fake_pseudo_c(monkeypatch, bridge, caller, [_control_flow_batches(call_addr)])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = _callsites_items(instance, None, "send_status",
+                            within_identifiers=["handle_reply"], context=1)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["hlil_statement"] is None
+    assert row["hlil_statement_reason"] == "statement_not_local"
+    excerpt = row["decompile_excerpt"]
+    # Exact-address anchoring: the callsite's own line, NOT the trailing brace that
+    # also carries a `<= call_addr` address (the pre-review scan anchored there and
+    # emitted the epilogue).
+    assert excerpt["anchor_address"] == hex(call_addr)
+    assert excerpt["window"] == 3
+    assert any(line.startswith(hex(call_addr)) and "send_status(fd, &buf);" in line
+               for line in excerpt["lines"])
+    assert not any("__stack_chk_fail" in line for line in excerpt["lines"])
+    # The function-entry address (header line AND closing brace) stays out of the
+    # window; it is not the callsite.
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
+
+
+def test_callsite_excerpt_proximity_fallback_never_anchors_on_the_function_entry_792(monkeypatch):
+    """No line carries the callsite address exactly: the window falls back to the
+    nearest guttered line, and the function-ENTRY address is excluded from that
+    contest -- a real render puts it on the closing brace, whose line is last."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),
+        (0x500050, "        prep(fd);"),
+        (0x5000b4, "    if (buf == 0) {"),          # nearest to the callsite below
+        (0x5000c0, "        return -1;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),
+        (0x500000, "}"),                            # closing brace @ func start
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert excerpt["anchor_address"] == "0x5000b4"
+    assert any(line.startswith("0x5000b4") for line in excerpt["lines"])
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
+
+
+def test_callsite_excerpt_without_an_attributable_line_says_so_792(monkeypatch):
+    """Nothing in the render can be attributed to the callsite: the excerpt must
+    say that instead of anchoring on the function's tail."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert "anchor_address" not in excerpt
+    assert excerpt["lines"] == []
+    assert excerpt["reason"] == "statement_not_located"
+
+
+def test_callsite_excerpt_caps_a_long_line_792(monkeypatch):
+    """A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line. Each line is capped (240 chars, the same ceiling
+    `_hlil_text_is_local` refuses) and the capped lines are counted, so a 7-line
+    window cannot become the blob `hlil_statement` deliberately withholds."""
+    bridge = _load_bridge(monkeypatch)
+    text = "    send_status(fd, &buf); /* " + "z" * 583 + " */"
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x5000b0, text),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    capped = [line for line in excerpt["lines"] if "send_status" in line]
+    assert len(capped) == 1
+    assert capped[0].startswith(hex(0x5000b0))
+    assert f"... [+{len(lines[1]) - 240} chars]" in capped[0]
+    assert excerpt["truncated_lines"] == 1
+    assert all(len(line) <= 240 + 40 for line in excerpt["lines"])
+
+
+def _null_statement_population(count: int, callee_addr: int = 0x5A10):
+    """*count* callers of one callee, each with exactly one callsite whose HLIL
+    statement cannot be localized -- so every row of every caller wants the
+    #792 excerpt, and the number of renders is a clean measure of the work."""
+    callers, refs, disasm, lengths = [], [], {}, {}
+    for index in range(count):
+        start = 0x500000 + index * 0x1000
+        call_addr = start + 0x10
+        caller = _FakeFunction(start, f"handler_{index:02d}")
+        caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+        caller.arch = _FakeArch(lengths={call_addr: 4})
+        # No HLIL for the LLIL call -> `hlil_statement` null, reason
+        # `no_hlil_mapping`: the #792 shape, on every caller.
+        caller.low_level_il = [[_FakeLLILInstruction(call_addr, _FakeConstPtr(callee_addr))]]
+        callers.append(caller)
+        refs.append(_FakeCodeRef(call_addr, caller))
+        disasm[call_addr] = "bl 0x5a10"
+        lengths[call_addr] = 4
+    callee = _FakeFunction(callee_addr, "send_status")
+    bv = _FakeBV(functions=[callee, *callers], code_refs={callee_addr: refs},
+                 disassembly=disasm, instruction_lengths=lengths)
+    return bv, callers
+
+
+def _counting_decompile_text(monkeypatch, bridge, rendered: list[int]):
+    """Replace the pseudo-C renderer with one that records WHICH function it was
+    asked to render. Counting renders is the only way to see this contract: the
+    returned page is byte-identical before and after the fix."""
+    def _render(bv, func, addresses=False):
+        rendered.append(int(func.start))
+        return f"{hex(int(func.start) + 0x10)}        send_status(fd, &buf);"
+
+    monkeypatch.setattr(bridge.read_listing.il_format, "_decompile_text", _render)
+
+
+def test_callsite_excerpt_renders_only_the_returned_page_792(monkeypatch):
+    """#792 review: the excerpt costs a whole-function decompilation, so it must
+    be a PAGE projection (#814), not scan-time work. A callsites read scans the
+    caller set until it holds `offset + limit + 1` rows; rendering while scanning
+    paid one whole-function decompile for every caller the `--offset`/`--limit`
+    window then discarded."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=4)
+
+    # The page itself is unchanged: the whole caller set was scanned (exact
+    # `total`), and the window holds the last four callers' rows.
+    assert result["total"] == 12 and result["scan_truncated"] is False
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09", "handler_10", "handler_11"]
+    assert all(row["hlil_statement"] is None for row in result["items"])
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    # The WORK is page-bounded: one render per caller ON THE PAGE. Before the
+    # fix this was one per caller SCANNED (all 12).
+    assert rendered == [caller.start for caller in callers[8:12]], rendered
+    # The transient handle never reaches a consumer.
+    assert all("_excerpt_fn" not in row for row in result["items"])
+
+
+def test_callsite_excerpt_page_projection_holds_on_a_truncated_scan_792(monkeypatch):
+    """The early-exit page (`scan_truncated`) is a second, hand-sliced return
+    path: it must project the excerpt onto its own page and drop the transient
+    too, or a live Function object leaks into the row."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=2)
+
+    assert result["scan_truncated"] is True and result["total"] is None
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09"]
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    assert all("_excerpt_fn" not in row for row in result["items"])
+    assert rendered == [caller.start for caller in callers[8:10]], rendered
+
+
+def _rendered_lines(bridge, monkeypatch, batches):
+    """(lines, gutter addresses) as the callsite excerpt sees them, through the
+    real render + gutter parser rather than a hand-built pair."""
+    func = _FakeFunction(0x500000, "handle_reply")
+    _install_fake_pseudo_c(monkeypatch, bridge, func, [batches])
+    return bridge.read_listing._callsite_decompile_render(_FakeBV(), func)
