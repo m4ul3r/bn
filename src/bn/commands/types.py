@@ -17,7 +17,8 @@ from ..transport import BridgeError
          fanout=True,
          args=[arg("--query"),
                arg("--count", action="store_true", default=False,
-                   help="Show the total type count instead of listing")])
+                   help="Show the total type count instead of listing")],
+         estimable=True)
 def _types(args: argparse.Namespace) -> int:
     if args.count:
         _refuse_count_only_slices(args, command="types")
@@ -50,7 +51,8 @@ def _types(args: argparse.Namespace) -> int:
 
 
 @command("types", "show", help="Show one type", target=True,
-         args=[arg("type_name")])
+         args=[arg("type_name")],
+         estimable=True)
 def _types_show(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -119,7 +121,8 @@ def _types_declare(args: argparse.Namespace) -> int:
 
 
 @command("struct", "show", help="Show one struct layout", target=True,
-         args=[arg("struct_name")])
+         args=[arg("struct_name")],
+         estimable=True)
 def _struct_show(args: argparse.Namespace) -> int:
     return _call(
         args,

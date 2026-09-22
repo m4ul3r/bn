@@ -194,14 +194,151 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
     counts as an annotation, so the rule lives in one place.
     """
     function_comment = str(getattr(func, "comment", "") or "")
+    # #861: cheap insurance, NOT a reproduced hazard. Against BN 6.1
+    # `Function.comments` builds and returns a FRESH local dict on every access
+    # (so does `BinaryView.address_comments`), which means a mid-walk
+    # `RuntimeError: dictionary changed size during iteration` cannot arise here,
+    # and the #850 symptom this comment used to lean on was diagnosed on a
+    # settling quick view rather than bisected to an accessor. What the snapshot
+    # costs is one O(n) copy of an already-private dict; what it defends against
+    # is a BN build that ever hands back the live store -- modelled by a
+    # regression test whose fake `comments` adds an entry mid-walk. Snapshot the
+    # WHOLE collection rather than its `.values()` view: if the store ever is
+    # live, that view iterates it and a parallel text decompile dies of
+    # "dictionary changed size during iteration".
+    local_comments = dict(getattr(func, "comments", {}) or {})
     return [
         *comments.values(),
         # Local and global bodies can differ at the same address; do not merge
         # their maps and silently discard one of the two annotations.
-        *(getattr(func, "comments", {}) or {}).values(),
+        *local_comments.values(),
         *([function_comment] if function_comment else []),
     ]
 
+
+
+# Mnemonics whose value is chosen WITHOUT a branch, which HLIL renders as an
+# ordinary ternary or folds into a compound condition (#676 item 12). The skill
+# documents these as known lies and tells the reader to confirm in `bn disasm`;
+# a note in the output reaches the reader who did not read the skill, which is
+# every reader at the moment they are wrong.
+#
+# Keyed on the MNEMONIC, not the architecture, and that is the whole reason
+# this is cheap where the return-width note (#675 item 5) needed a measured
+# arch set: the instruction IS the evidence. `csel` in a listing means a
+# selected value in THIS function, whatever the target is, so there is no
+# per-arch fact to inherit wrongly.
+_FLATTENED_GUARD_MNEMONICS = {
+    # AArch64: conditional compare (chains a second test into the flags, which
+    # HLIL merges into one `&&`/`||`) and conditional select.
+    "ccmp", "ccmn", "csel", "csinc", "csinv", "csneg", "cset", "csetm",
+    # x86: the same lie with a different name.
+    "cmova", "cmovae", "cmovb", "cmovbe", "cmovc", "cmove", "cmovg", "cmovge",
+    "cmovl", "cmovle", "cmovna", "cmovnae", "cmovnb", "cmovnbe", "cmovnc",
+    "cmovne", "cmovng", "cmovnge", "cmovnl", "cmovnle", "cmovno", "cmovnp",
+    "cmovns", "cmovnz", "cmovo", "cmovp", "cmovpe", "cmovpo", "cmovs", "cmovz",
+    # ARM32/Thumb: an IT block predicates the instructions that follow it, and
+    # BN's per-instruction mnemonics may not repeat the IT-derived condition.
+    "it", "ite", "itt", "itee", "itet", "itte", "ittt",
+    "iteee", "iteet", "itete", "itett", "ittee", "ittet", "ittte", "itttt",
+}
+
+
+def _flattened_guard_warning(bv, func) -> str | None:
+    """Name the branch-free selects in *func*, or say nothing (#676 item 12).
+
+    The harm is specific and has faked critical findings: HLIL flattens a
+    `ccmp`/`csel` range guard into a ternary, so a bound that IS enforced can
+    read as one that never fires (or the reverse). The reader cannot see that
+    from the Pseudo-C -- by construction, since the flattening is what removed
+    the evidence -- so the disclosure has to come from the listing underneath.
+
+    This states ONLY what was observed: the mnemonics actually present, by
+    name. The skill's other two documented lies -- a hoisted loop-invariant
+    bound aliased to a moving pointer, and a dropped `<< 4` in a size
+    accumulator -- are SEMANTIC properties with no mnemonic to key on, so
+    nothing is claimed about them here. A note that implied this function had
+    been checked for those would be worse than no note.
+    """
+    try:
+        arch = getattr(func, "arch", None)
+        seen: list[str] = []
+        for block in list(func.basic_blocks):
+            addr = int(block.start)
+            end = int(block.end)
+            while addr < end:
+                text, length = il_format._disasm_instruction(bv, addr, arch=arch)
+                if not length or length <= 0:
+                    break
+                if text:
+                    mnemonic = str(text).split(None, 1)[0].strip().lower()
+                    if mnemonic in _FLATTENED_GUARD_MNEMONICS and mnemonic not in seen:
+                        seen.append(mnemonic)
+                addr += length
+        if not seen:
+            return None
+    except Exception:  # noqa: BLE001 - no listing is not evidence of no select
+        return None
+    names = ", ".join(sorted(seen))
+    return (
+        f"branch-free conditional(s) in this function ({names}): Pseudo-C "
+        f"renders these as ternaries, folds them into one compound condition, "
+        f"or decomposes them into raw flag arithmetic (`v`/`z`/`n` locals) -- "
+        f"a two-sided range guard can come out as none of the three shapes a "
+        f"reader is looking for, so a bound that IS enforced can read as one "
+        f"that never fires. Confirm it in `bn disasm` before concluding on an "
+        f"off-by-one, truncation or missing check."
+    )
+
+
+def _decompile_batch(
+    ctx,
+    selector: str | None,
+    identifiers,
+    *,
+    addresses: bool = False,
+    force_analysis: bool = False,
+    include_annotations: bool = False,
+):
+    """Decompile several functions in ONE round trip (#676 item 5).
+
+    The pain this removes is not typing: every agent that needed three
+    functions wrote a bash `for` loop, which pays bridge round-trip latency
+    per function and -- the part that actually costs -- turns one readable
+    output into N shell invocations whose failures are N separate exit codes
+    nobody aggregates.
+
+    An identifier that does not resolve becomes a FAILED ROW, not an abort.
+    That is the whole reason to batch: a typo in the third name must not
+    discard the two functions that did resolve, because the caller already
+    paid the analysis cost for them. The row carries the error text so the
+    miss is visible per-identifier rather than as one collapsed failure.
+    """
+    rows: list[dict[str, Any]] = []
+    for identifier in identifiers:
+        try:
+            rows.append({
+                "identifier": identifier,
+                "ok": True,
+                "decompiled": _decompile(
+                    ctx, selector, identifier,
+                    addresses=addresses,
+                    force_analysis=force_analysis,
+                    include_annotations=include_annotations,
+                ),
+            })
+        except Exception as exc:  # noqa: BLE001 - one miss must not sink the batch
+            rows.append({
+                "identifier": identifier,
+                "ok": False,
+                "error": str(exc) or exc.__class__.__name__,
+            })
+    return {
+        "kind": "decompile_batch",
+        "requested": len(rows),
+        "resolved": sum(1 for row in rows if row["ok"]),
+        "functions": rows,
+    }
 
 
 def _decompile(
@@ -238,6 +375,9 @@ def _decompile(
         data_warn = _forced_data_region_warning(bv, func)
         if data_warn:
             warnings.append(data_warn)
+    guard_warn = _flattened_guard_warning(bv, func)
+    if guard_warn:
+        warnings.append(guard_warn)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
@@ -330,6 +470,75 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     return result
 
 
+# Architectures whose ABI returns in a register WIDER than a 32-bit write,
+# where that narrower write ZERO-EXTENDS the full register -- so BN infers a
+# 64-bit return for a function that only ever writes 32 bits.
+#
+# Confirmed per arch rather than inherited from x86 (#675 item 5): on x86_64
+# the `eax` write zero-extends `rax`, and AArch64 has the SAME relation
+# (`w0` zero-extends `x0`) -- measured, a cross-built AArch64 binary shows
+# the identical `uint64_t(int32_t, int32_t)` shape. ARM32/thumb2 does NOT
+# belong: its registers are natively 32-bit, there is no widening, and the
+# same measurement finds ZERO over-wide functions there.
+#
+# Emitting nothing outside this set is the point. A note that appeared on
+# ARM firmware while explaining an x86/AArch64 register relation would be
+# worse than no note: it would be a confident claim about a mechanism that
+# target does not have.
+_ZERO_EXTENDING_RETURN_ARCHS = frozenset({"x86_64", "aarch64"})
+
+
+def _return_width_inference_note(bv, func) -> str | None:
+    """Disclose a return width BN inferred from the full register (#675 item 5).
+
+    `int add(int, int)` is recovered as `uint64_t(int32_t, int32_t)` because
+    the callee writes `eax`/`w0` and that write zero-extends the 64-bit
+    register, so BN cannot tell a 32-bit return from a 64-bit one. The
+    prototype then states two different confidence levels in one line and
+    marks neither, and the harm reaches a SECOND surface: a caller returning
+    -1 renders `return 0xffffffff;`.
+
+    A NOTE, not a different answer -- BN cannot do better here, and
+    substituting a narrower type would be the fabrication. It misleads a
+    reader rather than breaking a computation, which is why this discloses
+    where the reserved-keyword guard refuses.
+
+    The signal is narrow ON PURPOSE. `has_user_type is False` is true of
+    nearly every function in a stripped binary, so a note keyed on it fires
+    everywhere and is skipped within a week; return-type confidence reads
+    its MAXIMUM on exactly the over-wide return. What selects the real
+    population is the shape: a pointer-width integer return on an arch where
+    a 32-bit write zero-extends, with the declared parameters all narrower.
+    """
+    try:
+        arch = str(getattr(getattr(bv, "arch", None), "name", "") or "")
+        if arch not in _ZERO_EXTENDING_RETURN_ARCHS:
+            return None
+        if bool(getattr(func, "has_user_type", False)):
+            return None          # an analyst set this; it is not an inference
+        rtype = getattr(func, "return_type", None)
+        if rtype is None or int(getattr(rtype, "width", 0) or 0) != 8:
+            return None
+        params = list(getattr(func, "parameter_vars", []) or [])
+        if not params:
+            return None
+        if any(int(getattr(getattr(p, "type", None), "width", 8) or 8) != 4
+               for p in params):
+            return None
+    except Exception:  # noqa: BLE001 - no evidence is not a claim
+        return None
+    reg = "eax/rax" if arch == "x86_64" else "w0/x0"
+    return (
+        f"return width may be INFERRED, not observed: on {arch} a 32-bit "
+        f"{reg.split('/')[0]} write zero-extends {reg.split('/')[1]}, so a "
+        f"function returning a 32-bit value is indistinguishable from one "
+        f"returning 64 bits and BN widens it. Every declared parameter here "
+        f"is 32-bit, which is the shape that produces the ambiguity -- a "
+        f"negative return will render as a large unsigned value (e.g. -1 as "
+        f"0xffffffff) at call sites. Set the prototype if you know the width."
+    )
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -341,6 +550,9 @@ def _get_prototype(ctx, selector: str | None, identifier):
         },
         **il_format._function_metadata(func),
     }
+    note = _return_width_inference_note(bv, func)
+    if note:
+        result["return_width_note"] = note
     _annotate_containment(ctx, result, identifier, func)
     return result
 
@@ -420,7 +632,14 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             )
     blocks = []
     if fn is not None:
-        for bb in fn.basic_blocks:
+        # #682 item 4: BN hands back basic blocks in its own iteration order,
+        # which at the asm level is not address order (observed interleaving
+        # such as 0x401090, 0x4010b0, 0x40109d). IL levels happen to come out
+        # sorted, so this is a no-op there and makes the asm render readable.
+        # Sorting on `bb.start` matches the documented identity contract at
+        # every level: an address at asm, an IL index at MLIL/HLIL.
+        ordered = sorted(fn.basic_blocks, key=lambda bb: int(bb.start))
+        for bb in ordered:
             insns = [
                 {"a": hex(line.address), "t": "".join(str(t) for t in line.tokens)}
                 for line in bb.disassembly_text
@@ -429,13 +648,60 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             # kind -- but fall back to str() rather than raising the whole op if
             # a core ever hands back a bare int (the same class of surprise as
             # a relocation/symbol enum arriving unwrapped).
-            edges = [
-                {"to": hex(edge.target.start),
-                 "k": getattr(edge.type, "name", None) or str(edge.type)}
-                for edge in bb.outgoing_edges
-                if edge.target is not None
-            ]
-            blocks.append({"start": hex(bb.start), "insns": insns, "edges": edges})
+            #
+            # #682 item 3. A null-target edge is NOT emitted, and that is a
+            # deliberate reversal of this PR's first cut. Two measurements
+            # decided it. (a) The shape is unreachable on BN 6.1:
+            # `BasicBlock._make_edges` asserts `BNNewBasicBlockReference` is
+            # non-None and wraps it through `_create_instance`, which cannot
+            # return None, and a sweep of 12,191 functions x 3 IL levels over
+            # four targets found zero. (b) Emitting `to: null` would silently
+            # BREAK a known consumer: bn-tui types the field `pub to: String`
+            # (not Option, no serde default), so a null fails the decode --
+            # and because the failure is inside `Vec<CfgEdge>`, the whole
+            # `CfgJson` parse fails and the TUI shows an EMPTY CFG with no
+            # error. Speculative code whose only effect, on the day it fires,
+            # is to blank a consumer's view is worse than no code.
+            #
+            # An unresolved target is therefore reported the same way the
+            # LIVE case is, on the block, where the disclosure is additive
+            # and breaks nothing (bn-tui sets no `deny_unknown_fields`, so an
+            # unknown block key is ignored).
+            edges = []
+            unresolved_target = False
+            for edge in bb.outgoing_edges:
+                kind = getattr(edge.type, "name", None) or str(edge.type)
+                if edge.target is None:
+                    unresolved_target = True
+                    continue
+                edges.append({"to": hex(edge.target.start), "k": kind})
+            block = {"start": hex(bb.start), "insns": insns, "edges": edges}
+            # #682 item 3, LIVE half. A real unresolvable indirect jump
+            # (`jmp rax`) produces NO EDGES AT ALL, so it rendered
+            # byte-identically to a block that simply has no successor -- the
+            # one distinction a control-flow view must not lose. BN answers
+            # it directly: `has_undetermined_outgoing_edges` is the core's
+            # own "I could not determine where this goes". Read defensively
+            # because reduced views and IL block objects need not implement
+            # it, and an absent or throwing probe is indeterminate -- not a
+            # claim of either kind.
+            #
+            # What the marker claims, exactly: it reports BN's VERDICT, it
+            # does not exhaustively classify lost successors. Measured live,
+            # 383 of 48,528 asm blocks carry it and none of the 42,034 blocks
+            # WITH resolved successors do -- but 368 jmp-terminated tail-call
+            # stubs have zero edges with the flag FALSE, so an unmarked
+            # edgeless block is not proof of a genuine dead end. It is also
+            # asm-level on this build: at MLIL/HLIL the same block reports
+            # False because BN models the jump as a `__tailcall` return. Both
+            # are BN's answer being relayed faithfully, not a bridge drop.
+            try:
+                undetermined = bool(bb.has_undetermined_outgoing_edges)
+            except Exception:  # noqa: BLE001 - absent/raising probe says nothing
+                undetermined = False
+            if undetermined or unresolved_target:
+                block["undetermined_edges"] = True
+            blocks.append(block)
     result = {
         "kind": "cfg",
         "function": {"name": func.name, "address": hex(func.start)},
@@ -942,9 +1208,104 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "is_phi": is_phi,
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
+        "hints": _call_model_truncation_hints(
+            ctx, bv, func, il, [u for u in uses if u is not None]),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
+
+
+def _call_model_truncation_hints(ctx, bv, func, il, uses) -> list[str]:
+    """The #489 call-model-truncation disclosure for THIS function's calls (#797).
+
+    A def-use read of a variable that feeds an under-recovered call used to show
+    the argument set-up as an ordinary use and say nothing about it: BN clamps a
+    direct call's MLIL parameters to the callee's recovered arity, so on a
+    register ABI a variadic callee auto-typed fixed-arity leaves its STACK-passed
+    arguments behind as `[sp+N].d = <var>` stores that nothing in the function
+    reads back, and the store for the defused variable sits in `uses` looking
+    like any other. `trace` already discloses exactly that state with the
+    reviewed #489 note; this reads the SAME helper over the same calls AND
+    resolves the callee name through the same two steps the sibling uses, so
+    the two ops cannot disagree about whether a call's model was truncated (one
+    gate, one wording, one remedy).
+
+    Scoped to the calls this variable's USES feed, because that is what the
+    disclosure CLAIMS to be: an explanation of a row in this listing. Built
+    over every call in the function it was a different statement, and a wrong
+    one: a variable with no uses at all printed a truncation note above
+    `uses (0):`, and a use downstream of the call got a caveat about argument
+    set-up it has no part in. A use belongs to a call's outgoing-argument run
+    when it IS the call (the variable is a recovered parameter) or it sits
+    between the previous call and this one -- which is exactly the region
+    `_call_model_truncation_note` reads its dropped stack-arg stores from.
+
+    The DEFINITION is deliberately not in that set (#797 round-4 review).
+    Scoping over `[definition] + uses` re-opened the whole defect through the
+    ordinary case: a value computed in this function has a definition ahead of
+    the call, which marked the call fed and put the note back above
+    `uses (0):`. A definition is where the value is PRODUCED -- it is no
+    evidence that the value reaches any call -- so the uses are the scope, and
+    a variable passed to the call shows up in them as the argument-set-up
+    store (or as the call itself when it is a recovered parameter).
+
+    Prints nothing for a call the helper is silent about -- unknown
+    calling-convention arity, a callee that is known fixed-arity, no outgoing
+    stack-arg run, or no caller-passed format string -- which is the
+    no-false-positive direction that note was reviewed for. Returns [] (never
+    raises) on any BN-API shortfall."""
+    from . import read_taint_slice as _ts  # local: this module's import list is documented as il_format/vars/taint_engine/_shared
+
+    hints: list[str] = []
+    try:
+        instructions = list(il.instructions)
+    except Exception:
+        return hints
+    use_indexes = {int(getattr(use, "instr_index", -1)) for use in uses}
+    feeding = False
+    for ins in instructions:
+        index = int(getattr(ins, "instr_index", -1))
+        if "CALL" not in il_format._il_op_name(ins):
+            # A use before the next call is part of that call's outgoing-argument
+            # run; anything after the last call feeds nothing.
+            feeding = feeding or index in use_indexes
+            continue
+        # Only a call THIS variable reaches: it is the call itself, or one of
+        # the uses sits in the run of stores between the previous call and it.
+        relevant, feeding = (feeding or index in use_indexes), False
+        if not relevant:
+            continue
+        # The CALL SITE's own address: `_call_model_truncation_note` looks the
+        # instruction up in the LLIL block by address to find the outgoing
+        # stack-arg stores feeding it, so this is the address it wants -- not the
+        # resolved callee's.
+        call_addr = int(getattr(ins, "address", func.start))
+        # The callee name, resolved EXACTLY as `trace` resolves it: the modeled
+        # name first, then the resolved callee function -- both of which follow
+        # thunks. Resolving it here without following thunks was the one place
+        # the two ops could still disagree, and the disagreement was live in
+        # both directions: the shared note's known-fixed-arity gate keys on this
+        # name, so a PLT stub / veneer in front of `strlen` presented as
+        # `j_strlen`, matched no denylist entry, and fired the exact residual
+        # false positive that denylist exists to close -- on a call `trace` is
+        # silent about. And when the note does fire, its `proto set <name>`
+        # remedy would have named the veneer, whose prototype is not the one
+        # that truncated the model.
+        callee_name = _ts._modeled_callee_name(bv, ins)
+        if not callee_name:
+            try:
+                callee_name = str(getattr(_ts._resolve_callee(ctx, bv, ins),
+                                          "name", "") or "") or None
+            except Exception:
+                callee_name = None
+        note = _ts._call_model_truncation_note(
+            bv, func, ins, call_addr,
+            list(getattr(ins, "params", None) or []),
+            callee_name,
+        )
+        if note is not None:
+            hints.append(f"call {hex(call_addr)}: {note}")
+    return hints
 
 
 def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:

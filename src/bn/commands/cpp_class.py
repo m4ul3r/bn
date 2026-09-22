@@ -31,7 +31,8 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                arg("--query", help="Filter classes by name substring"),
                arg("--count", action="store_true", default=False, dest="count_only",
                    help="Return just the class count (respects --no-stl/--no-vendor/--query/"
-                        "--all), plus artifact_count -- fast class-lens scale characterization")])
+                        "--all), plus artifact_count -- fast class-lens scale characterization")],
+         estimable=True)
 def _class_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.query:
@@ -64,7 +65,8 @@ def _class_list(args: argparse.Namespace) -> int:
 
 @command("class", "show", help="Show a C++ class: methods, vtable, size, bases, instances",
          target=True,
-         args=[arg("name")])
+         args=[arg("name")],
+         estimable=True)
 def _class_show(args: argparse.Namespace) -> int:
     return _call(
         args, "class_show", {"name": args.name},

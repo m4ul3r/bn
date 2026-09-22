@@ -80,7 +80,11 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# Defined in `wire_limits` (symlinked from `bn/`, like `paths`/`version`) so
+# the `batch apply` preflight that warns BEFORE sending and the handler that
+# refuses on arrival read ONE number rather than two copies of it (#769): a
+# client guessing low would refuse requests the bridge would have accepted.
+from .wire_limits import MAX_REQUEST_BYTES  # noqa: F401 - re-exported
 
 # Idle reaper: cap the watcher poll interval so a long BN_IDLE_TIMEOUT doesn't
 # leave a stale process lingering far past its deadline, while a short timeout
@@ -626,7 +630,11 @@ class TargetManager:
         for row in self.refresh():
             if row.get("view_id") == own:
                 continue
-            if row.get("filename") == path or row.get("database_path") == path:
+            # #869: identity, not spelling. A raw `==` missed a save landing
+            # on a file another target has open under a symlinked directory,
+            # while the reference states the disclosure unconditionally.
+            if _same_file(row.get("filename"), path) or \
+                    _same_file(row.get("database_path"), path):
                 return {
                     "target_id": row.get("target_id"),
                     "selector": row.get("selector"),
@@ -1061,6 +1069,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         )
         if identity is not None:
             response = {**response, "bridge_identity": dict(identity)}
+        # #825 item 2: echo the request's `id` (forward-compat). It was already
+        # threaded to this method for cancel tracking and disconnect logging but
+        # never emitted, so a client could not correlate a response with the
+        # request that produced it from the body alone. The current transport is
+        # one request per connection, so nothing NEEDS it today -- which is
+        # exactly why it is cheap to add now and expensive to retrofit once a
+        # multiplexing client exists. Emitted only when the request supplied
+        # one, so a request without an `id` keeps its byte-identical response.
+        if request_id is not None:
+            response = {**response, "id": request_id}
         for attempt in (1, 2):
             try:
                 return json.dumps(response, sort_keys=True, default=str).encode("utf-8")
@@ -1225,6 +1243,35 @@ def _is_go_rename_auto_name(name: str, address: int) -> bool:
     return name == f"sub_{address:x}" or name.startswith("nullsub_")
 
 
+def _disclose_go_rename_skips(
+    result: dict[str, Any],
+    *,
+    skipped_already_named: int = 0,
+    skipped_interior_pc: int = 0,
+) -> dict[str, Any]:
+    """Attach the two #818-review skip buckets `go rename` used to drop silently.
+
+    `skipped_user_named` (a function at the pcln address the user named) was the
+    only skip reason this op ever disclosed, so the two other ways a DEFINED row
+    can fail to become a candidate left the envelope asserting `defined_count: N`
+    beside `go_renamed_candidates: 0` with nothing accounting for N:
+
+    * ``skipped_interior_pc`` -- no BN function STARTS at the pcln address; it
+      resolves only by CONTAINMENT (#818), and the recovered name belongs to the
+      start the view does not have, so it is never applied;
+    * ``skipped_already_named`` -- the function at that start already carries the
+      recovered name (the idempotent re-run, which used to be invisible).
+
+    Present only when non-zero, the listing envelope's own convention, so the
+    common envelope keeps the key set every consumer already parses.
+    """
+    if skipped_already_named:
+        result["skipped_already_named"] = skipped_already_named
+    if skipped_interior_pc:
+        result["skipped_interior_pc"] = skipped_interior_pc
+    return result
+
+
 _IMPORT_SYMBOL_TYPE_NAMES = IMPORT_SYMBOL_TYPE_NAMES
 _is_imported_function = is_imported_function
 
@@ -1252,6 +1299,22 @@ def _function_name_summary(bv) -> dict[str, int]:
     come from relocations) in a separate bucket so they don't inflate "named".
     Reflects whatever functions analysis has discovered so far."""
     functions = list(getattr(bv, "functions", []) or [])
+    # #757/#793 review: BN can hold two records for one start address, and one
+    # address is one function -- `function list` collapses them. Counting the RAW
+    # records here made `target info` (and the `target` block inside `evidence
+    # orient`) state a different total from `function list --count` for the same
+    # view, so the same collapse runs here and the count it dropped is disclosed.
+    #
+    # BOTH counts, not just the collapse: `duplicate_starts_unresolved` is the
+    # second half of the same disclosure (an address whose records could not be
+    # ranked by extent, so both were kept) and dropping it here published the
+    # reason on one surface while suppressing it on the other, with the two
+    # agreeing on every number -- the shape where a reader concludes the larger
+    # count is a phantom rather than an unresolved conflict (#757 review).
+    # This summary counts EVERY retained record (it has no row filter of its
+    # own), so the counts are taken against the whole kept population.
+    functions, collapse = read_listing._collapse_duplicate_starts(functions)
+    collapsed_starts, unresolved_starts = collapse.counts(functions)
     total = len(functions)
     named = imported = 0
     imported_obj_names: set[str] = set()
@@ -1274,12 +1337,25 @@ def _function_name_summary(bv) -> dict[str, int]:
     # object both present) is not double-counted. The bv.functions partition
     # (named/unnamed) is unchanged -- those slots have no function object.
     extra_callable = read_misc._callable_import_slot_names(bv) - imported_obj_names
-    return {
+    summary = {
         "function_count": total,
         "named_function_count": named,
         "unnamed_function_count": total - named - imported,
         "imported_function_count": imported + len(extra_callable),
     }
+    if collapsed_starts:
+        # Present only when a collapse happened, the listing envelope's own
+        # convention, so a consumer that sees fewer functions than BN records can
+        # tell why and that the retained row carries the LARGER extent.
+        summary["duplicate_starts_collapsed"] = collapsed_starts
+    if unresolved_starts:
+        # The other half, on the same block: `function list` discloses this and
+        # `target info` did not, so an agent comparing the two read an unresolved
+        # conflict as a plain duplicate -- "the larger extent won" -- when the
+        # extents ranked nothing (one unreadable, or two the same) and both
+        # records are still live.
+        summary["duplicate_starts_unresolved"] = unresolved_starts
+    return summary
 
 
 class BinaryNinjaBridge:
@@ -2656,6 +2732,69 @@ class BinaryNinjaBridge:
         else:
             out = filename + ".bndb"
 
+        # #867: REFUSE before the write, rather than disclosing after it.
+        #
+        # A save landing on a file another target already has open makes the
+        # two targets one database from that moment -- BN dedups views by
+        # file -- so a later `session restart` returns one target for both and
+        # the instance comes back with fewer targets than it had (measured
+        # 2 -> 1, rc 0). #857 made that DISCLOSED; the collapse itself
+        # survived, and disclosure after an irreversible write is the weaker
+        # half of the pair.
+        #
+        # Refusing costs nothing the caller cannot recover: nothing is
+        # written, so no annotation is lost and the two ways out are one
+        # command away. The alternative considered and rejected was to keep
+        # the save and have restart reopen the re-homed target from its own
+        # binary -- that preserves the COUNT by bringing the target back as
+        # raw bytes with its analysis gone, which is the silent-data-loss
+        # shape #753 exists to stop.
+        #
+        # Best-effort in the same direction as the post-write disclosure: a
+        # probe that cannot answer must not block a legitimate save, so only
+        # a POSITIVE match refuses. The post-write disclosure stays as the
+        # backstop for the window between this check and the write.
+        try:
+            collision = self.targets.open_target_for_path(out, exclude=bv)
+        except Exception:  # noqa: BLE001 - an unanswerable probe refuses nothing
+            collision = None
+        if collision:
+            raise OperationFailure(
+                "invalid_request",
+                f"save refused: {out} is already open as target "
+                f"{collision.get('selector')!r} ({collision.get('target_id')}). "
+                "Saving here would make the two targets one database, so a "
+                "later `session restart` would return one target for both. "
+                "Save elsewhere with --path, or close the other target first.",
+                requested={"path": out},
+                observed={"collides_with_open_target": collision,
+                          "request_sent": True, "written": False},
+            )
+
+        # #889c finding 1: decide OWNERSHIP BEFORE THE WRITE.
+        #
+        # `_is_own_database_destination` asks "is this destination the
+        # target's own database", and #869 made it answer by file identity so
+        # a hard-linked spelling of the sibling is recognised. But it was
+        # evaluated AFTER `create_database`, and that write REPLACES the
+        # destination's inode (measured: sibling 2 links -> destination 1 new
+        # link) -- so by the time the gate ran, the hard link no longer shared
+        # an inode with anything and the gate answered False. `database_path`
+        # went unrecorded and the next `session restart` reopened the STALE
+        # database: the #753 silent-drop shape, reached through a spelling and
+        # surviving the identity fix because the identity was gone by then.
+        #
+        # The pre-write moment is the only one where the question is
+        # answerable, so the answer is captured here and consumed after. Both
+        # candidate destinations are decided now: the primary, and the cache
+        # path the read-only fallback may write instead.
+        own_primary = _is_own_database_destination(out, filename)
+        try:
+            own_cache = _is_own_database_destination(
+                str(_cache_bndb_path(filename)), filename)
+        except Exception:  # noqa: BLE001 - no cache path is not ownership
+            own_cache = False
+
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
             if make_parent:
@@ -2747,7 +2886,9 @@ class BinaryNinjaBridge:
             # raw bytes: the round-2 fix defeated by its companion guard, both
             # added in one commit, and invisible because the test's fake did not
             # re-home the way BN does (#857 review round 3).
-            if _is_own_database_destination(saved, filename):
+            # The CACHE branch: consume the decision taken before the write
+            # (#889c finding 1), because the write replaced the inode.
+            if own_cache:
                 self.targets.note_database(bv, saved)
             _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
@@ -2800,7 +2941,7 @@ class BinaryNinjaBridge:
         # that target fail to reload and vanish. That is the identity move
         # `_restore_filename` exists to prevent, deferred one step to restart
         # (#857 round-4 regression, introduced by this change).
-        if _is_own_database_destination(saved, filename):
+        if own_primary:
             self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
         _disclose_open_target_collision(self.targets, bv, saved, result)
@@ -2893,6 +3034,15 @@ class BinaryNinjaBridge:
                 "import_symbol_count": "rows returned by imports",
                 "imported_function_count": "callable imported function targets",
             },
+            # #793: the SAME annotation block `evidence orient` publishes, from
+            # the same builder, so the two surfaces cannot disagree about whether
+            # this view already carries inherited state. Orient answered this
+            # while `target info` -- the command every agent reaches for first --
+            # had no annotation key at all, so a cached .bndb read as a pristine
+            # view until a separate `bn comment list` pass contradicted it.
+            "existing_annotations": read_listing._existing_annotations(
+                self.ctx, bv, filename=filename
+            ),
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
         # target info -- the natural reflex, since function info accepts it -- is
@@ -3168,6 +3318,9 @@ class BinaryNinjaBridge:
     def _decompile(self, *a, **k):
         return read_decompile._decompile(self.ctx, *a, **k)
 
+    def _decompile_batch(self, *a, **k):
+        return read_decompile._decompile_batch(self.ctx, *a, **k)
+
     def _function_info(self, *a, **k):
         return read_decompile._function_info(self.ctx, *a, **k)
 
@@ -3406,22 +3559,47 @@ class BinaryNinjaBridge:
                 recovered = read_go._go_functions(self.ctx, selector)
                 items = recovered.get("items") or []
                 bv = self._resolve_view(selector)
-                get_fn = getattr(bv, "get_function_at", None)
                 candidates: list[dict[str, Any]] = []
                 skipped_user_named = 0
+                # #818 review: the DEFECT this closes was an envelope stating two
+                # different totals for one question. `go functions` counts `defined`
+                # by CONTAINMENT (#818), so on a view whose pcln addresses are
+                # interior PCs of some body it reports `defined_count: 1848` -- and
+                # this loop re-resolved with START-only `get_function_at`, matched
+                # nothing, and returned `go_renamed_candidates: 0` with no bucket
+                # accounting for the 1848. Every defined row now lands in exactly
+                # one of the four buckets below (candidate / user-named / already
+                # carries the Go name / no BN function STARTS there), so
+                # `defined_count` reconciles with the sum on the rename side.
+                #
+                # A containment-only row is DISCLOSED, never renamed: the recovered
+                # name belongs to the function that starts at the pcln entryoff, and
+                # the containing function starts somewhere else, so applying it
+                # would mislabel a body under a name that is not its own. That is
+                # also why the auto-name guard cannot rescue it -- the guard compares
+                # the current name against `sub_<addr>` for THIS address.
+                skipped_already_named = 0
+                skipped_interior_pc = 0
                 for it in items:
-                    if not it.get("defined") or not callable(get_fn):
+                    if not it.get("defined"):
                         continue
                     try:
                         addr = int(it["address"], 16)
                     except (KeyError, ValueError, TypeError):
                         continue
-                    fn = get_fn(addr)
-                    if fn is None:
+                    # The walk guarantees a non-empty name for every item it emits
+                    # (an unnamed entry is counted as `skipped` there), which is
+                    # what keeps the four buckets a partition of `defined_count`.
+                    new_name = str(it.get("name") or "")
+                    if not new_name:
+                        continue
+                    fn, start_matched = read_go.resolve_pcln_function(bv, addr)
+                    if fn is None or not start_matched:
+                        skipped_interior_pc += 1
                         continue
                     current = str(getattr(fn, "name", "") or "")
-                    new_name = str(it.get("name") or "")
-                    if not new_name or current == new_name:
+                    if current == new_name:
+                        skipped_already_named += 1
                         continue
                     if not _is_go_rename_auto_name(current, addr):
                         skipped_user_named += 1
@@ -3433,16 +3611,23 @@ class BinaryNinjaBridge:
                     })
 
             if not candidates:
-                return {"kind": "go_rename", "success": True, "committed": False,
-                        "preview": preview, "results": [],
-                        "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
-                        "defined_count": recovered.get("defined_count", 0)}
+                result = {"kind": "go_rename", "success": True, "committed": False,
+                          "preview": preview, "results": [],
+                          "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                          "defined_count": recovered.get("defined_count", 0)}
+                return _disclose_go_rename_skips(
+                    result,
+                    skipped_already_named=skipped_already_named,
+                    skipped_interior_pc=skipped_interior_pc,
+                )
 
             return self._apply_go_renames_chunked(
                 bv,
                 candidates,
                 preview=preview,
                 skipped_user_named=skipped_user_named,
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
                 defined_count=recovered.get("defined_count", 0),
             )
 
@@ -3497,18 +3682,24 @@ class BinaryNinjaBridge:
         preview: bool,
         skipped_user_named: int,
         defined_count: int,
+        skipped_already_named: int = 0,
+        skipped_interior_pc: int = 0,
     ) -> dict[str, Any]:
         get_fn = getattr(bv, "get_function_at", None)
         if not callable(get_fn):
-            return {"kind": "go_rename", "success": False, "committed": False,
-                    "preview": preview, "rolled_back": True,
-                    "results": [{"op": "rename_symbol", "status": "unsupported",
-                                 "message": "BinaryView does not support get_function_at"}],
-                    "go_renamed_candidates": len(candidates),
-                    "go_verified_count": 0, "go_failed_count": 1,
-                    "go_committed_count": 0,
-                    "skipped_user_named": skipped_user_named,
-                    "defined_count": defined_count}
+            return _disclose_go_rename_skips(
+                {"kind": "go_rename", "success": False, "committed": False,
+                 "preview": preview, "rolled_back": True,
+                 "results": [{"op": "rename_symbol", "status": "unsupported",
+                              "message": "BinaryView does not support get_function_at"}],
+                 "go_renamed_candidates": len(candidates),
+                 "go_verified_count": 0, "go_failed_count": 1,
+                 "go_committed_count": 0,
+                 "skipped_user_named": skipped_user_named,
+                 "defined_count": defined_count},
+                skipped_already_named=skipped_already_named,
+                skipped_interior_pc=skipped_interior_pc,
+            )
 
         applied: list[dict[str, Any]] = []
         failed_rows: list[dict[str, Any]] = []
@@ -3588,7 +3779,11 @@ class BinaryNinjaBridge:
             result["message"] = "Rollback failed; the view may be partially renamed"
         elif preview and not rolled_back:
             result["message"] = "Preview rollback failed; the view may be partially renamed"
-        return result
+        return _disclose_go_rename_skips(
+            result,
+            skipped_already_named=skipped_already_named,
+            skipped_interior_pc=skipped_interior_pc,
+        )
 
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)
@@ -3751,42 +3946,41 @@ class BinaryNinjaBridge:
         # BNDB, inherited comments/names bias analysis and let an agent over-credit
         # itself; surface bounded counts + a provenance hint so the inherited baseline
         # is visible up front instead of requiring a separate `bn comment list` pass.
-        # Annotation counting is best-effort -- if the view can't be resolved/read it
-        # degrades to an `unavailable` marker rather than erroring the whole digest.
+        # #793: the block is built by `read_listing._existing_annotations` -- the ONE
+        # builder, shared with `target info`, which is why the two surfaces can no
+        # longer disagree. `_target_info` (called at the top of this digest) has
+        # already built it, so reuse that rather than pay the function/symbol
+        # walk a second time; the fallback keeps the field a dict for a double that
+        # answers `_target_info` without the key.
+        #
+        # #883 item 2: reuse it by TAKING it, not by leaving a second copy in
+        # place. `_target_info` publishes the block at its own top level and the
+        # digest republished the byte-identical dict again under `target` --
+        # 2629 + 2629 of an 11399-byte payload (46%) on the view this was
+        # measured on, and the same shape at 63% on a denser one. Built once
+        # (#793) and now emitted once: at the digest's top level, which is where
+        # trunk carried it, where `_render_orient_text` reads it, and where the
+        # bn-kernel `assert_unannotated` contract looks for it. Nothing reads the
+        # nested path; `target info` still publishes it, because there the block
+        # is that op's own answer rather than this digest's.
         filename = str(target.get("filename", "") or "")
-        analysis_cache_restored = filename.endswith(".bndb")
-        try:
-            bv = self._resolve_view(selector)
-            annotations = read_listing._annotation_summary(self.ctx, bv)
-            # #733 F2: keyed on ANALYST work, not the raw non-auto count -- the
-            # loader's own placeholders made a pristine view hint that its
-            # entirely-current-run analysis may predate the run.
-            total_annotations = (
-                annotations["comments"] + annotations["function_comments"]
-                + annotations["analyst_symbols"]
-            )
-            hint = None
-            if analysis_cache_restored or total_annotations:
-                hint = (
-                    f"existing BNDB annotations may predate this run: "
-                    f"{annotations['comments']} comment(s), "
-                    f"{annotations['function_comments']} function doc(s), "
-                    f"{annotations['analyst_symbols']} analyst symbol(s) already present "
-                    f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
-                    + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
-                    + " -- do not over-credit current-run analysis"
+        existing_annotations = target.pop("existing_annotations", None)
+        if not isinstance(existing_annotations, dict):
+            # A `_target_info` answered without the block (a double, or a bridge
+            # predating #793): build it here through the same builder, resolving
+            # the view through this bridge's own shim -- the path the digest has
+            # always used, and the one the unit doubles patch -- then degrade to
+            # the marker exactly as before if even that fails.
+            try:
+                bv = self._resolve_view(selector)
+                existing_annotations = read_listing._existing_annotations(
+                    self.ctx, bv, filename=filename
                 )
-            existing_annotations = {
-                **annotations,
-                "analysis_cache_restored": analysis_cache_restored,
-                "provenance_hint": hint,
-            }
-        except Exception as exc:
-            existing_annotations = {
-                "unavailable": f"annotation counts unavailable: {exc}",
-                "analysis_cache_restored": analysis_cache_restored,
-            }
-        return {
+            except Exception as exc:
+                existing_annotations = read_listing._annotations_unavailable(
+                    exc, filename=filename
+                )
+        digest = {
             "kind": "orient_digest",
             "target": target,
             "analyzed": analyzed,
@@ -3798,6 +3992,18 @@ class BinaryNinjaBridge:
             "sections": sections,
             "existing_annotations": existing_annotations,
         }
+        # #757: `function_count` above is the LISTING's post-collapse total, so
+        # the two keys that explain it have to travel with it. Taking the number
+        # and leaving them behind is what made this card show a silently reduced
+        # count -- the same JSON-only shape the disclosure exists to remove, on
+        # the other command an agent runs on first contact. Copied at the digest's
+        # own level (the nested `target` block carries its own pair for the view,
+        # which this count is not taken from), and only when published.
+        return read_listing._disclose_collapsed_starts(
+            digest,
+            func_count.get("duplicate_starts_collapsed", 0),
+            func_count.get("duplicate_starts_unresolved", 0),
+        )
 
     def _normalize_py_result(self, *a, **k):
         return create_comments._normalize_py_result(self.ctx, *a, **k)
@@ -4271,6 +4477,25 @@ def _bind_decompile(bridge, params, target):
     return bridge._decompile(
         target,
         params["identifier"],
+        addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
+        force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
+        include_annotations=_validate_bool(
+            params.get("include_annotations"),
+            label="include_annotations",
+            default=False,
+        ),
+    )
+
+
+@op("decompile_batch", lock="read",
+    escalation=lambda p: _validate_bool(p.get("force_analysis"), label="force_analysis", default=False))
+def _bind_decompile_batch(bridge, params, target):
+    identifiers = params.get("identifiers")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise BridgeError("decompile_batch requires a non-empty `identifiers` list")
+    return bridge._decompile_batch(
+        target,
+        identifiers,
         addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
         force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
         include_annotations=_validate_bool(
@@ -4838,6 +5063,42 @@ READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
+
+def _same_file(a: str | None, b: str | None) -> bool:
+    """Do *a* and *b* name the same FILE, rather than the same spelling?
+
+    Two decisions in this module used to be made on a path's spelling while
+    the question was about the file (#869), and each missed a different
+    aliasing form: the collision probe compared raw strings, so a symlinked
+    spelling of an already-open database was not disclosed; the own-database
+    gate resolved symlinks but not HARD links, so an explicit save through a
+    hard link of the target's own sibling recorded no `database_path` and the
+    next `session restart` reopened the raw bytes -- the silent-data-loss
+    shape #753 exists to stop, reached by a different spelling.
+
+    Identity first (`os.path.samefile`, which is inode+device and therefore
+    sees both forms), and the string compare kept ONLY as a fast path that
+    can add an answer and never remove one: a destination that does not exist
+    yet -- the normal case for a save -- has no inode to compare, and
+    `samefile` raises there rather than answering False. Degrading to the
+    spelling is the same "answer only what the evidence supports" rule
+    `socket_evidence` applies when `/proc` cannot see a socket.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        if Path(a).expanduser().resolve() == Path(b).expanduser().resolve():
+            return True
+    except Exception:  # noqa: BLE001 - an unresolvable path is not a match
+        pass
+    try:
+        return os.path.samefile(a, b)
+    except Exception:  # noqa: BLE001 - absent/unstattable: no identity evidence
+        return False
+
+
 def _is_own_database_destination(saved: str, filename: str) -> bool:
     """Is *saved* this target's OWN database, rather than an export elsewhere?
 
@@ -4858,12 +5119,14 @@ def _is_own_database_destination(saved: str, filename: str) -> bool:
     """
     if not saved or not filename:
         return False
+    # #869: identity, not spelling. `.resolve()` alone sees a symlink and not
+    # a HARD link, so a save through a hard link of the sibling looked like
+    # an export and recorded nothing.
+    if _same_file(saved, filename + ".bndb"):
+        return True
     try:
-        written = Path(saved).expanduser().resolve()
-        if written == Path(filename + ".bndb").expanduser().resolve():
-            return True
-        return written == _cache_bndb_path(filename).expanduser().resolve()
-    except Exception:  # noqa: BLE001 - an unresolvable path is simply not ours
+        return _same_file(saved, str(_cache_bndb_path(filename)))
+    except Exception:  # noqa: BLE001 - an unresolvable cache path is not ours
         return False
 
 
@@ -4874,6 +5137,21 @@ def _disclose_open_target_collision(targets, bv, saved: str, result: dict) -> No
     the collision probe did. Both a structured key and a rendered note, because
     the harm is that a later `session restart` silently returns fewer targets
     than it had, and an agent needs to see that at save time (#857 round 4).
+
+    WHY THIS SURVIVED #867, which refuses a colliding destination outright:
+    the pre-write refusal tests the REQUESTED path, and the read-only cache
+    fallback writes somewhere else -- a destination chosen only after the
+    primary write has already failed. Extending the refusal there was
+    considered and deliberately rejected: the fallback exists so annotations
+    are NOT lost on a read-only mount, so refusing at that point could
+    destroy the work it was invented to save. Verified live (#867 pass,
+    detail 3) -- the disclosure fires, the save lands, and the `--path`
+    export still carries the annotations.
+
+    So this is the BACKSTOP, not a leftover: it covers the fallback
+    destination and the window between the pre-write check and the write.
+    A future reader seeing "the refusal did not fire here" should not
+    reach for the obvious fix without reading the paragraph above.
     """
     try:
         other = targets.open_target_for_path(saved, exclude=bv)

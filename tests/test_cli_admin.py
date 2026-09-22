@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import types
@@ -3501,3 +3502,764 @@ def test_the_probe_flag_reaches_the_WIRE_envelope_756(monkeypatch, tmp_path, cap
     assert ordinary, f"target list sent nothing: {received}"
     # Absent, not false: the envelope is byte-identical to before for real work.
     assert all("idle_probe" not in p for p in ordinary), ordinary
+
+
+# ---------------------------------------------------------------------------
+# #676 item 11: BN_TARGET, the per-shell target story `-i` already had
+# ---------------------------------------------------------------------------
+
+
+
+def _capture_target(monkeypatch, argv, env=None):
+    """Run *argv* through `main` and return the target each request carried."""
+    import bn.cli
+
+    seen: list = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen.append(target)
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": "1:1:1", "selector": "alpha.bin"},
+                {"target_id": "1:1:2", "selector": "beta.bin"},
+            ]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    bn.cli.main(argv)
+    return [t for t in seen if t is not None]
+
+
+def test_bn_target_supplies_the_selector_when_no_flag_is_passed(monkeypatch):
+    """The whole point: fan-out stops costing `-t` on every single command.
+
+    The sticky pin cannot do this job -- it lives in ~/.cache and is shared by
+    every shell on the machine, so two agents in one project clobber each
+    other, which is why the skill tells them not to use it. An environment
+    variable is per-process-tree, so each agent's selector is invisible to the
+    other by construction.
+    """
+    assert "beta.bin" in _capture_target(
+        monkeypatch, ["function", "list"], {"BN_TARGET": "beta.bin"}
+    )
+
+
+def test_an_explicit_target_flag_beats_the_environment(monkeypatch):
+    """`-t` is the override, not a duplicate of the export.
+
+    An agent that exports a working target and then reaches for ONE other
+    binary must not have to unset its shell to do it.
+    """
+    assert "alpha.bin" in _capture_target(
+        monkeypatch, ["-t", "alpha.bin", "function", "list"], {"BN_TARGET": "beta.bin"}
+    )
+
+
+def test_an_empty_bn_target_is_refused_rather_than_resolved(monkeypatch, capsys):
+    """An UNSET shell variable exports as the empty string, and the bridge
+    collapses an empty selector to the focused GUI view with no count check.
+
+    So the dangerous shape is not a wrong name, it is `export BN_TARGET=$SEL`
+    where SEL was never assigned: the command would then act on whichever tab
+    happened to have focus while LOOKING like it had been told a target. The
+    existing empty-selector refusal covers it, and this pins that the env path
+    reaches that refusal rather than bypassing it.
+
+    Round 1 blocker: the first cut asserted only `main(...) == 2`, and a 2 is
+    what this argv produces at base too -- from the no-targets-open error on
+    the implicit-target path, which the env default does not even reach. The
+    exit code alone cannot tell the two apart, so the assertions are now the
+    two things only the refusal produces: its own words, and the fact that
+    NOTHING was sent. The base path sends `list_targets` before it fails, so
+    the silence is what separates "refused the selector" from "asked the
+    bridge and got an unrelated error".
+
+    Round 4 review: those words now name the SOURCE rather than the `--target`
+    flag nobody passed, so the assertion follows them there -- and it is a
+    stronger discriminator, because only the env path can produce them.
+    """
+    import bn.cli
+
+    sent: list[str] = []
+
+    def fake_send_request(op, **kwargs):
+        sent.append(op)
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setenv("BN_TARGET", "   ")
+
+    assert bn.cli.main(["function", "list"]) == 2
+
+    assert "BN_TARGET is exported but empty" in capsys.readouterr().err
+    assert sent == [], (
+        "the empty selector must be refused BEFORE anything reaches the "
+        f"bridge; these ops were sent instead: {sent}")
+
+
+def _close_run(monkeypatch, argv, env=None, selectors=("alpha.bin", "beta.bin")):
+    """Run *argv* through `main`, returning `(rc, [(op, target), ...])`.
+
+    Pins a nonexistent instance so no probe can reach a live bridge even if a
+    future change moved one of these paths onto the transport.
+    """
+    import bn.cli
+
+    sent: list[tuple[str, object]] = []
+
+    def fake_send_request(op, *, params=None, target=None, **kwargs):
+        sent.append((op, target))
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": f"1:1:{i}", "selector": sel}
+                for i, sel in enumerate(selectors, start=1)]}
+        return {"ok": True, "result": {"closed": [{"selector": target}], "count": 1}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setenv("BN_INSTANCE", "prfleet-nonexistent-889")
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    return bn.cli.main(argv), sent
+
+
+def test_a_bare_destructive_close_never_takes_the_environment_default(monkeypatch):
+    """A destructive op must not be steered by an AMBIENT selector.
+
+    `close`'s handler already nulls a sticky-injected target for exactly this
+    reason: a bare `bn close` must not silently tear down whichever target
+    some earlier `bn target use` happened to pin. An exported selector is the
+    same ambient value from a different source, so honouring it there
+    reintroduces the hazard through the other door -- the one thing #676 item
+    11 must not do.
+
+    Round 2 blocker: the guarantee was implemented as "a `required=True`
+    target option never takes the env default", and NO command in the tree
+    sets `required=True` -- every `--target` comes from `@command(target=True)`
+    with `required=False`. So the protection covered zero commands and a bare
+    `close` closed the exported selector at rc 0. This test drives the real
+    command, so it cannot pass while that is true.
+
+    Two open targets, so a bare close has to refuse rather than fall through
+    to the legitimate single-open case.
+    """
+    rc, sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "beta.bin"})
+
+    assert [op for op, _ in sent] == ["list_targets"], (
+        "a bare destructive close must not act on the exported selector; "
+        f"it sent {sent}")
+    assert rc == 2
+
+
+def test_the_sticky_pin_and_the_environment_default_are_refused_alike(monkeypatch):
+    """The two ambient sources must behave identically at the destructive op,
+    or the safer-looking one is the one that surprises you.
+
+    Pinned as a PAIR: asserting only the env half would stay green if the
+    sticky guard were deleted, and the whole argument for the env default is
+    that it is the sticky pin's equal minus the cross-agent clobber.
+    """
+    from bn import session_state
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "beta.bin"})
+    sticky_rc, sticky_sent = _close_run(monkeypatch, ["close"])
+
+    monkeypatch.setattr(session_state, "read", lambda: {})
+    env_rc, env_sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "beta.bin"})
+
+    assert (sticky_rc, [op for op, _ in sticky_sent]) == (2, ["list_targets"])
+    assert (env_rc, [op for op, _ in env_sent]) == (sticky_rc,
+                                                    [op for op, _ in sticky_sent])
+
+
+def test_an_explicit_target_still_closes_that_target(monkeypatch):
+    """Must-not-fire twin: the refusal is about AMBIENCE, not about `close`.
+
+    An explicit `-t` is the caller naming the target, and it must still work
+    -- otherwise the fix above would have made `close` unusable rather than
+    safe.
+    """
+    rc, sent = _close_run(monkeypatch, ["-t", "beta.bin", "close"],
+                          {"BN_TARGET": "alpha.bin"})
+
+    assert ("close_binary", "beta.bin") in sent, sent
+    assert rc == 0
+
+
+def test_an_empty_export_is_refused_by_close_rather_than_discarded(monkeypatch):
+    """The two guarantees must not cancel each other out.
+
+    Round 3 made an exported selector AMBIENT so a bare destructive `close`
+    cannot be steered by it. An EMPTY export is not a selector, and marking
+    it ambient too made `close` -- which DISCARDS an ambient target -- throw
+    it away: with one target open the bare close then fell through to the
+    single-open auto-pick and tore that target down at exit 0, where it had
+    refused with nothing sent.
+
+    That is worse than the hazard the round-3 fix removed: the empty export
+    is the shape the whole refusal exists for (`export BN_TARGET=$SEL` where
+    SEL was never assigned), and the destructive command is where it matters
+    most. ONE target open, because that is the configuration where a
+    discarded selector silently succeeds instead of hitting the multi-target
+    refusal.
+    """
+    rc, sent = _close_run(monkeypatch, ["close"], {"BN_TARGET": "   "},
+                          selectors=("only.bin",))
+
+    assert sent == [], (
+        "an empty export must reach the empty-selector refusal, not be "
+        f"discarded as ambient; these ops were sent: {sent}")
+    assert rc == 2
+
+
+def test_an_empty_pin_is_refused_by_close_exactly_like_an_empty_export(monkeypatch):
+    """Round 4 fixed the empty EXPORT. The pin is the other half of the pair.
+
+    The pin reaches the same state by the same accident: `bn target use
+    "$SEL"` with SEL unset writes an empty pin and exits 0 (measured --
+    `_target_matches` answers True for "", so the pre-write validation lets it
+    through and `session_state.update(target="")` runs). Reading that back as
+    "no pin" made a bare destructive close fall through to the single-open
+    auto-pick and tear that target down at rc 0 -- the exact behaviour round 4
+    removed on the export path, still shipping on the other one, while
+    runtime.md derives the empty-value guarantee from BOTH sources being
+    ambient.
+
+    Both spellings, because they failed differently: "" was never filled (so
+    the command looked unpinned) and whitespace WAS filled and then marked
+    ambient, which `close` discards. ONE target open -- the configuration
+    where a discarded selector succeeds silently instead of hitting the
+    multi-target refusal.
+    """
+    from bn import session_state
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    empty = _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "   "})
+    blank = _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+
+    assert empty == (2, []), (
+        "an empty pin must reach the empty-selector refusal, not read as no "
+        f"pin at all and let a bare close take the sole target: {empty}")
+    assert blank == (2, []), (
+        "a whitespace pin is not a selector either, so `close` must not "
+        f"discard it as ambient and auto-pick instead: {blank}")
+
+
+def test_an_empty_ambient_selector_says_which_source_it_came_from(
+        monkeypatch, capsys):
+    """"…or omit --target" is advice the caller has already followed.
+
+    Nobody passed a flag: the empty value arrived from the environment or
+    from the pin, and the two are cleared in completely different ways. A
+    refusal that blames `--target` sends the reader looking for an argument
+    they never wrote, and one that names neither source leaves them
+    re-running the same command -- with the pin, re-reading a file they have
+    to know exists. `main` already discloses provenance this way for a sticky
+    INSTANCE on a dead bridge; this is the same disclosure for the target.
+    """
+    from bn import session_state
+
+    _close_run(monkeypatch, ["close"], {"BN_TARGET": "   "},
+               selectors=("only.bin",))
+    env_err = capsys.readouterr().err
+
+    # The export wins over the pin, so it has to go before the pin is asked.
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    _close_run(monkeypatch, ["close"], selectors=("only.bin",))
+    pin_err = capsys.readouterr().err
+
+    assert "BN_TARGET" in env_err and "--target" not in env_err, env_err
+    assert "bn target clear" in pin_err and "--target" not in pin_err, pin_err
+
+
+def test_a_broken_ambient_default_does_not_break_the_cleanup_verb(monkeypatch):
+    """An unneeded default must not fail the command that needs no default.
+
+    Refusing an empty ambient selector protects the resolution it corrupts.
+    `bn close --all` and `bn close <path>` resolve nothing -- the caller said
+    what to close -- so the broken default is never consulted, and failing
+    them turns a stale shell variable into "the cleanup verb no longer runs".
+    Worse, the refusal they produced came from close's operand-conflict guard
+    ("Pass --target or --all, not both"), naming a flag the caller never
+    typed, because the empty value had been filled into `args.target` where
+    that guard counts it as a GIVEN operand.
+
+    Both spellings and both ambient sources, because the guard that produced
+    the wrong refusal is per-operand and the two sources fill the same field.
+    """
+    from bn import session_state
+
+    all_env = _close_run(monkeypatch, ["close", "--all"], {"BN_TARGET": "   "},
+                         selectors=("only.bin",))
+    path_env = _close_run(monkeypatch, ["close", "/tmp/bn-not-a-real-target"],
+                          {"BN_TARGET": "   "}, selectors=("only.bin",))
+
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": ""})
+    all_pin = _close_run(monkeypatch, ["close", "--all"], selectors=("only.bin",))
+    path_pin = _close_run(monkeypatch, ["close", "/tmp/bn-not-a-real-target"],
+                          selectors=("only.bin",))
+
+    for label, (rc, sent) in (("--all under an empty export", all_env),
+                              ("a path under an empty export", path_env),
+                              ("--all under an empty pin", all_pin),
+                              ("a path under an empty pin", path_pin)):
+        assert rc == 0 and [op for op, _ in sent] == ["close_binary"], (
+            f"close with {label} names what to close and consults no default, "
+            f"so it must still run; got rc={rc} sent={sent}")
+
+
+def _fanout_pairs(monkeypatch, capsys, argv, env=None, sticky=None):
+    """Run a fan-out read; return its (instance, target) pairs and auto-expansion.
+
+    Two instances, one of them holding TWO targets: that is the only shape
+    where "apply the selector to every instance" and "survey every target"
+    produce different answers, so it is the shape this question has to be
+    asked in.
+    """
+    import json as _json
+    import types
+
+    import bn.cli
+
+    insts = [types.SimpleNamespace(instance_id="solo"),
+             types.SimpleNamespace(instance_id="multi")]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: dict(sticky or {}))
+
+    def fake_send_request(op, *, params=None, target=None, instance_id=None,
+                          **kwargs):
+        if op == "list_targets":
+            rows = ([{"target_id": "m-t1"}, {"target_id": "m-t2"}]
+                    if instance_id == "multi" else [{"target_id": "solo-t1"}])
+            return {"ok": True, "result": rows}
+        return {"ok": True, "result": {"kind": "sections", "items": [], "total": 0}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    # Each sub-case starts from NO export. `monkeypatch.setenv` lives for the
+    # whole test, and the export BEATS the pin, so an earlier exported
+    # sub-case would otherwise still be in the environment for a later pinned
+    # one -- the pin would never be read and `pinned == exported` would be
+    # comparing the export to itself.
+    monkeypatch.delenv("BN_TARGET", raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+
+    assert bn.cli.main(argv) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    return (sorted((row["instance"], row.get("target"))
+                   for row in payload["instances"]),
+            payload.get("auto_expanded_instances"))
+
+
+def test_an_ambient_selector_does_not_narrow_an_all_instances_survey(
+        monkeypatch, capsys):
+    """The OTHER consumer of the ambient marker, and the one nothing pinned.
+
+    `--all-instances` asks two different questions of a `-t`: an explicit one
+    is a choice, applied to every instance, while an AMBIENT one is not -- it
+    must not suppress the multi-target auto-survey (#368 facet 1, already
+    pinned for the sticky pin in test_cli_core.py). Making `BN_TARGET` ambient
+    in round 3 moved the export from the first answer to the second, which is
+    a real change to a read surface and was pinned by nothing: the export half
+    of this test passes at the round-2 head and at this one, for OPPOSITE
+    reasons, if you only assert an exit code.
+
+    So the three cases are asserted together, and the export is asserted to
+    equal the SURVEY, not merely "not an error". runtime.md states exactly
+    this ("a bare read under `--all-instances` still surveys every target
+    rather than treating the export as a chosen one. Where you need the export
+    to mean 'this exact target, no survey' ... pass `-t`"), and the pin is
+    carried along because the two ambient sources must not drift apart.
+    """
+    survey = ([("multi", "m-t1"), ("multi", "m-t2"), ("solo", "solo-t1")],
+              ["multi"])
+
+    argv = ["sections", "--all-instances", "--format", "json"]
+    exported = _fanout_pairs(monkeypatch, capsys, argv,
+                             env={"BN_TARGET": "beta.bin"})
+    pinned = _fanout_pairs(monkeypatch, capsys, argv,
+                           sticky={"target": "beta.bin"})
+    explicit = _fanout_pairs(monkeypatch, capsys,
+                             ["-t", "beta.bin", *argv],
+                             env={"BN_TARGET": "alpha.bin"})
+
+    assert exported == survey, (
+        "an exported BN_TARGET is ambient: --all-instances must still survey "
+        f"every target rather than apply it per instance; got {exported}")
+    assert pinned == exported, (
+        "the sticky pin and the export are the same ambient value from two "
+        f"sources and must fan out alike; pin={pinned} export={exported}")
+    assert explicit == ([("multi", "beta.bin"), ("solo", "beta.bin")], None), (
+        "an explicit -t IS a choice: it must apply to every instance and "
+        f"suppress the survey, even with a different value exported; got {explicit}")
+
+
+def test_a_broken_ambient_default_does_not_break_a_fan_out_survey(
+        monkeypatch, capsys):
+    """A survey consults no selector, so a broken one cannot corrupt it.
+
+    `--all-targets` reads every open target by definition, and under
+    `--all-instances` an ambient value is already not the explicit choice
+    that would narrow the run. Neither resolves anything from the default,
+    so refusing them because a shell variable is empty is not a safety
+    guarantee -- it is a straight regression: at base an empty pin was never
+    filled at all and the same survey returned its rows.
+
+    Asserted as EQUALITY with the no-ambient run rather than "rc 0", because
+    the failure this guards against is the survey silently narrowing, not
+    only erroring, and both spellings of both sources are carried because
+    the refusal they hit was one shared check.
+    """
+    for argv in (["sections", "--all-instances", "--format", "json"],
+                 ["sections", "--all-targets", "--format", "json"]):
+        clean = _fanout_pairs(monkeypatch, capsys, argv)
+        for label, kwargs in (
+                ("an empty export", {"env": {"BN_TARGET": ""}}),
+                ("a whitespace export", {"env": {"BN_TARGET": "   "}}),
+                ("an empty pin", {"sticky": {"target": ""}}),
+                ("a whitespace pin", {"sticky": {"target": "   "}})):
+            got = _fanout_pairs(monkeypatch, capsys, argv, **kwargs)
+            assert got == clean, (
+                f"{argv[1]} under {label} consults no selector, so it must "
+                f"read exactly what it reads with none: got {got}, "
+                f"expected {clean}")
+
+
+def _ambient_run(monkeypatch, argv, *, env=None, sticky=None,
+                 selectors=("only.bin",)):
+    """Run *argv* through `main` under one ambient-target state.
+
+    Returns `(rc, [(op, target, params), ...])` -- the exit code plus every
+    request that reached the transport, the selector it carried in the
+    ENVELOPE and the params it carried in the PAYLOAD. Both halves, because
+    a blank selector leaked through the payload once while the envelope was
+    clean: `batch apply` writes the selector into the manifest it sends, so
+    a probe that reads only `target=` cannot see it. The op list is also
+    what separates "refused before anything was sent" from "asked the bridge
+    and got an unrelated error".
+
+    Pins a nonexistent instance so no probe can reach a live bridge, and
+    stubs `list_instances` empty so `load`'s ambient-routing guard sees a
+    single-bridge machine.
+    """
+    import bn.cli
+    from bn.transport import send_request as real_send_request
+
+    sent: list[tuple[str, object, dict]] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=None,
+                          default_timeout=None, connect_retries=4,
+                          instance_id=None, spawn_missing_named=False,
+                          resolved=False, idle_probe=False):
+        sent.append((op, target, dict(params or {})))
+        if op == "list_targets":
+            return {"ok": True, "result": [
+                {"target_id": f"1:1:{i}", "selector": sel}
+                for i, sel in enumerate(selectors, start=1)]}
+        if op == "close_binary":
+            return {"ok": True, "result": {"closed": [{"selector": target}],
+                                           "count": 1}}
+        if op == "load_binary":
+            return {"ok": True, "result": {"target_id": "1:1:9",
+                                           "selector": "loaded.bin"}}
+        if op == "save_database":
+            return {"ok": True, "result": {"path": "/tmp/bn-not-a-real.bndb"}}
+        if op == "batch_apply":
+            return {"ok": True, "result": {"results": [{"status": "ok"}],
+                                           "success": True}}
+        return {"ok": True, "result": []}
+
+    # The stub must be no more forgiving than the transport it stands in for:
+    # a `**kwargs` fake swallows a mis-named keyword that would be a
+    # production TypeError, so the signature is asserted against the real one
+    # rather than re-typed and hoped for.
+    assert (inspect.signature(fake_send_request).parameters.keys()
+            == inspect.signature(real_send_request).parameters.keys()), (
+        "the ambient stub has drifted from bn.transport.send_request")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: dict(sticky or {}))
+    monkeypatch.setenv("BN_INSTANCE", "prfleet-nonexistent-889")
+    # Each cell starts from NO export: `setenv` lives for the whole test and
+    # the export BEATS the pin, so a leftover export would make a "pin" cell
+    # measure the export again.
+    monkeypatch.delenv("BN_TARGET", raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    return bn.cli.main(argv), sent
+
+
+# The four ways an ambient source can supply a value that is not a selector:
+# two sources x two spellings. They are carried together everywhere below
+# because each round of this fix has repaired one and left the other.
+_BROKEN_AMBIENT = (
+    ("an empty export", {"env": {"BN_TARGET": ""}}),
+    ("a whitespace export", {"env": {"BN_TARGET": "   "}}),
+    ("an empty pin", {"sticky": {"target": ""}}),
+    ("a whitespace pin", {"sticky": {"target": "   "}}),
+)
+
+
+def test_a_broken_ambient_default_does_not_refuse_the_verb_that_creates_a_target(
+        monkeypatch, tmp_path):
+    """`bn load <path>` cannot need a resolved target: it MAKES one.
+
+    `_apply_sticky_defaults` fills `args.target` on EVERY namespace, including
+    the stems that have no `-t` of their own, so an unassigned export (or an
+    empty pin) put an empty string on `load`'s namespace too -- and the
+    pre-dispatch refusal then failed the one command whose entire job is to
+    open the target everything else resolves. rc 2 with nothing sent, where
+    three of the four cells run at the merge base.
+
+    Asserted against the no-ambient run's shape rather than "not 2": the
+    failure to guard against is `load` quietly not sending, and an exit code
+    alone cannot tell a refused selector from a bridge that declined.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+
+    clean = _ambient_run(monkeypatch, ["load", str(binary)])
+    assert (clean[0], [op for op, _t, _p in clean[1]]) == (0, ["load_binary"]), clean
+
+    for label, kwargs in _BROKEN_AMBIENT:
+        rc, sent = _ambient_run(monkeypatch, ["load", str(binary)], **kwargs)
+        assert (rc, [op for op, _t, _p in sent]) == (0, ["load_binary"]), (
+            f"`bn load <path>` under {label} names what to act on and resolves "
+            f"no target, so a broken ambient default has nothing to corrupt; "
+            f"got rc={rc} sent={sent}")
+        assert [t for _op, t, _p in sent] == [None], (
+            f"`load` must not forward the ambient value at all under {label}; "
+            f"got {sent}")
+
+
+def test_a_broken_ambient_default_is_judged_where_it_would_be_used(monkeypatch,
+                                                                   tmp_path):
+    """The refusal belongs at the consumption site, not on an exempt-verb list.
+
+    Three consecutive review rounds each found one more verb the pre-dispatch
+    gate should never have touched (`close --all`/`close <path>`, then the
+    `--all-instances`/`--all-targets` surveys, then `bn load`), because the
+    question it asked was "is the ambient default broken, and is this command
+    exempt?" -- which can only ever be answered by naming commands, and the
+    list is only ever as complete as the last review.
+
+    Asked at the point the value is actually reached for, the same question
+    needs no list: an empty ambient value is the ABSENCE of a selector, so a
+    command that must resolve one hits the refusal and a command that says
+    what to act on some other way is untouched. This test states that as the
+    contract -- refusal IFF the invocation resolves its target from the
+    default -- over both classes at once, so adding a fourth exemption cannot
+    satisfy it and neither can deleting the refusal.
+
+    The unaffected half compares the WHOLE request, envelope and payload, not
+    just the exit code: `batch apply` writes the selector it will use into
+    the manifest it sends, so a whitespace ambient value that the resolver
+    had already ruled "not a selector" was still filled into the payload and
+    reached the bridge on a destructive op. An equality assertion over
+    (op, target, params) is what sees that; "rc 0" does not.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+    ops = [{"op": "set_comment", "address": "0x1000", "comment": "x"}]
+    bare = tmp_path / "bare.json"
+    bare.write_text(json.dumps({"ops": ops}), encoding="utf-8")
+    named = tmp_path / "named.json"
+    named.write_text(json.dumps({"target": "only.bin", "ops": ops}),
+                     encoding="utf-8")
+
+    # Resolves its target FROM the ambient default (an explicit `-t` is absent,
+    # so the single-open auto-pick would stand in for the broken value).
+    resolving = (["function", "list"], ["close"])
+    # Says what to act on some other way: a path to open, `--all`, the
+    # bridge-side single-open resolution, a manifest (whether or not it names
+    # a target of its own), every open target by construction.
+    naming_its_own = (["load", str(binary)],
+                      ["close", "--all"],
+                      ["save"],
+                      ["batch", "apply", str(bare), "--format", "json"],
+                      ["batch", "apply", str(named), "--format", "json"],
+                      ["sections", "--all-targets", "--format", "json"])
+
+    for argv in resolving:
+        for label, kwargs in _BROKEN_AMBIENT:
+            rc, sent = _ambient_run(monkeypatch, argv, **kwargs)
+            assert (rc, sent) == (2, []), (
+                f"`bn {' '.join(argv)}` resolves its target from the ambient "
+                f"default, so {label} is the resolution it corrupts and must "
+                f"be refused before anything is sent; got rc={rc} sent={sent}")
+
+    for argv in naming_its_own:
+        clean = _ambient_run(monkeypatch, argv)
+        for label, kwargs in _BROKEN_AMBIENT:
+            got = _ambient_run(monkeypatch, argv, **kwargs)
+            assert got == clean, (
+                f"`bn {' '.join(argv)}` resolves nothing from the ambient "
+                f"default, so under {label} it must send exactly what it "
+                f"sends with the variable unset -- envelope AND payload; got "
+                f"{got}, expected {clean}")
+
+
+def test_an_empty_ambient_value_never_reaches_the_bridge_as_a_selector(
+        monkeypatch, tmp_path):
+    """The hazard is the empty STRING, and dropping it must not forward it.
+
+    The bridge collapses an empty selector to the focused GUI view with no
+    count check, which is why an empty ambient value may never be sent. The
+    inversion answers "not a selector" with the ABSENCE of one -- `None` --
+    and the difference matters: `None` goes to the bridge's own single-open
+    resolution and its #688 destructive gate, where `""` goes to whichever
+    tab has focus.
+
+    Two places can carry a selector, and the first cut of this test only
+    watched one. `batch apply` puts the selector it will use inside the
+    manifest it sends, so a whitespace ambient value that had already been
+    ruled "not a selector" for the envelope was still written into the
+    PAYLOAD of a destructive op -- past the manifest's own empty-target
+    check, which runs before the fill. So the sweep reads both halves of
+    every request, and the verb list includes the one that fills a payload.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+    bare = tmp_path / "bare.json"
+    bare.write_text(json.dumps(
+        {"ops": [{"op": "set_comment", "address": "0x1000", "comment": "x"}]}),
+        encoding="utf-8")
+
+    for argv in (["function", "list"], ["close"], ["close", "--all"],
+                 ["save"], ["load", str(binary)],
+                 ["batch", "apply", str(bare), "--format", "json"],
+                 ["sections", "--all-targets", "--format", "json"]):
+        for label, kwargs in _BROKEN_AMBIENT:
+            _rc, sent = _ambient_run(monkeypatch, argv, **kwargs)
+            blank = [(op, where, value)
+                     for op, target, params in sent
+                     for where, value in (("envelope", target),
+                                          ("params.target",
+                                           params.get("target")))
+                     if value is not None and not str(value).strip()]
+            assert blank == [], (
+                f"`bn {' '.join(argv)}` under {label} forwarded a blank "
+                f"selector; the bridge would resolve it to the focused view: "
+                f"{blank}")
+
+
+def test_a_typed_empty_target_is_still_refused_on_a_fan_out_survey(monkeypatch):
+    """Dropping the AMBIENT half at the survey must not drop the TYPED half.
+
+    The survey never reaches the shared resolver, so the "a `-t \"\"` the
+    caller typed is a broken argument" rule is stated a second time on that
+    path -- and a rule stated twice can drift. Neutralising the survey copy
+    left this module entirely green, which means the coverage for it lived
+    somewhere this PR does not touch. Pin it here, beside the ambient cases
+    it has to stay distinguishable from.
+    """
+    for flag in ("--all-instances", "--all-targets"):
+        rc, sent = _ambient_run(
+            monkeypatch, ["-t", "", "sections", flag, "--format", "json"])
+        assert (rc, sent) == (2, []), (
+            f"an explicit `-t ''` with {flag} is a broken argument, not a "
+            f"broken default, so the survey must refuse it with nothing "
+            f"sent; got rc={rc} sent={sent}")
+
+
+def test_a_valid_ambient_selector_still_steers_the_verbs_that_forward_it(
+        monkeypatch, tmp_path):
+    """"Unaffected by a BROKEN default" is not "ignores the ambient value".
+
+    Those are two different statements about the same list, and runtime.md
+    conflated them: `bn save` and `bn load` are unaffected by an EMPTY
+    ambient value, but they consume a VALID one and forward it as the
+    request target -- so an exported selector really does decide which
+    analysis database a bare `bn save` overwrites. That is the one
+    destructive verb in the list an ambient value steers, and the reference
+    now says so; this pins the behaviour it describes, so the sentence
+    cannot quietly become false.
+
+    The bare destructive `close` is carried as the contrast: it is the verb
+    that ignores a valid ambient value outright, and asserting only the
+    forwarding half would stay green if that guarantee were deleted.
+    """
+    binary = tmp_path / "prog.bin"
+    binary.write_bytes(b"\x7fELF\x00")
+
+    for source, kwargs in (("an exported selector", {"env": {"BN_TARGET": "only.bin"}}),
+                           ("a pinned selector", {"sticky": {"target": "only.bin"}})):
+        for argv, op in ((["save"], "save_database"),
+                         (["load", str(binary)], "load_binary")):
+            rc, sent = _ambient_run(monkeypatch, argv, **kwargs)
+            assert (rc, [(o, t) for o, t, _p in sent]) == (0, [(op, "only.bin")]), (
+                f"`bn {' '.join(argv)}` forwards {source} as its request "
+                f"target; got rc={rc} sent={sent}")
+
+        rc, sent = _ambient_run(monkeypatch, ["close"], **kwargs)
+        assert [(o, t) for o, t, _p in sent] == [("list_targets", None),
+                                                 ("close_binary", "1:1:1")], (
+            f"a bare destructive `close` must IGNORE {source} and resolve the "
+            f"single open target itself; got {sent}")
+
+
+def test_bn_target_is_scrubbed_from_the_test_environment():
+    """An ambient BN_TARGET would redirect every test that passes no selector.
+
+    The multi-target refusals exist precisely to fire when nothing was given;
+    an exported value stops them firing and the suite goes green for the wrong
+    reason. Same argument that put BN_INSTANCE on this list.
+    """
+    from conftest import SCRUBBED_ENV_VARS
+
+    assert "BN_TARGET" in SCRUBBED_ENV_VARS
+
+
+def test_the_runtime_reference_denies_no_environment_default_the_cli_honours(
+        monkeypatch):
+    """runtime.md's routing ladder is where an agent learns how `-t` resolves,
+    and it said -- in bold -- that `BN_TARGET` does not exist, while the root
+    parser had started defaulting `-t` from it.
+
+    A doc that denies a shipped mechanism is worse than one that omits it: the
+    agent reads the denial, keeps paying `-t` on every command, and the
+    clobber hazard the variable exists to remove stays in place. The sibling
+    guard `test_every_flag_the_reference_denies_really_does_not_exist` covers
+    the same failure for FLAGS and cannot see this one, because its token
+    pattern only matches `--spellings`.
+
+    Both halves are asserted in one test on purpose. The doc half alone is
+    satisfiable by deleting the sentence while the mechanism is reverted, and
+    the behaviour half is what the sibling tests above already pin; it is
+    their CONJUNCTION that is the contract.
+    """
+    import re
+    from pathlib import Path
+
+    from test_skill_reference_drift import _SENTENCE, bound_absence_claims
+
+    # The mechanism is really shipped: the exported value reaches the request.
+    assert "beta.bin" in _capture_target(
+        monkeypatch, ["function", "list"], {"BN_TARGET": "beta.bin"})
+
+    # The env analogue of `_DOC_FLAG`/`_ABSENCE_CLAIM`: same denial forms, an
+    # env-variable token instead of a long flag. `bound_absence_claims` is
+    # shared rather than reimplemented -- it is already parameterised over the
+    # token and claim patterns for exactly this reason.
+    env_name = re.compile(r"BN_[A-Z][A-Z0-9_]*")
+    env_absence = re.compile(
+        r"`(BN_[A-Z0-9_]+)`[^.`]{0,30}do(?:es)? not exist"
+        r"|there is no `(BN_[A-Z0-9_]+)`"
+        r"|no such `?(BN_[A-Z0-9_]+)`?"
+        r"|no `(BN_[A-Z0-9_]+)` (?:variable|environment variable|default)")
+
+    doc = Path(__file__).resolve().parents[1] / "skills/bn/reference/runtime.md"
+    denied: set[str] = set()
+    for sentence in _SENTENCE.split(doc.read_text(encoding="utf-8")):
+        denied |= bound_absence_claims(sentence, env_name, env_absence)
+
+    assert "BN_TARGET" not in denied, (
+        "runtime.md denies BN_TARGET while the root `-t` default reads it")

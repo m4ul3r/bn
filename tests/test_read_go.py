@@ -33,6 +33,40 @@ def _build_pclntab(*, magic=0xFFFFFFF1, ptr_size=8, text_start=0x400000):
     return bytes(blob)
 
 
+def _build_pclntab_many(count, *, text_start=0x400000, entry_step=0x1000):
+    """A Go 1.20-format .gopclntab declaring *count* functions at distinct starts
+    (`main.f0` @ text_start+entry_step = 0x401000, `main.f1` @ +2*entry_step, ...).
+
+    Same layout as `_build_pclntab`, parameterized on the population so a test can
+    drive a view where a RATIO decides the answer (#883 item 1) instead of the
+    two-row fixture where any share is 0%, 50% or 100%.
+    """
+    funcname_off = 72
+    names = bytearray()
+    name_offsets: list[int] = []
+    for i in range(count):
+        name_offsets.append(len(names))
+        names += f"main.f{i}\x00".encode()
+    pcln_off = funcname_off + len(names)
+    func_off = count * 8                      # the _func table follows the functab
+    blob = bytearray(pcln_off + func_off + count * 8)
+    struct.pack_into("<I", blob, 0, 0xFFFFFFF1)
+    blob[6] = 1                               # minLC
+    blob[7] = 8                               # ptrSize
+    struct.pack_into("<Q", blob, 8, count)    # nfunc
+    struct.pack_into("<Q", blob, 24, text_start)
+    struct.pack_into("<Q", blob, 32, funcname_off)
+    struct.pack_into("<Q", blob, 64, pcln_off)
+    blob[funcname_off:funcname_off + len(names)] = names
+    for i in range(count):
+        struct.pack_into("<I", blob, pcln_off + i * 8 + 4, func_off + i * 8)
+        struct.pack_into("<I", blob, pcln_off + func_off + i * 8,
+                         entry_step * (i + 1))     # _func entryoff
+        struct.pack_into("<i", blob, pcln_off + func_off + i * 8 + 4,
+                         name_offsets[i])          # nameoff
+    return bytes(blob)
+
+
 class _GoBV:
     def __init__(self, blob, *, base=0x500000, defined=(), text_start=0x400000):
         self._blob = blob or b""
@@ -77,6 +111,45 @@ def test_go_functions_recovers_names_and_addresses(monkeypatch):
     assert by_name["main.bar"]["address"] == hex(0x402000)
     assert by_name["main.bar"]["defined"] is False
     assert out["total"] == 2 and out["defined_count"] == 1
+
+
+def test_go_functions_defined_via_containment_for_an_interior_pc_818(monkeypatch):
+    # #818: `defined` was read off `get_function_at` alone, which is START-only.
+    # A pcln entry whose prolog is a few bytes off -- or whose `_func` entryoff is
+    # an interior PC -- therefore read `defined: false`, and on a table where EVERY
+    # row missed that way the 0-match NOTE fired (PIE rebase / incomplete analysis)
+    # on a view that had in fact resolved each address to a function. Containment
+    # is the relation the row is asking about; the fallback is the same
+    # first-containing-function lookup the sibling reads use.
+    class _InteriorGoBV(_GoBV):
+        """BN recovers both pcln addresses as interior PCs of a function, so the
+        START-only accessor misses them and only containment finds them."""
+
+        _CONTAINERS = {0x401000: "sub_401000", 0x402000: "sub_402000"}
+
+        def get_function_at(self, addr):
+            return None
+
+        def get_functions_containing(self, addr):
+            name = self._CONTAINERS.get(int(addr))
+            return [type("F", (), {"name": name})()] if name else []
+
+    bridge, inst = _ctx(monkeypatch, _InteriorGoBV(_build_pclntab()))
+    out = inst._go_functions(None)
+    by_name = {i["name"]: i for i in out["items"]}
+
+    assert by_name["main.foo"]["defined"] is True
+    assert by_name["main.bar"]["defined"] is True
+    assert out["defined_count"] == 2
+    # #818 review: `defined` is satisfied by containment, so the note can no longer
+    # be gated on it. Gated there, a table whose every row lands on an interior PC
+    # (a constant rebase delta over a dense .text does exactly this) reported
+    # `defined: true` everywhere with the rebase warning suppressed. It is gated on
+    # START matches now, and its wording says which relation matched -- so a reader
+    # is told the rows are off-prolog, not sent to rebase good addresses blindly.
+    assert out["start_match_count"] == 0
+    assert "note" in out
+    assert "START" in out["note"] and "interior PC" in out["note"]
 
 
 def test_go_functions_count_only_skips_the_list(monkeypatch):
@@ -376,3 +449,204 @@ def test_go_rename_cancel_rolls_back(monkeypatch):
 
     assert fns[0x401000].name == "sub_401000"
     assert fns[0x402000].name == "sub_402000"
+class _ContainmentOnlyGoBV(_GoBV):
+    """A view where the pcln addresses are INTERIOR PCs of an already-recovered
+    body, so `get_function_at` (START-only) misses every one of them and only
+    `get_functions_containing` answers (#818's relation, which `go rename` still
+    re-resolved with the START-only accessor).
+
+    *starts* names the addresses BN does have a function START at; the rest are
+    answered by containment alone, under the containing body's own name.
+    """
+
+    _CONTAINER_NAME = "sub_400000"
+
+    def __init__(self, blob, *, starts=(), **kw):
+        super().__init__(blob, **kw)
+        self._starts = dict(starts)
+
+    def get_function_at(self, addr):
+        name = self._starts.get(int(addr))
+        return type("F", (), {"name": name})() if name else None
+
+    def get_functions_containing(self, addr):
+        return [type("F", (), {"name": self._CONTAINER_NAME})()]
+
+
+def test_go_rename_accounts_for_containment_only_rows_818(monkeypatch):
+    """#818 review: the two views must state ONE population.
+
+    `go functions` counts `defined` by CONTAINMENT, so on a view whose pcln
+    addresses resolve only as interior PCs it reports `defined 1848` -- while
+    `go rename` re-resolved every candidate with the START-only accessor, matched
+    nothing, and answered `defined_count: 1848` beside `go_renamed_candidates: 0`
+    with `success: true` and `results: []`. Rows #818 promoted to `defined: true`
+    landed in no bucket at all: not a candidate, not `skipped_user_named`, not a
+    failure row, so nothing in the envelope reconciled the two totals.
+
+    The row is DISCLOSED as unrenamable rather than renamed: the recovered name
+    belongs to the function that starts at the pcln entryoff, and the containing
+    body starts elsewhere -- applying it there would mislabel it.
+    """
+    blob = _build_pclntab()          # main.foo @0x401000, main.bar @0x402000
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob))
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("go rename must not use generic mutation"))
+
+    listed = inst._go_functions(None, summary=True)
+    rename = inst._go_rename(None, preview=True)
+
+    # Both views agree that two rows are defined...
+    assert listed["defined"] == 2 and listed["start_match_count"] == 0
+    assert rename["defined_count"] == 2
+    # ...and the rename side accounts for both of them instead of dropping them.
+    assert rename["go_renamed_candidates"] == 0 and rename["results"] == []
+    assert rename["skipped_interior_pc"] == 2
+    assert (rename["go_renamed_candidates"] + rename["skipped_user_named"]
+            + rename["skipped_interior_pc"]) == rename["defined_count"]
+
+    # The chunked/apply path carries the same accounting: one auto-named START
+    # candidate beside one containment-only row.
+    mixed, get_function_at = _fake_functions({0x401000: "sub_401000"})
+    mixed_bv = _ContainmentOnlyGoBV(blob, starts={0x401000: "sub_401000"})
+    monkeypatch.setattr(mixed_bv, "get_function_at", get_function_at)
+    _bridge, mixed_inst = _ctx(monkeypatch, mixed_bv)
+
+    applied = mixed_inst._go_rename(None, preview=True)
+
+    assert applied["go_renamed_candidates"] == 1
+    assert applied["go_verified_count"] == 1 and applied["skipped_interior_pc"] == 1
+    assert applied["defined_count"] == 2
+    assert mixed[0x401000].name == "sub_401000"          # preview reverted it
+
+
+def test_go_functions_summary_carries_the_note_and_the_start_matches_818(monkeypatch):
+    """#818 review: the go/no-go view is the one that must not lose the warning.
+
+    The note was attached after the summary branch returned, so `--summary` could
+    never carry it, and the counter it is gated on (`start_match_count`) was
+    JSON-only: the text renderer did not print it at all. Pre-#818 that view said
+    `defined 0 / undefined 1848` (loud and wrong); once `defined` could be
+    satisfied by containment the same view says `defined 1848 / undefined 0` --
+    the headline a caller decides `go rename` on -- with nothing saying that no
+    row matches a function START.
+    """
+    from bn.formatters import _render_go_functions_summary_text
+
+    blob = _build_pclntab()
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob))
+
+    summary = inst._go_functions(None, summary=True)
+
+    assert summary["defined"] == 2 and summary["undefined"] == 0
+    assert summary["start_match_count"] == 0
+    assert "note" in summary and "interior PC" in summary["note"]
+
+    text = _render_go_functions_summary_text(summary)
+    assert "start_matches: 0" in text
+    assert "interior PC" in text
+
+
+def test_go_functions_rebase_note_survives_a_single_start_match_883(monkeypatch):
+    """#883 item 1: a binary gate on `start_match_count` is not a gate on the
+    question the note asks.
+
+    Forced with exactly ONE matching address on a view whose other rows resolve
+    only as interior PCs: `defined 10`, `start_match_count 1`, and before this the
+    note was suppressed -- so the summary read clean while 9 of the 10 resolved
+    addresses were off-prolog, which is the shape a constant rebase delta
+    produces. A START match is evidence about THAT row, not about the table.
+
+    The bucket partition stays self-consistent while the gate changes: the note
+    states `defined - start_match` interior rows and invents no counter, so
+    `start_match + interior == defined` still reconciles both views.
+    """
+    from bn.formatters import _render_go_functions_summary_text, _render_go_functions_text
+
+    blob = _build_pclntab_many(10)               # starts at 0x401000, 0x402000, ...
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob, starts={0x401000: "sub_401000"}))
+
+    listed = inst._go_functions(None)
+
+    assert listed["defined_count"] == 10 and listed["start_match_count"] == 1
+    assert listed["defined_count"] - listed["start_match_count"] == 9   # the interior share
+    assert "note" in listed, "9 of 10 resolved rows being interior PCs must not read clean"
+    assert "9 of the 10" in listed["note"] and "1 matched a START" in listed["note"]
+    assert "interior PC" in listed["note"]
+    # The text face carries it, and carries it on a SLICE: the note lives on the
+    # envelope, not on a row, so `--offset`/`--limit` pages cannot lose it.
+    sliced = inst._go_functions(None, offset=2, limit=3)
+    assert "note" in sliced and "9 of the 10" in sliced["note"]
+    assert "interior PC" in _render_go_functions_text(sliced)
+
+    summary = inst._go_functions(None, summary=True)
+    assert summary["defined"] == 10 and summary["start_match_count"] == 1
+    assert "note" in summary and "interior PC" in summary["note"]
+    text = _render_go_functions_summary_text(summary)
+    assert "start_matches: 1" in text and "interior PC" in text
+
+
+def test_go_functions_rebase_note_ratio_boundary_883(monkeypatch):
+    """The other half of the ratio: it must not turn a well-based table into an
+    alarm. 2 interior rows in 10 (20%) stays quiet -- the counters still state the
+    split -- while exactly half is where the note starts firing."""
+    from bn.formatters import _render_go_functions_text
+
+    blob = _build_pclntab_many(10)
+    every_start = {0x400000 + 0x1000 * (i + 1): f"sub_{0x400000 + 0x1000 * (i + 1):x}"
+                   for i in range(10)}
+
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(blob, starts=every_start))
+    quiet = inst._go_functions(None)
+    assert quiet["defined_count"] == 10 and quiet["start_match_count"] == 10
+    assert "note" not in quiet
+
+    # Eight of ten matching at their start: two interior rows, below the gate.
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(
+        blob, starts={a: n for a, n in every_start.items() if a < 0x409000}))
+    below = inst._go_functions(None)
+    assert below["defined_count"] == 10 and below["start_match_count"] == 8
+    assert "note" not in below
+    assert "interior PC" not in _render_go_functions_text(below)
+
+    # Exactly half -- the boundary the constant names.
+    bridge, inst = _ctx(monkeypatch, _ContainmentOnlyGoBV(
+        blob, starts={a: n for a, n in every_start.items() if a < 0x406000}))
+    half = inst._go_functions(None)
+    assert half["defined_count"] == 10 and half["start_match_count"] == 5
+    assert "note" in half and "5 of the 10" in half["note"]
+
+
+def test_go_functions_rebase_note_does_not_claim_interior_pcs_when_nothing_resolved_818(monkeypatch):
+    """#818 review: the PIE branch was reached BEFORE the "nothing resolved"
+    branch, so a table where `defined_count` is 0 -- no row resolved to a BN
+    function by START *or* by containment -- was told "Every address resolves at
+    best to an interior PC". That is a positive claim about a relation that held
+    for no row at all, and it sends a reader to rebase addresses on the strength
+    of a containment result the view never produced. The textStart mismatch is
+    still disclosed; what it may not do is invent the interior-PC finding.
+    """
+    from bn.formatters import _render_go_functions_text
+
+    bv = _GoBV(_build_pclntab(text_start=0x400000), defined=set(), text_start=0x800000)
+    bridge, inst = _ctx(monkeypatch, bv)
+    out = inst._go_functions(None)
+
+    assert out["defined_count"] == 0 and out["start_match_count"] == 0
+    note = out["note"]
+    # The rebase/PIE disclosure survives -- that part was true.
+    assert "PIE" in note and "rebase" in note.lower()
+    # ...but nothing resolved, so no row can be said to resolve to anything.
+    assert "interior PC" not in note, note
+    assert "interior PC" not in _render_go_functions_text(out)
+
+    summary = inst._go_functions(None, summary=True)
+    assert "interior PC" not in summary["note"], summary["note"]
+
+    # The interior-PC wording is still what a view that DID resolve rows gets,
+    # so this is a scoping fix and not the note's removal.
+    resolved = _ContainmentOnlyGoBV(_build_pclntab_many(10), starts={})
+    bridge, inst = _ctx(monkeypatch, resolved)
+    interior = inst._go_functions(None)
+    assert interior["defined_count"] == 10 and interior["start_match_count"] == 0
+    assert "interior PC" in interior["note"]

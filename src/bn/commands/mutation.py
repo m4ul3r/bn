@@ -55,7 +55,8 @@ def _symbol_rename(args: argparse.Namespace) -> int:
                # address-only behaviour stays expressible.
                arg("--scope", choices=["all", "address", "function"], default="all",
                    help="Which comment store to list: address comments, function "
-                        "documentation comments (fn.comment), or both (default: all)")])
+                        "documentation comments (fn.comment), or both (default: all)")],
+         estimable=True)
 def _comment_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -148,7 +149,8 @@ def _comment_set(args: argparse.Namespace) -> int:
 
 
 @command("comment", "get", help="Get a comment", target=True,
-         args=_comment_locator_args())
+         args=_comment_locator_args(),
+         estimable=True)
 def _comment_get(args: argparse.Namespace) -> int:
     address, function = _comment_locator(args, "get")
     return _call(
@@ -201,7 +203,8 @@ def _proto_set(args: argparse.Namespace) -> int:
 
 
 @command("proto", "get", help="Show the current prototype", target=True,
-         args=[arg("identifier", help="Function name or address (hex 0x.. or decimal)")])
+         args=[arg("identifier", help="Function name or address (hex 0x.. or decimal)")],
+         estimable=True)
 def _proto_get(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -214,7 +217,8 @@ def _proto_get(args: argparse.Namespace) -> int:
 
 
 @command("local", "list", help="List locals with stable IDs", target=True,
-         args=[arg("function")])
+         args=[arg("function")],
+         estimable=True)
 def _local_list(args: argparse.Namespace) -> int:
     return _call(
         args,

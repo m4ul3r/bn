@@ -2427,6 +2427,82 @@ def test_function_text_accepts_valid_views(monkeypatch):
         assert isinstance(text, str)
 
 
+def test_function_text_renders_the_hlil_tree_for_a_string_operation_827(monkeypatch):
+    # #827 item 5: `_format_hlil_tree` read `ins.operation.name` DIRECTLY at three
+    # sites, so an instruction whose `operation` is a bare STRING raised
+    # AttributeError mid-tree -- and `_function_text` swallows that into the flat
+    # `il.instructions` listing, so an entire tree silently rendered as the
+    # inferior listing instead of the tree the view actually had. The defensive
+    # `_il_op_name` exists for exactly this shape; each site is driven below, one
+    # root per site, so a fix that guards only the first one still fails.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Op:
+        def __init__(self, name):
+            self.name = name
+
+    class _StrNode:
+        """An IL instruction whose `operation` is a STRING rather than an object
+        with `.name` (a unit/double shape, and a documented possibility)."""
+
+        def __init__(self, op_name, text, **attrs):
+            self.operation = op_name
+            self.text = text
+            for key, value in attrs.items():
+                setattr(self, key, value)
+
+        def __str__(self):
+            return self.text
+
+    class _StrBlock(_StrNode):
+        def __init__(self, children):
+            super().__init__("HLIL_BLOCK", "")
+            self.children = children
+
+        def __iter__(self):
+            return iter(self.children)
+
+    class _OpNode(_StrNode):
+        """The normal shape: `operation` is an object carrying `.name`."""
+
+        def __init__(self, op_name, text, **attrs):
+            super().__init__(_Op(op_name), text, **attrs)
+
+    class _FlatFallback:
+        def __str__(self):
+            return "FLAT-FALLBACK-LINE"
+
+    def render(root):
+        hlil = types.SimpleNamespace(root=root, instructions=[_FlatFallback()])
+        fn = types.SimpleNamespace(name="widget_poll", start=0x401000, hlil=hlil)
+        return instance._function_text(None, fn, view="hlil")
+
+    # 1. the root/statement op (pre-fix: AttributeError on the root's own op).
+    text = render(_StrBlock([_StrNode("HLIL_ASSIGN", "x = 1", address=0x401000)]))
+    assert "x = 1" in text and "FLAT-FALLBACK-LINE" not in text
+
+    # 2. the HLIL_IF false-branch op.
+    branch = _OpNode("HLIL_IF", "if (x)", condition="x")
+    branch.true = _StrBlock([_StrNode("HLIL_ASSIGN", "y = 2")])
+    branch.false = _StrNode("HLIL_NOP", "empty else")
+    text = render(branch)
+    assert "if (x)" in text and "y = 2" in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+    # 3. the HLIL_SWITCH default op.
+    switch = _OpNode("HLIL_SWITCH", "switch (x)", condition="x")
+    switch.cases = [_StrNode("HLIL_CASE", "case 1:", values=[1],
+                             body=_StrNode("HLIL_ASSIGN", "y = 3"))]
+    switch.default = _StrNode("HLIL_NOP", "empty default")
+    text = render(switch)
+    assert "switch (x)" in text and "case 1:" in text and "y = 3" in text
+    # A NOP default renders no `default:` arm -- the comparison itself is the
+    # site, so this pins that it was made through the guarded helper.
+    assert "default:" not in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+
 def test_il_function_for_rejects_unknown_view(monkeypatch):
     # #527: the structured-IL boundary must reject an unknown view rather than
     # silently substituting MLIL (which the caller then labels as requested).
@@ -3288,7 +3364,7 @@ def _cfg_asm_bv():
         lines=[_FakeCFGLine(0x401000, "cmp eax, 0x0"),
                _FakeCFGLine(0x401004, "je 0x401010")],
         edges=[_FakeCFGEdge(b2, "TrueBranch"),
-               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: must be dropped
+               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: disclosed (#682)
     )
     fn.basic_blocks = [b1, b2]
     return _FakeBV(functions=[fn]), fn
@@ -3311,9 +3387,155 @@ def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
         {"a": "0x401000", "t": "cmp eax, 0x0"},
         {"a": "0x401004", "t": "je 0x401010"},
     ]
-    # The edge whose target is None (indirect/unresolved) is dropped, not rendered.
+    # #682 item 3: a null-target edge is NOT emitted as a row. It would have
+    # to carry `to: null`, and bn-tui types that field `pub to: String` with
+    # no serde default -- so a null fails the decode, and because the failure
+    # is inside `Vec<CfgEdge>` the whole CFG parse fails and the TUI shows an
+    # EMPTY view with no error. The shape is also unreachable on BN 6.1.
+    # The unresolved target is reported on the BLOCK instead, where the
+    # disclosure is additive and no consumer breaks.
     assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    assert blocks[0]["undetermined_edges"] is True
     assert blocks[1]["edges"] == []
+    assert "undetermined_edges" not in blocks[1]
+
+
+def test_cfg_edge_rows_stay_exactly_two_keys_for_a_strict_consumer_682(monkeypatch):
+    # Must-not-fire twin for #682 item 3, repointed at the contract that
+    # actually matters. bn-tui decodes an edge as `{to: String, k: String}`
+    # with `to` non-optional, so the edge row must never grow a key that
+    # changes its shape and must never carry a non-string `to` -- the whole
+    # reason the unresolved case moved to the block. Assert the row's exact
+    # key set rather than the absence of one name a later change could rename.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_asm_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "process_packet", view="asm")
+
+    for block in result["blocks"]:
+        for edge in block["edges"]:
+            assert set(edge) == {"to", "k"}, edge
+            assert isinstance(edge["to"], str), edge
+
+
+def test_cfg_asm_blocks_are_sorted_by_start_not_bn_iteration_order(monkeypatch):
+    # #682 item 4: BN yields asm basic blocks in its own order, which is not
+    # address order. Feed them deliberately interleaved -- the shape observed
+    # on a real target -- and require address order out.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401090, "handler", "void handler(void)")
+    b_90 = _FakeCFGBlock(0x401090, lines=[_FakeCFGLine(0x401090, "push rbp")])
+    b_b0 = _FakeCFGBlock(0x4010B0, lines=[_FakeCFGLine(0x4010B0, "ret")])
+    b_9d = _FakeCFGBlock(0x40109D, lines=[_FakeCFGLine(0x40109D, "test eax, eax")])
+    b_a7 = _FakeCFGBlock(0x4010A7, lines=[_FakeCFGLine(0x4010A7, "jmp 0x4010b0")])
+    fn.basic_blocks = [b_90, b_b0, b_9d, b_a7]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "handler", view="asm")
+
+    assert [b["start"] for b in result["blocks"]] == [
+        "0x401090", "0x40109d", "0x4010a7", "0x4010b0",
+    ]
+
+
+def test_cfg_discloses_a_block_whose_successors_bn_could_not_resolve_682(monkeypatch):
+    # #682 item 3, the LIVE half. A cross-dogfood sweep of 12,191 functions x
+    # 3 IL levels over four targets found ZERO edges with `target is None`:
+    # `BasicBlock._make_edges` asserts the reference is non-None and wraps it
+    # through `_create_instance`, which cannot return None. What a real
+    # unresolvable indirect jump (`jmp rax`) produces instead is NO EDGES AT
+    # ALL -- so it rendered byte-identically to a block with no successor,
+    # the same lost distinction, in the shape that actually occurs.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "dispatch", "void dispatch(void)")
+    blk = _FakeCFGBlock(0x401000,
+                        lines=[_FakeCFGLine(0x401000, "jmp rax")],
+                        edges=[], undetermined=True)
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert block["undetermined_edges"] is True
+
+
+def test_cfg_a_genuine_dead_end_block_is_not_marked_undetermined_682(monkeypatch):
+    # Must-not-fire twin, and the whole point of the disclosure: a `ret`
+    # block really has no successors. If both shapes carried the marker the
+    # distinction would be lost in the other direction.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "leaf", "void leaf(void)")
+    fn.basic_blocks = [_FakeCFGBlock(0x401000,
+                                     lines=[_FakeCFGLine(0x401000, "ret")],
+                                     edges=[])]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "leaf", view="asm")
+
+    block = result["blocks"][0]
+    assert block["edges"] == []
+    assert "undetermined_edges" not in block
+
+
+def test_cfg_a_block_that_cannot_answer_the_probe_claims_neither_682(monkeypatch):
+    # An IL block object or a reduced view need not implement the property.
+    # Absent -- or raising -- is INDETERMINATE: it must not be reported as
+    # undetermined (a fabricated claim) and must not raise out of the op.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "reduced", "void reduced(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+    del blk.has_undetermined_outgoing_edges
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "reduced", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
+
+
+
+def test_cfg_a_probe_that_raises_claims_neither_682(monkeypatch):
+    # #889b review: the comment promises "absent OR raising" is indeterminate,
+    # but only the ABSENT variant drove the except path -- the raising half of
+    # a defensive read was unexercised. The whole fix hinges on reading BN's
+    # answer defensively, so the path that exists for a throwing probe needs a
+    # probe that throws.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "hostile", "void hostile(void)")
+    blk = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")], edges=[])
+
+    # A plain `__get__`-only class is a NON-data descriptor, so the instance
+    # attribute `__init__` sets would shadow it and the probe would never
+    # raise -- a vacuous test that passes against code with no except clause
+    # at all. Use a subclass whose property really raises, on an instance
+    # that has no shadowing entry in its __dict__.
+    class _HostileBlock(type(blk)):
+        @property
+        def has_undetermined_outgoing_edges(self):
+            raise RuntimeError("core refused the undetermined-edges query")
+
+    blk.__class__ = _HostileBlock
+    del blk.__dict__["has_undetermined_outgoing_edges"]
+    fn.basic_blocks = [blk]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "hostile", view="asm")
+
+    assert "undetermined_edges" not in result["blocks"][0]
 
 
 def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
@@ -3612,6 +3834,402 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
 
 
+def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+    # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
+    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
+    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # the analysis threads can add to while the walk is in flight. The store
+    # below mutates DURING that walk (the #850 store's mechanism, walked through
+    # `values()` because this site unpacked the value view), so the pre-fix code
+    # dies of the production error and the snapshot returns what was there when
+    # the call started.
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+
+    class _LiveFunctionCommentStore(Mapping):
+        """`func.comments` as the bridge sees it: a live map analysis may add to
+        at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def values(self):
+            for index, text in enumerate(self._entries.values()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield text
+
+    class _FakeFunc:
+        comment = ""
+
+        def __init__(self, store) -> None:
+            self.comments = store
+
+    store = _LiveFunctionCommentStore({0x1000: "a local note"})
+    # Pre-fix: RuntimeError: dictionary changed size during iteration.
+    bodies = read_decompile._annotation_bodies(_FakeFunc(store), {})
+    assert bodies == ["a local note"]
+
+# ---------------------------------------------------------------------------
+# #675 item 5: return width inferred from the full register, disclosed
+# ---------------------------------------------------------------------------
+
+
+class _RWType:
+    def __init__(self, width):
+        self.width = width
+
+
+class _RWParam:
+    def __init__(self, width):
+        self.type = _RWType(width)
+
+
+class _RWFunc:
+    def __init__(self, ret_width=8, params=(4, 4), has_user_type=False):
+        self.return_type = _RWType(ret_width)
+        self.parameter_vars = [_RWParam(w) for w in params]
+        self.has_user_type = has_user_type
+
+
+class _RWArch:
+    def __init__(self, name):
+        self.name = name
+
+
+class _RWBV:
+    def __init__(self, arch):
+        self.arch = _RWArch(arch)
+
+
+def _note(arch, **kw):
+    from bn_agent_bridge import read_decompile
+
+    return read_decompile._return_width_inference_note(_RWBV(arch), _RWFunc(**kw))
+
+
+@pytest.mark.parametrize("arch,reg", [("x86_64", "eax"), ("aarch64", "w0")])
+def test_return_width_note_names_the_mechanism_for_each_arch_in_the_set(arch, reg):
+    """The note must explain the arch's OWN register relation, not x86's.
+
+    Both members of the set share one mechanism -- a 32-bit write zero-extends
+    the 64-bit return register -- but they do not share register names. A note
+    that said `eax` on AArch64 would be a confident claim about a register the
+    target does not have.
+    """
+    note = _note(arch)
+    assert note is not None
+    assert arch in note
+    assert reg in note
+
+
+def test_return_width_note_is_silent_on_an_arch_outside_the_set():
+    """The must-not-fire twin: ARM32/thumb2 has no widening to disclose.
+
+    Its registers are natively 32-bit, so the ambiguity this note explains
+    does not exist there -- a measured cross-build finds ZERO over-wide
+    functions. A gate that leaked past its scope would print an x86/AArch64
+    register relation over ARM firmware, which is worse than printing nothing:
+    silence is the correct output where there is no evidence.
+    """
+    for arch in ("thumb2", "armv7", "mipsel32", "riscv32"):
+        assert _note(arch) is None, f"note leaked onto {arch}"
+
+
+def test_return_width_note_defers_to_an_analyst_set_prototype():
+    """A user-set type is not an inference, so there is nothing to disclose."""
+    assert _note("x86_64", has_user_type=True) is None
+
+
+def test_return_width_note_requires_the_ambiguous_shape():
+    """Selectivity is the whole design: a loud note is skipped within a week.
+
+    Only a pointer-width return with all-narrower declared parameters can be
+    the zero-extension artefact. A genuinely 64-bit return (64-bit params), a
+    return that is already 32-bit, and a parameterless function are all
+    ordinary and must stay quiet.
+    """
+    assert _note("x86_64", params=(8, 8)) is None
+    assert _note("x86_64", ret_width=4) is None
+    assert _note("x86_64", params=()) is None
+
+
+def test_return_width_note_warns_about_the_second_surface():
+    """The harm the issue reported is at the CALLER, not the prototype.
+
+    A caller returning -1 renders `return 0xffffffff;`, which is the reading
+    that actually misleads, so the note has to reach past its own output.
+    """
+    note = _note("x86_64")
+    assert "0xffffffff" in note
+
+
+# ---------------------------------------------------------------------------
+# #676 item 12: HLIL trust debt annotated inline, not only in the skill
+# ---------------------------------------------------------------------------
+
+
+class _GuardBlock:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class _GuardFunc:
+    def __init__(self, span=8):
+        self.arch = "probe-arch"
+        self.basic_blocks = [_GuardBlock(0, span)]
+
+
+def _guard_note(monkeypatch, mnemonics, span=None):
+    """Drive the detector over a synthetic 4-byte-per-instruction listing."""
+    from bn_agent_bridge import il_format, read_decompile
+
+    listing = list(mnemonics)
+    monkeypatch.setattr(
+        il_format, "_disasm_instruction",
+        lambda bv, addr, arch=None: (
+            (listing[addr // 4], 4) if addr // 4 < len(listing) else ("", 4)
+        ),
+    )
+    func = _GuardFunc(span if span is not None else 4 * len(listing))
+    return read_decompile._flattened_guard_warning(object(), func)
+
+
+def test_a_branch_free_select_is_named_in_the_output(monkeypatch):
+    """The skill already documents this lie; the note reaches the reader who
+    did not read the skill, which is every reader at the moment they are wrong.
+
+    The mnemonic is NAMED rather than described, because "this function has a
+    flattened guard" sends the reader looking for something they cannot
+    identify in the listing.
+    """
+    note = _guard_note(monkeypatch, ["ccmp x0, x1, #0, ge", "csel x0, x1, x2, lt"])
+    assert note is not None
+    assert "ccmp" in note and "csel" in note
+    assert "bn disasm" in note
+
+
+def test_the_note_is_silent_on_a_function_with_no_select(monkeypatch):
+    """A note on every function is a note nobody reads.
+
+    Selectivity is the feature: the whole point of annotating inline is that
+    its PRESENCE means something, which requires its absence to mean something
+    too.
+    """
+    assert _guard_note(monkeypatch, ["add x0, x1, x2", "ret"]) is None
+
+
+def test_the_same_note_fires_across_architectures_without_an_arch_gate(monkeypatch):
+    """Keyed on the MNEMONIC, not the target -- the instruction IS the evidence.
+
+    This is why item 12 is cheap where the return-width note (#675 item 5)
+    needed a measured arch set: `csel` in a listing means a selected value in
+    THIS function whatever the target is, so there is no per-architecture fact
+    that could be inherited wrongly onto a target that does not have it.
+    """
+    for mnemonic in ("csel x0, x1, x2, lt", "cmovg %eax, %edx", "ite ne"):
+        assert _guard_note(monkeypatch, [mnemonic]) is not None, mnemonic
+
+
+def test_the_note_claims_nothing_about_the_lies_it_cannot_detect(monkeypatch):
+    """The skill documents three HLIL lies; only one has a mnemonic.
+
+    A hoisted loop-invariant bound aliased to a moving pointer, and a dropped
+    `<< 4` in a size accumulator, are SEMANTIC properties with nothing to key
+    on. A note that mentioned them would imply this function had been checked
+    for them, which is worse than no note: it converts an unexamined property
+    into an apparently cleared one.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"])
+    lowered = note.lower()
+    assert "hoist" not in lowered
+    assert "<<" not in note
+    assert "accumulator" not in lowered
+
+
+def test_each_mnemonic_is_named_once_however_often_it_appears(monkeypatch):
+    """A guard that repeats a mnemonic forty times must not print it forty
+    times -- a note long enough to scroll is a note that gets skipped.
+
+    The mechanism is a MEMBERSHIP check while collecting, not the `sorted()`
+    that renders the names: breaking the sort leaves this test green, which
+    cost one wasted sabotage round to discover. Break `mnemonic not in seen`
+    to see this fail.
+    """
+    note = _guard_note(monkeypatch, ["csel x0, x1, x2, lt"] * 40 + ["ccmp x0, x1, #0, ge"])
+    assert note.count("csel") == 1
+    assert note.count("ccmp") == 1
+
+
+def test_an_unreadable_listing_does_not_sink_the_decompile(monkeypatch):
+    """The note is ADDITIVE, so a listing it cannot walk must cost nothing.
+
+    Decompilation succeeding is the caller's actual request; an annotation
+    that could turn a working read into an error would be a worse trade than
+    the annotation is worth.
+    """
+    from bn_agent_bridge import il_format, read_decompile
+
+    def _boom(bv, addr, arch=None):
+        raise RuntimeError("no listing here")
+
+    monkeypatch.setattr(il_format, "_disasm_instruction", _boom)
+    assert read_decompile._flattened_guard_warning(object(), _GuardFunc()) is None
+
+
+# --- #676 item 5 / #675: the multi-identifier producer, driven directly -----
+#
+# Round 1 major: `_decompile_batch` had no direct test at all. Failure
+# isolation and the requested/resolved counters were asserted only against a
+# hand-authored mock reply in the CLI renderer test -- which proves the
+# renderer reads those keys, and nothing at all about the producer that is
+# supposed to emit them.
+
+
+def _install_per_function_pseudo_c(monkeypatch, bridge, bodies):
+    """Like `_install_fake_pseudo_c`, but dispatches on the FUNCTION.
+
+    The shared helper asserts `fn is func` for one function, so it cannot
+    stand up a batch: a batch that decompiled the same function twice would
+    not exercise ordering or per-row identity at all.
+    """
+    class _FakeContents:
+        def __init__(self, address, text):
+            self.address, self._text = address, text
+
+        def __str__(self):
+            return self._text
+
+    class _FakeLine:
+        def __init__(self, address, text):
+            self.contents = _FakeContents(address, text)
+
+    class _FakeViewObject:
+        def __init__(self, batches):
+            self.batches = [[_FakeLine(a, t) for (a, t) in b] for b in batches]
+
+    class _FakeCursor:
+        def __init__(self, view_obj):
+            self._batches, self._i = view_obj.batches, 0
+
+        def seek_to_begin(self):
+            self._i = 0
+
+        @property
+        def lines(self):
+            return self._batches[self._i] if self._i < len(self._batches) else []
+
+        def next(self):
+            self._i += 1
+            return self._i < len(self._batches)
+
+    class _FakeLinearViewObject:
+        @staticmethod
+        def single_function_language_representation(fn, settings=None,
+                                                    language="Pseudo C"):
+            # The shared helper asserts this and the first cut of this fake
+            # dropped it, which made a local copy MORE FORGIVING than the
+            # helper it names as its model: a producer asking for a different
+            # representation left both batch tests green.
+            assert language == "Pseudo C"
+            return _FakeViewObject(bodies[fn.name])
+
+    fake_mod = types.ModuleType("binaryninja.lineardisassembly")
+    fake_mod.LinearViewObject = _FakeLinearViewObject
+    fake_mod.LinearViewCursor = _FakeCursor
+    monkeypatch.setattr(bridge.bn, "lineardisassembly", fake_mod, raising=False)
+
+    class _FakeDisassemblySettings:
+        def set_option(self, option, state=True):
+            return None
+
+    class _FakeDisassemblyOption:
+        ShowAddress = 0
+        ShowTypeCasts = 10
+        WaitForIL = 66
+        DisableLineFormatting = 68
+
+    monkeypatch.setattr(bridge.bn, "DisassemblySettings", _FakeDisassemblySettings,
+                        raising=False)
+    monkeypatch.setattr(bridge.bn, "DisassemblyOption", _FakeDisassemblyOption,
+                        raising=False)
+
+
+def _batch_bridge(monkeypatch):
+    """A bridge whose view holds two real functions with distinct bodies."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    handle = _FakeFunction(0x401000, "handle")
+    parse = _FakeFunction(0x402000, "parse_file")
+    bv = _FakeBV(functions=[handle, parse])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv_, func: {})
+    _install_per_function_pseudo_c(monkeypatch, bridge, {
+        "handle": [[(0x401000, "int32_t handle(void)")], [(0x401004, "{ }")]],
+        "parse_file": [[(0x402000, "int32_t parse_file(void)")],
+                       [(0x402004, "{ return 1; }")]],
+    })
+    return bridge, instance
+
+
+def test_decompile_batch_keeps_a_miss_in_place_and_counts_it_676(monkeypatch):
+    """A typo in the third name must not discard the two that resolved.
+
+    That is the entire reason to batch: the caller already paid the analysis
+    cost for the functions that worked, and a shell `for` loop under `set -e`
+    throws them away. So the miss becomes a FAILED ROW in the caller's own
+    order, carrying its error text, and the counters state the shortfall.
+    """
+    bridge, instance = _batch_bridge(monkeypatch)
+
+    result = instance._decompile_batch(
+        "active", ["handle", "nosuchfn", "parse_file"])
+
+    assert result["kind"] == "decompile_batch"
+    assert [row["identifier"] for row in result["functions"]] == [
+        "handle", "nosuchfn", "parse_file"], "a miss keeps its SLOT"
+    assert [row["ok"] for row in result["functions"]] == [True, False, True]
+
+    # The counters are the shortfall a caller reads, not a row count.
+    assert result["requested"] == 3
+    assert result["resolved"] == 2
+
+    # The two that resolved carry their own bodies, so the rows are not
+    # interchangeable placeholders.
+    assert result["functions"][0]["decompiled"]["text"] == (
+        "int32_t handle(void)\n{ }")
+    assert result["functions"][2]["decompiled"]["text"] == (
+        "int32_t parse_file(void)\n{ return 1; }")
+
+    # The miss says WHY, per identifier, rather than collapsing into one
+    # failure for the whole request.
+    miss = result["functions"][1]
+    assert "decompiled" not in miss
+    assert "nosuchfn" in miss["error"]
+
+
+def test_decompile_batch_that_resolves_everything_reports_no_shortfall_676(
+        monkeypatch):
+    """Must-not-fire twin: `resolved` must track the successes, not be a
+    constant that happens to be right on the failure path."""
+    bridge, instance = _batch_bridge(monkeypatch)
+
+    result = instance._decompile_batch("active", ["handle", "parse_file"])
+
+    assert result["requested"] == result["resolved"] == 2
+    assert all(row["ok"] for row in result["functions"])
+    assert all("error" not in row for row in result["functions"])
 def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
     """#827 item 3 / #888: `_require_mapped_address` and `_address_is_mapped`
     are NOT interchangeable, and the difference is only visible on a view that
@@ -3828,3 +4446,256 @@ def test_variadic_text_marks_the_count_with_the_stated_confidence_886():
     # Whitespace-only states no word: no empty marker, and no skew claimed.
     blank = render({**under, "confidence": "   "})
     assert "[count:" not in blank and "malformed" not in blank, blank
+
+# --- #797: `dataflow defuse` discloses a dropped call argument --------------
+# The defuse half of #489. BN clamps a direct call's MLIL parameters to the
+# callee's recovered arity, so a variadic callee auto-typed fixed-arity leaves
+# its STACK-passed arguments behind as `[sp+N].d = <var>` stores that nothing in
+# the function reads back -- and `uses` then lists the argument set-up for the
+# defused variable as if it were an ordinary use. `trace` already discloses that
+# state (#489); defuse now states the same thing, over the same calls, from the
+# same helper, so the two ops cannot disagree.
+
+def _d797_op(name):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=name))
+
+
+def _d797_reg(name):
+    expr = _d797_op("LLIL_REG")
+    expr.src = types.SimpleNamespace(name=name)
+    return expr
+
+
+def _d797_const(value):
+    expr = _d797_op("LLIL_CONST")
+    expr.constant = value
+    return expr
+
+
+def _d797_add(left, right):
+    expr = _d797_op("LLIL_ADD")
+    expr.left, expr.right = left, right
+    return expr
+
+
+def _d797_store(dest, address):
+    expr = _d797_op("LLIL_STORE")
+    expr.dest, expr.address = dest, address
+    return expr
+
+
+def _d797_call(address):
+    expr = _d797_op("LLIL_CALL")
+    expr.address = address
+    return expr
+
+
+def _d797_ins(name, address, *, params=None, instr_index=0):
+    return types.SimpleNamespace(
+        address=address, instr_index=instr_index,
+        operation=types.SimpleNamespace(name=name),
+        params=list(params or []), src=None, vars_read=[], vars_written=[],
+    )
+
+
+def _d797_thunk_resolver(thunk: str, real: str):
+    """A `resolve_call_target` that actually HONORS `follow_thunks`, so the two
+    resolutions differ the way they do on a real PLT stub / GCC veneer: the
+    unfollowed answer is the thunk's own name, the followed one is the real
+    callee."""
+    def resolve(bv_, ins, follow_thunks=False):
+        return types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name=real if follow_thunks else thunk))
+    return resolve
+
+
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before",
+                                 defined=False):
+    """`_defuse` over a function whose call at 0x401030 was recovered with ONE
+    arg (the caller's format string) while the LLIL hands it two outgoing
+    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic.
+
+    ``use_at`` places the defused variable's single use: ``"before"`` (the
+    default) makes it the argument set-up store feeding that call, ``"after"``
+    moves it past the call, and ``"none"`` gives the variable no uses at all.
+
+    ``defined`` gives the variable a DEFINITION ahead of the call, which the
+    real API supplies whenever the value is computed in this function.
+    Hardcoding it absent meant every case ran with an empty row set, so the
+    scoping the tests below assert was only ever measured on its
+    nothing-to-scope short-circuit (#797 round-4 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, func = _mid_function_bv()
+    bv._memory[0x402000] = b"%d %d\x00"
+    func.arch = types.SimpleNamespace(stack_pointer="sp", address_size=4)
+    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    call_addr = 0x401030
+    func.low_level_il = [[
+        _d797_store(_d797_reg("sp"), 0x401020),
+        _d797_store(_d797_add(_d797_reg("sp"), _d797_const(4)), 0x401024),
+        _d797_call(call_addr),
+    ]]
+    fmt = _d797_op("MLIL_CONST_PTR")
+    fmt.constant = 0x402000
+    call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
+    store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
+    trailing = _d797_ins("MLIL_STORE_SSA", 0x401040, instr_index=3)
+    # The variable's own definition, AHEAD of the call the way a value computed
+    # in this function is: `arg1#0 = ...` at 0x401010.
+    defn = _d797_ins("MLIL_SET_VAR_SSA", 0x401010, instr_index=0)
+    uses = {"before": [store], "after": [trailing], "none": []}[use_at]
+    il = types.SimpleNamespace(
+        instructions=([defn] if defined else []) + [store, call, trailing],
+        get_ssa_var_definition=lambda v: defn if defined else None,
+        get_ssa_var_uses=lambda v: list(uses),
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(bridge.il_format, "_resolve_ssa_variable",
+                        lambda f, i, sel: (ssa_var, []))
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    # The loaded bridge package is its own module COPY (`bn_test_bridge.*`), so
+    # the patch has to land on the alias `_defuse` resolves through, not on the
+    # same-named module this file imports for direct helper tests.
+    monkeypatch.setattr(
+        bridge.read_decompile._taint, "resolve_call_target",
+        resolve or (lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name="my_logger"))))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance, il
+
+
+def test_defuse_discloses_a_dropped_stack_arg_797(monkeypatch):
+    """#797: the result names the call whose model dropped the stack args.
+
+    Before this, the stack-arg store appeared in `uses` with nothing saying it
+    feeds a call whose recovered parameters do not include it -- so a def-use
+    answer was read as the complete set of things that touch the variable.
+    """
+    instance, _il = _defuse_under_recovered_call(monkeypatch)
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    hints = result["hints"]
+    assert len(hints) == 1, hints
+    hint = hints[0]
+    assert "call 0x401030" in hint
+    assert "call-model truncation" in hint
+    assert "my_logger" in hint
+    assert "sp+0x0" in hint and "sp+0x4" in hint     # the dropped stores, named
+    assert "proto set my_logger" in hint             # the runnable remedy
+    # The use itself is unchanged: the disclosure is additive, so an existing
+    # consumer of `uses` reads exactly what it read before.
+    assert [u["address"] for u in result["uses"]] == ["0x401024"]
+
+
+def test_defuse_stays_quiet_when_the_call_model_is_complete_797(monkeypatch):
+    """The no-false-positive direction, inherited from the #489 gate: a call
+    whose recovered args are NOT (all) register-passed -- here five args on a
+    4-register convention -- is not a truncated model, so nothing is disclosed
+    and the caller sees no invented caveat."""
+    instance, il = _defuse_under_recovered_call(monkeypatch)
+    il.instructions[1].params = il.instructions[1].params * 5
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == []
+
+
+def test_defuse_resolves_the_callee_through_thunks_like_its_sibling_797(monkeypatch):
+    """#797 review: `defuse` resolved the callee WITHOUT following thunks while
+    `trace` follows them, and the shared note keys its two safety gates on that
+    name -- so the claim that "the two ops cannot disagree" was false.
+
+    The gate that matters here is the known-fixed-arity denylist: a PLT stub /
+    GCC veneer in front of `strlen` resolves unfollowed to `j_strlen`, which is
+    in no denylist, so the shared note fired on a call `trace` is silent about.
+    That is exactly the residual false positive the #489 denylist was added to
+    close, re-opened on the second op.
+    """
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_strlen", "strlen"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == [], result["hints"]
+
+
+def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
+    """The other half of the same disagreement: when the note DOES fire through
+    a thunk, its `proto set` remedy must name the callee whose prototype is
+    actually wrong. `bn proto set j_my_logger ...` retypes the veneer and leaves
+    the model truncated, so a copy-pasted remedy silently does nothing."""
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_my_logger", "my_logger"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert len(result["hints"]) == 1, result["hints"]
+    hint = result["hints"][0]
+    assert "proto set my_logger" in hint
+    assert "j_my_logger" not in hint
+
+
+def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
+    """#797 review: the disclosure is about a USE, so it has to be scoped to one.
+
+    The hint list was built over every call in the FUNCTION, which is not what
+    the reference, `--help` and the renderer all say it is: a def-use of a
+    variable with no uses at all still printed "call 0x...: call-model
+    truncation" immediately above `uses (0):`, telling a reader that an empty
+    listing is incomplete because of a call the variable never touches. A use
+    that lands AFTER the call is the same error one step subtler -- it is not
+    argument set-up for it, so nothing about that call explains it.
+
+    Round-4 review: (a) and (b) were both green for the wrong reason -- the
+    fixture hardcoded the variable as having NO definition, so every case ran
+    with an empty row set and only the nothing-to-scope short-circuit was
+    measured. Give the variable the definition the real API supplies and the
+    scope re-opened: a definition ahead of the call made the call "fed", so
+    the hint came back above `uses (0):`. A DEFINITION is not evidence that
+    the value reaches a call -- it is where the value is produced -- so the
+    scope is the variable's USES, and (c)/(d) are (a)/(b) with the definition
+    present.
+    """
+    # (a) No uses at all: there is no listing for a disclosure to qualify.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none")
+    empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert empty["uses"] == []
+    assert empty["hints"] == [], empty["hints"]
+
+    # (b) The variable's only use sits past the call, so it is not part of the
+    # outgoing-argument run the dropped stack stores belong to.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after")
+    downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert [u["address"] for u in downstream["uses"]] == ["0x401040"]
+    assert downstream["hints"] == [], downstream["hints"]
+
+    # (c) The same empty listing for a variable that HAS a definition ahead of
+    # the call -- the ordinary case, and the one the fixture never built.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none",
+                                                 defined=True)
+    defined_empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_empty["definition"]["address"] == "0x401010"
+    assert defined_empty["uses"] == []
+    assert defined_empty["hints"] == [], defined_empty["hints"]
+
+    # (d) ...and the downstream use, with that definition present: the call
+    # still explains no row in this listing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after",
+                                                 defined=True)
+    defined_downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_downstream["definition"]["address"] == "0x401010"
+    assert [u["address"] for u in defined_downstream["uses"]] == ["0x401040"]
+    assert defined_downstream["hints"] == [], defined_downstream["hints"]
+
+    # ...while the use that IS the call's argument set-up still gets it, so the
+    # scope narrowed to the right thing rather than to nothing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="before",
+                                                 defined=True)
+    feeding = instance._defuse("active", "0x401000", "arg1#0")
+    assert len(feeding["hints"]) == 1, feeding["hints"]
+    assert "call 0x401030" in feeding["hints"][0]

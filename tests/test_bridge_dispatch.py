@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import io
 import json
+import os
 import socket
 import sys
 import threading
@@ -487,6 +488,105 @@ def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
         "import_symbol_count": "rows returned by imports",
         "imported_function_count": "callable imported function targets",
     }
+
+
+def test_target_info_and_orient_digest_agree_on_existing_annotations_793(monkeypatch):
+    """#793: `target info` published NO annotation key while `evidence orient`
+    published `existing_annotations`, so the same cached view read annotated on
+    one surface and pristine on the other -- and `target info` is the command
+    every agent runs first. Both now publish the same block, from one builder
+    (`read_listing._existing_annotations`), counts and provenance hint included.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    info = instance._target_info("active")
+    digest = instance._orient_digest("active")
+
+    assert info["existing_annotations"]["comments"] == 1
+    assert info["existing_annotations"]["analysis_cache_restored"] is True
+    assert "predate this run" in info["existing_annotations"]["provenance_hint"]
+    # The agreement IS the fix: one builder, one answer, whichever surface asks.
+    assert digest["existing_annotations"] == info["existing_annotations"]
+
+
+def test_orient_digest_emits_the_annotation_block_once_883(monkeypatch):
+    """#883 item 2: agreement is not enough -- the block must be emitted ONCE.
+
+    `_target_info` publishes the block and the digest used to republish the SAME
+    dict under `target`, so `evidence orient --format json` carried two
+    byte-identical copies: on the view this was measured on, 2469 + 2469 compact
+    bytes of an 11398-byte payload (43%), and the reviewer's denser view hit 63%
+    of 15152. Trunk carried only the top-level copy. Asserting the two surfaces
+    AGREE (the #793 test above) passes under the duplication, so this pins the
+    shape itself: the block is BUILT once, so the nested copy is pure waste, and
+    the digest is the only surface that has a second place to put it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note", 0x401020: "second note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    digest = instance._orient_digest("active")
+
+    # The block is still there, at the path the digest has always documented...
+    assert digest["existing_annotations"]["comments"] == 2
+    # ...and NOT a second time under `target`, which is where the duplicate sat.
+    assert "existing_annotations" not in digest["target"]
+    # ...while `target info` -- where the block is that op's OWN answer, not a
+    # repeated one -- keeps publishing it.
+    assert instance._target_info("active")["existing_annotations"]["comments"] == 2
+    # The payload carries the block once, stated over the encoded digest: a
+    # `target` copy could only come back through that key name.
+    assert json.dumps(digest).count('"existing_annotations"') == 1
+
+
+def test_target_info_annotation_counts_degrade_but_stay_present_793(monkeypatch):
+    """The other half of #793's contract: the key is never silently ABSENT. A view
+    whose annotation counts cannot be read publishes the `unavailable` marker (the
+    shape `bn_kernel.assert_unannotated` refuses), so an unreadable summary can
+    never pass as a pristine target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary",
+                        lambda ctx, view: (_ for _ in ()).throw(RuntimeError("view is dead")))
+
+    annotations = instance._target_info("active")["existing_annotations"]
+
+    assert "view is dead" in annotations["unavailable"]
+    assert annotations["analysis_cache_restored"] is True
 
 
 def test_target_info_surfaces_image_base(monkeypatch):
@@ -2911,6 +3011,90 @@ def test_serialize_error_keeps_user_facing_messages_clean(monkeypatch):
     assert bridge._serialize_error(value_error) == "Unknown operation: bogus"
 
 
+def _raise_from_a_library_file(exc):
+    """Raise *exc* from a module written OUTSIDE the project tree, so the
+    deepest traceback frame belongs to a 'library' for attribution purposes.
+    Built as a real importable file because that is the only way to get a
+    genuine foreign code object -- a lambda defined here is project code."""
+    import importlib.util
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "pretend_library.py")
+        with open(path, "w") as fh:
+            fh.write("def boom(exc):\n    raise exc\n")
+        spec = importlib.util.spec_from_file_location("pretend_library", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.boom(exc)
+
+
+def test_serialize_error_triages_a_library_runtime_error_825(monkeypatch):
+    # #825 item 1: RuntimeError/ValueError are on the user-facing whitelist
+    # because the bridge raises them DELIBERATELY (77 and 16 sites), so a
+    # LIBRARY RuntimeError inherited the same trust and was relayed verbatim
+    # -- reading exactly like a message the bridge composed for the user.
+    # Membership is necessary but not sufficient; origin decides.
+    bridge = _load_bridge(monkeypatch)
+
+    for exc in (RuntimeError("dictionary changed size during iteration"),
+                ValueError("invalid literal for int()")):
+        try:
+            _raise_from_a_library_file(exc)
+        except Exception as raised:  # noqa: BLE001
+            rendered = bridge._serialize_error(raised)
+        assert rendered.startswith("internal error: "), rendered
+        assert type(exc).__name__ in rendered
+
+
+def test_serialize_error_keeps_a_bridge_raised_runtime_error_clean_825(monkeypatch):
+    # THE must-not-fire twin, and the one that matters: 93 deliberate raise
+    # sites report bad input and missing targets this way. Prefixing those
+    # would stamp `internal error:` on every "Function not found".
+    bridge = _load_bridge(monkeypatch)
+    from bn_agent_bridge import _shared
+
+    try:
+        _shared._parse_address("not-an-address")   # raises inside the package
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert not rendered.startswith("internal error"), rendered
+    assert "not a valid address" in rendered
+
+
+def test_serialize_error_never_triages_an_operation_failure_825(monkeypatch):
+    # OperationFailure is exempt from the origin test: the bridge is the only
+    # thing that constructs one, so its origin is never in doubt even when it
+    # is re-raised through library code.
+    bridge = _load_bridge(monkeypatch)
+    failure = bridge.OperationFailure("unsupported", "Symbol not found: bar")
+    try:
+        _raise_from_a_library_file(failure)
+    except Exception as raised:  # noqa: BLE001
+        rendered = bridge._serialize_error(raised)
+    assert rendered == "Symbol not found: bar"
+
+
+def test_wire_byte_ceiling_is_one_number_not_two_769(monkeypatch):
+    # THE anti-drift assertion for #769. The CLI refuses an oversized manifest
+    # early ONLY because the bridge would refuse it on arrival, so the two
+    # ceilings must be the same number. A client-side copy guessed LOW would
+    # reject requests the bridge accepts -- the duplicated-constant shape
+    # #777 and #890 were filed for, where the copies drift apart silently.
+    bridge = _load_bridge(monkeypatch)
+    from bn import wire_limits
+
+    assert bridge.MAX_REQUEST_BYTES == wire_limits.MAX_REQUEST_BYTES
+    assert wire_limits.batch_apply_max_bytes() == bridge.MAX_REQUEST_BYTES
+
+    # And it is genuinely shared rather than coincidentally equal: the bridge
+    # module must not carry its own assignment of the constant.
+    import inspect
+    source = inspect.getsource(bridge)
+    assert "MAX_REQUEST_BYTES = " not in source, (
+        "bridge.py reassigns MAX_REQUEST_BYTES; it must import it from "
+        "wire_limits so the CLI preflight and the handler cannot drift")
+
+
 def test_dispatch_error_discloses_prototype_user_type_residue(monkeypatch):
     """#630 round 3, FINDING 2: when a mutation raises AFTER pinning an unclearable
     has_user_type override, the serialized error RESPONSE must DISCLOSE the residue
@@ -2949,14 +3133,24 @@ def test_dispatch_error_without_residue_has_no_disclosure(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
+    # #825 item 1: the double must raise the way a REAL handler does -- from
+    # inside the package -- or its RuntimeError is (correctly) attributed to
+    # a library and triaged with an `internal error:` prefix. A bare `raise`
+    # in this file cannot express "the bridge composed this message", so it
+    # would be pinning the wrong classification. Delegating to a genuine
+    # bridge raise is also simply a better double: this is what every real
+    # handler does when it rejects input.
+    from bn_agent_bridge import _shared
+    user_facing = "'nope' is not a valid address; expected a decimal or 0x-prefixed hex value"
+
     def _boom(op, params, target):
-        raise RuntimeError("Function not found: foo")
+        _shared._parse_address("nope")
 
     monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
 
     resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
     assert resp["ok"] is False
-    assert resp["error"] == "Function not found: foo"
+    assert resp["error"] == user_facing
     assert resp["result"] is None
 
 
@@ -3598,10 +3792,17 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
     # #275: the canonical envelope now carries a `kind` discriminator too.
     envelope_keys = {"kind", "items", "total", "offset", "limit", "returned", "has_more"}
+    # #795: `strings` carries ONE key beyond the shared envelope -- `filtered`,
+    # the count of candidates the active filter chain dropped, so the denominator
+    # is readable without a second unfiltered invocation. It rides the strings
+    # envelope alone (imports reports its exclusions under its own key), so it is
+    # added to the expected set HERE rather than to the shared one above.
+    strings_envelope_keys = envelope_keys | {"filtered"}
 
     # A limit that truncates: 2 of 5 come back, but the total stays honest.
     strings_page = instance._strings(None, query=None, offset=0, limit=2)
-    assert set(strings_page) == envelope_keys
+    assert set(strings_page) == strings_envelope_keys
+    assert strings_page["filtered"] == 0          # nothing filtered this run
     assert strings_page["kind"] == "strings"
     assert strings_page["total"] == 5
     assert strings_page["returned"] == 2
@@ -3899,6 +4100,54 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
     assert inst._inflight == 0                 # released after the response
     assert inst._last_activity > 0.0           # stamped only after the write
     assert json.loads(handler.wfile.data.decode("utf-8"))["ok"] is True
+
+
+def test_bridge_response_echoes_the_request_id(monkeypatch):
+    """#825 item 2: the request's `id` was threaded to `_encode_response` for
+    cancel tracking but never emitted, so a client could not correlate a
+    response with its request from the body alone."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps(
+            {"op": "noop", "id": "req-7f3a", "_bridge_identity": inst.bridge_identity}
+        ).encode("utf-8")
+        + b"\n"
+    )
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert json.loads(handler.wfile.data.decode("utf-8"))["id"] == "req-7f3a"
+
+
+def test_bridge_response_omits_id_when_the_request_had_none(monkeypatch):
+    """Must-not-fire twin for #825 item 2: the echo is additive. A request with
+    no `id` must not grow a null one -- a client checking `"id" in response`
+    would otherwise see it on every reply."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst.dispatch = lambda payload: {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(
+        json.dumps({"op": "noop", "_bridge_identity": inst.bridge_identity}).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )  # NO id
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+    handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
+
+    handler.handle()
+
+    assert "id" not in json.loads(handler.wfile.data.decode("utf-8"))
 
 
 def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
@@ -5643,20 +5892,29 @@ def test_save_onto_an_open_target_is_disclosed_at_save_time_857(monkeypatch, tmp
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867 SUPERSEDES the disclosure this test was written for. Disclosing an
+    # irreversible write is the weaker half of the pair: the save had already
+    # landed, and `session restart` then returned one target for both rows
+    # (measured 2 -> 1, rc 0). The destination is now REFUSED before the
+    # write, so nothing is lost and the caller is one command from safety.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    collision = result["collides_with_open_target"]
-    assert collision["filename"] == str(sidecar)
-    assert collision["target_id"]
-    assert "session restart" in result["note"]
-    # And it reaches the surface an operator actually reads.
-    rendered = formatters._render_save_text(result)
-    assert "also open as target" in rendered
-    assert "one database" in rendered
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert "session restart" in excinfo.value.message
+    assert str(sidecar) in excinfo.value.message
+    # Nothing was written: the sidecar still holds what it held.
+    assert sidecar.read_text() == "bndb"
+    assert raw_view.created_with is None
 
-    # The row state that made this reachable is still observable.
+    # THE payoff of #867, and the assertion worth keeping: the row state that
+    # made the collapse reachable is never created. Under the old behaviour
+    # the raw row's `database_path` was recorded as the sidecar -- the two
+    # rows naming one database, which is what made `session restart` return
+    # one target for both. Refusing before the write means neither row moved.
     rows = {r["filename"]: r for r in instance.targets.refresh()}
-    assert rows[str(raw)]["database_path"] == str(sidecar)
+    assert rows[str(raw)]["database_path"] is None
     assert rows[str(sidecar)]["database_path"] is None
 
 
@@ -5859,11 +6117,14 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
         lambda strict=False: ([raw_view, sidecar_view], True))
     instance.targets.refresh()
 
-    result = instance._save_database(None, None)
+    # #867: the destination collision is decided BEFORE the write, so it wins
+    # over the degradation this test was named for -- the save never reaches
+    # the re-home path, because it never reaches the write at all. That
+    # ordering is the point: a degraded save that still collapses two targets
+    # is not a better outcome than a refusal.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._save_database(None, None)
 
-    # Degraded, and still disclosed on both halves.
-    assert result["rehomed"] is True
-    assert result["collides_with_open_target"]["filename"] == str(sidecar)
-    assert "session restart" in result["note"]
-    assert "could not restore" in result["note"]
-    assert "also open as target" in formatters._render_save_text(result)
+    assert excinfo.value.status == "invalid_request"
+    assert "already open as target" in excinfo.value.message
+    assert sidecar.read_text() == "bndb"          # nothing written
