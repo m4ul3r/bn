@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
-                   _positive_int, arg, blank_selector, command, mutex, mutation_output_args,
-                   preview_arg)
+                   _positive_int, _refuse_count_only_slices, arg, blank_selector, command,
+                   decode_json_input, mutex, mutation_output_args, preview_arg,
+                   read_text_input)
 from ..formatters import (
+    _discloses,
+    _field_skewed,
+    _nonnegative_count,
     _render_data_symbols_text,
     _render_data_vars_text,
     _render_function_bundle_text,
@@ -24,10 +27,45 @@ from ..formatters import (
     _render_read_text,
     _render_sections_text,
     _render_strings_text,
+    _stated_count,
 )
 from ..transport import BridgeError, unwrap_result
-from ..wire_limits import (MAX_BYTES_ENV, MAX_OPS_ENV, batch_apply_max_bytes,
-                           batch_apply_max_ops, request_bytes_for_params)
+from ..wire_limits import MAX_OPS_ENV, batch_apply_max_ops
+
+
+@_discloses
+def _strings_count_text(value: Any) -> str:
+    """The `strings --count` line, with the filter's denominator (#795).
+
+    `Total strings: 30` from a `--probable-format-strings` run said nothing about
+    the 1329 strings the filter dropped, so the denominator cost a SECOND
+    unfiltered invocation. Mirrors `_imports_count_text`'s excluded-count tail:
+    the bridge's own `filtered` count is disclosed parenthetically when it is
+    non-zero, and the line is unchanged on an unfiltered dump.
+
+    Both numbers are read through the COUNT CHOKE POINT, which is the same
+    reading `_render_strings_text` gives them one surface over (#619 review).
+    An `isinstance(int)` test here was a second decider over a question this
+    codebase already answers, and it answered wrong in both directions: a
+    producer that spells counts as text (`"1329"`) had its disclosure dropped
+    entirely -- reinstating the extra invocation #795 removed -- while `bool` IS
+    an `int`, so `filtered: true` rendered "(True filtered out by the active
+    filters)". The headline goes through `_stated_count` for the same reason it
+    does everywhere else: `Total strings: 0` fabricated from an unreadable
+    counter reads byte-identically to an empty binary. The denominator goes
+    through the CARDINALITY reader the listing surface uses, so a filter that
+    claims to have dropped a negative number of strings is disclosed rather
+    than restated as a quantity (#795 round-5 review)."""
+    line = f"Total strings: {_stated_count(value, 'count')}"
+    dropped = _nonnegative_count(value, "filtered")
+    if dropped:
+        line += f" ({dropped} filtered out by the active filters)"
+    elif _field_skewed("filtered"):
+        # The same wording the listing surface uses, so one payload cannot be
+        # described two ways depending on which flag the caller passed.
+        line += ("\n// the payload's filtered-string count is not a number that "
+                 "can be read (use --format json)")
+    return line
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
@@ -52,7 +90,8 @@ from ..wire_limits import (MAX_BYTES_ENV, MAX_OPS_ENV, batch_apply_max_bytes,
                       "assert a format-string vulnerability."),
              arg("--count", action="store_true", default=False,
                  help="Show the matching string count instead of listing"),
-         ])
+         ],
+         estimable=True)
 def _strings(args: argparse.Namespace) -> int:
     common = {
         "query": args.query,
@@ -69,7 +108,7 @@ def _strings(args: argparse.Namespace) -> int:
             "strings",
             {**common, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total strings: {value.get('count', 0)}",
+            text_renderer=_strings_count_text,
             stem="strings-count",
             regex_hint_query=args.query,
         )
@@ -105,12 +144,59 @@ def _strings(args: argparse.Namespace) -> int:
     return rc
 
 
+@_discloses
 def _imports_count_text(value: Any) -> str:
-    line = f"Total imports: {value.get('count', 0)}"
-    excluded = value.get("self_defined_excluded")
-    if isinstance(excluded, int) and excluded > 0:
+    """The `imports --count` line, with the filter's excluded-count tail.
+
+    The sibling `_strings_count_text` is modelled on this line, and #795's
+    round-2 review found the model was the defective one: `isinstance(int)` is a
+    SECOND decider over a question the count choke point already answers, and it
+    gets all three of the same shapes wrong. `bool` IS an `int`, so
+    `self_defined_excluded: true` rendered "(True self-defined excluded)" -- a
+    flag printed as a quantity; a producer that spells counts as text dropped
+    the tail entirely; and the headline was interpolated raw, so a container
+    landed in the line as a Python repr. Both numbers go through the choke
+    point, under the boundary that discloses what it could not read (#619) --
+    and the excluded count through the ONE reader the paged listing and the
+    `--summary` card share, so the three surfaces cannot decide it three ways
+    (#795 round-4 review, where this line alone stated a negative count).
+    """
+    line = f"Total imports: {_stated_count(value, 'count')}"
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         line += f" ({excluded} self-defined excluded)"
+    elif _field_skewed("self_defined_excluded"):
+        line += ("\n// the payload's self-defined-excluded count is not a number "
+                 "that can be read (use --format json)")
     return line
+
+
+def _plain_count_text(label: str, value: Any) -> str:
+    """A `--count` line that states ONE number and nothing else.
+
+    The three surfaces below were inline `lambda value: f"{label}:
+    {value.get('count', 0)}"` renderers -- the raw read this module's two other
+    count lines were just taken off, and invisible to any guard because a
+    lambda has no name to probe. One named renderer each, all reading through
+    the choke point, so every `--count` line in the module answers the same way
+    and a new one cannot be written as a lambda without tripping the guard in
+    `tests/test_cli_misc.py` (#619/#795)."""
+    return f"{label}: {_stated_count(value, 'count')}"
+
+
+@_discloses
+def _exports_count_text(value: Any) -> str:
+    return _plain_count_text("Total exports", value)
+
+
+@_discloses
+def _sections_count_text(value: Any) -> str:
+    return _plain_count_text("Total sections", value)
+
+
+@_discloses
+def _go_functions_count_text(value: Any) -> str:
+    return _plain_count_text("Go functions", value)
 
 
 @command("imports", help="List imports", target=True, paged=True,
@@ -126,11 +212,16 @@ def _imports_count_text(value: Any) -> str:
                    help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
-                        "(collapsed by default)")])
+                        "(collapsed by default)")],
+         estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
     if args.count:
+        # #767: --summary and the paging flags vanished silently here while
+        # `go functions` refused the same combination at the parser; refuse by
+        # name instead of returning a number the flags did not shape.
+        _refuse_count_only_slices(args, command="imports")
         return _call(
             args,
             "imports",
@@ -179,6 +270,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 @command(
     "exports",
@@ -188,6 +280,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 def _exports(args: argparse.Namespace) -> int:
     if args.count:
@@ -196,7 +289,7 @@ def _exports(args: argparse.Namespace) -> int:
             "list_exports",
             {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total exports: {value.get('count', 0)}",
+            text_renderer=_exports_count_text,
             stem="exports-count",
         )
     params = {"offset": args.offset, "limit": _effective_limit(args)}
@@ -219,7 +312,8 @@ def _exports(args: argparse.Namespace) -> int:
                                     "label (e.g. 'code' matches .text=ReadOnlyCode); broadens to "
                                     "all matching-semantics sections, not just name matches"),
                            arg("--count", action="store_true", default=False,
-                               help="Show the section count instead of listing")])
+                               help="Show the section count instead of listing")],
+         estimable=True)
 def _sections(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
@@ -227,7 +321,7 @@ def _sections(args: argparse.Namespace) -> int:
             "sections",
             {"query": args.query, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total sections: {value.get('count', 0)}",
+            text_renderer=_sections_count_text,
             stem="sections-count",
         )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
@@ -258,7 +352,8 @@ def _sections(args: argparse.Namespace) -> int:
              arg("--limit", type=_positive_int, default=None, metavar="N",
                  help="Maximum rows to return (default 400); when truncated the result "
                       "sets has_more and text mode prints a --start resume hint"),
-         ])
+         ],
+         estimable=True)
 def _data_vars(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -277,7 +372,8 @@ def _data_vars(args: argparse.Namespace) -> int:
          paged=True,
          prefer_when="you need addressable data globals (including renamed/internal ones); "
                      "`exports` only shows the public surface",
-         see_also=("exports", "data vars"))
+         see_also=("exports", "data vars"),
+         estimable=True)
 def _data_symbols(args: argparse.Namespace) -> int:
     # #682 item 1: paged like every sibling list read. This command used to
     # hand-roll --limit/--offset with `default=None`, i.e. build and serialize
@@ -320,13 +416,14 @@ def _data_symbols(args: argparse.Namespace) -> int:
                        help="Show the recovered Go function count instead of listing"),
                    arg("--summary", action="store_true", default=False,
                        help="Show recovered/defined/renamable counts + pclntab status (decide whether to `go rename`)")),
-         ])
+         ],
+         estimable=True)
 def _go_functions(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
             args, "go_functions", {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Go functions: {value.get('count', 0)}",
+            text_renderer=_go_functions_count_text,
             stem="go-functions-count",
         )
     if args.summary:
@@ -405,7 +502,8 @@ def _resolved_out_format(args: argparse.Namespace) -> str:
          args=[arg("identifier"),
                arg("--include-annotations", action="store_true", default=False,
                    help="Include inherited comment bodies in the bundle's "
-                        "decompilation (default: redact, matching bn decompile)")])
+                        "decompilation (default: redact, matching bn decompile)")],
+         estimable=True)
 def _bundle_function(args: argparse.Namespace) -> int:
     # #665: `--out` is already absolute here (`_resolve_out_path`), so the
     # bridge writes it where the CALLER meant. The one destination the bridge
@@ -457,7 +555,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
              arg("--encoding", choices=("hex", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default) or raw bytes"),
-         ])
+         ],
+         estimable=True)
 def _read(args: argparse.Namespace) -> int:
     address = _pick(args.address, args.address_flag, "read address")
     if args.encoding == "bytes":
@@ -490,6 +589,45 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         data = bytes.fromhex(hex_payload)
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
+    # #827 item 4 review: the bridge marks a PARTIAL read in the payload
+    # (`capped` and/or `short_read`, plus `requested_length` and a `note`). The
+    # hex renderer prints that note, but THIS path returns the bytes themselves
+    # -- and a dump quietly shorter than the window the caller asked for is the
+    # "bounded read that reads as the whole window" failure the note exists to
+    # prevent, on the one path documented for piping a blob into another tool.
+    # Both markers, not just the cap: a short read is the same dump with the
+    # same consequence, and disclosing one of the two taught a reader that
+    # silence here means a complete window. Disclose on stderr (stdout IS the
+    # payload) and carry the markers into the --out summary.
+    partial_fields: dict[str, Any] = {}
+    # `result` is known to be a dict here: a non-dict one cannot carry the
+    # string `hex` the refusal above requires.
+    if result.get("capped") or result.get("short_read"):
+        partial_fields = {key: True for key in ("capped", "short_read") if result.get(key)}
+        if result.get("requested_length") is not None:
+            # Absent rather than `null`: the summary states what the caller
+            # asked for, and a bridge that did not send it has nothing to state.
+            partial_fields["requested_length"] = result["requested_length"]
+        note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
+        print(f"note: {note}", file=sys.stderr)
+    summary = {"kind": "bytes", "address": address, "length": len(data), **partial_fields}
+    if getattr(args, "estimate_output", False):
+        # #796: this is `read`'s SECOND emit path, and the flag has to mean the
+        # same thing on it. `_call` -> `_render_result` implements the preflight
+        # for the `--encoding hex` half; this branch returns above that call, so
+        # asking here is the only place the raw-byte payload can be measured
+        # instead of written. `--out` is refused beside the flag by the parser's
+        # own mutually exclusive group, so there is no destination to resolve.
+        from ..output import estimate_bytes_result
+
+        estimate = estimate_bytes_result(
+            data,
+            fmt=args.format,
+            summary=summary,
+            rerun_hint=cli._slice_hint_for_args(args, args.format),
+        )
+        sys.stdout.write(estimate.rendered)
+        return 0
     if args.out:
         from ..output import write_bytes_result
 
@@ -497,7 +635,7 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             data,
             out_path=args.out,
             fmt=args.format,
-            summary={"kind": "bytes", "address": address, "length": len(data)},
+            summary=summary,
         )
         sys.stdout.write(result.rendered)
     else:
@@ -531,17 +669,11 @@ def _py_exec(args: argparse.Namespace) -> int:
     elif inline is not None:
         script = inline
     elif args.script:
-        if not args.script.exists():
-            raise BridgeError(f"Script file not found: {args.script}. Use --code for inline Python.")
-        # Same shape as #754's `types declare --file`: `exists()` is true for a
-        # directory, so the read died with a raw IsADirectoryError at exit 1 with
-        # no envelope. A non-UTF-8 file did the same through UnicodeDecodeError.
-        if args.script.is_dir():
-            raise BridgeError(f"Script file is a directory: {args.script}. Use --code for inline Python.")
-        try:
-            script = args.script.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise BridgeError(f"Script file could not be read: {args.script}: {exc}") from exc
+        # #864: one reader for every CLI text input -- it refuses a directory or
+        # a FIFO/device by kind (a FIFO here blocked forever with no envelope)
+        # and wraps the read, keeping #754's structured-refusal envelope.
+        script = read_text_input(
+            args.script, what="Script file", hint="Use --code for inline Python.")
     elif args.stdin:
         script = sys.stdin.read()
     else:
@@ -611,11 +743,12 @@ def _batch_target_from_cli(args: argparse.Namespace,
                      "local_rename, local_retype, struct_field_set, struct_field_rename, "
                      "struct_field_delete, types_declare. A missing required field is reported "
                      "as status 'invalid_request' naming the field.\n"
-                     "Ceilings: a manifest over 5000 ops, or whose request would exceed the "
-                     "bridge's 32 MiB wire limit, is refused before anything is sent -- a "
-                     "batch that large holds the write lock for the whole run and reverts as "
-                     "ONE unit. Raise or disable either with BN_BATCH_APPLY_MAX_OPS=<n> / "
-                     "BN_BATCH_APPLY_MAX_BYTES=<n> (0 disables)."
+                     "Ceilings: a manifest over 5000 ops, or whose serialized request exceeds "
+                     "the bridge's hard 32 MiB wire limit, is refused before anything is "
+                     "sent. A large batch holds the write lock for the whole run and reverts "
+                     "as ONE unit. BN_BATCH_APPLY_MAX_OPS=<n> raises the op limit (0 disables); "
+                     "BN_BATCH_APPLY_MAX_BYTES=<n> may set a LOWER byte limit (0 restores the "
+                     "hard limit). File and FIFO input also has a 64 MiB source-file cap."
                  )),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
@@ -637,18 +770,13 @@ def _batch_apply(args: argparse.Namespace) -> int:
             )
     else:
         source = f"file {args.manifest}"
-        if not args.manifest.exists():
-            raise BridgeError(f"Manifest file not found: {args.manifest}")
-        try:
-            raw = args.manifest.read_text(encoding="utf-8")
-        # OSError alone left a non-UTF-8 manifest to raise UnicodeDecodeError as a
-        # raw traceback at exit 1, while the directory case was already wrapped (#754).
-        except (OSError, UnicodeDecodeError) as exc:
-            raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
-    try:
-        manifest = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"Invalid JSON in manifest ({source}): {exc}") from None
+        # #864: same shared reader as the other --file shapes; a FIFO manifest
+        # blocked here forever with no envelope.
+        raw = read_text_input(args.manifest, what="Manifest file")
+    # #864: and the same shared decoder, so a body the parser cannot take --
+    # malformed, nested past its stack, or too large to build -- is refused
+    # here rather than escaping as a traceback the way a `RecursionError` did.
+    manifest = decode_json_input(raw, refusal=f"Invalid JSON in manifest ({source})")
     # The manifest must be a JSON object {"target": <sel>, "ops": [...]}. A bare
     # array (an easy mistake) would otherwise crash client-side in _call's
     # dict(params) -- and `manifest["preview"]` below assumes a dict. Validate
@@ -676,16 +804,10 @@ def _batch_apply(args: argparse.Namespace) -> int:
                 f'Manifest ({source}) must have an "ops" array (the list of '
                 f"operations to apply)."
             )
-        # #769: neither the op count nor the byte size was checked. The
-        # bridge caps the REQUEST at MAX_REQUEST_BYTES, so an oversized
-        # manifest already failed -- but only after the client read the whole
-        # file, serialized it, and paid a round trip, and the answer was a
-        # bare "request too large" naming neither the limit nor a way around
-        # it. Refusing here costs nothing and can say what to do.
-        #
-        # Both ceilings read through `wire_limits`, so the byte limit is the
-        # bridge's own number rather than a second copy of it, and `0` in
-        # either env disables that check for a caller who really means it.
+        # #769: the op ceiling is checked here before the request. The byte
+        # ceiling is checked on the actual serialized envelope in transport,
+        # after instance/target resolution but before a socket send. A local
+        # estimate cannot account exactly for the selected bridge identity.
         max_ops = batch_apply_max_ops()
         op_count = len(manifest["ops"])
         if max_ops is not None and op_count > max_ops:
@@ -695,35 +817,6 @@ def _batch_apply(args: argparse.Namespace) -> int:
                 f"the whole run and reverts as ONE unit, so a single failure "
                 f"discards every sibling. Split it, or raise/disable the "
                 f"ceiling with {MAX_OPS_ENV}=<n> (0 disables)."
-            )
-        max_bytes = batch_apply_max_bytes()
-        # #769 review: measure the REQUEST, not the FILE. The file is
-        # re-serialized before it is sent, so a pretty-printed manifest is
-        # far larger than the request it produces -- judging the file
-        # refused inputs the bridge accepts, and made this message's own
-        # reason false for them. The request also carries an envelope the
-        # file lacks, so a compact file exactly at the cap slipped through
-        # and died at the bridge with the bare `request too large` this
-        # guard exists to pre-empt. One quantity, measured the way the
-        # transport serializes it.
-        # #889c finding 2: `-t` and `--preview` are folded into BOTH the
-        # params and the envelope AFTER this check, so a flat reserve let a
-        # long selector carry the request over the cap and into the bridge's
-        # bare `request too large`. Count them where they are known -- the
-        # selector this invocation will really send, which is not always the
-        # ambient `args.target` (see the demotion below).
-        request_bytes = request_bytes_for_params(
-            manifest,
-            selector=(cli_target or manifest.get("target")),
-            preview=bool(getattr(args, "preview", False)),
-        )
-        if max_bytes is not None and request_bytes > max_bytes:
-            raise BridgeError(
-                f"Manifest ({source}) produces a {request_bytes}-byte request, "
-                f"over the {max_bytes} limit -- the bridge refuses a request "
-                f"this large on arrival, so sending it can only fail. Split "
-                f"it, or raise/disable the ceiling with {MAX_BYTES_ENV}=<n> "
-                f"(0 disables)."
             )
     # #690 r4: an explicit-but-empty manifest target (an unset shell variable
     # templated into the file) is an error -- it must not ride the focused-tab

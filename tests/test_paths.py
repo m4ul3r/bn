@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import socket as _socket
+import stat
 import tempfile
 from pathlib import Path
 
@@ -128,3 +130,31 @@ def test_validate_instance_id_maps_the_path_boundary_error(monkeypatch):
 def test_validate_instance_id_still_accepts_a_normal_id(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     assert validate_instance_id("phase2-probe") == "phase2-probe"
+
+
+def test_ensure_private_dir_tightens_parents_it_creates(tmp_path):
+    """#763: `mkdir(parents=True, mode=0o700)` applies the mode to the LEAF only,
+    so a fresh cache root stayed at the umask default (0755) while its children
+    were 0700 -- and the parent is the directory a cross-user boundary crosses."""
+    umask = os.umask(0o022)
+    try:
+        leaf = tmp_path / "fresh" / "cache" / "spills"
+        _paths.ensure_private_dir(leaf)
+    finally:
+        os.umask(umask)
+
+    for created in (tmp_path / "fresh", tmp_path / "fresh" / "cache", leaf):
+        assert stat.S_IMODE(created.stat().st_mode) == 0o700
+
+
+def test_ensure_private_dir_leaves_a_preexisting_parent_alone(tmp_path):
+    """Only the chain this call CREATED is tightened: a pre-existing parent may
+    be a directory the user keeps for other reasons."""
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    os.chmod(parent, 0o755)
+
+    _paths.ensure_private_dir(parent / "spills")
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE((parent / "spills").stat().st_mode) == 0o700

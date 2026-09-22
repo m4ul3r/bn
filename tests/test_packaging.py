@@ -5,6 +5,7 @@ import importlib
 import os
 import shutil
 import subprocess
+import sys
 import tomllib
 import zipfile
 from pathlib import Path
@@ -117,6 +118,55 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
         if ".data/data/" in name
     }
     assert expected_data <= shipped_data, expected_data - shipped_data
+
+
+def test_pyproject_declares_the_posix_only_platform():
+    """#824: the package cannot run on Windows (fcntl locks, AF_UNIX transport)
+    and its metadata said nothing about it -- the first symptom was a bare
+    ModuleNotFoundError for fcntl out of `import bn.cli`."""
+    repo = Path(__file__).resolve().parents[1]
+    data = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+
+    classifiers = data["project"]["classifiers"]
+    assert "Operating System :: POSIX" in classifiers
+    assert "Operating System :: POSIX :: Linux" in classifiers
+
+
+def test_a_missing_fcntl_names_the_posix_requirement_instead_of_failing_to_import():
+    """The other half of #824 item 1, and the half that is actually a behaviour:
+    the ENTRY GATE. On a non-POSIX interpreter `import bn.cli` died with a bare
+    `ModuleNotFoundError: No module named 'fcntl'` raised out of a transitive
+    import, which tells the caller nothing about why. The classifiers pinned
+    above are metadata; this pins what README promises a user will see.
+
+    Stripping both `try/except ImportError` gates left the whole suite green
+    before this cell existed, so the gate could have rotted or been deleted
+    silently. Setting a module to ``None`` in ``sys.modules`` is the documented
+    way to make its import fail, and a child interpreter is the only way to
+    reach the gate from a POSIX host, where the real import always succeeds.
+    """
+    probe = (
+        "import sys\n"
+        "sys.modules['fcntl'] = None\n"
+        "try:\n"
+        "    import bn.cli\n"
+        "except RuntimeError as exc:\n"
+        "    print('RuntimeError:', exc)\n"
+        "except BaseException as exc:\n"
+        "    print(type(exc).__name__ + ':', exc)\n"
+        "else:\n"
+        "    print('imported with no gate')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe],
+                          capture_output=True, text=True,
+                          cwd=Path(__file__).resolve().parents[1])
+
+    assert proc.returncode == 0, proc.stderr
+    # A named RuntimeError, not the bare ModuleNotFoundError that was the
+    # reported first symptom, and not a silent success.
+    assert proc.stdout.startswith("RuntimeError:"), proc.stdout
+    assert "POSIX-only" in proc.stdout
+    assert "ModuleNotFoundError" not in proc.stdout
 
 
 def _declared_scripts() -> dict[str, str]:

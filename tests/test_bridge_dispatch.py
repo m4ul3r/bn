@@ -490,6 +490,105 @@ def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
     }
 
 
+def test_target_info_and_orient_digest_agree_on_existing_annotations_793(monkeypatch):
+    """#793: `target info` published NO annotation key while `evidence orient`
+    published `existing_annotations`, so the same cached view read annotated on
+    one surface and pristine on the other -- and `target info` is the command
+    every agent runs first. Both now publish the same block, from one builder
+    (`read_listing._existing_annotations`), counts and provenance hint included.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    info = instance._target_info("active")
+    digest = instance._orient_digest("active")
+
+    assert info["existing_annotations"]["comments"] == 1
+    assert info["existing_annotations"]["analysis_cache_restored"] is True
+    assert "predate this run" in info["existing_annotations"]["provenance_hint"]
+    # The agreement IS the fix: one builder, one answer, whichever surface asks.
+    assert digest["existing_annotations"] == info["existing_annotations"]
+
+
+def test_orient_digest_emits_the_annotation_block_once_883(monkeypatch):
+    """#883 item 2: agreement is not enough -- the block must be emitted ONCE.
+
+    `_target_info` publishes the block and the digest used to republish the SAME
+    dict under `target`, so `evidence orient --format json` carried two
+    byte-identical copies: on the view this was measured on, 2469 + 2469 compact
+    bytes of an 11398-byte payload (43%), and the reviewer's denser view hit 63%
+    of 15152. Trunk carried only the top-level copy. Asserting the two surfaces
+    AGREE (the #793 test above) passes under the duplication, so this pins the
+    shape itself: the block is BUILT once, so the nested copy is pure waste, and
+    the digest is the only surface that has a second place to put it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x401000: "inherited note", 0x401020: "second note"})
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 0})
+
+    digest = instance._orient_digest("active")
+
+    # The block is still there, at the path the digest has always documented...
+    assert digest["existing_annotations"]["comments"] == 2
+    # ...and NOT a second time under `target`, which is where the duplicate sat.
+    assert "existing_annotations" not in digest["target"]
+    # ...while `target info` -- where the block is that op's OWN answer, not a
+    # repeated one -- keeps publishing it.
+    assert instance._target_info("active")["existing_annotations"]["comments"] == 2
+    # The payload carries the block once, stated over the encoded digest: a
+    # `target` copy could only come back through that key name.
+    assert json.dumps(digest).count('"existing_annotations"') == 1
+
+
+def test_target_info_annotation_counts_degrade_but_stay_present_793(monkeypatch):
+    """The other half of #793's contract: the key is never silently ABSENT. A view
+    whose annotation counts cannot be read publishes the `unavailable` marker (the
+    shape `bn_kernel.assert_unannotated` refuses), so an unreadable summary can
+    never pass as a pristine target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/proj/shared.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary",
+                        lambda ctx, view: (_ for _ in ()).throw(RuntimeError("view is dead")))
+
+    annotations = instance._target_info("active")["existing_annotations"]
+
+    assert "view is dead" in annotations["unavailable"]
+    assert annotations["analysis_cache_restored"] is True
+
+
 def test_target_info_surfaces_image_base(monkeypatch):
     """#564: target info exposes image_base from bv.start so dynamic tools can
     rebase a BN address to runtime instead of guessing the preferred base."""
@@ -3693,10 +3792,17 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
     # #275: the canonical envelope now carries a `kind` discriminator too.
     envelope_keys = {"kind", "items", "total", "offset", "limit", "returned", "has_more"}
+    # #795: `strings` carries ONE key beyond the shared envelope -- `filtered`,
+    # the count of candidates the active filter chain dropped, so the denominator
+    # is readable without a second unfiltered invocation. It rides the strings
+    # envelope alone (imports reports its exclusions under its own key), so it is
+    # added to the expected set HERE rather than to the shared one above.
+    strings_envelope_keys = envelope_keys | {"filtered"}
 
     # A limit that truncates: 2 of 5 come back, but the total stays honest.
     strings_page = instance._strings(None, query=None, offset=0, limit=2)
-    assert set(strings_page) == envelope_keys
+    assert set(strings_page) == strings_envelope_keys
+    assert strings_page["filtered"] == 0          # nothing filtered this run
     assert strings_page["kind"] == "strings"
     assert strings_page["total"] == 5
     assert strings_page["returned"] == 2

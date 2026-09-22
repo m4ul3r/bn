@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import os
+import re
+import resource
+import signal
+import threading
+import time
+from pathlib import Path
+
 import bn.cli
 import pytest
 
@@ -159,3 +168,611 @@ def test_types_declare_file_failures_are_structured_refusals_754(
     assert "Traceback" not in captured.err and "Traceback" not in captured.out
     assert '"ok":false' in captured.out.replace(" ", "")
     assert str(target) in captured.out
+
+
+@contextlib.contextmanager
+def _must_not_hang(seconds: float = 10.0):
+    """Turn a hang into a failure for the #864 tests below.
+
+    Every one of them asserts that some FIFO shape TERMINATES, and a read that
+    never returns is the exact defect #864 reports -- but an unbounded read
+    makes pytest stall rather than fail, so a regression would score as "still
+    running" instead of as a red test, and would take the whole suite with it.
+    """
+    def _fire(signum, frame):
+        raise AssertionError(f"the call never returned ({seconds:g}s) -- it hung")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_types_declare_refuses_a_fifo_instead_of_hanging(fake_transport, capsys, tmp_path):
+    """#864: `--file <fifo>` blocked forever with no output and no envelope. The
+    shared reader refuses on what the stream DELIVERED, so the refusal names
+    that rather than "not a regular file", which would also condemn the process
+    substitutions below."""
+    fifo = tmp_path / "decl.h"
+    os.mkfifo(fifo)
+    calls = fake_transport()
+
+    with _must_not_hang():
+        rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(fifo)])
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "FIFO" in captured.err
+    assert "delivered no data" in captured.err
+    assert str(fifo) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def _declare_ok():
+    return {"types_declare": {"ok": True, "result": {"preview": False, "success": True,
+                                                     "results": [{"status": "verified"}]}}}
+
+
+def _declare(path: str) -> list[str]:
+    return ["types", "declare", "--target", "active", "--file", path]
+
+
+def test_types_declare_reads_a_buffered_process_substitution(fake_transport):
+    """#864 asked the decision to cover process substitution; a blanket
+    non-regular refusal answers it by deleting it. A shell hands `<(printf ...)`
+    over as /dev/fd/N -- a FIFO whose bytes are already buffered and whose
+    writer has exited -- and that read terminated on base, so refusing it is a
+    regression, not a guardrail."""
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"struct P { int hp; };")
+    os.close(write_fd)
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        os.close(read_fd)
+
+    assert rc == 0
+    assert calls[-1]["op"] == "types_declare"
+    assert calls[-1]["params"]["declaration"] == "struct P { int hp; };"
+
+
+def test_types_declare_waits_for_a_running_process_substitution_writer(
+        fake_transport, monkeypatch):
+    """The other half of the same shape: `<(sleep 1; gen)` has a writer attached
+    but no first byte yet, so the non-blocking probe sees EAGAIN rather than
+    data. Refusing on "nothing buffered yet" would break every generator that
+    is not instantaneous; the read waits for the writer it can see.
+
+    The writer is released only once the reader has OPENED the pipe, and the
+    wait is measured from that open -- otherwise the writer wins the race on a
+    slow interpreter start and the test silently degenerates into the buffered
+    case above, scoring a read that waited and a read that did not identically.
+    """
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    path = f"/dev/fd/{read_fd}"
+    opened = threading.Event()
+    opened_at: list[float] = []
+    real_open = os.open
+
+    def spy_open(target, *args, **kwargs):
+        fd = real_open(target, *args, **kwargs)
+        if str(target) == path:
+            opened_at.append(time.monotonic())
+            opened.set()
+        return fd
+
+    monkeypatch.setattr(os, "open", spy_open)
+
+    def _write_once_the_reader_is_waiting():
+        opened.wait(timeout=10)
+        time.sleep(0.2)
+        os.write(write_fd, b"struct Q { int a; };")
+        os.close(write_fd)
+
+    writer = threading.Thread(target=_write_once_the_reader_is_waiting)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(path))
+    finally:
+        writer.join(timeout=10)
+        os.close(read_fd)
+    waited = time.monotonic() - opened_at[0]
+
+    assert rc == 0
+    assert calls[-1]["params"]["declaration"] == "struct Q { int a; };"
+    assert waited >= 0.19, f"the read did not wait for the writer ({waited:.3f}s)"
+
+
+def test_a_zero_output_process_substitution_is_refused_the_same_way_either_way(
+        fake_transport, capsys, monkeypatch):
+    """`--file <(cmd)` where cmd writes nothing races the open: sometimes the
+    writer has already exited (the probe sees EOF), sometimes it is still
+    attached (the probe sees EAGAIN). It is the same input, so it must get the
+    same answer -- deciding on whichever state the probe caught means the same
+    command is refused or silently accepted as an empty declaration depending
+    on machine load.
+
+    The EAGAIN limb is released by the OBSERVED open, not by a fixed sleep from
+    thread start. A fixed delay races `main()`'s own startup -- measured at
+    0.149-0.285s to reach the FIFO open, against a 0.2s delay -- so the writer
+    usually won, both limbs probed EOF, and the cell silently compared one
+    state with itself: the scheduling race it exists to forbid could be
+    reinstated and it still passed. Keying the release off the open makes the
+    discriminating limb certain, and `opened` is asserted so the cell fails
+    loudly rather than degenerating again if the seam ever moves.
+    """
+    watched: list[str] = []
+    opened = threading.Event()
+    real_open = os.open
+
+    def spy_open(target, *args, **kwargs):
+        fd = real_open(target, *args, **kwargs)
+        if watched and str(target) == watched[0]:
+            opened.set()
+        return fd
+
+    monkeypatch.setattr(os, "open", spy_open)
+
+    outcomes = []
+    for exits_after_the_reader_opens in (None, 0.2):
+        calls = fake_transport(_declare_ok())
+        read_fd, write_fd = os.pipe()
+        path = f"/dev/fd/{read_fd}"
+        watched[:] = [path]
+        opened.clear()
+        closer = None
+        if exits_after_the_reader_opens is None:
+            # Writer already gone before the reader ever opens: probe sees EOF.
+            os.close(write_fd)
+        else:
+            # Writer still attached when the reader opens, exiting only after:
+            # the probe sees EAGAIN and then EOF.
+            closer = threading.Thread(target=lambda: (
+                opened.wait(timeout=10),
+                time.sleep(exits_after_the_reader_opens),
+                os.close(write_fd)))
+            closer.start()
+        try:
+            with _must_not_hang():
+                rc = bn.cli.main(_declare(path))
+        finally:
+            if closer is not None:
+                closer.join(timeout=10)
+            os.close(read_fd)
+        if exits_after_the_reader_opens is not None:
+            assert opened.is_set(), (
+                "the reader never opened the pipe, so the EAGAIN limb was not "
+                "reached and this cell would be comparing EOF with EOF")
+        err = capsys.readouterr().err.replace(path, "<pipe>")
+        outcomes.append((rc, err, [call["op"] for call in calls]))
+
+    assert outcomes[0] == outcomes[1], outcomes
+    rc, err, ops = outcomes[0]
+    assert rc == 2
+    assert ops == []
+    assert "FIFO" in err and "delivered no data" in err
+    assert "Traceback" not in err
+
+
+def test_types_declare_refuses_a_fifo_whose_writer_is_attached_but_silent(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """The reported hang from the other side of the pipe: `mkfifo f; sleep 60 >
+    f &` attaches a writer, so the non-blocking open succeeds and EAGAIN says
+    "a writer is there". Waiting for it unconditionally reproduces #864's exact
+    measured symptom -- rc=124, zero bytes, no envelope -- so the wait for the
+    next byte is bounded and the timeout is a structured refusal."""
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    fifo = tmp_path / "decl.h"
+    os.mkfifo(fifo)
+    calls = fake_transport()
+    # A write-only open of a FIFO fails with ENXIO while no reader is attached,
+    # so the test holds one open for the duration. It changes nothing the
+    # reader under test observes: the writer it finds is attached and silent.
+    keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    silent_writer = os.open(fifo, os.O_WRONLY)
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(str(fifo)))
+    finally:
+        os.close(silent_writer)
+        os.close(keep_reader)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "went quiet" in captured.err
+    assert str(fifo) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_slow_but_steady_producer_is_not_cut_off_by_the_idle_bound(
+        fake_transport, monkeypatch):
+    """The idle bound is on IDLE time. A generator that takes longer overall
+    than that bound but never goes quiet for it must read in full -- an idle
+    bound tight enough to cut off a correct slow producer would trade #864's
+    hang for a new wrong answer. The TOTAL bound the sibling below pins is the
+    termination guarantee, and it is deliberately far too generous to fire for
+    any real producer of a declaration, script, manifest or model map."""
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+
+    def _dribble():
+        for piece in (b"struct ", b"R { ", b"int a; ", b"};"):
+            os.write(write_fd, piece)
+            time.sleep(0.15)
+        os.close(write_fd)
+
+    writer = threading.Thread(target=_dribble)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        writer.join(timeout=10)
+        os.close(read_fd)
+
+    assert rc == 0
+    assert calls[-1]["params"]["declaration"] == "struct R { int a; };"
+
+
+def test_an_endless_dribble_is_refused_rather_than_read_without_end(
+        fake_transport, capsys, monkeypatch):
+    """The idle bound is a diagnosis, not the termination guarantee. A producer
+    that emits one byte inside every idle window resets that bound forever, so
+    the read never returns -- #864's measured symptom (rc=124, zero output, no
+    envelope) reached from a third direction, and the one shape for which
+    `read_text_input`'s "guaranteed to terminate" claim was false. The drain is
+    bounded in total as well, so an endless producer gets a structured refusal
+    naming what it delivered instead of never answering at all.
+
+    The writer here is never idle for the idle bound, so only a total bound can
+    end this read: with the idle bound alone this cell hangs, and the hang
+    guard turns that into a red assertion rather than a stalled suite.
+    """
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    monkeypatch.setattr(bn.cli, "_FIFO_TOTAL_TIMEOUT", 1.0)
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    stop = threading.Event()
+
+    def _dribble_without_end():
+        while not stop.is_set():
+            try:
+                os.write(write_fd, b".")
+            except OSError:
+                return
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=_dribble_without_end, daemon=True)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        stop.set()
+        writer.join(timeout=10)
+        os.close(write_fd)
+        os.close(read_fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    # Names the total bound it hit. It deliberately does NOT claim the writer
+    # "went quiet" (false here) nor that it is "still delivering" (unknowable
+    # at the bound -- the producer may have stopped inside the last window).
+    assert "could not finish within" in captured.err
+    assert "went quiet" not in captured.err
+    assert "still delivering" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_flooding_producer_is_refused_before_it_exhausts_memory(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """Both bounds above are CLOCKS, and a clock does not bound memory. The
+    drain buffers what it reads, so a fast endless producer exhausts the heap
+    long before either clock fires and dies as a bare `MemoryError` -- not an
+    `OSError`, so it escapes the reader's handler as a raw traceback with no
+    envelope. That is #864's symptom class (no output, no envelope) from a
+    fourth direction, and the same escape shape as the `select` `ValueError`.
+    Measured before the cap: ~0.24-0.36 GB/s accumulated, so the shipped 300s
+    total bound would need tens of GB resident to ever be reached.
+
+    The cap and the chunk size are patched down so the cell costs a few KiB,
+    and the writer is given a BOUNDED budget. That budget is what pins the
+    UNIT, and it has to be independent of the drain's own counter: asserting
+    on the byte figure the refusal REPORTS is circular, because a predicate
+    that counts chunks reports chunks and the assertion still holds. With a
+    budget of 256 KiB against a 8192-byte cap, byte-counting refuses after
+    ~9 KiB while chunk-counting would need 8192 chunks = 8 MiB, so it never
+    refuses at all: the writer's budget runs out with the write end still
+    held open below, the drain sits on the unpatched 30s idle bound waiting
+    for a producer that has nothing left to send, and the 10s hang guard
+    fires. Red either way; naming the wrong mechanism here is how a later
+    edit "fixes" the cell by patching the clock and silently removes the
+    only thing that makes the mutant observable.
+    """
+    monkeypatch.setattr(bn.cli, "_FIFO_CHUNK", 1024)
+    monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 8192)
+    calls = fake_transport(_declare_ok())
+    read_fd, write_fd = os.pipe()
+    stop = threading.Event()
+    budget = 256 * 1024
+
+    def _flood():
+        blob = b"x" * 4096
+        written = 0
+        while not stop.is_set() and written < budget:
+            try:
+                written += os.write(write_fd, blob)
+            except OSError:
+                return
+
+    writer = threading.Thread(target=_flood, daemon=True)
+    writer.start()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+    finally:
+        stop.set()
+        # Close the read end FIRST: once the drain has refused, the writer is
+        # blocked on a full pipe and only EPIPE releases it.
+        os.close(read_fd)
+        writer.join(timeout=10)
+        os.close(write_fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "delivered more than" in captured.err
+    # The whole point: a structured envelope, never the bare MemoryError.
+    assert "Traceback" not in captured.err
+    assert "MemoryError" not in captured.err
+
+
+def test_a_regular_file_over_the_limit_is_refused_before_it_is_read(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """The FIFO limb counts bytes as they arrive; the regular-file limb had no
+    bound at all, so the same reader refused an endless stream with an envelope
+    and then died on a too-large file with a bare `MemoryError` and no envelope
+    -- one limb bounded, its sibling not. The size is already in hand from the
+    stat the kind checks use, so it is enforced before a single byte is read.
+
+    A sparse file keeps the cell cheap: it claims the size without occupying
+    the disk, which is also the realistic shape (a mistyped path to a large
+    artifact) rather than a contrived one.
+    """
+    monkeypatch.setattr(bn.cli, "_MAX_INPUT_BYTES", 4096)
+    big = tmp_path / "decl.h"
+    with open(big, "wb") as fh:
+        fh.truncate(4096 * 8)
+    calls = fake_transport(_declare_ok())
+
+    rc = bn.cli.main(_declare(str(big)))
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "limit for a text input" in captured.err
+    assert "Traceback" not in captured.err
+    # The negative control: at the limit it is still read and still dispatched,
+    # so the cap refuses the oversized file rather than the feature.
+    ok = tmp_path / "small.h"
+    ok.write_text("struct S { int a; };", encoding="utf-8")
+    assert bn.cli.main(_declare(str(ok))) == 0
+    assert calls[-1]["params"]["declaration"] == "struct S { int a; };"
+
+
+@pytest.mark.parametrize("target", ["fifo", "regular"])
+def test_a_memory_error_answers_with_an_envelope_not_a_traceback(
+        fake_transport, capsys, monkeypatch, tmp_path, target):
+    """`MemoryError` is not an `OSError`, so it escaped both limbs' handlers as
+    a raw traceback at rc 1 -- the round-3 `select` `ValueError` shape, out of
+    the one code path whose entire job is a structured envelope. The byte cap
+    bounds what the reader will KEEP, but a caller whose own address-space
+    budget is smaller than the cap (a container, a `ulimit -v`) hits the
+    allocation failure before the cap is ever reached, so the handler has to
+    catch it as well as bound it.
+
+    Forced rather than provoked with a real limit: a genuine OOM is the one
+    failure a test cannot stage reliably, and what needs pinning is the
+    handler, not the allocator.
+    """
+    calls = fake_transport(_declare_ok())
+    if target == "regular":
+        path = tmp_path / "decl.h"
+        path.write_text("struct S { int a; };", encoding="utf-8")
+
+        real_read_text = Path.read_text
+
+        def boom(self, *args, **kwargs):
+            # Only the input under test: the CLI reads its own session pin
+            # through the same method, and failing that instead would stage a
+            # different defect.
+            if self == path:
+                raise MemoryError
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        spelling = str(path)
+    else:
+        fifo = tmp_path / "decl.h"
+        os.mkfifo(fifo)
+        keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        writer = os.open(fifo, os.O_WRONLY)
+        os.write(writer, b"struct S { int a; };")
+        os.close(writer)
+        real_read = os.read
+
+        def boom(fd, size):
+            real_read(fd, size)
+            raise MemoryError
+
+        monkeypatch.setattr(os, "read", boom)
+        spelling = str(fifo)
+
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(spelling))
+    finally:
+        if target == "fifo":
+            os.close(keep_reader)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "did not fit in memory" in captured.err
+    assert "Traceback" not in captured.err
+    assert "MemoryError" not in captured.err
+
+
+def test_the_idle_wait_cannot_overshoot_the_total_bound(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    """The idle wait is clamped to whatever of the total bound is left, so the
+    worst case is the total and not total-plus-one-idle-window. With an idle
+    bound far larger than the total, a silent writer must still be answered at
+    the total: unclamped, the readiness wait would sit for a whole idle window
+    first and the documented bound would silently be the sum of the two."""
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 5.0)
+    monkeypatch.setattr(bn.cli, "_FIFO_TOTAL_TIMEOUT", 0.5)
+    calls = fake_transport()
+    fifo = tmp_path / "decl.h"
+    os.mkfifo(fifo)
+    # A write-only open fails with ENXIO while no reader is attached, so hold
+    # one open; the writer the reader finds is attached and silent either way.
+    keep_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    silent_writer = os.open(fifo, os.O_WRONLY)
+    started = time.monotonic()
+    try:
+        with _must_not_hang():
+            rc = bn.cli.main(_declare(str(fifo)))
+    finally:
+        os.close(silent_writer)
+        os.close(keep_reader)
+    elapsed = time.monotonic() - started
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    assert elapsed < 2.5, f"the idle wait overshot the total bound ({elapsed:.2f}s)"
+    captured = capsys.readouterr()
+    assert "could not finish within" in captured.err
+    assert "Traceback" not in captured.err
+
+
+_FD_SETSIZE = 1024
+# The ballast the probe burns to push its pipe past the ceiling, plus room for
+# everything the interpreter and the test runner already hold open.
+_FD_HEADROOM = _FD_SETSIZE + 400
+
+
+@contextlib.contextmanager
+def _descriptor_headroom(needed: int = _FD_HEADROOM):
+    """Raise this process's ``RLIMIT_NOFILE`` soft limit to *needed* for the block.
+
+    The probe below is the only regression guard for the FD_SETSIZE blocker,
+    and conditioning it on the INHERITED soft limit made it vanish silently:
+    at the conventional 1024 default it skipped and the run still exited 0, so
+    the same commit executed the guard in one full-suite run and skipped it in
+    another depending only on the limit the worker happened to inherit. A guard
+    that disappears when the environment shrugs is not a guard.
+
+    POSIX lets a process raise its own soft limit up to the hard limit, so the
+    probe takes the headroom it needs instead of asking the environment for it,
+    and skips only when the HARD limit genuinely cannot hold the descriptors --
+    a statement about the host's real capability rather than about a default.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < needed:
+        pytest.skip(f"hard RLIMIT_NOFILE ({hard}) cannot hold {needed} descriptors")
+    raise_it = soft != resource.RLIM_INFINITY and soft < needed
+    if raise_it:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+    try:
+        yield
+    finally:
+        if raise_it:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def _assert_a_high_descriptor_fifo_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch):
+    """`select()`'s fd_set stops at FD_SETSIZE and raises a bare `ValueError`
+    past it -- not an `OSError`, so it escapes the reader's own handler. A `bn`
+    launched from a supervisor or CI runner that leaks a large descriptor table
+    would then get a Python traceback at exit 1 out of the one code path whose
+    entire job is to answer in a structured envelope. Ballast pushes the pipe
+    past the ceiling so the wait is exercised with a high descriptor.
+
+    Shared by the two cells below so that the descriptor limit the guard runs
+    under is the ONLY difference between them.
+    """
+    monkeypatch.setattr(bn.cli, "_FIFO_IDLE_TIMEOUT", 0.3)
+    calls = fake_transport()
+    with _descriptor_headroom():
+        ballast = [os.open(os.devnull, os.O_RDONLY) for _ in range(_FD_SETSIZE + 100)]
+        read_fd, write_fd = os.pipe()
+        try:
+            assert read_fd > _FD_SETSIZE, f"ballast did not clear FD_SETSIZE ({read_fd})"
+            # The write end stays open and silent, so the read reaches the
+            # bounded wait -- the only place a descriptor is handed to the
+            # readiness call.
+            with _must_not_hang():
+                rc = bn.cli.main(_declare(f"/dev/fd/{read_fd}"))
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+            for fd in ballast:
+                os.close(fd)
+
+    assert rc == 2
+    assert [call["op"] for call in calls] == []
+    captured = capsys.readouterr()
+    assert "went quiet" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_fifo_above_fd_setsize_still_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch):
+    """The guard at whatever descriptor limit this run inherited."""
+    _assert_a_high_descriptor_fifo_answers_with_an_envelope(
+        fake_transport, capsys, monkeypatch)
+
+
+def test_the_fd_setsize_guard_still_runs_at_a_conventional_descriptor_limit(
+        fake_transport, capsys, monkeypatch):
+    """The guard must not be able to vanish. This pins the exact condition that
+    made it disappear -- a soft limit at the conventional 1024 default, below
+    the headroom the probe needs -- and asserts the high-descriptor envelope is
+    still VERIFIED there rather than skipped past at a green exit."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < _FD_HEADROOM:
+        pytest.skip(f"hard RLIMIT_NOFILE ({hard}) cannot hold {_FD_HEADROOM} descriptors")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_FD_SETSIZE, hard))
+    try:
+        _assert_a_high_descriptor_fifo_answers_with_an_envelope(
+            fake_transport, capsys, monkeypatch)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_types_declare_dev_null_still_reaches_the_op(fake_transport):
+    """The #864 rule must not swallow /dev/null, which #754/#855 deliberately
+    keep working as an empty declaration."""
+    calls = fake_transport({
+        "types_declare": {"ok": True, "result": {"preview": False, "success": True,
+                                                 "results": [{"status": "verified"}]}},
+    })
+
+    rc = bn.cli.main(["types", "declare", "--target", "active", "--file", "/dev/null"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "types_declare"
+    assert calls[-1]["params"]["declaration"] == ""

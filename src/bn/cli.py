@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import select
 import stat
 import sys
 import time
@@ -23,7 +25,8 @@ from .formatters import (
     _render_mutation_text,
     _render_target_choices,
 )
-from .output import render_envelope, render_error, render_value, write_output_result
+from .output import (estimate_output_result, render_envelope, render_error, render_value,
+                     write_output_result)
 from .target_hint import SELECT_HINT_LINE
 
 # The names below are re-exported through this module on purpose: command
@@ -366,6 +369,7 @@ def _common_io_options(
     parser: argparse.ArgumentParser,
     *,
     default_format: str = "text",
+    estimable: bool = False,
 ) -> None:
     parser.add_argument(
         "--format",
@@ -374,11 +378,35 @@ def _common_io_options(
         action=_RecordExplicitFormat,
         help="Output format",
     )
-    parser.add_argument(
-        "--out", type=_resolve_out_path,
-        help="Write output to a file instead of stdout (a .json/.ndjson path "
-             "infers --format unless one is given). Relative paths are resolved "
-             "against the invoking shell's cwd, not the bridge's.",
+    out_help = ("Write output to a file instead of stdout (a .json/.ndjson path "
+                "infers --format unless one is given). Relative paths are resolved "
+                "against the invoking shell's cwd, not the bridge's.")
+    # #796: the preflight half of #409's "bound the next read" -- the size of the
+    # payload the caller would otherwise pay for, and the flag that slices it.
+    # Advertised ONLY on the commands whose emit path implements it
+    # (`estimable=True`, set by the decorator of a read that renders through
+    # `_call` -> `_render_result`), because a flag whose behaviour depends on
+    # which emit path the handler happens to take is not a shared output option:
+    # `--format`/`--out` are honored by every command, this one is not. Placement
+    # follows the code path that implements it, exactly as `fanout=True` does
+    # (#169 L1 review) -- and a command that does not advertise it refuses it for
+    # free through argparse's unrecognized-arguments, at the same exit code the
+    # bespoke refusal used to produce.
+    if not estimable:
+        parser.add_argument("--out", type=_resolve_out_path, help=out_help)
+        return
+    # Reproduced as a preflight, a size and a write path are two answers to one
+    # question, so argparse refuses the pair itself (`not allowed with argument`)
+    # rather than one of them silently winning.
+    exclusive = parser.add_mutually_exclusive_group()
+    exclusive.add_argument("--out", type=_resolve_out_path, help=out_help)
+    exclusive.add_argument(
+        "--estimate-output", action="store_true", default=False,
+        dest="estimate_output",
+        help="Report the estimated token/byte size of this command's output and "
+             "the flag that slices it, INSTEAD of printing or writing it (the read "
+             "still runs; nothing is written to disk and no spill artifact is "
+             "created). Mutually exclusive with --out.",
     )
 
 
@@ -541,6 +569,7 @@ def command(
     prefer_when: str = "",
     see_also: tuple[str, ...] = (),
     fanout: bool = False,
+    estimable: bool = False,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -555,6 +584,15 @@ def command(
     (no per-function/address identifier) set it, so a write or side-effecting
     command -- several of which default to ``fmt="text"`` (save/close/refresh/py
     exec/load) -- can never be fanned across every instance.
+
+    ``estimable`` advertises ``--estimate-output`` (#796) on the same terms: an
+    explicit allow-list for the commands whose handler renders through ``_call``
+    -- ``_render_result``, which is the only path that implements the preflight.
+    A mutation (refused anyway), a side-effecting command whose result IS its
+    status (save/close/load/refresh/py exec), and a command that emits through
+    ``_emit_result`` (capabilities/doctor/session/plugin/skill/pins) all leave it
+    off, so the flag can neither replace an outcome with a byte count nor be
+    accepted-and-ignored.
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -577,16 +615,44 @@ def command(
             "prefer_when": prefer_when,
             "see_also": tuple(see_also),
             "fanout": fanout,
+            # #796: an EXPLICIT allow-list for `--estimate-output`, like `fanout`
+            # above and for the same reason -- the flag is implemented by ONE emit
+            # path (`_call` -> `_render_result`), so inferring it from the format
+            # or the target requirement would advertise it on commands that
+            # silently ignore it (or, worse, on a command whose side effect the
+            # estimate then replaces with a byte count).
+            "estimable": estimable,
         })
         return fn
 
     return decorator
 
 
+def _group_paths() -> frozenset[tuple[str, ...]]:
+    """Every registered path that is a proper PREFIX of another one (#796 r2).
+
+    Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
+    path like ``types``/``exports``, the very same parser object also serves as
+    the node's own leaf. A flag attached there is therefore accepted BEFORE the
+    subcommand is dispatched, which is why the estimate flag cannot be advertised
+    on such a node: `bn types --estimate-output declare ...` ran the declaration
+    and printed a byte count over it, and `bn types --estimate-output show X` had
+    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
+    (a real default on an intermediate-level parser) landing on the one node
+    class where "intermediate" and "leaf" are the same object.
+
+    Derived from the registry rather than a second hand-kept list, so a new
+    command or subcommand cannot reopen the hole silently.
+    """
+    return frozenset(spec["path"][:i] for spec in _COMMANDS
+                     for i in range(1, len(spec["path"])))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
+    group_paths = _group_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -632,7 +698,12 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             cmd = _get_subparsers(parent).add_parser(path[-1], help=spec["help"])
             node_parsers[path] = cmd
 
-        _common_io_options(cmd, default_format=spec["fmt"])
+        # A group node never carries the estimate flag, even when the node is also
+        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
+        # for the two live failure shapes that buys.
+        _common_io_options(cmd, default_format=spec["fmt"],
+                           estimable=(bool(spec.get("estimable"))
+                                      and path not in group_paths))
         _instance_option(cmd)
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting
@@ -684,12 +755,26 @@ def _render_result(
     spill_status: tuple[Any, Callable[[Any], str] | None] | None = None,
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
+    estimate_only: bool = False,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
     The spilled flag lets the caller decide whether to add a further note (e.g. a
     display-truncation warning): a spill already prints its own pipe-trap note, so
-    a caller-side note would be redundant when it fires."""
+    a caller-side note would be redundant when it fires.
+
+    *estimate_only* (#796) replaces the whole write/spill decision with the
+    preflight one: the payload is measured and only its size reaches stdout, so
+    nothing is written and there is nothing to spill. It sits ABOVE the
+    ``artifact_path`` passthrough because an already-materialized artifact
+    envelope is a payload like any other -- a caller asking what it costs gets
+    its size, not a re-render of a file it may not have."""
+    if estimate_only:
+        result = _apply_result_transform(
+            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+            value, f"estimate the {stem} output size as {fmt}")
+        sys.stdout.write(result.rendered)
+        return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
     # deeply nested response raises RecursionError, and a renderer meeting a
     # field shape it cannot read raises out of `main()`, which catches only
@@ -1527,6 +1612,398 @@ def _mutation_preflight(args: argparse.Namespace):
         ) from exc
 
 
+# #767/#768: a `--count` run reports the whole-target total, so an ordering,
+# paging or aggregate flag beside it can only be ignored -- and a silently
+# dropped flag is how an agent draws a wrong conclusion from a right-looking
+# number. argparse cannot express "this flag excludes each of those": one
+# mutually exclusive group would also exclude the flags from EACH OTHER
+# (`--sort` with `--reverse` is a legitimate pair), so the check is explicit.
+_COUNT_SLICE_FLAGS: tuple[tuple[str, str, Any], ...] = (
+    ("limit", "--limit", None),
+    ("offset", "--offset", 0),
+    ("sort", "--sort", "address"),
+    ("reverse", "--reverse", False),
+    ("summary", "--summary", False),
+)
+
+
+def _refuse_count_only_slices(args: argparse.Namespace, *, command: str) -> None:
+    """Refuse a ``--count`` run that also carries a slice-shaped flag.
+
+    Each flag is compared against its own "not given" value and read with
+    ``getattr``, so a command that does not declare the flag cannot trip it.
+    ``--sort address`` on an address-sorted command is not an offender: it is
+    indistinguishable from the default and means the same thing anyway.
+    """
+    offenders = [
+        flag for attr, flag, unset in _COUNT_SLICE_FLAGS
+        if getattr(args, attr, unset) != unset
+    ]
+    if offenders:
+        raise BridgeError(
+            f"{command} --count reports the whole-target total, so "
+            f"{', '.join(offenders)} would be silently ignored. Drop --count for "
+            "the paged list, or drop the flags for the count."
+        )
+
+
+def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
+    """Read a CLI text-input file whose read is guaranteed to terminate.
+
+    ``open(fifo, O_RDONLY)`` does not return until a writer appears, so a FIFO
+    with none made ``Path.read_text`` block forever: no output, no envelope, no
+    timeout -- the worst failure an agent-facing CLI can produce, and one the
+    caller cannot even see in a log (#864). #754/#855 refused a directory by
+    name and wrapped the read; this states the rule once for the --file /
+    --script / manifest / --models / --resolve-map readers instead of five
+    times.
+
+    The rule is about what can BLOCK, not about file kind. #864 asked the
+    decision to cover process substitution explicitly, and a blanket
+    non-regular refusal answers it by deleting it: ``--file <(cmd)`` is handed
+    over as ``/dev/fd/N``, which stats as a FIFO. It is read by
+    `_read_fifo_text`, which never blocks in ``open`` and bounds the wait for
+    each next byte. ``--file /dev/null`` stays the "empty input" spelling
+    #855's scope note protects. Everything else non-regular -- a socket, a
+    block device, a streaming character device like ``/dev/zero`` -- is refused
+    by kind, because nothing bounds those reads.
+
+    The other half of #864's question, ``--file -``: it is NOT a spelling this
+    CLI gives a meaning to. ``-`` is a path like any other and is reported as a
+    missing file, which is the honest answer -- inventing a dash convention
+    here would give one reader a stdin spelling its four siblings do not share.
+    ``/dev/stdin`` and ``<(cmd)`` are the streaming spellings, both FIFOs, both
+    read by the bounded path above, and the by-kind refusal names them.
+
+    Every refusal here raises `BridgeError`, which is the same structured error
+    envelope at rc 2 that #754 established for the directory case at this very
+    call site -- the `invalid_request` status at rc 3 belongs to the mutation
+    preflight, which these readers run BEFORE, not inside, so matching it here
+    would make the input refusal claim a preflight it never reached.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        raise BridgeError(_with_hint(f"{what} not found: {path}", hint)) from None
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    if stat.S_ISDIR(st.st_mode):
+        raise BridgeError(_with_hint(f"{what} is a directory: {path}", hint))
+    if stat.S_ISFIFO(st.st_mode):
+        return _read_fifo_text(path, what=what)
+    if not stat.S_ISREG(st.st_mode) and not _is_null_device(path):
+        raise BridgeError(_with_hint(
+            f"{what} is not a regular file ({_file_kind(st.st_mode)}): {path}. "
+            "Nothing bounds a read from a socket or a device -- it can stream "
+            "without end -- so it is refused instead of read until it stops; "
+            "write the input to a regular file, or stream it in through a "
+            "process substitution (`<(cmd)`) or a pipe on /dev/stdin -- a "
+            "/dev/stdin that is still a terminal is this same device", hint))
+    if st.st_size > _MAX_INPUT_BYTES:
+        # The FIFO limb counts bytes as they arrive because it cannot know the
+        # size in advance. Here the size is already in hand from the stat
+        # above, so the same limit is enforced before a single byte is read --
+        # otherwise this branch is the unbounded sibling of a bounded one.
+        raise BridgeError(_with_hint(
+            f"{what} is {st.st_size >> 20} MiB, over the "
+            f"{_MAX_INPUT_BYTES >> 20} MiB limit for a text input: {path}. The "
+            "whole file is read into memory to be parsed, so one this large "
+            "would exhaust the heap before it could be used; the FIFO reader "
+            "refuses an endless stream for exactly the same reason", hint))
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # `MemoryError` is not an `OSError`, so without this it escapes as a
+        # raw traceback -- the same shape as round 3's `select` `ValueError`.
+        # The size check above refuses what is too large to read at all; this
+        # covers a caller whose own address-space budget is smaller than that
+        # limit, where even an in-limit file cannot be allocated.
+        raise BridgeError(
+            f"{what} did not fit in memory: {path}. The whole file is read in "
+            f"to be parsed, and {st.st_size} byte(s) exceeded what this "
+            "process could allocate; pass a smaller input, or raise the "
+            "memory limit this command runs under"
+        ) from None
+
+
+# One page: the FIFO drain below reads in whole chunks rather than byte-wise.
+_FIFO_CHUNK = 1 << 16
+# How long the drain will wait for the NEXT byte before it gives up. An idle
+# bound, not a total one: a producer that streams slowly but steadily resets it
+# on every chunk and is never cut off, while one that says nothing at all for
+# this long is indistinguishable from hung to the caller -- and an invisible
+# hang is the whole defect #864 reports. Generous enough to cover any realistic
+# generator's startup, short enough that the answer is a diagnosis.
+_FIFO_IDLE_TIMEOUT = 30.0
+# ...and how long it will wait in TOTAL, however steadily the bytes arrive. The
+# idle bound above diagnoses a stalled producer, but on its own it is not a
+# termination guarantee: one byte inside every idle window resets it forever,
+# so the read never returns and #864's measured symptom -- rc=124, no output,
+# no envelope -- comes back from a third direction. These readers take a
+# declaration, a script, a manifest or a model map: small documents, not data
+# streams, so a bound this generous cannot cut off a correct producer, and it
+# is what makes "the read terminates" true rather than nearly true.
+_FIFO_TOTAL_TIMEOUT = 300.0
+# ...and, for EITHER limb of `read_text_input`, how many bytes it will take at
+# all. Neither clock above bounds MEMORY: the drain buffers what it reads so
+# the text can be parsed, so a fast producer (`<(cat /dev/zero)` sustains
+# hundreds of MB/s here) exhausts the heap long before either clock can fire,
+# and `MemoryError` -- not an `OSError` -- escapes as a raw traceback with no
+# envelope. That is #864's symptom class from a fourth direction, and
+# structurally the round-3 escape again: a non-OSError leaving the one path
+# whose whole job is a structured refusal. It is also what the by-kind refusal
+# already says about a device -- nothing bounds a read from it -- so the same
+# rule has to hold for an endless stream that arrives through a pipe, and for
+# a regular file too large to hold: bounding one limb and not its sibling
+# would just move the escape. The FIFO limb counts as it reads; the regular
+# file is checked against its stat before any read. A declaration, a script,
+# a manifest or a model map is a document, so this refuses no real input.
+_MAX_INPUT_BYTES = 64 << 20
+
+
+def _read_fifo_text(path: Path, *, what: str) -> str:
+    """Drain a FIFO to EOF under a bound, and refuse an empty one (#864).
+
+    Three distinct ways a FIFO read hangs, and what each gets:
+
+    * **No writer attached** -- ``open(fifo, O_RDONLY)`` does not return until
+      one appears. That is the rc=124-with-no-envelope hang the issue measured.
+      ``O_NONBLOCK`` makes the open return at once.
+    * **A writer attached but silent** (``mkfifo f; sleep 60 > f &``, or a
+      stalled upstream behind ``--file /dev/stdin``) -- the same invisible hang
+      from the other side, so the wait for each next byte is bounded by
+      `_FIFO_IDLE_TIMEOUT` and the timeout is a structured refusal. ``EAGAIN``
+      alone is NOT a refusal: it just means the writer has nothing ready yet,
+      which is the ordinary ``--file <(sleep 1; gen)`` shape, so the drain
+      waits for it.
+    * **A writer that never stops** -- a producer emitting one byte inside
+      every idle window keeps the idle bound alive indefinitely, so the drain
+      is bounded by `_FIFO_TOTAL_TIMEOUT` as well. Without it the read has no
+      termination guarantee at all, only a fast answer for the stalled case.
+    * **A writer that floods** -- the two bounds above are clocks, and a clock
+      does not bound memory. The drain buffers what it reads so the text can
+      be parsed, so a fast endless producer exhausts the heap well before
+      either clock fires and dies as a bare ``MemoryError`` -- not an
+      ``OSError``, so it escapes the handler below exactly the way the
+      ``select`` ``ValueError`` did. `_MAX_INPUT_BYTES` caps the accumulation,
+      counted in BYTES rather than chunks, which is the same judgement the
+      by-kind refusal already makes about a device: nothing bounds an endless
+      stream, so it is refused rather than read until it stops. The cap is
+      what the drain will KEEP; a caller whose own address-space budget is
+      smaller still gets a structured refusal, because the handler below now
+      catches ``MemoryError`` too rather than letting it out as a traceback.
+    * **A writer that delivers nothing at all** -- refused on the DELIVERED
+      BYTE COUNT, never on which state the first probe happened to catch.
+      Whether the writer had already exited (the probe sees EOF) or was still
+      attached and then exited without writing (the probe sees ``EAGAIN``) is
+      pure scheduling; deciding on that would accept or refuse the same
+      ``--file <(cmd)`` at random. An empty pipe is refused rather than read as
+      empty input because it cannot be told apart from a producer that never
+      ran -- a ``<(gen)`` whose command was missing or died looks exactly like
+      one that chose to emit nothing, and accepting it turns a failed generator
+      into a successful no-op mutation. ``/dev/null`` is the unambiguous
+      spelling for "deliberately empty" and keeps working.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    # poll, not select: select's fd_set caps at FD_SETSIZE (1024) and raises a
+    # bare ValueError above it, so a caller launched with a large inherited fd
+    # table would get a traceback at exit 1 instead of the envelope every other
+    # refusal here produces. poll has no such ceiling.
+    waiter = select.poll()
+    waiter.register(fd, select.POLLIN)
+    # A bytearray, not a list of chunks joined at the end: the join would hold
+    # the pieces AND the result at once, doubling peak memory at exactly the
+    # moment the cap below says memory is the scarce thing.
+    buf = bytearray()
+    delivered = 0
+    started = time.monotonic()
+    try:
+        while True:
+            left = _FIFO_TOTAL_TIMEOUT - (time.monotonic() - started)
+            if left <= 0:
+                # Deliberately state-neutral: at this point the producer may be
+                # mid-stream or may have just gone quiet inside the last idle
+                # window, and the drain cannot tell. Saying either would assert
+                # something it does not know, so it reports the bound it hit
+                # and what arrived.
+                raise BridgeError(
+                    f"{what} is a FIFO the read could not finish within "
+                    f"{_FIFO_TOTAL_TIMEOUT:g}s ({delivered} byte(s) delivered): "
+                    f"{path}. The wait for each next byte is bounded, but a "
+                    "producer that says something inside every one of those "
+                    "windows would stream without end, so the read is bounded "
+                    "in total too; what arrived is discarded rather than used "
+                    "as if it were the whole input. Write the input to a "
+                    "regular file"
+                )
+            try:
+                chunk = os.read(fd, _FIFO_CHUNK)
+            except BlockingIOError:
+                # A writer is attached with nothing ready. Wait for it, but not
+                # forever: an unbounded wait here reproduces the reported
+                # symptom exactly, just from the writer's side of the pipe.
+                if not waiter.poll(min(_FIFO_IDLE_TIMEOUT, left) * 1000):
+                    if left <= _FIFO_IDLE_TIMEOUT:
+                        # The total bound ran out first, not the idle one --
+                        # the loop head names it rather than reporting a
+                        # writer that never actually went quiet.
+                        continue
+                    raise BridgeError(
+                        f"{what} is a FIFO whose writer went quiet for "
+                        f"{_FIFO_IDLE_TIMEOUT:g}s after {delivered} byte(s): "
+                        f"{path}. A writer that is attached but silent blocks "
+                        "the read forever, so the wait is bounded; what did "
+                        "arrive is discarded rather than used as if it were the "
+                        "whole input. Write the input to a regular file, or use "
+                        "a producer that streams"
+                    ) from None
+                continue
+            if not chunk:
+                break
+            buf += chunk
+            delivered += len(chunk)
+            if delivered > _MAX_INPUT_BYTES:
+                # Counted in BYTES, deliberately: counting chunks or
+                # iterations would make the real bound this many CHUNKS, i.e.
+                # 64Ki x 64KiB, and the memory escape would be back with the
+                # suite still green.
+                buf.clear()
+                raise BridgeError(
+                    f"{what} is a FIFO that delivered more than "
+                    f"{_MAX_INPUT_BYTES >> 20} MiB ({delivered} byte(s) so "
+                    f"far): {path}. These readers take a document, and the "
+                    "bytes are buffered so the text can be parsed, so an "
+                    "endless producer would exhaust memory long before either "
+                    "time bound could answer. What arrived is discarded rather "
+                    "than truncated into a partial input. Write the input to a "
+                    "regular file"
+                )
+    except OSError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # Not an `OSError`, so without this it escapes as a raw traceback --
+        # the round-3 `select` `ValueError` shape exactly. The cap above
+        # bounds what this drain will KEEP; this covers a caller whose own
+        # address-space budget is smaller than that cap, where the allocation
+        # fails before the cap is ever reached. Drop the buffer first: the
+        # message itself has to be built while memory is already scarce.
+        buf.clear()
+        raise BridgeError(
+            f"{what} is a FIFO whose data did not fit in memory after "
+            f"{delivered} byte(s): {path}. The bytes are buffered so the text "
+            "can be parsed, and this process could not allocate that much; "
+            "pass a smaller input, or raise the memory limit this command "
+            "runs under"
+        ) from None
+    finally:
+        os.close(fd)
+    if not buf:
+        raise BridgeError(
+            f"{what} is a FIFO that delivered no data: {path}. An empty pipe "
+            "cannot be told apart from a producer that never ran, so it is "
+            "refused instead of read as an empty input; pass a regular file, "
+            "/dev/null if you meant empty input, or a process substitution that "
+            "actually writes"
+        )
+    try:
+        return buf.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BridgeError(f"{what} could not be read: {path}: {exc}") from exc
+    except MemoryError:
+        # The decoded str is a second copy of the buffer, so the decode is its
+        # own allocation and its own way to escape without an envelope.
+        buf.clear()
+        raise BridgeError(
+            f"{what} could not be decoded within memory: {path}. {delivered} "
+            "byte(s) were read but the text form could not be allocated; pass "
+            "a smaller input, or raise the memory limit this command runs under"
+        ) from None
+
+
+def decode_json_input(raw: str, *, refusal: str) -> Any:
+    """Decode a text input's JSON, with every failure a structured envelope.
+
+    `read_text_input` above guarantees that no input SHAPE leaves it except
+    as one: not a hang, not a traceback, not an OOM. The decode one line
+    downstream reintroduced the escape for input STRUCTURE. `json.loads` on
+    a ``str`` raises `ValueError` for a malformed document -- which each of
+    its callers already wrapped -- but `RecursionError` for one nested past
+    the scanner's stack and `MemoryError` for one whose object graph does
+    not fit, and neither of those is a `ValueError`. Both escaped as a raw
+    traceback at rc 1 with empty stdout, which is #864's measured symptom
+    one call after the reader added to prevent it.
+
+    A few hundred KB of nested brackets is far inside the 64 MiB the reader
+    will accept, so the bound that makes the READ safe does not make the
+    PARSE safe -- a limit on how much text arrives says nothing about what
+    building an object graph from it costs.
+
+    Stated once rather than at each reader, for the reason `_add_resolve_map`
+    exists: three call sites decoded a `read_text_input` result and all three
+    leaked identically, so per-site handling is how the defect spread.
+    """
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        # `json.JSONDecodeError` is a `ValueError`. Wording unchanged: this
+        # is the ordinary malformed-document answer, and the only one of the
+        # three that ever reached a caller.
+        raise BridgeError(f"{refusal}: {exc}") from None
+    except RecursionError:
+        raise BridgeError(
+            f"{refusal}: the JSON is nested too deeply to parse -- the "
+            "decoder ran out of stack before reaching the end of the "
+            "document. Nesting this deep is a generator bug rather than a "
+            "document a reader can use; flatten it"
+        ) from None
+    except MemoryError:
+        raise BridgeError(
+            f"{refusal}: the JSON did not fit in memory while being parsed. "
+            "The decoded object graph is several times the size of the text "
+            "it came from, so a document inside the input size limit can "
+            "still exceed what this process can allocate; pass a smaller one"
+        ) from None
+
+
+def _with_hint(message: str, hint: str | None) -> str:
+    """Append *hint* to *message* as one sentence, or return *message* alone."""
+    return f"{message}. {hint}" if hint else message
+
+
+def _is_null_device(path: Path) -> bool:
+    """Whether *path* is the platform's null device (``/dev/null``).
+
+    ``samefile`` needs both paths to exist, so a platform without one simply
+    never matches -- the safe direction, since the path then refuses like every
+    other non-regular input rather than being let through on its name.
+    """
+    try:
+        return os.path.samefile(path, os.devnull)
+    except OSError:
+        return False
+
+
+def _file_kind(mode: int) -> str:
+    """Name a non-regular file type for the by-kind refusal message (#864).
+
+    No FIFO row: a FIFO never reaches the by-kind refusal -- `read_text_input`
+    routes it to `_read_fifo_text`, which decides on the writer rather than on
+    the kind, and names the kind in its own message.
+    """
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    return "not a regular file"
+
+
 def _mutate(
     args: argparse.Namespace,
     op: str,
@@ -1635,8 +2112,6 @@ def _call(
     # -t/--target on a target-required command.
     allow_implicit_target: bool = True,
     text_renderer: Callable[[Any], str] | None = None,
-    page_limit: int | None = None,
-    page_offset: int = 0,
     page_label: str | None = None,
     paged_spill: bool = False,
     stem: str,
@@ -1672,16 +2147,18 @@ def _call(
         spill_status_renderer, f"render the {op} status line as text",
         advice="Rerun with --format json to see the raw status.")
     request_params = dict(params or {})
+    # #796: the preflight flag. Only commands whose registry entry says
+    # `estimable=True` advertise it (see `_common_io_options`), so there is no
+    # gate to write here: a mutation, a side-effecting command or an
+    # `_emit_result` command never sees it, and `--out`/`--estimate-output`
+    # together are refused by the parser's own mutually exclusive group.
+    estimate_only = bool(getattr(args, "estimate_output", False))
     # A long one-time op (load/refresh full analysis) raises its no-env default
     # client timeout so it isn't abandoned at the 600s read-op default on a very
     # large binary; BN_REQUEST_TIMEOUT still overrides it (#321).
     timeout_kwargs = (
         {"default_timeout": op_default_timeout} if op_default_timeout is not None else {}
     )
-    effective_page_limit = None
-    if page_limit is not None and page_limit >= 0:
-        effective_page_limit = page_limit
-        request_params["limit"] = page_limit + 1
 
     # #169 L1: --all-instances / --all-targets fan this read across instances
     # and/or targets and aggregate. Gated branch -- the normal single-target path
@@ -1817,10 +2294,12 @@ def _call(
         # recognising unrelated symbol names.
         provenance={"target": target, "instance": getattr(args, "instance", None)},
         slice_hint=slice_hint,
-        # paged_spill keeps the "--limit/--offset to page" spill hint for
-        # commands (function list/search) that page bridge-side and so don't set
-        # the client-side page_limit (#59).
-        paged=(page_limit is not None) or paged_spill,
+        # paged_spill is the "--limit/--offset to page" spill hint, set by the
+        # commands (function list/search) that page bridge-side (#59).
+        paged=paged_spill,
+        # #796: hand the preflight decision to the one place that would otherwise
+        # have written or spilled the payload.
+        estimate_only=estimate_only,
     )
     # A text renderer that display-truncates (e.g. xrefs capping caller groups)
     # produces output too small to spill, so the spill pipe-note never fires and a
@@ -2038,6 +2517,10 @@ def _fanout_call(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
         slice_hint=_slice_hint_for_args(args, fmt),
+        # #796: a fan-out is a survey of whole targets, so "how big is this going
+        # to be" is exactly the question it should be able to answer without
+        # dumping every instance's rows.
+        estimate_only=bool(getattr(args, "estimate_output", False)),
     )
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A
@@ -2141,7 +2624,13 @@ def _parse_line_range(value: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(f"expected START:END or START-END, got {value!r}")
     try:
-        start, end = int(parts[0]), int(parts[1])
+        # Base-0 like the bare form above, so `--lines 0x1:0x2` works: the header
+        # prints the range with plain integers, but addresses (and therefore the
+        # ranges an agent copies out of disasm/xrefs output) are hex, and the two
+        # forms must not disagree about which bases they accept (#824). `int(x, 0)`
+        # still parses a leading `-` as negative, so the 1-indexed rejection below
+        # keeps working.
+        start, end = int(parts[0], 0), int(parts[1], 0)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"expected START:END or START-END with integers, got {value!r}"
@@ -2443,9 +2932,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire
-    # before args.format exists) can still emit a JSON error envelope.
+    # before args.format exists) can still emit a JSON error envelope. Scoped to
+    # THIS parse: BnArgumentParser.error reads the global while parsing runs, and
+    # leaving it set leaked the machine format into the next in-process parse --
+    # a later `build_parser().parse_args([...])` with no --format still printed a
+    # JSON envelope to stdout because an earlier main() call asked for json
+    # (#824).
     _MACHINE_ERROR_FORMAT = _requested_output_format(parse_argv)
-    args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    try:
+        args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    finally:
+        _MACHINE_ERROR_FORMAT = None
     (
         args._explicit_instance,
         args._explicit_instance_id,

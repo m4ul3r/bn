@@ -2427,6 +2427,82 @@ def test_function_text_accepts_valid_views(monkeypatch):
         assert isinstance(text, str)
 
 
+def test_function_text_renders_the_hlil_tree_for_a_string_operation_827(monkeypatch):
+    # #827 item 5: `_format_hlil_tree` read `ins.operation.name` DIRECTLY at three
+    # sites, so an instruction whose `operation` is a bare STRING raised
+    # AttributeError mid-tree -- and `_function_text` swallows that into the flat
+    # `il.instructions` listing, so an entire tree silently rendered as the
+    # inferior listing instead of the tree the view actually had. The defensive
+    # `_il_op_name` exists for exactly this shape; each site is driven below, one
+    # root per site, so a fix that guards only the first one still fails.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Op:
+        def __init__(self, name):
+            self.name = name
+
+    class _StrNode:
+        """An IL instruction whose `operation` is a STRING rather than an object
+        with `.name` (a unit/double shape, and a documented possibility)."""
+
+        def __init__(self, op_name, text, **attrs):
+            self.operation = op_name
+            self.text = text
+            for key, value in attrs.items():
+                setattr(self, key, value)
+
+        def __str__(self):
+            return self.text
+
+    class _StrBlock(_StrNode):
+        def __init__(self, children):
+            super().__init__("HLIL_BLOCK", "")
+            self.children = children
+
+        def __iter__(self):
+            return iter(self.children)
+
+    class _OpNode(_StrNode):
+        """The normal shape: `operation` is an object carrying `.name`."""
+
+        def __init__(self, op_name, text, **attrs):
+            super().__init__(_Op(op_name), text, **attrs)
+
+    class _FlatFallback:
+        def __str__(self):
+            return "FLAT-FALLBACK-LINE"
+
+    def render(root):
+        hlil = types.SimpleNamespace(root=root, instructions=[_FlatFallback()])
+        fn = types.SimpleNamespace(name="widget_poll", start=0x401000, hlil=hlil)
+        return instance._function_text(None, fn, view="hlil")
+
+    # 1. the root/statement op (pre-fix: AttributeError on the root's own op).
+    text = render(_StrBlock([_StrNode("HLIL_ASSIGN", "x = 1", address=0x401000)]))
+    assert "x = 1" in text and "FLAT-FALLBACK-LINE" not in text
+
+    # 2. the HLIL_IF false-branch op.
+    branch = _OpNode("HLIL_IF", "if (x)", condition="x")
+    branch.true = _StrBlock([_StrNode("HLIL_ASSIGN", "y = 2")])
+    branch.false = _StrNode("HLIL_NOP", "empty else")
+    text = render(branch)
+    assert "if (x)" in text and "y = 2" in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+    # 3. the HLIL_SWITCH default op.
+    switch = _OpNode("HLIL_SWITCH", "switch (x)", condition="x")
+    switch.cases = [_StrNode("HLIL_CASE", "case 1:", values=[1],
+                             body=_StrNode("HLIL_ASSIGN", "y = 3"))]
+    switch.default = _StrNode("HLIL_NOP", "empty default")
+    text = render(switch)
+    assert "switch (x)" in text and "case 1:" in text and "y = 3" in text
+    # A NOP default renders no `default:` arm -- the comparison itself is the
+    # site, so this pins that it was made through the guarded helper.
+    assert "default:" not in text
+    assert "FLAT-FALLBACK-LINE" not in text
+
+
 def test_il_function_for_rejects_unknown_view(monkeypatch):
     # #527: the structured-IL boundary must reject an unknown view rather than
     # silently substituting MLIL (which the caller then labels as requested).
@@ -3760,6 +3836,52 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
 
 
+def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+    # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
+    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
+    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # the analysis threads can add to while the walk is in flight. The store
+    # below mutates DURING that walk (the #850 store's mechanism, walked through
+    # `values()` because this site unpacked the value view), so the pre-fix code
+    # dies of the production error and the snapshot returns what was there when
+    # the call started.
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+
+    class _LiveFunctionCommentStore(Mapping):
+        """`func.comments` as the bridge sees it: a live map analysis may add to
+        at any moment, including mid-walk."""
+
+        def __init__(self, entries: dict[int, str]) -> None:
+            self._entries = dict(entries)
+            self.injected = False
+
+        def __getitem__(self, key: int) -> str:
+            return self._entries[key]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def values(self):
+            for index, text in enumerate(self._entries.values()):
+                if index == 0 and not self.injected:
+                    self.injected = True
+                    self._entries[0x2000] = "settled mid-walk"
+                yield text
+
+    class _FakeFunc:
+        comment = ""
+
+        def __init__(self, store) -> None:
+            self.comments = store
+
+    store = _LiveFunctionCommentStore({0x1000: "a local note"})
+    # Pre-fix: RuntimeError: dictionary changed size during iteration.
+    bodies = read_decompile._annotation_bodies(_FakeFunc(store), {})
+    assert bodies == ["a local note"]
+
 # ---------------------------------------------------------------------------
 # #675 item 5: return width inferred from the full register, disclosed
 # ---------------------------------------------------------------------------
@@ -4110,7 +4232,6 @@ def test_decompile_batch_that_resolves_everything_reports_no_shortfall_676(
     assert result["requested"] == result["resolved"] == 2
     assert all(row["ok"] for row in result["functions"])
     assert all("error" not in row for row in result["functions"])
-
 def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
     """#827 item 3 / #888: `_require_mapped_address` and `_address_is_mapped`
     are NOT interchangeable, and the difference is only visible on a view that
@@ -4327,3 +4448,256 @@ def test_variadic_text_marks_the_count_with_the_stated_confidence_886():
     # Whitespace-only states no word: no empty marker, and no skew claimed.
     blank = render({**under, "confidence": "   "})
     assert "[count:" not in blank and "malformed" not in blank, blank
+
+# --- #797: `dataflow defuse` discloses a dropped call argument --------------
+# The defuse half of #489. BN clamps a direct call's MLIL parameters to the
+# callee's recovered arity, so a variadic callee auto-typed fixed-arity leaves
+# its STACK-passed arguments behind as `[sp+N].d = <var>` stores that nothing in
+# the function reads back -- and `uses` then lists the argument set-up for the
+# defused variable as if it were an ordinary use. `trace` already discloses that
+# state (#489); defuse now states the same thing, over the same calls, from the
+# same helper, so the two ops cannot disagree.
+
+def _d797_op(name):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=name))
+
+
+def _d797_reg(name):
+    expr = _d797_op("LLIL_REG")
+    expr.src = types.SimpleNamespace(name=name)
+    return expr
+
+
+def _d797_const(value):
+    expr = _d797_op("LLIL_CONST")
+    expr.constant = value
+    return expr
+
+
+def _d797_add(left, right):
+    expr = _d797_op("LLIL_ADD")
+    expr.left, expr.right = left, right
+    return expr
+
+
+def _d797_store(dest, address):
+    expr = _d797_op("LLIL_STORE")
+    expr.dest, expr.address = dest, address
+    return expr
+
+
+def _d797_call(address):
+    expr = _d797_op("LLIL_CALL")
+    expr.address = address
+    return expr
+
+
+def _d797_ins(name, address, *, params=None, instr_index=0):
+    return types.SimpleNamespace(
+        address=address, instr_index=instr_index,
+        operation=types.SimpleNamespace(name=name),
+        params=list(params or []), src=None, vars_read=[], vars_written=[],
+    )
+
+
+def _d797_thunk_resolver(thunk: str, real: str):
+    """A `resolve_call_target` that actually HONORS `follow_thunks`, so the two
+    resolutions differ the way they do on a real PLT stub / GCC veneer: the
+    unfollowed answer is the thunk's own name, the followed one is the real
+    callee."""
+    def resolve(bv_, ins, follow_thunks=False):
+        return types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name=real if follow_thunks else thunk))
+    return resolve
+
+
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before",
+                                 defined=False):
+    """`_defuse` over a function whose call at 0x401030 was recovered with ONE
+    arg (the caller's format string) while the LLIL hands it two outgoing
+    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic.
+
+    ``use_at`` places the defused variable's single use: ``"before"`` (the
+    default) makes it the argument set-up store feeding that call, ``"after"``
+    moves it past the call, and ``"none"`` gives the variable no uses at all.
+
+    ``defined`` gives the variable a DEFINITION ahead of the call, which the
+    real API supplies whenever the value is computed in this function.
+    Hardcoding it absent meant every case ran with an empty row set, so the
+    scoping the tests below assert was only ever measured on its
+    nothing-to-scope short-circuit (#797 round-4 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, func = _mid_function_bv()
+    bv._memory[0x402000] = b"%d %d\x00"
+    func.arch = types.SimpleNamespace(stack_pointer="sp", address_size=4)
+    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    call_addr = 0x401030
+    func.low_level_il = [[
+        _d797_store(_d797_reg("sp"), 0x401020),
+        _d797_store(_d797_add(_d797_reg("sp"), _d797_const(4)), 0x401024),
+        _d797_call(call_addr),
+    ]]
+    fmt = _d797_op("MLIL_CONST_PTR")
+    fmt.constant = 0x402000
+    call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
+    store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
+    trailing = _d797_ins("MLIL_STORE_SSA", 0x401040, instr_index=3)
+    # The variable's own definition, AHEAD of the call the way a value computed
+    # in this function is: `arg1#0 = ...` at 0x401010.
+    defn = _d797_ins("MLIL_SET_VAR_SSA", 0x401010, instr_index=0)
+    uses = {"before": [store], "after": [trailing], "none": []}[use_at]
+    il = types.SimpleNamespace(
+        instructions=([defn] if defined else []) + [store, call, trailing],
+        get_ssa_var_definition=lambda v: defn if defined else None,
+        get_ssa_var_uses=lambda v: list(uses),
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(bridge.il_format, "_resolve_ssa_variable",
+                        lambda f, i, sel: (ssa_var, []))
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    # The loaded bridge package is its own module COPY (`bn_test_bridge.*`), so
+    # the patch has to land on the alias `_defuse` resolves through, not on the
+    # same-named module this file imports for direct helper tests.
+    monkeypatch.setattr(
+        bridge.read_decompile._taint, "resolve_call_target",
+        resolve or (lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name="my_logger"))))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance, il
+
+
+def test_defuse_discloses_a_dropped_stack_arg_797(monkeypatch):
+    """#797: the result names the call whose model dropped the stack args.
+
+    Before this, the stack-arg store appeared in `uses` with nothing saying it
+    feeds a call whose recovered parameters do not include it -- so a def-use
+    answer was read as the complete set of things that touch the variable.
+    """
+    instance, _il = _defuse_under_recovered_call(monkeypatch)
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    hints = result["hints"]
+    assert len(hints) == 1, hints
+    hint = hints[0]
+    assert "call 0x401030" in hint
+    assert "call-model truncation" in hint
+    assert "my_logger" in hint
+    assert "sp+0x0" in hint and "sp+0x4" in hint     # the dropped stores, named
+    assert "proto set my_logger" in hint             # the runnable remedy
+    # The use itself is unchanged: the disclosure is additive, so an existing
+    # consumer of `uses` reads exactly what it read before.
+    assert [u["address"] for u in result["uses"]] == ["0x401024"]
+
+
+def test_defuse_stays_quiet_when_the_call_model_is_complete_797(monkeypatch):
+    """The no-false-positive direction, inherited from the #489 gate: a call
+    whose recovered args are NOT (all) register-passed -- here five args on a
+    4-register convention -- is not a truncated model, so nothing is disclosed
+    and the caller sees no invented caveat."""
+    instance, il = _defuse_under_recovered_call(monkeypatch)
+    il.instructions[1].params = il.instructions[1].params * 5
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == []
+
+
+def test_defuse_resolves_the_callee_through_thunks_like_its_sibling_797(monkeypatch):
+    """#797 review: `defuse` resolved the callee WITHOUT following thunks while
+    `trace` follows them, and the shared note keys its two safety gates on that
+    name -- so the claim that "the two ops cannot disagree" was false.
+
+    The gate that matters here is the known-fixed-arity denylist: a PLT stub /
+    GCC veneer in front of `strlen` resolves unfollowed to `j_strlen`, which is
+    in no denylist, so the shared note fired on a call `trace` is silent about.
+    That is exactly the residual false positive the #489 denylist was added to
+    close, re-opened on the second op.
+    """
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_strlen", "strlen"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == [], result["hints"]
+
+
+def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
+    """The other half of the same disagreement: when the note DOES fire through
+    a thunk, its `proto set` remedy must name the callee whose prototype is
+    actually wrong. `bn proto set j_my_logger ...` retypes the veneer and leaves
+    the model truncated, so a copy-pasted remedy silently does nothing."""
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_my_logger", "my_logger"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert len(result["hints"]) == 1, result["hints"]
+    hint = result["hints"][0]
+    assert "proto set my_logger" in hint
+    assert "j_my_logger" not in hint
+
+
+def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
+    """#797 review: the disclosure is about a USE, so it has to be scoped to one.
+
+    The hint list was built over every call in the FUNCTION, which is not what
+    the reference, `--help` and the renderer all say it is: a def-use of a
+    variable with no uses at all still printed "call 0x...: call-model
+    truncation" immediately above `uses (0):`, telling a reader that an empty
+    listing is incomplete because of a call the variable never touches. A use
+    that lands AFTER the call is the same error one step subtler -- it is not
+    argument set-up for it, so nothing about that call explains it.
+
+    Round-4 review: (a) and (b) were both green for the wrong reason -- the
+    fixture hardcoded the variable as having NO definition, so every case ran
+    with an empty row set and only the nothing-to-scope short-circuit was
+    measured. Give the variable the definition the real API supplies and the
+    scope re-opened: a definition ahead of the call made the call "fed", so
+    the hint came back above `uses (0):`. A DEFINITION is not evidence that
+    the value reaches a call -- it is where the value is produced -- so the
+    scope is the variable's USES, and (c)/(d) are (a)/(b) with the definition
+    present.
+    """
+    # (a) No uses at all: there is no listing for a disclosure to qualify.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none")
+    empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert empty["uses"] == []
+    assert empty["hints"] == [], empty["hints"]
+
+    # (b) The variable's only use sits past the call, so it is not part of the
+    # outgoing-argument run the dropped stack stores belong to.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after")
+    downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert [u["address"] for u in downstream["uses"]] == ["0x401040"]
+    assert downstream["hints"] == [], downstream["hints"]
+
+    # (c) The same empty listing for a variable that HAS a definition ahead of
+    # the call -- the ordinary case, and the one the fixture never built.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none",
+                                                 defined=True)
+    defined_empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_empty["definition"]["address"] == "0x401010"
+    assert defined_empty["uses"] == []
+    assert defined_empty["hints"] == [], defined_empty["hints"]
+
+    # (d) ...and the downstream use, with that definition present: the call
+    # still explains no row in this listing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after",
+                                                 defined=True)
+    defined_downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_downstream["definition"]["address"] == "0x401010"
+    assert [u["address"] for u in defined_downstream["uses"]] == ["0x401040"]
+    assert defined_downstream["hints"] == [], defined_downstream["hints"]
+
+    # ...while the use that IS the call's argument set-up still gets it, so the
+    # scope narrowed to the right thing rather than to nothing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="before",
+                                                 defined=True)
+    feeding = instance._defuse("active", "0x401000", "arg1#0")
+    assert len(feeding["hints"]) == 1, feeding["hints"]
+    assert "call 0x401030" in feeding["hints"][0]

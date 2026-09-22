@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _int_at_least, arg, command
+from ..cli import (
+    _call,
+    _depth_int,
+    _int_at_least,
+    arg,
+    command,
+    decode_json_input,
+    read_text_input,
+)
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -15,7 +22,6 @@ from ..formatters import (
     _render_values_text,
     _resolution_note,
 )
-from ..transport import BridgeError
 
 
 # #812: the fixpoint remediation string ("raise --max-iters", taint_result.py
@@ -64,10 +70,14 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     resolved = Path(path).expanduser()
     if not flag and not resolved.exists():
         return
-    try:
-        params["user_models"] = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise BridgeError(f"could not read {source} {path}: {exc}")
+    # #864: the shared reader already refused a missing, unreadable or blocking
+    # path by name (a FIFO here hung with no envelope at all), and the shared
+    # decoder refuses a body the parser cannot take -- malformed, nested past
+    # its stack, or too large to build. #669's silent-degrade above keeps an
+    # env-sourced missing file out of here entirely.
+    params["user_models"] = decode_json_input(
+        read_text_input(resolved, what=f"{source} file"),
+        refusal=f"could not read {source} {path}")
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
@@ -75,7 +85,28 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     params["user_models_via"] = source
 
 
-@command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
+def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
+    """Read `--resolve-map <file>` into ``params['resolve_map']`` (#824).
+
+    Forward and backward taint each carried a byte-identical copy of this
+    read/refuse policy. One copy now, mirroring the `_add_user_models`
+    precedent above: a change to how the file is read or how a bad one is
+    refused cannot land on one direction and silently miss the other.
+    """
+    if not args.resolve_map:
+        return
+    # #864: the shared reader refuses a directory/FIFO/device by kind -- a FIFO
+    # here blocked forever with no envelope -- and the shared decoder refuses a
+    # body the parser cannot take.
+    params["resolve_map"] = decode_json_input(
+        read_text_input(Path(args.resolve_map), what="--resolve-map file"),
+        refusal=f"could not read --resolve-map {args.resolve_map}")
+
+
+@command("dataflow", "defuse",
+         help="Show the SSA definition site and use sites of a variable "
+              "(argument set-up for a call whose under-recovered callee dropped "
+              "its stack-passed args is disclosed as a call-model truncation)",
          target=True,
          prefer_when="per-function SSA def/use of one variable; "
                      "use taint to follow a value across calls source->sink",
@@ -83,8 +114,15 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--var", dest="var", required=True,
-                 help="Variable selector: name, local_id, or name#version (SSA)"),
-         ])
+                 help="Variable selector: name, local_id, or name#version (SSA). NOTE: "
+                      "BN clamps a call's MLIL parameters to the callee's recovered "
+                      "arity, so a callee auto-typed fixed-arity (a variadic declared "
+                      "without `...`, a thunk with too narrow a prototype) drops its "
+                      "stack-passed arguments from the call model; `uses` still lists "
+                      "the argument stores, and the result carries the same "
+                      "`hints` disclosure `trace` prints (`bn proto set` fixes it)"),
+         ],
+         estimable=True)
 def _dataflow_defuse(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -104,7 +142,8 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
                  help="Which edges to resolve (default: both)"),
              arg("--no-resolve-indirect", dest="resolve_indirect", action="store_false", default=True,
                  help="Skip value-set resolution of indirect call targets"),
-         ])
+         ],
+         estimable=True)
 def _dataflow_callgraph(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -126,7 +165,8 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--at", dest="at", required=True,
                  help="Instruction address (hex 0x.. or decimal) within the function"),
-         ])
+         ],
+         estimable=True)
 def _dataflow_values(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -187,7 +227,8 @@ _SINK_LOCATOR_HELP = (
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
-         ])
+         ],
+         estimable=True)
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -199,11 +240,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,
@@ -236,7 +273,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
-         ])
+         ],
+         estimable=True)
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -245,11 +283,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "sinks": list(args.sinks),
         "max_depth": int(args.max_depth),
     }
-    if args.resolve_map:
-        try:
-            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+    _add_resolve_map(args, params)
     _add_user_models(args, params)
     return _call(
         args,
@@ -276,7 +310,8 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present sink's callsite addresses"),
              _models_arg(),
-         ])
+         ],
+         estimable=True)
 def _taint_models(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.role:

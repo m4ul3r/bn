@@ -329,7 +329,7 @@ Add `--preview` before the `-` to diff without committing: `bn batch apply --pre
 
 The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
 
-A manifest over **5000 ops**, or whose request would exceed the bridge's 32 MiB wire limit, is refused before anything is sent (`invalid_request`, exit 3, `observed.request_sent: false`). That is a ceiling on one batch, not on the work: a batch that large holds the write lock for its whole run and reverts as **one** unit, so a single failure discards every sibling. Split it, or raise either ceiling with `BN_BATCH_APPLY_MAX_OPS=<n>` / `BN_BATCH_APPLY_MAX_BYTES=<n>` (`0` disables, a malformed value falls back to the default). The byte ceiling measures the **request** the manifest produces, not the file, so indentation does not count against it.
+A manifest over **5000 ops**, or whose serialized request would exceed the bridge's hard 32 MiB wire limit, is refused before anything is sent (`invalid_request`, exit 3, `observed.request_sent: false`). A batch that large holds the write lock for its whole run and reverts as **one** unit, so a single failure discards every sibling. Split it, or raise the op-count ceiling with `BN_BATCH_APPLY_MAX_OPS=<n>` (`0` disables). `BN_BATCH_APPLY_MAX_BYTES=<n>` can set a **lower** byte ceiling; `0` restores the hard limit and cannot make an oversized request valid. The transport measures the actual request after resolving the target and bridge, so manifest indentation does not count against it. File and FIFO manifest input also has an independent 64 MiB source-file cap.
 
 #### Batch op kinds and their required fields
 

@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     disclosure_boundary,
     _render_call_descriptors_text,
@@ -75,7 +75,8 @@ from ..transport import BridgeError
                        help="Only BN auto-named functions (sub_*/j_sub_*) -- how much "
                             "of a stripped target is still unrecovered; excludes "
                             "import thunks")),
-         ])
+         ],
+         estimable=True)
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.min_address is not None:
@@ -86,9 +87,14 @@ def _function_list(args: argparse.Namespace) -> int:
         params["min_size"] = args.min_size
     if getattr(args, "named", None) is not None:
         params["named"] = bool(args.named)
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: send offset even at 0, like every sibling paged handler (strings,
+    # tag list, types) -- a param the CLI omits reads as a handshake difference
+    # at the bridge for no gain.
+    params["offset"] = args.offset
     if args.count:
+        # #768: --sort/--reverse/--limit/--offset beside --count were dropped
+        # without a word; refuse them by name instead.
+        _refuse_count_only_slices(args, command="function list")
         params["count_only"] = True
         return _call(
             args,
@@ -98,10 +104,10 @@ def _function_list(args: argparse.Namespace) -> int:
             text_renderer=_render_function_count_text,
             stem="function-count",
         )
-    # Bridge-authoritative paging: send the real limit/offset (not the generic
-    # +1 page_limit) so the bridge returns the page WITH the true total, which
-    # the renderer surfaces (#59). The bridge envelope is {functions, total, ...}.
-    # _effective_limit defaults to 100 but uncaps for --out full-body export (#165).
+    # Bridge-authoritative paging: send the real limit/offset so the bridge
+    # returns the page WITH the true total, which the renderer surfaces (#59).
+    # The bridge envelope is {functions, total, ...}. _effective_limit defaults
+    # to 100 but uncaps for --out full-body export (#165).
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -155,7 +161,8 @@ def _function_list(args: argparse.Namespace) -> int:
                        help="Match the query as a whole identifier token (word-boundary): for a "
                             "sink survey, `--word popen` hits popen/popen@plt but not the "
                             "substring FPs zipOpenArchive/my_popen_wrapper")),
-         ])
+         ],
+         estimable=True)
 def _function_search(args: argparse.Namespace) -> int:
     # #410: accept the query positionally OR via --query (matches strings/types
     # muscle memory). _pick errors on both-different / neither.
@@ -173,6 +180,9 @@ def _function_search(args: argparse.Namespace) -> int:
     if getattr(args, "min_size", None) is not None:
         params["min_size"] = args.min_size
     if args.count:
+        # #768: same refusal as `function list` -- a count has no order and no
+        # page, so these flags could only be ignored.
+        _refuse_count_only_slices(args, command="function search")
         params["count_only"] = True
         return _call(
             args,
@@ -189,8 +199,8 @@ def _function_search(args: argparse.Namespace) -> int:
             regex_hint_query=query,
             regex_fallback_query=query,
         )
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, matching `function list` and the other paged reads.
+    params["offset"] = args.offset
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -225,7 +235,8 @@ def _function_search(args: argparse.Namespace) -> int:
                # lines first.
                arg("--blocks", action="store_true", default=False,
                    help="List basic-block address ranges (with edges), so a large "
-                        "function can be read a region at a time instead of whole")])
+                        "function can be read a region at a time instead of whole")],
+         estimable=True)
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
     demangle = getattr(args, "demangle", False)
@@ -388,7 +399,8 @@ def _decompile_many(
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
              arg("--include-annotations", action="store_true", default=False,
                  help="Include inherited comment bodies in text/JSON (default: redact)"),
-         ])
+         ],
+         estimable=True)
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -446,7 +458,8 @@ def _decompile(args: argparse.Namespace) -> int:
                       "json/ndjson do not produce, so passing it with --format "
                       "json is REFUSED rather than ignored. For a structured "
                       "slice, take the payload's text and slice it (#675 item 3)."),
-         ])
+         ],
+         estimable=True)
 def _il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -477,7 +490,8 @@ def _il(args: argparse.Namespace) -> int:
                       "json/ndjson do not produce, so passing it with --format "
                       "json is REFUSED rather than ignored. For a structured "
                       "slice, take the payload's text and slice it (#675 item 3)."),
-         ])
+         ],
+         estimable=True)
 def _function_structured_il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
     if lines_range is not None:
@@ -542,7 +556,8 @@ def _render_disasm_text(value: Any) -> str:
                        help="Linear-disassemble up to N units (default 32): one physical "
                             "instruction or one undecodable byte (.byte) per unit, from "
                             "any mapped address, independent of function membership")),
-         ])
+         ],
+         estimable=True)
 def _disasm(args: argparse.Namespace) -> int:
     linear = getattr(args, "linear", None)
     mode = getattr(args, "mode", None)
@@ -607,7 +622,8 @@ def _disasm(args: argparse.Namespace) -> int:
                       "targets are IL instruction indexes (hex), not addresses -- "
                       "first-line addresses collide when one instruction expands to "
                       "several IL blocks; per-line addresses stay real at every level"),
-         ])
+         ],
+         estimable=True)
 def _function_cfg(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -634,7 +650,8 @@ def _function_cfg(args: argparse.Namespace) -> int:
                       "reported, not errors"),
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
-         ])
+         ],
+         estimable=True)
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
@@ -675,8 +692,8 @@ def _xrefs(args: argparse.Namespace) -> int:
         # offset/limit so a hot field respects --limit/--offset instead of spilling.
         field_params: dict[str, Any] = {"field": field_spec}
         field_limit = _effective_limit(args)
-        if args.offset:
-            field_params["offset"] = args.offset
+        # #824: unconditional, like the sibling paged reads.
+        field_params["offset"] = args.offset
         if field_limit is not None:
             field_params["limit"] = field_limit
         return _call(
@@ -702,8 +719,9 @@ def _xrefs(args: argparse.Namespace) -> int:
         params["fn_pointer_scan"] = True
     limit = _effective_limit(args)
     if args.format != "text":
-        if args.offset:
-            params["offset"] = args.offset
+        # #824: the branch is what gates paging here (text mode fetches the full
+        # set by design); inside it, offset goes out even at 0 like its siblings.
+        params["offset"] = args.offset
         if limit is not None:
             params["limit"] = limit
 
@@ -760,14 +778,14 @@ def _xrefs(args: argparse.Namespace) -> int:
 
 def _load_within_identifiers(path: Path) -> list[str]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
+        # #864: one reader for every CLI text input -- a FIFO here would block
+        # forever with no envelope, and the shared reader refuses it by kind.
+        text = read_text_input(path, what="--within-file")
+    except BridgeError as exc:
         raise BridgeError(
-            "--within-file must be a UTF-8 text file with one function "
-            f"identifier per line; got a binary file: {path}"
-        ) from exc
-    except OSError as exc:
-        raise BridgeError(f"could not read --within-file {path}: {exc}") from exc
+            f"{exc}; --within-file must be a UTF-8 text file with one function "
+            "identifier per line"
+        ) from None
     identifiers = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -794,7 +812,8 @@ def _load_within_identifiers(path: Path) -> list[str]:
                    arg("--within", help="Restrict callsite search to one containing function"),
                    arg("--within-file", type=Path,
                        help="Restrict callsite search to functions listed in a UTF-8 text file")),
-         ])
+         ],
+         estimable=True)
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
         within_identifiers = [args.within]
@@ -814,8 +833,8 @@ def _callsites(args: argparse.Namespace) -> int:
         "context": args.context,
         "caller_static": bool(args.caller_static),
     }
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, like the sibling paged reads.
+    params["offset"] = args.offset
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
@@ -846,13 +865,14 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
                  help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
-         ])
+         ],
+         estimable=True)
 def _evidence_function(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"identifier": args.identifier, "context": args.context}
     if args.limit is not None:
         params["limit"] = args.limit
-    if args.offset:
-        params["offset"] = args.offset
+    # #824: unconditional, like the sibling paged reads.
+    params["offset"] = args.offset
     if args.address_window:
         params["address_window"] = args.address_window
     return _call(
@@ -870,7 +890,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
          target=True, paged=True,
          args=[
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
-         ])
+         ],
+         estimable=True)
 def _evidence_xrefs(args: argparse.Namespace) -> int:
     # Same canonical paging envelope and #184 payload-bounding as `xrefs`: JSON
     # pages the items (and the op drops the deprecated full arrays). Text fetches
@@ -884,8 +905,8 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"identifier": args.identifier, "fn_pointer_scan": True}
     limit = _effective_limit(args)
     if args.format != "text":
-        if args.offset:
-            params["offset"] = args.offset
+        # #824: offset goes out even at 0 inside the paging branch.
+        params["offset"] = args.offset
         if limit is not None:
             params["limit"] = limit
     return _call(
@@ -925,7 +946,8 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
                       "u8/i8/u16/i16/u32/i32/u64/i64 or char[N], OFF is hex/decimal, e.g. "
                       "--field command:u32@0 --field name:char[16]@8. Requires --record-size; "
                       "makes --ptr-fields optional (scalar-only records)."),
-         ])
+         ],
+         estimable=True)
 def _evidence_table(args: argparse.Namespace) -> int:
     ptr_fields = None
     if getattr(args, "ptr_fields", None):
@@ -963,7 +985,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
                  help="Declare a descriptor field (repeatable): TYPE is u8/i8/u16/i16/u32/i32/u64/i64, "
                       "char[N], or ptr (resolves a callback/data symbol), OFF is hex/decimal, e.g. "
                       "--field type:u8@2 --field callback:ptr@0x10"),
-         ])
+         ],
+         estimable=True)
 def _evidence_calls(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -993,7 +1016,8 @@ def _evidence_calls(args: argparse.Namespace) -> int:
              arg("--providers", default=None, metavar="SELECTOR",
                  help="Target selector for the provider binary that defines the class/vtable "
                       "(name/path/id of another open target); omit to resolve within this binary"),
-         ])
+         ],
+         estimable=True)
 def _evidence_virtual_call(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1022,7 +1046,8 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
              arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_surface(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1049,7 +1074,8 @@ def _evidence_surface(args: argparse.Namespace) -> int:
                       "(the reported total stays honest, with truncated=true when capped)"),
              arg("--table-entries", type=_non_negative_int, default=6,
                  help="Pointer entries to show around metadata data refs (0 = none)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_message(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1076,7 +1102,8 @@ def _evidence_message(args: argparse.Namespace) -> int:
          args=[
              arg("--strings-limit", type=_positive_int, default=20, dest="strings_limit",
                  help="Max strings in the bounded sample (default: 20)"),
-         ])
+         ],
+         estimable=True)
 def _evidence_orient(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1094,7 +1121,8 @@ def _evidence_orient(args: argparse.Namespace) -> int:
          args=[
              arg("--limit", type=_positive_int, default=64,
                  help="Maximum entries to show per constructor/destructor section"),
-         ])
+         ],
+         estimable=True)
 def _evidence_init(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1132,7 +1160,8 @@ def _evidence_init(args: argparse.Namespace) -> int:
                       "intra mode (this flag off), for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
-         ])
+         ],
+         estimable=True)
 def _trace(args: argparse.Namespace) -> int:
     return _call(
         args,

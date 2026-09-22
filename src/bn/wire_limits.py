@@ -17,58 +17,17 @@ would refuse requests the bridge would have accepted.
 """
 from __future__ import annotations
 
-import json
 import os
-from typing import Any
 
 # The wire ceiling. A request line longer than this is refused by the bridge
 # (see ``BridgeHandler.handle``), so it is also the honest client-side
 # ceiling: sending more can only fail.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
-# What the bridge caps is the SERIALIZED REQUEST, so that is what a
-# client-side guard must measure. The manifest FILE is not that quantity and
-# not a safe proxy for it, in either direction (#769 review):
-#
-#   * the file is re-serialized before it is sent, so indentation is
-#     discarded -- a pretty-printed 3909-byte manifest and its 2779-byte
-#     compact twin produce the SAME 3024-byte request. Judging the file
-#     refuses inputs the bridge would accept, and the refusal's stated
-#     reason ("sending it can only fail") is then factually false;
-#   * the request also carries an envelope the file does not -- id, op,
-#     target, bridge identity -- so a compact file exactly at the cap
-#     produces an OVER-cap request and dies at the bridge with the bare
-#     `request too large` this guard exists to pre-empt.
-#
-# `REQUEST_ENVELOPE_BYTES` is the FIXED non-params part -- id, op, bridge
-# identity, braces -- measured at 198 and rounded up. The selector is NOT
-# fixed and is not covered by it: `-t` is injected into params AND into the
-# envelope after the guard runs, so both copies used to escape a flat
-# reserve. Measured, the real non-params size is
-# `198 + 2*(len(selector)+14) + 17 if --preview`, and with a constant
-# reserve the guard let a request through at a 144-char selector -- the bare
-# `request too large` this guard exists to pre-empt, reached through the
-# selector instead of the file (#889c finding 2).
-REQUEST_ENVELOPE_BYTES = 256
-_SELECTOR_KEY_BYTES = 14          # `"target":"…"` framing, per copy
-_PREVIEW_BYTES = 17               # `"preview":true,`
-
-
-def request_bytes_for_params(params: Any, *, selector: str | None = None,
-                             preview: bool = False) -> int:
-    """Bytes the request carrying *params* will occupy on the wire.
-
-    Serialized the same way `transport` serializes it, so the guard and the
-    sender measure one quantity rather than two. *selector* and *preview*
-    are the parts folded in AFTER this check runs, and are counted here
-    because a caller cannot be refused for bytes and then silently grow.
-    """
-    total = len(json.dumps(params).encode("utf-8")) + REQUEST_ENVELOPE_BYTES
-    if selector:
-        total += 2 * (len(str(selector)) + _SELECTOR_KEY_BYTES)
-    if preview:
-        total += _PREVIEW_BYTES
-    return total
+# The transport checks the bytes of the actual serialized request, after
+# target and bridge identity have been resolved. A manifest-size check or a
+# fixed envelope reserve can reject a request the bridge accepts, or miss one
+# with a long instance id / Unicode target (#769/#889 review).
 
 
 # Op-count ceiling for one `batch apply` manifest. Not a wire limit -- a
@@ -84,7 +43,7 @@ MAX_BYTES_ENV = "BN_BATCH_APPLY_MAX_BYTES"
 
 
 def _limit_from_env(name: str, default: int) -> int | None:
-    """Resolve an override, or ``None`` to mean "no limit".
+    """Resolve an override, or ``None`` to mean "no optional limit".
 
     ``0`` disables the check -- the documented escape hatch for a caller who
     really does want a 50k-op batch and has accepted the consequences. A
@@ -108,5 +67,11 @@ def batch_apply_max_ops() -> int | None:
     return _limit_from_env(MAX_OPS_ENV, BATCH_APPLY_MAX_OPS)
 
 
-def batch_apply_max_bytes() -> int | None:
-    return _limit_from_env(MAX_BYTES_ENV, MAX_REQUEST_BYTES)
+def batch_apply_max_bytes() -> int:
+    """Optional tighter batch budget, never above the bridge's hard wire cap.
+
+    ``0`` removes only the optional local limit; it cannot permit a request
+    that the bridge would reject at ``MAX_REQUEST_BYTES``.
+    """
+    optional = _limit_from_env(MAX_BYTES_ENV, MAX_REQUEST_BYTES)
+    return MAX_REQUEST_BYTES if optional is None else min(optional, MAX_REQUEST_BYTES)

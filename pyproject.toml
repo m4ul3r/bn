@@ -15,6 +15,16 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = []
+# #824: the package is POSIX-only (fcntl locks + AF_UNIX transport, see
+# transport.py's import gate). Declaring it here means a resolver or a package
+# page can say so before the first import fails.
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3 :: Only",
+]
 
 [project.urls]
 Repository = "https://github.com/m4ul3r/bn"

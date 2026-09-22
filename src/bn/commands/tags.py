@@ -8,7 +8,8 @@ from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_ta
 from ..transport import BridgeError
 
 
-@command("tag", "types", help="List tag types (name, icon, built-in)", target=True)
+@command("tag", "types", help="List tag types (name, icon, built-in)", target=True,
+         estimable=True)
 def _tag_types(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -31,19 +32,27 @@ def _tag_locator_args() -> list:
     ]
 
 
-def _tag_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, str | None]:
+def _tag_locator(args: argparse.Namespace, verb: str, *,
+                 required: bool = True) -> tuple[str | None, str | None]:
+    """The one locator rule for every tag verb (#824).
+
+    ``required=False`` is for `tag remove --id`: an id names the tag by itself,
+    so the location is optional -- but when both spellings of a location arrive
+    they still contradict each other and are refused by the same message.
+    """
     address = _pick(args.address, args.address_flag, "tag address", required=False)
     function = args.function
     if address is not None and function is not None:
         raise BridgeError(f"tag {verb} takes an address or --function, not both")
-    if address is None and function is None:
+    if required and address is None and function is None:
         raise BridgeError(
             f"tag {verb} needs a location: an address (positional or --address) or --function")
     return address, function
 
 
 @command("tag", "get", help="Get tags at an address or on a function", target=True,
-         args=_tag_locator_args())
+         args=_tag_locator_args(),
+         estimable=True)
 def _tag_get(args: argparse.Namespace) -> int:
     address, function = _tag_locator(args, "get")
     return _call(
@@ -64,7 +73,8 @@ def _tag_get(args: argparse.Namespace) -> int:
              arg("--data", dest="data_only", action="store_true",
                  help="Only data-scope tags (not function/address tags)"),
              arg("--query", default=None, help="Filter by substring of the tag data"),
-         ])
+         ],
+         estimable=True)
 def _tag_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -106,12 +116,8 @@ def _tag_add(args: argparse.Namespace) -> int:
         bn tag add 0x1000 --type Library --data "libc" --data-scope
     """
     with _mutation_preflight(args):
-        address = _pick(args.address, args.address_flag, "tag address", required=False)
-        if address is not None and args.function is not None:
-            raise BridgeError("tag add takes an address or --function, not both")
-        if address is None and args.function is None:
-            raise BridgeError("tag add needs a location: an address or --function")
-        if args.function is not None and args.force_data:
+        address, function = _tag_locator(args, "add")
+        if function is not None and args.force_data:
             raise BridgeError(
                 "tag add: --data-scope can't be combined with --function "
                 "(a function tag has no address); drop one")
@@ -119,7 +125,7 @@ def _tag_add(args: argparse.Namespace) -> int:
         args,
         "tag_add",
         {"type": args.type, "data": args.data, "address": address,
-         "function": args.function, "force_data": bool(args.force_data)},
+         "function": function, "force_data": bool(args.force_data)},
         preview=bool(args.preview),
         stem="tag-add",
     )
@@ -146,18 +152,16 @@ def _tag_remove(args: argparse.Namespace) -> int:
         bn tag remove --function sub_1000 --type Important --data "doc"
     """
     with _mutation_preflight(args):
-        address = _pick(args.address, args.address_flag, "tag address", required=False)
         if args.tag_id is None and args.type is None:
             raise BridgeError("tag remove needs --id, or --type with a location (address or --function)")
-        if args.tag_id is None and address is None and args.function is None:
-            raise BridgeError("tag remove by --type needs an address or --function")
-        if address is not None and args.function is not None:
-            raise BridgeError("tag remove takes an address or --function, not both")
+        # #824: one locator rule (_tag_locator) instead of a third wording of it;
+        # --id is the only shape that needs no location.
+        address, function = _tag_locator(args, "remove", required=args.tag_id is None)
     return _mutate(
         args,
         "tag_remove",
         {"tag_id": args.tag_id, "type": args.type, "data": args.data_match,
-         "address": address, "function": args.function, "force_data": bool(args.force_data)},
+         "address": address, "function": function, "force_data": bool(args.force_data)},
         preview=bool(args.preview),
         stem="tag-remove",
     )
