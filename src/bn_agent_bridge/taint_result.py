@@ -95,6 +95,13 @@ _WEAK_SEED_ASSUMPTION_MARKERS = (
     # fixed unrolled run; the residual args are unseeded and the all-clear is
     # not safe to report.
     "scanf_arity_residual",
+    # #863: a model that declines to claim its callee's destinations for a
+    # STRUCTURAL reason (vsscanf writes through a va_list the engine cannot
+    # resolve) rather than an arity one. The arity residual above cannot see it
+    # -- there is no modeled `*arg:N` run to out-length -- so without this marker
+    # a run whose taint reached such a call reported an all-clear that meant "no
+    # flow" when the truth was "the model never claimed those destinations".
+    "destinations_unmodeled",
 )
 
 # Receive APIs whose ``arg:N`` seed is easy to mis-anchor (header/pointer vs the
@@ -128,6 +135,14 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
         return "interprocedural descent hit the depth bound -- raise --max-depth"
     if "recursion" in causes:
         return "Python recursion limit reached (possible unresolved cycle)"
+    if "caller_cap" in causes:
+        # #812: backward-only cause. Without this branch it fell through to the
+        # generic "depth/recursion cutoff" string, which names the wrong knob --
+        # no depth or recursion bound was hit, the caller ascent stopped at its
+        # per-site cap with callers unexamined.
+        return ("the backward caller ascent hit its per-site cap -- some calling "
+                "sites were never followed; narrow the sink or inspect the "
+                "capped sites named in the caller_sites_truncated leaf")
     return "depth/recursion cutoff"
 
 
@@ -138,6 +153,7 @@ def _derive_all_clear(
     truncated: bool,
     unmodeled_reached: bool = False,
     truncation_cause: list[str] | None = None,
+    analysis_incomplete: bool = False,
 ) -> tuple[bool, str]:
     """The honesty claim gate for a ZERO-SINK forward result.
 
@@ -184,6 +200,18 @@ def _derive_all_clear(
             "frontier (an unresolved in-binary callee or an external callee with "
             "no taint model, returned conservatively tainted) -- analysis "
             "escaped there, NOT an all-clear")
+    if analysis_incomplete:
+        # #811: a callee whose MLIL was missing mid-run (a partially analysed
+        # view, or a function BN had not finished lifting) is caught by
+        # _summarize, which conservatively taints its return and records a prose
+        # assumption. Prose no consumer can gate on is exactly how the caller-cap
+        # under-disclosure started, so the condition is threaded structurally and
+        # withholds the all-clear here: the body was never read, so "no sink in
+        # it" is an absence of evidence, not evidence of absence.
+        return False, (
+            "no modeled sink reached, but one or more callee bodies could not be "
+            "analysed (MLIL unavailable -- the view may be partially analysed); "
+            "their contents were never examined, NOT an all-clear")
     if truncated:
         return False, (
             f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
@@ -195,7 +223,8 @@ def _derive_all_clear(
 
 def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
                              truncated: bool = False,
-                             truncation_cause: list[str] | None = None) -> dict[str, Any]:
+                             truncation_cause: list[str] | None = None,
+                             analysis_incomplete: bool = False) -> dict[str, Any]:
     """Frontier diagnostics + honesty gate for a zero-sink forward run (#559/#562).
 
     Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -263,7 +292,8 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
 
     safe, reason = _derive_all_clear(
         leaves, assumptions, truncated=truncated,
-        unmodeled_reached=unmodeled_reached, truncation_cause=truncation_cause)
+        unmodeled_reached=unmodeled_reached, truncation_cause=truncation_cause,
+        analysis_incomplete=analysis_incomplete)
 
     return {
         "source_callsites": int(seed_callsites),
@@ -274,6 +304,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         # sees WHY coverage was incomplete and the matching remediation (#579/#576).
         "truncated": truncated,
         "truncation_cause": truncation_cause,
+        # #811: at least one callee body could not be analysed during this run,
+        # so the region the result speaks for is smaller than it looks.
+        "analysis_incomplete": bool(analysis_incomplete),
         "frontier": {
             "unresolved": unresolved_n,
             "coarse_memory": coarse_n,
@@ -284,6 +317,148 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         # #562 honesty gate, folded into the single diagnostics block.
         "safe_to_report_all_clear": safe,
         "all_clear_reason": reason,
+    }
+
+
+def backward_diagnostics(
+    leaves: list[dict[str, Any]],
+    assumptions: list[str],
+    *,
+    sinks_seeded: int,
+    slices: int,
+    truncated: bool = False,
+    truncation_cause: list[str] | None = None,
+) -> dict[str, Any]:
+    """Frontier diagnostics + completeness gate for a BACKWARD run (#812).
+
+    Forward attached a diagnostics block and backward did not, so the two
+    directions disagreed about whether a caller could tell an exhaustive answer
+    from a curtailed one: a backward slice that dropped callers at the ascent
+    cap or bottomed out at an unresolved field load came back in the same shape
+    as a slice that reached every origin.
+
+    The gate here is deliberately NOT ``safe_to_report_all_clear``. That key
+    answers forward's question -- "no modeled sink was reached" -- and a
+    backward run never asks it: it starts AT a sink and walks toward origins, so
+    reusing the name would attach forward's meaning to a different claim. What
+    backward's own state can actually support is whether the def-chain was
+    followed to its origins with nothing dropped, which is what
+    ``safe_to_report_complete_slice`` reports. A False value withholds a
+    completeness claim; like every gate in this module it never asserts a bug.
+
+    Emitted unconditionally (forward's block is zero-sink only) because a
+    backward run has no "found something, so the findings are the signal" case:
+    its slices ARE the result, and their completeness is a live question whether
+    there are none, one, or many.
+    """
+    by_kind: dict[str, int] = {}
+    for lf in leaves or []:
+        k = str(lf.get("kind", "?"))
+        by_kind[k] = by_kind.get(k, 0) + 1
+    # Same vocabulary the forward frontier groups by, so one leaf kind never
+    # means two things across directions. `caller_sites_truncated` is counted
+    # under its own heading: it is not an unresolved callee or a coarse store
+    # but a deliberately abandoned ascent, and conflating it would hide the one
+    # frontier a user can act on by re-running with a narrower sink.
+    UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
+                  "indirect_call_unresolved", "field_load_unresolved")
+    COARSE = ("coarse_memory_store", "pointer_escape")
+    unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
+    dropped_callers_n = by_kind.get("caller_sites_truncated", 0)
+
+    blocking = [str(lf.get("kind")) for lf in (leaves or [])
+                if lf.get("kind") in BLOCKING_LEAF_KINDS]
+    weak_seed = _assumption_has_weak_seed(assumptions or [])
+    truncation_cause = list(truncation_cause or [])
+
+    if blocking:
+        seen: list[str] = []
+        for k in blocking:
+            if k not in seen:
+                seen.append(k)
+        complete, reason = False, (
+            f"{len(blocking)} frontier leaf(s) ({', '.join(seen)}) remain -- the "
+            "def-chain was not followed to every origin, so this slice is NOT a "
+            "complete account of what reaches the sink")
+    elif truncated:
+        complete, reason = False, (
+            f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
+            "origins behind the cut are absent, NOT a complete slice")
+    # DEFENCE-IN-DEPTH, and deliberately kept as such: no assumption today's
+    # backward walk records contains any `_WEAK_SEED_ASSUMPTION_MARKERS`
+    # substring (measured over the six it can emit), so this cannot fire from
+    # the only caller -- the weak backward seed shape that does exist arrives as
+    # a BLOCKING `arg_under_recovered` leaf and is withheld above. It stays
+    # because the marker set is shared with forward and keeps growing (#851 and
+    # #863 each added one), and a gate that silently stops covering a shape is
+    # the failure this whole block exists to prevent. Pinned directly by
+    # `test_backward_weak_sink_seed_withholds_completeness_812` rather than
+    # through a run that would not prove it exists.
+    elif weak_seed:
+        complete, reason = False, (
+            "the sink seed was incomplete or mis-anchored (see caveats), so the "
+            "walk may have started from the wrong value -- NOT a complete slice")
+    elif not sinks_seeded:
+        complete, reason = False, (
+            "no sink seeded, so nothing was walked -- an empty slice list here "
+            "is a seeding outcome, not a complete answer")
+    else:
+        complete, reason = True, (
+            "every seeded sink was walked to its origins with no frontier leaf "
+            "and no truncation; still a may-analysis over the recovered IL -- "
+            "not a proof that no other value reaches the sink")
+
+    if dropped_callers_n:
+        next_action = (
+            "the caller ascent was capped, so some calling sites were never "
+            "followed; re-run against a specific caller or narrow the sink to "
+            "see the origins behind the dropped sites")
+    elif unresolved_n:
+        next_action = (
+            "the walk bottomed out at an unresolved def (an indirect call or a "
+            "field load the engine could not key); recover the callee prototype "
+            "with `bn proto set` or seed inside the producing function")
+    elif coarse_n:
+        next_action = (
+            "the walk crossed a coarse-memory frontier (a pointer/store not "
+            "precisely tracked); inspect the frontier leaves or re-seed on the "
+            "destination buffer directly")
+    elif not sinks_seeded:
+        # Must precede the no-slices branch: with nothing seeded there are also
+        # no slices, so the generic "the sink seeded but no slice was produced"
+        # fired and contradicted this same block's own
+        # `complete_slice_reason` ("no sink seeded, so nothing was walked").
+        # Two lines of one diagnostic disagreeing about whether a sink seeded is
+        # worse than either line alone (found in cross-dogfood).
+        next_action = (
+            "no sink seeded, so nothing was walked; check that the --sink "
+            "locator names a call this function actually makes and an operand "
+            "that reads a variable")
+    elif not slices:
+        next_action = (
+            "the sink seeded but no slice was produced; confirm the --sink "
+            "locator names the operand you meant")
+    else:
+        next_action = (
+            "the slice reached its origins; classify each origin (parameter / "
+            "modeled source / constant) to decide whether the sink is "
+            "attacker-reachable")
+
+    return {
+        "sinks_seeded": int(sinks_seeded),
+        "slices": int(slices),
+        "truncated": bool(truncated),
+        "truncation_cause": truncation_cause,
+        "frontier": {
+            "unresolved": unresolved_n,
+            "coarse_memory": coarse_n,
+            "dropped_callers": dropped_callers_n,
+            "by_kind": by_kind,
+        },
+        "next_action": next_action,
+        "safe_to_report_complete_slice": complete,
+        "complete_slice_reason": reason,
     }
 
 
