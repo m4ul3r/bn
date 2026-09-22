@@ -21,10 +21,10 @@ Rerun bootstrap after a kernel reset. It prints whether the source was reused or
 
 ```python
 s = bn_kernel.session(instance="analysis-1", target="<selector-from-target-list>")
-await s.assert_target("<expected-loaded-basename-or-absolute-path>")
+_ = await s.assert_target("<expected-loaded-basename-or-absolute-path>")
 ```
 
-`assert_target` accepts a stem, exact basename, or strict absolute loaded path. A sidecar or cached `.bndb` may be the actual loaded file, so use `bn -i analysis-1 target list` rather than guessing from the original raw path. A retained kernel does not inherit later shell exports: `session(cache_dir=...)` and `scoped(cache_dir=...)` set `BN_CACHE_DIR` process-wide (last explicit value wins), including for sibling sessions. In a shared kernel, launch it with the bridge's cache directory; use `cache_dir=` only in an isolated kernel, or use the CLI for another directory. For a clean benchmark or from-scratch dogfood input, call `await s.assert_unannotated()` before interpreting the rows. `allow_contaminated=True` explicitly permits known annotations; symbol-name exclusions are heuristic, not proof of an untouched database.
+`assert_target` accepts a stem, exact basename, or strict absolute loaded path. A sidecar or cached `.bndb` may be the actual loaded file, so use `bn -i analysis-1 target list` rather than guessing from the original raw path. A retained kernel does not inherit later shell exports: `session(cache_dir=...)` and `scoped(cache_dir=...)` set `BN_CACHE_DIR` process-wide (last explicit value wins), including for sibling sessions. In a shared kernel, launch it with the bridge's cache directory; use `cache_dir=` only in an isolated kernel, or use the CLI for another directory. For a clean benchmark or from-scratch dogfood input, run `_ = await s.assert_unannotated()` before interpreting rows; assigning the returned digest keeps eval output bounded. `allow_contaminated=True` explicitly permits known annotations; symbol-name exclusions are heuristic, not proof of an untouched database.
 
 Keep large rows inside a function and return a bounded summary:
 
