@@ -3924,12 +3924,12 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    # #874 adds six taint counter reads; #823 adds seven spill-GC reads;
-    # #795 adds eleven reads for strings, imports, functions, and class lists.
-    # Measured here: 19 + 6 + 7 + 11 = 43 pairs.
-    assert len(sites) == 43, (
+    # #874 contributes six taint reads, #823 seven spill-GC reads, #795
+    # eleven CLI count reads, and #907 one declared-class count read.
+    # Measured here: 19 + 6 + 7 + 11 + 1 = 44 pairs.
+    assert len(sites) == 44, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 43. The number is the size of the covered set: a "
+        "count helper, not 44. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4434,9 +4434,9 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    # #874 adds one taint diagnostic container position x six malformed
-    # shapes; #797 adds one def-use hint position x six. Measured: 1254.
-    assert checked == 1254, f"the differential ran {checked} cases, not 1254"
+    # #907 adds four class-lens container positions, six malformed shapes
+    # each, to the PR-integrated 1254. Measured here: 1278 cases.
+    assert checked == 1278, f"the differential ran {checked} cases, not 1278"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4481,10 +4481,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # #874's seven taint reads add 56 malformed renders to the PR-integrated
-    # 5024. Measured here: 5080. The artifact_count pair on that earlier
-    # branch was observed, but its originating commit was not inferred.
-    assert swept == 5080, f"the raise sweep ran {swept} renders, not 5080"
+    # #907's class-lens reads add 48 malformed renders to the PR-integrated
+    # 5080. The artifact_count pair is observed but its originating commit
+    # is not inferred. Measured here: 5128 renders.
+    assert swept == 5128, f"the raise sweep ran {swept} renders, not 5128"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4639,9 +4639,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # The seven taint reads add sixteen benign renders to the PR-integrated
-    # 1463, because list-shaped reads have three benign values. Measured: 1479.
-    assert checked == 1479, f"the mirror ran {checked} renders, not 1479"
+    # #907's class-lens reads add sixteen benign renders to the PR-integrated
+    # 1479. Measured here: 1495 renders.
+    assert checked == 1495, f"the mirror ran {checked} renders, not 1495"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7365,7 +7365,6 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    # #890 obs 2: `_operation_row_text` now reads the `unapplied_prototypes` container and its nested `functions`/`variables` lists, so a text reader of a mixed declare is told what went unapplied. Three new discovered reads, and these derived populations grow with them. The row reads one more top-level key than before.
     assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
@@ -7393,13 +7392,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # #890 obs 2: the row now reads `unapplied_prototypes` (and its nested
-    # `functions`/`variables`), so both sizes grow with the new key: the
-    # rendered population 1980 -> 2178 and the checked subset 1188 -> 1298.
+    # #877/#890 adds the unapplied_prototypes field to the op row: 11 keys,
+    # 2178 rendered and 1298 checked on this merged tree.
     assert (rendered, checked) == (2178, 1298), (
         f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
         f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 792 "
+        "different claims: the carve-out for a readable container skips 880 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a
@@ -7496,10 +7494,10 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    # #797 adds one hint-list position, with nine junk elements at four
-    # shapes. Measured here: default's 4680 + 36 = 4716 renders.
-    assert swept == 4716, (
-        f"the element sweep ran {swept} renders, not 4716 -- the size of the "
+    # #907 adds two class-note list positions, each tested with nine junk
+    # elements at four shapes, to the PR-integrated 4716. Measured: 4788.
+    assert swept == 4788, (
+        f"the element sweep ran {swept} renders, not 4788 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
@@ -8757,3 +8755,103 @@ def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
         if bad is not None:
             step["alternate_parents"] = bad
         assert "not shown" not in "\n".join(_render_taint_path([step])), bad
+
+
+def test_render_class_show_text_prints_the_declared_note_675():
+    """#675.2: a declared-type card's vtable/methods/instances are empty because
+    the view has no RTTI class for the name, not because the class has none -- the
+    note is the only line that says which, so it must reach the card."""
+    from bn.formatters import _render_class_show_text
+
+    out = _render_class_show_text({
+        "name": "Widget",
+        "confidence": "declared-only",
+        "size": {"value": "0x10", "source": "declared_type"},
+        "methods": [], "vtable": None, "bases": [],
+        "instances": {"construction_sites": [], "stored_globals": [],
+                      "construction_sites_total": 0,
+                      "construction_sites_truncated": False,
+                      "stored_globals_total": 0,
+                      "stored_globals_truncated": False},
+        "notes": ["declared type -- no RTTI class, demangled methods or "
+                  "construction sites for this name in this view"],
+    })
+
+    assert "class Widget" in out
+    assert "[declared-only]" in out
+    assert "note: declared type -- no RTTI class" in out
+
+
+def test_render_class_show_text_discloses_a_skewed_notes_container_675():
+    """The note is read through the choke point, so an unusable `notes` says so
+    instead of dropping the line that distinguishes absence from silence."""
+    from bn.formatters import _render_class_show_text
+
+    rec = {"name": "Widget", "confidence": "declared-only", "methods": [],
+           "vtable": None, "bases": [],
+           "instances": {"construction_sites": [], "stored_globals": [],
+                         "construction_sites_total": 0,
+                         "construction_sites_truncated": False,
+                         "stored_globals_total": 0,
+                         "stored_globals_truncated": False}}
+
+    assert "malformed" not in _render_class_show_text({**rec, "notes": []})
+    assert "malformed" not in _render_class_show_text(rec)
+    skewed = _render_class_show_text({**rec, "notes": "bad"})
+    assert "malformed notes" in skewed
+
+
+def test_render_class_list_text_discloses_declared_types_folded_out_675():
+    """#675.2: the default listing folds declared class types out through the
+    confidence gate, so it says they are there (and how to see them) rather than
+    reading as a lens that never saw the class the user declared.
+
+    The noun names the population EXACTLY, because twice it did not: it counted
+    the view's whole type table when it said "declared type", and every type BN
+    itself imported when it said "declared class type" (#907 review). What the
+    counter counts is what `--all` adds -- the class types this view's USER
+    declared."""
+    from bn.formatters import _render_class_list_text
+
+    one = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 1})
+    assert "1 user-declared class type (--all to show)" in one
+
+    two = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 2})
+    assert "2 user-declared class types (--all to show)" in two
+
+    none = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 0})
+    assert "declared" not in none
+
+    # An unreadable counter must not print as "0 user-declared class types", which
+    # reads as "the lens looked and found none" (#619).
+    skewed = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": "lots"})
+    assert "? user-declared class types (--all to show)" in skewed
+
+    # ... but the ADVICE is only advice when it is still actionable. An `--all`
+    # run whose declared set could not be read still has to state the unknown,
+    # and telling the reader to pass the flag they just passed reads as a
+    # different, unsatisfied suggestion (#907 review rounds 4 and 5).
+    skewed_all = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0,
+        "include_all": True, "declared_suppressed": "lots"})
+    assert "? user-declared class types" in skewed_all
+    assert "(--all to show)" not in skewed_all, skewed_all
+
+
+def test_class_list_keeps_both_hidden_share_disclosures_after_integration():
+    """An unreadable filtered share must not erase a known declared share."""
+    from bn.formatters import _render_class_list_text
+
+    out = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0,
+        "no_stl": True, "library_suppressed": True,
+        "declared_suppressed": 2,
+    })
+    assert "? library/STL" in out
+    assert "2 user-declared class types (--all to show)" in out
+    assert "malformed library_suppressed field" in out
+    assert "malformed declared_suppressed field" not in out
