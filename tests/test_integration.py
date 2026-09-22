@@ -313,6 +313,41 @@ class TestSavePathIdentity:
         assert "--target is empty" in result.stderr
 
 
+class TestBatchManifestTarget:
+    def test_ambient_target_cannot_redirect_a_preview(self, shared_bn, monkeypatch,
+                                                      tmp_path):
+        """A two-target preview must run against the manifest's chosen view.
+
+        ``add`` exists only in the second synthetic fixture. If BN_TARGET
+        overrides the manifest, the batch hits the first view and fails with
+        "Symbol not found". Preview makes both probes reversible.
+        """
+        other = shared_bn.load(HELLO_BINARY)
+        chosen = shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({
+            "target": chosen,
+            "ops": [{"op": "rename_symbol", "identifier": "add",
+                     "new_name": "add_reviewed"}],
+        }), encoding="utf-8")
+
+        control = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                "--verbose", "--format", "json")
+        assert control.returncode == 0, (control.stdout, control.stderr)
+        assert json.loads(control.stdout)["success"] is True
+
+        # This deliberately omits -t to exercise the ambient-versus-manifest
+        # decision on a dedicated, test-owned bridge.
+        monkeypatch.setenv("BN_TARGET", other)
+        result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                               "--verbose", "--format", "json")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["success"] is True
+        assert payload["preview"] is True
+        assert payload["results"][0]["status"] == "verified"
+
+
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names
     must verify, not be reported verification_failed and reverted. BN auto-names

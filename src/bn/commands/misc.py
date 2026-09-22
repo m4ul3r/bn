@@ -271,27 +271,38 @@ def _data_vars(args: argparse.Namespace) -> int:
 
 
 @command("data", "symbols",
-         help="List every named data symbol (address + name), including internal ones "
+         help="List named data symbols (address + name), including internal ones "
               "the exports list omits",
          target=True,
+         paged=True,
          prefer_when="you need addressable data globals (including renamed/internal ones); "
                      "`exports` only shows the public surface",
-         see_also=("exports", "data vars"),
-         args=[
-             arg("--limit", type=_positive_int, default=None, metavar="N",
-                 help="Maximum symbols to return (default: all of them -- an "
-                      "index build wants the whole set; page an oversized view "
-                      "with --limit/--offset)"),
-             arg("--offset", type=_non_negative_int, default=0, metavar="N",
-                 help="Skip the first N symbols (paging)"),
-         ])
+         see_also=("exports", "data vars"))
 def _data_symbols(args: argparse.Namespace) -> int:
+    # #682 item 1: paged like every sibling list read. This command used to
+    # hand-roll --limit/--offset with `default=None`, i.e. build and serialize
+    # EVERY data symbol unless told otherwise; on a large view that was the
+    # read lock held for the whole build, the inverse of what this read-locked
+    # family exists for. The page is the default now, and a caller who
+    # genuinely wants the whole set asks for it with a large --limit -- or with
+    # --out, which `_effective_limit` deliberately uncaps (#165) so a
+    # full-body export is not silently capped at the page.
+    #
+    # That uncap must be spelled OUT on the wire: the bridge op defaults an
+    # omitted `limit` to the same 100-row page (so the direct programmatic
+    # caller the issue names is bounded too), and `"all"` is its explicit
+    # whole-set request. Omitting the key would now cap the `--out` export.
+    # The token is deliberately not `0`: a caller-visible zero already means
+    # "the schema, not the rows" everywhere else in this repo.
+    limit = _effective_limit(args)
     return _call(
         args,
         "data_symbols",
-        {"offset": args.offset, "limit": args.limit},
+        {"offset": args.offset, "limit": "all" if limit is None else limit},
         require_target=True,
         text_renderer=_render_data_symbols_text,
+        page_label="data symbols",
+        paged_spill=True,
         stem="data-symbols",
     )
 

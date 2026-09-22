@@ -1185,7 +1185,7 @@ def test_render_cfg_undetermined_block_is_named_not_a_silent_dead_end_682():
         "view": "asm",
         "blocks": [{
             "start": "0x401000",
-            "insns": [{"a": "0x401000", "t": "jmp rax"}],
+            "insns": [{"address": "0x401000", "text": "jmp rax"}],
             "edges": [],
             "undetermined_edges": True,
         }],
@@ -1200,7 +1200,7 @@ def test_render_cfg_real_dead_end_block_gets_no_undetermined_line_682():
         "function": {"name": "leaf", "address": "0x401000"},
         "view": "asm",
         "blocks": [{"start": "0x401000",
-                    "insns": [{"a": "0x401000", "t": "ret"}], "edges": []}],
+                    "insns": [{"address": "0x401000", "text": "ret"}], "edges": []}],
     })
     assert "undetermined" not in out
 
@@ -4550,7 +4550,7 @@ def test_well_formed_realistic_payloads_carry_no_disclosure():
                          "missing_function_candidates": 0}}),
         formatters._render_cfg_text(
             {"function": {"name": "f", "address": "0x1"}, "view": "mlil",
-             "blocks": [{"start": "0x1", "insns": [{"a": "0x1", "t": "nop"}], "edges": []}]}),
+             "blocks": [{"start": "0x1", "insns": [{"address": "0x1", "text": "nop"}], "edges": []}]}),
         formatters._render_class_show_text(
             {"name": "Widget", "bases": [], "methods": [], "confidence": "rtti"}),
     ]
@@ -6645,10 +6645,10 @@ def _type_entry(key, changed, value):
 
 
 def _data_vars_resume(value):
-    row = {"a": "0x1000", "t": "int", "w": 4}
+    row = {"address": "0x1000", "type": "int", "width": 4}
     return {"has_more": True,
-            "items": [{"a": "0x0ff0", "t": "int", "w": 4},
-                      _without(row, "a") if value is _ABSENT else {**row, "a": value}]}
+            "items": [{"address": "0x0ff0", "type": "int", "width": 4},
+                      _without(row, "address") if value is _ABSENT else {**row, "address": value}]}
 
 
 def _unmeasured_first_error(value):
@@ -6746,15 +6746,15 @@ def test_a_paged_window_never_loses_its_resume_hint_in_silence():
     for quiet in (_ABSENT, None, ""):
         out = render(_data_vars_resume(quiet))
         assert "resume with" not in out, (
-            f"a={quiet!r} carries no address to resume from: {out!r}")
+            f"address={quiet!r} carries no address to resume from: {out!r}")
         assert "malformed" not in out, (
-            f"a={quiet!r} is not a skew and must not disclose: {out!r}")
+            f"address={quiet!r} is not a skew and must not disclose: {out!r}")
     for bogus in ({"a": 1}, ["a"], 7, True, 1.5, ()):
         out = render(_data_vars_resume(bogus))
         assert "resume with" not in out, (
-            f"a={bogus!r} is not an address and must not be turned into one")
-        assert _disclosed(out, "a"), (
-            f"a={bogus!r} cost the window its resume hint with no note naming "
+            f"address={bogus!r} is not an address and must not be turned into one")
+        assert _disclosed(out, "address"), (
+            f"address={bogus!r} cost the window its resume hint with no note naming "
             f"the field: {out!r}")
 
 

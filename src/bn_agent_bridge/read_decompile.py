@@ -595,7 +595,14 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
     edge `to` are IL instruction INDEXES (hex), because first-line addresses
     collide when one assembly instruction expands into several IL blocks; at
     the asm level `start` is the block's start address. Each rendered line
-    keeps a real address in `a` at every level.
+    keeps a real address in `address` at every level.
+
+    Key spelling (#682 item 2): lines are `{address, text}` and edges
+    `{to, branch_type}` -- the pay-as-you-read contract is the neighbour
+    `_structured_il`'s (`address`/`text`), not a one-letter wire form, because
+    these payloads are read by models and `a`/`t`/`k` are opaque without the
+    reference open. `branch_type` rather than `kind` because `kind` is already
+    the ENVELOPE discriminator on this same payload ("kind": "cfg").
     """
     level = str(view or "asm").lower()
     if level not in _CFG_VIEWS:
@@ -628,7 +635,7 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
         ordered = sorted(fn.basic_blocks, key=lambda bb: int(bb.start))
         for bb in ordered:
             insns = [
-                {"a": hex(line.address), "t": "".join(str(t) for t in line.tokens)}
+                {"address": hex(line.address), "text": "".join(str(t) for t in line.tokens)}
                 for line in bb.disassembly_text
             ]
             # `edge.type` is a BranchType member, so `.name` is the readable
@@ -661,7 +668,7 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
                 if edge.target is None:
                     unresolved_target = True
                     continue
-                edges.append({"to": hex(edge.target.start), "k": kind})
+                edges.append({"to": hex(edge.target.start), "branch_type": kind})
             block = {"start": hex(bb.start), "insns": insns, "edges": edges}
             # #682 item 3, LIVE half. A real unresolvable indirect jump
             # (`jmp rax`) produces NO EDGES AT ALL, so it rendered
