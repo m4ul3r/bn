@@ -3844,9 +3844,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # through `_count_field`. It is a count in a DISCLOSURE line, so a
     # fabricated zero would silently delete the disclosure and a fabricated
     # number would invent one; both are worse than the marker being absent.
-    assert len(sites) == 25, (
+    # 25 -> 32 (#823): `_render_spill_gc_text` states five top-level counters
+    # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
+    # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
+    # are the headline's numbers; the two row reads are nested, which is why
+    # they are named in the skipped set below rather than silently dropped.
+    assert len(sites) == 32, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 25. The number is the size of the covered set: a "
+        "count helper, not 32. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3928,6 +3933,18 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # `_render_spill_gc_text` (#823). `removed_count`/`reclaimed_bytes` are
+        # stated on the branch a NON-dry sweep takes, and the probe payload
+        # carries no `dry_run` flag at all; `bytes`/`files` are read off each
+        # candidate ROW, one level below anything a top-level probe reaches.
+        # All four are driven on the real shapes by
+        # `test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823`
+        # (`tests/test_output.py`), which asserts `?` in the body a caller acts
+        # on rather than a fabricated number.
+        "_render_spill_gc_text(bytes) [count not stated in this context]",
+        "_render_spill_gc_text(files) [count not stated in this context]",
+        "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
+        "_render_spill_gc_text(removed_count) [count not stated in this context]",
         # #827 item 1: gated behind a truthiness check, so an unreadable value
         # drops the disclosure clause entirely rather than stating `?`. That is
         # the intended behaviour -- a disclosure built out of a value nobody can
@@ -4266,7 +4283,11 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # reads `last_use_by_source` (the union's per-callsite answer) and
     # `_render_taint_text` reads `stats.analysis_incomplete_functions`, both
     # discovered reads with their nested rows.
-    assert checked == 1224, f"the differential ran {checked} cases, not 1224"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1224 + 18 (#823) = 1242.
+    assert checked == 1242, f"the differential ran {checked} cases, not 1242"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4318,7 +4339,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # by 6 x 8 = 48. 4896 + 48 (#812) = 4944.
     # 4944 -> 4952 (#805/#811 text half): 1 further discovered read key swept
     # against this population's 8 bogus values.
-    assert swept == 4952, f"the raise sweep ran {swept} renders, not 4952"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4952 + 72 (#823) = 5024.
+    assert swept == 5024, f"the raise sweep ran {swept} renders, not 5024"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4479,7 +4504,11 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # against this population's benign payloads. 1426 + 13 (#812) = 1439.
     # 1439 -> 1442 (#805/#811 text half): the same newly discovered reads,
     # mirrored against the benign payloads.
-    assert checked == 1442, f"the mirror ran {checked} renders, not 1442"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1442 + 21 (#823) = 1463.
+    assert checked == 1463, f"the mirror ran {checked} renders, not 1463"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7231,8 +7260,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4572 + 108 (#823) = 4680.
+    assert swept == 4680, (
+        f"the element sweep ran {swept} renders, not 4680 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
