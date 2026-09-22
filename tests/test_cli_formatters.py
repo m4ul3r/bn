@@ -763,12 +763,14 @@ def test_render_callsites_no_footer_on_complete_single_page():
 
 def test_render_callsites_empty_string_row_does_not_read_as_no_callsites():
     # A row that renders to a literal empty string (fallback text for a raw ""
-    # item) must not be silently dropped into the "no callsites found" fallback
-    # -- that misrepresents a one-row page as a zero-result page.
-    from bn.formatters import _render_callsites_text
+    # item) must not be silently dropped into the zero-result fallback -- that
+    # misrepresents a one-row page as a zero-result page. The comparison is
+    # against the SHARED empty-result marker, not a literal: #824 renamed that
+    # line, and a test pinned to the retired spelling can no longer fail.
+    from bn.formatters import _empty_result, _render_callsites_text
     value = {"items": [""]}
     out = _render_callsites_text(value)
-    assert out != "no callsites found"
+    assert out != _empty_result("callsites")
 
 
 def test_render_callsites_string_offset_footer_renders_unknown_not_fabricated():
@@ -788,10 +790,10 @@ def test_render_callsites_non_int_total_empty_page_does_not_assert_zero():
     # the same confidently-wrong shape the over-shot-page fix (F3) stopped
     # fabricating for a bad offset. The total is unusable, so say so instead
     # of asserting zero.
-    from bn.formatters import _render_callsites_text
+    from bn.formatters import _empty_result, _render_callsites_text
     value = {"items": [], "total": "47", "offset": 60}
     out = _render_callsites_text(value)
-    assert out != "no callsites found"
+    assert out != _empty_result("callsites")
     assert "total count is not a number" in out
     assert "(offset 60)" in out
 
@@ -1198,10 +1200,10 @@ def test_the_disclosure_reaches_an_early_return_path():
     # appending a line per branch: several renderers bail out BEFORE their
     # normal tail -- "none", "no instance has a binary matching ...", the
     # no-possible-values return -- and a per-branch line misses exactly those.
-    from bn.formatters import (_render_data_symbols_text,
+    from bn.formatters import (_EMPTY_RESULT, _render_data_symbols_text,
                                _render_instance_find_text, _render_values_text)
     listing = _render_data_symbols_text({"items": "bad", "total": 3})
-    assert listing != "none" and "malformed items field" in listing
+    assert listing != _EMPTY_RESULT and "malformed items field" in listing
 
     found = _render_instance_find_text({"query": "q", "items": "bad"})
     assert found.startswith("no instance has a binary matching")
@@ -8195,6 +8197,153 @@ def test_render_trace_text_states_a_readable_arg_index_755():
     assert "malformed arg_index" not in _render_trace_text(base)
 
 
+def test_close_single_entry_carries_the_unsaved_marker():
+    """#824: the marker belongs to the ROW, not the listing form -- the
+    single-entry branch dropped it while the multi-entry branch printed it."""
+    from bn.formatters import _render_close_text
+
+    single = _render_close_text({"closed": [{"path": "/tmp/a.bndb", "unsaved": True}]})
+    assert "closed: /tmp/a.bndb  [unsaved changes discarded]" in single
+    assert _render_close_text({"closed": [{"path": "/tmp/a.bndb"}]}) == "closed: /tmp/a.bndb"
+
+
+def test_empty_results_use_one_vocabulary():
+    """#824: renderers disagreed between "none", "no targets" and "(no tags)" for
+    the same state; every empty result comes from _empty_result now.
+
+    The rows below are every render that once spelled the empty state its own
+    way -- the ones that share `_EMPTY_RESULT` by construction are not listed,
+    because the shared constant is what makes them agree. A partial sweep is
+    what left `data vars` printing a bare `none` next to a `data symbols` page
+    printing `(none)` for the identical state, so the sibling pair is asserted
+    EQUAL rather than each against its own literal.
+    The two reasoned-absence lines (#448 init arrays, #816 callsites under a
+    partial caller scan) say more than "empty" and are deliberately not this
+    vocabulary -- their own tests pin them.
+    """
+    from bn.formatters import (
+        _render_close_text,
+        _render_comment_list_text,
+        _render_comment_text,
+        _render_data_symbols_text,
+        _render_data_vars_text,
+        _render_local_list_text,
+        _render_session_list_text,
+        _render_session_status_text,
+        _render_tag_get_text,
+        _render_tag_list_text,
+        _render_tag_types_text,
+        _render_taint_models_text,
+        _render_target_list_text,
+    )
+
+    assert _render_comment_list_text([]) == "(none)"
+    assert _render_tag_types_text({"tag_types": []}) == "(none)"
+    assert _render_tag_list_text([]) == "(none)"
+    assert _render_tag_get_text({}) == "(no tags)"
+    assert _render_target_list_text({"items": []}) == "(no targets)"
+    assert _render_session_list_text({"items": []}) == "(no sessions)"
+    assert _render_local_list_text(
+        {"function": {"name": "parse", "address": "0x1000"}, "locals": []}
+    ).endswith("(no locals)")
+
+    # The four the first pass missed. `comment get <addr>` on an empty comment
+    # is the issue's own evidence row, and the models listing is the one it
+    # enumerated by name.
+    assert _render_comment_text({"comment": ""}) == "(no comment)"
+    assert _render_close_text({"closed": []}) == "(no binaries closed)"
+    assert _render_session_status_text({"items": []}) == "(no load jobs)"
+    assert _render_taint_models_text({}) == "(no models matching the filter)"
+
+    # Same state, two sibling reads: an empty window and an empty page must not
+    # read differently, which is precisely what the partial sweep introduced.
+    assert _render_data_vars_text({"items": []}) == _render_data_symbols_text({"items": []})
+    assert _render_data_vars_text({"items": []}) == "(none)"
+
+
+def test_every_generic_empty_render_uses_the_shared_marker():
+    """#909: census every use of the marker and every literal that bypasses it.
+
+    The empty cases exercise the rendered result, while the source scan catches
+    a newly added renderer that spells its own ``none`` before it can be added
+    to this table. A diagnostic sentence such as ``none (offset ... is past the
+    end)`` states a reason and is not an empty-result token.
+    """
+    import ast
+
+    from bn import formatters
+
+    module = ast.parse(inspect.getsource(formatters))
+    marker_uses = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+        and any(isinstance(child, ast.Name) and child.id == "_EMPTY_RESULT"
+                and isinstance(child.ctx, ast.Load) for child in ast.walk(node))
+    }
+    page = {"items": [], "total": 0, "offset": 0, "returned": 0,
+            "limit": 50, "has_more": False}
+    cases = {
+        "_empty_result": ((), {}),
+        "_render_comment_list_text": (([],), {}),
+        "_render_tag_types_text": (({"tag_types": []},), {}),
+        "_render_tag_list_text": (([],), {}),
+        "_render_target_choices": (([],), {}),
+        "_render_name_address_rows": (([],), {}),
+        "_render_name_address_list_text": ((page,), {}),
+        "_render_paged_list_text": ((page, "items", formatters._render_name_address_rows), {}),
+        "_render_type_list_text": ((page,), {}),
+        "_render_strings_rows": (([],), {}),
+        "_render_sections_rows": (([],), {}),
+        "_render_data_vars_text": ((page,), {}),
+        "_render_data_symbols_text": ((page,), {}),
+    }
+    assert marker_uses == cases.keys() | {"_render_record_table_text"}, (
+        "The shared empty marker has a new caller: add an empty payload and "
+        "assert what that renderer prints")
+    for name, (args, kwargs) in cases.items():
+        assert getattr(formatters, name)(*args, **kwargs) == formatters._EMPTY_RESULT, name
+
+    # One renderer uses the same marker inside a labeled row, so its empty
+    # field is covered separately from the whole-result cases above.
+    assert f"ptr-fields: {formatters._EMPTY_RESULT}" in formatters._render_record_table_text(
+        {"address": "0x1000", "record_size": 8, "ptr_fields": [], "items": []})
+
+    def raw_empty_literals(tree):
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            value = node.value.lower()
+            if (value in {"none", "(none)"}
+                    or re.fullmatch(r"\(no [^)]+\)", value)
+                    or (re.fullmatch(r"no [a-z][\w -]*", value)
+                        and isinstance(parents.get(node), (ast.Return, ast.IfExp)))):
+                found.append((node.lineno, node.value))
+        return found
+
+    definitions = [node for node in module.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "_EMPTY_RESULT"
+                           for target in node.targets)]
+    assert len(definitions) == 1
+    assert definitions[0].value.value == "(none)"
+    assert raw_empty_literals(module) == [(definitions[0].lineno, formatters._EMPTY_RESULT)], (
+        "An empty token bypasses _EMPTY_RESULT/_empty_result")
+    # The scan itself must reject the shape that drifted in the integration
+    # tree, including a new branch that returns a named empty token directly.
+    for spelling in ("none", "(none)", "(no targets)", "no targets"):
+        probe = ast.parse(f"def added_renderer(value):\n    return {spelling!r}\n")
+        assert raw_empty_literals(probe) == [(2, spelling)]
+
+
+def test_record_table_renderer_falls_back_on_a_non_dict():
+    """#824: its siblings gate on isinstance(dict); without one the first `.get`
+    raised AttributeError out of a renderer internal callers can reach."""
+    from bn.formatters import _render_record_table_text
+
+    assert "not-a-dict" in _render_record_table_text(["not-a-dict"])
+
+
 def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     """#883 item 4: the #757 collapse counts were JSON-only on this command.
 
@@ -8277,7 +8426,7 @@ def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757(
     the empty-list marker.
 
     `_render_function_list_text` returned the note INSTEAD of the body when the
-    body was the bare `none`, borrowing the paging footer's replace-the-marker
+    body was the bare empty marker, borrowing the paging footer's replace-the-marker
     rule from `_render_paged_list_text` -- but a footer states the emptiness
     ("showing 0 of 15") and this note does not. An empty listing that carried
     `duplicate_starts_collapsed` therefore rendered as a single
@@ -8291,7 +8440,7 @@ def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757(
     empty = {"kind": "functions", "items": [],
              "duplicate_starts_collapsed": 1}
     text = formatters._render_function_list_text(empty)
-    assert text.splitlines()[0] == "none", text
+    assert text.splitlines()[0] == formatters._EMPTY_RESULT, text
     assert "duplicate starts" in text, text
 
     # ...and the same for an envelope whose total is an honest zero (no paging
@@ -8299,7 +8448,7 @@ def test_empty_function_list_keeps_the_none_marker_beside_the_collapse_note_757(
     zero_total = {"kind": "functions", "items": [], "total": 0, "returned": 0,
                   "offset": 0, "has_more": False, "duplicate_starts_unresolved": 2}
     zero_text = formatters._render_function_list_text(zero_total)
-    assert zero_text.splitlines()[0] == "none", zero_text
+    assert zero_text.splitlines()[0] == formatters._EMPTY_RESULT, zero_text
     assert "2 start address(es)" in zero_text and "extent" in zero_text, zero_text
 
 
