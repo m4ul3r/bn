@@ -1158,6 +1158,48 @@ def test_batch_apply_ambient_selector_still_fills_a_manifest_that_names_none(
     assert calls[-1]["params"].get("target") == "exported.bin"
 
 
+@pytest.mark.parametrize("instance_source", ["flag", "environment"])
+@pytest.mark.parametrize("ambient_source", ["export", "pin"])
+def test_batch_apply_instance_placeholder_does_not_adopt_ambient_target(
+        monkeypatch, fake_transport, instance_source, ambient_source):
+    """An instance-id placeholder names the bridge's single open target.
+
+    Removing the placeholder must not turn the manifest into one that never
+    named a target: an ambient selector would redirect every destructive op.
+    Check the payload and the request envelope, including when neither -i nor
+    -t appears on the command line.
+    """
+    import io
+
+    from bn import session_state
+
+    instance = "bridge_17"
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"target": "bridge_17", "ops": [{"op": "set_comment", '
+        '"address": "0x1000", "comment": "reviewed"}]}'))
+    monkeypatch.delenv("BN_TARGET", raising=False)
+    monkeypatch.delenv("BN_INSTANCE", raising=False)
+    monkeypatch.setattr(session_state, "read", lambda: {})
+    if ambient_source == "export":
+        monkeypatch.setenv("BN_TARGET", "other.bin")
+    else:
+        monkeypatch.setattr(session_state, "read",
+                            lambda: {"target": "other.bin"})
+
+    argv = ["batch", "apply", "-"]
+    if instance_source == "flag":
+        argv = ["-i", instance, *argv]
+    else:
+        monkeypatch.setenv("BN_INSTANCE", instance)
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}})
+
+    assert bn.cli.main(argv) == 0
+    assert calls[-1]["op"] == "batch_apply"
+    assert calls[-1]["target"] is None
+    assert "target" not in calls[-1]["params"]
+
+
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
     pytest.param(["--max-length", "80"], {"max_length": 80}, id="max-length"),

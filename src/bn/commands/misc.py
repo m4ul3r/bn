@@ -558,7 +558,8 @@ def _batch_target_from_cli(args: argparse.Namespace,
     ``BN_TARGET``, both filled and marked by ``cli._apply_sticky_defaults`` --
     is not that: nobody named it on this command line, and ``batch_apply`` is
     a DESTRUCTIVE op. It may only FILL a manifest that named no target of its
-    own; a manifest that DID name one keeps it (#676 item 11).
+    own; a manifest that DID name one keeps that choice, including when #227
+    drops an instance-id placeholder for single-open resolution (#676 item 11).
 
     A BLANK value is not a selector at all and can fill nothing. This asked
     that with plain truthiness, which is true of ``"   "``: the resolver read
@@ -566,8 +567,8 @@ def _batch_target_from_cli(args: argparse.Namespace,
     of the request envelope, while this fill read the same value as a
     selector and wrote it into the manifest -- so it reached the bridge in
     the PAYLOAD of a destructive op, the one place the reference promises a
-    blank value never goes. One shared predicate now, so the two answers
-    cannot disagree again.
+    blank value never goes. One shared predicate handles blankness; the
+    caller must also decide once before it changes the manifest.
     """
     cli_target = getattr(args, "target", None)
     if cli_target is None or blank_selector(cli_target):
@@ -648,6 +649,16 @@ def _batch_apply(args: argparse.Namespace) -> int:
             f"{type(manifest).__name__}. (A bare list of ops should be wrapped as "
             f'{{"ops": [...]}}.)'
         )
+    # #227: a fan-out agent can put its -i/--instance id in the manifest
+    # "target". That id names the bridge, not a binary, so drop the placeholder
+    # and let the bridge resolve its single open target. Decide which CLI
+    # selector may apply BEFORE dropping it: reasking afterwards would let an
+    # ambient BN_TARGET/pin fill the new vacancy and redirect the whole batch.
+    manifest_named_target = bool(manifest.get("target"))
+    cli_target = _batch_target_from_cli(args, manifest)
+    inst = getattr(args, "instance", None)
+    if inst and manifest.get("target") == inst:
+        manifest.pop("target", None)
     with _mutation_preflight(args):
         if not isinstance(manifest.get("ops"), list):
             raise BridgeError(
@@ -692,8 +703,7 @@ def _batch_apply(args: argparse.Namespace) -> int:
         # ambient `args.target` (see the demotion below).
         request_bytes = request_bytes_for_params(
             manifest,
-            selector=(_batch_target_from_cli(args, manifest)
-                      or manifest.get("target")),
+            selector=(cli_target or manifest.get("target")),
             preview=bool(getattr(args, "preview", False)),
         )
         if max_bytes is not None and request_bytes > max_bytes:
@@ -704,19 +714,11 @@ def _batch_apply(args: argparse.Namespace) -> int:
                 f"it, or raise/disable the ceiling with {MAX_BYTES_ENV}=<n> "
                 f"(0 disables)."
             )
-    # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and
-    # naturally put that id in the manifest "target" -- but an instance id is a
-    # bridge, not a target selector, so it gets rejected. When the manifest target
-    # is just the -i/--instance id, drop it: the bridge then resolves the instance's
-    # single open target (the manifest "target" is optional with -i/--instance).
-    inst = getattr(args, "instance", None)
-    if inst and manifest.get("target") == inst:
-        manifest.pop("target", None)
     # #690 r4: an explicit-but-empty manifest target (an unset shell variable
     # templated into the file) is an error -- it must not ride the focused-tab
     # convenience bridge-side, and a sticky pin must not silently paper over it.
     manifest_target = manifest.get("target")
-    if manifest_target is not None and not str(manifest_target).strip():
+    if blank_selector(manifest_target):
         raise BridgeError(
             f'Manifest ({source}) target is empty: set a selector from '
             '`bn target list`, or drop the "target" key to use the single '
@@ -735,14 +737,13 @@ def _batch_apply(args: argparse.Namespace) -> int:
     # `close` refuses (#676 item 11). An ambient value may only FILL a manifest
     # that named none; without any CLI target the manifest "target" is honored
     # as before.
-    cli_target = _batch_target_from_cli(args, manifest)
     if cli_target:
         manifest["target"] = cli_target
-    elif getattr(args, "_sticky_target", False) and manifest.get("target"):
+    elif getattr(args, "_sticky_target", False) and manifest_named_target:
         # The ambient value was demoted. Drop it from the ENVELOPE too, so the
         # request names ONE selector: the bridge resolves `batch_apply` from
-        # the manifest's own target (`_batch_apply_selector`, read by both the
-        # binder and the destructive gate), and a second, different selector
+        # the manifest's own target, or from its sole open target if #227
+        # removed an instance-id placeholder. A second, different selector
         # riding beside it is a claim this invocation no longer makes.
         #
         # A BROKEN ambient default (an empty export or pin) lands here too,
