@@ -4658,8 +4658,40 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # Combined #873, #879 and #889 renderer population; remeasured below.
-    assert swept == 5280, f"the raise sweep ran {swept} renders, not 5280"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
+    # #793: 4896 + 8 -- `_render_target_info_annotations_text` reads the
+    # `existing_annotations` container (8 bogus values x 1 render). Measured.
+    # #818 review: 4904 + 32 -- FOUR more discovered (renderer, ctx) pairs, 8
+    # bogus values each: `_render_go_functions_summary_text` reads `note` and
+    # `start_match_count` (the summary view carries the rebase note and the
+    # START-match counter now) and `_render_go_rename_text` reads the two new
+    # skip buckets. Measured on the rebased tree by diffing the population.
+    # #883 item 4: 4936 + 48 -- SIX more discovered (renderer, ctx) pairs, 8 bogus
+    # values each: `_duplicate_starts_collapsed` and `_duplicate_starts_unresolved`
+    # are read by `_render_function_count_text` and by
+    # `_render_function_list_text` in both its demangled and undemangled probe
+    # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
+    # carried over from a comment.
+    # #757 review round 5: 4984 + 32 -- FOUR more discovered (renderer, ctx)
+    # pairs, 8 bogus values each. The same two duplicate-start counts are now
+    # read by `_render_target_summary` (the note sits under the function count
+    # it modifies) and therefore by `_render_target_info_text`, which composes
+    # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
+    # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
+    # under the digest's own function count (1 renderer x 2 keys x 8).
+    # Measured by diffing the population, not carried over from a comment.
+    # #693 items 1/2: + 16 -- TWO more discovered pairs, 8 bogus values each, both
+    # on `_render_go_rename_text`: it reads `rolled_back` and `success` BEFORE its
+    # branch, because the two rollback states are decided from those two fields
+    # rather than from the branch a payload happens to walk into.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 56 malformed probes for its taint diagnostic reads.
+    # #907 adds 48 malformed probes for its class-list reads.
+    # #693 adds 16 more for two go-rename reads.
+    # Combined #873/#879/#889 population is 5280. #693 adds two go-rename
+    # reads, each probed with eight malformed values, for 5296 total.
+    assert swept == 5296, f"the raise sweep ran {swept} renders, not 5296"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4814,8 +4846,33 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # Combined #873, #879 and #889 renderer population; remeasured below.
-    assert checked == 1534, f"the mirror ran {checked} renders, not 1534"
+    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
+    # #793: 1426 + 3 -- the new target-info annotation renderer reads
+    # `existing_annotations` in three probed contexts. Measured.
+    # #818 review: 1429 + 8 -- the same four discovered pairs the raise sweep
+    # `_render_go_functions_summary_text`'s `note` / `start_match_count`
+    # and `_render_go_rename_text`'s two skip buckets), x 2 benign payloads each.
+    # Measured on the rebased tree by diffing the population.
+    # #883 item 4: 1437 + 12 -- the same SIX discovered pairs the raise sweep
+    # gained (`_duplicate_starts_note`'s two counts across the three
+    # `function list` / `--count` probe forms), x 2 benign payloads each. A
+    # well-formed count must not draw a "malformed" note, which is what this
+    # mirror checks. Measured by diffing the population.
+    # #757 review round 5: 1449 + 8 -- the same FOUR discovered pairs the raise
+    # sweep gained (the two duplicate-start counts now read by
+    # `_render_target_summary` and by `_render_target_info_text` composing it),
+    # x 2 benign payloads each. Measured by diffing the population.
+    # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
+    # gained, x 2 benign payloads each. Measured by diffing the population.
+    # #693 adds two go-rename pairs, or four benign probes.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 16 benign probes for those reads.
+    # #907 adds 16 benign probes for those reads.
+    # #693 adds four more for the same go-rename pairs.
+    # Combined #873/#879/#889 mirror is 1534. #693's two reads add four
+    # benign probes, for 1538 total.
+    assert checked == 1538, f"the mirror ran {checked} renders, not 1538"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 

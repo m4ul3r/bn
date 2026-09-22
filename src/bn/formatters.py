@@ -2007,19 +2007,66 @@ def _render_go_rename_text(value: Any) -> str:
                 else str(targeted - len(failed)))
     preview = bool(value.get("preview"))
     committed = bool(value.get("committed", True))
+    rolled_back = value.get("rolled_back")
+    # The question the compact summary also answers -- a preview whose run
+    # reported a failure is NOT a preview of what would land (#693 item 2). The
+    # op is all-or-nothing, so the failure reverted the whole batch and a live
+    # run of the same state commits zero; stating the rows that verified as
+    # "would rename" misleads a caller that plans on it, and this view is the
+    # one that CLAIMS those counts. It is asked here from `success` and the
+    # failure ROWS only, and that is NOT the compact summary's question: the
+    # summary refuses when `go_failed_count` disagrees with the rows and when
+    # any counter it read came back in a shape no count reads out of, neither
+    # of which this view asks -- and it classifies each row BY STATUS where
+    # this view counts the raw list, which splits them the OTHER way (a
+    # non-failure row beside a zero counter is `ok` to the summary and a
+    # failure to this view). So on a skewed payload the two faces differ in
+    # both directions. A pre-existing gap, named here rather than papered over
+    # by a comment claiming they cannot (#693 r2/r3/r4).
+    ok = value.get("success") is not False and not failed
     lines: list[str] = []
-    if preview:
+    # A revert that did not complete is the ONE state where no line here may
+    # state a number for what is live: an unknown subset of the renames the
+    # apply made is still in the view, which is exactly why the compact face of
+    # this payload reports `changed=None` (#693 item 1). Both lines this branch
+    # replaces stated a confident `0` -- "0 would rename" on the preview, "0
+    # renamed" live -- so the two views of ONE payload disagreed, and on this op
+    # a 0 is the "nothing changed, do not save" verdict a control loop acts on.
+    #
+    # The preview line also named "the failure" and pointed at "the failure(s)
+    # below". A failed preview revert may have NO apply failure at all: the
+    # bridge computes `rolled_back` whenever the run was a preview OR something
+    # failed, so `results: []` beside `go_failed_count: 0` (every rename
+    # verified, only the revert failed) is one of its two shapes -- the other
+    # carries rows, and this branch prints them below either way. Naming "the
+    # failure" was wrong on the first shape; directing a re-run was wrong on
+    # both, at a view the banner above says may be left modified (#693 r2/r3).
+    if rolled_back is False and not committed:
+        lines.append(
+            "rollback failed: the preview could not be reverted -- the view "
+            "may be left modified by an unknown number of the renames"
+            if preview else
+            "rollback failed: the view may be left modified")
+        lines.append(
+            f"go rename{' (preview)' if preview else ''}: an unknown number of "
+            f"the renames this run applied are still live -- the revert failed, "
+            f"so this is neither a plan nor a zero ({verified} verified, "
+            f"{len(failed)} failed, {skipped} skipped); re-read the view and "
+            f"save or discard it deliberately")
+    elif preview:
         lines.append("preview: renames applied + reverted (nothing committed)")
-        lines.append(f"go rename (preview): {verified} would rename, {len(failed)} failed, "
-                     f"{skipped} skipped (already user-named)")
-    elif not committed and (value.get("success") is False or failed):
+        if ok:
+            lines.append(f"go rename (preview): {verified} would rename, {len(failed)} failed, "
+                         f"{skipped} skipped (already user-named)")
+        else:
+            lines.append(f"go rename (preview): 0 would rename ({verified} verified before "
+                         f"the failure, {len(failed)} failed, {skipped} skipped); "
+                         f"fix the failure(s) below and re-run")
+    elif not committed and not ok:
         # All-or-nothing: a failure reverted the WHOLE batch, so NOTHING landed --
         # don't claim "N renamed" for rows that passed readback before the revert.
-        if value.get("rolled_back") is False:
-            lines.append("rollback failed: the view may be left modified")
-        else:
-            lines.append("rolled back: the batch was reverted because a rename failed — "
-                         "NOTHING was committed")
+        lines.append("rolled back: the batch was reverted because a rename failed — "
+                     "NOTHING was committed")
         lines.append(f"go rename: 0 renamed ({verified} would have, {len(failed)} failed, "
                      f"{skipped} skipped); fix the failure(s) below and re-run")
     else:
@@ -5466,6 +5513,16 @@ def _build_mutation_summary(
         first_error = message or first_error or (
             "prototype has_user_type override could not be cleared"
         )
+    # A revert that did NOT complete leaves an unknown subset of the applied
+    # changes LIVE. `skills/bn/reference/mutating.md` states that rule of the
+    # ONE compact-status schema, so it belongs HERE and not in one caller:
+    # shipped in `_go_rename_summary` alone it was a documented contract the
+    # `results[]`-derived sibling did not obey, and a generic PREVIEW whose
+    # non-journaled restore fails reaches exactly this state -- and reported a
+    # confident plan for it while its own message said the view may be left
+    # modified (#693 r2). The predicate is the one `dirty_after` uses below;
+    # see its note for why `not committed` is part of it.
+    revert_failed = rolled_back is False and not committed
     unmeasured = not measured
     if unmeasured:
         # Review of the first cut of this fix (#684): `dirty_after: None` is
@@ -5499,7 +5556,7 @@ def _build_mutation_summary(
         # `dirty_after` is a deliberate fail-safe True, NOT unknown (#684).
         "measured": not unmeasured,
         "op_count": op_count,
-        "changed_count": (None if unmeasured else changed),
+        "changed_count": (None if unmeasured or revert_failed else changed),
         "verified_count": (None if unmeasured else verified),
         "noop_count": (None if unmeasured else noop),
         "failed_count": (None if unmeasured else failed),
@@ -5525,7 +5582,7 @@ def _build_mutation_summary(
         # `measured` still gets the safe answer from `dirty_after` alone.
         "dirty_after": (True if unmeasured else (
             (committed and bool(changed))
-            or (rolled_back is False and not committed)
+            or revert_failed
             or proto_residue
         )),
     }
@@ -5545,11 +5602,12 @@ def _mutation_summary(value: Any) -> Any:
     Derives the shared builder's inputs from `results[]` (#685)."""
     if not isinstance(value, dict):
         return value
-    # Idempotent: `_call` evaluates `spill_status` against the ALREADY-transformed
-    # result, so on the compact path this runs on its own output. Without this
-    # guard the second pass sees no `results` and re-zeroes every count -- today
-    # only wasted work (a ~200-byte summary never crosses the spill threshold),
-    # but a spilled mutation would print an all-zero status.
+    # Idempotent on its own output, which the CLI no longer requires: `_call`
+    # evaluates `spill_status` against the RAW result (#693 item 4), and every
+    # other caller here hands this function a fresh bridge payload. The guard
+    # stays for a DIRECT double application -- without it the second pass sees no
+    # `results` and re-zeroes every count -- and is pinned by
+    # `test_mutation_summary_transforms_are_idempotent`.
     if value.get("kind") == "mutation_summary":
         return value
     # Read inside a NESTED capture so this transform can tell an UNREADABLE
@@ -5723,37 +5781,7 @@ def _go_rename_summary(value: Any) -> Any:
     failed = counters["go_failed_count"]
     skipped = counters["skipped_user_named"]
     rolled_back = value.get("rolled_back")
-
-    # `changed` is what is LIVE in the view when the call returns, never the plan:
-    #   committed -> what actually landed;
-    #   preview   -> what WOULD land, i.e. the rows that verified (NOT the
-    #                candidate count, which over-reports every candidate the
-    #                apply skipped because it changed underneath us);
-    #   otherwise -> a live run that failed and was reverted: nothing landed.
-    # Reporting `candidates` in that last case is the mirror image of the bug
-    # this function exists to fix, and `_render_go_rename_text` already refuses
-    # to claim "N renamed" for rows that passed readback before a revert.
-    # The counter `changed` is READ FROM is this summary's measurement source,
-    # and the third state matters here exactly as it does for a container:
-    # ABSENT means the op claimed nothing, so there is nothing to report
-    # against. `_count_field` answers 0 for an absent key, which on this op is
-    # the "nothing changed, do not save" verdict -- so a partial or
-    # version-skewed envelope with the counters MISSING produced the decision
-    # keys of a genuine all-noop commit, reaching #683's harm by absence
-    # instead of by wrong shape. `_mutation_summary` already calls its own
-    # missing measurement source unmeasured; both callers of the one builder
-    # must answer that the same way (#619/#685).
-    if committed:
-        changed = committed_count
-        source = "go_committed_count"
-    elif preview:
-        changed = verified
-        source = "go_verified_count"
-    else:
-        # Nothing landed, and that is established by the revert rather than by
-        # a counter -- so there is no measurement source to require.
-        changed = 0
-        source = None
+    reported_success = bool(value.get("success", True))
     # The rows and the counter answer the SAME question on this op, and the
     # bridge builds them from ONE list: `"results": failed_rows` beside
     # `"go_failed_count": len(failed_rows)`. So they may not disagree in
@@ -5770,8 +5798,108 @@ def _go_rename_summary(value: Any) -> Any:
     # counts for one payload while both read `measured` -- the drift between
     # an op's two views that #685 exists to close, one key over from `ok`.
     rows_contradict = len(row_failures) != failed
+    # Did this run SUCCEED, by the builder's own rule (`reported_success and not
+    # failed and not unusable`)? Asked here as well because the count ladder
+    # below turns on it, and a ladder that decided from `value["success"]` alone
+    # would call a run with a failure row beside it clean -- while `ok` on the
+    # same payload reports it failed. One decider, one answer (#619/#685).
+    run_ok = (reported_success and not failed
+              and not unreadable and not rows_contradict)
+
+    # `changed` is what is LIVE in the view when the call returns, never the plan:
+    #   committed      -> what actually landed;
+    #   preview, ok    -> what WOULD land, i.e. the rows that verified (NOT the
+    #                     candidate count, which over-reports every candidate the
+    #                     apply skipped because it changed underneath us);
+    #   revert FAILED  -> UNKNOWN, decided by the SHARED builder rather than
+    #                     here: stating the rule in this caller alone left the
+    #                     `results[]`-derived sibling reporting a confident
+    #                     integer for the identical live state, while
+    #                     `mutating.md` states it of the one compact-status
+    #                     schema (#693 item 1 / r2). Whatever this ladder
+    #                     computes for that state, `_build_mutation_summary`
+    #                     overrides it to `None` beside the fail-safe
+    #                     `dirty_after: true` it already sets; `measured` stays
+    #                     True, because the counters DID read -- what is
+    #                     unknown is the live delta, not the measurement;
+    #   otherwise      -> nothing landed. A live run that failed and WAS
+    #                     reverted, or a PREVIEW that failed: the op is
+    #                     all-or-nothing, so running the same state live commits
+    #                     zero and the rows that verified before the failure are
+    #                     not "what would land" either (#693 item 2).
+    # Reporting `candidates` OR `verified` in those last two cases is the mirror
+    # image of the bug this function exists to fix, and `_render_go_rename_text`
+    # already refuses to claim "N renamed" for rows that passed readback before a
+    # revert.
+    # The counter `changed` is READ FROM is this summary's measurement source,
+    # and the third state matters here exactly as it does for a container:
+    # ABSENT means the op claimed nothing, so there is nothing to report
+    # against. `_count_field` answers 0 for an absent key, which on this op is
+    # the "nothing changed, do not save" verdict -- so a partial or
+    # version-skewed envelope with the counters MISSING produced the decision
+    # keys of a genuine all-noop commit, reaching #683's harm by absence
+    # instead of by wrong shape. `_mutation_summary` already calls its own
+    # missing measurement source unmeasured; both callers of the one builder
+    # must answer that the same way (#619/#685).
+    if committed:
+        changed = committed_count
+        source = "go_committed_count"
+    elif preview:
+        # #693 item 2 changed the VALUE a failed preview reports (0 -- the op
+        # is all-or-nothing, so a live run of that state commits zero), and it
+        # must not also change what this rung MEASURES. `go_verified_count`
+        # stays the source either way, because the summary still STATES it as
+        # `verified_count` and the detail view still prints it: letting a
+        # failed preview fall through to the sourceless rung below made an
+        # envelope that omits the counter report a fabricated
+        # `verified_count: 0` beside `measured: true`, switching off the #684
+        # fail-safe that exists for exactly that version-skewed envelope
+        # (#693 r2).
+        changed = verified if run_ok else 0
+        source = "go_verified_count"
+    elif rolled_back is False:
+        # A revert that did NOT complete. `changed` is 0 here only nominally --
+        # the shared builder overrides it to `None`, because an unknown subset
+        # of the renames is live -- so the counts this summary DOES state are
+        # the only numbers a remediation pass has, and `_count_field` answers 0
+        # for an absent key. A fabricated `verified_count: 0` is at its worst
+        # in this cell: it sits beside `changed_count: null` and disagrees with
+        # the detail view, which falls back to `candidates - failure rows` and
+        # printed a DIFFERENT number for the same payload (#693 r4). So the
+        # counter is required here even though the revert, not a counter,
+        # established `changed`.
+        changed = 0
+        source = "go_verified_count"
+    else:
+        # A live run that WAS reverted: nothing landed, and that is established
+        # by the revert rather than by a counter, so there is no measurement
+        # source to require -- pinned by
+        # `test_a_go_rename_summary_with_no_counters_is_not_a_measured_noop`.
+        changed = 0
+        source = None
     measured = (not unreadable and not rows_contradict
                 and (source is None or _field_present(value, source)))
+
+    # `measured` covers the counter `changed` is read from. The summary STATES
+    # two more, and on the SOURCELESS rung nothing else gates them: a revert
+    # that completed establishes what LANDED, never how many rows verified
+    # before the failure, so an envelope omitting `go_verified_count` there
+    # reported `verified_count: 0` beside `measured: true` -- while the detail
+    # view of the SAME payload derived `candidates - failure rows` and printed
+    # a different, non-zero figure. A count the envelope never STATED is not a
+    # zero, on any rung: `_count_field` answers 0 for an absent key and 0 on
+    # this op is the "nothing happened, do not save" verdict #683 discarded a
+    # rename batch to (#693 r6).
+    #
+    # `failed` is deliberately not in this rule. The failure ROWS answer the
+    # same question, `rows_contradict` above refuses when the two disagree,
+    # and an empty `results[]` beside an absent counter is a zero the rows
+    # established -- withholding it would refuse a count this payload does
+    # support, which is the mirror of the fabrication.
+    stated_verified = (verified if _field_present(value, "go_verified_count")
+                       else None)
+    stated_noop = (skipped if _field_present(value, "skipped_user_named")
+                   else None)
 
     # The failure explanation (a failure row's message/status, then the top-level
     # `message`) and `dirty_after` come from the shared builder: gating on
@@ -5807,15 +5935,17 @@ def _go_rename_summary(value: Any) -> Any:
         # op_count, the invariant every other mutation summary holds.
         op_count=candidates + skipped
                  - counters["skipped_changed_during_apply"],
-        reported_success=bool(value.get("success", True)),
+        reported_success=reported_success,
         # `results[]` holds only the FAILURE rows for this op.
         failure_rows=failure_rows,
         failed=failed,
         changed=changed,
-        verified=verified,
+        verified=stated_verified,
         # Already-user-named functions are deliberately left alone: no change,
-        # which is what `noop` means elsewhere.
-        noop=skipped,
+        # which is what `noop` means elsewhere. `op_count` above still uses the
+        # numeric read: it is a literal count of what the op could see, and an
+        # absent counter shrinks it rather than unknowing it.
+        noop=stated_noop,
         committed=committed,
         preview=preview,
         rolled_back=rolled_back,
@@ -5828,10 +5958,22 @@ def _go_rename_summary(value: Any) -> Any:
 def _render_mutation_summary_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    state = ("committed" if value.get("committed")
-             else "preview" if value.get("preview")
-             else "rolled back" if value.get("rolled_back")
-             else "ok" if value.get("success") else "FAILED")
+    # This word is the ONLY place the compact TEXT carries `rolled_back` (the
+    # JSON carries the key itself), so a revert that did NOT complete has to be
+    # visible in it: calling such a run "preview" reads as "applied and cleanly
+    # reverted" while an unknown subset of the renames is still live (#693 item
+    # 1). `preview` stays in the word for that state, so the two facts travel
+    # together instead of one replacing the other.
+    if value.get("committed"):
+        state = "committed"
+    elif value.get("rolled_back") is False:
+        state = "rollback failed (preview)" if value.get("preview") else "rollback failed"
+    elif value.get("preview"):
+        state = "preview"
+    elif value.get("rolled_back"):
+        state = "rolled back"
+    else:
+        state = "ok" if value.get("success") else "FAILED"
     parts = [
         f"mutation: {state}",
         f"changed={value.get('changed_count', 0)}",
