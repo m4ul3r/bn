@@ -9,11 +9,12 @@ from __future__ import annotations
 import difflib
 import functools
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
+from .read_types import _follow_typedef
 from .seam import _view_memo
 
 
@@ -385,6 +386,340 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     }
 
 
+# #675.2: the DECLARED half of the lens. `class list` / `class show` cluster
+# classes from symbols and RTTI, so a class the user DECLARED -- `bn types
+# declare 'class Widget { virtual void draw(); };'` -- is invisible to that half:
+# it has no `_ZTV`/`_ZTI` symbol and no demangled method symbol, so `class show
+# Widget` answered "No class named 'Widget'" while `types --query Widget` found
+# it. The records below are what the lens falls back to.
+#
+# They are read LIVE, never memoised, and deliberately NOT merged into the
+# memoised registry. The measured reason is REDEFINITION, not first definition:
+# a per-name cache of a declared type's facts answers the OLD width after the
+# type is re-declared -- measured live on BN 6.1 through the real CLI, where
+# `class show` reported `size 0x10` while the view's type was already `0x18`.
+# Reading this half fresh per call removes that staleness whatever the
+# registry's invalidation covers.
+#
+# An earlier version of this comment justified the live read by claiming a
+# `types declare` (`define_user_type`) fires no symbol/function notification and
+# therefore cannot invalidate the memo (#622's cache, #675's triage comment).
+# That was MEASURED FALSE: `define_user_type` moves the per-view generation
+# counter (observed 3 -> 4 in-process, and 0 -> 1 -> 2 across two CLI declares),
+# so a declare DOES invalidate the registry memo on this build. Kept as a note
+# rather than deleted: the live read is defensive with respect to that
+# question, and correct for the redefinition case either way.
+_DECLARED_CONFIDENCE = "declared-only"
+_DECLARED_TYPE_NOTE = (
+    "declared type -- no RTTI class, demangled methods or construction sites for "
+    "this name in this view; the empty vtable/methods/instances are RTTI evidence "
+    "that is absent, NOT evidence this class has none"
+)
+
+
+def _no_instances() -> dict[str, Any]:
+    """The envelope :func:`_instances` returns when it found nothing.
+
+    The class card reads ``instances`` as a CONTAINER, so the registry's
+    pre-``_enrich`` ``[]`` would be disclosed as a malformed field on every
+    declared card (#619). Built fresh per record: a shared dict would let one
+    caller's append reach every other record."""
+    return {
+        "construction_sites": [],
+        "stored_globals": [],
+        "construction_sites_total": 0,
+        "construction_sites_truncated": False,
+        "stored_globals_total": 0,
+        "stored_globals_truncated": False,
+    }
+
+
+# The value `declared_suppressed` carries when the view's type table could not be
+# read: a STATED unknown, which `_stated_count` renders as `?`, rather than a `0`
+# indistinguishable from a real "no declared classes here" (#619, #907 review).
+_DECLARED_UNREADABLE = "unreadable"
+
+
+# #675.2 / #907 review: WHICH types the declared half answers for. Two axes, and
+# both were measured wrong before this block existed.
+#
+# KIND. `bv.types` holds enums, scalars, pointers, arrays, function prototypes
+# and typedef aliases alongside structures, so an unfiltered enumeration answered
+# `class show Color` (an enum) with `class Color (size 0x4) [declared-only]`, the
+# note asserting its empty vtable is "RTTI evidence that is absent" about a type
+# that can never carry one. The admitted kind is BN's `StructureTypeClass`,
+# exactly C++'s three class-keys (`class`, `struct`, `union`).
+#
+# PROVENANCE. `bv.types` is not the set the user declared either -- it is every
+# type BN has, including the ones IT imported. Measured on a stock system ELF
+# with zero user declarations: 53 types, 25 of them structure-kind (the ELF
+# format structs, `FILE`, the libc `_IO_*` family), so the lens rendered
+# `classes: 0 shown of 0 (hidden: 25 declared class types (--all to show))`
+# directly above its own note saying the target has no C++ type evidence at all,
+# and `class show <an ELF format struct>` answered a class card. On a C++ target
+# it additionally listed BN's own generated `<Class>::VTable` structs as peer
+# "classes" of the class they belong to -- the artifact family #309/#481 exist to
+# suppress. The population is therefore the USER type container: the set
+# `types declare` (`define_user_type`) writes to, which is what #675 item 2 asks
+# about and what this module's comments have always claimed.
+_STRUCTURE_TYPE_CLASS = 4       # binaryninja.TypeClass.StructureTypeClass
+
+# `binaryninja.NamedTypeReferenceClass` values that NAME a C++ class type:
+# ClassNamedTypeClass, StructNamedTypeClass, UnionNamedTypeClass. An alias BN
+# cannot resolve still states the kind it references, and that is not a rare
+# shape: measured on BN 6.1, `typedef struct { ... } T;` DOES register its
+# anonymous body (as `_T`) so the plain spelling resolves, but the NAMESPACED
+# one -- `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of
+# None while the reference itself states StructNamedTypeClass, as does any
+# alias whose body is defined without it. Refusing on an unresolvable target
+# alone would therefore drop a common way a declared class reaches a view,
+# while `typedef enum { ... } M;` (EnumNamedTypeClass, target also None) must
+# still be refused. (An earlier version of this comment claimed the anonymous
+# body is NEVER registered; that was refuted live -- #907 review rounds 3/4.)
+_CLASS_NAMED_TYPE_CLASSES = frozenset({2, 3, 4})
+_CLASS_NAMED_TYPE_PREFIXES = ("Class", "Struct", "Union")
+# `EnumNamedTypeClass`. The remaining spellings -- `Unknown` (0) and `Typedef`
+# (1) -- name neither a class nor a non-class: a typedef-kinded reference may
+# well resolve to a structure, so reading it as "not a class" is a conclusion
+# the handle does not support (#907 review round 3).
+_NON_CLASS_NAMED_TYPE_CLASSES = frozenset({5})
+_NON_CLASS_NAMED_TYPE_PREFIXES = ("Enum",)
+
+# Returned for a declaration whose KIND could not be established at all -- the
+# read raised, or the handle states nothing that classifies it. Distinct from
+# `None` (read fine, positively not a class) because the two must be answered
+# differently: an unknown kind may not be counted and may not be reported as an
+# absent class (#907 review round 3).
+_UNREADABLE_DECLARATION = object()
+
+
+def _named_class_kind(type_obj) -> bool | None:
+    """``True`` if *type_obj* is a NamedTypeReference naming a class type,
+    ``False`` if it names something that is positively NOT one, and ``None``
+    when the handle does not say.
+
+    Prefix-matched, not substring-matched: every ``NamedTypeReferenceClass``
+    spelling ends in ``NamedTypeClass``, so ``"Class" in name`` is true of
+    ``EnumNamedTypeClass`` too."""
+    ntc = getattr(type_obj, "named_type_class", None)
+    if ntc is None:
+        return None
+    try:
+        value = int(ntc)
+    except (TypeError, ValueError):
+        spelling = str(getattr(ntc, "name", None) or ntc)
+        if spelling.startswith(_CLASS_NAMED_TYPE_PREFIXES):
+            return True
+        return False if spelling.startswith(_NON_CLASS_NAMED_TYPE_PREFIXES) else None
+    if value in _CLASS_NAMED_TYPE_CLASSES:
+        return True
+    return False if value in _NON_CLASS_NAMED_TYPE_CLASSES else None
+
+
+def _class_type_target(bv, name: str, type_obj):
+    """The handle carrying a declaration's facts when the declaration is a C++
+    class type -- the structure itself, the structure its alias chain reaches, or
+    an unresolvable reference that still NAMES a class. ``None`` when the
+    declaration was READ and is positively not a class, and
+    :data:`_UNREADABLE_DECLARATION` when its kind could not be established at
+    all.
+
+    Kind test duck-typed over BN's ``TypeClass`` IntEnum and the plain string the
+    unit fakes carry, the shape :func:`read_types._is_named_type_ref` uses.
+
+    The resolved TARGET is preferred because that is where a declaration's facts
+    live: a NamedTypeReference states no members and (for a resolvable alias) a
+    width that is not its own, so a card built from the alias rendered
+    ``kind: named_type_ref ... size=0x0`` for a 0x30-wide class and could not show
+    the class the user asked about (#907 review). ``read_types``' struct reader
+    resolves the same way, for the same reason (#674) -- one convention for which
+    handle carries a declaration's facts. The record keeps the DECLARED name; the
+    entry's own ``decl`` discloses the underlying body.
+
+    Never admits a class on a read that failed -- but the THIRD answer is the
+    point. Collapsing "I read this and it is an enum" into "I could not read
+    this" let one raising handle vanish from the enumeration, so the listing
+    stated a measured count that silently excluded it and `class show` of that
+    very name answered a confident `No class named`: a fabricated count and a
+    fabricated absence off a failed read, one level below the set guard this
+    module already had (#907 review round 3). An unclassifiable declaration is
+    reported as such by both surfaces instead.
+
+    The read is guarded because this runs over every declaration on a read path:
+    an exception from one type's ``type_class`` would otherwise take down the
+    entire `class list` (:func:`_declared_size` guards its width read for the same
+    reason)."""
+    try:
+        _, target, reason = _follow_typedef(bv, name, type_obj)
+        if reason is not None:
+            # The chain did not terminate (an unregistered anonymous body, a
+            # cycle, too many hops). The reference it stopped on may still state
+            # which kind it names, which is enough to admit the class -- carrying
+            # only the facts it does have -- and to keep refusing an enum alias.
+            # A reference that names neither (Unknown/Typedef spellings, or no
+            # `named_type_class` at all) classifies nothing: unreadable, because
+            # the chain it would have been decided on is exactly what broke.
+            names_class = _named_class_kind(target)
+            if names_class is None:
+                return _UNREADABLE_DECLARATION
+            return target if names_class else None
+        tc = getattr(target, "type_class", None)
+        if tc is None:
+            return _UNREADABLE_DECLARATION
+        try:
+            is_structure = int(tc) == _STRUCTURE_TYPE_CLASS
+        except (TypeError, ValueError):
+            is_structure = "Structure" in str(getattr(tc, "name", None) or tc)
+        return target if is_structure else None
+    except Exception:
+        return _UNREADABLE_DECLARATION
+
+
+def _user_declared_entries(bv) -> list[tuple[str, Any]] | None:
+    """``[(name, type_obj)]`` for the types the USER declared in this view, or
+    ``None`` when that set could not be read.
+
+    BN's user type container is the set `types declare` (``define_user_type``)
+    writes to, and it is the only observable answer to "did the user declare
+    this": on a freshly loaded view it is empty while ``bv.types`` already holds
+    everything BN imported (see the PROVENANCE note above). A view that exposes
+    no container at all has no user declarations to offer, which is an empty
+    answer and not a failed read -- the lens simply has no declared half there,
+    exactly as before #675.2."""
+    container = getattr(bv, "user_type_container", None)
+    if container is None:
+        return []
+    entries = container.types
+    if entries is None:
+        return None
+    # `{type_id: (QualifiedName, Type)}` -- keyed by id, so the NAME comes out of
+    # the value, and a declaration renamed in place keeps one entry.
+    return [(str(entry[0]), entry[1]) for entry in entries.values()]
+
+
+class _DeclaredSet(NamedTuple):
+    """What the view's USER declarations came to.
+
+    ``types`` is every declared class type, keyed by the name it is declared
+    under -- the LISTING shows all of it and ``class show`` resolves against
+    all of it, because those two must never disagree about which names exist.
+    ``unreadable`` names the declarations whose kind could not be established.
+
+    There is deliberately no "BN generated this one" subset. BN's C parser
+    registers a body of its own for `typedef struct { ... } T;` (spelled `_T`,
+    or `anonymous_<N>` for an array element), and three review rounds tried to
+    fold it out of the listing on the shape of its NAME. Each round measured a
+    new escape, and the decisive one is not an escape: the spelling cannot
+    tell BN's `_T` from a `struct _X { ... };` the user hand-wrote beside
+    `typedef struct _X X;` -- the GLib/GTK idiom -- because they are the same
+    name, and no BN attribute distinguishes them (measured). A rule that
+    suppresses a class the user DID declare makes `class show` answer a
+    confident absence about a name this view has, which is the exact defect
+    #675.2 exists to remove. The rule was withdrawn: an extra row for BN's own
+    half is cosmetic, a fabricated absence is not (#907 review round 5)."""
+
+    types: dict[str, Any]
+    unreadable: tuple[str, ...]
+
+
+def _declared_types(bv) -> _DeclaredSet | None:
+    """The USER-declared class types in this view -- the LIVE read -- or ``None``
+    when the user's declarations could not be READ AT ALL.
+
+    One function owns the enumeration AND every filter, so every consumer of the
+    declared half reads the same, current view (see the block comment above for
+    why nothing here may be memoised) and describes the same POPULATION: the
+    listing's rows, its hidden count and `class show`'s fallback all resolve
+    here, which is what stopped the count from counting the type table while the
+    rows were something else (#907 review). Filtering a caller instead would
+    re-split them on the next change.
+
+    ``None`` is distinct from an empty set on purpose. An unreadable set must not
+    report as zero declared classes: `0` reads as "the lens looked and found
+    none", which is the exact blindness #675.2 exists to remove, so the callers
+    disclose it instead (`? user-declared class types` on the listing, and a miss
+    that does not claim the name is absent). Guarded here rather than per entry
+    because a raising container took `class list` down whole -- the RTTI half
+    included, which has no stake in the declared types.
+
+    ``unreadable`` carries the same distinction one level down, for a single
+    declaration: its kind could not be established, so it is neither a class nor
+    a proven absence and is named rather than swallowed (see
+    :func:`_class_type_target`)."""
+    try:
+        entries = _user_declared_entries(bv)
+        if entries is None:
+            return None
+    except Exception:
+        return None
+    declared: dict[str, Any] = {}
+    unreadable: list[str] = []
+    for name, type_obj in entries:
+        target = _class_type_target(bv, name, type_obj)
+        if target is _UNREADABLE_DECLARATION:
+            unreadable.append(name)
+        elif target is not None:
+            declared[name] = target
+    return _DeclaredSet(declared, tuple(unreadable))
+
+
+def _declared_size(type_obj) -> dict[str, Any] | None:
+    """The ``{value: N}`` size envelope for ONE defined type, or ``None`` when it
+    states no width (never fabricated) -- the same shape :func:`_object_size`
+    reports, so a declared class and an RTTI class state their size one way.
+
+    Called only for a record that is actually HANDED OUT. Reading a type's width
+    is a LAZY operation in BN: measured on a small C++ target, the first pass over
+    its 234 defined types costs ~250 ms (~1 ms per type, cached by BN after), so
+    paying it per record in the builder would put that on every `class list` --
+    including the default listing, whose declared records are counted and never
+    rendered -- and multiples of it on a DWARF-heavy view."""
+    try:
+        width = int(getattr(type_obj, "width", 0) or 0)
+    except Exception:
+        return None
+    return {"value": hex(width), "source": "declared_type"} if width > 0 else None
+
+
+def _declared_type_records(declared: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``{name: ClassRecord}`` for *declared* -- one :func:`_declared_types`
+    reading of the view, and nothing else (#675.2).
+
+    Takes the mapping rather than the view because both callers need the type
+    objects too (for the size a returned record states), and the kind filter now
+    does real work per entry: re-enumerating here made every `class list` and
+    every `class show` miss pay for the view's type table twice. One reading also
+    means the records and the type objects a caller pairs them with cannot come
+    from two different moments of a live view.
+
+    Every record is in the class registry's shape, so one renderer and one JSON
+    consumer read both halves of the lens, and every record carries
+    ``confidence: "declared-only"`` plus the note that says which kind of absence
+    its empty ``methods``/``vtable``/``instances`` is (see
+    :data:`_DECLARED_TYPE_NOTE`).
+
+    Built from the cheap facts only. ``size`` (see :func:`_declared_size`) and the
+    canonical ``ctx._type_entry`` -- which walks and renders a type's members --
+    are drill-downs the CALLERS attach to a record they return (a show's matches:
+    both; a listing's page rows: the size), exactly as the vtable layout and
+    object size are drill-downs on the RTTI side."""
+    return {
+        name: {
+            "name": name,
+            "methods": [],
+            "vtable": None,
+            "typeinfo": None,
+            "typeinfo_name": None,
+            "size": None,
+            "bases": [],
+            "instances": _no_instances(),
+            "confidence": _DECLARED_CONFIDENCE,
+            "notes": [_DECLARED_TYPE_NOTE],
+        }
+        for name in declared
+    }
+
+
 # Standard-library / ABI-runtime top-level namespaces folded out by --no-stl.
 _LIBRARY_NAMESPACES = frozenset({"std", "__gnu_cxx", "__cxxabiv1"})
 
@@ -566,24 +901,60 @@ def _class_list(
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
+    # #675.2: the DECLARED records join the candidates -- read live, never folded
+    # into the memoised registry (see `_declared_type_records`). A name the RTTI
+    # half already clustered keeps its RTTI record, except when that "class" is
+    # a thunk-shaped symbol artifact. A declared class under that same spelling
+    # remains a real type and must not be lost with the artifact.
+    needle = query.lower() if query else None
+    # ONE live reading of the view's declared class types: the records below and
+    # the type objects their returned rows take a size from (`_declared_size`)
+    # both come from it. `None` means the declarations could not be read --
+    # disclosed through the counter, never flattened to "no declared classes"
+    # (#907 review), so the listing prints `? user-declared class types` and the
+    # RTTI half still answers. A single declaration whose KIND could not be read
+    # unmeasures the count the same way: it is neither in the set nor proven
+    # outside it, so the number would exclude it silently (#907 review round 3).
+    declared_set = _declared_types(bv)
+    declared_types = declared_set.types if declared_set is not None else {}
+    declared_unmeasurable = declared_set is None or bool(declared_set.unreadable)
+    # No name-shape filter runs here: the rows ARE the user type container's
+    # class types, which is the only population `class show` can resolve
+    # against without one surface asserting an absence the other contradicts
+    # (see :class:`_DeclaredSet`). BN's own parser half for an anonymous
+    # typedef therefore lists as a peer row, and that is honest.
+    declared_records = _declared_type_records(declared_types)
+    declared_only = [
+        rec for name, rec in declared_records.items()
+        if (name not in registry or _is_thunk_artifact(name))
+        and (needle is None or needle in name.lower())
+    ]
     candidates = []
     library_suppressed = 0
     vendor_suppressed = 0
     construction_vtables_suppressed = 0
     thunks_suppressed = 0
-    for rec in registry.values():
+    declared_suppressed = 0
+    for rec in [*registry.values(), *declared_only]:
         name = rec["name"]
+        # Both artifact filters read the shape of a DEMANGLED SYMBOL, so they
+        # have no standing over a name the user typed into `types declare`.
+        # Applied to the declared half they split the two surfaces: a declaration
+        # spelled like a thunk vanished from `class list --all` and was
+        # attributed to `N thunks` while `class show` of the same name returned a
+        # full card, and the construction-vtable gate (which fires BEFORE the
+        # declared counter) made the default header promise one fewer class than
+        # `--all` then listed (#907 review round 3).
+        symbol_artifact = rec["confidence"] != _DECLARED_CONFIDENCE
         # A thunk is never a type -- drop it unconditionally (even under --all),
         # so it isn't surfaced as a class/namespace (#309).
-        if _is_thunk_artifact(name):
+        if symbol_artifact and _is_thunk_artifact(name):
             thunks_suppressed += 1
             continue
         # Construction-vtable artifacts (`X{for `Base'}`) ARE real RTTI objects,
         # just not classes -- hide by default, reveal under --all (#309).
-        if not include_all and _is_construction_vtable_artifact(name):
+        if symbol_artifact and not include_all and _is_construction_vtable_artifact(name):
             construction_vtables_suppressed += 1
-            continue
-        if not (include_all or rec["confidence"] in ("rtti", "ctor")):
             continue
         if no_stl and _is_library_class(name):
             library_suppressed += 1
@@ -591,8 +962,29 @@ def _class_list(
         if no_vendor and _is_vendor_class(name):
             vendor_suppressed += 1
             continue
+        if not (include_all or rec["confidence"] in ("rtti", "ctor")):
+            # #675.2: a declared class type is not RTTI/ctor-confirmed either, so
+            # the same gate folds it out of the default listing -- counted, so the
+            # fold-out is disclosed the way the library/vendor suppressions are
+            # rather than leaving `class list` silently blind to it.
+            #
+            # The library/vendor filters already ran, so this count is exactly
+            # the declared rows `--all` would add under the same flags. A
+            # filtered declaration is counted under the filter that hid it,
+            # even on the default listing.
+            if rec["confidence"] == _DECLARED_CONFIDENCE:
+                declared_suppressed += 1
+            continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
+    if declared_unmeasurable:
+        # The disclosure choke point for a counter that could not be measured:
+        # `_stated_count` renders a non-int as `?`, so the header says
+        # `? user-declared class types (--all to show)` instead of a fabricated
+        # `0` (#619's rule, #907's unreadable-table finding). One declaration
+        # whose kind could not be read unmeasures it just as the whole set does:
+        # the number would otherwise state a total that silently excludes it.
+        declared_suppressed = _DECLARED_UNREADABLE
     # `total` counts candidates AFTER the confidence + --no-stl filters but before
     # paging, so it reflects what this query actually surfaced.
     total = len(candidates)
@@ -610,6 +1002,7 @@ def _class_list(
             "include_all": include_all,
             "no_stl": no_stl,
             "no_vendor": no_vendor,
+            "declared_suppressed": declared_suppressed,
             **_analysis_state_fields(bv),
         }
         if total == 0:
@@ -624,6 +1017,12 @@ def _class_list(
     # and object size stay show-only -- they are far costlier per class. (#205 review)
     rows = []
     for rec in page:
+        if rec["confidence"] == _DECLARED_CONFIDENCE:
+            # #675.2: the declared row's size, taken for this page only -- the
+            # width is a lazy read in BN (see `_declared_size`).
+            type_obj = declared_types.get(rec["name"])
+            if type_obj is not None:
+                rec["size"] = _declared_size(type_obj)
         try:
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
@@ -645,6 +1044,7 @@ def _class_list(
         "vendor_suppressed": vendor_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
+        "declared_suppressed": declared_suppressed,
         **_analysis_state_fields(bv),
     }
     if total == 0:
@@ -1288,15 +1688,115 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     # reimplemented. A miss needs the full registry anyway, because the suggestion
     # hint is drawn from every class name (#413).
     registry = _build_class_registry(ctx, bv)
-    matches = _resolve_class_names(registry, name)
+    # #675.2: the RTTI/symbol half is blind to a class the user DECLARED -- it has
+    # no `_ZTV`/`_ZTI` symbol and no demangled method to cluster -- so the declared
+    # half is read here too. ONE live reading: the records and the type objects
+    # their facts come from.
+    #
+    # Resolved over ONE namespace holding BOTH halves, never the registry first.
+    # Resolving the registry alone and consulting the declared set only on a MISS
+    # let an RTTI class in ANY namespace swallow every bare-leaf query: a user who
+    # declared `Thing` in a view whose binary exposes `ns::Thing` got the RTTI card
+    # back with `ambiguous` unset and nothing disclosed, while `class list --all`
+    # listed and counted the declaration that card could no longer reach -- the two
+    # surfaces disagreeing about which names exist, which is the one thing the
+    # declared half exists to prevent. One namespace puts the resolver's documented
+    # exact-match-first rule in charge instead: an exact declared name beats a
+    # registry LEAF match, and a genuine leaf collision across the halves is
+    # AMBIGUOUS and shows both (#907 review round 5).
+    #
+    # This costs the declared read on every show, including one the registry
+    # answers. That is the price of the two surfaces describing one population:
+    # `class list` already pays it per call, the container is the user's own
+    # declarations rather than the view's type table, and the expensive per-record
+    # facts (`_declared_size`, `ctx._type_entry`) stay drill-downs on a record
+    # actually handed out.
+    declared_set = _declared_types(bv)
+    declared_types = declared_set.types if declared_set is not None else {}
+    declared = _declared_type_records(declared_types)
+    # A name BOTH halves carry keeps its RTTI record unless the registry entry
+    # is a thunk-shaped artifact, which is never a class. The listing drops
+    # that artifact and keeps the declaration; show must resolve the same name
+    # to the declared card.
+    registry_classes = {key: rec for key, rec in registry.items()
+                        if key not in declared or not _is_thunk_artifact(key)}
+    candidates = {**declared, **registry_classes}
+    matches = _resolve_class_names(candidates, name)
+    # Whether this query ALSO reaches a declaration whose kind could not be
+    # established. Resolved over the same namespace PLUS the unreadable names, so
+    # the exact-match-first rule decides who discloses: a fully qualified name
+    # resolves to itself and says nothing, while a bare leaf that also reaches an
+    # unreadable sibling must. The unreadable names cannot SELECT a card -- there
+    # is no record behind them -- so they are resolved for disclosure only.
+    unreadable_names = set(declared_set.unreadable) if declared_set else set()
+    unreadable_here = [
+        match for match in _resolve_class_names(
+            dict.fromkeys([*candidates, *unreadable_names], {}), name)
+        if match in unreadable_names
+    ]
+    # A match is not a licence to stop disclosing, and WHICH half answered must
+    # not decide whether the reader is told: the listing prints
+    # `? user-declared class types` about this very view at this very moment, so a
+    # card that presents itself as the whole answer contradicts it. Both the
+    # whole-set failure and the single unreadable declaration reach every returned
+    # record, RTTI or declared (#907 review rounds 4 and 5).
+    if declared_set is None:
+        disclosure = ("the view's declared types could not be read, so this card"
+                      " is not the whole answer")
+    elif unreadable_here:
+        disclosure = (f"{len(unreadable_here)} further declaration(s) of this name"
+                      " could not be read, so this card is not the whole answer")
+    else:
+        disclosure = None
     if not matches:
+        # A failed read is not an absent class: the miss says what it could not
+        # read instead of asserting a "No class named" this call has no standing
+        # to assert (#907 review). The message is byte-identical to the one it
+        # has always emitted whenever the declarations read fine.
+        #
+        # Two failures reach here. The whole set may be unreadable, or THIS name
+        # may be one of the declarations whose kind could not be established --
+        # resolved by the same name resolution as the set itself, so a bare leaf
+        # query still matches a qualified declaration. Answering the second with
+        # a flat miss claimed a name was absent while holding the entry that
+        # carries it (#907 review round 3).
+        if declared_set is None:
+            unreadable = (" The view's declared types could not be read, so a"
+                          " declared class of this name is not ruled out.")
+        elif _resolve_class_names(dict.fromkeys(declared_set.unreadable, {}), name):
+            unreadable = (" A type this view declares under that name could not be"
+                          " read, so a declared class of this name is not ruled out.")
+        else:
+            unreadable = ""
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "
             f"Run `bn class list` (add --all for name-only clusters) to discover "
-            f"available classes.",
+            f"available classes.{unreadable}",
         )
-    enriched = [_enrich(ctx, bv, registry[m]) for m in matches]
-    if len(enriched) == 1:
-        return enriched[0]
-    return {"ambiguous": True, "query": name, "matches": enriched}
+    records = []
+    for match in matches:
+        if match in registry_classes:
+            rec = _enrich(ctx, bv, registry_classes[match])
+        else:
+            # A declared record comes back as it was BUILT: `_enrich`'s RTTI
+            # drill-downs (vtable layout, bases, instances) are precisely what
+            # its note says this view has no evidence for, so running them would
+            # only decorate the card.
+            rec = declared[match]
+            type_obj = declared_types.get(match)
+            if type_obj is not None:
+                rec["size"] = _declared_size(type_obj)
+                # The canonical `types` entry for the declaration (decl, layout,
+                # members) -- a SHOW-only drill-down, exactly as the vtable
+                # layout and object size are, and for the same reason:
+                # `_type_entry` walks and renders the members, which is
+                # affordable for the one class being shown and not for a listing
+                # (see `_declared_type_records`).
+                rec["type"] = ctx._type_entry(match, type_obj)
+        if disclosure:
+            rec.setdefault("notes", []).append(disclosure)
+        records.append(rec)
+    if len(records) == 1:
+        return records[0]
+    return {"ambiguous": True, "query": name, "matches": records}
