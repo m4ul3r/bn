@@ -3950,3 +3950,256 @@ def test_variadic_text_marks_the_count_with_the_stated_confidence_886():
     # Whitespace-only states no word: no empty marker, and no skew claimed.
     blank = render({**under, "confidence": "   "})
     assert "[count:" not in blank and "malformed" not in blank, blank
+
+# --- #797: `dataflow defuse` discloses a dropped call argument --------------
+# The defuse half of #489. BN clamps a direct call's MLIL parameters to the
+# callee's recovered arity, so a variadic callee auto-typed fixed-arity leaves
+# its STACK-passed arguments behind as `[sp+N].d = <var>` stores that nothing in
+# the function reads back -- and `uses` then lists the argument set-up for the
+# defused variable as if it were an ordinary use. `trace` already discloses that
+# state (#489); defuse now states the same thing, over the same calls, from the
+# same helper, so the two ops cannot disagree.
+
+def _d797_op(name):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=name))
+
+
+def _d797_reg(name):
+    expr = _d797_op("LLIL_REG")
+    expr.src = types.SimpleNamespace(name=name)
+    return expr
+
+
+def _d797_const(value):
+    expr = _d797_op("LLIL_CONST")
+    expr.constant = value
+    return expr
+
+
+def _d797_add(left, right):
+    expr = _d797_op("LLIL_ADD")
+    expr.left, expr.right = left, right
+    return expr
+
+
+def _d797_store(dest, address):
+    expr = _d797_op("LLIL_STORE")
+    expr.dest, expr.address = dest, address
+    return expr
+
+
+def _d797_call(address):
+    expr = _d797_op("LLIL_CALL")
+    expr.address = address
+    return expr
+
+
+def _d797_ins(name, address, *, params=None, instr_index=0):
+    return types.SimpleNamespace(
+        address=address, instr_index=instr_index,
+        operation=types.SimpleNamespace(name=name),
+        params=list(params or []), src=None, vars_read=[], vars_written=[],
+    )
+
+
+def _d797_thunk_resolver(thunk: str, real: str):
+    """A `resolve_call_target` that actually HONORS `follow_thunks`, so the two
+    resolutions differ the way they do on a real PLT stub / GCC veneer: the
+    unfollowed answer is the thunk's own name, the followed one is the real
+    callee."""
+    def resolve(bv_, ins, follow_thunks=False):
+        return types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name=real if follow_thunks else thunk))
+    return resolve
+
+
+def _defuse_under_recovered_call(monkeypatch, *, resolve=None, use_at="before",
+                                 defined=False):
+    """`_defuse` over a function whose call at 0x401030 was recovered with ONE
+    arg (the caller's format string) while the LLIL hands it two outgoing
+    stack-arg stores -- the #489 shape, standing in for an auto-typed variadic.
+
+    ``use_at`` places the defused variable's single use: ``"before"`` (the
+    default) makes it the argument set-up store feeding that call, ``"after"``
+    moves it past the call, and ``"none"`` gives the variable no uses at all.
+
+    ``defined`` gives the variable a DEFINITION ahead of the call, which the
+    real API supplies whenever the value is computed in this function.
+    Hardcoding it absent meant every case ran with an empty row set, so the
+    scoping the tests below assert was only ever measured on its
+    nothing-to-scope short-circuit (#797 round-4 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, func = _mid_function_bv()
+    bv._memory[0x402000] = b"%d %d\x00"
+    func.arch = types.SimpleNamespace(stack_pointer="sp", address_size=4)
+    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    call_addr = 0x401030
+    func.low_level_il = [[
+        _d797_store(_d797_reg("sp"), 0x401020),
+        _d797_store(_d797_add(_d797_reg("sp"), _d797_const(4)), 0x401024),
+        _d797_call(call_addr),
+    ]]
+    fmt = _d797_op("MLIL_CONST_PTR")
+    fmt.constant = 0x402000
+    call = _d797_ins("MLIL_CALL_SSA", call_addr, params=[fmt], instr_index=2)
+    store = _d797_ins("MLIL_STORE_SSA", 0x401024, instr_index=1)
+    trailing = _d797_ins("MLIL_STORE_SSA", 0x401040, instr_index=3)
+    # The variable's own definition, AHEAD of the call the way a value computed
+    # in this function is: `arg1#0 = ...` at 0x401010.
+    defn = _d797_ins("MLIL_SET_VAR_SSA", 0x401010, instr_index=0)
+    uses = {"before": [store], "after": [trailing], "none": []}[use_at]
+    il = types.SimpleNamespace(
+        instructions=([defn] if defined else []) + [store, call, trailing],
+        get_ssa_var_definition=lambda v: defn if defined else None,
+        get_ssa_var_uses=lambda v: list(uses),
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(bridge.il_format, "_resolve_ssa_variable",
+                        lambda f, i, sel: (ssa_var, []))
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    # The loaded bridge package is its own module COPY (`bn_test_bridge.*`), so
+    # the patch has to land on the alias `_defuse` resolves through, not on the
+    # same-named module this file imports for direct helper tests.
+    monkeypatch.setattr(
+        bridge.read_decompile._taint, "resolve_call_target",
+        resolve or (lambda bv_, ins, follow_thunks=False: types.SimpleNamespace(
+            address=0x402100,
+            function=types.SimpleNamespace(name="my_logger"))))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance, il
+
+
+def test_defuse_discloses_a_dropped_stack_arg_797(monkeypatch):
+    """#797: the result names the call whose model dropped the stack args.
+
+    Before this, the stack-arg store appeared in `uses` with nothing saying it
+    feeds a call whose recovered parameters do not include it -- so a def-use
+    answer was read as the complete set of things that touch the variable.
+    """
+    instance, _il = _defuse_under_recovered_call(monkeypatch)
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    hints = result["hints"]
+    assert len(hints) == 1, hints
+    hint = hints[0]
+    assert "call 0x401030" in hint
+    assert "call-model truncation" in hint
+    assert "my_logger" in hint
+    assert "sp+0x0" in hint and "sp+0x4" in hint     # the dropped stores, named
+    assert "proto set my_logger" in hint             # the runnable remedy
+    # The use itself is unchanged: the disclosure is additive, so an existing
+    # consumer of `uses` reads exactly what it read before.
+    assert [u["address"] for u in result["uses"]] == ["0x401024"]
+
+
+def test_defuse_stays_quiet_when_the_call_model_is_complete_797(monkeypatch):
+    """The no-false-positive direction, inherited from the #489 gate: a call
+    whose recovered args are NOT (all) register-passed -- here five args on a
+    4-register convention -- is not a truncated model, so nothing is disclosed
+    and the caller sees no invented caveat."""
+    instance, il = _defuse_under_recovered_call(monkeypatch)
+    il.instructions[1].params = il.instructions[1].params * 5
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == []
+
+
+def test_defuse_resolves_the_callee_through_thunks_like_its_sibling_797(monkeypatch):
+    """#797 review: `defuse` resolved the callee WITHOUT following thunks while
+    `trace` follows them, and the shared note keys its two safety gates on that
+    name -- so the claim that "the two ops cannot disagree" was false.
+
+    The gate that matters here is the known-fixed-arity denylist: a PLT stub /
+    GCC veneer in front of `strlen` resolves unfollowed to `j_strlen`, which is
+    in no denylist, so the shared note fired on a call `trace` is silent about.
+    That is exactly the residual false positive the #489 denylist was added to
+    close, re-opened on the second op.
+    """
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_strlen", "strlen"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["hints"] == [], result["hints"]
+
+
+def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
+    """The other half of the same disagreement: when the note DOES fire through
+    a thunk, its `proto set` remedy must name the callee whose prototype is
+    actually wrong. `bn proto set j_my_logger ...` retypes the veneer and leaves
+    the model truncated, so a copy-pasted remedy silently does nothing."""
+    instance, _il = _defuse_under_recovered_call(
+        monkeypatch, resolve=_d797_thunk_resolver("j_my_logger", "my_logger"))
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert len(result["hints"]) == 1, result["hints"]
+    hint = result["hints"][0]
+    assert "proto set my_logger" in hint
+    assert "j_my_logger" not in hint
+
+
+def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
+    """#797 review: the disclosure is about a USE, so it has to be scoped to one.
+
+    The hint list was built over every call in the FUNCTION, which is not what
+    the reference, `--help` and the renderer all say it is: a def-use of a
+    variable with no uses at all still printed "call 0x...: call-model
+    truncation" immediately above `uses (0):`, telling a reader that an empty
+    listing is incomplete because of a call the variable never touches. A use
+    that lands AFTER the call is the same error one step subtler -- it is not
+    argument set-up for it, so nothing about that call explains it.
+
+    Round-4 review: (a) and (b) were both green for the wrong reason -- the
+    fixture hardcoded the variable as having NO definition, so every case ran
+    with an empty row set and only the nothing-to-scope short-circuit was
+    measured. Give the variable the definition the real API supplies and the
+    scope re-opened: a definition ahead of the call made the call "fed", so
+    the hint came back above `uses (0):`. A DEFINITION is not evidence that
+    the value reaches a call -- it is where the value is produced -- so the
+    scope is the variable's USES, and (c)/(d) are (a)/(b) with the definition
+    present.
+    """
+    # (a) No uses at all: there is no listing for a disclosure to qualify.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none")
+    empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert empty["uses"] == []
+    assert empty["hints"] == [], empty["hints"]
+
+    # (b) The variable's only use sits past the call, so it is not part of the
+    # outgoing-argument run the dropped stack stores belong to.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after")
+    downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert [u["address"] for u in downstream["uses"]] == ["0x401040"]
+    assert downstream["hints"] == [], downstream["hints"]
+
+    # (c) The same empty listing for a variable that HAS a definition ahead of
+    # the call -- the ordinary case, and the one the fixture never built.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="none",
+                                                 defined=True)
+    defined_empty = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_empty["definition"]["address"] == "0x401010"
+    assert defined_empty["uses"] == []
+    assert defined_empty["hints"] == [], defined_empty["hints"]
+
+    # (d) ...and the downstream use, with that definition present: the call
+    # still explains no row in this listing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="after",
+                                                 defined=True)
+    defined_downstream = instance._defuse("active", "0x401000", "arg1#0")
+    assert defined_downstream["definition"]["address"] == "0x401010"
+    assert [u["address"] for u in defined_downstream["uses"]] == ["0x401040"]
+    assert defined_downstream["hints"] == [], defined_downstream["hints"]
+
+    # ...while the use that IS the call's argument set-up still gets it, so the
+    # scope narrowed to the right thing rather than to nothing.
+    instance, _il = _defuse_under_recovered_call(monkeypatch, use_at="before",
+                                                 defined=True)
+    feeding = instance._defuse("active", "0x401000", "arg1#0")
+    assert len(feeding["hints"]) == 1, feeding["hints"]
+    assert "call 0x401030" in feeding["hints"][0]

@@ -955,9 +955,104 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "is_phi": is_phi,
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
+        "hints": _call_model_truncation_hints(
+            ctx, bv, func, il, [u for u in uses if u is not None]),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
+
+
+def _call_model_truncation_hints(ctx, bv, func, il, uses) -> list[str]:
+    """The #489 call-model-truncation disclosure for THIS function's calls (#797).
+
+    A def-use read of a variable that feeds an under-recovered call used to show
+    the argument set-up as an ordinary use and say nothing about it: BN clamps a
+    direct call's MLIL parameters to the callee's recovered arity, so on a
+    register ABI a variadic callee auto-typed fixed-arity leaves its STACK-passed
+    arguments behind as `[sp+N].d = <var>` stores that nothing in the function
+    reads back, and the store for the defused variable sits in `uses` looking
+    like any other. `trace` already discloses exactly that state with the
+    reviewed #489 note; this reads the SAME helper over the same calls AND
+    resolves the callee name through the same two steps the sibling uses, so
+    the two ops cannot disagree about whether a call's model was truncated (one
+    gate, one wording, one remedy).
+
+    Scoped to the calls this variable's USES feed, because that is what the
+    disclosure CLAIMS to be: an explanation of a row in this listing. Built
+    over every call in the function it was a different statement, and a wrong
+    one: a variable with no uses at all printed a truncation note above
+    `uses (0):`, and a use downstream of the call got a caveat about argument
+    set-up it has no part in. A use belongs to a call's outgoing-argument run
+    when it IS the call (the variable is a recovered parameter) or it sits
+    between the previous call and this one -- which is exactly the region
+    `_call_model_truncation_note` reads its dropped stack-arg stores from.
+
+    The DEFINITION is deliberately not in that set (#797 round-4 review).
+    Scoping over `[definition] + uses` re-opened the whole defect through the
+    ordinary case: a value computed in this function has a definition ahead of
+    the call, which marked the call fed and put the note back above
+    `uses (0):`. A definition is where the value is PRODUCED -- it is no
+    evidence that the value reaches any call -- so the uses are the scope, and
+    a variable passed to the call shows up in them as the argument-set-up
+    store (or as the call itself when it is a recovered parameter).
+
+    Prints nothing for a call the helper is silent about -- unknown
+    calling-convention arity, a callee that is known fixed-arity, no outgoing
+    stack-arg run, or no caller-passed format string -- which is the
+    no-false-positive direction that note was reviewed for. Returns [] (never
+    raises) on any BN-API shortfall."""
+    from . import read_taint_slice as _ts  # local: this module's import list is documented as il_format/vars/taint_engine/_shared
+
+    hints: list[str] = []
+    try:
+        instructions = list(il.instructions)
+    except Exception:
+        return hints
+    use_indexes = {int(getattr(use, "instr_index", -1)) for use in uses}
+    feeding = False
+    for ins in instructions:
+        index = int(getattr(ins, "instr_index", -1))
+        if "CALL" not in il_format._il_op_name(ins):
+            # A use before the next call is part of that call's outgoing-argument
+            # run; anything after the last call feeds nothing.
+            feeding = feeding or index in use_indexes
+            continue
+        # Only a call THIS variable reaches: it is the call itself, or one of
+        # the uses sits in the run of stores between the previous call and it.
+        relevant, feeding = (feeding or index in use_indexes), False
+        if not relevant:
+            continue
+        # The CALL SITE's own address: `_call_model_truncation_note` looks the
+        # instruction up in the LLIL block by address to find the outgoing
+        # stack-arg stores feeding it, so this is the address it wants -- not the
+        # resolved callee's.
+        call_addr = int(getattr(ins, "address", func.start))
+        # The callee name, resolved EXACTLY as `trace` resolves it: the modeled
+        # name first, then the resolved callee function -- both of which follow
+        # thunks. Resolving it here without following thunks was the one place
+        # the two ops could still disagree, and the disagreement was live in
+        # both directions: the shared note's known-fixed-arity gate keys on this
+        # name, so a PLT stub / veneer in front of `strlen` presented as
+        # `j_strlen`, matched no denylist entry, and fired the exact residual
+        # false positive that denylist exists to close -- on a call `trace` is
+        # silent about. And when the note does fire, its `proto set <name>`
+        # remedy would have named the veneer, whose prototype is not the one
+        # that truncated the model.
+        callee_name = _ts._modeled_callee_name(bv, ins)
+        if not callee_name:
+            try:
+                callee_name = str(getattr(_ts._resolve_callee(ctx, bv, ins),
+                                          "name", "") or "") or None
+            except Exception:
+                callee_name = None
+        note = _ts._call_model_truncation_note(
+            bv, func, ins, call_addr,
+            list(getattr(ins, "params", None) or []),
+            callee_name,
+        )
+        if note is not None:
+            hints.append(f"call {hex(call_addr)}: {note}")
+    return hints
 
 
 def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
