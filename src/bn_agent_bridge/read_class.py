@@ -159,13 +159,13 @@ def _is_alias_symbol(sym) -> bool:
     A real BN ``SymbolType`` is an ``IntEnum`` whose ``str()`` renders as the numeric
     value (``str(SymbolType.ExternalSymbol) == "5"``), so the member NAME must come
     from ``.name`` -- matching on ``str(sym.type)`` would never fire on a live BV.
-    Falls back to ``str()`` for the plain-string ``sym.type`` used by test scaffolding
-    (e.g. ``"SymbolType.ExternalSymbol"``)."""
+    Falls back to ``str()`` for plain-string ``sym.type`` on hand-built test
+    symbols in ``tests/test_read_class.py`` (e.g. ``"SymbolType.ExternalSymbol"``)."""
     st = getattr(sym, "type", None)
     if st is None:
         return False
     tname = getattr(st, "name", None) or str(st)
-    tname = tname.rsplit(".", 1)[-1]   # tolerate a "SymbolType." prefix (test strings)
+    tname = tname.rsplit(".", 1)[-1]   # hand-built test strings may have a "SymbolType." prefix
     return tname in _ALIAS_SYMBOL_TYPES
 
 
