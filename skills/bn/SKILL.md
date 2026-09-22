@@ -5,7 +5,7 @@ description: "Use the local bn CLI and Binary Ninja bridge for target selection,
 
 # bn
 
-Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodology before a long investigation: `bn-re` for understanding a binary and `bn-vr` for finding security bugs. In an OMP session with a retained Python kernel, use `bn-kernel` for large collections that should stay out of the transcript. For one-off reads and lifecycle, use the CLI.
+Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodology before a long investigation: `bn-re` for understanding a binary and `bn-vr` for finding security bugs. In an OMP session with a retained Python kernel, use `bn-kernel` for large collections that should stay out of the transcript. Ordinary sibling agents may share that eval namespace: use `bn_kernel.scoped()` for function-local bindings, but it does not isolate `os.environ`; use isolated kernels or the CLI when siblings need different cache directories. For one-off reads and lifecycle, use the CLI.
 
 ## Working rules
 

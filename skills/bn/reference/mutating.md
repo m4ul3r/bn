@@ -46,7 +46,7 @@ Per-op statuses:
 - `rollback_failed` — restore failed; the view may contain some changes.
 - `internal_error` — unexpected apply failure; rollback is attempted.
 
-A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2; a local semantic mutation preflight exits 3 with `observed.request_sent: false`. Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
+A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2; a local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
 
 ## Output and compact status
 
@@ -54,7 +54,7 @@ Mutations print a compact **text status line** by default. Use `--format json --
 
 ### Compact status keys
 
-Every key below is present except `prototype_user_type_residue`, emitted only when true:
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true:
 
 | key | meaning |
 |---|---|
