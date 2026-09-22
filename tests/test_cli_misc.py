@@ -812,6 +812,138 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, caps
     assert calls[-1]["params"]["ops"][0]["comment"] == comment
 
 
+def _op_manifest(count):
+    import json as _json
+    return _json.dumps({"target": "active", "ops": [
+        {"op": "set_comment", "address": "0x1000", "comment": "x"}] * count})
+
+
+def test_batch_apply_refuses_a_runaway_op_count_before_sending_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #769: neither the op count nor the byte size was checked, so a runaway
+    # generator's manifest was read, serialized and sent -- to be met with a
+    # bare "request too large" that named neither the limit nor a remedy.
+    # Refuse client-side, and say what to do about it.
+    path = tmp_path / "big.json"
+    path.write_text(_op_manifest(6000))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 3                       # invalid_request, like every preflight
+    assert calls == []                   # the whole point: nothing was sent
+    out = capsys.readouterr().out
+    assert "6000 operations" in out and "5000 limit" in out
+    assert "BN_BATCH_APPLY_MAX_OPS" in out
+
+
+def test_batch_apply_op_ceiling_is_raisable_and_disablable_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # A guard with no escape hatch is a wall. `0` disables the check outright
+    # and a number raises it -- both must let the same manifest through.
+    path = tmp_path / "big.json"
+    path.write_text(_op_manifest(6000))
+
+    for value in ("0", "9000"):
+        monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", value)
+        calls = fake_transport({"batch_apply": {"ok": True, "result": {
+            "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+        rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+        assert rc == 0, value
+        assert calls and calls[-1]["op"] == "batch_apply", value
+
+
+def test_batch_apply_ordinary_manifest_is_untouched_by_the_guard_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # Must-not-fire twin: the guard exists for a runaway, not for real work.
+    path = tmp_path / "small.json"
+    path.write_text(_op_manifest(50))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 0
+    assert len(calls[-1]["params"]["ops"]) == 50
+
+
+def test_batch_apply_op_ceiling_is_strict_at_both_sides_of_the_boundary_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # #769 review finding 2: no test pinned the comparison, so turning
+    # `>` into `>=` left every new test green. The ceiling is a MAXIMUM --
+    # exactly max_ops is allowed and max_ops+1 is not -- and an off-by-one
+    # here silently rejects a batch the user was told was legal.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "50")
+    at = tmp_path / "at.json"
+    at.write_text(_op_manifest(50))
+    over = tmp_path / "over.json"
+    over.write_text(_op_manifest(51))
+
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", str(at), "--preview"]) == 0
+    assert len(calls[-1]["params"]["ops"]) == 50      # AT the cap: allowed
+
+    calls2 = fake_transport({"batch_apply": {"ok": True, "result": {}}})
+    assert bn.cli.main(["batch", "apply", str(over), "--preview"]) == 3
+    assert calls2 == []                                # one over: refused
+
+
+def test_batch_apply_byte_limit_override_only_tightens_769(monkeypatch):
+    from bn.wire_limits import MAX_REQUEST_BYTES, batch_apply_max_bytes
+
+    monkeypatch.delenv("BN_BATCH_APPLY_MAX_BYTES", raising=False)
+    assert batch_apply_max_bytes() == MAX_REQUEST_BYTES
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", "2048")
+    assert batch_apply_max_bytes() == 2048
+    # The bridge's 32 MiB wire limit is hard. The override cannot make a
+    # request that the bridge refuses suddenly valid, even with 0.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", str(MAX_REQUEST_BYTES * 2))
+    assert batch_apply_max_bytes() == MAX_REQUEST_BYTES
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", "0")
+    assert batch_apply_max_bytes() == MAX_REQUEST_BYTES
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_BYTES", "not-a-number")
+    assert batch_apply_max_bytes() == MAX_REQUEST_BYTES
+
+
+def test_batch_apply_byte_guard_ignores_manifest_whitespace_769(
+        monkeypatch, fake_transport, tmp_path):
+    # The transport measures the serialized request, not the source file.
+    # Both documents parse to the same params despite their different sizes.
+    import json as _json
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "0")
+    ops = _json.loads(_op_manifest(40))
+    compact = tmp_path / "c.json"
+    compact.write_text(_json.dumps(ops))
+    pretty = tmp_path / "p.json"
+    pretty.write_text(_json.dumps(ops, indent=2))
+    assert len(pretty.read_bytes()) > len(compact.read_bytes()) + 500
+
+    sent = []
+    for path in (compact, pretty):
+        calls = fake_transport({"batch_apply": {"ok": True, "result": {
+            "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+        assert bn.cli.main(["batch", "apply", str(path), "--preview"]) == 0
+        sent.append(calls[-1]["params"])
+    assert sent[0] == sent[1]
+
+
+def test_batch_apply_malformed_limit_env_falls_back_not_crashes_769(
+        monkeypatch, fake_transport, capsys, tmp_path):
+    # A typo'd env var must not turn a valid command into a hard failure --
+    # this is a guard, not a config parser. The default ceiling still applies.
+    monkeypatch.setenv("BN_BATCH_APPLY_MAX_OPS", "not-a-number")
+    path = tmp_path / "small.json"
+    path.write_text(_op_manifest(10))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": True, "success": True, "results": [{"status": "verified"}]}}})
+
+    rc = bn.cli.main(["batch", "apply", str(path), "--preview"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "batch_apply"
+
+
 def test_batch_apply_full_result_carries_top_level_ok(monkeypatch, fake_transport, capsys):
     # #447: mutation/batch JSON used only success/committed, so `jq '.ok'` read
     # null. Add a top-level `ok` mirroring the read-command envelope.
@@ -885,6 +1017,122 @@ def test_batch_apply_manifest_target_used_when_no_flag(monkeypatch, fake_transpo
     rc = bn.cli.main(["batch", "apply", "-", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "explicit"
+
+
+def test_batch_apply_manifest_target_beats_an_ambient_selector(monkeypatch, fake_transport):
+    """#676 item 11, round 4: `batch apply` is a DESTRUCTIVE op, and the #366
+    override above is written for "the explicit per-invocation selector". An
+    exported `BN_TARGET` -- or a sticky pin -- is not one: both are AMBIENT,
+    the class of value a bare destructive `bn close` already refuses to be
+    steered by, and `_apply_sticky_defaults` marks them for exactly this
+    question.
+
+    Letting them through here dispatched the WHOLE manifest at the ambient
+    selector and silently discarded the target the manifest itself named: every
+    op ran against a binary the caller never named on this command line, and
+    the file's own statement of intent was thrown away without a word.
+
+    The two ambient sources are asserted as a PAIR because they must behave
+    alike -- the env half alone would stay green while the pin still won, and
+    the whole argument for the export is that it is the pin's equal minus the
+    cross-agent clobber.
+    """
+    import io
+
+    from bn import session_state
+
+    responses = {"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}}
+
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "manifest.bin", "ops": []}'))
+    monkeypatch.setenv("BN_TARGET", "exported.bin")
+    env_calls = fake_transport(responses)
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+
+    monkeypatch.delenv("BN_TARGET")
+    monkeypatch.setattr(session_state, "read", lambda: {"target": "pinned.bin"})
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "manifest.bin", "ops": []}'))
+    pin_calls = fake_transport(responses)
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+
+    assert env_calls[-1]["params"].get("target") == "manifest.bin", (
+        "an exported BN_TARGET must not override the manifest's own target on "
+        f"a destructive batch apply; it sent {env_calls[-1]['params'].get('target')!r}")
+    assert pin_calls[-1]["params"].get("target") == "manifest.bin", (
+        "a sticky pin must not override the manifest's own target either; it "
+        f"sent {pin_calls[-1]['params'].get('target')!r}")
+    # ONE selector on the wire. `batch_apply` resolves the manifest's target
+    # (bridge `_batch_apply_selector`, read by the binder AND the destructive
+    # gate), so a demoted ambient value riding on the ENVELOPE beside it would
+    # be a second, contradictory claim -- and the byte guard counts one
+    # selector, not two different ones.
+    assert [c[-1]["target"] for c in (env_calls, pin_calls)] == [None, None], (
+        "the demoted ambient selector must not ride on the request envelope "
+        f"either: {env_calls[-1]['target']!r} / {pin_calls[-1]['target']!r}")
+
+
+def test_batch_apply_ambient_selector_still_fills_a_manifest_that_names_none(
+        monkeypatch, fake_transport):
+    """Must-not-fire twin: ambience demotes the CLI value, it does not delete it.
+
+    A manifest with no "target" of its own has named nothing to protect, so the
+    ambient selector is still the best answer available -- refusing it there
+    would break the single-agent convenience `BN_TARGET` exists for and push
+    the request onto the bridge's focused-tab fallback. Without this half, the
+    sibling above is satisfiable by ignoring an ambient target everywhere.
+    """
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"ops": []}'))
+    monkeypatch.setenv("BN_TARGET", "exported.bin")
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}})
+    assert bn.cli.main(["batch", "apply", "-", "-i", "prfleet-nonexistent-889"]) == 0
+    assert calls[-1]["params"].get("target") == "exported.bin"
+
+
+@pytest.mark.parametrize("instance_source", ["flag", "environment"])
+@pytest.mark.parametrize("ambient_source", ["export", "pin"])
+def test_batch_apply_instance_placeholder_does_not_adopt_ambient_target(
+        monkeypatch, fake_transport, instance_source, ambient_source):
+    """An instance-id placeholder names the bridge's single open target.
+
+    Removing the placeholder must not turn the manifest into one that never
+    named a target: an ambient selector would redirect every destructive op.
+    Check the payload and the request envelope, including when neither -i nor
+    -t appears on the command line.
+    """
+    import io
+
+    from bn import session_state
+
+    instance = "bridge_17"
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"target": "bridge_17", "ops": [{"op": "set_comment", '
+        '"address": "0x1000", "comment": "reviewed"}]}'))
+    monkeypatch.delenv("BN_TARGET", raising=False)
+    monkeypatch.delenv("BN_INSTANCE", raising=False)
+    monkeypatch.setattr(session_state, "read", lambda: {})
+    if ambient_source == "export":
+        monkeypatch.setenv("BN_TARGET", "other.bin")
+    else:
+        monkeypatch.setattr(session_state, "read",
+                            lambda: {"target": "other.bin"})
+
+    argv = ["batch", "apply", "-"]
+    if instance_source == "flag":
+        argv = ["-i", instance, *argv]
+    else:
+        monkeypatch.setenv("BN_INSTANCE", instance)
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {
+        "success": True, "results": [{"status": "verified"}]}}})
+
+    assert bn.cli.main(argv) == 0
+    assert calls[-1]["op"] == "batch_apply"
+    assert calls[-1]["target"] is None
+    assert "target" not in calls[-1]["params"]
+
+
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
     pytest.param(["--max-length", "80"], {"max_length": 80}, id="max-length"),

@@ -7,8 +7,9 @@ from typing import Any
 
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
-                   _positive_int, _refuse_count_only_slices, arg, command, decode_json_input, mutex,
-                   mutation_output_args, preview_arg, read_text_input)
+                   _positive_int, _refuse_count_only_slices, arg, blank_selector, command,
+                   decode_json_input, mutex, mutation_output_args, preview_arg,
+                   read_text_input)
 from ..formatters import (
     _discloses,
     _field_skewed,
@@ -29,6 +30,7 @@ from ..formatters import (
     _stated_count,
 )
 from ..transport import BridgeError, unwrap_result
+from ..wire_limits import MAX_OPS_ENV, batch_apply_max_ops
 
 
 @_discloses
@@ -679,6 +681,35 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
+def _batch_target_from_cli(args: argparse.Namespace,
+                           manifest: dict[str, Any]) -> str | None:
+    """The CLI selector this invocation may apply to *manifest*, if any.
+
+    An EXPLICIT ``-t`` is the per-invocation selector and WINS over a manifest
+    ``"target"`` (#366). An AMBIENT one -- the sticky pin or an exported
+    ``BN_TARGET``, both filled and marked by ``cli._apply_sticky_defaults`` --
+    is not that: nobody named it on this command line, and ``batch_apply`` is
+    a DESTRUCTIVE op. It may only FILL a manifest that named no target of its
+    own; a manifest that DID name one keeps that choice, including when #227
+    drops an instance-id placeholder for single-open resolution (#676 item 11).
+
+    A BLANK value is not a selector at all and can fill nothing. This asked
+    that with plain truthiness, which is true of ``"   "``: the resolver read
+    a whitespace ambient value as the absence of a selector and kept it out
+    of the request envelope, while this fill read the same value as a
+    selector and wrote it into the manifest -- so it reached the bridge in
+    the PAYLOAD of a destructive op, the one place the reference promises a
+    blank value never goes. One shared predicate handles blankness; the
+    caller must also decide once before it changes the manifest.
+    """
+    cli_target = getattr(args, "target", None)
+    if cli_target is None or blank_selector(cli_target):
+        return None
+    if getattr(args, "_sticky_target", False) and manifest.get("target"):
+        return None
+    return cli_target
+
+
 @command("batch", "apply", help="Apply a JSON manifest", fmt="json", target=True,
          args=[
              preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
@@ -700,7 +731,13 @@ def _py_exec(args: argparse.Namespace) -> int:
                      "Kinds: rename_symbol, set_comment, delete_comment, set_prototype, "
                      "local_rename, local_retype, struct_field_set, struct_field_rename, "
                      "struct_field_delete, types_declare. A missing required field is reported "
-                     "as status 'invalid_request' naming the field."
+                     "as status 'invalid_request' naming the field.\n"
+                     "Ceilings: a manifest over 5000 ops, or whose serialized request exceeds "
+                     "the bridge's hard 32 MiB wire limit, is refused before anything is "
+                     "sent. A large batch holds the write lock for the whole run and reverts "
+                     "as ONE unit. BN_BATCH_APPLY_MAX_OPS=<n> raises the op limit (0 disables); "
+                     "BN_BATCH_APPLY_MAX_BYTES=<n> may set a LOWER byte limit (0 restores the "
+                     "hard limit). File and FIFO input also has a 64 MiB source-file cap."
                  )),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
@@ -740,39 +777,76 @@ def _batch_apply(args: argparse.Namespace) -> int:
             f"{type(manifest).__name__}. (A bare list of ops should be wrapped as "
             f'{{"ops": [...]}}.)'
         )
+    # #227: a fan-out agent can put its -i/--instance id in the manifest
+    # "target". That id names the bridge, not a binary, so drop the placeholder
+    # and let the bridge resolve its single open target. Decide which CLI
+    # selector may apply BEFORE dropping it: reasking afterwards would let an
+    # ambient BN_TARGET/pin fill the new vacancy and redirect the whole batch.
+    manifest_named_target = bool(manifest.get("target"))
+    cli_target = _batch_target_from_cli(args, manifest)
+    inst = getattr(args, "instance", None)
+    if inst and manifest.get("target") == inst:
+        manifest.pop("target", None)
     with _mutation_preflight(args):
         if not isinstance(manifest.get("ops"), list):
             raise BridgeError(
                 f'Manifest ({source}) must have an "ops" array (the list of '
                 f"operations to apply)."
             )
-    # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and
-    # naturally put that id in the manifest "target" -- but an instance id is a
-    # bridge, not a target selector, so it gets rejected. When the manifest target
-    # is just the -i/--instance id, drop it: the bridge then resolves the instance's
-    # single open target (the manifest "target" is optional with -i/--instance).
-    inst = getattr(args, "instance", None)
-    if inst and manifest.get("target") == inst:
-        manifest.pop("target", None)
+        # #769: the op ceiling is checked here before the request. The byte
+        # ceiling is checked on the actual serialized envelope in transport,
+        # after instance/target resolution but before a socket send. A local
+        # estimate cannot account exactly for the selected bridge identity.
+        max_ops = batch_apply_max_ops()
+        op_count = len(manifest["ops"])
+        if max_ops is not None and op_count > max_ops:
+            raise BridgeError(
+                f"Manifest ({source}) has {op_count} operations, over the "
+                f"{max_ops} limit. A batch this size holds the write lock for "
+                f"the whole run and reverts as ONE unit, so a single failure "
+                f"discards every sibling. Split it, or raise/disable the "
+                f"ceiling with {MAX_OPS_ENV}=<n> (0 disables)."
+            )
     # #690 r4: an explicit-but-empty manifest target (an unset shell variable
     # templated into the file) is an error -- it must not ride the focused-tab
     # convenience bridge-side, and a sticky pin must not silently paper over it.
     manifest_target = manifest.get("target")
-    if manifest_target is not None and not str(manifest_target).strip():
+    if blank_selector(manifest_target):
         raise BridgeError(
             f'Manifest ({source}) target is empty: set a selector from '
             '`bn target list`, or drop the "target" key to use the single '
             "open target"
         )
     # Accept -t/--target like every other target-required mutate command (#308).
-    # CLI -t WINS over a manifest "target" (#366): it is the explicit per-invocation
-    # selector, so a fan-out agent that copies the documented {"target":"active"}
-    # example but passes a correct -t isn't sabotaged by the in-payload value
-    # ("active" doesn't resolve under multi-target headless). Without -t the
-    # manifest "target" is still honored.
-    cli_target = getattr(args, "target", None)
+    # An EXPLICIT CLI -t WINS over a manifest "target" (#366): it is the explicit
+    # per-invocation selector, so a fan-out agent that copies the documented
+    # {"target":"active"} example but passes a correct -t isn't sabotaged by the
+    # in-payload value ("active" doesn't resolve under multi-target headless).
+    # An AMBIENT one -- the sticky pin or an exported BN_TARGET, both filled and
+    # marked by `_apply_sticky_defaults` -- is NOT that: nobody named it on this
+    # command line, and `batch_apply` is a DESTRUCTIVE op. Letting it through
+    # dispatched the whole manifest at the ambient selector and discarded the
+    # target the file itself named, which is the same hazard a bare destructive
+    # `close` refuses (#676 item 11). An ambient value may only FILL a manifest
+    # that named none; without any CLI target the manifest "target" is honored
+    # as before.
     if cli_target:
         manifest["target"] = cli_target
+    elif getattr(args, "_sticky_target", False) and manifest_named_target:
+        # The ambient value was demoted. Drop it from the ENVELOPE too, so the
+        # request names ONE selector: the bridge resolves `batch_apply` from
+        # the manifest's own target, or from its sole open target if #227
+        # removed an instance-id placeholder. A second, different selector
+        # riding beside it is a claim this invocation no longer makes.
+        #
+        # A BROKEN ambient default (an empty export or pin) lands here too,
+        # and needs nothing extra: it is not a selector, so `_resolve_target`
+        # treats it as the absence of one, and `batch_apply` requires no
+        # target of its own -- the manifest named it. Clearing the marker
+        # here as well used to be what kept the empty-selector refusal off
+        # this command; it no longer is, because the refusal is now asked at
+        # the resolution, and this invocation performs none (#676 item 11).
+        args.target = None
     if args.preview:
         manifest["preview"] = True
     # preview is already set on the manifest above, so it is not passed through

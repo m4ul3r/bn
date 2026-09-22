@@ -182,6 +182,23 @@ def _guess_type_affected_functions(ctx, bv, type_name: str, limit: int | None = 
 
 
 
+def _declaration_include_root(source_path: str | None) -> str | None:
+    """The implicit include root a `--file` declaration parses under.
+
+    `parse_types_from_source` is handed the header's PARENT DIRECTORY as an
+    include root, which is what lets `#include "sibling.h"` resolve. That is
+    deliberate and load-bearing -- but it means a declare can succeed because
+    of a directory the user never named, and if a sibling header shadows
+    another of the same name, which one was used is invisible (#825 item 3).
+
+    One function so the disclosure cannot state a different root than the
+    parse used: the value reported and the value passed come from one call.
+    """
+    if not source_path:
+        return None
+    return str(Path(source_path).expanduser().resolve().parent)
+
+
 def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | None = None):
     parse_result = None
     source_error: Exception | None = None
@@ -190,7 +207,7 @@ def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | N
         kwargs: dict[str, Any] = {}
         if source_path:
             kwargs["filename"] = source_path
-            kwargs["include_dirs"] = [str(Path(source_path).expanduser().resolve().parent)]
+            kwargs["include_dirs"] = [_declaration_include_root(source_path)]
         try:
             parse_result = platform.parse_types_from_source(declaration, **kwargs)
         except Exception as exc:
@@ -723,6 +740,43 @@ def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) ->
         result["observed"] = exc.observed
     return result
 
+
+
+def _unattempted_results(ctx, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A row per op the batch never reached, after a sibling op failed (#675
+    item 15).
+
+    The failure path used to return rows only up to and including the op that
+    failed, so a two-op batch whose first op failed answered with ONE row. The
+    response then could not express "not attempted": a consumer diffing the
+    manifest against the results reads the missing op as absent from the
+    request, and a consumer counting reads 1 where it submitted 2. That is the
+    absence-versus-silence shape, in the batch envelope rather than a renderer
+    -- and unlike the rendering cases it is not a wording problem, because
+    there was no field carrying the fact at all.
+
+    `not_attempted` is deliberately NOT in `FAILED_MUTATION_STATUSES`: these
+    ops did not fail, they never ran, and stamping them as failures would turn
+    one bad op into N and inflate the failure count a control loop reads. It
+    sits beside `reverted` (#118) as the other honest non-failure status a
+    doomed batch produces.
+
+    Each row echoes its `requested` op, so the reconciliation a consumer needs
+    -- one row per submitted op, in submission order -- holds without the
+    consumer having to re-read the manifest it sent.
+    """
+    rows: list[dict[str, Any]] = []
+    for op in operations:
+        rows.append({
+            "op": str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>",
+            "status": "not_attempted",
+            "message": (
+                "not attempted: an earlier operation in this batch failed and the "
+                "batch was rolled back, so this operation never ran"
+            ),
+            "requested": _operation_requested(ctx, op),
+        })
+    return rows
 
 
 def _mark_unverified_results(
@@ -2371,7 +2425,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "rolled_back": reverted,
                 "message": message,
                 "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
-                + [_operation_failure_result(ctx, operations[len(results)], exc)],
+                + [_operation_failure_result(ctx, operations[len(results)], exc)]
+                + _unattempted_results(ctx, operations[len(results) + 1:]),
                 "affected_functions": [],
                 "affected_types": [],
                 "affected_summary": {
@@ -3878,6 +3933,72 @@ def _struct_overflow_member(type_obj):
     return None
 
 
+# Reserved C keywords that can occupy a TYPE POSITION and that BN's parser
+# does NOT implement. Enumerated rather than inferred, because "reserved" is
+# not queryable from the parser and guessing would be the fabrication this
+# guard exists to stop.
+_RESERVED_UNIMPLEMENTED_TYPE_KEYWORDS = frozenset({
+    "_Bool", "_Complex", "_Imaginary", "_Atomic",
+})
+
+
+def _refuse_reserved_keyword_tags(ctx, op: dict[str, Any], named_types) -> None:
+    """Refuse a declaration whose TAG is a reserved C keyword BN cannot parse.
+
+    This completes an existing guard rather than adding a second one. For a
+    name the parser DOES implement, `_declarations_without_named_types`
+    (#760) already refuses: the platform parser silently DROPS a declaration
+    colliding with a built-in, so `struct uint32_t {...}` would apply one
+    type, discard the other and report `verified`. That guard's coverage is
+    exactly the parser's builtin table.
+
+    A reserved keyword the parser does NOT implement reaches the same harm
+    by the opposite route: nothing is dropped, because nothing was there --
+    the tag is accepted as a fresh name. Measured, `struct bool {...}` is
+    refused today while `struct _Bool {...}` is applied and `verified`, and
+    a later `struct three { _Bool a; _Bool b; _Bool c; }` then comes back
+    0xC with three `struct _Bool` members where C says 3 bytes. The
+    asymmetry IS the defect.
+
+    REFUSE rather than warn, for a structural reason: the fabrication is
+    generated by the NEXT command -- the one writing a bare `_Bool` field --
+    not by this declaration, so a warning here leaves that command's
+    `verified` untouched. Same shape as the bitfield guard above, which
+    names the consequence rather than the syntax.
+
+    Checked over the PARSED names, not the source text, so the ground truth
+    is what BN would actually define: a `_Bool` in a comment or used as a
+    FIELD name cannot trip it. Tags are normalised, because a `struct X`
+    declaration may report as `struct X` rather than `X`.
+
+    SCOPE, stated because the next reader will otherwise expect more: this
+    makes the tool HONEST, not CAPABLE. BN has no `_Bool`, so a field of
+    that type still fails to parse and still will. What changes is that the
+    tool stops manufacturing a meaning for a reserved name and stamping it
+    `verified`.
+    """
+    offenders = []
+    for name, _type_obj in named_types or ():
+        tag = str(name).split()[-1] if str(name).strip() else ""
+        if tag in _RESERVED_UNIMPLEMENTED_TYPE_KEYWORDS:
+            offenders.append(tag)
+    if not offenders:
+        return
+    named = ", ".join(sorted(set(offenders)))
+    raise OperationFailure(
+        "invalid_request",
+        f"{named} is a reserved C keyword that this parser does not implement, "
+        f"so declaring a type with that tag does not shadow the builtin -- it "
+        f"CREATES one. A later field written as `{offenders[0]} x;` would then "
+        f"silently mean this struct rather than the C type, and be reported "
+        f"`verified`: three such fields lay out as 0xC bytes where C says 3. "
+        f"A tag that collides with a builtin the parser DOES implement is "
+        f"already refused (#760); this is the same refusal for the reserved "
+        f"names it does not. Rename the tag (e.g. `{offenders[0].lstrip('_')}_t`).",
+        requested=_operation_requested(ctx, op),
+    )
+
+
 def _op_types_declare(ctx, bv, op: dict[str, Any]):
     declaration = str(op["declaration"])
     # Reject C bitfield syntax up front: BN's parser corrupts it (see
@@ -3914,6 +4035,7 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             requested=_operation_requested(ctx, op),
         ) from exc
     named_types = list(parsed["types"])
+    _refuse_reserved_keyword_tags(ctx, op, named_types)
     if not named_types:
         raise OperationFailure(
             "invalid_request",
@@ -4020,6 +4142,17 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "parsed_type_count": len(named_types),
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
+        # #825 item 3: a `--file` declaration parses with the header's PARENT
+        # DIRECTORY as an implicit include root, so `#include "sibling.h"`
+        # resolves. The root was derivable from `requested.source_path` but
+        # never stated, which makes the interesting case invisible: a declare
+        # that only succeeded because a sibling header was found, or that
+        # picked a shadowing sibling over the header the user expected.
+        # Absent for an inline declaration, so an ordinary declare grows no
+        # key -- and it comes from the same helper the parse used, so the
+        # reported root cannot differ from the one actually searched.
+        **({"include_root": _declaration_include_root(op.get("source_path"))}
+           if op.get("source_path") else {}),
         # #778: the two buckets this verb parsed but CANNOT bind, stated as
         # not-applied rather than left for the caller to infer from a bare
         # count. Absent entirely when the declaration was types-only, so an
@@ -4125,6 +4258,20 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             "message": "A function already starts at this address.",
             "requested": requested,
         }
+    # #675 item 14: capture the CONTAINING functions before the create, while
+    # the answer still exists -- afterwards this address IS a function start
+    # and `get_functions_containing` reports the new one. A create at a
+    # mid-function address succeeded with `verified` and said nothing, so a
+    # caller who mistyped an address, or who did not realise BN had already
+    # attributed those bytes, was left with two overlapping functions and no
+    # trace of it in the result.
+    #
+    # DISCLOSED, not refused -- the opposite call from the reserved-tag guard
+    # beside it, and for the opposite reason: creating a function BN missed
+    # inside a neighbour it over-extended is ordinary RE work, so refusing
+    # would break a legitimate flow. The harm here is that the overlap is
+    # INVISIBLE, not that it happened.
+    overlapped = create_comments._containing_function_rows(bv, addr)
     if len(bytes(bv.read(addr, 1))) == 0:
         raise OperationFailure(
             "invalid_request",
@@ -4199,13 +4346,17 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
                 requested=requested,
                 observed={"address": hex(addr), "function": str(created.name)},
             )
-    return {
+    result = {
         "op": "function_create",
         "status": "verified",
         "address": hex(addr),
         "function": str(created.name) if created is not None else None,
         "requested": requested,
     }
+    # ONE builder for both create paths (the other is
+    # `create_comments._function_create`), so the two cannot state the same
+    # fact differently.
+    return create_comments._with_overlap_note(result, overlapped)
 
 
 def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:

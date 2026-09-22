@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
@@ -35,6 +35,10 @@ from ..formatters import (
     _text_field,
     _xref_buckets,
     _group_refs_by_caller,
+    _field_list,
+    _render_fallback_text,
+    _stated_count,
+    _text_value,
 )
 from ..transport import BridgeError
 
@@ -274,13 +278,122 @@ def _require_text_format(args: argparse.Namespace, flag: str) -> None:
         raise BridgeError(f"{flag} only applies to --format text")
 
 
+def _reject_text_mode_offset(args: argparse.Namespace, stem: str) -> None:
+    """Refuse `--offset` where text mode cannot honour it, instead of
+    discarding it (#738).
+
+    On the xrefs family text mode GROUPS the full result set by caller and
+    uses `--limit` only as a renderer-side cap on how many groups print, so
+    the offset never reached the op: every offset returned byte-identical
+    output at exit 0. An agent paging a hot symbol re-read page 1 forever
+    and believed it had advanced -- and the derived slicing hint, which
+    reads the flags a parser ACCEPTS, actively advertised `--offset` for
+    these stems in text mode. The hint was right about acceptance and wrong
+    about effect.
+
+    A refusal rather than a forward, because forwarding changes the answer:
+    grouping over a page is not the same result as grouping the full set,
+    and the display cap would have to be redefined. This is the same trade
+    `_require_text_format` already makes from the other direction, and it
+    makes the hint TRUE -- following it in text mode now tells you to
+    switch format rather than handing you page 1 again.
+    """
+    if args.format == "text" and getattr(args, "offset", 0):
+        raise BridgeError(
+            f"--offset only applies to --format json on {stem}: text mode "
+            f"groups the full result set by caller and uses --limit only as "
+            f"a display cap on groups, so an offset cannot move the page. "
+            f"Re-run with --format json to page, or raise --limit to show "
+            f"more groups.")
+
+
+
+def _decompile_many(
+    args: argparse.Namespace,
+    identifiers: list[str],
+    shared: dict[str, Any],
+    render_one: Callable[[Any], str],
+) -> int:
+    """`bn decompile f1 f2 f3` -- several functions, ONE round trip (#676 item 5).
+
+    Exit code differs deliberately from the `--all-*` fan-out, which returns 0
+    when ANY instance answered. Fan-out surveys a population where a target
+    legitimately lacks the thing being asked for; here every identifier was
+    NAMED by the caller, so one that does not resolve is a mistake in the
+    request, and reporting success would hide a typo behind two functions that
+    happened to work.
+    """
+    def _render_batch_text(value: Any) -> str:
+        if not isinstance(value, dict):
+            return _render_fallback_text(value)
+        # An EXPLICIT boundary, because this renderer is a closure in a command
+        # module rather than a decorated `formatters` entry point: `_record_skew`
+        # is a no-op with nothing on the stack, so without this the tally's
+        # `_stated_count` cannot see an unreadable counter and prints a
+        # confident `0` -- the #683 fabricated zero, restated.
+        with disclosure_boundary():
+            return _render_batch_body(value)
+
+    def _render_batch_body(value: dict) -> str:
+        rows = _field_list(value, "functions")
+        if rows is None:
+            return _render_fallback_text(value)
+        chunks: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                chunks.append(_render_fallback_text(row))
+                continue
+            name = _text_value(row, "identifier") or "<unnamed>"
+            if row.get("ok"):
+                chunks.append(f"===== {name} =====\n{render_one(row.get('decompiled'))}")
+            else:
+                # A failed row is rendered IN PLACE, not summarised at the end:
+                # the caller asked for these in order, and a miss that only
+                # appears in a trailing tally reads as if that function had
+                # been skipped rather than attempted.
+                reason = _text_value(row, "error") or "did not resolve"
+                chunks.append(f"===== {name} =====\nerror: {reason}")
+        # Stated, not derived from len(chunks): the tally is a headline a
+        # caller acts on, so an unreadable counter must print `?` rather than
+        # a plausible number this renderer invented (#683).
+        resolved = _stated_count(value, "resolved")
+        requested = _stated_count(value, "requested")
+        return "\n\n".join(chunks) + f"\n\n{resolved} of {requested} resolved"
+
+    def _batch_exit_code(value: Any) -> int:
+        if not isinstance(value, dict):
+            return 2
+        rows = _field_list(value, "functions")
+        if rows is None:
+            return 2
+        return 0 if all(isinstance(r, dict) and r.get("ok") for r in rows) else 2
+
+    return _call(
+        args,
+        "decompile_batch",
+        {"identifiers": identifiers, **shared},
+        require_target=True,
+        text_renderer=_render_batch_text,
+        result_exit_code=_batch_exit_code,
+        stem="decompile-batch",
+    )
+
+
 @command("decompile", help="Render Binary Ninja Pseudo C for a function", target=True,
          args=[
-             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("identifier", nargs="+", metavar="IDENTIFIER",
+                 help="Function name or entry address (hex 0x.. or decimal). "
+                      "Several may be given: each is decompiled in one "
+                      "round trip, and one that does not resolve becomes a "
+                      "failed row rather than aborting the rest."),
              arg("--addresses", action="store_true", default=False,
                  help="Show address prefixes on each line"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
              arg("--force-analysis", action="store_true", default=False,
                  help="If Binary Ninja skipped this function (e.g. too large), override the skip "
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
@@ -304,19 +417,27 @@ def _decompile(args: argparse.Namespace) -> int:
         # False here, so it cannot carry this.
         return _quick_partial_prefix(value, "decompile") + _resolution_note(value) + text
 
-    return _call(
-        args,
-        "decompile",
-        {
-            "identifier": args.identifier,
-            "addresses": args.addresses,
-            "force_analysis": args.force_analysis,
-            "include_annotations": bool(args.include_annotations),
-        },
-        require_target=True,
-        text_renderer=_render_decompile_text,
-        stem="decompile",
-    )
+    identifiers = list(args.identifier)
+    shared = {
+        "addresses": args.addresses,
+        "force_analysis": args.force_analysis,
+        "include_annotations": bool(args.include_annotations),
+    }
+    if len(identifiers) == 1:
+        # ONE identifier keeps the exact single-function shape it has always
+        # had. The batch envelope is not "the general case with n=1": every
+        # existing caller, renderer and test reads `text` off the top level,
+        # and wrapping the common case to make the rare one uniform would
+        # break all of them to tidy a shape nobody asked to be uniform.
+        return _call(
+            args,
+            "decompile",
+            {"identifier": identifiers[0], **shared},
+            require_target=True,
+            text_renderer=_render_decompile_text,
+            stem="decompile",
+        )
+    return _decompile_many(args, identifiers, shared, _render_decompile_text)
 
 
 @command("il", help="Dump IL for a function", target=True,
@@ -332,7 +453,11 @@ def _decompile(args: argparse.Namespace) -> int:
              arg("--ssa", action="store_true",
                  help="Emit the SSA form of the selected IL view"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
          ],
          estimable=True)
 def _il(args: argparse.Namespace) -> int:
@@ -360,7 +485,11 @@ def _il(args: argparse.Namespace) -> int:
              arg("--no-ssa", dest="ssa", action="store_false", default=True,
                  help="Emit non-SSA form (default: SSA)"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+                 help="Show only lines START through END (1-indexed, inclusive). "
+                      "TEXT MODE ONLY: it slices the rendered listing, which "
+                      "json/ndjson do not produce, so passing it with --format "
+                      "json is REFUSED rather than ignored. For a structured "
+                      "slice, take the payload's text and slice it (#675 item 3)."),
          ],
          estimable=True)
 def _function_structured_il(args: argparse.Namespace) -> int:
@@ -584,6 +713,7 @@ def _xrefs(args: argparse.Namespace) -> int:
     # Text mode groups the full set and uses `limit` only as a renderer-side
     # caller-group display cap, so it must fetch the full set -- don't forward
     # offset/limit to the op or the renderer would group only a slice.
+    _reject_text_mode_offset(args, "xrefs")   # #738
     params: dict[str, Any] = {"identifier": identifier}
     if fn_pointer_scan:
         params["fn_pointer_scan"] = True
@@ -771,6 +901,7 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
     # data sections for stored function pointers so a callback-only function
     # (vtable/dispatch-table slot) isn't reported as dead (#323). Plain `xrefs`
     # stays fast and does not scan.
+    _reject_text_mode_offset(args, "evidence xrefs")   # #738, same reason
     params: dict[str, Any] = {"identifier": args.identifier, "fn_pointer_scan": True}
     limit = _effective_limit(args)
     if args.format != "text":

@@ -12,6 +12,10 @@ from _bridge_fakes import _load_bridge
 EXPECTED_READ = {
     "doctor", "list_targets", "target_info", "function_info", "get_prototype",
     "list_functions", "list_locals", "search_functions", "callsites", "decompile",
+    # #676 item 5: the multi-identifier form of `decompile`. READ-locked like
+    # its singular sibling -- it loops the same handler under one lock instead
+    # of paying a round trip and a lock acquisition per function.
+    "decompile_batch",
     "il", "structured_il", "defuse", "resolved_calls", "possible_values", "taint", "taint_models",
     "disasm", "function_evidence", "xrefs", "xrefs_any", "field_xrefs", "pointer_table",
     "call_descriptors", "hidden_surface", "resolve_virtual_call",
@@ -143,10 +147,19 @@ def test_registry_covers_every_dispatch_op(op_registry):
     assert REGISTRY.names() == expected
 
 
-def test_decompile_is_the_only_escalating_op(op_registry):
+def test_escalation_exists_only_for_force_analysis(op_registry):
+    """Lock escalation is a read op's licence to take the WRITE lock, so the
+    set is pinned: an op gaining it is a deliberate change, not a side effect.
+
+    Both members escalate for the same single reason -- `--force-analysis`
+    reanalyses a function BN skipped, which mutates the view. `decompile_batch`
+    (#676 item 5) is the multi-identifier form of `decompile` and forwards the
+    same flag, so it inherits the same licence; it is a second instance of one
+    mechanism, not a second mechanism.
+    """
     REGISTRY = op_registry.REGISTRY
     escalating = {n for n in REGISTRY.names() if REGISTRY.spec(n).lock_escalation is not None}
-    assert escalating == {"decompile"}
+    assert escalating == {"decompile", "decompile_batch"}
 
 
 # #688: the ops whose bare/empty/"active" target may NOT fall back to the

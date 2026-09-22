@@ -922,7 +922,15 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
         width = int(type_.width)
     except Exception:
         width = 0
-    sym = bv.get_symbol_at(addr)
+    # #682 item 4: `get_symbol_at` / `get_sections_at` used to sit OUTSIDE the
+    # try below, so one throwing accessor killed the whole windowed read --
+    # contradicting this function's own guarantee that a row survives
+    # undecorated. They decorate the row; they do not define it, so a failure
+    # costs the decoration and nothing else.
+    try:
+        sym = bv.get_symbol_at(addr)
+    except Exception:  # noqa: BLE001 - a throwing accessor must not drop the row
+        sym = None
     type_text = str(type_)
     row: dict[str, Any] = {
         "a": hex(addr),
@@ -930,7 +938,10 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
         "t": type_text,
         "w": width,
     }
-    secs = bv.get_sections_at(addr)
+    try:
+        secs = bv.get_sections_at(addr)
+    except Exception:  # noqa: BLE001 - same: the section is decoration
+        secs = None
     if secs:
         row["sec"] = secs[0].name
     is_pointer = _is_pointer_type(type_, type_text)

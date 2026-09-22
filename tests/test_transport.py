@@ -2316,6 +2316,93 @@ def test_send_request_to_instance_refuses_non_dict_params_853(tmp_path, monkeypa
             )
 
 
+@pytest.mark.parametrize(
+    ("instance_id", "selector"),
+    [("i" * 80, "alpha"), ("i", "é" * 20)],
+    ids=("long-instance-id", "unicode-selector"),
+)
+def test_batch_apply_checks_exact_wire_bytes_before_send_769(
+        tmp_path, monkeypatch, instance_id, selector):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    instance.pid = 12345
+    instance.instance_id = instance_id
+    instance.instance_token = "t" * 36
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "S")
+    monkeypatch.setattr(
+        transport.uuid, "uuid4",
+        lambda: "00000000-0000-0000-0000-000000000000",
+    )
+
+    params = {"ops": [], "target": selector, "preview": True}
+    identity = {"instance_id": instance_id, "pid": 12345, "token": "t" * 36}
+    wire = (json.dumps({
+        "id": "00000000-0000-0000-0000-000000000000",
+        "op": "batch_apply", "params": params,
+        "_bridge_identity": identity, "target": selector,
+    }) + "\n").encode("utf-8")
+    opened: list[str] = []
+    sent: list[bytes] = []
+
+    class FakeSocket:
+        def __enter__(self):
+            opened.append("socket")
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, data):
+            sent.append(data)
+
+        def shutdown(self, _how):
+            pass
+
+        def recv(self, _size):
+            if sent and not getattr(self, "_replied", False):
+                self._replied = True
+                return json.dumps({
+                    "ok": True, "result": {}, "bridge_identity": identity,
+                }).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *_a, **_k: FakeSocket())
+
+    # One byte over the limit is refused before socket creation, with enough
+    # evidence for the mutation caller to report invalid_request at exit 3.
+    monkeypatch.setattr(transport, "batch_apply_max_bytes", lambda: len(wire) - 1,
+                        raising=False)
+    with pytest.raises(BridgeError) as exc:
+        transport._send_request_to_instance(
+            instance, "batch_apply", params=params, target=selector,
+            timeout=1.0, connect_retries=1, resolved=True,
+        )
+    assert exc.value.status == "invalid_request"
+    assert exc.value.requested == {
+        "request_bytes": len(wire), "max_request_bytes": len(wire) - 1,
+    }
+    assert exc.value.observed == {"request_sent": False}
+    assert opened == sent == []
+
+    # A line exactly at the limit is allowed; the bytes actually sent must be
+    # the same line whose length the refusal above measured.
+    monkeypatch.setattr(transport, "batch_apply_max_bytes", lambda: len(wire),
+                        raising=False)
+    response = transport._send_request_to_instance(
+        instance, "batch_apply", params=params, target=selector,
+        timeout=1.0, connect_retries=1, resolved=True,
+    )
+    assert response["ok"] is True
+    assert sent == [wire]
+
+
 # --------------------------------------------------------------------------
 # #694: the spawn budget is separate from the request budget
 # --------------------------------------------------------------------------

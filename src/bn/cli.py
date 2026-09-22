@@ -453,12 +453,23 @@ def _target_option(
         "help": (
             "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id); "
             "omit only when exactly one target is open, or use `active` to follow the GUI-selected target explicitly "
-            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all)"
+            "(destructive `close` does not honor `active` -- it needs a concrete selector, a path, or --all) "
+            "(env: BN_TARGET)"
         ),
         "required": required,
     }
     if not is_root:
         kwargs["default"] = argparse.SUPPRESS
+    # `BN_TARGET` is NOT resolved here (#676 item 11). It is an AMBIENT
+    # selector, exactly like the sticky pin, and both are filled together in
+    # `_apply_sticky_defaults` so they carry the same marker and every
+    # consumer that must distinguish "the caller named this" from "something
+    # in the environment did" sees them alike. Resolving it as an argparse
+    # default instead made it arrive unmarked, and a bare destructive `close`
+    # -- which nulls an ambient target precisely so it cannot be steered --
+    # then tore down the exported selector at exit 0. Guarding it on
+    # `required=False` looked like the fix and covered nothing: no command in
+    # this tree sets `required=True` on `--target`.
     parser.add_argument("-t", "--target", **kwargs)
 
 
@@ -1153,9 +1164,23 @@ _SLICE_VOCABULARY_SET = frozenset(_SLICE_VOCABULARY)
 # group refuses).
 _TEXT_ONLY_SLICE_FLAGS = frozenset({"--lines"})
 
+# The inverse of `_TEXT_ONLY_SLICE_FLAGS`, per command: a flag the parser
+# ACCEPTS but which the handler refuses under `--format text`. #738 made
+# `xrefs`/`evidence xrefs` refuse a text-mode `--offset` -- text groups the
+# FULL result set by caller and `--limit` only caps how many groups print,
+# so an offset cannot move the page. The hint is derived from acceptance,
+# so without this it went on advising `--offset` and, after #738, advised
+# the one thing that now exits 2 (#889c finding 3). Right about acceptance,
+# wrong about effect -- in both directions, before and after the refusal.
+_JSON_ONLY_SLICE_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
+    ("xrefs",): frozenset({"--offset"}),
+    ("evidence", "xrefs"): frozenset({"--offset"}),
+}
+
 
 def _derive_slice_hint(
-    accepted: Iterable[str], text_format: bool, used: Iterable[str] = ()
+    accepted: Iterable[str], text_format: bool, used: Iterable[str] = (),
+    path: tuple[str, ...] = (),
 ) -> str | None:
     """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
 
@@ -1173,6 +1198,10 @@ def _derive_slice_hint(
     a flag-free hint rather than inventing one.
     """
     accepted = set(accepted)
+    # #889c finding 3: drop the flags this command refuses in text mode, so
+    # the hint cannot advise the thing that exits 2.
+    if text_format:
+        accepted -= _JSON_ONLY_SLICE_FLAGS.get(tuple(path), frozenset())
     used = set(used)
 
     def in_order(vocabulary: Iterable[str]) -> list[str]:
@@ -1243,7 +1272,8 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
         # vocabulary order picks which one to name.
         if getattr(args, dest, None) not in (None, False)
     }
-    return _derive_slice_hint(accepted, fmt == "text", used)
+    return _derive_slice_hint(accepted, fmt == "text", used,
+                              tuple(getattr(args, "_command_path", ()) or ()))
 
 
 @lru_cache(maxsize=None)
@@ -1255,7 +1285,7 @@ def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | N
     the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    return _derive_slice_hint(_known_option_strings(sub), text_format)
+    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path)
 
 
 def _spill_next_step_hint(
@@ -1323,6 +1353,50 @@ def _require_nonempty_instance(args: argparse.Namespace) -> None:
         )
 
 
+def blank_selector(value: Any) -> bool:
+    """Whether *value* is PRESENT but says nothing -- ``""`` or whitespace.
+
+    One spelling of the question, because two of them drifted and shipped a
+    hole. `_resolve_target` asked it with `.strip()` while `batch apply`'s
+    manifest fill asked it with plain truthiness, so a whitespace ambient
+    value was "not a selector" to the resolver and "a selector" to the fill:
+    it was dropped from the request envelope and then written into the
+    manifest payload, where it reached the bridge on a DESTRUCTIVE op --
+    exactly the forwarding the reference promises never happens.
+
+    `None` is absence, not blankness, and answers False: the callers that
+    care about "no selector at all" test that separately, because absence is
+    legal everywhere and blankness is legal nowhere (#676 item 11).
+    """
+    return value is not None and not str(value).strip()
+
+
+def _empty_target_message(
+    args: argparse.Namespace,
+    omit_hint: str = "omit --target to use the single open target",
+) -> str:
+    """The refusal for an empty selector, phrased for where it CAME FROM.
+
+    An `-t ""` the caller typed is a flag problem and says so. An empty value
+    that arrived from an AMBIENT source is not: nobody passed `--target` on
+    that command line, so blaming the flag sends the reader looking for an
+    argument they never wrote, and the two sources are cleared in completely
+    different ways (`unset BN_TARGET` vs `bn target clear`). Name the source
+    and its own remedy instead (#676 item 11).
+    """
+    ambient = getattr(args, "_empty_ambient_target", None)
+    if ambient:
+        source, remedy = ambient
+        return (
+            f"{source}: {remedy}. An empty selector is a broken default, not "
+            "a request for the default, so nothing was sent."
+        )
+    return (
+        f"--target is empty: pass a selector from `bn target list`, or "
+        f"{omit_hint}"
+    )
+
+
 def _implicit_target(args: argparse.Namespace) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
@@ -1333,6 +1407,18 @@ def _implicit_target(args: argparse.Namespace) -> str:
     pinned id fails as a safe unknown-selector error instead.
     """
     _require_nonempty_instance(args)
+    # THE refusal for a broken ambient default, and the only one left: this
+    # auto-pick is precisely what the empty value corrupts. Every caller that
+    # gets here needs a target and was given no usable selector -- either the
+    # ambient value was empty and `_resolve_target` read it as the absence of
+    # one, or `close` nulled it so it could not steer a destructive op -- and
+    # without this guard the broken default falls through to "there is only
+    # one target open, use that": a bare `bn close` then tears down a target
+    # the caller never named, at exit 0. Refused before the peek, so nothing
+    # is sent. A command that resolves no target never reaches this function
+    # and is therefore unaffected by construction (#676 item 11).
+    if getattr(args, "_empty_ambient_target", None):
+        raise BridgeError(_empty_target_message(args))
     response = send_request(
         "list_targets",
         params={},
@@ -1377,19 +1463,40 @@ def _resolve_target(
     allow_implicit_target: bool = False,
 ) -> str | None:
     target = getattr(args, "target", None)
-    # An explicit-but-empty selector (an unset shell variable, `-t ""`) is
-    # never pin-filled (see _apply_sticky_defaults) and must never be
-    # forwarded either: the bridge collapses "" to the focused GUI view with
-    # no count check, so a write op would silently act on the wrong target.
-    if target is not None and not str(target).strip():
-        raise BridgeError(
-            "--target is empty: pass a selector from `bn target list`, or "
-            "omit --target to use the single open target"
-        )
+    ambient_empty = getattr(args, "_empty_ambient_target", None)
+    # An empty selector must never be FORWARDED: the bridge collapses "" to
+    # the focused GUI view with no count check, so a write op would silently
+    # act on the wrong target. What happens instead depends on where the
+    # empty value came from, and this is the only place that asks:
+    #
+    #  * A `-t ""` the caller TYPED is a broken argument. Refuse it, naming
+    #    the flag, because the flag is what they wrote.
+    #
+    #  * An AMBIENT source (an unassigned export, an empty pin) supplied no
+    #    selector at all -- an empty string is the ABSENCE of one, not a
+    #    request for anything -- so treat it as absent and let the ordinary
+    #    no-selector path below decide. A command that must resolve a target
+    #    then reaches `_implicit_target`, which refuses rather than letting
+    #    the single-open auto-pick stand in for a broken default; a command
+    #    that names what to act on some other way resolves nothing, so it
+    #    runs exactly as it would with the variable unset.
+    #
+    # Asked HERE, at the moment the value is reached for, the question needs
+    # no list of exempt verbs -- which is what three consecutive review
+    # rounds of a pre-dispatch gate produced, each round finding one more
+    # command that should never have been checked (`close --all`, the
+    # `--all-*` surveys, then `bn load <path>`, the verb whose whole job is
+    # to CREATE the target everything else resolves) (#676 item 11).
+    if blank_selector(target):
+        if not ambient_empty:
+            raise BridgeError(_empty_target_message(args))
+        target = None
     if require_target and target is None:
         if allow_implicit_target:
             return _implicit_target(args)
-        raise BridgeError("This command requires --target")
+        raise BridgeError(
+            _empty_target_message(args) if ambient_empty
+            else "This command requires --target")
     return target
 
 
@@ -2235,15 +2342,24 @@ def _fanout_call(
         advice="Rerun with --format json to see the raw result.")
     fan_instances = getattr(args, "all_instances", False)
     fan_targets = getattr(args, "all_targets", False)
-    # Only a -t passed on the CLI counts as explicit (applies to every instance). A
-    # STICKY target pin (filled by _apply_sticky_defaults, which sets _sticky_target)
-    # is NOT explicit -- it must not suppress the multi-target auto-survey (#368).
+    # Only a -t passed on the CLI counts as explicit (applies to every instance).
+    # An AMBIENT target -- the sticky pin or an exported BN_TARGET, both filled
+    # by _apply_sticky_defaults, which sets _sticky_target -- is NOT explicit:
+    # it must not suppress the multi-target auto-survey (#368, #676 item 11).
     fan_target = getattr(args, "target", None)
-    if fan_target is not None and not str(fan_target).strip():
-        raise BridgeError(
-            "--target is empty: pass a selector from `bn target list`, or "
-            "omit --target to survey every target"
-        )
+    # A `-t ""` the caller TYPED is a broken argument on a survey too, and the
+    # survey never reaches `_resolve_target` on this path, so the same rule is
+    # applied here with the remedy this surface actually has. An AMBIENT empty
+    # value is NOT that: it named no selector, `bool("")` already keeps it out
+    # of `explicit_target` below, and the survey resolves nothing from it. The
+    # marker deliberately stays on the namespace -- the per-instance plan falls
+    # back to a normal single resolve when its `list_targets` peek fails, and
+    # THAT is a resolution, so it still refuses in `_resolve_target`, as one
+    # instance's error row rather than as the whole run (#676 item 11).
+    if (blank_selector(fan_target)
+            and not getattr(args, "_empty_ambient_target", None)):
+        raise BridgeError(_empty_target_message(
+            args, "omit --target to survey every target"))
     explicit_target = bool(fan_target) and not getattr(
         args, "_sticky_target", False
     )
@@ -2732,7 +2848,42 @@ def _explicit_instance_options(argv: list[str]) -> tuple[bool, bool]:
 
 
 def _apply_sticky_defaults(args: argparse.Namespace) -> None:
-    """Fill unset --instance / --target from per-project sticky state."""
+    """Fill unset --instance / --target from the environment or sticky state.
+
+    Both sources are AMBIENT: the caller did not name this selector on the
+    command line. `_sticky_target` marks exactly that one fact, and it has
+    exactly three readers -- a bare destructive `close` nulls an ambient
+    target so it cannot be silently steered; `--all-instances` does not treat
+    one as the explicit choice that suppresses the multi-target auto-survey
+    (`--all-targets` surveys unconditionally and never consults the marker);
+    and `batch apply` lets one FILL a manifest that named no target but never
+    OVERRIDE one that did. The environment must therefore be filled HERE and
+    marked the same way; resolving it as an argparse default made it arrive
+    unmarked and walk straight past all three (#676 item 11).
+
+    An EMPTY ambient value is marked too -- it is still a value nobody typed
+    -- and additionally recorded in `_empty_ambient_target`, because it is
+    not a selector and must not become one. Nothing is decided here: the
+    record is READ where the value would be used, and only there. An empty
+    ambient value reaching `_resolve_target` is the absence of a selector,
+    so a command that must resolve one hits `_implicit_target`, which
+    refuses rather than letting the single-open auto-pick stand in for a
+    broken default, and a command that says what to act on some other way
+    (`bn load <path>`, `close --all`, a manifest carrying its own target,
+    the `--all-*` surveys) resolves nothing and is untouched. Marking here
+    and judging there is what keeps that list a CONSEQUENCE rather than an
+    exemption table this function would have to be taught. The record also
+    names the source in the refusal, since the export and the pin are
+    cleared in completely different ways.
+
+    `BN_INSTANCE` is DELIBERATELY not treated this way and stays an argparse
+    default in `_instance_option`: `session stop` documents the env var as one
+    of the three ways to NAME an instance (positional, `-i`, `BN_INSTANCE`),
+    and only the sticky pin is excluded there (#588). Marking it ambient would
+    break a documented behaviour, where marking the target one FIXES an
+    undocumented hazard -- nothing says a bare `close` follows an ambient
+    selector, and the reference says the opposite.
+    """
     state = session_state.read()
     # Presence, not truthiness (#690 r3): `-i "$INST"` with $INST unset must
     # not be silently replaced by the pin -- the same doctrine as -t below.
@@ -2742,14 +2893,38 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
         if sticky_instance:
             args.instance = sticky_instance
             args._sticky_instance = True
-    # Only an ABSENT -t is filled from the pin. An explicit `-t ""` stays as
-    # given so the handler can tell "no selector" from "empty selector" (close
-    # must reject the latter instead of letting a pin paper over it).
+    # Only an ABSENT -t is filled. An explicit `-t ""` stays as given so the
+    # handler can tell "no selector" from "empty selector" (close must reject
+    # the latter instead of letting an ambient value paper over it).
     if getattr(args, "target", None) is None:
+        # The environment beats the pin: it is per-process-tree, so it is the
+        # narrower statement of intent of the two. Presence, not truthiness
+        # again -- `export BN_TARGET=$SEL` with SEL unset exports "", and that
+        # must reach the empty-selector refusal rather than falling through to
+        # a pin the caller never chose for this command.
+        env_target = os.environ.get("BN_TARGET")
         sticky_target = state.get("target")
-        if sticky_target:
+        if env_target is not None:
+            args.target = env_target
+            args._sticky_target = True
+            if not env_target.strip():
+                args._empty_ambient_target = (
+                    "BN_TARGET is exported but empty",
+                    "unset it, or export a selector from `bn target list`")
+        elif sticky_target is not None:
+            # Presence, not truthiness, on THIS source too. `bn target use
+            # "$SEL"` with SEL unset WRITES an empty pin and exits 0 --
+            # `_target_matches` answers True for "" -- and reading that back
+            # as "no pin at all" let a bare destructive `close` fall through
+            # to the single-open auto-pick and tear that target down at exit
+            # 0, the hazard the export was just taken out of.
             args.target = sticky_target
             args._sticky_target = True
+            if not str(sticky_target).strip():
+                args._empty_ambient_target = (
+                    "the sticky target pin is set but empty",
+                    "clear it with `bn target clear`, or pin a selector from "
+                    "`bn target list`")
 
 
 def main(argv: list[str] | None = None) -> int:
