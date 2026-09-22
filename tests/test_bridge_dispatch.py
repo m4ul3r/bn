@@ -4455,7 +4455,7 @@ def test_dispatch_routes_lens_read_ops(monkeypatch):
     assert cfg["blocks"][0]["start"] == "0x401000"
 
     window = instance._dispatch_on_main("data_vars", {"start": "0x2000", "end": "0x2100"}, None)
-    assert [r["a"] for r in window["items"]] == ["0x2000"]
+    assert [r["address"] for r in window["items"]] == ["0x2000"]
 
     syms = instance._dispatch_on_main("data_symbols", {}, None)
     assert syms["items"] == [{"a": "0x2000", "n": "g_counter"}]

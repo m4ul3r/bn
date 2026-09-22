@@ -38,9 +38,26 @@ KNOWN_BREAKS records divergences that already shipped. They are listed
 rather than asserted so this file fails on anything NEW while keeping the
 existing debt visible and attributable. Removing an entry is how the fix
 gets proven; adding one requires the scheduled-break note in the PR.
+
+The register carries three kinds of entry. A `(op, "container")` entry is shipped
+debt. A `(op, "field:<old>-><new>")` entry is a SCHEDULED rename: the bridge is
+moving the key on purpose and the consumer update lands in the same window, so
+the old name is expected to be GONE -- but the check moves to the new name
+rather than skipping the field. Presence is demanded on the PRODUCER's fact
+(`always_emitted`), not the consumer's (`required`): `name`/`type`/`width` are
+always sent and always defaulted, so a half-done rename of one of those is a
+permanent silent blank, not a tolerated absence.
+
+A `(op, "request:<param>=<value>")` entry is a SCHEDULED REQUEST change: the
+payload still decodes, but the consumer's existing call no longer returns what
+it used to, and the registered request is what it must send to get that back.
+Nothing about the shape is wrong, so no field or container check can catch it
+-- the test for that op reads the registered request and exercises it, which
+is what makes the entry load-bearing rather than a note.
 """
 from __future__ import annotations
 
+import sys
 from typing import NamedTuple
 
 import pytest
@@ -122,14 +139,154 @@ KNOWN_BREAKS = {
     ("data_symbols", "container"): (
         "#275 renamed the container `syms` -> `items`; same silent-empty "
         "shape as data_vars. Tracked in bn-lens#45 / bn#892."),
+
+    # #682 item 2, SCHEDULED break (not shipped debt): the bridge spells the
+    # terse keys out because models read this JSON without the reference open.
+    # The consumer's structs still spell the old names, so until it moves, `cfg`
+    # loses a required field per row and `data vars` rows lose their address --
+    # which for `a` aborts the element (and with it the whole Vec). The
+    # consumer must be updated in the SAME window; the patch-ready mapping is
+    # on the tracking issue. Tracked in bn#892 / bn-lens#45.
+    ("cfg", "field:a->address"): (
+        "#682 item 2 renames the insn address key `a` -> `address`. Tracked in "
+        "bn#892 / bn-lens#45."),
+    ("cfg", "field:t->text"): (
+        "#682 item 2 renames the insn text key `t` -> `text`. Tracked in bn#892 "
+        "/ bn-lens#45."),
+    ("cfg", "field:k->branch_type"): (
+        "#682 item 2 renames the edge kind key `k` -> `branch_type` (not `kind`, "
+        "which is already the envelope discriminator on this payload). Tracked "
+        "in bn#892 / bn-lens#45."),
+    ("data_vars", "field:a->address"): (
+        "#682 item 2 renames the row address key `a` -> `address`. Tracked in "
+        "bn#892 / bn-lens#45."),
+    ("data_vars", "field:n->name"): (
+        "#682 item 2 renames the row symbol key `n` -> `name`; the consumer "
+        "defaults it, so the rename fails SILENTLY there. Tracked in bn#892 / "
+        "bn-lens#45."),
+    ("data_vars", "field:t->type"): (
+        "#682 item 2 renames the row type key `t` -> `type`; silent in the "
+        "consumer. Tracked in bn#892 / bn-lens#45."),
+    ("data_vars", "field:w->width"): (
+        "#682 item 2 renames the row width key `w` -> `width`; silent in the "
+        "consumer. Tracked in bn#892 / bn-lens#45."),
+    ("data_vars", "field:v->value"): (
+        "#682 item 2 renames the decoded scalar key `v` -> `value`; conditional "
+        "on the slot, silent in the consumer. Tracked in bn#892 / bn-lens#45."),
+    ("data_vars", "field:p->pointer"): (
+        "#682 item 2 renames the pointer target key `p` -> `pointer`; "
+        "conditional on the slot, silent in the consumer. Tracked in bn#892 / "
+        "bn-lens#45."),
+    ("data_vars", "field:ps->pointer_symbol"): (
+        "#682 item 2 renames the pointer-symbol key `ps` -> `pointer_symbol`; "
+        "`ps` was opaque without the reference open. Conditional on the slot, "
+        "silent in the consumer. Tracked in bn#892 / bn-lens#45."),
+    ("data_vars", "field:pstr->pointer_string"): (
+        "#682 item 2 renames the pointer-string preview key `pstr` -> "
+        "`pointer_string`; conditional on the slot. Tracked in bn#892 / "
+        "bn-lens#45."),
+    ("data_vars", "field:sec->section"): (
+        "#682 item 2 renames the section key `sec` -> `section`; conditional on "
+        "the slot, silent in the consumer. Tracked in bn#892 / bn-lens#45."),
+
+    # #682 item 1, SCHEDULED REQUEST change (not shipped debt): `data_symbols`
+    # now answers an omitted `limit` with a 100-row page instead of the whole
+    # set, because the paramless call is the one that held the read lock for
+    # the full build. The rows still decode; the consumer simply stops seeing
+    # every data global, which for an index build is the "renamed globals stop
+    # being addressable" regression that read exists to prevent. It must send
+    # the registered request in the SAME window as item 2's key updates. Note
+    # what is and is not tracked WHERE: bn#892 / bn-lens#45 are item 2's
+    # rename tickets and their written plans enumerate the key mapping only,
+    # so this entry plus the PR's patch-ready consumer table ARE the record
+    # of the request change until those tickets are extended.
+    ("data_symbols", "request:limit=all"): (
+        "#682 item 1 makes an omitted `limit` a 100-row page; the consumer's "
+        "paramless call must send `limit: \"all\"` to keep the whole set. The "
+        "token is not `0`, which already means \"the schema, not the rows\" "
+        "across this repo's helpers. Lands in the same window as the item-2 "
+        "renames (bn#892 / bn-lens#45), whose plans cover the keys only -- "
+        "this entry is the record of the request change."),
 }
 
 
-def _check_row(row, model, where, problems):
+def _scheduled_rename(op: str, field: str) -> str | None:
+    """The name *field* is scheduled to move to under *op*, or None.
+
+    Registered as `(op, "field:<old>-><new>")` in KNOWN_BREAKS, so the register
+    stays the single source of truth and the two cannot drift."""
+    prefix = f"field:{field}->"
+    for key in KNOWN_BREAKS:
+        if len(key) == 2 and key[0] == op and key[1].startswith(prefix):
+            return key[1][len(prefix):]
+    return None
+
+
+def _scheduled_request(op: str) -> dict[str, object]:
+    """The request the consumer must now send under *op* to keep the payload
+    its old call returned, or ``{}`` when nothing is registered.
+
+    Registered as `(op, "request:<param>=<value>")` in KNOWN_BREAKS, parsed
+    here for the same reason `_scheduled_rename` parses its entry: the
+    register is the single source of truth, so the break and the test that
+    exercises it cannot drift apart. A value that reads as an integer is sent
+    as one, anything else as the string token it is -- the wire takes both,
+    and guessing wrong would send a count where the op expects a word. Like a
+    `field:` entry, an entry is only load-bearing for an op whose own test
+    reads it: registering one for an op nothing exercises records the break
+    without checking it."""
+    for key in KNOWN_BREAKS:
+        if len(key) == 2 and key[0] == op and key[1].startswith("request:"):
+            param, sep, value = key[1][len("request:"):].partition("=")
+            assert sep and param and value, (
+                f"KNOWN_BREAKS[{key!r}]: a request entry is "
+                f"`request:<param>=<value>`, all three parts non-empty")
+            try:
+                return {param: int(value)}
+            except ValueError:
+                return {param: value}
+    return {}
+
+
+def _check_row(row, model, where, problems, op):
     assert isinstance(row, dict), f"{where}: row is {type(row).__name__}, not an object"
     for field, spec in model.items():
         types, required, nullable = spec.types, spec.required, spec.nullable
         if field not in row:
+            replacement = _scheduled_rename(op, field)
+            if replacement is not None:
+                # A SCHEDULED rename (#682 item 2): the old name is expected to
+                # be gone, and the check MOVES to the new name rather than
+                # skipping the field. Presence is demanded on the PRODUCER's
+                # fact -- `always_emitted` -- not the consumer's `required`:
+                # `name`/`type`/`width` are always emitted and consumer-
+                # defaulted, so demanding only what the CONSUMER would crash on
+                # would let a half-done rename of one of those through, which is
+                # the same hole one layer in. `required` is still honoured when
+                # set, because a rename is no excuse for an absent field the
+                # consumer cannot default.
+                names = "/".join(t.__name__ for t in types)
+                if replacement not in row:
+                    if spec.always_emitted or required:
+                        consequence = (
+                            "the consumer has no serde default for it, so the "
+                            "element (and, inside a Vec, the whole list) fails "
+                            "to decode" if required else
+                            "the consumer defaults it, so nothing errors and "
+                            "the value silently becomes blank in every view")
+                        problems.append(
+                            f"{where}: field {field!r} is absent AND its "
+                            f"scheduled replacement {replacement!r} (#682 item "
+                            f"2) is missing -- {consequence}")
+                    continue
+                if isinstance(row[replacement], bool) and int not in types:
+                    problems.append(f"{where}: field {replacement!r} is a bool")
+                elif not isinstance(row[replacement], types):
+                    problems.append(
+                        f"{where}: field {replacement!r} is "
+                        f"{type(row[replacement]).__name__}, but the consumer "
+                        f"decodes the renamed {field!r} as {names}")
+                continue
             if required:
                 problems.append(
                     f"{where}: required field {field!r} absent -- the consumer "
@@ -203,11 +360,11 @@ def test_cfg_payload_decodes_under_the_consumers_strict_schema(monkeypatch):
     result = _cfg_result(monkeypatch)
     blocks = _check_container(result, "cfg", problems)
     for i, block in enumerate(blocks or []):
-        _check_row(block, _CFG_BLOCK, f"cfg.blocks[{i}]", problems)
+        _check_row(block, _CFG_BLOCK, f"cfg.blocks[{i}]", problems, "cfg")
         for j, insn in enumerate(block.get("insns", [])):
-            _check_row(insn, _CFG_INSN, f"cfg.blocks[{i}].insns[{j}]", problems)
+            _check_row(insn, _CFG_INSN, f"cfg.blocks[{i}].insns[{j}]", problems, "cfg")
         for j, edge in enumerate(block.get("edges", [])):
-            _check_row(edge, _CFG_EDGE, f"cfg.blocks[{i}].edges[{j}]", problems)
+            _check_row(edge, _CFG_EDGE, f"cfg.blocks[{i}].edges[{j}]", problems, "cfg")
     assert not problems, "\n".join(problems)
 
 
@@ -223,7 +380,7 @@ def test_cfg_unresolved_target_never_reaches_the_wire_as_a_null(monkeypatch):
     result = _cfg_result(monkeypatch, null_edge=True)
     for i, block in enumerate(result["blocks"]):
         for j, edge in enumerate(block["edges"]):
-            _check_row(edge, _CFG_EDGE, f"cfg.blocks[{i}].edges[{j}]", problems)
+            _check_row(edge, _CFG_EDGE, f"cfg.blocks[{i}].edges[{j}]", problems, "cfg")
     assert not problems, "\n".join(problems)
     # The information is not lost -- it moved somewhere additive.
     assert result["blocks"][0]["undetermined_edges"] is True
@@ -268,7 +425,7 @@ def test_data_vars_rows_decode_under_the_consumers_strict_schema(monkeypatch):
     if rows is None:                       # known container rename
         rows = result["items"]
     for i, row in enumerate(rows):
-        _check_row(row, _DATA_VAR, f"data_vars[{i}]", problems)
+        _check_row(row, _DATA_VAR, f"data_vars[{i}]", problems, "data_vars")
     assert not problems, "\n".join(problems)
 
 
@@ -286,8 +443,67 @@ def test_data_symbols_rows_decode_under_the_consumers_strict_schema(monkeypatch)
     if rows is None:
         rows = result["items"]
     for i, row in enumerate(rows):
-        _check_row(row, _DATA_SYM, f"data_symbols[{i}]", problems)
+        _check_row(row, _DATA_SYM, f"data_symbols[{i}]", problems, "data_symbols")
     assert not problems, "\n".join(problems)
+
+
+def test_the_lens_paramless_data_symbols_call_is_a_bounded_page_682(monkeypatch):
+    """#682 item 1's lock half, measured at the caller the ISSUE names.
+
+    The issue does not complain about the CLI. It says this op "holds the read
+    lock for the full build on a large target -- a mild inversion of the thesis
+    the op was added under (it exists so lens reads *stop* blocking other
+    clients)", and prescribes "paged=True, and let the lens ask for the full
+    set explicitly". The lens is the consumer this whole file mirrors, and it
+    calls the op with NO params at all --
+    `read_op::<DataSymsJson>("data_symbols", json!({}))`, bn.rs:2128-2129 --
+    so a default that bounds only the CLI leaves exactly that caller building
+    and serializing every row while holding the read lock.
+
+    Dispatched through the op binder rather than the method, because the binder
+    is what turns the lens's `{}` into the handler's arguments, and it forwards
+    `limit` verbatim (`params.get("limit")`) -- a keyword default on the
+    handler would never fire for this caller.
+
+    The truncation is a break of this consumer, so it is REGISTERED in
+    KNOWN_BREAKS as a scheduled request change, and the whole-set request the
+    consumer must move to is read back from that entry rather than spelled
+    again here: delete the entry and this test fails, which is what makes the
+    register the thing that tracks the break instead of a note claiming it.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(250)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._dispatch_on_main("data_symbols", {}, None)
+
+    assert page["limit"] == 100 and page["returned"] == 100
+    assert page["total"] == 250 and page["has_more"] is True
+    # ...and the bounded page is still a payload the consumer can decode.
+    problems: list[str] = []
+    rows = _check_container(page, "data_symbols", problems)
+    if rows is None:
+        rows = page["items"]
+    for i, row in enumerate(rows):
+        _check_row(row, _DATA_SYM, f"data_symbols[{i}]", problems, "data_symbols")
+    assert not problems, "\n".join(problems)
+
+    requested = _scheduled_request("data_symbols")
+    assert requested, (
+        "the paging default truncates this consumer's paramless call, but "
+        "KNOWN_BREAKS carries no `request:` entry for data_symbols -- the "
+        "break is then claimed rather than tracked, and a consumer applying "
+        "the register literally keeps a silently short index")
+
+    whole = instance._dispatch_on_main("data_symbols", requested, None)
+
+    assert whole["returned"] == 250 and whole["total"] == 250
+    assert whole["limit"] is None and whole["has_more"] is False
 
 
 def test_the_container_check_fires_when_a_break_is_not_yet_known(monkeypatch):
@@ -308,6 +524,35 @@ def test_the_container_check_fires_when_a_break_is_not_yet_known(monkeypatch):
 
     assert problems and "vars" in problems[0]
     assert "EMPTY list" in problems[0]
+
+
+def test_the_request_reader_is_empty_for_an_op_with_no_registered_request(monkeypatch):
+    # Non-vacuity guard for the third entry kind, the twin of the container
+    # one above. `_scheduled_request` is what makes the paging break tracked
+    # rather than claimed -- the lens test asserts its result is truthy -- so
+    # a reader that answered truthily for ANY op would turn that assertion
+    # into a tautology and the register entry back into a note.
+    assert _scheduled_request("data_vars") == {}
+    assert _scheduled_request("cfg") == {}
+    assert _scheduled_request("no_such_op") == {}
+    assert _scheduled_request("data_symbols") == {"limit": "all"}
+
+    # Both value shapes reach the wire as themselves: a count as an int, a
+    # token as the word. Sending "100" where the op wants a number, or 0
+    # where it wants a word, is the drift this reader exists to prevent.
+    monkeypatch.setitem(KNOWN_BREAKS, ("probe_count", "request:limit=100"), "note")
+    assert _scheduled_request("probe_count") == {"limit": 100}
+    monkeypatch.setitem(KNOWN_BREAKS, ("probe_signed", "request:limit=+1"), "note")
+    assert _scheduled_request("probe_signed") == {"limit": 1}
+
+    # A malformed entry must say so where it is registered, not surface as a
+    # bare parse error from the middle of an unrelated op's test.
+    monkeypatch.setitem(KNOWN_BREAKS, ("probe_op", "request:limit="), "note")
+    with pytest.raises(AssertionError, match="non-empty"):
+        _scheduled_request("probe_op")
+    monkeypatch.setitem(KNOWN_BREAKS, ("probe_op2", "request:limit"), "note")
+    with pytest.raises(AssertionError, match="non-empty"):
+        _scheduled_request("probe_op2")
 
 
 @pytest.mark.parametrize("op", sorted(_CONTAINERS))
@@ -334,7 +579,7 @@ def test_a_half_done_rename_on_a_defaulted_field_is_not_tolerated():
     """
     problems: list[str] = []
     row = {"a": "0x2000", "t": "int32_t", "w": 4}      # `n` dropped, nothing added
-    _check_row(row, _DATA_VAR, "data_vars[0]", problems)
+    _check_row(row, _DATA_VAR, "data_vars[0]", problems, "data_vars")
 
     assert problems, "a half-done rename on a defaulted field went unnoticed"
     assert "'n' is absent" in problems[0]
@@ -349,6 +594,45 @@ def test_a_conditional_field_may_be_absent_without_complaint():
     would be discarded as noise -- which is how a guard dies."""
     problems: list[str] = []
     row = {"a": "0x2000", "n": "g_count", "t": "int32_t", "w": 4}
-    _check_row(row, _DATA_VAR, "data_vars[0]", problems)
+    _check_row(row, _DATA_VAR, "data_vars[0]", problems, "data_vars")
 
     assert problems == []
+
+
+def test_a_scheduled_rename_never_tolerates_an_absence():
+    """Non-vacuity guard for the FIELD half of KNOWN_BREAKS.
+
+    A rename entry must tolerate the old name being GONE, not the field being
+    gone: `_check_row` moves the requirement to the new name, on the
+    `always_emitted` fact. Without this the field entries would degrade into an
+    allowlist that accepts a payload carrying neither name -- the "confidently
+    blank consumer" failure the container guard exists to prevent, one level
+    down."""
+    # The scheduled rename, satisfied: the new name is present and typed.
+    problems: list[str] = []
+    _check_row({"address": "0x1000", "text": "nop"}, _CFG_INSN,
+               "cfg.blocks[0].insns[0]", problems, "cfg")
+    assert not problems, problems
+
+    # ...and with the new name MISSING, the old absence is not tolerated.
+    problems = []
+    _check_row({"address": "0x1000"}, _CFG_INSN,
+               "cfg.blocks[0].insns[0]", problems, "cfg")
+    assert problems, ("a row with neither the old nor the new `text` key "
+                      "passed, so the tolerate-the-rename rule tolerates "
+                      "everything")
+    assert "'text'" in problems[0] and "missing" in problems[0]
+
+    # A field no scheduled entry covers is still an ordinary break, not a rename.
+    problems = []
+    _check_row({}, _DATA_VAR, "data_vars[0]", problems, "data_symbols")
+    assert problems and "'a'" in problems[0]
+
+    # Must-not-fire twin for the CONDITIONAL fields: their rename entry must NOT
+    # demand the replacement, or every ordinary row (no pointer, no decoded
+    # scalar, no section) would be a problem and the check would be noise. This
+    # is the same per-field reasoning `always_emitted` carries.
+    problems = []
+    _check_row({"address": "0x2000", "name": "g_count", "type": "int32_t",
+                "width": 4}, _DATA_VAR, "data_vars[0]", problems, "data_vars")
+    assert not problems, problems

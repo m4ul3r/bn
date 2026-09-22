@@ -4780,7 +4780,8 @@ def _render_sections_rows(value: Any) -> str:
 def _render_cfg_text(value: Any) -> str:
     """Render the cfg result: a function header, then each block's rendered
     lines and outgoing edges. Block `start` / edge `to` are IL instruction
-    indexes at IL levels (the identity contract), so they are echoed verbatim."""
+    indexes at IL levels (the identity contract), so they are echoed verbatim.
+    Lines are `{address, text}` and edges `{to, branch_type}` (#682 item 2)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     func = _field_dict(value, "function")
@@ -4797,12 +4798,12 @@ def _render_cfg_text(value: Any) -> str:
             if not isinstance(insn, dict):
                 parts.append(f"  {insn!r}")
                 continue
-            parts.append(f"  {insn.get('a', '?')}  {insn.get('t', '')}")
+            parts.append(f"  {insn.get('address', '?')}  {insn.get('text', '')}")
         for edge in _field_list(block, "edges"):
             if not isinstance(edge, dict):
                 parts.append(f"  -> {edge!r}")
                 continue
-            parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
+            parts.append(f"  -> {edge.get('to', '?')} [{edge.get('branch_type', '?')}]")
         # #682 item 3, live half: a block BN could not resolve the successors
         # of emits no edges at all, so without this line it renders exactly
         # like a block that genuinely has none -- e.g. a `jmp rax` reading as
@@ -4816,8 +4817,9 @@ def _render_cfg_text(value: Any) -> str:
 @_discloses
 def _render_data_vars_text(value: Any) -> str:
     """Render the data_vars window: one row per typed data variable, with the
-    decoded scalar (`= v`), pointer target (`-> p sym` / `-> p "str"`), and
-    section, plus a resume hint when the row cap truncated the window."""
+    decoded scalar (`= value`), pointer target (`-> pointer pointer_symbol` /
+    `-> pointer "pointer_string"`), and section, plus a resume hint when the row
+    cap truncated the window. Row keys are spelled out (#682 item 2)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     rows = _field_list(value, "items")  # #275: was `vars`
@@ -4826,20 +4828,21 @@ def _render_data_vars_text(value: Any) -> str:
         if not isinstance(row, dict):
             lines.append(f"  {row!r}")
             continue
-        cells = [str(row.get("a", "?")), str(row.get("t", "?")), f"w={row.get('w', '?')}"]
-        if row.get("n"):
-            cells.append(str(row["n"]))
-        if "v" in row:
-            cells.append(f"= {row['v']}")
-        if "p" in row:
-            target = f"-> {row['p']}"
-            if row.get("ps"):
-                target += f" {row['ps']}"
-            elif row.get("pstr") is not None:
-                target += f' "{row["pstr"]}"'
+        cells = [str(row.get("address", "?")), str(row.get("type", "?")),
+                 f"w={row.get('width', '?')}"]
+        if row.get("name"):
+            cells.append(str(row["name"]))
+        if "value" in row:
+            cells.append(f"= {row['value']}")
+        if "pointer" in row:
+            target = f"-> {row['pointer']}"
+            if row.get("pointer_symbol"):
+                target += f" {row['pointer_symbol']}"
+            elif row.get("pointer_string") is not None:
+                target += f' "{row["pointer_string"]}"'
             cells.append(target)
-        if row.get("sec"):
-            cells.append(f"[{row['sec']}]")
+        if row.get("section"):
+            cells.append(f"[{row['section']}]")
         lines.append("  ".join(cells))
     body = "\n".join(lines) if lines else _EMPTY_RESULT
     if value.get("has_more"):
@@ -4849,7 +4852,7 @@ def _render_data_vars_text(value: Any) -> str:
         # exactly the confident-looking partial answer this module exists to
         # stop. The row cell above renders the container's repr, so the value is
         # not invisible -- the missing HINT was, and now it is named.
-        last = _text_value(rows[-1], "a") if rows else None
+        last = _text_value(rows[-1], "address") if rows else None
         if last is not None:
             try:
                 hint = f"; resume with --start {hex(int(last, 16) + 1)}"
