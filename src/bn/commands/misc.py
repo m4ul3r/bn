@@ -151,9 +151,10 @@ def _imports(args: argparse.Namespace) -> int:
     # Summary is a single aggregate object, so it ignores paging entirely. The
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
-    params = {"summary": summary_mode, "offset": args.offset, "include_got": bool(args.include_got),
+    params = {"summary": summary_mode, "include_got": bool(args.include_got),
               "query": query, "regex": regex}
     if not summary_mode:
+        params["offset"] = args.offset
         params["limit"] = _effective_limit(args)
     return _call(
         args,

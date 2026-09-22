@@ -24,7 +24,7 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                    help="Return just the class count (respects --no-stl/--no-vendor/--query/"
                         "--all), plus artifact_count -- fast class-lens scale characterization")])
 def _class_list(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"offset": args.offset}
+    params: dict[str, Any] = {}
     if args.query:
         params["query"] = args.query
     if args.all_clusters:
@@ -40,9 +40,11 @@ def _class_list(args: argparse.Namespace) -> int:
         # rather than sending a flag that cannot mean anything.
         _refuse_count_only_slices(args, command="class list")
         params["count_only"] = True
-    limit = _effective_limit(args) if not args.count_only else None
-    if limit is not None:
-        params["limit"] = limit
+    else:
+        params["offset"] = args.offset
+        limit = _effective_limit(args)
+        if limit is not None:
+            params["limit"] = limit
     return _call(
         args, "class_list", params,
         require_target=True,

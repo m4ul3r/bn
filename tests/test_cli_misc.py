@@ -1643,6 +1643,7 @@ def test_count_siblings_alone_still_count_872(fake_transport, argv, label, op):
     assert calls, f"{label} sent nothing"
     assert calls[-1]["params"].get(key) is True, label
     assert "limit" not in calls[-1]["params"], label
+    assert "offset" not in calls[-1]["params"], label
 
 
 @pytest.mark.parametrize("extra", [["--limit", "5"], ["--offset", "1"]])
@@ -1697,6 +1698,7 @@ def test_imports_summary_alone_still_summarises_872(fake_transport):
     bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--summary"])
 
     assert calls and calls[-1]["params"]["summary"] is True
+    assert "offset" not in calls[-1]["params"]
 
 
 def test_imports_count_alone_still_counts(fake_transport):
