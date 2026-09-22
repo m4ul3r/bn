@@ -40,6 +40,10 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import vars as vars_mod
 from .bridge_state import _quick_loaded_views
+# #777: the ONE definition of the failure-status vocabulary, reached through the
+# same symlinked-leaf arrangement paths/version/target_hint already use, because
+# the bridge must not import the `bn` CLI package.
+from .mutation_statuses import FAILED_MUTATION_STATUSES
 from ._shared import (
     USER_FACING_ERRORS,
     OperationFailure,
@@ -106,15 +110,23 @@ def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
     entries, ``types show``), so a batch manifest inferred from what the tool
     *shows* naturally uses ``type_name`` and would otherwise fail validation with
     "missing required field 'struct_name'". Normalize to the canonical
-    ``struct_name`` in place (an explicit ``struct_name`` always wins) so the
-    pre-apply snapshot pass and the apply both resolve the struct. (M12)
+    ``struct_name`` so the pre-apply snapshot pass and the apply both resolve the
+    struct. (M12)
+
+    #825: returns a normalized COPY instead of editing the caller's dict. The
+    in-place version handed back the same object with an extra `struct_name` key
+    written into it, so a caller's own manifest silently gained a field it never
+    wrote -- externally observable, and a trap for any caller that re-reads,
+    re-sends, hashes or diffs its request after a batch. Callers take the return
+    value; an op needing no normalization is returned unchanged, so the common
+    path still allocates nothing.
     """
     if not isinstance(op, dict):
         return op
     kind = op.get("op")
-    if isinstance(kind, str) and kind.startswith("struct_field_"):
-        if "struct_name" not in op and "type_name" in op:
-            op["struct_name"] = op["type_name"]
+    if (isinstance(kind, str) and kind.startswith("struct_field_")
+            and "struct_name" not in op and "type_name" in op):
+        return {**op, "struct_name": op["type_name"]}
     return op
 
 # Op kinds that mutate a function's local variables via create_user_var /
@@ -657,6 +669,47 @@ def _operation_requested(ctx, op: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in op.items() if key != "preview"}
 
 
+def _refuse_unmapped_mutation_address(
+    ctx, bv, op: dict[str, Any], address: int, consequence: str
+) -> None:
+    """Refuse an affirmatively-unmapped mutation target, and ONLY that.
+
+    A typo'd address used to be accepted by the address-taking mutations,
+    writing into nowhere and then reporting `verified` against its own
+    readback -- while `comment get` rejected the identical address. An
+    unmapped target is a bad REQUEST, not an unsupported operation, hence
+    `invalid_request`.
+
+    The guard is deliberately TRI-STATE and the middle state is the whole
+    reason this is a helper rather than an inlined `if` (#890, the #777 drift
+    shape): `is_valid_offset` answers mapped, unmapped, or nothing at all.
+    Only an AFFIRMATIVE "unmapped" refuses. A view that does not implement
+    the probe, or whose probe raises, is INDETERMINATE and must keep working
+    -- reduced views and test fakes live there, and hardening the middle
+    state into a refusal would reject perfectly good requests. That is the
+    same distinction that kept `_require_mapped_address` and
+    `_address_is_mapped` separate under #827 item 3c, so it is stated once
+    here instead of being re-derived at each callsite.
+
+    *consequence* completes "Address 0x… is not mapped in this binary, so …",
+    because the actionable half of the message is what the caller was trying
+    to do, which the callsite knows and this helper does not.
+    """
+    is_valid = getattr(bv, "is_valid_offset", None)
+    if not callable(is_valid):
+        return
+    try:
+        mapped = bool(is_valid(address))
+    except Exception:  # noqa: BLE001 - a raising probe is indeterminate, not invalid
+        mapped = True
+    if not mapped:
+        raise OperationFailure(
+            "invalid_request",
+            f"Address {hex(address)} is not mapped in this binary, so {consequence}",
+            requested=_operation_requested(ctx, op),
+        )
+
+
 
 def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) -> dict[str, Any]:
     op_label = str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>"
@@ -698,7 +751,19 @@ def _mark_unverified_results(
 
 
 def _has_failed_results(ctx, results: list[dict[str, Any]]) -> bool:
-    return any(item.get("status") in {"unsupported", "verification_failed"} for item in results)
+    """True when any per-op result carries a FAILURE status (#777).
+
+    This gates "revert the batch". It used to carry its own inline
+    ``{"unsupported", "verification_failed"}`` literal -- a strict subset of the
+    canonical five, missing ``invalid_request``, ``rollback_failed`` and
+    ``internal_error``. The drift was latent rather than live (no ``_verify_*``
+    raises the other three, and apply-phase failures short-circuit before this
+    runs), but it was a landmine aimed squarely at the revert path: the next
+    verifier to raise one of the missing statuses would leave the batch
+    UN-REVERTED while the CLI still, correctly, reported exit 3. Reading the one
+    shared definition removes the drift instead of re-syncing two copies.
+    """
+    return any(item.get("status") in FAILED_MUTATION_STATUSES for item in results)
 
 
 
@@ -1116,7 +1181,12 @@ def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             f"Tag {type_name!r} not found after add ({scope} scope).",
             requested=item.get("requested"), observed=item["observed"],
         )
-    item["status"] = "verified"
+    # #779: the readback above is unchanged -- the tag must still be present or
+    # this raises. All that changes is WHICH success status is reported: an add
+    # that found its (type, data) pair already there wrote nothing, and `noop`
+    # is the status this codebase already uses for "already in the requested
+    # state" (it is a success, and it does not affect the exit code).
+    item["status"] = "noop" if item.get("pre_existing") else "verified"
     return item
 
 
@@ -1569,6 +1639,23 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
     defined_types = dict(item.get("defined_types") or {})
     defined_type_layouts = dict(item.get("defined_type_layouts") or {})
+    # #758 observes, correctly, that this guard is unreachable from the one
+    # production dispatch path: `_op_types_declare` raises `invalid_request` the
+    # moment its parse yields no named types, and that raise short-circuits the
+    # batch long before verification runs, so a real result always carries at
+    # least one entry here. RETAINED anyway, deliberately.
+    #
+    # This is a verifier -- the function whose entire job is refusing to stamp
+    # `verified` on something it did not observe. An empty `defined_types` is a
+    # result claiming a declaration landed while naming nothing that landed, and
+    # the failure mode of removing the check is the worst one this codebase has:
+    # a mutation that declared nothing reported as a success. The guard costs
+    # eight lines and one branch, it is pinned by
+    # `test_declared_types_verifier_rejects_an_empty_apply_result`, and
+    # `_verify_operation` is reachable from batch replay as well as the single
+    # op path, so "today's only caller cannot produce it" is a weaker guarantee
+    # than it looks. Unreachable-by-construction is a reason to keep a boundary
+    # check cheap, not a reason to delete it.
     if not defined_types:
         item["observed"] = {
             "defined_types": {},
@@ -1694,7 +1781,7 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None, 
             "invalid_request",
             f"each manifest operation must be a JSON object, got {type(op).__name__}",
         )
-    _normalize_struct_alias(op)  # type_name -> struct_name alias for struct ops (M12)
+    op = _normalize_struct_alias(op)  # type_name -> struct_name alias (M12/#825)
     kind = _validate_operation_request(ctx, op)
     try:
         if kind == "rename_symbol":
@@ -2105,8 +2192,9 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     # Normalize struct field op aliases up front so the pre-apply snapshot pass
     # (_guess_affected_functions / _capture_type_snapshots) resolves the struct
     # under the same key the apply will, not just _apply_operation. (M12)
-    for op in operations:
-        _normalize_struct_alias(op)
+    # #825: rebind rather than mutate -- the normalized list is this function's
+    # own, so the caller's manifest dicts are left exactly as they were sent.
+    operations = [_normalize_struct_alias(op) for op in operations]
     # #652: reject a same-key-twice manifest BEFORE touching the view.
     _reject_duplicate_write_keys(ctx, operations)
 
@@ -2533,6 +2621,9 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
             "requested": _operation_requested(ctx, op),
         }
     address = _parse_address(op["address"])
+    _refuse_unmapped_mutation_address(
+        ctx, bv, op, address, "no comment can be set there."
+    )
     before_comment = bv.get_comment_at(address) or ""
     if before_comment != comment:
         bv.set_comment_at(address, comment)
@@ -2593,34 +2684,63 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
         )
     requested = _operation_requested(ctx, op)
 
+    # #779: an add whose (type, data) pair is ALREADY present is a no-op, and
+    # BN's add_tag does not dedupe -- `_find_new_tag` exists precisely because
+    # every call mints a fresh Tag with its own id, so running `bn tag add`
+    # twice genuinely produced two identical tags and still reported `verified`
+    # both times. Check before writing, exactly as `_op_set_comment` compares
+    # `before_comment` before assigning, and hand the verifier a `pre_existing`
+    # flag so it can report `noop` instead of claiming a write that did not
+    # happen. Skipping the write is also what keeps revert honest: tag ops roll
+    # back through BN's undo journal, so an add that never happened records
+    # nothing to undo and a pre-existing tag cannot be destroyed by reverting
+    # someone else's preview.
+    def _existing(tags):
+        return next((t for t in tags if _tag_matches(t, type_name, data)), None)
+
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        before_ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
-        fn.add_tag(type_name, data, None)
-        tag = _find_new_tag(before_ids, fn.get_function_tags(auto=False))
+        tag = _existing(fn.get_function_tags(auto=False))
+        pre_existing = tag is not None
+        if not pre_existing:
+            before_ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
+            fn.add_tag(type_name, data, None)
+            tag = _find_new_tag(before_ids, fn.get_function_tags(auto=False))
         return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "function",
                 "function": fn.name, "address": hex(int(fn.start)),
                 "tag_id": str(tag.id) if tag is not None else None,
-                "message": f"Added function tag {type_name!r} to {fn.name}.",
+                "pre_existing": pre_existing,
+                "message": (f"Function tag {type_name!r} already present on {fn.name}."
+                            if pre_existing else
+                            f"Added function tag {type_name!r} to {fn.name}."),
                 "requested": requested}
 
     addr = _parse_address(op["address"])
     force_data = bool(op.get("force_data"))
     funcs = bv.get_functions_containing(addr)
     if force_data or not funcs:
-        before_ids = {str(t.id) for t in bv.get_tags_at(addr, auto=False)}
-        bv.add_tag(addr, type_name, data)
-        tag = _find_new_tag(before_ids, bv.get_tags_at(addr, auto=False))
+        tag = _existing(bv.get_tags_at(addr, auto=False))
+        pre_existing = tag is not None
+        if not pre_existing:
+            before_ids = {str(t.id) for t in bv.get_tags_at(addr, auto=False)}
+            bv.add_tag(addr, type_name, data)
+            tag = _find_new_tag(before_ids, bv.get_tags_at(addr, auto=False))
         note = "" if force_data else " (no function contains this address)"
         return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "data",
                 "address": hex(addr), "function": None,
                 "tag_id": str(tag.id) if tag is not None else None,
-                "message": f"Added data tag {type_name!r} at {hex(addr)}{note}.",
+                "pre_existing": pre_existing,
+                "message": (f"Data tag {type_name!r} already present at {hex(addr)}."
+                            if pre_existing else
+                            f"Added data tag {type_name!r} at {hex(addr)}{note}."),
                 "requested": requested}
     fn = funcs[0]
-    before_ids = {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
-    fn.add_tag(type_name, data, addr)
-    tag = _find_new_tag(before_ids, fn.get_tags_at(addr, auto=False))
+    tag = _existing(fn.get_tags_at(addr, auto=False))
+    pre_existing = tag is not None
+    if not pre_existing:
+        before_ids = {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
+        fn.add_tag(type_name, data, addr)
+        tag = _find_new_tag(before_ids, fn.get_tags_at(addr, auto=False))
     return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "address",
             "address": hex(addr), "function": fn.name,
             # Record the EXACT function the tag was added to (its stable start
@@ -2629,7 +2749,10 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
             # match on a DIFFERENT function pass verification (#630).
             "function_start": hex(int(fn.start)),
             "tag_id": str(tag.id) if tag is not None else None,
-            "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
+            "pre_existing": pre_existing,
+            "message": (f"Tag {type_name!r} already present at {hex(addr)} in {fn.name}."
+                        if pre_existing else
+                        f"Added tag {type_name!r} at {hex(addr)} in {fn.name}."),
             "requested": requested}
 
 
@@ -3182,23 +3305,9 @@ def _op_data_retype(ctx, bv, op: dict[str, Any]):
     buffer (verified live: revert_undo_actions restores the prior auto type), so the
     standard preview/rollback machinery covers it with no explicit restore."""
     address = _parse_address(op["address"])
-    # A typo'd/unmapped address must be a clean invalid_request, not a data var
-    # defined into nowhere and then reported `verified` against itself. (An
-    # indeterminate view -- no is_valid_offset -- is not rejected; only an
-    # affirmative "unmapped" is, mirroring _require_mapped_address.)
-    is_valid = getattr(bv, "is_valid_offset", None)
-    if callable(is_valid):
-        try:
-            mapped = bool(is_valid(address))
-        except Exception:
-            mapped = True
-        if not mapped:
-            raise OperationFailure(
-                "invalid_request",
-                f"Address {hex(address)} is not mapped in this binary, so no data "
-                "variable can be defined there.",
-                requested=_operation_requested(ctx, op),
-            )
+    _refuse_unmapped_mutation_address(
+        ctx, bv, op, address, "no data variable can be defined there."
+    )
     expected_type, _ = _parse_concrete_type(ctx, bv, op, op["new_type"], label="type")
     before = bv.get_data_var_at(address)
     before_type = str(before.type) if before is not None else None
@@ -3837,6 +3946,43 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
                 "dropped_declarations": dropped,
             },
         )
+    # #778: a declaration may ALSO carry function prototypes / variable
+    # declarations. The parser returns all three buckets and this op applies
+    # only `types`; the other two were echoed as bare `parsed_functions` /
+    # `parsed_variables` counts with nothing saying they had NOT been applied,
+    # so a caller who declared a struct and its accessors in one header got the
+    # struct, a `verified` status, and no signal about the rest.
+    #
+    # DISCLOSED, not refused. Refusing was the first cut and it is wrong twice
+    # over: #760 already settled that a variable declaration with a brace
+    # initializer is a USAGE rather than a definition and must not break working
+    # input (test_types_declare_allows_a_variable_declaration_with_a_brace_
+    # initializer_760), and a header that declares a type alongside the
+    # functions taking it is the normal shape -- refusing it would reject the
+    # very input this verb exists for.
+    #
+    # Applying them is not possible here either: a bare `int f(struct S *);`
+    # carries no ADDRESS, and BN binds a function type through
+    # `Function.set_user_type` and a data var through `define_user_data_var`,
+    # both of which need a target this op never receives. Matching prototypes to
+    # symbols by name would invent an address-resolution policy nobody asked
+    # for. So the honest answer is to say plainly what was and was not applied
+    # and name the address-aware verbs that can finish the job.
+    _proto_fns = [str(name) for name, _ in parsed["functions"]]
+    _proto_vars = [str(name) for name, _ in parsed["variables"]]
+    _unapplied_note = None
+    if _proto_fns or _proto_vars:
+        _named = "; ".join(
+            part for part in (
+                f"function prototype(s): {', '.join(_proto_fns)}" if _proto_fns else "",
+                f"variable declaration(s): {', '.join(_proto_vars)}" if _proto_vars else "",
+            ) if part
+        )
+        _unapplied_note = (
+            f"declared the named types only; NOT applied -- {_named}. A bare "
+            "prototype carries no address, so bind it with `bn proto set "
+            "<function>` or `bn data retype <address>`."
+        )
     # Backstop for any OTHER malformed layout the parser might emit (beyond the
     # bitfield case caught above): a member extending past the struct width is a
     # corrupt layout that must not be applied and reported `verified` (#322).
@@ -3874,6 +4020,13 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "parsed_type_count": len(named_types),
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
+        # #778: the two buckets this verb parsed but CANNOT bind, stated as
+        # not-applied rather than left for the caller to infer from a bare
+        # count. Absent entirely when the declaration was types-only, so an
+        # ordinary request grows no keys and reads exactly as before.
+        **({"unapplied_prototypes": {"functions": _proto_fns,
+                                     "variables": _proto_vars},
+            "unapplied_note": _unapplied_note} if _unapplied_note else {}),
         "requested": _operation_requested(ctx, op),
     }
 

@@ -4250,8 +4250,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #823: `_render_spill_gc_text` joins the population with three
     # discovered container reads (`candidates`, `skipped`, `errors`), so every
     # derived count here moves by its contribution alone. Measured.
-    # 1236 + 18 (#823) = 1254.
-    assert checked == 1254, f"the differential ran {checked} cases, not 1254"
+    # 1236 + 18 (#823) + 6 (#890) = 1260, measured on the merged tree.
+    assert checked == 1260, f"the differential ran {checked} cases, not 1260"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4303,8 +4303,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #823: `_render_spill_gc_text` joins the population with three
     # discovered container reads (`candidates`, `skipped`, `errors`), so every
     # derived count here moves by its contribution alone. Measured.
-    # 4944 + 72 (#823) = 5016.
-    assert swept == 5016, f"the raise sweep ran {swept} renders, not 5016"
+    # 4944 + 72 (#823) + 8 (#890) = 5024, measured on the merged tree.
+    assert swept == 5024, f"the raise sweep ran {swept} renders, not 5024"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4465,8 +4465,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #823: `_render_spill_gc_text` joins the population with three
     # discovered container reads (`candidates`, `skipped`, `errors`), so every
     # derived count here moves by its contribution alone. Measured.
-    # 1442 + 21 (#823) = 1463.
-    assert checked == 1463, f"the mirror ran {checked} renders, not 1463"
+    # 1442 + 21 (#823) + 3 (#890) = 1466, measured on the merged tree.
+    assert checked == 1466, f"the mirror ran {checked} renders, not 1466"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7091,7 +7091,7 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
+    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7118,10 +7118,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert (rendered, checked) == (1980, 1188), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
-        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 792 "
+    # #877/#890 adds the unapplied_prototypes field to the op row: 11 keys,
+    # 2178 rendered and 1298 checked on this merged tree.
+    assert (rendered, checked) == (2178, 1298), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
+        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips 880 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a
