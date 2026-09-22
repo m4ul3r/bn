@@ -6223,6 +6223,38 @@ def _render_class_list_text(value: Any) -> str:
     ven = value.get("vendor_suppressed") or 0
     if value.get("no_vendor") and ven:
         hidden_parts.append(f"{ven} vendored")
+    # #675.2: user-declared class types are folded out by the confidence gate the
+    # way name-only clusters are, so the default listing says they exist instead
+    # of reading as a lens that never saw the class the user declared.
+    #
+    # Read inside its OWN boundary, tight around these three reads so no other
+    # field's skew is swallowed (the mutation card's per-entry layout reads use
+    # the same pattern). The bridge sets this key to a sentinel ON PURPOSE when
+    # it could not measure the set -- or one declaration in it -- and the
+    # `@_discloses` note for a skewed read then says the payload's "rows or
+    # counts may be missing or partial", which reads as a corrupt response
+    # rather than the documented state (#907 review round 3). `_stated_count`
+    # still prints `?` on the line a caller acts on, which IS the disclosure;
+    # what is dropped is only the second, contradictory sentence.
+    with disclosure_boundary():
+        ds = _count_field(value, "declared_suppressed")
+        skewed = _field_skewed("declared_suppressed")
+        stated = _stated_count(value, "declared_suppressed")
+    if ds or skewed:
+        # `_stated_count`, not the raw count: an unreadable counter must not print
+        # as `0 user-declared class types`, which reads as "the lens looked and
+        # found none". The noun names the population exactly, because twice it did
+        # not: it counted the view's WHOLE type table when it said "declared type",
+        # and every type BN itself imported when it said "declared class type"
+        # (#907 review). What it counts is what `--all` adds: the class types this
+        # view's USER declared.
+        # `(--all to show)` is ADVICE, so it is printed only while it is still
+        # actionable. An `--all` run whose declared set could not be read still
+        # states the unknown, and telling the reader to pass the flag they just
+        # passed reads as a different, unsatisfied suggestion (#907 review r5).
+        hidden_parts.append(
+            f"{stated} user-declared class type{'s' if ds != 1 else ''}"
+            + ("" if value.get("include_all") else " (--all to show)"))
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
@@ -6453,4 +6485,25 @@ def _render_one_class(rec: Any) -> str:
         # #822: the 128-per-list cap is disclosed with exact totals, so a capped
         # result is never read as a complete one (the vtable cap's shape).
         lines.append("  instances (capped): " + "; ".join(hidden))
+    # #675.2: a declared-type record states WHY its vtable/methods/instances are
+    # empty (no RTTI class, no demangled methods, no construction sites for this
+    # name in this view), which is the one line that tells absence from silence on
+    # a card whose every other evidence block is legitimately empty. Through the
+    # choke point, so a malformed `notes` container discloses instead of dropping
+    # the line that carries the distinction.
+    for note in _field_list(rec, "notes"):
+        lines.append(f"  note: {note}")
+    # #675.2: the DECLARATION itself. The record carries the canonical `types`
+    # entry and no renderer read it, so the default format -- text -- printed a
+    # size and the note and nothing else: an agent that had just declared a class
+    # WITH members saw a card showing none, and the shipped reference promises
+    # this card carries "object size and the canonical `types` entry" (#907
+    # review round 3). Same precedence as `types show` (`_render_type_info_text`):
+    # the rendered layout when there is one, else the decl line, so an
+    # unfollowable alias states its reference rather than inventing members.
+    entry = _field_dict(rec, "type")
+    declaration = _text_value(entry, "layout") or _text_value(entry, "decl")
+    if declaration:
+        lines.append("  declared as:")
+        lines.extend(f"    {line}" for line in declaration.splitlines())
     return "\n".join(lines)
