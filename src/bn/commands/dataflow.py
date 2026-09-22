@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, arg, command
+from ..cli import _call, _depth_int, _int_at_least, arg, command
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -16,6 +16,15 @@ from ..formatters import (
     _resolution_note,
 )
 from ..transport import BridgeError
+
+
+# #812: the fixpoint remediation string ("raise --max-iters", taint_result.py
+# _truncation_hint / the formatters truncation clause) named a flag that did not
+# exist, so a truncated run told the user to do something impossible. Built here
+# rather than beside `_depth_int` in cli.py so the label reads "iterations"
+# instead of "depth" in the argparse error -- an iteration budget of 0 analyses
+# nothing, so the floor is 1.
+_iters_int = _int_at_least(1, "iterations")
 
 
 def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -169,6 +178,11 @@ _SINK_LOCATOR_HELP = (
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural recursion depth into callees (default: 8; "
                       "0 = intraprocedural only)"),
+             arg("--max-iters", dest="max_iters", type=_iters_int, default=256,
+                 help="Max intra-function fixpoint iterations before the walk is "
+                      "reported unconverged (default: 256). Raise when a result "
+                      "reports truncation_cause fixpoint_exhausted; the configured "
+                      "value is echoed back in run_params."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
@@ -194,6 +208,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "function": args.function,
         "sources": list(args.sources),
         "max_depth": int(args.max_depth),
+        "max_iters": int(args.max_iters),
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
     }
