@@ -3660,8 +3660,10 @@ def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
         # STRICT: answers False, i.e. treats "cannot tell" as "not mapped".
         assert read_decompile._address_is_mapped(bv, 0x1000) is False, label
         # The op the permissive policy exists for: a clean zero, not a raise.
-        assert read_tags._get_tags(_Ctx(bv), None, "0x1000", None) == {
-            "address": "0x1000", "tags": [], "count": 0}, label
+        tags = read_tags._get_tags(_Ctx(bv), None, "0x1000", None)
+        assert tags["address"] == "0x1000", label
+        assert tags["tags"] == [], label
+        assert tags["count"] == 0, label
 
 
 def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
