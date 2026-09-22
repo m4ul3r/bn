@@ -63,7 +63,8 @@ Every key below is present except `prototype_user_type_residue`, emitted only wh
 | `committed` | whether live apply reached commit, including all-noop |
 | `preview` | whether preview was requested |
 | `measured` | false when result rows or required counters cannot establish counts |
-| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero; `op_count` is not necessarily the manifest size for `go rename` |
+| `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
+| `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
 | `rolled_back` | true/false when restore was attempted, null when none was needed |
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |

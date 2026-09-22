@@ -1,8 +1,10 @@
 ---
 name: bn-re
 description: >-
-  Reverse-engineering specialist for a long binary-mapping task through bn.
-  Returns a compact function and type map instead of decompiler output.
+  Reverse-engineering specialist for open-ended binary mapping through bn:
+  functions, types, and call paths. Dispatch for long, multi-function work to
+  keep decompiler and xref output out of the orchestrator's context; returns a
+  compact map. NOT for vulnerability hunting (use bn-vr).
 tools: Bash, Read, Grep, Glob
 skills: [bn-re, bn]
 model: inherit

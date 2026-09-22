@@ -1,6 +1,6 @@
 ---
 name: bn-kernel
-description: "Use OMP's retained Python kernel for large Binary Ninja reads through bn when rows should stay in Python rather than the transcript. Bind a bridge instance and target explicitly; use the bn CLI for lifecycle and mutations."
+description: "Use OMP's retained Python kernel for list-shaped, multi-function, grep-like, or locally filtered Binary Ninja reads where rows should stay in Python rather than the transcript. Bind a bridge instance and target explicitly; use the bn CLI for lifecycle and mutations."
 ---
 
 # bn-kernel

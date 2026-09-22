@@ -1,8 +1,11 @@
 ---
 name: bn-vr
 description: >-
-  Vulnerability-research specialist for a long binary audit through bn.
-  Enumerates sinks, traces input paths, and returns bounded evidence and coverage.
+  Vulnerability-research specialist for security audits through bn: entry
+  points, source-to-sink paths, and exploitability. Dispatch for long,
+  multi-sink work to keep decompiler and taint output out of the orchestrator's
+  context; returns bounded findings and coverage. NOT for open-ended reversing
+  (use bn-re).
 tools: Bash, Read, Grep, Glob
 skills: [bn-vr, bn]
 model: inherit

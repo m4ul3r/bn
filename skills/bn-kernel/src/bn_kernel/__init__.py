@@ -530,6 +530,8 @@ def _target_name_candidates(observed_basename: str) -> set[str]:
     A cached database is named ``<basename>.<16 hex>.bndb``. Strip that digest
     once, matching the bridge selector. Keep the ordinary ``Path.stem`` check,
     which also lets ``sample`` assert an ordinary ``sample.bin`` view.
+    That stem check is deliberately broader than ``_matches_record`` for an
+    ordinary view; do not narrow it while handling cached names (#733 F3).
     """
     candidates = {observed_basename, Path(observed_basename).stem}
     if observed_basename.endswith(".bndb"):
