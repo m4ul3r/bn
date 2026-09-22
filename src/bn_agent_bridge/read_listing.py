@@ -14,7 +14,8 @@ Outbound calls resolve through:
   * ``il_format`` -- the pure IL/HLIL/disasm renderers and iteration helpers
     (``_structured_disasm_entries``, ``_iter_llil_instructions``, ``_il_op_name``,
     ``_hlil_statement_text``, ``_hlil_pre_branch_condition``,
-    ``_instruction_length``, ``_llil_constant_value``);
+    ``_instruction_length``, ``_llil_constant_value``, ``_decompile_text`` for
+    the callsite decompile excerpt);
   * ``_shared`` -- module-free helpers (``_validate_count``, ``_parse_address``,
     ``OperationFailure``).
 
@@ -71,6 +72,137 @@ def _callee_variadic_hint(callee) -> dict[str, Any] | None:
             "`bn disasm <caller> --linear`."
         ),
     }
+
+
+# #792: decompiled lines of context the callsite excerpt carries on either side of
+# the callsite when its HLIL statement cannot be localized.
+_DECOMPILE_EXCERPT_WINDOW = 3
+# #792 review: the per-LINE cap for that window, set to the same 240 characters
+# `il_format._hlil_text_is_local` refuses, so a statement too long to be a local
+# statement cannot reappear in full through the excerpt.
+_EXCERPT_LINE_MAX_CHARS = 240
+
+
+def _callsite_decompile_render(bv, func) -> tuple[list[str], list[int]]:
+    """The decompiled body of *func*, plus the gutter address of each line (#792).
+
+    Both renderers this can excerpt (``il_format._pseudo_c_text`` and its HLIL
+    fallback) prefix a line with ``hex(address)`` and eight spaces, so the leading
+    token is the line's address; ``-1`` marks a line without one (a blank spacer,
+    a closing brace, or a ``// bn:`` degradation marker). A rendering failure is
+    reported as an empty render -- the callsite's identity never depends on it."""
+    try:
+        text = il_format._decompile_text(bv, func, addresses=True)
+    except Exception:
+        text = ""
+    lines = text.splitlines() if text else []
+    addresses: list[int] = []
+    for line in lines:
+        head = line.split(None, 1)[0] if line.strip() else ""
+        try:
+            addresses.append(int(head, 16) if head[:2] == "0x" else -1)
+        except ValueError:
+            addresses.append(-1)
+    return lines, addresses
+
+
+def _callsite_decompile_excerpt(render: tuple[list[str], list[int]], call_addr: int,
+                                func_start: int) -> dict[str, Any]:
+    """A bounded decompiled window around *call_addr* (#792).
+
+    When ``hlil_statement`` cannot be localized, the callsite is still readable in
+    the decompilation -- this is what ``bn decompile <caller>`` renders, captured
+    in-row so an agent need not re-run it and correlate addresses by hand. A row
+    that did not carry it offered only disassembly fields for a call the
+    decompiler plainly shows.
+
+    The render is in CONTROL-FLOW order, not address order (#792 review): a switch
+    emits its cases out of sequence and the closing brace carries the FUNCTION
+    START, so a positional/scan-order rule anchors on the epilogue. The callsite's
+    own line is found by EXACT address, and only that miss falls back to proximity.
+    """
+    lines, addresses = render
+    excerpt: dict[str, Any] = {"window": _DECOMPILE_EXCERPT_WINDOW, "lines": []}
+    if not lines:
+        excerpt["reason"] = "decompile_text_unavailable"
+        return excerpt
+    # The renderer emits the callsite's statement with the call's own address, so an
+    # exact match IS the callsite and needs no order assumption at all.
+    anchor = next((index for index, address in enumerate(addresses)
+                   if address == call_addr), None)
+    if anchor is None:
+        # No exact hit (the statement's gutter can carry an earlier instruction of
+        # the same statement, or the call sits inside a line keyed elsewhere): fall
+        # back to the numerically nearest guttered line, EXCLUDING the
+        # function-entry address -- a real render puts that on the closing brace,
+        # which in control-flow order is often the LAST line and would otherwise
+        # win every proximity contest. Ties prefer the earlier line, which is the
+        # one a statement's first-instruction key puts before the call.
+        candidates = [index for index, address in enumerate(addresses)
+                      if address >= 0 and address != func_start]
+        if candidates:
+            anchor = min(candidates, key=lambda index: (abs(addresses[index] - call_addr),
+                                                        addresses[index] > call_addr, index))
+    if anchor is None:
+        # Nothing in this render is attributable to the callsite: say so rather
+        # than pointing at the function's tail (#792 review).
+        excerpt["reason"] = "statement_not_located"
+        return excerpt
+    excerpt["anchor_address"] = hex(addresses[anchor])
+    window = _DECOMPILE_EXCERPT_WINDOW
+    excerpt["lines"] = _cap_excerpt_lines(lines[max(0, anchor - window):anchor + window + 1],
+                                          excerpt)
+    return excerpt
+
+
+def _cap_excerpt_lines(lines: list[str], excerpt: dict[str, Any]) -> list[str]:
+    """Cap each excerpted line at ``_EXCERPT_LINE_MAX_CHARS`` (#792 review).
+
+    A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line, and such a row is exactly the null-statement row
+    that needs an excerpt -- 7 of them is the whole-function blob #557 refuses to
+    put in ``hlil_statement``. The cap and the per-line count of capped lines keep
+    the excerpt's cost bounded and its shape self-describing; a truncated line is
+    never presented as verbatim."""
+    capped: list[str] = []
+    truncated = 0
+    for line in lines:
+        if len(line) > _EXCERPT_LINE_MAX_CHARS:
+            truncated += 1
+            line = (line[:_EXCERPT_LINE_MAX_CHARS]
+                    + f" ... [+{len(line) - _EXCERPT_LINE_MAX_CHARS} chars]")
+        capped.append(line)
+    if truncated:
+        excerpt["truncated_lines"] = truncated
+    return capped
+
+
+def _attach_callsite_excerpts(bv, page_rows: list[dict[str, Any]]) -> None:
+    """Fill ``decompile_excerpt`` on the rows of the RETURNED PAGE, in place (#792).
+
+    The excerpt is the only callsite field that costs a whole-function
+    decompilation, so it is a PAGE projection, not a scan-time one. `_callsites`
+    scans until it holds ``offset + limit + 1`` rows to answer the paging
+    contract, so building the excerpt while scanning paid a render for every
+    caller the `--offset`/`--limit` window then discarded -- the population-wide
+    per-row work #814 forbids. Here the cost is bounded by the page the caller
+    asked for, and one render still serves every row of the same caller.
+
+    Rows carrying no ``_excerpt_fn`` (their HLIL statement localized, or they
+    came from a test double) are left exactly as they are.
+    """
+    renders: dict[int, tuple[list[str], list[int]]] = {}
+    for row in page_rows:
+        func = row.pop("_excerpt_fn", None)
+        if func is None:
+            continue
+        start = int(func.start)
+        render = renders.get(start)
+        if render is None:
+            render = renders[start] = _callsite_decompile_render(bv, func)
+        row["decompile_excerpt"] = _callsite_decompile_excerpt(
+            render, int(row["call_addr"], 16), start
+        )
 
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
@@ -181,6 +313,17 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         )
         if variadic_hint is not None:
             rows[-1]["callee_variadic"] = variadic_hint
+        if hlil_statement is None:
+            # #792: the statement is null (with a reason), but the callsite is
+            # still visible in the decompilation. Rendering that body is by far
+            # the most expensive thing this row can carry, so the row only
+            # RECORDS which function would have to be rendered and
+            # `_attach_callsite_excerpts` fills the excerpt for the returned page
+            # -- the same transient-handle convention `_fn` uses for the function
+            # listing, and the same reason (#814): a scan that reads
+            # `offset + limit + 1` rows must not pay a whole-function
+            # decompilation for the rows paging then drops.
+            rows[-1]["_excerpt_fn"] = func
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
 
@@ -416,11 +559,13 @@ def _callsites(
                 "callee_symbol_only": callee_symbol_only,
             }
         )
+        _attach_callsite_excerpts(bv, result["items"])
         return result
 
     if scan_truncated:
         assert limit is not None
         page = rows[offset:offset + limit]
+        _attach_callsite_excerpts(bv, page)
         return {
             "kind": "callsites",
             "items": page,
@@ -451,6 +596,7 @@ def _callsites(
             "callee_symbol_only": callee_symbol_only,
         }
     )
+    _attach_callsite_excerpts(bv, result["items"])
     return result
 
 
@@ -874,18 +1020,15 @@ def _filtered_functions(
     return functions
 
 
-def _extent_known(fn) -> bool:
-    """Whether this record's extent can be read at all (#757 review)."""
-    size = il_format._function_size(fn)
-    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
-
-
 def _duplicate_extent_key(fn) -> tuple[int, int]:
     """Order two records that claim the SAME start address by extent (#757).
 
-    Only consulted for a group whose every member has a readable extent
-    (see `_collapse_duplicate_starts`), so the readable-size preference here is
-    a tiebreak among comparable records, not a substitute for comparison.
+    ``(extent is readable, extent)``, so an unreadable extent sorts below every
+    readable one and the caller can tell readable from unreadable off the key
+    without sizing the record twice. The key ORDERS; it does not by itself
+    choose: a group collapses only where every key is readable and exactly one
+    of them is the maximum, because two records of equal extent are not ranked
+    by extent at all (see `_collapse_duplicate_starts`).
     """
     size = il_format._function_size(fn)
     known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
@@ -964,18 +1107,19 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartC
     rows assert ``size_known: true`` -- so a size-sorted triage or a "small
     function = stub" heuristic reads whichever record sorted first as fact, per
     address, with no round trip that could tell the two apart (#757). One
-    address is one function here: the record with the LARGER extent is retained
-    (the real body; the phantom is the smaller, stub-shaped one), and every
-    address that had more than one record is reported so the collapse is
-    disclosed rather than silent.
+    address is one function here ONLY where the extents settle it: the record
+    with the strictly LARGER extent is retained (the real body; the phantom is
+    the smaller, stub-shaped one), and every address that had more than one
+    record is reported so the collapse is disclosed rather than silent.
 
-    Returns ``(kept, collapse)``. A group whose members are all sized collapses,
-    and its larger extent wins. A group where any extent is UNREADABLE cannot be
-    ordered by that rule at all, so it is left standing and recorded as
-    ``unresolved`` -- the issue's own second answer ("or report the conflict"),
-    and the only option that cannot promote a phantom. The caller turns
-    *collapse* into the two published counts with `_StartCollapse.counts`, once
-    it knows which rows its answer kept.
+    Returns ``(kept, collapse)``. A group collapses when every member's extent
+    is readable AND one of them is strictly the largest. Any other group is
+    left standing and recorded as ``unresolved`` -- the issue's own second
+    answer ("or report the conflict"), and the only option that cannot promote
+    a phantom. Two groups reach it: one where an extent is UNREADABLE, and one
+    where the largest extent is SHARED. The caller turns *collapse* into the
+    two published counts with `_StartCollapse.counts`, once it knows which rows
+    its answer kept.
 
     Cheap by construction: addresses with a single record (every address on a
     well-formed target) are never sized -- the extent read happens only inside a
@@ -1007,16 +1151,25 @@ def _collapse_duplicate_starts(functions: list[Any]) -> tuple[list[Any], _StartC
         if len(group) == 1:
             kept.append(group[0])
             continue
-        if all(_extent_known(fn) for fn in group):
-            winner = max(group, key=_duplicate_extent_key)
+        extents = [_duplicate_extent_key(fn) for fn in group]
+        widest = max(extents)
+        if all(readable for readable, _ in extents) and extents.count(widest) == 1:
+            winner = group[extents.index(widest)]
             collapsed.append(winner)
             kept.append(winner)
             continue
-        # "Keep the larger extent" is undefined when a record's extent cannot be
-        # read at all: choosing the record that happens to state a size lets a
-        # stub-shaped phantom outvote a real body the view would not size -- the
-        # exact confusion #757 was filed for. The issue's other accepted answer
-        # is "report the conflict", so the group is left intact and disclosed.
+        # "Keep the larger extent" does not name a record in two cases, and
+        # both of them silently picked one anyway. An extent that cannot be
+        # read at all is the first: choosing the record that happens to state a
+        # size lets a stub-shaped phantom outvote a real body the view would
+        # not size -- the exact confusion #757 was filed for. Equal extents are
+        # the second: `max` returns the FIRST maximum, and the population
+        # arrives `(start, name)`-ordered, so the survivor of a tie was chosen
+        # by NAME -- alphabetical order deciding which of two conflicting
+        # records a reader is shown, while the row said `collapsed` and the
+        # text note said the larger extent was kept (#757 review round 9).
+        # The issue's other accepted answer is "report the conflict", so the
+        # group is left intact and disclosed in both cases.
         unresolved.append(tuple(group))
         kept.extend(group)
     return kept, _StartCollapse(tuple(collapsed), tuple(unresolved))
@@ -1026,10 +1179,12 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
                                unresolved: int = 0) -> dict[str, Any]:
     """Attach the #757 duplicate-start counts, when there were any.
 
-    ``duplicate_starts_collapsed`` counts addresses where the larger extent was
-    kept; ``duplicate_starts_unresolved`` counts addresses where BN holds
-    another record whose extent could not be read, so the issue's rule could not
-    be applied and NO record was chosen there (see `_collapse_duplicate_starts`).
+    ``duplicate_starts_collapsed`` counts addresses where one record's extent
+    was strictly the largest and that record was kept;
+    ``duplicate_starts_unresolved`` counts addresses where the extents could
+    not rank the records -- BN holds one whose extent cannot be read, or two
+    that claim the SAME extent -- so NO record was chosen there (see
+    `_collapse_duplicate_starts`).
     Both are present only when non-zero, so the common envelope keeps the key
     set every consumer already parses (the ``got_collapsed`` /
     ``self_defined_excluded`` convention in ``read_misc._imports``). A caller
@@ -1305,10 +1460,15 @@ def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
     (#59). `kind` is the envelope discriminator (#275); `items` is the sole data
     container (the legacy `functions` alias was dropped in the #275 clean
     break)."""
-    start, stop = read_misc._page_window(len(items), offset=offset, limit=limit)
-    return read_misc._paged_envelope(
-        kind=kind, items=items[start:stop], total=len(items), offset=offset, limit=limit,
-    )
+    # #827 item 3: this body was a verbatim twin of
+    # `read_misc._paged_list_result` -- both sliced with `_page_window` and
+    # wrapped with `_paged_envelope`, in that order, with the same arguments.
+    # The shared rule already existed; these were two thin wrappers over it that
+    # could drift independently. Delegated rather than deleted because the
+    # signature differs deliberately: this one takes `ctx` (for call-shape
+    # parity with its sibling listing helpers) and defaults `kind` to
+    # "functions", so every caller keeps working unchanged.
+    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind=kind)
 
 
 def _search_functions(

@@ -963,6 +963,70 @@ def test_duplicate_start_rows_carry_their_own_marker_757(monkeypatch):
     assert "duplicate_start" not in instance._list_functions(None)["items"][0]
 
 
+def test_tied_extents_are_reported_not_decided_by_name_order_757(monkeypatch):
+    """Two records of EQUAL extent at one start are not ranked by extent, so
+    neither may be dropped.
+
+    `max()` returns the FIRST maximum and the population arrives
+    `(start, name)`-ordered, so a tie was resolved ALPHABETICALLY: of two
+    64-byte records `tie_a` survived `tie_b`, and renaming them `zz_big` /
+    `aa_big` moved the survivor to `aa_big` -- the same view, a different
+    answer, decided by a name. The surviving row then said `collapsed` and
+    the text note said "the larger extent was kept", neither of which
+    happened; nothing disclosed that a name had picked the winner (#757
+    review round 9).
+
+    A tie is the collapse rule failing to name a record, exactly like an
+    unreadable extent, so it takes the same path the issue's second answer
+    defines: keep both, mark both, count the address as unresolved.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # On the seam: both records survive and the group is recorded unresolved.
+    pair = [_FakeFunction(0x401014, "tie_a", total_bytes=64),
+            _FakeFunction(0x401014, "tie_b", total_bytes=64)]
+    kept, collapse = bridge.read_listing._collapse_duplicate_starts(pair)
+    assert kept == pair
+    assert collapse.counts(kept) == (0, 1)
+
+    # ...and through the command in BOTH name orders: the answer cannot
+    # depend on which of the tied names sorts first.
+    tied_envs = []
+    for names in (("tie_a", "tie_b"), ("zz_big", "aa_big")):
+        _view(monkeypatch, instance, [
+            _FakeFunction(0x401014, names[0], total_bytes=64),
+            _FakeFunction(0x401014, names[1], total_bytes=64),
+        ])
+        env = instance._list_functions(None)
+        tied_envs.append(env)
+        assert sorted(row["name"] for row in env["items"]) == sorted(names), env
+        assert {row["duplicate_start"] for row in env["items"]} == {"unresolved"}, env
+        assert env.get("duplicate_starts_unresolved") == 1, env
+        assert "duplicate_starts_collapsed" not in env, env
+
+    # The rule is narrowed, not disabled: a strictly larger extent still wins,
+    # and still wins against the name order rather than with it.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "zz_big", total_bytes=64),
+        _FakeFunction(0x401014, "aa_small", total_bytes=8),
+    ])
+    ranked = instance._list_functions(None)
+    assert [row["name"] for row in ranked["items"]] == ["zz_big"], ranked
+    assert ranked["duplicate_starts_collapsed"] == 1, ranked
+    assert "duplicate_starts_unresolved" not in ranked, ranked
+
+    # The text face makes the promise only where it was kept: "the larger
+    # extent was kept" belongs to the ranked answer, and the tie gets the
+    # clause that is true of it.
+    from bn import formatters
+    ranked_text = formatters._render_function_list_text(ranked)
+    tied_text = formatters._render_function_list_text(tied_envs[0])
+    assert "the larger extent was kept" in ranked_text, ranked_text
+    assert "the larger extent was kept" not in tied_text, tied_text
+    assert "no record was chosen" in tied_text, tied_text
+
+
 def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeypatch):
     """ONE scoping rule, and paging is not part of it.
 
@@ -1005,392 +1069,773 @@ def test_duplicate_start_counts_are_scoped_to_the_total_not_the_page_757(monkeyp
     assert searched["duplicate_starts_unresolved"] == 1
 
 
-def _duplicate_starts_bullet() -> str:
-    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`.
+def _entry_region(lines: list[str], index: int) -> str:
+    """The markdown list item beginning at *index*: that line and everything
+    printed before the next one opens.
 
-    The WHOLE entry, continuation lines included. Returning only the first line
-    that mentions the key let a second physical line of the same bullet carry
-    prose no check ever saw (#757 review round 6).
+    Three narrower rules have already been defeated -- the first line only
+    (round 6), stopping at the first blank or `#`-prefixed line (round 7), and
+    stopping at a real ATX heading, which let `###### note: <lie>` sit
+    directly under the entry and outside the compared region (round 8). A
+    reader sees whatever is printed between the two bullets, so whatever is
+    printed between the two bullets IS the entry. Split out of the reader
+    below so the rule itself can be pinned on input the reference does not
+    have to contain (round 9: reverting it left the guard green).
     """
+    region = [lines[index]]
+    for nxt in lines[index + 1:]:
+        if nxt.startswith("- "):
+            break
+        region.append(nxt)
+    return "\n".join(region)
+
+
+def _duplicate_starts_bullet() -> str:
+    """The duplicate-start-disclosure entry of `skills/bn/reference/reading.md`."""
     reference = (Path(__file__).resolve().parent.parent
                  / "skills" / "bn" / "reference" / "reading.md")
     lines = reference.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if "duplicate_starts_unresolved" not in line:
-            continue
-        entry = [line]
-        for nxt in lines[i + 1:]:
-            if not nxt.strip() or nxt.startswith("- ") or nxt.startswith("#"):
-                break
-            entry.append(nxt)
-        return "\n".join(entry)
-    raise AssertionError("reading.md carries no duplicate-start bullet")
+    starts = [i for i, line in enumerate(lines)
+              if "duplicate_starts_unresolved" in line]
+    assert starts, "reading.md carries no duplicate-start bullet"
+    assert len(starts) == 1, (
+        "more than one line of reading.md names the disclosure key, so the "
+        f"entry is no longer identifiable: lines {[i + 1 for i in starts]}")
+    return _entry_region(lines, starts[0])
 
 
-def _measure_duplicate_start_behaviour(bridge, instance, monkeypatch) -> dict:
-    """Every fact the reference bullet claims, READ OFF the bridge.
+def _publishes_duplicate_starts(payload) -> bool:
+    """Does this payload disclose a duplicated start ANYWHERE in JSON?
 
-    The bullet has to describe two structurally different outcomes -- a start
-    whose records can be ranked (one wins on extent) and one whose records
-    cannot (none is chosen, every record stays) -- plus how the two counts
-    behave under a row filter and under paging, which surfaces print them, and
-    what a clean view does. Each is measured here and returned, so the prose
-    check below compares wording against behaviour instead of against a fixed
-    substring list -- and so EVERY sentence of the bullet has a measurement to
-    be checked against.
+    Recursive on purpose. `evidence orient` carries the counts twice -- at its
+    own level and inside its nested `target` block -- so a top-level-only test
+    reads a payload that still discloses in JSON as silent, and the entry's
+    parity claim then holds vacuously on exactly the surface it was written
+    for (#757 review round 7).
+    """
+    if isinstance(payload, Mapping):
+        return any(str(k).startswith("duplicate_start")
+                   or _publishes_duplicate_starts(v) for k, v in payload.items())
+    if isinstance(payload, (list, tuple)):
+        return any(_publishes_duplicate_starts(v) for v in payload)
+    return False
+
+
+def _text_discloses_duplicate_starts(text: str, count_keys) -> bool:
+    """Does this rendering say anything about a duplicated start?
+
+    Either the `// duplicate starts` note a card prints, or the count keys
+    themselves -- a payload with no dedicated renderer falls back to a JSON
+    dump, which prints the keys verbatim. Both are disclosure; only a face
+    showing neither is silent while its payload publishes (#757 review round
+    8).
+    """
+    return "duplicate starts" in text or any(k in text for k in count_keys)
+
+
+def _duplicate_start_faces(bridge, instance, monkeypatch, population) -> dict:
+    """The text faces a duplicate-start payload reaches, each paired with the
+    payload behind it.
+
+    The reference makes ONE claim about text -- parity: a face says something
+    about a duplicated start exactly when the payload behind it publishes one.
+    Where the line lands inside a card is a rendering detail and is
+    deliberately not claimed (#757 review round 7).
+
+    Each face is the payload the bridge really builds rendered by the text
+    renderer the COMMAND really uses -- `target info` composes annotations onto
+    the shared summary, so measuring the shared renderer measured a proxy.
     """
     from bn import formatters
+    from bn.commands import binary as binary_cmd
+
+    bv = _view(monkeypatch, instance, population)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []))
+    listing = instance._list_functions(None)
+    counted = instance._list_functions(None, count_only=True)
+    searched = instance._search_functions("active", "")
+    info = instance._target_info(None)
+    # Only the digest's sub-reads are stubbed, and only the ones that need a
+    # richer view than this population: its function count, and both counts,
+    # still come from the real collapse.
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary",
+                                               "total_symbols": 0, "by_kind": {}})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings", "items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [{"name": ".text"}], "total": 1})
+    digest = instance._orient_digest(None)
+    return {
+        "function list": (listing, formatters._render_function_list_text(listing)),
+        "function search": (searched,
+                            formatters._render_function_list_text(searched)),
+        "function list --count": (counted,
+                                  formatters._render_function_count_text(counted)),
+        "target info": (info,
+                        binary_cmd._render_target_info_text_with_annotations(info)),
+        "evidence orient": (digest, formatters._render_orient_text(digest)),
+        # The renderer any payload without a dedicated one falls back to: it
+        # prints the keys verbatim, so it discloses too -- measured, not
+        # assumed, because the entry's claim is over every text face.
+        "json fallback": (info, formatters._render_fallback_text(info)),
+    }
+
+
+def test_target_and_orient_share_one_duplicate_start_note_900(monkeypatch):
+    """The first-contact text faces use the same disclosure as function list."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    faces = _duplicate_start_faces(bridge, instance, monkeypatch, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=96),
+        _FakeFunction(0x401000, "init_stub", total_bytes=4),
+        _FakeFunction(0x401100, "widget_poll", total_bytes=48),
+    ])
+    notes = []
+    for surface in ("function list", "target info", "evidence orient"):
+        payload, rendered = faces[surface]
+        assert payload["duplicate_starts_collapsed"] == 1
+        found = [line.strip() for line in rendered.splitlines()
+                 if "// duplicate starts" in line]
+        assert len(found) == 1, (surface, rendered)
+        notes.append(found[0])
+    assert notes[0] == notes[1] == notes[2]
+
+    clean = _duplicate_start_faces(bridge, instance, monkeypatch, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=96),
+    ])
+    for surface in ("function list", "target info", "evidence orient"):
+        payload, rendered = clean[surface]
+        assert "duplicate_starts_collapsed" not in payload
+        assert "// duplicate starts" not in rendered
+
+
+def _measure_duplicate_start_disclosure(bridge, instance, monkeypatch) -> dict:
+    """The duplicate-start contract, READ OFF the bridge, over EVERY shape
+    review has found this entry wrong about.
+
+    Two things, because they are the two a reader has to get right: what a
+    duplicated start does to the ROWS, and what it does to the COUNTS. The
+    BEHAVIOUR is pinned here in full; the reference entry rendered from this
+    dict by `_render_duplicate_starts_bullet` states only the envelope
+    contract, because nine rounds proved every per-shape sentence false on
+    some shape. Reducing the PROSE is not reducing the pin: everything below
+    is still measured off the bridge and still asserted.
+
+    The populations below are the measurement's whole claim surface. Every
+    one of them satisfies the same two invariants -- a group whose extents
+    rank one record strictly highest keeps that record, and any other group
+    keeps them all -- with a tie now on the second side of that line, where
+    the survivor used to be whichever name sorted first.
+    """
+    def _rows_at(env, address="0x401014"):
+        return [r for r in env["items"] if r["address"] == address]
 
     # RANKED: every extent readable, so the group can be ordered by extent.
-    resolved_pop = [
+    ranked_pop = [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
         _FakeFunction(0x401014, "poll_stub", total_bytes=4),
     ]
-    _view(monkeypatch, instance, resolved_pop)
-    resolved = instance._list_functions(None)
-    resolved_rows = [r for r in resolved["items"] if r["address"] == "0x401014"]
-    dropped_named = instance._search_functions("active", "poll_stub")
-    ranked_kept, _ = bridge.read_listing._collapse_duplicate_starts(list(resolved_pop))
+    _view(monkeypatch, instance, ranked_pop)
+    ranked = instance._list_functions(None)
+    ranked_rows = _rows_at(ranked)
+
+    # RANKED, SHARED NAME: #757's own reported shape -- both records carry the
+    # loader-assigned name, so nothing about NAMES can be claimed here.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=96),
+        _FakeFunction(0x401014, "sub_401014", total_bytes=4),
+    ])
+    same_name = instance._list_functions(None)
+    same_name_rows = _rows_at(same_name)
+
+    # TIED EXTENTS: both readable and EQUAL, so the extents rank nothing and
+    # the group is left standing. It used to collapse to whichever name
+    # sorted first (#757 review round 9).
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "tie_a", total_bytes=64),
+        _FakeFunction(0x401014, "tie_b", total_bytes=64),
+    ])
+    tied = instance._list_functions(None)
+    tied_rows = _rows_at(tied)
 
     # UNRANKED: one extent unreadable, so the rule cannot pick a record. THREE
-    # records, because the bullet may not claim the group is a pair -- this is
-    # the issue's own reported shape (two rows asserting conflicting sizes at
-    # one address, both `size_known: true`).
-    _view(monkeypatch, instance, [
+    # records, so the prose may not describe the group as a pair.
+    unranked_pop = [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
         _FakeFunction(0x401014, "poll_alt", total_bytes=32),
         _FakeFunction(0x401014, "poll_stub"),          # extent unreadable
-    ])
-    unresolved = instance._list_functions(None)
-    unresolved_rows = [r for r in unresolved["items"] if r["address"] == "0x401014"]
-    named_back = [instance._search_functions("active", row["name"])["total"]
-                  for row in unresolved_rows]
+    ]
+    _view(monkeypatch, instance, unranked_pop)
+    unranked = instance._list_functions(None)
+    unranked_rows = _rows_at(unranked)
+    # A row filter that leaves ONE record of the address, and one that leaves
+    # none of them: the counts count addresses, so only the second drops.
     kept = instance._list_functions(None, min_size=64, count_only=True)
     gone = instance._list_functions(None, min_size=1000, count_only=True)
+    # A row filter narrows the ROWS too, and by HOW MUCH depends entirely on
+    # the threshold -- 64 leaves one record of this address, 16 leaves two.
+    # The entry therefore says a filter narrows and says no number (#757
+    # review rounds 8 and 9).
+    filtered = instance._list_functions(None, min_size=64)
+    filtered_rows = _rows_at(filtered)
+    loosely_filtered_rows = _rows_at(instance._list_functions(None, min_size=16))
 
-    # PAGED: a window that contains NONE of the counted addresses.
-    _view(monkeypatch, instance, resolved_pop + [
+    # UNRANKED, EVERY EXTENT UNREADABLE: still unranked, still all kept.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "sizeless_a"),
+        _FakeFunction(0x401014, "sizeless_b"),
+    ])
+    sizeless = instance._list_functions(None)
+    sizeless_rows = _rows_at(sizeless)
+
+    # UNRANKED, SHARED NAME: the other half of the shape #757 reports.
+    _view(monkeypatch, instance, [
+        _FakeFunction(0x401014, "sub_401014", total_bytes=96),
+        _FakeFunction(0x401014, "sub_401014"),
+    ])
+    unranked_same_name = instance._list_functions(None)
+    unranked_same_name_rows = _rows_at(unranked_same_name)
+
+    # PAGED: a window holding none of the counted addresses.
+    _view(monkeypatch, instance, ranked_pop + [
         _FakeFunction(0x402000 + i * 0x10, f"fn_{i}", total_bytes=32) for i in range(4)
     ])
     paged = instance._list_functions(None, offset=3, limit=2)
+    paged_rows = _rows_at(paged)
 
-    # THE FOUR TEXT SURFACES that print a post-collapse function count, so the
-    # bullet's claims about WHERE the note appears are measured rather than
-    # asserted. `target info` reads the summary the bridge builds; the orient
-    # card reads the digest shape `_orient_digest` produces (its key COPY is
-    # pinned by `test_orient_digest_discloses_the_duplicate_start_collapse_757`
-    # -- what is measured here is the text face, which is what the bullet
-    # claims).
-    surface_bv = _view(monkeypatch, instance, [
+    collided = _duplicate_start_faces(bridge, instance, monkeypatch, [
         _FakeFunction(0x401000, "widget_init", total_bytes=28),
         _FakeFunction(0x401014, "widget_poll", total_bytes=96),
         _FakeFunction(0x401014, "poll_stub", total_bytes=4),
         _FakeFunction(0x401100, "widget_tick", total_bytes=64),
         _FakeFunction(0x401100, "tick_stub"),
     ])
-    summary = bridge._function_name_summary(surface_bv)
-    count_env = instance._list_functions(None, count_only=True)
-    faces = {
-        "listing": formatters._render_function_list_text(instance._list_functions(None)),
-        "count": formatters._render_function_count_text(count_env),
-        # A real card, not a two-line stub: the note has to sit UNDER the count
-        # with the rest of the card after it, which a stub cannot show.
-        "target info": formatters._render_target_summary(
-            {"selector": "t", "arch": "x86_64", "import_symbol_count": 0, **summary}),
-        "evidence orient": formatters._render_orient_text({
-            "kind": "orient_digest", "target": {"basename": "t"}, "analyzed": True,
-            "analysis_state": "full",
-            "function_count": count_env["total"],
-            **{k: v for k, v in count_env.items() if k.startswith("duplicate_start")},
-            "imports_summary": {"total_symbols": 0, "by_kind": {}},
-        }),
-    }
+    clean_faces = _duplicate_start_faces(bridge, instance, monkeypatch, [
+        _FakeFunction(0x401000, "widget_init", total_bytes=28),
+    ])
 
-    def _note_line(face: str) -> int:
-        lines = faces[face].splitlines()
-        return next((i for i, line in enumerate(lines) if "duplicate starts" in line), -1)
-
-    def _count_line(face: str) -> int:
-        lines = faces[face].splitlines()
-        return next((i for i, line in enumerate(lines) if "functions" in line), -1)
-
-    # CLEAN: nothing collided, so nothing may be published or printed.
-    _view(monkeypatch, instance, [_FakeFunction(0x401000, "widget_init", total_bytes=28)])
-    clean = instance._list_functions(None)
-
+    envelopes = (ranked, same_name, tied, unranked, sizeless, unranked_same_name,
+                 kept, gone, filtered, paged,
+                 *(payload for payload, _ in collided.values()))
+    row_keys = {k for env in envelopes for row in env.get("items", ())
+                for k in row if k.startswith("duplicate_start")}
+    # Every RANKED shape (one extent strictly largest): that row survives and
+    # it carries the largest extent its group held. Every UNRANKED shape
+    # (an unreadable extent, or a tie at the top): nothing is dropped.
+    ranked_shapes = (
+        ("distinct names", ranked_rows, (96, 4)),
+        ("shared name", same_name_rows, (96, 4)),
+    )
+    unranked_shapes = (
+        ("three records, one unsized", unranked_rows, 3),
+        ("every extent unreadable", sizeless_rows, 2),
+        ("shared name", unranked_same_name_rows, 2),
+        ("tied extents", tied_rows, 2),
+    )
     return {
-        "envelopes": (resolved, unresolved, paged, kept, gone),
-        "rows": tuple(resolved["items"]) + tuple(unresolved["items"]),
-        # BN holds more than one record for one start, and their sizes disagree.
-        "one_start_holds_conflicting_records": (
-            len(ranked_kept) == len(resolved_pop) - 1
-            and resolved_rows and resolved_rows[0]["size"] == 96
-        ),
-        # A ranked start answers with ONE row, and it is the larger extent.
-        "resolved_is_one_row": len(resolved_rows) == 1 and resolved_rows[0]["size"] == 96,
-        # The record it dropped is gone from the other command too, so the
-        # collapse ran on the population BEFORE the query filtered it.
-        "dropped_is_unreachable": dropped_named["total"] == 0,
-        # An unranked start answers with EVERY record it has, whatever the count...
-        "unresolved_keeps_all": len(unresolved_rows) == 3,
-        # ...and naming ANY of them returns that record.
-        "unranked_records_reachable": named_back == [1, 1, 1],
-        # A record BN did size still reports a real size there -- the marker,
-        # not `size_known`, is what says it never won a comparison.
-        "unranked_sized_record_keeps_size_known": (
-            sum(1 for row in unresolved_rows if row["size_known"]) == 2
-        ),
-        # Rows of a duplicated start are labelled individually.
-        "rows_are_labelled": {row.get("duplicate_start") for row in unresolved_rows} == {
-            "unresolved"},
-        # Both keys are published...
-        "both_keys_published": {
-            k for env in (resolved, unresolved) for k in env
-            if k.startswith("duplicate_starts_")
-        } == {"duplicate_starts_collapsed", "duplicate_starts_unresolved"},
-        # ...and EVERY text face that prints a post-collapse function count
-        # prints the note. Measured across all four, so the bullet cannot name
-        # a surface the note does not reach (nor stay silent about one it does).
-        "text_prints_on_every_surface": all(_note_line(f) >= 0 for f in faces),
-        # WHERE it appears differs, and the bullet has to say so: the two
-        # listing surfaces end with it...
-        "note_is_last_on_the_listing_surfaces": all(
-            _note_line(f) == len(faces[f].splitlines()) - 1 for f in ("listing", "count")
-        ),
-        # ...while the two cards put it directly under the count it modifies,
-        # with more of the card after it.
-        "note_sits_under_the_count_on_the_cards": all(
-            _note_line(f) == _count_line(f) + 1
-            and _note_line(f) < len(faces[f].splitlines()) - 1
-            for f in ("target info", "evidence orient")
-        ),
-        # ...so "trailing" is not true of every surface, and may not be claimed.
-        "note_is_last_everywhere": all(
-            _note_line(f) == len(faces[f].splitlines()) - 1 for f in faces
-        ),
-        # `--offset`/`--limit` do not move the counts: this page carries the
-        # disclosure while holding none of the addresses it counts.
-        "counts_survive_paging": (
-            paged.get("duplicate_starts_collapsed") == 1
-            and all(row["address"] != "0x401014" for row in paged["items"])
-        ),
-        # A row filter that leaves one record of the address keeps the count...
-        "filter_keeps_the_count": (
-            kept["total"] == 1 and kept.get("duplicate_starts_unresolved") == 1
-        ),
-        # ...and one that removes every record of it takes the count with them.
-        "filter_drops_the_count": "duplicate_starts_unresolved" not in gone,
-        # A view with no collision publishes neither key and prints nothing.
-        "clean_view_is_silent": (
-            not any(k.startswith("duplicate_start") for k in clean)
-            and "duplicate" not in formatters._render_function_list_text(clean)
+        # Every key any measured envelope carries, so the render's backticked
+        # vocabulary can be checked against the payload rather than a list.
+        "envelope_keys": frozenset(k for env in envelopes for k in env),
+        "count_keys": tuple(sorted(
+            {k for env in envelopes for k in env
+             if k.startswith("duplicate_starts_")})),
+        "row_keys": tuple(sorted(row_keys)),
+        "markers": tuple(sorted(
+            {row[k] for env in envelopes for row in env.get("items", ())
+             for k in row_keys if k in row})),
+        # Which marker each case puts on its rows, so the entry can say what
+        # the two values MEAN without the mapping being a phrase.
+        "ranked_marker": ranked_rows[0].get("duplicate_start") if ranked_rows else None,
+        "unranked_marker": ({row.get("duplicate_start") for row in unranked_rows}
+                            or {None}).pop(),
+        # ONE row survives every ranked shape, carrying that group's largest
+        # extent -- reported per shape so a failure names the shape.
+        "ranked_keeps_one_largest": tuple(
+            (label, len(rows) == 1 and bool(rows) and rows[0]["size"] == max(sizes))
+            for label, rows, sizes in ranked_shapes),
+        # NOTHING is dropped from any unranked shape.
+        "unranked_keeps_all": tuple(
+            (label, len(rows) == records) for label, rows, records in unranked_shapes),
+        "ranked_extents_all_readable": all(
+            fn.total_bytes is not None for fn in ranked_pop if fn.start == 0x401014),
+        "unranked_extents_all_readable": all(
+            fn.total_bytes is not None for fn in unranked_pop if fn.start == 0x401014),
+        # A row filter and a page each narrow what the collapse kept, and by
+        # how much is a property of the filter, not of the collapse: the two
+        # thresholds below leave different numbers of the SAME group.
+        "narrowing": tuple(sorted({len(filtered_rows), len(loosely_filtered_rows),
+                                   len(paged_rows)})),
+        "unranked_rows": len(unranked_rows),
+        "kept_total": kept["total"],
+        "kept_count": kept.get("duplicate_starts_unresolved"),
+        "gone_count": gone.get("duplicate_starts_unresolved"),
+        "paged_count": paged.get("duplicate_starts_collapsed"),
+        "paged_holds_a_counted_address": bool(paged_rows),
+        # The target-info face has to be the COMMAND's composed card, not the
+        # shared summary renderer: only the command's adds the #793 block.
+        "target_info_face_is_the_command_card": (
+            "existing annotations" in collided["target info"][1]),
+        "parity": tuple(
+            (f"{state} {face}", _publishes_duplicate_starts(payload),
+             _text_discloses_duplicate_starts(
+                 text, ("duplicate_starts_collapsed", "duplicate_starts_unresolved")))
+            for state, faces in (("collided", collided), ("clean", clean_faces))
+            for face, (payload, text) in faces.items()
         ),
     }
 
 
-#: The bullet, pinned EXACTLY. Every check below decides the claims it can
-#: name; four rounds of review proved that a claim can always be phrased to
-#: sit outside whatever the current rule inspects -- token-free, behind a
-#: comma, in a semicolon clause, on a continuation line. Finer split rules
-#: lose that race by construction. Equality does not: the prose cannot change
-#: at all without this failing, and the only legitimate way to change it is to
-#: edit this constant, which puts a human back in front of the paired claims
-#: below and the measurements behind them. The claims are what make the pinned
-#: text TRUE; this makes it the only text that ships (#757 review round 6).
-_PINNED_BULLET = (
-    '- **Duplicate function start addresses are disclosed in text, not only in JSON.** Binary Ninja can hold two Function records for one start address with conflicting sizes (#757). '
-    '`function list` and `function search` collapse the same population, everything `--min-address`/`--max-address` left, before the query matches anything; what happens there depends on whether the records can be RANKED. '
-    '**Ranked** (every extent readable): the address answers with ONE row carrying the larger extent, the rest are gone from both commands, and naming it returns nothing. '
-    "**Unranked** (any extent unreadable): no record is chosen, so ALL of that address's records stay in the answer, however many there are, and naming any of them returns it. "
-    'A record BN did size still reports `size_known: true` there, which means BN stated a size, not "this size won". '
-    'Each returned row of a duplicated start therefore carries `duplicate_start`: `"collapsed"` when this record won on extent, `"unresolved"` when nothing was ranked here — so a `--sort size` page that splits the group apart is still self-describing. '
-    'The counts are `duplicate_starts_collapsed` / `duplicate_starts_unresolved`, printed in text as a `// duplicate starts` line: last on the `function list` listing and on `--count`, and directly under the function count on `target info` and on `evidence orient`, whose counts are post-collapse too. '
-    '**Scope, one rule:** both counts are taken over the whole filtered answer `total` reports, everything `--min-size`, `--named` and the query left, and are NOT affected by `--offset`/`--limit`, so a page can disclose an address none of its rows holds, which is why the note names the total it counted against and why the rows carry their own label. '
-    'They count ADDRESSES, not dropped records: a filter that removes every record of an address removes its count with it, while an address that keeps even one record stays counted, so `duplicate_starts_unresolved: 1` beside `total: 1` is the expected shape, not a missing row. '
-    'Both keys exist only when non-zero, so a clean view prints nothing extra.'
-)
+#: Identifier-shaped words anywhere in the render, quoted or not:
+#: snake_case, kebab-case and camelCase alike. Round 8 shipped an invented
+#: `duplicate_starts_phantom` past a backtick-only check by not quoting it,
+#: and round 9 shipped `duplicateStartsPhantom` and
+#: `duplicate-starts-phantom` past a snake_case-only one. The render is also
+#: required to be ASCII, which is what closes the homoglyph spelling.
+_IDENTIFIER_TOKEN = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+\b|\b[a-z]+[A-Z][A-Za-z0-9]*\b")
 
 
-#: Splits the bullet into sentences. The trailing class swallows the markdown
-#: that closes one (`**`, a quote, a bracket) so the terminator is still the
-#: period the lookbehind matched.
-_SENTENCE_SPLIT = re.compile(r"(?<=\.)[*`\"')\]]*\s+")
+def _render_duplicate_starts_bullet(m: dict) -> str:
+    """The reference entry, RENDERED from the measured envelope.
 
-#: Every technical token in the bullet -- anything backticked, and every CLI
-#: flag -- must sit INSIDE a measured claim. Chasing ever-finer split points
-#: (sentence, then parenthetical, then comma) is an arms race the prose keeps
-#: winning; this is granularity-free instead. Strip the measured claims out of
-#: the bullet and whatever technical content is left over is, by construction,
-#: an assertion nothing decides. Connective prose -- "what happens there
-#: depends on", "(every extent readable)" -- carries no such token and stays
-#: free.
-_TECHNICAL_TOKEN = re.compile(r"`|--[a-z]")
+    Nine review rounds pinned this bullet, and each repair that ADDED a
+    clause became the next round's blocker: a substring list, a paired claim
+    inventory, sentence completeness, a residue rule, byte equality against a
+    hand-written constant, then two reductions. The defect never moved -- a
+    clause generalised from the fixture behind it. "Naming a dropped record
+    returns nothing" was true only of records with distinct names; "under a
+    size floor an unranked address keeps the record that passes" was true
+    only of one threshold. The behaviour has more shapes than a sentence can
+    carry (ranked, unranked, shared name, tied extent, row filtered, paged,
+    and their combinations), so every per-shape claim is a liability.
+
+    The operator's terminal ruling, applied here: the entry states the
+    ENVELOPE CONTRACT and nothing else. That a start address can carry more
+    than one Function record, and that the answer discloses it through the
+    two counts named exactly, in JSON and in text alike. Which record an
+    answer keeps, whether a dropped one is reachable by name, what a row
+    filter or a page does to the counts, what a tie does, any per-shape
+    quantity: deleted, not reworded. A reader who needs one of those reads
+    the answer, which is measured. "The entry does not explain X" is that
+    ruling, not a defect.
+
+    What this guard catches, exactly:
+
+    * a reference edited without this template, or this template edited
+      without the reference: the shipped list item must EQUAL this render,
+      byte for byte, over the WHOLE item (`_entry_region`: its continuation
+      lines, indented paragraphs and lazy headings included, up to the next
+      list item);
+    * an identifier-shaped or backticked token the measurement did not
+      produce, in any spelling -- snake_case, kebab-case, camelCase
+      (`_IDENTIFIER_TOKEN`) or a non-ASCII homoglyph (the ASCII assertion) --
+      with no hand-written vocabulary left to exempt one;
+    * any digit but the issue's;
+    * a renamed count key, or an inverted parity clause: both are read off
+      the measurement, so the render moves with the bridge and the reference
+      must follow.
+
+    What it does NOT catch, and nothing here does:
+
+    * this template and the reference edited TOGETHER -- a hedge, a
+      contradicting parenthetical, a false sentence built from measured
+      vocabulary, or the consistent DELETION of a true clause. The reduction
+      is what shrinks this: two sentences of envelope contract are a much
+      smaller surface to write a falsehood onto than the six clauses of
+      per-shape behaviour they replaced;
+    * prose OUTSIDE this list item -- a sibling bullet immediately above or
+      below it renders adjacent to the entry and is not this entry;
+    * a shape the measurement below does not cover. That is the residual the
+      reduction is an answer to, not a gap it closes.
+    """
+    keys = " / ".join(f"`{k}`" for k in m["count_keys"])
+    parity = ("and every text face that answer reaches discloses it too"
+              if all(discloses is publishes for _, publishes, discloses in m["parity"])
+              else "and a text face can stay silent about it")
+    return (
+        "- **Duplicate function start addresses are disclosed (#757).** Binary "
+        "Ninja can hold more than one Function record for one start address. "
+        f"Where an answer holds such an address it publishes {keys}, {parity}. "
+        "This entry states no more than that on purpose: every summary of what "
+        "the collapse does to a given answer has been false on some shape of "
+        "it, so the answer carries that truth and this page does not restate "
+        "it."
+    )
 
 
 def test_reading_reference_states_the_duplicate_start_rule_the_bridge_applies_757(monkeypatch):
-    """The reference has to say what the payload does -- checked against a
-    MEASURED envelope, not against a substring allow-list.
+    """The reference entry has to be what the bridge does -- so it is rendered
+    from a measurement of the bridge, and the file must match.
 
-    Three review rounds each deleted one over-claim from this bullet and shipped
-    its mirror image, because the guard here was three `in bullet` checks plus
-    one absence check: prose that was plainly false about the unresolved case
-    still passed it, so nothing ever caught the replacement (#757 review round
-    4). Three properties close that, and all three are needed:
+    Rounds 3-6 each removed one false claim from this entry and shipped its
+    mirror image, because the guard was always derived from the prose: a
+    substring list, then paired claims, then sentence completeness, then a
+    token-residue rule, then byte equality against a hand-written pin. Round 7
+    reproduced the end state of that arms race -- a plainly false, token-free
+    clause shipped GREEN when the entry and its pin were edited consistently.
 
-    * every claim below is PAIRED with the measurement that decides it and
-      asserted as `(phrase in bullet) is measured`, so the bullet cannot state
-      a rule the bridge does not hold nor omit one it does -- change the
-      collapse rule and the required and forbidden sets swap;
-    * every SENTENCE must carry one of those measured claims, because pairing
-      alone decides only the sentences it enumerates and a bullet that GREW a
-      sentence still shipped false prose green (#757 review round 5); and
-    * every TECHNICAL TOKEN -- anything backticked, any CLI flag -- must sit
-      inside one. Sentence coverage still let a false claim ride into an
-      anchored sentence behind a comma, and chasing finer split points is an
-      arms race the prose keeps winning (#757 review round 6). Stripping the
-      measured claims and requiring the residue to be free of technical tokens
-      is granularity-free: whatever is left cannot make an operational claim.
+    The answer is not a sixth rule, and after nine rounds it is not a smaller
+    behavioural claim either: the entry now states the ENVELOPE CONTRACT
+    only -- that a start address can carry more than one record, and that the
+    answer discloses it through the two counts, in JSON and in text alike.
+    Every per-shape clause (which record wins, naming, filters, paging, ties)
+    is deleted, because each of rounds 7, 8 and 9 filed a blocker on the
+    clause the round before had ADDED. The BEHAVIOUR those clauses described
+    is not unpinned by that: it is measured and asserted in full below. The
+    `_entry_region` rule, the publication predicate and the command-composed
+    summary face are each pinned here too, because reverting them was
+    invisible.
     """
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    m = _measure_duplicate_start_behaviour(bridge, instance, monkeypatch)
-    bullet = _duplicate_starts_bullet()
-    # The whole entry, exactly -- no comma, clause, continuation line or
-    # token-free sentence can reach the reference without coming through the
-    # claims below first.
-    assert bullet == _PINNED_BULLET, (
-        "the reference entry no longer matches its pin. Every claim in it is "
-        "MEASURED below; change the prose only by editing `_PINNED_BULLET` and "
-        "re-deriving those measurements.\nshipped: " + bullet)
+    m = _measure_duplicate_start_disclosure(bridge, instance, monkeypatch)
 
-    claims = (
-        ("the collapse is disclosed on the text face, not only in the JSON",
-         m["text_prints_on_every_surface"], "disclosed in text, not only in JSON"),
-        ("BN can hold several records for one start address, with sizes that disagree",
-         m["one_start_holds_conflicting_records"],
-         "two Function records for one start address with conflicting sizes"),
-        ("the collapse runs on the address-filtered population, ahead of the query",
-         m["dropped_is_unreachable"],
-         "`function list` and `function search` collapse the same population, everything "
-         "`--min-address`/`--max-address` left, before the query matches anything"),
-        ("a ranked start answers with one row carrying the larger extent",
-         m["resolved_is_one_row"], "ONE row carrying the larger extent"),
-        ("the record the collapse dropped cannot be named back",
-         m["dropped_is_unreachable"], "naming it returns nothing"),
-        ("an unranked start keeps every record it has",
-         m["unresolved_keeps_all"], "ALL of that address's records stay in the answer"),
-        ("every record of an unranked start is still reachable by name",
-         m["unranked_records_reachable"], "naming any of them returns it"),
-        ("a sized record of an unranked start still reports size_known: true",
-         m["unranked_sized_record_keeps_size_known"],
-         "A record BN did size still reports `size_known: true` there"),
-        ("...and that size is not a won comparison",
-         m["unranked_sized_record_keeps_size_known"], 'not "this size won"'),
-        ("each row of a duplicated start is labelled individually",
-         m["rows_are_labelled"],
-         'therefore carries `duplicate_start`: `"collapsed"` when this record won on '
-         'extent, `"unresolved"` when nothing was ranked here'),
-        ("a --sort size page that separates the group still self-describes",
-         m["rows_are_labelled"],
-         "`--sort size` page that splits the group apart is still self-describing"),
-        ("the row filters inside the counts' scope are --min-size, --named and the query",
-         m["filter_keeps_the_count"] and m["filter_drops_the_count"],
-         "everything `--min-size`, `--named` and the query left"),
-        ("the two counts are the published disclosure keys",
-         m["both_keys_published"],
-         "The counts are `duplicate_starts_collapsed` / `duplicate_starts_unresolved`"),
-        ("every text face that prints a post-collapse count prints the note",
-         m["text_prints_on_every_surface"],
-         "printed in text as a `// duplicate starts` line"),
-        ("the two listing surfaces end with the note",
-         m["note_is_last_on_the_listing_surfaces"],
-         "last on the `function list` listing and on `--count`"),
-        ("the two cards put the note directly under the count it modifies",
-         m["note_sits_under_the_count_on_the_cards"],
-         "directly under the function count on `target info` and on `evidence orient`"),
-        ("the counts are scoped to the number total reports",
-         m["filter_keeps_the_count"],
-         "both counts are taken over the whole filtered answer `total` reports"),
-        ("the counts are unaffected by --offset/--limit",
-         m["counts_survive_paging"], "NOT affected by `--offset`/`--limit`"),
-        ("a filter that removes every record of an address removes its count",
-         m["filter_drops_the_count"], "removes its count with it"),
-        ("an address that keeps one record stays counted",
-         m["filter_keeps_the_count"], "`duplicate_starts_unresolved: 1` beside `total: 1`"),
-        ("a clean view publishes and prints nothing",
-         m["clean_view_is_silent"], "only when non-zero"),
-        # The mirror images, decided by the SAME measurements. Round 4 shipped
-        # the first of these while the search returned the twin, and the old
-        # substring guard stayed green.
-        ("the unranked twin can never be returned by naming it",
-         not m["unranked_records_reachable"], "can never be returned by naming it"),
-        ("every duplicated address answers with exactly one row",
-         m["resolved_is_one_row"] and not m["unresolved_keeps_all"],
-         "each address answers with one row"),
-        ("the counts describe the rows the answer contains",
-         not m["counts_survive_paging"], "describe the rows the answer contains"),
-        # The note is the LAST line on two surfaces and mid-card on the other
-        # two, so "trailing" as a blanket claim sends a reader to the end of a
-        # card that discloses in the middle (#757 review round 6).
-        ("the note is trailing on every surface",
-         m["note_is_last_everywhere"], "as a trailing `// duplicate starts` line"),
+    # --- THE REGION RULE ------------------------------------------------
+    # Everything printed between this list item and the next one, whatever it
+    # looks like: a heading, a lazy `#` line, a blank line, an indented
+    # paragraph. Pinned on synthetic input because the reference contains
+    # none of them, which is why reverting the rule was invisible (round 9).
+    sample = ["- entry duplicate_starts_unresolved", "###### note: lie",
+              "#757 lazy continuation", "", "  indented paragraph", "- next"]
+    assert _entry_region(sample, 0) == "\n".join(sample[:5])
+
+    # --- THE ROWS, ON EVERY MEASURED SHAPE -------------------------------
+    # Ranked (every extent readable AND one strictly largest): that row
+    # survives and it carries the largest extent -- with distinct names and
+    # with a shared name.
+    assert m["ranked_extents_all_readable"], m
+    assert all(ok for _, ok in m["ranked_keeps_one_largest"]), (
+        "a ranked shape did not reduce to one row carrying the largest extent",
+        m["ranked_keeps_one_largest"])
+    # Unranked (an unreadable extent, or a tie at the top): nothing is
+    # dropped -- three records, every extent unreadable, a shared name, and
+    # two equal extents.
+    assert not m["unranked_extents_all_readable"], m
+    assert all(ok for _, ok in m["unranked_keeps_all"]), (
+        "an unranked shape lost a record", m["unranked_keeps_all"])
+    assert m["unranked_rows"] > 2, "the unranked group must not be a pair"
+    # How much a row filter or a page leaves is a property of THAT filter,
+    # not of the collapse: the same group answers with different counts under
+    # two thresholds and a window, which is why the entry states none of them.
+    assert len(m["narrowing"]) > 1, (
+        "the filtered/paged shapes all left the same number of rows, so the "
+        "entry's refusal to state one is unmeasured", m["narrowing"])
+    # Each surviving row says which case it is in, with both values in play.
+    assert m["row_keys"] == ("duplicate_start",), m
+    assert m["markers"] == ("collapsed", "unresolved"), m
+
+    # --- THE COUNTS -----------------------------------------------------
+    assert m["count_keys"] == ("duplicate_starts_collapsed",
+                               "duplicate_starts_unresolved"), m
+    # Addresses, not dropped records: one surviving record keeps the count...
+    assert (m["kept_total"], m["kept_count"]) == (1, 1), m
+    # ...and a filter that removes every record of the address removes it.
+    assert m["gone_count"] is None, m
+    # Paging does not move them: this page discloses an address it does not hold.
+    assert m["paged_count"] == 1 and not m["paged_holds_a_counted_address"], m
+
+    # --- TEXT / JSON PARITY ---------------------------------------------
+    # Publication is detected ANYWHERE in the payload: the orient digest
+    # carries the counts in its nested `target` block as well as at its own
+    # level, and a top-level-only predicate let that face hold vacuously.
+    assert _publishes_duplicate_starts({"target": {"duplicate_starts_collapsed": 1}})
+    assert _publishes_duplicate_starts({"items": [{"duplicate_start": "collapsed"}]})
+    assert not _publishes_duplicate_starts({"target": {"function_count": 4}})
+    # The summary face is the COMMAND's composed card, not the shared renderer.
+    assert m["target_info_face_is_the_command_card"], m
+    # Every face -- including the generic JSON fallback a payload without its
+    # own renderer reaches -- says something about a duplicated start exactly
+    # when its payload publishes one. Both directions, collided and clean.
+    for face, publishes, discloses in m["parity"]:
+        assert discloses is publishes, (
+            f"{face}: payload publishes={publishes} but its text "
+            f"discloses={discloses}")
+    assert {p for _, p, _ in m["parity"]} == {True, False}, (
+        "parity was measured in only one direction", m["parity"])
+
+    # --- THE REFERENCE IS THAT MEASUREMENT, RENDERED --------------------
+    expected = _render_duplicate_starts_bullet(m)
+    # ASCII only: a homoglyph spelling of a measured token would otherwise
+    # walk past every check below (round 9).
+    assert expected.isascii(), expected
+    # Identifiers: every identifier-shaped token in the render -- snake_case,
+    # kebab-case or camelCase, quoted or not -- has to be a key an envelope
+    # carries or a marker a row carries.
+    measured_names = m["envelope_keys"] | set(m["row_keys"]) | set(m["markers"])
+    invented = set(_IDENTIFIER_TOKEN.findall(expected)) - measured_names
+    assert not invented, (
+        f"the rendered entry names identifiers nothing produced: {sorted(invented)}"
+        f"\n{expected}")
+    # ...and every backticked token is one of those. The terminal reduction
+    # left the entry naming no command and no flag, so the hand-written
+    # vocabulary that used to be exempted here is gone with them: a backtick
+    # the measurement cannot supply is now simply wrong (#757 round 10).
+    backticked = set(re.findall(r"`([^`]+)`", expected))
+    unexplained = backticked - measured_names
+    assert not unexplained, (
+        f"the rendered entry backticks tokens nothing produced: {sorted(unexplained)}"
+        f"\n{expected}")
+    # Numbers: the issue's, and nothing else. Every per-shape quantity this
+    # entry used to state became the next round's blocker.
+    assert set(re.findall(r"\d+", expected)) == {"757"}, expected
+    # Both of the two things the entry is permitted to say are read off the
+    # measurement, so inverting either is RED: the counts by their measured
+    # names, and the parity clause by the parity actually observed.
+    for key in m["count_keys"]:
+        assert f"`{key}`" in expected, (key, expected)
+    assert ("discloses it too" in expected) is all(
+        discloses is publishes for _, publishes, discloses in m["parity"]), expected
+
+    assert _duplicate_starts_bullet() == expected, (
+        "skills/bn/reference/reading.md's duplicate-start entry is not what the "
+        "bridge measures. This entry is GENERATED from the measurement above -- "
+        "do not hand-edit it and do not add a sentence to it; replace the line "
+        "with:\n\n" + expected)
+
+# --- #792: a callsite whose HLIL statement cannot be localized ---------------
+#
+# `hlil_statement: null` + a reason code is the honest answer for one row, but it
+# left the row with no readable context on the JSON surface: `bn decompile
+# <caller>` plainly renders the call, yet nothing in the row said so. The row now
+# carries a bounded decompiled excerpt around the callsite.
+#
+# The render is in CONTROL-FLOW order, not address order (#792 review): a real
+# pseudo-C body emits switch cases out of sequence and puts the FUNCTION START on
+# the closing brace, so a body whose LINES happen to be address-sorted is a straw
+# fixture -- it cannot catch an anchor rule that assumes monotonic addresses. Every
+# fixture below therefore places the callsite line before an epilogue and ends with
+# a brace carrying the function-entry address.
+
+def _control_flow_batches(call_addr: int) -> list[tuple[int, str]]:
+    """The repro's render shape: out-of-order addresses, a callsite line, a body
+    tail, an epilogue, and a closing brace that carries the FUNCTION START."""
+    return [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),        # header @ func start
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),                     # control flow, not address order
+        (0x500050, "        send_ack(fd);"),
+        (call_addr, "    send_status(fd, &buf);"),             # the callsite, exact address
+        (0x5000b8, "    if (buf == 0) {"),
+        (0x5000c0, "        goto out;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),                 # epilogue
+        (0x5000e8, "    no return;"),
+        (0x500000, "}"),                                       # closing brace @ func start
+    ]
+
+
+def test_callsite_null_hlil_statement_carries_decompile_excerpt_792(monkeypatch):
+    """The excerpt is a field of the callsites PAGE, so it is read through the op
+    that pages, not through the per-function row builder."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    call_addr = 0x5000b0
+    callee = _FakeFunction(0x5a10, "send_status")
+    caller = _FakeFunction(0x500000, "handle_reply")
+    caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+    caller.arch = _FakeArch(lengths={call_addr: 4})
+    block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock", address=call_addr,
+                                 expr_index=9, instr_index=9)
+    # A statement whose rendered text is a whole-function-sized blob: the
+    # localization layer refuses it as non-local (#557) -- the shape this issue's
+    # repro reports on a real AArch64 handler.
+    blob = _FakeHLILInstruction("send_status(\n" + "x" * 300 + "\n)",
+                                class_name="HighLevelILCall", parent=block,
+                                address=call_addr, expr_index=11, instr_index=11)
+    caller.low_level_il = [[
+        _FakeLLILInstruction(call_addr, _FakeConstPtr(0x5a10), hlils=[blob]),
+    ]]
+    bv = _FakeBV(
+        functions=[callee, caller],
+        disassembly={call_addr: "bl 0x5a10"},
+        instruction_lengths={call_addr: 4},
     )
-    for what, measured, phrase in claims:
-        verb = "must state" if measured else "must NOT state"
-        assert (phrase in bullet) is measured, (
-            f"reading.md {verb} that {what} -- measured={measured}, "
-            f"phrase={phrase!r}\n{bullet}")
+    _install_fake_pseudo_c(monkeypatch, bridge, caller, [_control_flow_batches(call_addr)])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    # COMPLETENESS. Every sentence has to be one of the claims above, so a
-    # sentence added to this bullet arrives with a measurement or arrives red.
-    anchors = [phrase for _, measured, phrase in claims if measured]
-    sentences = [s for s in _SENTENCE_SPLIT.split(bullet) if s.strip()]
-    unanchored = [s for s in sentences if not any(a in s for a in anchors)]
-    assert not unanchored, (
-        "every sentence of this bullet must carry a claim this test MEASURES; "
-        "these assert something nothing here decides, which is exactly how "
-        f"three rounds of false prose shipped green: {unanchored}")
-    unused = [a for a in anchors if not any(a in s for s in sentences)]
-    assert not unused, (
-        "these measured claims anchor no sentence, so the inventory and the "
-        f"prose have drifted apart: {unused}")
-    # ...and no technical token may sit OUTSIDE one. Strip every measured claim
-    # from the bullet; what remains must be connective prose, because anything
-    # backticked or flag-shaped in the residue is an operational assertion this
-    # test does not decide. This is what closes the comma route, and every
-    # finer one after it, without another split rule.
-    residue = bullet
-    for anchor in anchors:
-        residue = residue.replace(anchor, " ")
-    leftover = [frag for frag in residue.split() if _TECHNICAL_TOKEN.search(frag)]
-    assert not leftover, (
-        "these technical tokens sit outside every measured claim, so nothing "
-        f"here decides what the prose around them asserts: {leftover}\n"
-        f"residue: {residue}")
+    rows = _callsites_items(instance, None, "send_status",
+                            within_identifiers=["handle_reply"], context=1)
 
-    # Every disclosure key the bridge actually emits is named, so a new one
-    # cannot ship undocumented.
-    envelope_keys = {k for env in m["envelopes"] for k in env
-                     if k.startswith("duplicate_start")}
-    assert envelope_keys, "no envelope carried a duplicate-start disclosure"
-    for key in sorted(envelope_keys):
-        assert key in bullet, (key, bullet)
-    # ...and so is the per-row marker, with every value it takes.
-    row_keys = {k for row in m["rows"] for k in row if k.startswith("duplicate_start")}
-    assert row_keys, "no returned row carries a per-row duplicate-start marker"
-    for key in sorted(row_keys):
-        assert f"`{key}`" in bullet, (key, bullet)
-    markers = {row[key] for row in m["rows"] for key in row_keys if key in row}
-    assert markers, "the per-row marker took no value"
-    for marker in sorted(markers):
-        assert f'"{marker}"' in bullet, (marker, bullet)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["hlil_statement"] is None
+    assert row["hlil_statement_reason"] == "statement_not_local"
+    excerpt = row["decompile_excerpt"]
+    # Exact-address anchoring: the callsite's own line, NOT the trailing brace that
+    # also carries a `<= call_addr` address (the pre-review scan anchored there and
+    # emitted the epilogue).
+    assert excerpt["anchor_address"] == hex(call_addr)
+    assert excerpt["window"] == 3
+    assert any(line.startswith(hex(call_addr)) and "send_status(fd, &buf);" in line
+               for line in excerpt["lines"])
+    assert not any("__stack_chk_fail" in line for line in excerpt["lines"])
+    # The function-entry address (header line AND closing brace) stays out of the
+    # window; it is not the callsite.
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
 
-    # Any number the bullet states about the envelope has to be one an envelope
-    # carries: a worked example is where this prose drifts first.
-    for key, stated in re.findall(r"`?([a-z_]+)`?: (\d+)", bullet):
-        if not any(key in env for env in m["envelopes"]):
-            continue
-        assert any(env.get(key) == int(stated) for env in m["envelopes"]), (
-            f"reading.md states `{key}: {stated}`, which no measured envelope holds")
+
+def test_callsite_excerpt_proximity_fallback_never_anchors_on_the_function_entry_792(monkeypatch):
+    """No line carries the callsite address exactly: the window falls back to the
+    nearest guttered line, and the function-ENTRY address is excluded from that
+    contest -- a real render puts it on the closing brace, whose line is last."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500004, "{"),
+        (0x500008, "    uint8_t buf[32];"),
+        (0x500020, "    if (cmd == 1) {"),
+        (0x500050, "        prep(fd);"),
+        (0x5000b4, "    if (buf == 0) {"),          # nearest to the callsite below
+        (0x5000c0, "        return -1;"),
+        (0x5000c8, "    }"),
+        (0x5000d0, "    last_err = 0;"),
+        (0x5000e4, "    __stack_chk_fail();"),
+        (0x500000, "}"),                            # closing brace @ func start
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert excerpt["anchor_address"] == "0x5000b4"
+    assert any(line.startswith("0x5000b4") for line in excerpt["lines"])
+    assert not any(line.startswith(hex(0x500000)) for line in excerpt["lines"])
+
+
+def test_callsite_excerpt_without_an_attributable_line_says_so_792(monkeypatch):
+    """Nothing in the render can be attributed to the callsite: the excerpt must
+    say that instead of anchoring on the function's tail."""
+    bridge = _load_bridge(monkeypatch)
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    assert "anchor_address" not in excerpt
+    assert excerpt["lines"] == []
+    assert excerpt["reason"] == "statement_not_located"
+
+
+def test_callsite_excerpt_caps_a_long_line_792(monkeypatch):
+    """A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line. Each line is capped (240 chars, the same ceiling
+    `_hlil_text_is_local` refuses) and the capped lines are counted, so a 7-line
+    window cannot become the blob `hlil_statement` deliberately withholds."""
+    bridge = _load_bridge(monkeypatch)
+    text = "    send_status(fd, &buf); /* " + "z" * 583 + " */"
+    lines, addresses = _rendered_lines(bridge, monkeypatch, [
+        (0x500000, "int32_t handle_reply(int32_t fd)"),
+        (0x5000b0, text),
+        (0x500000, "}"),
+    ])
+    excerpt = bridge.read_listing._callsite_decompile_excerpt(
+        (lines, addresses), 0x5000b0, 0x500000)
+
+    capped = [line for line in excerpt["lines"] if "send_status" in line]
+    assert len(capped) == 1
+    assert capped[0].startswith(hex(0x5000b0))
+    assert f"... [+{len(lines[1]) - 240} chars]" in capped[0]
+    assert excerpt["truncated_lines"] == 1
+    assert all(len(line) <= 240 + 40 for line in excerpt["lines"])
+
+
+def _null_statement_population(count: int, callee_addr: int = 0x5A10):
+    """*count* callers of one callee, each with exactly one callsite whose HLIL
+    statement cannot be localized -- so every row of every caller wants the
+    #792 excerpt, and the number of renders is a clean measure of the work."""
+    callers, refs, disasm, lengths = [], [], {}, {}
+    for index in range(count):
+        start = 0x500000 + index * 0x1000
+        call_addr = start + 0x10
+        caller = _FakeFunction(start, f"handler_{index:02d}")
+        caller.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+        caller.arch = _FakeArch(lengths={call_addr: 4})
+        # No HLIL for the LLIL call -> `hlil_statement` null, reason
+        # `no_hlil_mapping`: the #792 shape, on every caller.
+        caller.low_level_il = [[_FakeLLILInstruction(call_addr, _FakeConstPtr(callee_addr))]]
+        callers.append(caller)
+        refs.append(_FakeCodeRef(call_addr, caller))
+        disasm[call_addr] = "bl 0x5a10"
+        lengths[call_addr] = 4
+    callee = _FakeFunction(callee_addr, "send_status")
+    bv = _FakeBV(functions=[callee, *callers], code_refs={callee_addr: refs},
+                 disassembly=disasm, instruction_lengths=lengths)
+    return bv, callers
+
+
+def _counting_decompile_text(monkeypatch, bridge, rendered: list[int]):
+    """Replace the pseudo-C renderer with one that records WHICH function it was
+    asked to render. Counting renders is the only way to see this contract: the
+    returned page is byte-identical before and after the fix."""
+    def _render(bv, func, addresses=False):
+        rendered.append(int(func.start))
+        return f"{hex(int(func.start) + 0x10)}        send_status(fd, &buf);"
+
+    monkeypatch.setattr(bridge.read_listing.il_format, "_decompile_text", _render)
+
+
+def test_callsite_excerpt_renders_only_the_returned_page_792(monkeypatch):
+    """#792 review: the excerpt costs a whole-function decompilation, so it must
+    be a PAGE projection (#814), not scan-time work. A callsites read scans the
+    caller set until it holds `offset + limit + 1` rows; rendering while scanning
+    paid one whole-function decompile for every caller the `--offset`/`--limit`
+    window then discarded."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=4)
+
+    # The page itself is unchanged: the whole caller set was scanned (exact
+    # `total`), and the window holds the last four callers' rows.
+    assert result["total"] == 12 and result["scan_truncated"] is False
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09", "handler_10", "handler_11"]
+    assert all(row["hlil_statement"] is None for row in result["items"])
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    # The WORK is page-bounded: one render per caller ON THE PAGE. Before the
+    # fix this was one per caller SCANNED (all 12).
+    assert rendered == [caller.start for caller in callers[8:12]], rendered
+    # The transient handle never reaches a consumer.
+    assert all("_excerpt_fn" not in row for row in result["items"])
+
+
+def test_callsite_excerpt_page_projection_holds_on_a_truncated_scan_792(monkeypatch):
+    """The early-exit page (`scan_truncated`) is a second, hand-sliced return
+    path: it must project the excerpt onto its own page and drop the transient
+    too, or a live Function object leaks into the row."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, callers = _null_statement_population(12)
+    rendered: list[int] = []
+    _counting_decompile_text(monkeypatch, bridge, rendered)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "send_status", within_identifiers=[], offset=8, limit=2)
+
+    assert result["scan_truncated"] is True and result["total"] is None
+    assert [row["containing_function"]["name"] for row in result["items"]] == [
+        "handler_08", "handler_09"]
+    assert all(row["decompile_excerpt"]["lines"] for row in result["items"])
+    assert all("_excerpt_fn" not in row for row in result["items"])
+    assert rendered == [caller.start for caller in callers[8:10]], rendered
+
+
+def _rendered_lines(bridge, monkeypatch, batches):
+    """(lines, gutter addresses) as the callsite excerpt sees them, through the
+    real render + gutter parser rather than a hand-built pair."""
+    func = _FakeFunction(0x500000, "handle_reply")
+    _install_fake_pseudo_c(monkeypatch, bridge, func, [batches])
+    return bridge.read_listing._callsite_decompile_render(_FakeBV(), func)

@@ -1148,6 +1148,51 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_types_declare_text_row_discloses_unapplied_prototypes_890():
+    # #890 obs 2: the #778 disclosure reached JSON only, so a text-mode reader
+    # of a MIXED declare was told `verified` and never told that the function
+    # prototype and variable in the same source went unapplied.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {
+            "functions": ["parse_frame"],
+            "variables": ["g_session_count"],
+        },
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "packet_header" in out
+    assert "unapplied" in out
+    assert "parse_frame" in out and "g_session_count" in out
+
+
+def test_types_declare_text_row_stays_bare_for_a_types_only_declare_890():
+    # Must-not-fire twin: an ordinary types-only declaration carries no
+    # unapplied buckets and must read exactly as it did before.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+    })
+    assert out == "types_declare packet_header"
+
+
+def test_types_declare_text_row_omits_an_empty_unapplied_bucket_890():
+    # A declare that could not bind a FUNCTION says so without inventing an
+    # empty "variables:" clause -- the disclosure names what happened, not
+    # every bucket it checked.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {"functions": ["parse_frame"], "variables": []},
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "functions: parse_frame" in out
+    assert "variables" not in out
+
+
 def test_the_disclosure_reaches_an_early_return_path():
     # The whole point of declaring the coerced keys per renderer instead of
     # appending a line per branch: several renderers bail out BEFORE their
@@ -3847,9 +3892,26 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # `_count_field` to state them in the `function list` text face. It is a
     # fragment helper, not a payload renderer, so both pairs join the skipped set
     # below by name with their own test.
-    assert len(sites) == 28, (
+    # #812: `_render_backward_diagnostics` adds five
+    # counters through `_count_field` -- `sinks_seeded`/`slices` off the
+    # diagnostics block and `unresolved`/`coarse_memory`/`dropped_callers` off
+    # its frontier. They are counts in a block whose entire purpose is to
+    # withhold a completeness claim, so a fabricated zero there reads as
+    # "nothing was dropped" -- exactly the reassurance the block exists to
+    # refuse. Routed through the helper rather than `get(k, 0)` so the residue
+    # census stays put and these five join the covered set instead.
+    # #827 item 1: `_render_taint_path` adds `alternate_parents`
+    # through `_count_field`. It is a count in a DISCLOSURE line, so a
+    # fabricated zero would silently delete the disclosure and a fabricated
+    # number would invent one; both are worse than the marker being absent.
+    # #823: `_render_spill_gc_text` states five top-level counters
+    # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
+    # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
+    # are the headline's numbers; the two row reads are nested, which is why
+    # they are named in the skipped set below rather than silently dropped.
+    assert len(sites) == 41, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 28. The number is the size of the covered set: a "
+        "count helper, not 41. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3917,6 +3979,20 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",
+        # #812: all three live NESTED under the diagnostics block's `frontier`
+        # container, so a top-level probe never reaches the read that states
+        # them -- the same shape as the `existing_annotations` pair below, not a
+        # renderer that stopped stating a count. `unresolved`/`coarse_memory` DO
+        # go through `_stated_count` and render `?` on an unreadable value when
+        # the nested payload is real; `dropped_callers` is gated behind a
+        # truthiness check (a zero drops the clause entirely), so it stays a
+        # plain `_count_field` read.
+        "_render_backward_diagnostics(coarse_memory) [count not stated in this "
+        "context]",
+        "_render_backward_diagnostics(dropped_callers) [count not stated in "
+        "this context]",
+        "_render_backward_diagnostics(unresolved) [count not stated in this "
+        "context]",
         "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # The same branch for the #818 skip buckets: the recorded context opens
@@ -3938,6 +4014,15 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # `_render_spill_gc_text` (#823): two reads are nested in candidate
+        # rows, and two live on the non-dry branch the probe does not open.
+        "_render_spill_gc_text(bytes) [count not stated in this context]",
+        "_render_spill_gc_text(files) [count not stated in this context]",
+        "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
+        "_render_spill_gc_text(removed_count) [count not stated in this context]",
+        # #827 item 1: an unreadable alternate-parent count suppresses the
+        # disclosure clause. The dedicated taint-path test covers that branch.
+        "_render_taint_path(alternate_parents) [count not stated in this context]",
         # The same nested reason for the #793 renderer: its five counts also live
         # under `existing_annotations`, so a top-level probe cannot open the gate
         # that states them. Covered by name in
@@ -3954,6 +4039,7 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "stated in this context]",
         "_render_target_info_annotations_text(user_symbols) [count not stated "
         "in this context]",
+
     ], sorted(not_stated)
 
 
@@ -4286,7 +4372,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #793: `_render_target_info_annotations_text` adds the
     # `existing_annotations` container (6 malformed shapes probed on it) to the
     # same discovered population. Measured.
-    assert checked == 1218, f"the differential ran {checked} cases, not 1218"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds twelve more cases for the taint diagnostic containers.
+    assert checked == 1254, f"the differential ran {checked} cases, not 1254"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4357,10 +4446,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # on `_render_go_rename_text`: it reads `rolled_back` and `success` BEFORE its
     # branch, because the two rollback states are decided from those two fields
     # rather than from the branch a payload happens to walk into.
-    # Both contributions are live on this MERGED tree, so the total is their sum:
-    # 4984 + 48 (#757 r5) + 16 (#693) = 5048. The assertion is what MEASURES it --
-    # neither branch's own number survives the merge (#893 merge of #873).
-    assert swept == 5048, f"the raise sweep ran {swept} renders, not 5048"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 56 malformed probes for its taint diagnostic reads.
+    # Combined population: 5168 + 16 (#693) = 5184 renders.
+    assert swept == 5184, f"the raise sweep ran {swept} renders, not 5184"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4533,10 +4623,12 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # x 2 benign payloads each. Measured by diffing the population.
     # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
     # gained, x 2 benign payloads each. Measured by diffing the population.
-    # #693 items 1/2: + 4 -- the same TWO pairs the raise sweep gained on
-    # `_render_go_rename_text`, x 2 benign payloads each: 1449 + 12 + 4 = 1465,
-    # measured the same way on the MERGED tree.
-    assert checked == 1465, f"the mirror ran {checked} renders, not 1465"
+    # #693 adds two go-rename pairs, or four benign probes.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # #874 adds 16 benign probes for those reads.
+    # Combined population: 1501 + 4 (#693) = 1505 renders.
+    assert checked == 1505, f"the mirror ran {checked} renders, not 1505"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7161,7 +7253,8 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
+    # #890 obs 2: `_operation_row_text` now reads the `unapplied_prototypes` container and its nested `functions`/`variables` lists, so a text reader of a mixed declare is told what went unapplied. Three new discovered reads, and these derived populations grow with them. The row reads one more top-level key than before.
+    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7188,9 +7281,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert (rendered, checked) == (1980, 1188), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
-        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
+    # #890 obs 2: the row now reads `unapplied_prototypes` (and its nested
+    # `functions`/`variables`), so both sizes grow with the new key: the
+    # rendered population 1980 -> 2178 and the checked subset 1188 -> 1298.
+    assert (rendered, checked) == (2178, 1298), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
+        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
         "different claims: the carve-out for a readable container skips 792 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
@@ -7288,8 +7384,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    assert swept == 4572, (
-        f"the element sweep ran {swept} renders, not 4572 -- the size of the "
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4572 + 108 (#823) = 4680.
+    assert swept == 4680, (
+        f"the element sweep ran {swept} renders, not 4680 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
@@ -8131,7 +8231,7 @@ def test_function_list_text_discloses_the_duplicate_start_collapse_883():
     both = {**collapsed, "duplicate_starts_unresolved": 2}
     text = formatters._render_function_list_text(both)
     assert "1 start address(es) carried duplicate function records" in text, text
-    assert "2 start address(es) hold another record whose extent" in text, text
+    assert "2 start address(es) hold records their extents could not rank" in text, text
     assert "no record was chosen there" in text, text
     # ...and the two halves do not read as one alarm: the collapsed part never
     # says nothing was chosen, which is the whole difference between them.
@@ -8211,11 +8311,12 @@ def test_the_unresolved_duplicate_starts_note_states_only_what_is_true_757():
     row that is not in the listing, and told nothing was dropped when the filter
     dropped exactly the record the conflict is about.
 
-    What IS always true when the key fires is the finding itself: BN holds
-    another record at that address whose extent could not be read, so no record
-    could be chosen -- the row shown was not picked on extent, which is
-    precisely what the collapsed half's "the larger extent was kept" promises
-    and this half cannot.
+    What IS always true when the key fires is the finding itself: the extents
+    at that address ranked nothing -- BN holds another record whose extent
+    cannot be read, or two records claim the same extent -- so no record could
+    be chosen, and the row shown was not picked on extent, which is precisely
+    what the collapsed half's "the larger extent was kept" promises and this
+    half cannot.
     """
     from bn import formatters
 
@@ -8319,3 +8420,328 @@ def test_a_duplicate_start_row_is_labelled_in_text_757():
     unknown = formatters._render_name_address_rows(
         [{"name": "fn", "address": "0x401200", "duplicate_start": "shadowed"}])
     assert unknown.endswith("[duplicate start: shadowed]"), unknown
+
+# ---------------------------------------------------------------------------
+# #812 / #811 / #805: the four taint renderings the census counters above only
+# COUNT. A census differential moves when a renderer gains a read, so it holds
+# the disclosure contract -- but it never asserts what any of these four
+# actually print, and every one of them is a line a reader acts on.
+# ---------------------------------------------------------------------------
+
+
+def _per_source_frontier_payload():
+    """A forward result whose per-callsite rows carry the bridge's own blocking
+    frontier count, in the three states the row can be in."""
+    return {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x10"},
+        "sources": [{"kind": "arg", "callee": "recv", "index": 1}],
+        "reached_sinks": [], "leaves": [], "assumptions": [],
+        "by_source": {
+            # Three leaves, two of them BLOCKING -- and neither of the two is
+            # `unmodeled_callee`, the single kind the CLI used to count.
+            "0x14": {"reached_sinks": [], "frontier": 2,
+                     "leaves": [{"kind": "coarse_memory_store"},
+                                {"kind": "pointer_escape"},
+                                {"kind": "arg_dropped_partial"}]},
+            # Leaves, but none of them blocking: a marker here would be noise.
+            "0x1c": {"reached_sinks": [], "frontier": 0,
+                     "leaves": [{"kind": "arg_dropped_partial"}]},
+            # No `frontier` key at all -- a bridge older than this CLI.
+            "0x24": {"reached_sinks": [],
+                     "leaves": [{"kind": "coarse_memory_store"}]},
+        },
+        "soundness": "may-analysis",
+    }
+
+
+def test_per_source_frontier_marker_uses_the_bridge_count_812():
+    # #812's headline defect, CLI end: this marker used to be recomputed here by
+    # counting ONE hard-coded leaf kind (`unmodeled_callee`) out of the ten
+    # that block a claim, so a callsite whose frontier was a coarse store or a
+    # pointer escape printed no marker at all -- on the row a reader uses to
+    # choose which callsite to triage. The count is now the bridge's, computed
+    # against the canonical vocabulary the CLI cannot import.
+    from bn.formatters import _render_taint_text
+    rows = {ln.strip().split(":", 1)[0]: ln.strip()
+            for ln in _render_taint_text(_per_source_frontier_payload()).splitlines()
+            if ln.startswith("  0x")}
+    assert rows["0x14"] == "0x14: no sinks; 3 leaf(s) (2 frontier)", rows
+    # A zero count prints no marker: "(0 frontier)" reads as a finding about
+    # the frontier when it is the absence of one.
+    assert rows["0x1c"] == "0x1c: no sinks; 1 leaf(s)", rows
+    # Absent key -> no marker. The CLI must not fall back to a number it cannot
+    # derive correctly; that fallback IS the bug.
+    assert rows["0x24"] == "0x24: no sinks; 1 leaf(s)", rows
+
+
+def test_per_source_frontier_marker_ignores_an_unreadable_count_812():
+    # The count arrives over JSON, so a malformed row must degrade to no marker
+    # rather than interpolating a string into a "(N frontier)" claim.
+    from bn.formatters import _render_taint_text
+    payload = _per_source_frontier_payload()
+    # A bool is the one that got through: `isinstance(True, int)` is True in
+    # Python, so a bridge that sent a FLAG where a count belongs used to render
+    # "(True frontier)" -- a number-shaped claim made out of a boolean. A
+    # NEGATIVE count is the same defect one step further along: it is readable
+    # as a number and says a thing no count can mean, so "(-3 frontier)" would
+    # be a fabricated disclosure that survived every shape check above it.
+    for bad in ("lots", True, 1.5, None, [2], -3):
+        payload["by_source"]["0x14"]["frontier"] = bad
+        row = next(ln.strip() for ln in _render_taint_text(payload).splitlines()
+                   if ln.startswith("  0x14"))
+        assert row == "0x14: no sinks; 3 leaf(s)", (bad, row)
+        assert "frontier)" not in row, (bad, row)
+
+
+def test_backward_text_renders_the_completeness_gate_812():
+    # #812: forward printed a diagnostics block and backward printed none, so a
+    # text reader could not tell a slice that reached every origin from one that
+    # abandoned caller sites at the ascent cap. The gate is deliberately
+    # `safe_to_report_complete_slice` -- backward starts AT a sink and never
+    # answers forward's "no sink was reached" question.
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text({
+        "direction": "backward",
+        "function": {"name": "use_len", "address": "0x800"},
+        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+        "slices": [], "leaves": [], "assumptions": [],
+        "diagnostics": {
+            "sinks_seeded": 1, "slices": 0, "truncated": True,
+            "truncation_cause": ["caller_cap"],
+            "frontier": {"unresolved": 2, "coarse_memory": 1, "dropped_callers": 3,
+                         "by_kind": {"caller_sites_truncated": 3,
+                                     "field_load_unresolved": 2,
+                                     "coarse_memory_store": 1}},
+            "next_action": "re-run against a specific caller",
+            "safe_to_report_complete_slice": False,
+            "complete_slice_reason": "6 frontier leaf(s) remain",
+        },
+        "soundness": "may-analysis",
+    })
+    body = [ln.rstrip() for ln in out.splitlines()]
+    assert "diagnostics:" in body, out
+    assert "  walked: 1 seeded sink(s), 0 slice(s)" in body, out
+    # The dropped-caller clause is the one frontier a user can act on, so it is
+    # named on the same line rather than left to `by_kind` in the JSON.
+    assert "  frontier: 2 unresolved, 1 coarse-memory, 3 dropped-caller-site(s)" in body, out
+    assert "  safe_to_report_complete_slice: false" in body, out
+    assert "    reason: 6 frontier leaf(s) remain" in body, out
+    assert "  next: re-run against a specific caller" in body, out
+    # Forward's key must never appear on a backward render -- that was the whole
+    # reason the gate got its own name.
+    assert "safe_to_report_all_clear" not in out, out
+
+
+def test_backward_text_marks_a_complete_slice_as_may_analysis_812():
+    # The other side of the gate: a True value is still not a proof, and the
+    # qualifier is what stops the line reading as one. A backward run with no
+    # diagnostics block at all (an older bridge) must print no block, not an
+    # empty heading.
+    from bn.formatters import _render_taint_text
+    base = {
+        "direction": "backward",
+        "function": {"name": "use_len", "address": "0x800"},
+        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+        "slices": [], "leaves": [], "assumptions": [], "soundness": "may-analysis",
+    }
+    out = _render_taint_text(dict(base, diagnostics={
+        "sinks_seeded": 1, "slices": 1, "truncated": False, "truncation_cause": [],
+        "frontier": {"unresolved": 0, "coarse_memory": 0, "dropped_callers": 0,
+                     "by_kind": {}},
+        "next_action": "classify each origin",
+        "safe_to_report_complete_slice": True,
+        "complete_slice_reason": "every seeded sink was walked to its origins",
+    }))
+    assert ("  safe_to_report_complete_slice: true (may-analysis, not a proof)"
+            in [ln.rstrip() for ln in out.splitlines()]), out
+    # dropped_callers == 0 drops the clause entirely rather than printing a zero.
+    assert "dropped-caller-site" not in out, out
+    assert "diagnostics:" not in _render_taint_text(base)
+
+
+def test_analysis_incomplete_note_rides_a_run_that_found_sinks_811():
+    # #811: an unread callee body is a coverage hole that survives INTO a run
+    # WITH findings -- and a run with findings carries no diagnostics block at
+    # all, so leaving the disclosure JSON-only hid it in exactly the case a
+    # reader is most likely to stop reading early. It prints under the verdict
+    # it qualifies and NAMES the functions, so the reader knows which region the
+    # result does not speak for.
+    from bn.formatters import _render_taint_text
+    sink = {"callee": "memcpy", "address": "0x24", "tainted_arg_index": 2,
+            "class": "overflow_len", "detail": "tainted length"}
+    payload = {
+        "direction": "forward",
+        "function": {"name": "handler", "address": "0x10"},
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [{"sink": sink, "path": []}],
+        "leaves": [], "assumptions": [],
+        "stats": {"functions_visited": 2, "max_depth": 1, "sinks": 1, "leaves": 0,
+                  "truncated": False, "truncation_cause": [],
+                  "analysis_incomplete": True,
+                  "analysis_incomplete_functions": ["helper_a", "helper_b"]},
+        "soundness": "may-analysis",
+    }
+    lines = [ln.rstrip() for ln in _render_taint_text(payload).splitlines()]
+    note = next(i for i, ln in enumerate(lines) if "NOTE: analysis incomplete" in ln)
+    assert lines[note] == (
+        "  NOTE: analysis incomplete -- 2 callee body/bodies could not be read "
+        "(helper_a, helper_b); their contents were never examined"), lines[note]
+    # Directly under the verdict it qualifies -- a disclosure parked after the
+    # flows list is one a reader scanning the verdict never sees.
+    assert lines[note - 1].startswith("verdict:"), lines[note - 3:note + 1]
+
+    # Must-not-fire: a fully analysed run pays nothing, or every clean result
+    # would carry a permanent incompleteness warning.
+    clean = dict(payload, stats=dict(payload["stats"], analysis_incomplete=False,
+                                     analysis_incomplete_functions=[]))
+    assert "analysis incomplete" not in _render_taint_text(clean)
+
+    # The flag with no names still discloses -- an unnamed hole is still a hole,
+    # and a renderer that needs the list would print nothing at all here.
+    unnamed = dict(payload, stats=dict(payload["stats"],
+                                       analysis_incomplete_functions=[]))
+    assert ("  NOTE: analysis incomplete -- a callee body could not be read; "
+            "their contents were never examined"
+            in [ln.rstrip() for ln in _render_taint_text(unnamed).splitlines()])
+
+
+def _union_last_use_payload(by_source):
+    return {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x10"},
+        "sources": [{"kind": "call", "callee": "read"}],
+        "reached_sinks": [], "leaves": [], "assumptions": [],
+        "diagnostics": {
+            "source_callsites": 2, "tainted_values": 4, "last_use": None,
+            "unmodeled_calls_reached": False, "truncated": False,
+            "truncation_cause": [], "analysis_incomplete": False,
+            "frontier": {"unresolved": 0, "coarse_memory": 0, "seed_misanchored": 0,
+                         "by_kind": {}},
+            "safe_to_report_all_clear": True, "all_clear_reason": "r",
+            "next_action": "n", "last_use_by_source": by_source,
+        },
+        "soundness": "may-analysis",
+    }
+
+
+def test_per_callsite_last_use_is_not_rendered_as_no_propagation_805():
+    # #805: a per-callsite attributed union has NO single last use, so the
+    # scalar is deliberately null and `last_use_by_source` carries the real
+    # answer. Rendering only the scalar printed "seed did not propagate" for a
+    # run that propagated from every callsite -- the union's null means
+    # AMBIGUOUS, not ABSENT, and the two must not share a line.
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_union_last_use_payload({
+        "0x20": {"label": "ta#1", "address": "0x24",
+                 "reason": "assignment/copy of tainted value"},
+        "0x30": None,
+    }))
+    body = [ln.rstrip() for ln in out.splitlines()]
+    assert "  last propagated use: differs per source callsite --" in body, out
+    assert "    0x20: ta#1 @ 0x24 (assignment/copy of tainted value)" in body, out
+    # A callsite that genuinely did not propagate is named as such, per row --
+    # that is the distinction the shared line destroyed.
+    assert "    0x30: <none — this callsite did not propagate>" in body, out
+    assert "seed did not propagate" not in out, out
+
+
+def test_the_genuinely_absent_last_use_still_says_so_805():
+    # The must-not-fire twin. The per-callsite branch may only pre-empt the
+    # "<none>" line when there is something to show: an all-null map (every
+    # callsite seeded and none propagated) is the ABSENT case, and suppressing
+    # the honest "<none>" there would replace a fact with an empty heading.
+    from bn.formatters import _render_taint_text
+    for by_source in ({}, {"0x20": None, "0x30": None}):
+        out = _render_taint_text(_union_last_use_payload(by_source))
+        assert "  last propagated use: <none — seed did not propagate>" in [
+            ln.rstrip() for ln in out.splitlines()], (by_source, out)
+        assert "differs per source callsite" not in out, by_source
+
+
+def test_taint_forward_threads_the_iteration_budget_to_the_bridge_812(fake_transport):
+    # #812: a fixpoint-truncated result tells the user to "raise --max-iters".
+    # The flag has to reach the engine for that advice to be actionable, and the
+    # request params are the only place the CLI can be held to it. Asserted with
+    # the flag and without, because the default is what every existing run gets.
+    def _run(extra):
+        calls = fake_transport({
+            "taint": {"ok": True, "result": {
+                "direction": "forward",
+                "function": {"name": "handler", "address": "0x10"},
+                "sources": [], "reached_sinks": [], "leaves": [],
+                "assumptions": [], "soundness": "may"}},
+        })
+        rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "param:0",
+                          "--target", "active", "--format", "json"] + extra)
+        assert rc == 0
+        assert calls[-1]["op"] == "taint"
+        return calls[-1]["params"]
+
+    assert _run(["--max-iters", "7"])["max_iters"] == 7
+    # The documented default, echoed back by the bridge in `run_params`; the
+    # engine's own constructor default is the same number.
+    assert _run([])["max_iters"] == 256
+
+
+def test_taint_forward_refuses_a_zero_iteration_budget_812(fake_transport, capsys):
+    # An iteration budget of 0 analyses nothing, so the floor is 1 and the
+    # argparse error must say "iterations" -- the shared `_depth_int` validator
+    # would have blamed "depth", naming a different flag than the one that was
+    # wrong. Both halves are asserted: exit 2 alone stays green when the label
+    # reverts, and the label alone would not catch a floor of 0.
+    #
+    # `fake_transport({})` refuses every op, so if the validator ever stops
+    # rejecting, this fails loudly on an unexpected dispatch instead of falling
+    # through to a real bridge. The rejection happens during parsing, so at HEAD
+    # the stub is never consulted.
+    fake_transport({})
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["taint", "forward", "-f", "handler", "--source", "param:0",
+                     "--target", "active", "--max-iters", "0"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "iterations must be an integer >= 1, got 0" in err, err
+    # The label, not the flag name: argparse echoes the whole usage line, which
+    # legitimately contains `--max-depth`. What must not appear is the other
+    # validator's message blaming the wrong quantity.
+    assert "depth must be an integer" not in err, err
+
+
+
+def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
+    # #827 item 1: the bridge follows ONE predecessor per step and discloses the
+    # join as an `alternate_parents` count. That count is the ONLY half of item 1
+    # this PR delivers, and it was JSON-only -- so a text reader saw a phi-join
+    # step rendered byte-identically to a linear one and learned nothing, while
+    # the PR body claimed they learn how many parents were dropped. It rides the
+    # rendered SSA path, which is a `--full` detail, so unlike this PR's two
+    # sibling disclosures (analysis_incomplete, the per-callsite frontier) it is
+    # NOT on the compact default view: the chain it qualifies is not printed
+    # there either, and annotating a step the reader cannot see would disclose
+    # nothing. This test drives the path renderer directly for that reason.
+    from bn.formatters import _render_taint_path
+    out = _render_taint_path([
+        {"address": "0x10", "op": "MLIL_SET_VAR_SSA", "il_text": "a#1 = src",
+         "reason": "seed"},
+        {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(a#1, b#1)",
+         "reason": "phi join", "alternate_parents": 1},
+    ])
+    joined = "\n".join(out)
+    assert ("        <- joins 1 other tainted parent(s) not shown "
+            "(this is one of several provenance paths)") in out, joined
+    # The linear step must NOT be annotated -- an unconditional marker would be
+    # a permanent false alarm on every ordinary chain.
+    assert joined.count("not shown") == 1, joined
+    # A count of 0, an absent key, an unreadable value, a NEGATIVE count and a
+    # value that is merely COERCIBLE to one all render nothing. This is a
+    # disclosure, so a fabricated one is the same defect as a missing one: 1.5
+    # parents do not exist, and the count helper reads a float or a numeric
+    # string as a number by design (it serves counters where that is right), so
+    # the disclosure has to require the real thing -- exactly as the sibling
+    # frontier marker does.
+    for bad in (0, None, "two", True, -3, 1.5, -1.5, "2", [2], {}, float("nan")):
+        step = {"address": "0x30", "op": "MLIL_VAR_PHI", "il_text": "x#1 = phi(...)"}
+        if bad is not None:
+            step["alternate_parents"] = bad
+        assert "not shown" not in "\n".join(_render_taint_path([step])), bad

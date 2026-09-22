@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import importlib
 import importlib.util
 import io
@@ -21,19 +22,30 @@ def _load_bridge(monkeypatch):
     sys.dont_write_bytecode = True
     fake_bn = types.ModuleType("binaryninja")
 
-    class SymbolType:
-        FunctionSymbol = "SymbolType.FunctionSymbol"
-        DataSymbol = "SymbolType.DataSymbol"
-        ImportedFunctionSymbol = "SymbolType.ImportedFunctionSymbol"
-        ImportedDataSymbol = "SymbolType.ImportedDataSymbol"
-        ImportAddressSymbol = "SymbolType.ImportAddressSymbol"
-        ExternalSymbol = "SymbolType.ExternalSymbol"
+    # Real BN models these three as IntEnum, so a member's `str()` is its NUMERIC
+    # value and `.name` is the member name -- `str(SymbolType.ExternalSymbol)` is
+    # "5", never "SymbolType.ExternalSymbol" (#529, #593). The plain-string fakes
+    # this replaces were strictly MORE forgiving: a `str(sym.type) == "SymbolType.X"`
+    # comparison passed the mocked suite and silently never fired against a live
+    # view -- exactly how #529 shipped. Member names AND values are the ones a live
+    # BN 5.4 install exposes (`binaryninja.enums`), so `getattr(bn.SymbolType, name)`
+    # lookups resolve to the same identity a live view hands back.
+    class SymbolType(enum.IntEnum):
+        FunctionSymbol = 0
+        ImportAddressSymbol = 1
+        ImportedFunctionSymbol = 2
+        DataSymbol = 3
+        ImportedDataSymbol = 4
+        ExternalSymbol = 5
+        LibraryFunctionSymbol = 6
+        SymbolicFunctionSymbol = 7
+        LocalLabelSymbol = 8
 
-    class SymbolBinding:
-        NoBinding = "SymbolBinding.NoBinding"
-        LocalBinding = "SymbolBinding.LocalBinding"
-        GlobalBinding = "SymbolBinding.GlobalBinding"
-        WeakBinding = "SymbolBinding.WeakBinding"
+    class SymbolBinding(enum.IntEnum):
+        NoBinding = 0
+        LocalBinding = 1
+        GlobalBinding = 2
+        WeakBinding = 3
 
     class TypeClass:
         # Values match the strings _FakeType carries in its `type_class` field,
@@ -51,13 +63,18 @@ def _load_bridge(monkeypatch):
         NamedTypeReferenceClass = "NamedTypeReferenceClass"
         WideCharTypeClass = "WideCharTypeClass"
 
-    class RelocationType:
-        # The ELF GOT-slot reloc kinds the import classifier cares about (#478):
+    class RelocationType(enum.IntEnum):
+        # The ELF GOT-slot reloc kinds, plus the full live set so a
+        # `getattr(bn.RelocationType, name)` lookup resolves as it does against a
+        # live core. Names and values verified against a live BN 5.4 install;
         # JUMP_SLOT (.rela.plt, callable function import) vs GLOB_DAT (.rela.dyn,
-        # data import). Names mirror real BN's enum members (ELFJumpSlot /
-        # ELFGlobal), verified against a live BinaryView.
-        ELFJumpSlotRelocationType = "RelocationType.ELFJumpSlotRelocationType"
-        ELFGlobalRelocationType = "RelocationType.ELFGlobalRelocationType"
+        # data import) are the two the import classifier distinguishes (#478).
+        ELFGlobalRelocationType = 0
+        ELFCopyRelocationType = 1
+        ELFJumpSlotRelocationType = 2
+        StandardRelocationType = 3
+        IgnoredRelocation = 4
+        UnhandledRelocation = 5
 
     class Symbol:
         def __init__(self, symbol_type, address, name, binding=None):
@@ -423,7 +440,10 @@ class _FakeFunction:
 
     def add_tag(self, tag_type, data, addr=None, auto=False, arch=None):
         tt = self.view.get_tag_type(str(tag_type))
-        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        # The VIEW's id source, not a module-level one (#786): a function tag and
+        # a data tag on the same view are one id space, as they are in real BN,
+        # while ids stay independent of every other view in the run.
+        tag = _FakeTag(tt, str(data), self.view._tag_ids.next())
         if addr is None:
             self._function_tags.append(tag)
         else:
@@ -604,10 +624,37 @@ class _FakeSection:
 
 
 class _FakeSegment:
-    def __init__(self, *, readable: bool = True, writable: bool = False, executable: bool = False):
+    """A BN Segment. *start*/*end* are the half-open address range it covers.
+
+    Both default to None: the common seeding style keys `segments={addr: seg}` by
+    the segment's base address alone, and the extent then comes from the memory
+    blob seeded at that same base (see `_FakeBV.get_segment_at`), so a range query
+    does not need every call site to spell it out. A test that wants a wider
+    segment than its seeded memory passes them explicitly.
+    """
+    def __init__(self, *, start: int | None = None, end: int | None = None,
+                 readable: bool = True, writable: bool = False, executable: bool = False):
+        self.start = start
+        self.end = end
         self.readable = readable
         self.writable = writable
         self.executable = executable
+
+
+def _function_span(fn) -> tuple[int, int]:
+    """The half-open (start, end) a function's body covers: its basic-block
+    extent, exactly as `_FakeBV.get_functions_containing` computes it. A function
+    with no blocks still covers its entry byte.
+
+    ONE rule for both callers: a body that counts as "containing" an address must
+    also be the body that makes the address mapped in `is_valid_offset`, or an
+    xref at a body address would resolve while the same address read as unmapped.
+    """
+    start = int(fn.start)
+    end = start
+    for block in getattr(fn, "basic_blocks", []) or []:
+        end = max(end, int(block.end))
+    return start, end if end > start else start + 1
 
 
 class _FakeReloc:
@@ -622,18 +669,21 @@ class _FakeReloc:
 class _TagIdCounter:
     """Deterministic tag-id source. Emits valid UUID strings (real BN tag ids are
     UUIDs, and `_op_tag_remove` now rejects a non-UUID `--id`) that are still
-    stable/predictable per run -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
+    stable/predictable -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
     The 'fa5e' marker keeps them recognizable as fakes and clear of the all-zeros
-    UUID a test may use for the well-formed-but-nonexistent case."""
+    UUID a test may use for the well-formed-but-nonexistent case.
+
+    ONE counter PER VIEW (#786), never a module-level one: an absolute id is then
+    a function of the view the test built and nothing else, so it cannot drift with
+    how many tags earlier tests in the session created nor with which xdist worker
+    ran this one -- the two ways a suite-order-dependent id shows up as a flake.
+    """
     def __init__(self):
         self._n = 0
 
     def next(self) -> str:
         self._n += 1
         return f"0000fa5e-0000-0000-0000-{self._n:012d}"
-
-
-_TAG_IDS = _TagIdCounter()
 
 
 class _FakeTagType:
@@ -726,6 +776,9 @@ class _FakeBV:
         # tag state: {name: _FakeTagType}, data/address tags {addr: [_FakeTag]}
         self._tag_types: dict[str, _FakeTagType] = {}
         self._data_tags: dict[int, list[_FakeTag]] = {}
+        # This view's own tag-id source (#786); `_FakeFunction.add_tag` draws from
+        # it too, so absolute ids depend on this view alone.
+        self._tag_ids = _TagIdCounter()
         # {address: _FakeDataVariable} -- mirrors bv.data_vars' mapping shape.
         self.data_vars = dict(data_vars or {})
 
@@ -849,12 +902,7 @@ class _FakeBV:
     def get_functions_containing(self, address: int):
         result = []
         for fn in self.functions:
-            start = int(fn.start)
-            end = start
-            for block in getattr(fn, "basic_blocks", []) or []:
-                end = max(end, int(block.end))
-            if end == start:
-                end = start + 1
+            start, end = _function_span(fn)
             if start <= int(address) < end:
                 result.append(fn)
         return result
@@ -879,7 +927,63 @@ class _FakeBV:
         return result
 
     def get_segment_at(self, address: int):
-        return self._segments.get(address)
+        """The segment CONTAINING *address*, like real BN's get_segment_at --
+        not only the one based exactly at it.
+
+        A segment seeded as `segments={base: seg}` takes its extent from the
+        memory blob seeded at the same base, so `get_segment_at(base + 0x10)`
+        answers for the blob the test actually mapped; a segment with explicit
+        start/end uses those. Nothing widens beyond what the view was seeded
+        with: an address outside every seeded extent stays None, so
+        `is_offset_executable` cannot report a segment the view never had.
+        """
+        for base, seg in self._segments.items():
+            start, end = self._segment_extent(base, seg)
+            if start <= int(address) < end:
+                return seg
+        return None
+
+    def _segment_extent(self, base, seg) -> tuple[int, int]:
+        """The half-open range one seeded segment covers."""
+        start = int(base) if seg.start is None else int(seg.start)
+        if seg.end is not None:
+            return start, int(seg.end)
+        blob = self._memory.get(start)
+        # With no blob at the base there is no extent the fake can honestly
+        # claim, so the segment covers the single byte it was seeded at.
+        return start, start + (len(blob) if blob else 1)
+
+    def is_valid_offset(self, address: int) -> bool:
+        """Real BN's BinaryView.is_valid_offset: True only for a MAPPED address.
+
+        Implemented so that "#374/`_require_mapped_address` rejects an unmapped
+        address" is the DEFAULT under the mocks, not something each unmapped-path
+        test has to hand-patch: a bare `_FakeBV()` maps nothing, so every address
+        in it is invalid, and a read that a live view would refuse cannot pass a
+        test here (#783, the #616 class).
+
+        Mapped means the view was seeded with something AT that address: a memory
+        blob, a segment extent, a section range, or a function body. Those are the
+        fake's structural mapping records. Deliberately NOT included: `code_refs`/
+        `data_refs` keys and comment/tag addresses -- `0x0` is real BN's placeholder
+        for unresolved indirect-call sites, so an address can carry refs, comments
+        or tags while still being unmapped, which is the case #374's follow-up
+        tests exist to pin (and why they must keep patching this member).
+        """
+        address = int(address)
+        for base, blob in self._memory.items():
+            if int(base) <= address < int(base) + len(blob):
+                return True
+        if self.get_segment_at(address) is not None:
+            return True
+        for sec in self.sections.values():
+            if int(sec.start) <= address < int(sec.end):
+                return True
+        for fn in self.functions:
+            start, end = _function_span(fn)
+            if start <= address < end:
+                return True
+        return False
 
     def read(self, address: int, length: int):
         # Binary Ninja's bv.read returns only the contiguous mapped bytes
@@ -916,7 +1020,7 @@ class _FakeBV:
 
     def add_tag(self, addr, tag_type_name, data, user=True):
         tt = self._tag_types[str(tag_type_name)]  # KeyError if unknown -> handler validates first
-        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        tag = _FakeTag(tt, str(data), self._tag_ids.next())
         self._data_tags.setdefault(int(addr), []).append(tag)
         return tag
 

@@ -47,6 +47,7 @@ import bn.cli
 import pytest
 from bn.headless import _find_bn_python
 from bn.proc_identity import PIDFD_AVAILABLE, PinUnavailable, pin_process
+from bn.transport import DEFAULT_REQUEST_TIMEOUT
 
 sys.dont_write_bytecode = True
 
@@ -219,6 +220,13 @@ def build_integration_fixtures(
     *out_dir* defaults to `tests/fixtures/` -- where the real-BN lane reads
     them. Tests that only exercise the build itself pass a tmp dir, so a
     unit-only run stays side-effect-free.
+
+    That default is the WORKING TREE, and the build leaves things in it: the
+    `*_x86_64` binaries and the `.build.lock` flock file stay in `tests/fixtures/`
+    after the run. Both are gitignored (.gitignore's fixture block), so a real-BN
+    run dirties the directory without dirtying `git status` -- but a sandbox that
+    requires a pristine tree should pass *out_dir* and read the binaries from
+    there.
 
     Race-safe across pytest-xdist workers (an flock on `.build.lock`) and
     across threads in one process (`fcntl` locks are per-process, so the
@@ -627,13 +635,48 @@ def _hermetic_env(request, monkeypatch, tmp_path_factory):
 
 @pytest.fixture
 def fake_transport(monkeypatch):
+    """Install a recording `bn.cli.send_request`; returns the installer.
+
+    Each recorded call is ONE dict describing the request the CLI built: `op`,
+    `params` and `target`, plus every keyword `bn.cli.send_request` accepts --
+    `timeout`, `default_timeout`, `connect_retries`, `instance_id`,
+    `spawn_missing_named`, `resolved`, `idle_probe`. Recorded in full rather
+    than only op/params/target (#787): a fake that drops the routing kwargs
+    cannot catch a routing regression, so a test could assert the op while the
+    CLI sent the call to the wrong INSTANCE, with the wrong spawn policy, or
+    without the `resolved` flag a shrinking end-to-end budget depends on -- and
+    the suite stayed green.
+
+    The signature is the real one's parameter for parameter, with NO `**kwargs`
+    catch-all: a recorder more forgiving than the function it replaces accepts a
+    call the live `send_request` raises TypeError on, so a handler shipping a
+    misspelled or removed routing kwarg would pass the mocked suite and break
+    against a real bridge. Because it binds identically, the recorded values are
+    the ones the real call would bind: `timeout=None` means the CLI left timeout
+    resolution to `send_request` (it does on every primary call), not that the
+    fake defaulted.
+    """
     def install(results=None, *, default=None):
         results = results or {}
         calls = []
 
-        def fake_send_request(op, *, params=None, target=None, timeout=30.0,
-                              instance_id=None, spawn_missing_named=False, **kwargs):
-            calls.append({"op": op, "params": params, "target": target})
+        def fake_send_request(op, *, params=None, target=None, timeout=None,
+                              default_timeout=DEFAULT_REQUEST_TIMEOUT,
+                              connect_retries=4, instance_id=None,
+                              spawn_missing_named=False, resolved=False,
+                              idle_probe=False):
+            calls.append({
+                "op": op,
+                "params": params,
+                "target": target,
+                "timeout": timeout,
+                "default_timeout": default_timeout,
+                "connect_retries": connect_retries,
+                "instance_id": instance_id,
+                "spawn_missing_named": spawn_missing_named,
+                "resolved": resolved,
+                "idle_probe": idle_probe,
+            })
             if op in results:
                 return results[op]
             if default is not None:
