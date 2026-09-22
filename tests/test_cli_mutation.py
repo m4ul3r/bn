@@ -362,9 +362,13 @@ def test_go_rename_preview_counts_match_the_detail_renderer():
 
 
 def test_mutation_summary_transforms_are_idempotent():
-    # `_call` evaluates spill_status against the ALREADY-transformed result, so a
-    # second pass must not re-zero the counts. Harmless today only because a
-    # ~200-byte summary never crosses the spill threshold.
+    # The shipped compact transforms are no-ops on their OWN output, so a caller
+    # that applies one twice cannot re-zero the counts. This property is no
+    # longer LOAD-BEARING for the CLI -- `_call` now evaluates `spill_status`
+    # against the raw result (#693 item 4, pinned by
+    # `test_a_non_idempotent_summary_transform_is_applied_once_per_call`), so a
+    # future transform is allowed to be non-idempotent -- but the guard it covers
+    # is still what makes a direct double application safe.
     from bn.formatters import _go_rename_summary, _mutation_summary
     go = {"kind": "go_rename", "success": True, "committed": True, "preview": False,
           "results": [], "go_renamed_candidates": 1783, "go_committed_count": 1783,
@@ -373,6 +377,626 @@ def test_mutation_summary_transforms_are_idempotent():
     plain = {"success": True, "committed": True, "results": [{"status": "verified"}]}
     assert _mutation_summary(_mutation_summary(plain)) == _mutation_summary(plain)
     assert _mutation_summary(_mutation_summary(plain))["changed_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #693 round 2 -- the go-rename payloads below come from the PRODUCER, never
+# from a hand-written dict.
+#
+# Round 1's blocker was exactly a hand-built shape: an empty `results` list
+# beside a NONZERO `go_failed_count`. `_apply_go_renames_chunked` builds both
+# from the one `failed_rows` list (`"results": failed_rows` beside
+# `"go_failed_count": len(failed_rows)`), so that pair cannot occur -- and the
+# assertions written on it rode the pre-existing rows-contradict fail-safe
+# rather than the new failed-revert rule, so they passed on base. These helpers
+# run the real bridge function against a fake BinaryView and hand ITS output to
+# the CLI seam, so every payload below is one the bridge really emits and the
+# live names are the ground truth a `changed_count` claim is judged against.
+# ---------------------------------------------------------------------------
+
+
+class _GoRenameFn:
+    """A view function whose rename can be made not to TAKE, which is how the
+    producer's readback check (`observed != new_name`) fails."""
+
+    def __init__(self, name: str, *, rename_sticks: bool = True) -> None:
+        self._name = name
+        self._rename_sticks = rename_sticks
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        if self._rename_sticks:
+            self._name = value
+
+
+class _GoRenameBV:
+    """The view the producer renames through.
+
+    The apply loop looks each address up once and the rollback looks it up
+    again, so "the SECOND lookup of this address returns None" is how a
+    rollback fails while the rename it could not undo stays LIVE. It is the
+    same seam `tests/test_bridge_mutation.py` drives for the bridge's own
+    dirty-marking, reused here to SOURCE the CLI's payloads."""
+
+    def __init__(self, functions, lose_on_rollback=()):
+        self._functions = dict(functions)
+        self._lookups: dict[int, int] = {}
+        self._lost = set(lose_on_rollback)
+
+    def get_function_at(self, addr):
+        seen = self._lookups.get(addr, 0) + 1
+        self._lookups[addr] = seen
+        if seen > 1 and addr in self._lost:
+            return None
+        return self._functions.get(addr)
+
+
+_GO_RENAME_ADDRS = (0x401000, 0x402000)
+
+
+def _go_rename_produced(monkeypatch, *, preview, readback_fails=(),
+                        lose_on_rollback=(), skipped_user_named=3,
+                        skipped_already_named=0, skipped_interior_pc=0):
+    """Run the REAL `go rename` producer; return (payload, live names).
+
+    The dict is `_apply_go_renames_chunked`'s own output -- the exact envelope
+    the CLI receives over the wire -- and the name map is what the view
+    actually holds when it returns, which is what makes an assertion about
+    `changed_count` checkable instead of self-referential."""
+    from _bridge_fakes import _load_bridge
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda bv: None)
+    functions = {addr: _GoRenameFn(f"sub_{addr:x}",
+                                   rename_sticks=addr not in readback_fails)
+                 for addr in _GO_RENAME_ADDRS}
+    candidates = [{"address": addr, "before_name": f"sub_{addr:x}",
+                   "new_name": f"main.f{index}"}
+                  for index, addr in enumerate(_GO_RENAME_ADDRS)]
+    payload = instance._apply_go_renames_chunked(
+        _GoRenameBV(functions, lose_on_rollback), candidates, preview=preview,
+        skipped_user_named=skipped_user_named,
+        skipped_already_named=skipped_already_named,
+        skipped_interior_pc=skipped_interior_pc,
+        # The scan's FOUR buckets partition `defined_count` (bridge #818):
+        # candidate / user-named / already carries the Go name / no function
+        # STARTS at the pcln address.
+        defined_count=(len(candidates) + skipped_user_named
+                       + skipped_already_named + skipped_interior_pc))
+    return payload, {addr: fn.name for addr, fn in functions.items()}
+
+
+def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatch):
+    """#693 item 1: `changed` is what is LIVE, and a failed revert leaves an
+    UNKNOWN nonzero subset of the renames live. Reporting `changed_count: 0`
+    there is a claim the state cannot support, and on this op a 0 is the "nothing
+    changed, do not save" verdict a control loop acts on -- the #683 harm
+    reached from the one state where the view is KNOWN to be modified.
+
+    The count is therefore `null` (unknown), beside `rolled_back: false` and the
+    fail-safe `dirty_after: true`; `measured` stays `true`, because the counters
+    and the failure row DID read -- what is unknown is the live delta, not the
+    measurement. Every FACE has to carry it: the JSON key, the default text line
+    (which drops `rolled_back` entirely and so has to name the state in its
+    word), and the `--verbose` detail view, which may not state a confident `0`
+    where the compact face of the identical payload states `changed=None`."""
+    from bn.formatters import (_go_rename_summary, _render_go_rename_text,
+                               _render_mutation_summary_text)
+
+    # The producer's own output for "a rename failed and the revert that
+    # followed did not complete", plus the names the view is LEFT holding.
+    stuck, live = _go_rename_produced(
+        monkeypatch, preview=False,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    assert stuck["rolled_back"] is False and stuck["committed"] is False
+    assert stuck["go_verified_count"] == 1 and stuck["go_failed_count"] == 1
+    # The ground truth every count below is judged against: one rename is LIVE.
+    assert live[0x401000] == "main.f0", live
+
+    summary = _go_rename_summary(dict(stuck))
+    assert summary["changed_count"] is None, summary          # UNKNOWN, not 0
+    assert summary["measured"] is True, summary               # the counters read
+    assert summary["dirty_after"] is True, summary
+    assert summary["rolled_back"] is False
+    # The counts that ARE known stay reported: nulling them would lose the one
+    # fact a remediation pass needs.
+    assert summary["verified_count"] == 1 and summary["failed_count"] == 1
+
+    compact = _render_mutation_summary_text(summary)
+    assert "changed=None" in compact and "changed=0" not in compact, compact
+    assert "mutation: rollback failed" in compact, compact
+    detail = _render_go_rename_text(dict(stuck))
+    assert "rollback failed" in detail, detail
+    assert "reverted" not in detail, detail
+    # The DETAIL view may not state a count either: "0 renamed" beside the
+    # compact face's `changed=None` is one payload's two views disagreeing,
+    # and a rename really is live (asserted from the producer above).
+    assert "0 renamed" not in detail, detail
+    assert "unknown number of the renames this run applied are still live" in detail, detail
+    # ...and the counts it CAN support are stated, so the reworded line is not
+    # a vaguer replacement for the numbers it dropped (#693 r3).
+    assert "(1 verified, 1 failed, 3 skipped)" in detail, detail
+
+    # Anti-vacuity, BOTH directions, from the SAME producer: the identical run
+    # whose revert COMPLETED is a measured zero that is not dirty -- so the null
+    # above is the state's answer and not a constant this summary always emits.
+    reverted, reverted_live = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=(0x402000,))
+    assert reverted["rolled_back"] is True
+    assert reverted_live == {0x401000: "sub_401000", 0x402000: "sub_402000"}
+    clean = _go_rename_summary(dict(reverted))
+    assert clean["changed_count"] == 0 and clean["measured"] is True, clean
+    assert clean["dirty_after"] is False, clean
+    assert "mutation: rolled back" in _render_mutation_summary_text(clean)
+    assert "0 renamed" in _render_go_rename_text(dict(reverted))
+
+    # ...and the PREVIEW whose revert failed is the same live state: a preview
+    # that could not be reverted really renamed the view, so it may not report a
+    # plan either. THIS is the shape round 1's hand-built dict could not reach --
+    # no failure row AND a zero failure counter -- so nothing below can be
+    # satisfied by the rows-contradict/unmeasured fail-safe.
+    preview_stuck, preview_live = _go_rename_produced(
+        monkeypatch, preview=True, lose_on_rollback=(0x401000,))
+    assert preview_stuck["results"] == [] and preview_stuck["go_failed_count"] == 0
+    assert preview_stuck["rolled_back"] is False and preview_stuck["success"] is False
+    assert preview_live[0x401000] == "main.f0", preview_live   # really live
+    preview_summary = _go_rename_summary(dict(preview_stuck))
+    assert preview_summary["changed_count"] is None, preview_summary
+    assert preview_summary["measured"] is True, preview_summary   # NOT the fail-safe
+    assert preview_summary["dirty_after"] is True, preview_summary
+    preview_detail = _render_go_rename_text(dict(preview_stuck))
+    assert "0 would rename" not in preview_detail, preview_detail
+    assert "unknown number of the renames this run applied are still live" in preview_detail, (
+        preview_detail)
+    assert "(2 verified, 0 failed, 3 skipped)" in preview_detail, preview_detail
+    # No apply failure happened here (`go_failed_count: 0`, `results: []`), so
+    # this view may not name one, and may not send the reader to a list of
+    # failures that does not exist -- at a view its own banner says may be left
+    # modified.
+    assert "before the failure" not in preview_detail, preview_detail
+    assert "fix the failure(s) below" not in preview_detail, preview_detail
+
+
+def test_a_failed_preview_whose_revert_also_failed_still_lists_its_failure(monkeypatch):
+    """#693 r3: a failed preview revert is NOT always row-free.
+
+    The bridge computes `rolled_back` whenever the run was a preview OR
+    something failed, so `rolled_back: false` on a preview has TWO shapes: no
+    failure row at all (every rename verified, only the revert failed), and a
+    populated `results[]` (a rename failed AND the revert that followed did not
+    complete). Round 2 wrote the first as a universal into the public reference
+    and into the renderer's own comment, which is the same defect class this PR
+    exists to fix -- a claim the producer does not support -- and a reader who
+    trusts it stops parsing `results[]` on exactly the state that HAS rows.
+
+    This cell is the state's coverage: the unknown-count line is right for it
+    (the revert left renames live), and the failure row must still be listed
+    and counted beside it."""
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    both, live = _go_rename_produced(
+        monkeypatch, preview=True,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    # The shape the round-2 reference said could not occur.
+    assert both["preview"] is True and both["rolled_back"] is False
+    assert both["go_failed_count"] == 1 and len(both["results"]) == 1
+    assert live[0x401000] == "main.f0", live          # a rename is still live
+
+    summary = _go_rename_summary(dict(both))
+    assert summary["changed_count"] is None and summary["measured"] is True, summary
+    assert summary["failed_count"] == 1 and summary["dirty_after"] is True, summary
+
+    detail = _render_go_rename_text(dict(both))
+    assert "unknown number of the renames this run applied are still live" in detail, detail
+    assert "(1 verified, 1 failed, 3 skipped)" in detail, detail
+    # The row is listed under the line, which is why the reference may not tell
+    # a reader there is nothing there.
+    assert "failed: main.f1 @ 0x402000 (verification_failed)" in detail, detail
+
+
+def test_a_failed_preview_does_not_report_its_verified_rows_as_would_land(monkeypatch):
+    """#693 item 2: `go rename` is all-or-nothing, so a FAILED preview's rows that
+    verified before the failure are not "what would land" -- running that same
+    state live commits zero. The compact summary reported them as `changed`, in
+    the PREVIEW state a caller reads as "this is the plan", and the detail view
+    stated them as `N would rename` on the one line that claims those counts.
+
+    Both faces must report 0 instead, with the verified rows named as what they
+    are: how far the apply got. A preview that SUCCEEDED is unaffected -- it is
+    the only one whose verified rows are the plan."""
+    from bn.formatters import (_go_rename_summary, _render_go_rename_text,
+                               _render_mutation_summary_text)
+
+    failed, live = _go_rename_produced(
+        monkeypatch, preview=True, readback_fails=(0x402000,))
+    assert failed["preview"] is True and failed["rolled_back"] is True
+    assert failed["go_verified_count"] == 1 and failed["go_failed_count"] == 1
+    # The revert COMPLETED, so nothing is live -- which is what makes 0 the
+    # honest answer here and `null` the honest answer in the sibling test.
+    assert live == {0x401000: "sub_401000", 0x402000: "sub_402000"}
+
+    summary = _go_rename_summary(dict(failed))
+    assert summary["changed_count"] == 0, summary      # nothing would land
+    assert summary["verified_count"] == 1, summary     # ...how far it got is kept
+    assert summary["measured"] is True and summary["dirty_after"] is False
+    detail = _render_go_rename_text(dict(failed))
+    assert "0 would rename" in detail, detail
+    assert "1 verified before the failure" in detail, detail
+    assert "1 would rename" not in detail, detail
+    assert "changed=1" not in _render_mutation_summary_text(summary)
+
+    # The anti-vacuity partner, from the same producer: a preview that reported
+    # no failure IS the plan.
+    clean, clean_live = _go_rename_produced(monkeypatch, preview=True)
+    assert clean["success"] is True and clean["go_failed_count"] == 0
+    assert clean_live == {0x401000: "sub_401000", 0x402000: "sub_402000"}
+    exact = _go_rename_summary(dict(clean))
+    assert exact["changed_count"] == 2, exact
+    assert "2 would rename" in _render_go_rename_text(dict(clean))
+
+
+def test_a_failed_preview_missing_its_verified_counter_stays_unmeasured(monkeypatch):
+    """#693 r2: the item-2 fix narrowed `elif preview:` to `elif preview and
+    run_ok:`, which changed the VALUE a failed preview reports (0, not the rows
+    that verified) but also dropped `go_verified_count` as that branch's
+    MEASUREMENT SOURCE -- a failed preview fell through to the `else`, whose
+    `source is None` asks for no counter at all.
+
+    So an envelope that states no verified counter went from the #684 fail-safe
+    (`measured: false`, every derived count `null`, `dirty_after: true`, exit 4)
+    to a fabricated `verified_count: 0` beside `measured: true` and
+    `dirty_after: false` -- the summary claiming a measurement it never made,
+    over the one counter this state's own detail line still prints as "N
+    verified before the failure". The value change was the intent; switching
+    off the fail-safe was not. The source is required for every preview again.
+
+    The missing counter is a VERSION-SKEW envelope, so it cannot come from
+    today's producer -- that is the finding. The payload is therefore the
+    producer's own output with the one key deleted, and the counterpart that
+    keeps it is pure producer."""
+    from bn.formatters import _go_rename_summary
+
+    failed, _ = _go_rename_produced(
+        monkeypatch, preview=True, readback_fails=(0x402000,))
+    assert failed["rolled_back"] is True and failed["go_failed_count"] == 1
+    assert "go_verified_count" in failed          # today's bridge always states it
+
+    skewed = {key: value for key, value in failed.items()
+              if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(skewed))
+    assert summary["measured"] is False, summary
+    assert summary["changed_count"] is None, summary
+    assert summary["verified_count"] is None, summary   # never a fabricated 0
+    assert summary["dirty_after"] is True, summary      # the #684 fail-safe
+
+    # The counterpart, straight from the producer: the counter IS stated, so the
+    # same failed preview is measured and reports the plan of zero.
+    stated = _go_rename_summary(dict(failed))
+    assert stated["measured"] is True and stated["changed_count"] == 0, stated
+    assert stated["verified_count"] == 1, stated
+
+
+def test_a_live_failed_revert_missing_its_verified_counter_stays_unmeasured(monkeypatch):
+    """#693 r4: the same hole as r2's, one rung down and in the LIVE direction.
+
+    Round 2 named `go_verified_count` on the preview rung and left the rung
+    below sourceless, on the reason that `changed = 0` is established by the
+    revert rather than by a counter. True of `changed` -- but on a revert that
+    did NOT complete the builder overrides that 0 to `None` anyway, so the
+    counts this summary still STATES (`verified_count`, `noop_count`,
+    `failed_count`) are the only numbers a remediation pass has, and
+    `_count_field` answers 0 for an absent key. A LIVE failed revert whose
+    envelope omits the counter therefore reported `verified_count: 0` beside
+    `measured: true` and beside `changed_count: null` -- while the detail view,
+    which falls back to `candidates - failure rows`, printed `1 verified` for
+    the SAME payload. Two faces, two different fabricated numbers, in the one
+    state where the caller has already been told the live delta is unknown.
+
+    A revert that COMPLETED keeps the sourceless rung: nothing landed, the
+    revert establishes it, and that contract is pinned by
+    `test_a_go_rename_summary_with_no_counters_is_not_a_measured_noop`.
+
+    Version skew again, so the payload is the producer's own output with the
+    one key deleted; the counterpart that keeps it is pure producer."""
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    live, _ = _go_rename_produced(
+        monkeypatch, preview=False,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    assert live["preview"] is False and live["rolled_back"] is False
+    assert "go_verified_count" in live          # today's bridge always states it
+
+    skewed = {key: value for key, value in live.items()
+              if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(skewed))
+    assert summary["measured"] is False, summary
+    assert summary["verified_count"] is None, summary   # never a fabricated 0
+    assert summary["failed_count"] is None, summary
+    assert summary["dirty_after"] is True, summary
+    # The detail view's own figure on that envelope is `candidates - failure
+    # rows`, not something the envelope reported -- which is both why the
+    # compact face may not call it a measurement and why a confident 0 there
+    # would have disagreed with the text a reader sees.
+    assert "1 verified" in _render_go_rename_text(dict(skewed))
+
+    # Anti-vacuity: with the counter stated, the same run is measured.
+    stated = _go_rename_summary(dict(live))
+    assert stated["measured"] is True and stated["verified_count"] == 1, stated
+
+    # ...and the neighbouring rung keeps its sourceless `changed`: a revert
+    # that COMPLETED establishes "nothing landed" without a counter. What it
+    # does NOT establish is how many rows verified first -- see
+    # `test_a_completed_revert_states_no_count_its_envelope_never_stated`.
+    reverted, _ = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=(0x402000,))
+    assert reverted["rolled_back"] is True
+    completed = _go_rename_summary(
+        {key: value for key, value in reverted.items()
+         if key != "go_verified_count"})
+    assert completed["measured"] is True and completed["changed_count"] == 0, completed
+
+
+def test_a_completed_revert_states_no_count_its_envelope_never_stated(monkeypatch):
+    """#693 r6: `measured` covers the counter `changed` is read from -- and the
+    summary STATES two more.
+
+    A live run that failed and reverted CLEANLY takes the sourceless rung:
+    nothing landed, and the REVERT establishes that, so no counter is needed
+    for `changed`. The rung still states `verified_count` and `noop_count`
+    though, `_count_field` answers 0 for an absent key, and 0 on this op is the
+    "nothing happened, do not save" verdict #683 discarded a rename batch to.
+    So a version-skewed envelope omitting `go_verified_count` reported
+    `verified_count: 0` beside `measured: true` -- while `--verbose` on the
+    SAME payload derived `candidates - failure rows` and printed a different,
+    non-zero figure. A revert establishes what LANDED, never how many rows
+    verified before the failure, and a count the envelope never stated is not
+    a zero.
+
+    `failed_count` is deliberately NOT in this rule: the failure ROWS answer
+    the same question, `rows_contradict` refuses when the two disagree, and an
+    empty `results[]` beside an absent counter is a zero the rows establish.
+    """
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+
+    reverted, live_names = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=(0x402000,))
+    assert reverted["rolled_back"] is True and reverted["committed"] is False
+    # Ground truth: the revert really did put every name back.
+    assert set(live_names.values()) == {f"sub_{addr:x}"
+                                        for addr in _GO_RENAME_ADDRS}
+    assert reverted["go_verified_count"] == 1, reverted
+    assert reverted["skipped_user_named"] == 3, reverted
+
+    no_verified = {key: value for key, value in reverted.items()
+                   if key != "go_verified_count"}
+    summary = _go_rename_summary(dict(no_verified))
+    assert summary["measured"] is True, summary        # the revert measured `changed`
+    assert summary["changed_count"] == 0, summary      # ...and nothing landed
+    assert summary["verified_count"] is None, summary  # never a fabricated 0
+    assert summary["dirty_after"] is False, summary    # the view really is clean
+    # The detail view still DERIVES a figure here (candidates - failure rows).
+    # The compact face refusing is what stops the two from stating different
+    # numbers for one payload.
+    detail = _render_go_rename_text(dict(no_verified))
+    assert "1 would have" in detail, detail
+
+    no_skipped = {key: value for key, value in reverted.items()
+                  if key != "skipped_user_named"}
+    assert _go_rename_summary(dict(no_skipped))["noop_count"] is None
+
+    # Anti-vacuity: a STATED counter is still reported as its number.
+    stated = _go_rename_summary(dict(reverted))
+    assert stated["verified_count"] == 1 and stated["noop_count"] == 3, stated
+
+    # `failed_count` stays a number when the ROWS establish it...
+    clean, _ = _go_rename_produced(monkeypatch, preview=False)
+    assert clean["results"] == [] and clean["committed"] is True
+    rows_say_zero = _go_rename_summary(
+        {key: value for key, value in clean.items() if key != "go_failed_count"})
+    assert rows_say_zero["measured"] is True, rows_say_zero
+    assert rows_say_zero["failed_count"] == 0, rows_say_zero
+    # ...and the summary refuses when the rows CONTRADICT the absent counter.
+    rows_disagree = _go_rename_summary(
+        {key: value for key, value in reverted.items() if key != "go_failed_count"})
+    assert rows_disagree["measured"] is False, rows_disagree
+
+
+def test_the_op_count_reference_names_the_scan_buckets_it_leaves_out(monkeypatch):
+    """#693 r6: `op_count` is the candidates plus the SCAN-TIME user-named
+    skips -- and the scan has two more buckets it does not include.
+
+    The bridge partitions every DEFINED row into four buckets (#818): a
+    candidate, a user-named skip, a function already carrying the recovered
+    name, and a pcln address no BN function STARTS at. Only the first two
+    reach `op_count`, so it does not reconcile with the `defined_count` the
+    SAME envelope carries -- and on an idempotent re-run every previously
+    renamed function moves into the already-named bucket, so `op_count`
+    collapses toward 0 while the op considered the whole table. Calling it
+    "the distinct functions considered" in the public reference was false by
+    the size of those two buckets, and a reader reconciling the two numbers
+    has no way to tell which to believe. The reference has to NAME the fields
+    it leaves out, so the gap is disclosed rather than discovered.
+    """
+    from pathlib import Path
+
+    from bn.formatters import _go_rename_summary
+
+    payload, _ = _go_rename_produced(
+        monkeypatch, preview=False, skipped_user_named=3,
+        skipped_already_named=2, skipped_interior_pc=4)
+    assert payload["defined_count"] == 11, payload      # 2 + 3 + 2 + 4
+    assert payload["skipped_already_named"] == 2, payload
+    assert payload["skipped_interior_pc"] == 4, payload
+    # candidates (2) + the scan-time user-named skips (3): six of the eleven
+    # rows the op considered are outside it.
+    assert _go_rename_summary(payload)["op_count"] == 5, payload
+
+    reference = (Path(__file__).resolve().parents[1]
+                 / "skills" / "bn" / "reference" / "mutating.md")
+    row = [line for line in reference.read_text(encoding="utf-8").splitlines()
+           if line.startswith("| `op_count`")]
+    assert len(row) == 1, row
+    for field in ("skipped_already_named", "skipped_interior_pc", "defined_count"):
+        assert field in row[0], (
+            f"the op_count row must name `{field}` -- a bucket the op counted "
+            f"and `op_count` leaves out: {row[0]}")
+
+
+def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
+        monkeypatch, fake_transport, capsys):
+    """The same states end to end, because the default and `--verbose` views are
+    separate code paths and #693's harm is a CLIENT reading a summary key: the
+    live failed-revert run must print an unknown `changed`, the failed preview
+    must not print a plan, and the preview whose REVERT failed must print
+    neither a plan nor a zero."""
+    stuck, live = _go_rename_produced(
+        monkeypatch, preview=False,
+        readback_fails=(0x402000,), lose_on_rollback=(0x401000,))
+    assert live[0x401000] == "main.f0", live
+    fake_transport({"go_rename": {"ok": True, "result": dict(stuck)}})
+    # Exit 3: a failed mutation's code is not reclassified by how its counts read.
+    assert bn.cli.main(["go", "rename", "--target", "active"]) == 3
+    out = capsys.readouterr().out
+    assert "changed=None" in out and "changed=0" not in out, out
+    assert "rollback failed" in out, out
+
+    fake_transport({"go_rename": {"ok": True, "result": dict(stuck)}})
+    assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
+    verbose = capsys.readouterr().out
+    assert "reverted" not in verbose, verbose
+    assert "0 renamed" not in verbose, verbose
+    assert "unknown number of the renames this run applied are still live" in verbose, verbose
+
+    # The bridge-reachable failed PREVIEW: no failure row, a zero failure
+    # counter, and the renames really live.
+    preview_stuck, preview_live = _go_rename_produced(
+        monkeypatch, preview=True, lose_on_rollback=(0x401000,))
+    assert preview_live[0x401000] == "main.f0", preview_live
+    fake_transport({"go_rename": {"ok": True, "result": dict(preview_stuck)}})
+    assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
+    stuck_preview = capsys.readouterr().out
+    assert "0 would rename" not in stuck_preview, stuck_preview
+    assert "unknown number of the renames this run applied are still live" in stuck_preview, (
+        stuck_preview)
+
+    # ...and the failed preview that DID revert, the one state a plan of zero is
+    # the correct answer for.
+    reverted_preview, _ = _go_rename_produced(
+        monkeypatch, preview=True, readback_fails=(0x402000,))
+    fake_transport({"go_rename": {"ok": True, "result": dict(reverted_preview)}})
+    assert bn.cli.main(["go", "rename", "--target", "active", "--verbose"]) == 3
+    failed_preview = capsys.readouterr().out
+    assert "0 would rename" in failed_preview, failed_preview
+    assert "1 would rename" not in failed_preview, failed_preview
+
+
+def test_a_generic_mutation_whose_revert_failed_reports_changed_unknown(monkeypatch):
+    """#693 round 2: "a revert that failed makes `changed_count` unknown" is
+    stated of the ONE compact-status schema in
+    `skills/bn/reference/mutating.md`, but it shipped implemented in
+    `_go_rename_summary` ALONE -- the `results[]`-derived sibling that serves
+    every other mutation still stated a confident integer for the identical
+    live state. A documented rule one of the two callers does not obey is the
+    drift `_build_mutation_summary` was extracted to stop, so the rule now
+    lives in the shared builder beside the `dirty_after` clause that reads the
+    same two fields.
+
+    Driven from the GENERIC producer (`mutation_engine._mutation` with its
+    non-journaled restore refusing), because the whole point is that this state
+    is bridge-reachable on ops that have nothing to do with `go rename`: the
+    message the producer itself writes is "the view may be left modified"."""
+    from _bridge_fakes import _FakeMutationBV, _load_bridge, _mutation_with_stubs
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply,
+                         verify=lambda bv_, result: {**result, "status": "verified"})
+    ops = [{"op": "local_rename", "function": "f", "variable": "a", "new_name": "x"},
+           {"op": "local_rename", "function": "f", "variable": "b", "new_name": "y"}]
+
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: False)
+    stuck = instance._mutation("active", True, [dict(op) for op in ops])
+    assert stuck["rolled_back"] is False and stuck["committed"] is False
+    assert [row["status"] for row in stuck["results"]] == ["verified", "verified"]
+    assert "may be left modified" in stuck["message"], stuck["message"]
+
+    summary = _mutation_summary(dict(stuck))
+    assert summary["changed_count"] is None, summary   # UNKNOWN, not a plan of 2
+    assert summary["measured"] is True, summary        # the rows DID read
+    assert summary["verified_count"] == 2, summary     # how far it got is kept
+    assert summary["dirty_after"] is True, summary
+    text = _render_mutation_summary_text(summary)
+    assert "changed=None" in text and "changed=2" not in text, text
+
+    # Anti-vacuity from the SAME producer: the identical batch whose restore
+    # SUCCEEDED is a clean preview with a measured plan of 2 and a clean view,
+    # so the null above is this state's answer and not a constant.
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: True)
+    reverted = instance._mutation("active", True, [dict(op) for op in ops])
+    assert reverted["rolled_back"] is True
+    clean = _mutation_summary(dict(reverted))
+    assert clean["changed_count"] == 2 and clean["dirty_after"] is False, clean
+
+
+def test_a_non_idempotent_summary_transform_is_applied_once_per_call(
+        monkeypatch, capsys):
+    """#693 item 4: `_call` built the spill status from the ALREADY-transformed
+    result, which silently made every summary transform a two-pass requirement --
+    a requirement nothing enforced, whose failure mode was invisible until a
+    mutation SPILLED, and then printed the transform's SECOND-pass value as the
+    status an agent reads.
+
+    `spill_status` is now evaluated against the raw bridge result, so idempotence
+    is not required of a transform at all. This cell drives a deliberately
+    non-idempotent one: the status must carry its FIRST-pass value, and the
+    transform must never have been handed its own output."""
+    calls: list[object] = []
+
+    def non_idempotent(result):
+        calls.append(result)
+        if isinstance(result, dict) and "passes" in result:
+            return {"kind": "mutation_summary", "measured": True,
+                    "passes": result["passes"] + 1}
+        return {"kind": "mutation_summary", "measured": True, "passes": 1}
+
+    payload = {"success": True, "committed": True, "rolled_back": False,
+               "results": [{"op": "rename_symbol", "status": "verified"}],
+               # Big enough that the status path is really taken.
+               "affected_functions": [{"name": "sub_401000"}] * 40}
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kwargs: {"ok": True, "result": dict(payload)})
+    # A spill is the ONLY path that PRINTS the status, and the defect only became
+    # visible there.
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    args = bn.cli.build_parser().parse_args(
+        ["symbol", "rename", "--target", "active", "--summary", "--format", "json",
+         "sub_401000", "player_update"])
+
+    rc = bn.cli._mutate(args, "rename_symbol", {}, stem="probe",
+                        summary_transform=non_idempotent)
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    assert "full mutation detail" in captured.err, captured.err   # it really spilled
+    status = json.loads(captured.out)
+    assert status["passes"] == 1, status
+    assert status["detail_artifact_path"], status
+    # Anti-vacuity for the mechanism: the transform was handed the bridge's
+    # payload every time, never the summary it produced.
+    assert calls and all("passes" not in call for call in calls), calls
 
 
 def test_go_rename_default_text_reports_real_counts(fake_transport, capsys):

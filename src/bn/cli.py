@@ -2105,8 +2105,9 @@ def _mutate(
         # so `json.loads` raised and the agent could not confirm a batch that HAD
         # committed. Keep the parseable status on stdout no matter how big the
         # detail payload is; the detail goes to the artifact.
-        # _call evaluates this against the ALREADY-transformed result, so both
-        # transforms short-circuit on a `mutation_summary` envelope.
+        # `_call` evaluates this against the RAW result it captured before any
+        # transform (#693 item 4), so this transform sees the bridge's payload
+        # and never its own output -- idempotence is not required of it.
         spill_status=(summary_transform or _mutation_summary),
         spill_status_renderer=_render_mutation_summary_text,
         **call_kwargs,
@@ -2272,12 +2273,19 @@ def _call(
     # offset, limit, returned, has_more} envelope and pages bridge-side (#275).
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
+    # The RAW bridge result, captured BEFORE any transform runs (#693 item 4).
+    # `spill_status` and `truncation_note` -- both evaluated further down, and
+    # both about what the OP reported -- read THIS, so a caller's transform is
+    # applied to the payload it was written for and never to its own output. It
+    # used to be captured after `result_transform`, which made every summary
+    # transform a two-pass requirement: a non-idempotent one printed its
+    # second-pass value as the spill status, exactly when a mutation spilled.
+    spill_context = result
     if result_transform is not None:
         # Needed on its own: a FAILING mutation short-circuits to exit 3 before
         # the exit-code helper ever runs its transform, so on that path this is
         # the first place the result is parsed.
         result = result_transform(result)
-    spill_context = result
     fmt = _resolve_output_format(args)
     # Derived from the flags recorded when this command's parser was built, so
     # every flag the note and the envelope's `rerun` offer is one THIS command
