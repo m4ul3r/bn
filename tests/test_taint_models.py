@@ -306,6 +306,175 @@ def test_present_callsites_label_import_thunk_560():
     assert system["audit_callsite_count"] == 1
 
 
+class _BVDisasm(_BVTriage):
+    def get_disassembly(self, a):
+        return {0x5010: "call    system", 0x2000: "jmp     qword [rip+0x2f1a]"}.get(a, "")
+
+
+def test_present_callsites_carry_one_line_of_context_794():
+    # #794: the row answered {address, function, kind}, which says WHERE a
+    # modeled sink is called but nothing about WHAT the call looks like, so
+    # triaging a callsite queue cost a `bn disasm` round-trip per row. The key
+    # is `disasm`, matching the sibling address-row emitters that actually use
+    # it -- `read_xrefs` on its ref rows and `seam` on its call-context row --
+    # rather than inventing a second spelling for one field. (`read_evidence` is
+    # NOT one of them: `il_format._disasm_entry` returns {address, text} under a
+    # different key. An earlier version of this comment cited it and was wrong.)
+    res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
+                               {"present": True, "callsites": True})
+    rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
+    assert rows["0x5010"]["disasm"] == "call    system"
+    assert rows["0x2000"]["disasm"] == "jmp     qword [rip+0x2f1a]"
+    # The pre-existing fields are untouched -- this is additive.
+    assert rows["0x5010"]["function"] == "parse_record"
+    assert rows["0x5010"]["kind"] == "app_caller"
+
+
+def test_present_callsite_context_reaches_catalog_text_794():
+    """The text catalog is the default read surface. A row that has disasm on
+    the wire must print it beside the address and function; the existing JSON
+    test alone cannot detect the renderer silently dropping the new column."""
+    from bn.formatters import _render_taint_models_text
+
+    res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
+                               {"present": True, "callsites": True})
+    text = _render_taint_models_text(res)
+    assert "0x5010  parse_record  call    system" in text
+    assert "0x2000  system [import_thunk]  jmp     qword [rip+0x2f1a]" in text
+
+
+def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
+    # A BN shape with no `get_disassembly` (and a read that raises) must still
+    # produce the row -- an unavailable context is an empty string, never a
+    # failed listing. `_BVTriage` has no such method at all.
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True})
+    rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
+    assert rows["0x5010"]["disasm"] == ""
+    assert rows["0x5010"]["function"] == "parse_record"
+
+
+def test_present_callsites_degrade_when_disassembly_raises_794():
+    """A failed read at one address must not discard the catalog or its other
+    callsites. A missing get_disassembly method exercises a different guard."""
+    class _BVFailingDisasm(_BVDisasm):
+        def get_disassembly(self, a):
+            if a == 0x5010:
+                raise RuntimeError("unmapped address")
+            return super().get_disassembly(a)
+
+    res = rts._taint_models_op(_CtxWithBV(_BVFailingDisasm()), "active",
+                               {"present": True, "callsites": True})
+    system = _sink_entry(res, "system")
+    rows = {c["address"]: c for c in system["callsites"]}
+    assert system["callsite_count"] == 2
+    assert rows["0x5010"]["disasm"] == ""
+    assert rows["0x5010"]["function"] == "parse_record"
+    assert rows["0x2000"]["disasm"] == "jmp     qword [rip+0x2f1a]"
+
+
+class _BVPlain:
+    """The minimum a `_taint_op` request needs of a view: an identity the
+    quick-loaded WeakSet can be asked about. The engine is recorded, not run, so
+    nothing here is read."""
+
+
+def test_taint_op_threads_max_iters_into_the_engine_812(monkeypatch):
+    # #812: a fixpoint-truncated result's remediation string names `--max-iters`,
+    # and until this handler forwarded the knob that advice pointed at nothing a
+    # user could do. The threading is what makes the remediation real, so it is
+    # pinned END TO END on the handler: the value in the request becomes the
+    # engine's budget, and an absent value leaves the engine's own default --
+    # the reason every pre-existing caller and the whole backward path are
+    # unaffected by the new knob.
+    #
+    # The recorder SUBCLASSES the real engine rather than replacing it, so the
+    # observed `max_iters` is whatever the real constructor resolved (including
+    # its default), not a kwargs dict this test could read either way.
+    import inspect
+
+    seen: list[int] = []
+    # Read off the REAL class before it is patched: the absent-value contract is
+    # "the engine's own default", and comparing against the signature proves the
+    # handler did not substitute one of its own.
+    engine_default = inspect.signature(
+        rts._taint.TaintEngine).parameters["max_iters"].default
+
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def __init__(self, bv, models, **kw):
+            super().__init__(bv, models, **kw)
+            seen.append(self.max_iters)
+
+        def forward(self, func, locators, **kw):        # never analyse anything
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    monkeypatch.setattr(rts._taint, "TaintEngine", _RecordingEngine)
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    ctx = _Ctx(_BVPlain())
+    request = {"function": "handler", "sources": ["param:0"]}
+    rts._taint_op(ctx, "active", dict(request, max_iters=7))
+    rts._taint_op(ctx, "active", dict(request))
+    # 7 from the request; then the engine's own default, NOT a zero or a None
+    # that would make the fixpoint analyse nothing. 256 is also the CLI flag's
+    # default, so the two ends agree on the budget an unflagged run gets.
+    assert engine_default == 256, engine_default
+    assert seen == [7, engine_default], seen
+
+
+def test_taint_answers_disclose_the_view_analysis_state_811(monkeypatch):
+    # #811, the view-level half: both taint answers carry the SAME
+    # `{analysis_state, partial}` shape every other read op attaches, imported
+    # from `read_listing` rather than re-derived, so the taint surface cannot
+    # fork the convention. It shipped pinned by nothing -- deleting both
+    # `.update(_analysis_state_fields(bv))` calls left 711 tests green across
+    # all four taint test files -- and the catalog half is the one that matters:
+    # `taint models --present` computes presence by WALKING the view, so on a
+    # quick-loaded view a modeled sink is reported ABSENT merely because its
+    # caller was never analysed. That is a false all-clear in catalog form, and
+    # the disclosure is the only thing standing between a reader and it.
+    from bn_agent_bridge import read_listing as rl
+
+    bv = _BVTriage()
+    ctx = _CtxWithBV(bv)
+    full = rts._taint_models_op(ctx, "active", {"present": True})
+    assert full["analysis_state"] == "full", full
+    assert full["partial"] is False, full
+
+    # The same view, now quick-loaded: the catalog must say so rather than
+    # answering in the same shape as a fully analysed one.
+    rl._quick_loaded_views.add(bv)
+    try:
+        quick = rts._taint_models_op(ctx, "active", {"present": True})
+    finally:
+        rl._quick_loaded_views.discard(bv)
+    assert quick["analysis_state"] == "quick", quick
+    assert quick["partial"] is True, quick
+
+    # The slice half. `require_analysis` refuses a quick view outright, so this
+    # path can only ever report "full" today -- which is exactly why it needs a
+    # test: the fields are there so the contract is uniform and a future
+    # quick-tolerant taint mode cannot ship a silent partial answer, and a
+    # contract kept for a future caller is the easiest kind to delete.
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def forward(self, func, locators, **kw):        # never analyse anything
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    monkeypatch.setattr(rts._taint, "TaintEngine", _RecordingEngine)
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    result = rts._taint_op(_Ctx(_BVPlain()), "active",
+                           {"function": "handler", "sources": ["param:0"]})
+    assert result["analysis_state"] == "full", result
+    assert result["partial"] is False, result
+
+
 def test_present_self_stub_labeled_non_audit_560():
     # A code ref located inside the modeled symbol's OWN body (a self-tailcall
     # stub) is non-audit, distinct from an import thunk.
