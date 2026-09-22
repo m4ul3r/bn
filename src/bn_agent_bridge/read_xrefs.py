@@ -53,6 +53,7 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
     require_analysis(bv, "Cross-references")
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    literal_address = False
     try:
         address = _parse_address(identifier)
     except Exception:
@@ -100,23 +101,28 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
                 _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
             )
     else:
-        # Raw-address path (parse succeeded): reject an unmapped address rather
-        # than returning a false-negative empty xref set (#374). A function start
-        # (the name path above) is always mapped, so only the literal-address
-        # case needs the guard. But NEVER reject an address BN actually holds refs
-        # FOR -- 0x0 is the placeholder for unresolved indirect-call sites (many
-        # real code refs, is_valid_offset False), and a tail-call can target an
-        # out-of-image address; rejecting those would discard a real answer. Only
-        # an address that is BOTH unmapped AND ref-less is the typo case (#374
-        # follow-up).
-        has_refs = bool(
-            list(bv.get_code_refs(int(address))) or list(bv.get_data_refs(int(address)))
-        )
-        if not has_refs:
-            _require_mapped_address(bv, int(address))
+        # Raw-address path (parse succeeded) -- see the guard note below.
+        literal_address = True
+    # A literal address must be rejected when it is unmapped, rather than answered
+    # with a false-negative empty xref set (#374). A function start (the name path
+    # above) is always mapped, so only the literal-address case needs the guard.
+    # But NEVER reject an address BN actually holds refs FOR -- 0x0 is the
+    # placeholder for unresolved indirect-call sites (many real code refs,
+    # is_valid_offset False), and a tail-call can target an out-of-image address;
+    # rejecting those would discard a real answer. Only an address that is BOTH
+    # unmapped AND ref-less is the typo case (#374 follow-up).
+    #
+    # #815: the guard runs INSIDE the builder, on the SAME UNFILTERED ref lists
+    # it reads for the response. Probing here first (`bool(list(get_code_refs(...))
+    # or list(get_data_refs(...)))`) materialised both lists a second time -- a
+    # high-fan-in symbol paid for its whole ref set twice per call. The builder
+    # keys the guard on BN's unfiltered code refs, not on the #284-filtered /
+    # #286-unioned list it renders, so the set of addresses this rejects is
+    # exactly the set the probe rejected.
     return _drop_legacy_ref_arrays(
         _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit,
-                          fn_pointer_scan=fn_pointer_scan)
+                          fn_pointer_scan=fn_pointer_scan,
+                          require_refs_or_mapped=literal_address)
     )
 
 
@@ -267,20 +273,67 @@ def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:
     return _adrp_pagebase_is_spurious(il, following, int(address))
 
 
+def _code_refs_once(bv, address: int, *, propagate_read_errors: bool = False) -> tuple[list, list]:
+    """``(all_refs, genuine_refs)`` for *address*, from ONE read of the ref list.
+
+    Both populations come back because they answer different questions and the
+    list may only be read once (#815): *genuine_refs* is what the response
+    RENDERS (#284 drops spurious adrp page-base materializations for a
+    page-aligned target), while *all_refs* is what the #374 mapped-address guard
+    must key on -- an address BN holds ANY ref for exists, whatever the #284
+    filter later decides about how to render those refs.
+
+    With *propagate_read_errors* a read that FAILED raises instead of reading as
+    an empty list. The #374 guard keys on this list, and a failed enumeration is
+    not evidence of "no refs": downgrading it to `[]` would answer a mapped
+    address with the false-negative `0 callers` that #374 exists to prevent. The
+    probe this function replaced read the list unguarded on that path, so the
+    failure surfaced as an error; every other caller keeps the swallow, which is
+    a rendering decision (show the refs we could read) rather than an answer."""
+    get_code_refs = getattr(bv, "get_code_refs", None)
+    if not callable(get_code_refs):
+        if propagate_read_errors:
+            raise RuntimeError(
+                f"This view cannot enumerate code references for {hex(int(address))}")
+        return [], []
+    try:
+        raw = list(get_code_refs(int(address)))
+    except Exception:
+        if propagate_read_errors:
+            raise
+        return [], []
+    if int(address) & 0xFFF:
+        return raw, raw
+    return raw, [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
+
+
+def _data_refs_once(bv, address: int, *, propagate_read_errors: bool = False) -> list:
+    """BN's data refs to *address*, read once -- the mirror of `_code_refs_once`.
+
+    A reader that RAISES has always propagated from here (this read was never
+    wrapped), so *propagate_read_errors* only decides the other way a view can be
+    unable to answer: offering no reader at all. Set it ONLY where this list is
+    the evidence the #374 guard decides on -- a literal address BN holds no code
+    ref for -- because there, reading an unavailable list as `[]` produces the
+    false-negative `0 callers` #374 exists to prevent. With code refs in hand the
+    guard is already satisfied and never consults this list: the probe this
+    replaced was `bool(list(code) or list(data))`, whose `or` short-circuited and
+    never touched the data reader in that branch, so raising there would invent a
+    refusal base did not have."""
+    get_data_refs = getattr(bv, "get_data_refs", None)
+    if not callable(get_data_refs):
+        if propagate_read_errors:
+            raise RuntimeError(
+                f"This view cannot enumerate data references for {hex(int(address))}")
+        return []
+    return list(get_data_refs(address))
+
+
 def _genuine_code_refs(bv, address: int) -> list:
     """Code refs to *address*, with spurious adrp page-base materializations
     dropped when *address* is page-aligned (#284). Non-page-aligned targets
     cannot be an adrp page base, so their refs pass through untouched."""
-    get_code_refs = getattr(bv, "get_code_refs", None)
-    if not callable(get_code_refs):
-        return []
-    try:
-        raw = list(get_code_refs(int(address)))
-    except Exception:
-        return []
-    if int(address) & 0xFFF:
-        return raw
-    return [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
+    return _code_refs_once(bv, int(address))[1]
 
 
 def _code_ref_count(bv, address: int) -> int:
@@ -537,17 +590,39 @@ def _function_pointer_data_refs(ctx, bv, address: int, existing_addrs: set[int])
 
 
 def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None,
-                      fn_pointer_scan: bool = False) -> dict[str, Any]:
+                      fn_pointer_scan: bool = False,
+                      require_refs_or_mapped: bool = False) -> dict[str, Any]:
     code_refs = []
     data_refs = []
-    # Drop spurious adrp page-base materializations for a page-aligned target
-    # (#284); non-page-aligned targets pass through unchanged.
-    raw_code_refs = _genuine_code_refs(bv, address)
+    # One read of each ref list, two consumers (#815). `all_code_refs` is BN's
+    # unfiltered population; `genuine_code_refs` has spurious adrp page-base
+    # materializations dropped for a page-aligned target (#284) and is what the
+    # response renders. On the guarded (literal-address) path a read that FAILED
+    # raises rather than reading as "no refs", because that is the population the
+    # #374 guard decides on: `0 callers` must mean BN said so. The data list is
+    # guarded only when there are no code refs -- the same short-circuit the
+    # probe's `bool(list(code) or list(data))` had, so a view that cannot
+    # enumerate data refs keeps answering an address BN holds code refs for.
+    all_code_refs, genuine_code_refs = _code_refs_once(
+        bv, address, propagate_read_errors=require_refs_or_mapped)
+    raw_data_refs = _data_refs_once(
+        bv, address,
+        propagate_read_errors=require_refs_or_mapped and not all_code_refs)
+    if require_refs_or_mapped and not all_code_refs and not raw_data_refs:
+        # #374: an address BN holds no ref of ANY kind for must still be mapped
+        # to be a legitimate "0 callers" answer; an unmapped one is a typo and is
+        # rejected. Keyed on the UNFILTERED lists, exactly the population the
+        # pre-#815 probe in `_xrefs` read: a page-aligned address whose only code
+        # refs are #284-spurious adrp page bases IS an address BN holds refs for,
+        # and must keep answering `0` rather than turning into "not mapped".
+        _require_mapped_address(bv, int(address))
     # #286: an exported function's intra-lib callers reference its same-name PLT
     # stub, not the body. Union the stub(s)' callers into the body's xrefs so a
-    # hot exported function isn't reported as having zero code callers.
-    raw_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, raw_code_refs)
-    for ref in sorted(raw_code_refs, key=lambda item: int(item.address)):
+    # hot exported function isn't reported as having zero code callers. Run after
+    # the guard: a stub's callers are extra refs to RENDER, never the evidence
+    # that the queried address itself exists.
+    genuine_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, genuine_code_refs)
+    for ref in sorted(genuine_code_refs, key=lambda item: int(item.address)):
         fn = getattr(ref, "function", None)
         caller = (
             {"address": hex(int(fn.start)), "name": str(fn.name)}
@@ -567,8 +642,6 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
                 ),
             }
         )
-    get_data_refs = getattr(bv, "get_data_refs", None)
-    raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
     for ref_addr in sorted(raw_data_refs):
         ref_addr = int(ref_addr)
         functions = ctx._functions_containing(bv, ref_addr)
