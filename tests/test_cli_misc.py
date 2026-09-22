@@ -14,6 +14,11 @@ from bn_agent_bridge._shared import OperationFailure, _serialize_error, _write_j
 from bn.commands.misc import _resolved_out_format
 from bn.output import OutputWriteError, render_value, write_output_result
 from _cli_helpers import *  # noqa: F401,F403
+# The #864 FIFO readers are split across two test modules; the stall guard is
+# imported from the one holding the larger group rather than copied, because
+# two copies of a hang guard drift and the stale one is the copy nobody is
+# looking at when the reader regresses.
+from test_cli_types import _must_not_hang
 
 
 def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
@@ -1559,6 +1564,65 @@ def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--target is empty" in capsys.readouterr().err
+
+
+# --- #767: --count refuses the flags it would otherwise ignore --------------
+
+
+@pytest.mark.parametrize("extra", [["--summary"], ["--limit", "5"], ["--offset", "1"]])
+def test_imports_count_refuses_flags_it_would_ignore(fake_transport, capsys, extra):
+    """#767: the --count branch returned before --summary and the paging flags
+    were read, so a run that passed them silently answered a different question
+    than the one asked (`go functions` already refused the same combination)."""
+    calls = fake_transport()
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--count", *extra, "--format", "json"])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "--count" in err
+    assert extra[0] in err
+
+
+def test_imports_count_alone_still_counts(fake_transport):
+    calls = fake_transport({"imports": {"ok": True, "result": {"kind": "imports", "count": 7, "total": 7}}})
+
+    rc = bn.cli.main(["-i", "fake", "-t", "t.bndb", "imports", "--count", "--format", "json"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["count_only"] is True
+
+
+# --- #864: a FIFO input is refused instead of hanging the command -----------
+
+
+@pytest.mark.parametrize("argv_tail", [
+    ["batch", "apply", "{fifo}"],
+    ["py", "exec", "--target", "active", "--script", "{fifo}"],
+])
+def test_fifo_file_input_is_refused_not_hung(fake_transport, capsys, tmp_path, argv_tail):
+    """#864: a FIFO with no writer blocked `read_text` forever -- zero bytes of
+    output, no envelope, no timeout. The refusal names the path and its kind.
+
+    Under the guard, because without it a regression here does not turn this
+    test red -- it wedges the run at "still running" and takes the rest of the
+    suite with it, which is how the defect stayed invisible in the first place.
+    """
+    fifo = tmp_path / "input.fifo"
+    os.mkfifo(fifo)
+    calls = fake_transport()
+    argv = [a.format(fifo=fifo) for a in argv_tail]
+
+    with _must_not_hang():
+        rc = bn.cli.main([*argv, "--format", "json"])
+
+    assert rc == 2
+    assert calls == []
+    captured = capsys.readouterr()
+    assert "FIFO" in captured.err
+    assert str(fifo) in captured.err
+    assert "Traceback" not in captured.err
 
 
 # --- #823: `bn spill gc` ---------------------------------------------------

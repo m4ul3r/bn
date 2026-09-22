@@ -75,7 +75,33 @@ def ensure_private_dir(path: Path) -> Path:
     the previous bare ``mkdir(parents=True, exist_ok=True)`` calls did. Returns
     *path* so call sites can chain (``ensure_private_dir(d) / "file"``).
     """
+    # `mkdir(parents=True, mode=...)` applies the mode to the LEAF only: the
+    # intermediate directories are created under the process umask, so a fresh
+    # `BN_CACHE_DIR=<dir>/cache` left the cache root itself at 0755 while
+    # cache/spills, cache/instances and cache/sessions were 0700 (#763, residual
+    # of #612). Collect the chain that is missing BEFORE creating anything, then
+    # tighten every directory this call created -- and never a pre-existing
+    # parent, which may be a directory the user keeps for other reasons.
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for created in reversed(missing):
+        _tighten_private_dir(created)
+    _tighten_private_dir(path)
+    return path
+
+
+def _tighten_private_dir(path: Path) -> None:
+    """Best-effort ``chmod 0o700`` with a warning, never a raise.
+
+    Split out so the leaf and the parents #763 tightens share one policy: an
+    ``OSError`` from a filesystem that cannot carry the bits must not fail
+    directory setup, but it must not be silent either (see the caller's
+    docstring).
+    """
     try:
         if stat.S_IMODE(path.stat().st_mode) != 0o700:
             os.chmod(path, 0o700)
@@ -84,7 +110,6 @@ def ensure_private_dir(path: Path) -> Path:
             "could not tighten permissions on %s to 0o700 (%s); it may remain "
             "group/world-accessible", path, exc,
         )
-    return path
 
 
 def repo_root() -> Path:

@@ -24,7 +24,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(fake_tran
     rc = bn.cli.main(["function", "list"])
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "list_functions"]
-    assert calls[1]["params"] == {"limit": 100}
+    assert calls[1]["params"] == {"limit": 100, "offset": 0}  # #824: offset sent even at 0
     assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
     output = capsys.readouterr().out
     assert output == "0x401000  sub_401000\n"
@@ -83,7 +83,7 @@ def test_function_list_returns_full_result_set(fake_transport, capsys):
 
     assert rc == 0
     assert calls[-1]["op"] == "list_functions"
-    assert calls[-1]["params"] == {"limit": 200}
+    assert calls[-1]["params"] == {"limit": 200, "offset": 0}  # #824: offset sent even at 0
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
     assert len(payload["items"]) == 150
@@ -448,7 +448,7 @@ def test_function_list_forwards_address_filters(fake_transport, capsys):
     assert calls[-1]["op"] == "list_functions"
     assert calls[-1]["params"]["min_address"] == "0x401000"
     assert calls[-1]["params"]["max_address"] == "0x402000"
-    assert capsys.readouterr().out == "none\n"
+    assert capsys.readouterr().out == "(none)\n"  # #824: one empty-result vocabulary
 
 
 def test_function_search_can_request_regex_matching(fake_transport, capsys):
@@ -461,7 +461,7 @@ def test_function_search_can_request_regex_matching(fake_transport, capsys):
     assert calls[-1]["op"] == "search_functions"
     assert calls[-1]["params"]["query"] == "attach|detach"
     assert calls[-1]["params"]["regex"] is True
-    assert "offset" not in calls[-1]["params"]
+    assert calls[-1]["params"]["offset"] == 0  # #824: was omitted entirely at 0
     assert calls[-1]["params"]["limit"] == 100
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
@@ -905,7 +905,7 @@ def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
 
     assert rc == 0
     assert calls[-1]["op"] == "function_evidence"
-    assert calls[-1]["params"] == {"identifier": "build_response", "context": 1}
+    assert calls[-1]["params"] == {"identifier": "build_response", "context": 1, "offset": 0}
     output = capsys.readouterr().out
     assert "build_response @ 0x412470" in output
     assert "target: send_message @ 0x461746" in output
@@ -1351,7 +1351,7 @@ def test_callsites_empty_result_shows_descriptive_message(fake_transport, capsys
     rc = bn.cli.main(["callsites", "--format", "text", "--target", "active", "--within", "main", "sub_401000"])
 
     assert rc == 0
-    assert capsys.readouterr().out == "no callsites found\n"
+    assert capsys.readouterr().out == "(no callsites)\n"  # #824: one empty-result vocabulary
 
 
 def test_function_list_pagination_states_true_total(fake_transport, capsys):
@@ -2841,3 +2841,63 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     out = capsys.readouterr().out
     assert "WARNING" not in out
     assert out.startswith("int32_t sub_401000()")
+
+
+# --- #768: --count refuses the ordering/paging flags it would ignore --------
+
+
+@pytest.mark.parametrize("command, extra", [
+    ("list", ["--sort", "size"]),
+    ("list", ["--reverse"]),
+    ("list", ["--limit", "5"]),
+    ("list", ["--offset", "3"]),
+    ("search", ["--sort", "size"]),
+    ("search", ["--reverse"]),
+    ("search", ["--limit", "2"]),
+    ("search", ["--offset", "1"]),
+])
+def test_function_count_refuses_flags_it_would_ignore(fake_transport, capsys, command, extra):
+    """#768: the --count branch returned before offset/limit/sort/reverse were
+    read, so `--count --sort size --reverse --limit 5 --offset 3` was
+    byte-identical to a bare `--count`."""
+    calls = fake_transport()
+
+    argv = ["function", command, "--target", "active", "--count", *extra]
+    if command == "search":
+        argv.append("main")
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "--count" in err
+    assert extra[0] in err
+
+
+def test_function_list_count_alone_still_counts(fake_transport):
+    calls = fake_transport({"list_functions": {"ok": True, "result": {"kind": "functions", "count": 12, "total": 12}}})
+
+    rc = bn.cli.main(["function", "list", "--target", "active", "--count", "--format", "json"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["count_only"] is True
+
+
+# --- #824: paged reads send offset even when it is 0 ------------------------
+
+
+@pytest.mark.parametrize("argv, op", [
+    (["function", "list"], "list_functions"),
+    (["function", "search", "sub"], "search_functions"),
+    (["callsites", "strcpy"], "callsites"),
+])
+def test_paged_reads_send_offset_zero(fake_transport, argv, op):
+    """#824: function.py guarded `if args.offset:` while every sibling paged
+    handler (strings, tag list, types) always sent it, so the two families
+    disagreed about the wire shape for the same value."""
+    calls = fake_transport({op: {"ok": True, "result": {"items": [], "total": 0}}})
+
+    rc = bn.cli.main([*argv, "--target", "active", "--offset", "0", "--format", "json"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["offset"] == 0

@@ -1662,7 +1662,7 @@ _RESULT_ROW_KEY_NAME = "_RESULT_ROW_KEY"
 # `_call`'s parameters to hand a raising transform to.
 _CALL_DATA_PARAMS = frozenset({
     "args", "op", "params", "require_target", "allow_implicit_target",
-    "page_limit", "page_offset", "page_label", "paged_spill", "stem",
+    "page_label", "paged_spill", "stem",
     "bridge_writes_output", "spawn_missing_named", "regex_hint_query",
     "regex_fallback_query", "offset_hint_identifier", "op_default_timeout",
 })
