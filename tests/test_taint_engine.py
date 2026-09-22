@@ -8383,3 +8383,975 @@ def test_new_809_model_keys_resolve_by_their_real_names_only(models):
         assert te.lookup_model(models, f"{name}64")[0] is None, name
         assert te.lookup_model(models, f"user_{name}")[0] is None, name
         assert te.lookup_model(models, f"{name}_ex")[0] is None, name
+
+
+def _two_recv_callsites():
+    """recv_both(fd): read(fd,&bufa,0x40); ta = bufa; read(fd,&bufb,0x40); tb = bufb.
+
+    Two attributable `read` callsites whose taint dies in two DIFFERENT local
+    values, so the per-callsite runs report different last uses and a union that
+    elects a representative is order-dependent. Neither buffer reaches a sink,
+    so the zero-sink diagnostics block (and its gate) is attached."""
+    fd = FVar("fd")
+    bufa, bufb = FVar("bufa", typ="char[0x40]"), FVar("bufb", typ="char[0x40]")
+    ta1, tb1 = FSSA(FVar("ta"), 1), FSSA(FVar("tb"), 1)
+    abuf, bbuf = FSSA(bufa, 0), FSSA(bufb, 0)
+    instrs = [
+        _ext_call(0, 0x20, "read(fd, &bufa, 0x40)", 0x910,
+                  [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                   FExpr("MLIL_ADDRESS_OF", "&bufa", src=bufa),
+                   FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x24, "MLIL_SET_VAR_SSA", "ta#1 = bufa", reads=[abuf], writes=[ta1],
+               src=FExpr("MLIL_VAR_SSA", "bufa", reads=[abuf])),
+        _ext_call(2, 0x30, "read(fd, &bufb, 0x40)", 0x910,
+                  [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                   FExpr("MLIL_ADDRESS_OF", "&bufb", src=bufb),
+                   FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(3, 0x34, "MLIL_SET_VAR_SSA", "tb#1 = bufb", reads=[bbuf], writes=[tb1],
+               src=FExpr("MLIL_VAR_SSA", "bufb", reads=[bbuf])),
+    ]
+    return FFunc("recv_both", 0x10, FSSAFunc(instrs), params=[fd])
+
+
+def _residual_chunk_func(*, inline_dest: bool = False, widen_len: bool = False,
+                         copy_hops: int = 0, dest_shape: str = "unit"):
+    """fill(fd, cap): dst = &staging + progress; n = cap - progress;
+    read(fd, dst, n).
+
+    #791's shape reduced, in the spellings a real lifter actually emits. Each
+    knob corresponds to a variant measured against a live bridge during
+    cross-dogfood, because every one of them defeated an earlier version of the
+    matcher:
+
+    * default -- both call operands are plain SSA VARIABLES whose definitions
+      hold the ADD and the SUB. The first implementation read the operands
+      directly and was dead on every real binary while passing a fixture that
+      inlined the ADD into the call.
+    * ``inline_dest`` -- the ADD inlined into the parameter list. Not a shape
+      the lifter produces, kept because the matcher checks the operand before
+      walking its chain.
+    * ``widen_len`` -- an ``MLIL_SX`` between the length operand and the SUB.
+      This is the ordinary ``int n = cap - progress`` spelling: ``read`` takes
+      ``size_t``, so the widening is ALWAYS there, and a matcher that stops at
+      the extension sees no subtraction.
+    * ``copy_hops`` -- extra copy indirections on both operands, the -O0 shape
+      (measured: ``rsi#2 -> rcx_1#2 -> ADD`` and ``rdx_1#2 -> n#2 -> SUB``).
+      A one-hop resolver finds neither.
+    * ``dest_shape`` -- what the cursor actually indexes. ``"unit"`` is the real
+      idiom, ``&staging + cursor`` at unit stride, where the cumulative extent
+      identity `cursor + (total - cursor) == total` holds. The other two are the
+      shapes that must NOT be claimed as residual chunks, because in both the
+      write extent is NOT bounded by ``total``:
+        - ``"scaled"``: ``&staging + (cursor << 2)`` -- an array of 4-byte
+          elements. The cursor is an ELEMENT index, so the byte extent is
+          `cursor*4 + (total - cursor)`, which exceeds `total` for any
+          `cursor > 0`.
+        - ``"table_load"``: ``[&table + cursor]`` -- the destination pointer is
+          LOADED from a pointer table the cursor indexes. The cursor never
+          offsets the destination at all; it selects which buffer is written,
+          so `total` says nothing about how far the write reaches.
+
+    The destination is a FIXED stack array -- precisely what this engine cannot
+    size, which is why the finding must survive rather than be downgraded."""
+    fd, cap = FVar("fd"), FVar("cap")
+    staging = FVar("staging", typ="uint8_t[0x1000]")
+    cap0 = FSSA(cap, 0)
+    prog1 = FSSA(FVar("progress"), 1)
+    sub = FExpr("MLIL_SUB", "cap#0 - progress#1", reads=[cap0, prog1],
+                left=FExpr("MLIL_VAR_SSA", "cap#0", reads=[cap0]),
+                right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    # Declared before the shape switch: one variant needs to emit its own
+    # instructions (a base behind more copies than the def-chain budget).
+    instrs: list = []
+    addr = 0x18
+    if dest_shape == "scaled":
+        # &staging + (progress#1 << 2), the shift INLINE in the ADD -- the
+        # spelling a real lifter emits for `uint32_t staging[]`, and the one
+        # that defeated the first matcher: `expr_reads` on the ADD still yields
+        # `progress#1` even though nothing adds the cursor to the base.
+        addr_expr = FExpr("MLIL_ADD", "&staging + (progress#1 << 2)", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_LSL", "progress#1 << 2", reads=[prog1],
+                                      left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                                      right=FExpr("MLIL_CONST", "2", constant=2)))
+    elif dest_shape == "table_load":
+        # dst = [&table + progress#1]: the cursor selects a pointer OUT of a
+        # table; it is not an offset into the thing being written.
+        table = FVar("table", typ="void*[0x40]")
+        addr_expr = FExpr(
+            "MLIL_LOAD_SSA", "[&table + progress#1]", reads=[prog1],
+            src=FExpr("MLIL_ADD", "&table + progress#1", reads=[prog1],
+                      left=FExpr("MLIL_ADDRESS_OF", "&table", src=table),
+                      right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1])))
+    elif dest_shape == "extra_offset":
+        # (&staging + hdrlen) + progress#1: a second, non-constant offset sits
+        # between the base and the cursor, so the cumulative extent is
+        # `hdrlen + total`, not `total`.
+        hdr1 = FSSA(FVar("hdrlen"), 1)
+        addr_expr = FExpr(
+            "MLIL_ADD", "(&staging + hdrlen#1) + progress#1", reads=[hdr1, prog1],
+            left=FExpr("MLIL_ADD", "&staging + hdrlen#1", reads=[hdr1],
+                       left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                       right=FExpr("MLIL_VAR_SSA", "hdrlen#1", reads=[hdr1])),
+            right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "add_add":
+        # (&staging + progress#1) + progress#1: stride 2 spelled as add-add, so
+        # the extent is `total + cursor`.
+        addr_expr = FExpr(
+            "MLIL_ADD", "(&staging + progress#1) + progress#1", reads=[prog1],
+            left=FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                       left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                       right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1])),
+            right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "swapped":
+        # progress#1 + &staging -- the same unit-stride idiom with the operands
+        # the other way round. MUST still be claimed.
+        addr_expr = FExpr("MLIL_ADD", "progress#1 + &staging", reads=[prog1],
+                          left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                          right=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging))
+    elif dest_shape == "heap_base":
+        # buf#1 = malloc(cap); buf#1 + progress#1 -- an OPAQUE base (a call
+        # return, not an address-of) at unit stride. MUST still be claimed: the
+        # identity holds for any base the cursor offsets once.
+        heap1 = FSSA(FVar("buf"), 1)
+        addr_expr = FExpr("MLIL_ADD", "buf#1 + progress#1", reads=[heap1, prog1],
+                          left=FExpr("MLIL_VAR_SSA", "buf#1", reads=[heap1]),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "sub_dest":
+        # &staging - progress#1: the cursor DISPLACES the base downward, so the
+        # write runs backwards out of the buffer and `total` bounds nothing. Its
+        # only job here is to pin the `op_name(expr) != "MLIL_ADD"` guard, which
+        # a later simplification could drop without any other case noticing.
+        addr_expr = FExpr("MLIL_SUB", "&staging - progress#1", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape in ("field_base", "or_base", "adc_base"):
+        # A base carrying its OWN displacement, in the three spellings a lifter
+        # and an optimiser pick for `&buf[K] + cursor`:
+        #   MLIL_ADDRESS_OF_FIELD -- the canonical lift of a constant offset
+        #     into a fixed array, which is the destination kind #791's own repro
+        #     uses;
+        #   MLIL_OR / MLIL_ADC     -- the same address arithmetic after an
+        #     optimiser has rewritten the add.
+        # The real extent from the buffer base is `K + total`, so a destination
+        # that holds exactly `total` bytes still overflows by K. An opcode
+        # DENYLIST let all three through while refusing the MLIL_ADD spelling of
+        # the identical source line -- two spellings of one program disagreeing.
+        _op = {"field_base": "MLIL_ADDRESS_OF_FIELD", "or_base": "MLIL_OR",
+               "adc_base": "MLIL_ADC"}[dest_shape]
+        displaced = FExpr(_op, f"{_op.lower()}(&staging, 0x40)",
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_CONST", "0x40", constant=0x40),
+                          src=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging))
+        addr_expr = FExpr("MLIL_ADD", f"({_op}) + progress#1", reads=[prog1],
+                          left=displaced,
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "cursor_plus_cursor":
+        # progress#1 + progress#1: stride 2 with the base folded away entirely,
+        # so there is no inner ADD to disqualify and the extent is
+        # `total + cursor`. The base must not BE the cursor.
+        addr_expr = FExpr("MLIL_ADD", "progress#1 + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "deep_displaced_base":
+        # A displaced base behind more pure copies than the bounded def-chain
+        # walk can see. "No arithmetic in the chain" only ever meant "none
+        # within the budget", so the walk must refuse at its bound instead of
+        # reading a truncated chain as clean.
+        base = FExpr("MLIL_ADD", "&staging + 0x40", reads=[],
+                     left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                     right=FExpr("MLIL_CONST", "0x40", constant=0x40))
+        for _h in range(9):
+            _s = FSSA(FVar(f"pb{_h}"), 1)
+            instrs.append(FInstr(len(instrs), 0x100 + 4 * _h, "MLIL_SET_VAR_SSA",
+                                 f"pb{_h}#1 = {base}", reads=[], writes=[_s], src=base))
+            base = FExpr("MLIL_VAR_SSA", f"pb{_h}#1", reads=[_s])
+        addr_expr = FExpr("MLIL_ADD", "deep_base + progress#1", reads=[prog1],
+                          left=base,
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    elif dest_shape == "loaded_base":
+        # dst = [&slot] + progress#1: the base is a pointer READ from memory. It
+        # carries no displacement of its own, so the identity holds and the shape
+        # MUST still be claimed -- the allow-list has to admit a real base form,
+        # not only an address-of.
+        slot = FVar("slot", typ="void**")
+        addr_expr = FExpr("MLIL_ADD", "[&slot] + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_LOAD_SSA", "[&slot]",
+                                     src=FExpr("MLIL_ADDRESS_OF", "&slot", src=slot)),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+    else:
+        addr_expr = FExpr("MLIL_ADD", "&staging + progress#1", reads=[prog1],
+                          left=FExpr("MLIL_ADDRESS_OF", "&staging", src=staging),
+                          right=FExpr("MLIL_VAR_SSA", "progress#1", reads=[prog1]))
+
+    def _bind(name, src_expr, reads):
+        """Emit `name#1 = <src>` and return the operand that reads it."""
+        nonlocal addr
+        ssa = FSSA(FVar(name), 1)
+        instrs.append(FInstr(len(instrs), addr, "MLIL_SET_VAR_SSA",
+                             f"{name}#1 = {src_expr}", reads=list(reads),
+                             writes=[ssa], src=src_expr))
+        addr += 4
+        return FExpr("MLIL_VAR_SSA", f"{name}#1", reads=[ssa]), ssa
+
+    if inline_dest:
+        dest_param, dest_ssa = addr_expr, None
+    else:
+        dest_param, dest_ssa = _bind("dst", addr_expr, [prog1])
+        for i in range(copy_hops):
+            dest_param, dest_ssa = _bind(f"dstc{i}", dest_param, [dest_ssa])
+
+    len_src = sub
+    len_reads = [cap0, prog1]
+    if widen_len:
+        narrow, narrow_ssa = _bind("ni", sub, len_reads)
+        len_src = FExpr("MLIL_SX", f"sx.q({narrow})", reads=[narrow_ssa], src=narrow)
+        len_reads = [narrow_ssa]
+    len_param, len_ssa = _bind("n", len_src, len_reads)
+    for i in range(copy_hops):
+        len_param, len_ssa = _bind(f"nc{i}", len_param, [len_ssa])
+
+    call_reads = [len_ssa] + ([dest_ssa] if dest_ssa is not None else [])
+    instrs.append(_ext_call(len(instrs), 0x40, "read(fd, dst, n)", 0x910,
+                            [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest_param, len_param],
+                            reads=call_reads))
+    return FFunc("fill", 0x10, FSSAFunc(instrs), params=[fd, cap])
+
+
+def _vsscanf_func(*, taint_reaches: bool):
+    """parse(buf): vsscanf(&buf, fmt, ap) -- the va_list destinations the model
+    deliberately does not claim.
+
+    ``taint_reaches`` selects the two cases the #863 gate must tell apart: the
+    run's seed lands on the call's arg0 (the string vsscanf parses FROM), or the
+    call merely SITS in a walked body with an untainted, unrelated argument.
+    """
+    buf = FVar("buf", typ="char[0x40]")
+    other = FVar("other", typ="char[0x40]")
+    src = buf if taint_reaches else other
+    args = [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+            FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+            FExpr("MLIL_VAR_SSA", "ap", reads=[])]
+    return FFunc("parse", 0x10,
+                 FSSAFunc([_ext_call(0, 0x10, "vsscanf(&src, fmt, ap)", 0x902, args)]),
+                 params=[buf])
+
+
+def test_vsscanf_unmodeled_destinations_withhold_the_all_clear_863(models):
+    # #863: vsscanf's real destinations sit behind the va_list in arg2, which the
+    # engine cannot resolve, so the model claims only `*arg:0 -> ret`. That kept
+    # SEEDING honest (`--source call:vsscanf` fails loudly) but not the claim
+    # gate: a run whose taint reached the call still answered
+    # safe_to_report_all_clear, which reads as "no flow" when the truth is "the
+    # model never claimed those destinations". The #851 arity residual cannot
+    # cover it -- there is no modeled `*arg:N` run to out-length -- so this needs
+    # its own marker. Deleting the disclosure, or failing to register the marker
+    # in _WEAK_SEED_ASSUMPTION_MARKERS, is caught here.
+    func = _vsscanf_func(taint_reaches=True)
+    result = te.TaintEngine(FBV({0x902: "vsscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert any("destinations_unmodeled" in s for s in result["assumptions"]), result["assumptions"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_vsscanf_untouched_by_taint_does_not_fire_863(models):
+    # The must-not-fire twin, and the reason the gate keys on reached taint
+    # rather than on the callee's presence: `apply_model` runs for EVERY call to
+    # a modeled callee inside a walked function, so an unconditional disclosure
+    # would brand every body that merely CONTAINS a vsscanf. Here the seed never
+    # reaches the call's arguments, so nothing may be disclosed.
+    func = _vsscanf_func(taint_reaches=False)
+    result = te.TaintEngine(FBV({0x902: "vsscanf"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert not any("destinations_unmodeled" in s for s in result["assumptions"]), result["assumptions"]
+
+
+def test_attributed_union_last_use_does_not_depend_on_callsite_order_805(models):
+    # #805: the union's descriptive diagnostics were copied from the FIRST
+    # per-callsite run, so `last_use` was an artifact of iteration order --
+    # [A,B] and [B,A] over one binary disagreed about where taint was last seen
+    # while the gate stayed identical. Reversing the callsite order must not
+    # change the rendered answer.
+    # Driven through `_forward_attributed` with the callsite list in both
+    # orders: that list IS the variable the bug rode on, so passing it
+    # explicitly tests the union directly instead of hoping a fixture rewrite
+    # changes discovery order. `forward()` is what normally installs the
+    # enabled-sink-class set, so establish it the same way here.
+    def _run(addrs):
+        engine = te.TaintEngine(FBV({0x910: "read"}), models)
+        engine._enabled_sink_classes = set()
+        return engine._forward_attributed(
+            _two_recv_callsites(), [te.parse_locator("call:read")],
+            list(addrs), max_depth=8)
+
+    fwd, rev = _run([0x20, 0x30]), _run([0x30, 0x20])
+    d1 = fwd.get("diagnostics") or {}
+    d2 = rev.get("diagnostics") or {}
+    assert d1.get("last_use") == d2.get("last_use"), (d1.get("last_use"), d2.get("last_use"))
+    # ...and the per-callsite answers are still all there -- the scalar going
+    # null for an ambiguous union must not DELETE the information, only stop
+    # electing an arbitrary representative for it.
+    assert set(d1.get("last_use_by_source") or {}) == {"0x20", "0x30"}, d1
+    assert (d1.get("last_use_by_source") or {}) == (d2.get("last_use_by_source") or {})
+    assert d1.get("tainted_values") == d2.get("tainted_values")
+    # #874 r2: order-agreement ALONE is satisfied by a DEGENERATE union -- a
+    # fixture where no callsite propagates yields `last_use is None` and
+    # `tainted_values == 0` in both orders, passes every line above, and sees
+    # nothing of the defect. So pin that this union is the non-degenerate case
+    # the bug actually rode on, with exact values:
+    #
+    #   * both callsites DID propagate, into DIFFERENT local values -- that
+    #     disagreement is the only thing an elected representative could be
+    #     wrong about, so without it the test cannot observe the bug at all;
+    #   * the null scalar therefore means AMBIGUOUS, not "nothing propagated";
+    #   * tainted_values is the SUM over the per-callsite runs (2 + 2), not the
+    #     representative's own 2 -- reverting to `base_diag.get(...)` halves it.
+    _by_src = d1["last_use_by_source"]
+    assert {a: (u or {}).get("label") for a, u in _by_src.items()} == {
+        "0x20": "ta#1", "0x30": "tb#1"}, _by_src
+    assert {a: (u or {}).get("address") for a, u in _by_src.items()} == {
+        "0x20": "0x24", "0x30": "0x34"}, _by_src
+    assert d1["last_use"] is None, d1["last_use"]
+    assert d1["tainted_values"] == 4, d1["tainted_values"]
+
+
+def test_forward_run_params_echo_the_configured_knobs_812(models):
+    # #812: `stats.max_depth` is the deepest depth REACHED, so a result carrying
+    # only that cannot answer "was I bounded by the cap, or did the flow simply
+    # end?" -- the two are identical when a walk happens to stop at the cap. The
+    # configured knobs are echoed alongside, never merged into the measurement.
+    func = _scanf_arity_func(4)
+    engine = te.TaintEngine(FBV({0x900: "scanf"}), models, max_iters=64)
+    result = engine.forward(func, [te.parse_locator("call:scanf")], max_depth=3)
+    rp = result.get("run_params") or {}
+    assert rp.get("max_depth") == 3, rp
+    assert rp.get("max_iters") == 64, rp
+    assert rp.get("unknown_call") == "conservative", rp
+    # The echo is NOT the measurement: stats still reports what was reached.
+    assert result["stats"]["max_depth"] <= 3
+
+
+@pytest.mark.parametrize("shape", [
+    {},                                  # dst/len each one def hop behind the call
+    {"inline_dest": True},               # ADD inlined into the parameter list
+    {"widen_len": True},                 # `int n = cap - progress` -> SX before the SUB
+    {"copy_hops": 2},                    # -O0: several copies on both operands
+    {"widen_len": True, "copy_hops": 2},  # both at once
+    {"dest_shape": "swapped"},           # cursor + base, operands the other way
+    {"dest_shape": "heap_base"},         # an OPAQUE base (a malloc return), unit stride
+    {"dest_shape": "loaded_base"},       # a pointer READ from memory, unit stride
+], ids=["def_chain", "inlined", "widened_int_len", "o0_copy_hops", "widened_and_copied",
+        "swapped_operands", "opaque_heap_base", "loaded_base"])
+def test_residual_chunk_length_is_disclosed_but_not_downgraded_791(models, shape):
+    # #791 asked for the chunked-read residual (`n = cap - progress;
+    # read(buf + progress, n)`) to be SUPPRESSED so recv_overflow became usable
+    # by default. It is deliberately recognised and NOT downgraded: the loop
+    # invariant bounds the write by `cap`, but safety needs `cap <=
+    # sizeof(dest)`, and this engine can size neither a fixed stack array nor
+    # the loop guard. #791's own repro is the UNSAFE case -- an attacker
+    # controlled `cap` into a fixed stack buffer -- so suppressing on the shape
+    # would clear a real overflow. The class must survive; only the open
+    # question is named.
+    #
+    # Every shape here is one a live bridge actually produced, and each defeated
+    # an earlier matcher: reading the call operand directly missed all of them;
+    # a single def hop still missed the widened `int n` spelling and every -O0
+    # variant (4 of 6 real variants), because the SUB sits behind an MLIL_SX or
+    # two copies. Disclosure has to hold across the spellings the compiler
+    # chooses, or it is advice that only appears when it is least needed.
+    func = _residual_chunk_func(**shape)
+    result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
+        func, [te.parse_locator("param:1")],
+        enabled_sink_classes={"recv_overflow"})
+    reads = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "read"]
+    assert len(reads) == 1, result["reached_sinks"]
+    sink = reads[0]["sink"]
+    # THE soundness assertion: still an overflow, never relabelled to bounded.
+    assert sink["class"] == "overflow_len", sink
+    # ...and the shape is disclosed so the reader knows the one thing to check.
+    assert sink.get("length_shape") == "residual_chunk", sink
+    assert "capacity" in (sink.get("detail") or "")
+    # The PR body's delivered/refused table sells the total/cursor expressions as
+    # part of the disclosure, so they are pinned too: `_make_finding`'s allow-list
+    # is explicit, and a field dropped from it would otherwise vanish silently
+    # while this test stayed green on `length_shape` alone.
+    assert sink.get("residual_total") == "cap#0", sink
+    assert sink.get("residual_cursor") == "progress#1", sink
+
+
+@pytest.mark.parametrize("dest_shape,why", [
+    ("scaled",
+     "the cursor is an ELEMENT index into a 4-byte-element array, so the byte "
+     "extent is cursor*4 + (total - cursor) and exceeds total for any cursor > 0"),
+    ("table_load",
+     "the destination pointer is LOADED from a table the cursor indexes, so the "
+     "cursor is not an offset into the thing being written at all"),
+    ("extra_offset",
+     "a second non-constant offset sits between the base and the cursor, so the "
+     "cumulative extent is hdrlen + total, not total -- a destination that holds "
+     "exactly total bytes still overflows"),
+    ("add_add",
+     "the cursor is added TWICE (stride 2 spelled add-add), so the extent is "
+     "total + cursor"),
+    ("sub_dest",
+     "the cursor is SUBTRACTED from the base, so the write runs backwards out "
+     "of the buffer and total bounds nothing"),
+    ("field_base",
+     "the base is &buf[K] spelled MLIL_ADDRESS_OF_FIELD, so the extent from the "
+     "buffer base is K + total -- and this is the destination kind #791's own "
+     "repro uses, so an opcode denylist got the issue's own case wrong"),
+    ("or_base",
+     "the same displaced base after an optimiser rewrote the add as MLIL_OR"),
+    ("adc_base",
+     "the same displaced base after an optimiser rewrote the add as MLIL_ADC"),
+    ("cursor_plus_cursor",
+     "stride 2 with the base folded away entirely -- there is no inner ADD to "
+     "disqualify, so the base must be checked against BEING the cursor"),
+    ("deep_displaced_base",
+     "a displaced base behind more pure copies than the bounded def-chain walk "
+     "can see, so 'no arithmetic in the chain' silently meant 'none within the "
+     "budget'"),
+], ids=["scaled_index", "pointer_table_load", "extra_offset", "cursor_added_twice",
+        "subtracting_destination", "address_of_field_base", "or_displaced_base",
+        "adc_displaced_base", "cursor_plus_cursor", "deep_displaced_base"])
+def test_residual_chunk_refuses_a_destination_the_cursor_does_not_offset_791(
+        models, dest_shape, why):
+    # The disclosure's whole value is the sentence it attaches: "the loop's
+    # cumulative extent is bounded by `total`, so the one thing to check is the
+    # destination's capacity against total". That sentence is only TRUE when the
+    # cursor offsets the destination at UNIT STRIDE -- it is the identity
+    # `cursor + (total - cursor) == total`.
+    #
+    # The matcher used to accept any destination whose def chain merely READ the
+    # cursor somewhere, which is satisfied by a scaled index and by a pointer
+    # load the cursor indexes. In both, `why` above, so the disclosure asserted
+    # a bound that does not hold and pointed the triager at the wrong question --
+    # worse than saying nothing, because it reads as analysis.
+    #
+    # The finding itself must SURVIVE: the class is the answer, the shape claim
+    # was the error. Suppressing the sink here would be the false negative this
+    # engine treats as its worst outcome.
+    func = _residual_chunk_func(dest_shape=dest_shape)
+    result = te.TaintEngine(FBV({0x910: "read"}), models).forward(
+        func, [te.parse_locator("param:1")],
+        enabled_sink_classes={"recv_overflow"})
+    reads = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "read"]
+    assert len(reads) == 1, result["reached_sinks"]
+    sink = reads[0]["sink"]
+    assert sink["class"] == "overflow_len", sink
+    assert sink.get("length_shape") is None, (why, sink)
+    assert sink.get("residual_total") is None, sink
+    assert sink.get("residual_cursor") is None, sink
+    # And no prose remnant of the withdrawn claim -- a detail that still says
+    # "bounded by" would mislead exactly as much as the structured field.
+    assert "residual chunk" not in (sink.get("detail") or ""), sink
+    assert "cumulative extent" not in (sink.get("detail") or ""), sink
+
+
+def test_reconstruct_path_discloses_a_dropped_phi_parent_827(models):
+    # #827 item 1: the walk renders ONE chain, following parents[0]. A value
+    # defined at a branch join has several tainted parents, and dropping the
+    # rest silently let the single rendered chain read as the value's whole
+    # provenance -- the signature derived from it inherited the same blind spot.
+    # The chain stays one real path; the join is now named.
+    engine = te.TaintEngine(FBV({}), models)
+    join, alt, root = ("x", 1), ("b", 1), ("a", 1)
+    why = {
+        join: {"instr": FInstr(2, 0x30, "MLIL_SET_VAR_SSA", "x#1 = phi(a#1, b#1)"),
+               "label": "x#1", "reason": "phi join", "parents": [root, alt]},
+        root: {"instr": FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "a#1 = src"),
+               "label": "a#1", "reason": "seed", "parents": []},
+    }
+    chain = engine._reconstruct_path(join, why)
+    step = next(s for s in chain if s.get("address") == "0x30")
+    assert step["alternate_parents"] == 1, step
+    # The linear step must NOT be annotated -- an unconditional marker would be
+    # a permanent false alarm on every ordinary chain.
+    linear = next(s for s in chain if s.get("address") == "0x10")
+    assert "alternate_parents" not in linear, linear
+
+
+def _unreadable_callee_func():
+    """caller(p): helper(p#0) -- `helper` is an in-binary callee the run DESCENDS
+    into and then cannot read.
+
+    The faithful mid-refresh shape, and the reason it is not simply "mlil is
+    None": `_is_internal` already rejects a null-MLIL callee as external, and
+    the external path discloses "has no model" which blocks the gate on its own.
+    The gap #811 names needs a callee that passes the descend test -- MLIL with
+    instructions -- and then fails INSIDE the walk, which is what a view whose
+    SSA form has not been built yet produces. The argument is a bare tainted VAR
+    so the descent actually fires."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    body = FInstr(0, 0xB04, "MLIL_SET_VAR_SSA", "q#1 = q#0")
+    helper = FFunc("helper", 0xB00, FSSAFunc([body]), params=[FVar("q", ident=41)])
+    helper.mlil.ssa_form = None             # lifted, but SSA not built yet
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
+    return FFunc("caller", 0x10, FSSAFunc([call]), params=[p]), helper
+
+
+def test_unreadable_callee_body_is_named_in_the_result_811(models):
+    # #811: `_summarize` already degraded conservatively when a callee's body
+    # could not be read, but disclosed it as PROSE only -- "nothing in the
+    # result distinguishes it from a fully analysed run". The condition is now
+    # STRUCTURAL and names the function, which is the marker the issue asks for;
+    # a consumer no longer has to substring-match an assumption to learn that
+    # part of the program was never examined.
+    func, helper = _unreadable_callee_func()
+    result = te.TaintEngine(FBV({}, funcs={0xB00: helper}), models).forward(
+        func, [te.parse_locator("param:0")])
+    stats = result["stats"]
+    assert stats["analysis_incomplete"] is True, stats
+    assert "helper" in stats["analysis_incomplete_functions"], stats
+    diag = result.get("diagnostics") or {}
+    assert diag.get("analysis_incomplete") is True, diag
+    assert diag.get("safe_to_report_all_clear") is False, diag
+    # The conservative degrade is unchanged -- only the disclosure was added.
+    assert any("could not analyze helper" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_analysis_incomplete_alone_withholds_the_all_clear_811():
+    # The gate branch on its own. In the integration case above a frontier leaf
+    # happens to be emitted too and takes priority in the reason, so that test
+    # cannot prove this branch exists. Here nothing else is wrong: no leaves, no
+    # assumptions, not truncated -- an unread body is the ONLY defect, and it
+    # must still withhold the claim, because "no sink in a body I never read" is
+    # an absence of evidence.
+    from bn_agent_bridge import taint_result as tr
+
+    safe, reason = tr._derive_all_clear([], [], truncated=False)
+    assert safe is True, reason
+    safe, reason = tr._derive_all_clear([], [], truncated=False, analysis_incomplete=True)
+    assert safe is False
+    assert "could not be analysed" in reason, reason
+
+
+def test_fully_analysed_run_stays_complete_811(models):
+    # The must-not-fire twin: an ordinary run must not pay the disclosure, or
+    # every clean result would carry a permanent incompleteness warning.
+    func = _scanf_arity_func(4)
+    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
+        func, [te.parse_locator("call:scanf")])
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
+    assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is True
+
+
+def test_backward_result_carries_a_completeness_gate_812(process_func, models):
+    # #812: forward attached a diagnostics block and backward attached none, so
+    # a curtailed slice was shaped exactly like an exhaustive one. The gate is
+    # deliberately `safe_to_report_complete_slice`, NOT the forward key: backward
+    # starts AT a sink and never answers "no sink was reached".
+    engine = te.TaintEngine(FBV({0x401070: "read", 0x401080: "memcpy"}), models)
+    result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
+    diag = result.get("diagnostics") or {}
+    assert diag, result.keys()
+    assert "safe_to_report_complete_slice" in diag, diag
+    # ...and its VALUE, end to end: this run has no blocking leaf and is not
+    # truncated, so the gate must CLAIM completeness. Stated precisely, because
+    # a round-6 lens measured what this assertion does and does not catch: it
+    # is load-bearing against a gate that wrongly WITHHOLDS (it reds when the
+    # clean branch is flipped to False), and it does NOT catch a broken
+    # blocking-leaf branch -- there is no blocking leaf here for that branch to
+    # mis-handle. The withholding direction is pinned by the decision-table
+    # test below, which is where a curtailed slice lives.
+    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    assert diag["safe_to_report_complete_slice"] is True, diag
+    assert not [lf for lf in result["leaves"]
+                if lf.get("kind") in BLOCKING_LEAF_KINDS], result["leaves"]
+    # Forward's key must NOT appear on a backward result -- that was the whole
+    # reason for a separate name.
+    assert "safe_to_report_all_clear" not in diag, diag
+    assert "frontier" in diag and "next_action" in diag, diag
+    assert result["run_params"]["max_depth"] == 8
+    # `max_iters` bounds the forward fixpoint only; echoing it on a backward run
+    # is how the "raise --max-iters" advice reached runs it could never fix.
+    assert "max_iters" not in result["run_params"], result["run_params"]
+
+
+def test_backward_completeness_gate_is_a_decision_not_a_key_812():
+    # The decision table behind `safe_to_report_complete_slice`, pinned value by
+    # value. Every branch below was reachable with nothing asserting its answer:
+    # with the blocking-leaf branch disabled, a slice that abandoned caller
+    # sites at the ascent cap claimed completeness and the text view printed
+    # "complete slice (may-analysis, not a proof)" -- the exact false claim #812
+    # exists to withhold -- while the whole taint suite stayed green.
+    from bn_agent_bridge import taint_result as tr
+
+    # The clean walk is the ONLY shape allowed to claim completeness.
+    clean = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1)
+    assert clean["safe_to_report_complete_slice"] is True, clean
+    assert "no frontier leaf" in clean["complete_slice_reason"], clean
+
+    # A blocking frontier leaf means the def-chain was not followed to every
+    # origin, and the reason must name the kind so the reader knows which.
+    curtailed = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}], [], sinks_seeded=1, slices=1)
+    assert curtailed["safe_to_report_complete_slice"] is False, curtailed
+    assert "caller_sites_truncated" in curtailed["complete_slice_reason"], curtailed
+
+    # A non-blocking leaf kind must NOT withhold it -- the gate discriminates on
+    # the canonical vocabulary, not on "a leaf exists".
+    benign = tr.backward_diagnostics(
+        [{"kind": "arg_dropped_partial"}], [], sinks_seeded=1, slices=1)
+    assert benign["safe_to_report_complete_slice"] is True, benign
+
+    # Truncation withholds it on its own, with the cause named rather than the
+    # generic frontier sentence.
+    cut = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, truncated=True,
+                                  truncation_cause=["caller_cap"])
+    assert cut["safe_to_report_complete_slice"] is False, cut
+    assert "truncated" in cut["complete_slice_reason"], cut
+
+    # Nothing seeded means nothing was walked: an empty slice list is a seeding
+    # outcome, not an exhaustive answer.
+    unseeded = tr.backward_diagnostics([], [], sinks_seeded=0, slices=0)
+    assert unseeded["safe_to_report_complete_slice"] is False, unseeded
+    assert "no sink seeded" in unseeded["complete_slice_reason"], unseeded
+
+
+def test_backward_next_action_names_the_unseeded_sink_before_the_empty_slice_812():
+    # The second unpinned branch of the same function. With nothing seeded there
+    # are also no slices, so without this precedence the generic "the sink
+    # seeded but no slice was produced" line fires and contradicts this block's
+    # own reason ("no sink seeded, so nothing was walked") -- two lines of one
+    # diagnostic disagreeing about whether a sink seeded at all.
+    from bn_agent_bridge import taint_result as tr
+
+    unseeded = tr.backward_diagnostics([], [], sinks_seeded=0, slices=0)
+    assert "no sink seeded" in unseeded["next_action"], unseeded
+    assert "the sink seeded but no slice" not in unseeded["next_action"], unseeded
+    # Both lines of the block must tell the same story about the seed.
+    assert "no sink seeded" in unseeded["complete_slice_reason"], unseeded
+
+    # The empty-slice line still answers for the case it actually describes.
+    seeded = tr.backward_diagnostics([], [], sinks_seeded=1, slices=0)
+    assert "the sink seeded but no slice was produced" in seeded["next_action"], seeded
+
+
+def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812():
+    # The rest of the same block's decision surface, every branch of which
+    # shipped pinned by nothing: disabling any one of the three frontier
+    # next_action branches, zeroing the dropped-caller bucket, or dropping
+    # `field_load_unresolved` from backward's UNRESOLVED vocabulary each left
+    # 781 tests green. The harm is not a missing sentence -- it is the block
+    # telling the reader "the slice reached its origins" in one line while its
+    # own gate says the slice is NOT complete in the next.
+    from bn_agent_bridge import taint_result as tr
+
+    # Dropped caller sites: counted under their own heading, and the one
+    # frontier a user can act on by re-running with a narrower sink.
+    dropped = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}, {"kind": "caller_sites_truncated"}],
+        [], sinks_seeded=1, slices=1)
+    assert dropped["frontier"]["dropped_callers"] == 2, dropped
+    assert dropped["frontier"]["unresolved"] == 0, dropped
+    assert "caller ascent was capped" in dropped["next_action"], dropped
+
+    # An unresolved def. `field_load_unresolved` is the shape the issue names as
+    # the motivating one ("bottomed out at an unresolved field load"), so a
+    # vocabulary that omits it reports zero unresolved frontier on exactly the
+    # run the feature exists for.
+    for kind in ("field_load_unresolved", "unmodeled_callee",
+                 "indirect_call_unresolved", "arg_under_recovered"):
+        unres = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
+        assert unres["frontier"]["unresolved"] == 1, (kind, unres)
+        assert "bn proto set" in unres["next_action"], (kind, unres)
+
+    # A coarse-memory frontier: its own bucket and its own remediation.
+    for kind in ("coarse_memory_store", "pointer_escape"):
+        coarse = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
+        assert coarse["frontier"]["coarse_memory"] == 1, (kind, coarse)
+        assert coarse["frontier"]["unresolved"] == 0, (kind, coarse)
+        assert "coarse-memory frontier" in coarse["next_action"], (kind, coarse)
+
+    # Precedence when several fire at once: the dropped ascent wins, because it
+    # is the only one the user can act on directly -- and the buckets stay
+    # separate rather than collapsing into a single total.
+    several = tr.backward_diagnostics(
+        [{"kind": "caller_sites_truncated"}, {"kind": "field_load_unresolved"},
+         {"kind": "coarse_memory_store"}], [], sinks_seeded=1, slices=1)
+    assert "caller ascent was capped" in several["next_action"], several
+    assert several["frontier"]["dropped_callers"] == 1, several
+    assert several["frontier"]["unresolved"] == 1, several
+    assert several["frontier"]["coarse_memory"] == 1, several
+
+    # The must-not-fire twin for all three: a clean walk gets the classify
+    # action, so none of these remediations is a permanent fixture on every row.
+    clean = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1)
+    assert "classify each origin" in clean["next_action"], clean
+    assert clean["frontier"] == {"unresolved": 0, "coarse_memory": 0,
+                                 "dropped_callers": 0, "by_kind": {}}, clean
+
+
+def test_backward_weak_sink_seed_withholds_completeness_812():
+    # The last completeness branch. It is DEFENCE-IN-DEPTH, not live coverage:
+    # none of the six assumptions today's backward walk records contains any
+    # `_WEAK_SEED_ASSUMPTION_MARKERS` substring, so the branch cannot fire from
+    # its only caller -- the weak backward seed shapes that exist reach the gate
+    # as a BLOCKING leaf (`arg_under_recovered`) instead. That is precisely why
+    # it is pinned here directly rather than through a run that would not prove
+    # it exists: an unreachable, untested branch is the one a later reader
+    # deletes as dead, and the marker set it keys on is shared with forward and
+    # grows (#851, #863 each added one).
+    from bn_agent_bridge import taint_result as tr
+
+    weak = tr.backward_diagnostics(
+        [], ["--sink arg 1 is source_seed_misanchored: the seeded operand is "
+             "not the value the callee reads"],
+        sinks_seeded=1, slices=1)
+    assert weak["safe_to_report_complete_slice"] is False, weak
+    assert "seed" in weak["complete_slice_reason"], weak
+
+    # And it keys on the MARKERS, not on "an assumption exists": the caller-cap
+    # note the backward walk really does record must not be read as a weak seed,
+    # or every capped ascent would be blamed on its seed.
+    ordinary = tr.backward_diagnostics(
+        [], ["parse_record has 9 callers; caller ascent followed 4, capped at 4"],
+        sinks_seeded=1, slices=1)
+    assert ordinary["safe_to_report_complete_slice"] is True, ordinary
+
+
+def test_truncation_hint_names_the_caller_cap_rather_than_a_depth_cutoff_812():
+    # The backward-only truncation cause. Without its own branch it fell through
+    # to the generic "depth/recursion cutoff" string, which names the wrong knob:
+    # no depth or recursion bound was hit, the caller ascent stopped at its
+    # per-site cap with callers unexamined. The branch shipped pinned by nothing
+    # -- disabling it left 726 tests green across all four taint test files --
+    # so the remediation could regress silently at the moment it matters most.
+    from bn_agent_bridge import taint_result as tr
+
+    hint = tr._truncation_hint(["caller_cap"])
+    assert "caller ascent" in hint, hint
+    assert "per-site cap" in hint, hint
+    # It must not offer either depth knob: neither bound was reached.
+    assert "--max-depth" not in hint and "--max-iters" not in hint, hint
+    assert hint != "depth/recursion cutoff"
+
+    # The generic fallback still answers for a cause this table does not know,
+    # and the two forward causes keep their own (different) remediations.
+    assert tr._truncation_hint(["an_unknown_cause"]) == "depth/recursion cutoff"
+    assert "--max-iters" in tr._truncation_hint(["fixpoint_exhausted"])
+    assert "--max-depth" in tr._truncation_hint(["max_depth"])
+
+    # And it reaches the consumer: a truncated backward run quotes it verbatim
+    # in the reason a reader sees, rather than deriving a second wording.
+    diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, truncated=True,
+                                   truncation_cause=["caller_cap"])
+    assert hint in diag["complete_slice_reason"], diag
+
+
+def _phi_join_of_source_and_unconditional_func():
+    """join(fd): gets(&buf); v#1 = buf; x#1 = phi(fd#0, v#1); strcpy(&dst, x#1).
+
+    The multi-parent provenance shape #827 item 1's second site needs. `x#1` is
+    a join of TWO tainted values:
+
+      * ``parents[0]`` is ``fd``, the run's declared ``--source param:0``, whose
+        own ``why`` entry has no parents at all -- a dead end for the walk;
+      * ``parents[1]`` reaches ``buf``, the buffer ``gets()`` taints
+        UNCONDITIONALLY (independently of ``--source``), which is the
+        injected root the tagger is looking for.
+
+    The parent ORDER is the whole point, and it is not incidental: ``read_taint``
+    preserves ``ssa_reads`` order, so listing ``fd#0`` first puts the injected
+    root strictly behind ``parents[1]``. A walk that follows only the first
+    parent answers False here and the strcpy finding is then attributed to
+    ``param:0`` -- a causal claim the flow does not support.
+    """
+    fd = FVar("fd")
+    buf = FVar("buf", typ="char[0x40]")
+    dst = FVar("dst", typ="char[0x40]")
+    fd0, bufssa = FSSA(fd, 0), FSSA(buf, 0)
+    v1, x1 = FSSA(FVar("v"), 1), FSSA(FVar("x"), 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "v#1 = buf", reads=[bufssa], writes=[v1],
+               src=FExpr("MLIL_VAR_SSA", "buf", reads=[bufssa])),
+        FInstr(2, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
+               reads=[fd0, v1], writes=[x1]),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    bv = FBV({0x401070: "gets", 0x401090: "strcpy"})
+    return FFunc("join", 0x10, FSSAFunc(instrs), params=[fd]), bv
+
+
+def test_unconditional_root_behind_a_later_phi_parent_is_still_tagged_827(models):
+    # #827 item 1, second site: `_rooted_at_unconditional` is a REACHABILITY
+    # question ("is any ancestor an unconditionally-injected root?"), and it used
+    # to follow parents[0] only. A join whose injected root sits behind the
+    # SECOND parent then answered False, UNDER-tagging the finding: the strcpy
+    # got rendered as though the run's declared --source causally reached it,
+    # when the taint it copies was created by gets()'s own always-unsafe read.
+    #
+    # The observable is the finding's signature source, the same sentinel #615
+    # already pins for the single-parent case: "?" (no declared source traced
+    # here), never "param:0".
+    func, bv = _phi_join_of_source_and_unconditional_func()
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
+    assert len(strcpy_sinks) == 1, result["reached_sinks"]
+    # A REAL arg-taint finding, not the unconditional sentinel shape -- so the
+    # "?" below is the multi-parent walk's work and not #615's arg_index-is-None
+    # branch answering for it.
+    assert strcpy_sinks[0]["sink"]["tainted_arg_index"] == 1, strcpy_sinks[0]["sink"]
+    assert strcpy_sinks[0]["signature"]["source"] == "?", strcpy_sinks[0]["signature"]
+    assert "param:0" not in strcpy_sinks[0]["signature"]["rendered"], strcpy_sinks[0]["signature"]
+
+
+def test_unconditional_tag_does_not_fire_without_an_injected_root_827(models):
+    # The must-not-fire twin. A walk that answered True on ANY multi-parent join
+    # would erase --source attribution from every phi-joined finding in the
+    # binary -- the same information loss as the under-tagging bug, in the other
+    # direction.
+    #
+    # The fixture must therefore reach the walk, and that is not automatic:
+    # `_rooted_at_unconditional` opens with `if not unconditional_roots: return
+    # False`, so a function with NO always-unsafe call short-circuits before the
+    # traversal and the twin proves nothing (measured: with the walk mutated to
+    # `return True` on any join, 876 tests across the taint-touching files stayed
+    # green). So `gets(&other)` is present -- it populates `unconditional_roots`
+    # and forces the early-return open -- while `other` flows nowhere near the
+    # strcpy, whose provenance is a join of the declared --source with a copy of
+    # itself. Two tainted parents, no injected ancestor: the attribution must
+    # survive.
+    fd = FVar("fd")
+    dst = FVar("dst", typ="char[0x40]")
+    other = FVar("other", typ="char[0x40]")
+    fd0 = FSSA(fd, 0)
+    v1, x1 = FSSA(FVar("v"), 1), FSSA(FVar("x"), 1)
+    instrs = [
+        # Populates unconditional_roots with a node nothing below reads.
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&other)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&other", src=other)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "v#1 = fd#0", reads=[fd0], writes=[v1],
+               src=FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])),
+        FInstr(2, 0x18, "MLIL_VAR_PHI", "x#1 = phi(fd#0, v#1)",
+               reads=[fd0, v1], writes=[x1]),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "strcpy(&dst, x#1)", reads=[x1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    func = FFunc("join_clean", 0x10, FSSAFunc(instrs), params=[fd])
+    result = te.TaintEngine(FBV({0x401070: "gets", 0x401090: "strcpy"}), models).forward(
+        func, [te.parse_locator("param:0")])
+    # The guard that makes this test non-vacuous: the gets() sink fired, which is
+    # the observable proof that `unconditional_roots` is non-empty and the walk
+    # was actually entered rather than short-circuited.
+    assert [s for s in result["reached_sinks"]
+            if s["sink"]["callee"] == "gets"], result["reached_sinks"]
+    strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
+    assert len(strcpy_sinks) == 1, result["reached_sinks"]
+    assert strcpy_sinks[0]["signature"]["source"] == "param:0", strcpy_sinks[0]["signature"]
+
+
+def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
+    # #812's headline defect, bridge end: the per-callsite row now carries its
+    # OWN blocking-frontier count, derived from the canonical
+    # BLOCKING_LEAF_KINDS. The CLI used to recompute the "(N frontier)" marker
+    # by counting one hard-coded kind (`unmodeled_callee`) out of the ten
+    # that block a claim, so a callsite whose frontier was a coarse store, a
+    # pointer escape or an unresolved indirect call counted ZERO and the marker
+    # vanished -- silently, on the row a reader uses to pick which callsite to
+    # triage first.
+    #
+    # Canned per-callsite runs (the `_forward_run` seam
+    # test_forward_attributed_gate_recomputed_over_union_leaves already uses):
+    # the leaf VOCABULARY is what is under test here, and a fixture that has to
+    # produce three different real frontier kinds from one synthetic function
+    # would pin the fixture instead.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run(leaves):
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
+            "diagnostics": {"safe_to_report_all_clear": False, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    # Callsite A: two BLOCKING leaves, neither of them `unmodeled_callee` (the
+    # kind the old CLI-side count was hard-coded to), plus one non-blocking row
+    # that must NOT be counted -- a frontier marker that counts every leaf is
+    # just `len(leaves)` under a scarier name.
+    a = _run([{"kind": "coarse_memory_store", "address": "0x24"},
+              {"kind": "pointer_escape", "address": "0x28"},
+              {"kind": "arg_dropped_partial", "address": "0x2c"}])
+    # Callsite B: the one kind the old count DID see, so the test distinguishes
+    # "counts the right vocabulary" from "counts more things".
+    b = _run([{"kind": "unmodeled_callee", "address": "0x34"}])
+    runs = iter([a, b])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["by_source"]["0xa"]["frontier"] == 2, out["by_source"]["0xa"]
+    assert out["by_source"]["0xb"]["frontier"] == 1, out["by_source"]["0xb"]
+    # The row's own leaf list is untouched -- `frontier` is an added count, not
+    # a filter, so a reader can still see the non-blocking row it excluded.
+    assert len(out["by_source"]["0xa"]["leaves"]) == 3, out["by_source"]["0xa"]
+
+
+def test_forward_attributed_union_keeps_the_unread_callee_disclosure_811(models):
+    # #811's structural marker has to survive the ATTRIBUTED path, which is the
+    # DEFAULT whenever a single ret/arg source spreads over several callsites --
+    # so it is the shape most runs actually take. The union recomputes stats
+    # from the per-callsite results, and an omission there would answer as
+    # though every callee body was read while one was not: exactly the honesty
+    # gap #811 exists to close, in the path a user hits first.
+    #
+    # Canned per-callsite runs through the `_forward_run` seam, because the
+    # question is whether the UNION carries the field forward, not whether a
+    # synthetic callee can be made unreadable twice.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run(incomplete):
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0,
+                      "truncated": False,
+                      "analysis_incomplete": bool(incomplete),
+                      "analysis_incomplete_functions": list(incomplete)},
+            "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    # Callsite A read everything; callsite B could not read `helper_b`. The union
+    # must report the hole -- an OR, not the first run's answer.
+    runs = iter([_run([]), _run(["helper_b"])])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["stats"]["analysis_incomplete"] is True, out["stats"]
+    assert out["stats"]["analysis_incomplete_functions"] == ["helper_b"], out["stats"]
+    # ...and the gate must act on it: a clean per-callsite run said all-clear,
+    # and the union may not inherit that claim over an unread body.
+    diag = out.get("diagnostics") or {}
+    assert diag.get("analysis_incomplete") is True, diag
+    assert diag.get("safe_to_report_all_clear") is False, diag
+    assert "could not be analysed" in (diag.get("all_clear_reason") or ""), diag
