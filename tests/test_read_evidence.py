@@ -1276,6 +1276,49 @@ def test_init_arrays_no_tls_item_for_non_pe(monkeypatch):
     assert not any("TLS callbacks" in it["name"] for it in result["items"])
 
 
+def test_init_arrays_discloses_the_entry_population_819(monkeypatch):
+    """#819: the top-level `total` counts the SECTIONS in `items`, while the read's
+    `--limit N` caps ENTRIES per section -- so `.total` read as the entry
+    population never moved (one section, whatever the limit), and a bounded read
+    of a 400-constructor table looked like a complete 1-row answer. The entry
+    population now has its own name, next to the per-section counts it sums."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ctor = _FakeFunction(0x401000, "global_ctor")
+    table = b"".join((0x401000 + i * 4).to_bytes(4, "little") for i in range(8))
+    bv = _FakeBV(
+        functions=[ctor],
+        arch=_FakeArch(name="armv7"),
+        sections={".init_array": _FakeSection(".init_array", 0x5000, 0x5020)},
+        memory={0x5000: table},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._init_arrays("active", limit=2)
+
+    assert result["kind"] == "init_arrays"
+    assert result["total"] == 1              # the `items` collection: sections
+    assert result["total_entries"] == 8      # the population the limit bounds
+    assert result["items"][0]["shown_entries"] == 2
+    assert result["items"][0]["truncated"] is True
+
+
+def test_function_evidence_payload_carries_its_kind_discriminator_819(monkeypatch):
+    """#819: `evidence function` was the one read in its family with no `kind`, so
+    `jq .kind` answered null and a generic consumer could not tell this card from
+    any other object payload. The `calls` container the renderers read is
+    untouched (it is the documented leaf, and duplicating the heaviest array in
+    the module under a second key would double this read's payload)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+
+    result = instance._function_evidence("active", "probe_device", context=0)
+
+    assert result["kind"] == "function_evidence"
+    assert [call["address"] for call in result["calls"]] == ["0x401400"]
+
+
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2034,7 +2077,12 @@ def test_function_evidence_slicing_471(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: the call scan moved into read_call_evidence WITH `_function_evidence`,
+    # so the seam is patched where the scan is looked up now -- resolved through
+    # the package the loaded bridge actually uses (`_load_bridge` imports it under
+    # an alias, so a bare `bn_agent_bridge...` import would patch a second copy).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
     monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
@@ -2059,6 +2107,34 @@ def test_function_evidence_slicing_471(monkeypatch):
         instance._function_evidence("active", "dispatch", limit=0)
 
 
+def test_function_evidence_paging_validation_matches_the_shared_helper_827(monkeypatch):
+    """#827 item 8: the bridge re-enforces the CLI's argparse contract for a raw
+    socket / `py exec` client, and it must do so with the SAME code and wording
+    every other paged read uses (`_validate_count`) instead of the ad-hoc
+    `invalid_context`/"Invalid offset: -1" messages this op used to emit. The
+    sibling `callsites` read (`read_listing.py`) still raises `invalid_context`
+    with the same ad-hoc idiom and is out of this PR's scope -- so this asserts
+    the SHARED wording, not that the old spelling is extinct.
+    Validation runs before the view is resolved, so no view is needed here."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    with pytest.raises(bridge.OperationFailure) as context_exc:
+        instance._function_evidence("active", "dispatch", context=-1)
+    assert context_exc.value.status == "invalid_request"
+    assert context_exc.value.message == "context must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as offset_exc:
+        instance._function_evidence("active", "dispatch", offset=-1)
+    assert offset_exc.value.status == "invalid_request"
+    assert offset_exc.value.message == "offset must be >= 0, got -1"
+
+    with pytest.raises(bridge.OperationFailure) as limit_exc:
+        instance._function_evidence("active", "dispatch", limit=0)
+    assert limit_exc.value.status == "invalid_request"
+    assert limit_exc.value.message == "limit must be >= 1, got 0"
+
+
 def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     """#622: a paged read returns the call PAGE without paying for the full
     Pseudo-C decompile, and says so -- `decompile_deferred` + a warning line, so
@@ -2067,7 +2143,9 @@ def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
-    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+    # #592: patched where the scan is looked up now (see the slicing test above).
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view",
                         lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
