@@ -3879,26 +3879,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     sites = _count_helper_sites()
     # 18 -> 19 (#858 review r5): `_render_trace_text` now reads `arg_index`
     # through `_stated_count`, which is a read this differential covers.
-    # 19 -> 24 (#812): `_render_backward_diagnostics` is new and reads five
-    # counters through `_count_field` -- `sinks_seeded`/`slices` off the
-    # diagnostics block and `unresolved`/`coarse_memory`/`dropped_callers` off
-    # its frontier. They are counts in a block whose entire purpose is to
-    # withhold a completeness claim, so a fabricated zero there reads as
-    # "nothing was dropped" -- exactly the reassurance the block exists to
-    # refuse. Routed through the helper rather than `get(k, 0)` so the residue
-    # census stays put and these five join the covered set instead.
-    # 24 -> 25 (#827 item 1): `_render_taint_path` now reads `alternate_parents`
-    # through `_count_field`. It is a count in a DISCLOSURE line, so a
-    # fabricated zero would silently delete the disclosure and a fabricated
-    # number would invent one; both are worse than the marker being absent.
-    # 25 -> 32 (#823): `_render_spill_gc_text` states five top-level counters
+    # 19 -> 20 (#675.2): declared_suppressed joins the count-helper census.
+    # 20 -> 25 (#812): backward diagnostics adds five counters.
+    # 25 -> 26 (#827): alternate_parents is a disclosure count.
+    # 26 -> 33 (#823): spill GC adds five headline and two row counts.
     # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
     # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
     # are the headline's numbers; the two row reads are nested, which is why
     # they are named in the skipped set below rather than silently dropped.
-    assert len(sites) == 32, (
+    assert len(sites) == 33, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 32. The number is the size of the covered set: a "
+        "count helper, not 33. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4322,9 +4313,8 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    # #874 adds the taint diagnostic reads to the current renderer population.
-    # Measured after combining both branches: 1248 container cases.
-    assert checked == 1248, f"the differential ran {checked} cases, not 1248"
+    # Combined #874 and #907 renderer population: 1272 measured cases.
+    assert checked == 1272, f"the differential ran {checked} cases, not 1272"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4369,9 +4359,8 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # #874 adds the taint diagnostic reads to the current renderer population.
-    # Measured after combining both branches: 5032 malformed renders.
-    assert swept == 5032, f"the raise sweep ran {swept} renders, not 5032"
+    # Combined #874 and #907 renderer population: 5080 measured renders.
+    assert swept == 5080, f"the raise sweep ran {swept} renders, not 5080"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4526,9 +4515,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # #874 adds the taint diagnostic reads to the current renderer population.
-    # Measured after combining both branches: 1466 benign renders.
-    assert checked == 1466, f"the mirror ran {checked} renders, not 1466"
+    # Combined #874 and #907 renderer population: 1482 measured renders.
+    assert checked == 1482, f"the mirror ran {checked} renders, not 1482"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7153,7 +7141,6 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    # #890 obs 2: `_operation_row_text` now reads the `unapplied_prototypes` container and its nested `functions`/`variables` lists, so a text reader of a mixed declare is told what went unapplied. Three new discovered reads, and these derived populations grow with them. The row reads one more top-level key than before.
     assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
@@ -7181,13 +7168,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # #890 obs 2: the row now reads `unapplied_prototypes` (and its nested
-    # `functions`/`variables`), so both sizes grow with the new key: the
-    # rendered population 1980 -> 2178 and the checked subset 1188 -> 1298.
+    # #877/#890 adds the unapplied_prototypes field to the op row: 11 keys,
+    # 2178 rendered and 1298 checked on this merged tree.
     assert (rendered, checked) == (2178, 1298), (
         f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
         f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 792 "
+        "different claims: the carve-out for a readable container skips 880 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a
@@ -7284,12 +7270,13 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
+    # #675.2: + 2 `notes` list positions x 6 junk element kinds x 6 element shapes = 4644.
     # #823: `_render_spill_gc_text` joins the population with three
     # discovered container reads (`candidates`, `skipped`, `errors`), so every
     # derived count here moves by its contribution alone. Measured.
-    # 4572 + 108 (#823) = 4680.
-    assert swept == 4680, (
-        f"the element sweep ran {swept} renders, not 4680 -- the size of the "
+    # 4644 + 108 (#823) = 4752.
+    assert swept == 4752, (
+        f"the element sweep ran {swept} renders, not 4752 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
@@ -8563,3 +8550,88 @@ def test_taint_path_discloses_a_phi_join_in_the_text_view_827():
         if bad is not None:
             step["alternate_parents"] = bad
         assert "not shown" not in "\n".join(_render_taint_path([step])), bad
+
+
+def test_render_class_show_text_prints_the_declared_note_675():
+    """#675.2: a declared-type card's vtable/methods/instances are empty because
+    the view has no RTTI class for the name, not because the class has none -- the
+    note is the only line that says which, so it must reach the card."""
+    from bn.formatters import _render_class_show_text
+
+    out = _render_class_show_text({
+        "name": "Widget",
+        "confidence": "declared-only",
+        "size": {"value": "0x10", "source": "declared_type"},
+        "methods": [], "vtable": None, "bases": [],
+        "instances": {"construction_sites": [], "stored_globals": [],
+                      "construction_sites_total": 0,
+                      "construction_sites_truncated": False,
+                      "stored_globals_total": 0,
+                      "stored_globals_truncated": False},
+        "notes": ["declared type -- no RTTI class, demangled methods or "
+                  "construction sites for this name in this view"],
+    })
+
+    assert "class Widget" in out
+    assert "[declared-only]" in out
+    assert "note: declared type -- no RTTI class" in out
+
+
+def test_render_class_show_text_discloses_a_skewed_notes_container_675():
+    """The note is read through the choke point, so an unusable `notes` says so
+    instead of dropping the line that distinguishes absence from silence."""
+    from bn.formatters import _render_class_show_text
+
+    rec = {"name": "Widget", "confidence": "declared-only", "methods": [],
+           "vtable": None, "bases": [],
+           "instances": {"construction_sites": [], "stored_globals": [],
+                         "construction_sites_total": 0,
+                         "construction_sites_truncated": False,
+                         "stored_globals_total": 0,
+                         "stored_globals_truncated": False}}
+
+    assert "malformed" not in _render_class_show_text({**rec, "notes": []})
+    assert "malformed" not in _render_class_show_text(rec)
+    skewed = _render_class_show_text({**rec, "notes": "bad"})
+    assert "malformed notes" in skewed
+
+
+def test_render_class_list_text_discloses_declared_types_folded_out_675():
+    """#675.2: the default listing folds declared class types out through the
+    confidence gate, so it says they are there (and how to see them) rather than
+    reading as a lens that never saw the class the user declared.
+
+    The noun names the population EXACTLY, because twice it did not: it counted
+    the view's whole type table when it said "declared type", and every type BN
+    itself imported when it said "declared class type" (#907 review). What the
+    counter counts is what `--all` adds -- the class types this view's USER
+    declared."""
+    from bn.formatters import _render_class_list_text
+
+    one = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 1})
+    assert "1 user-declared class type (--all to show)" in one
+
+    two = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 2})
+    assert "2 user-declared class types (--all to show)" in two
+
+    none = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": 0})
+    assert "declared" not in none
+
+    # An unreadable counter must not print as "0 user-declared class types", which
+    # reads as "the lens looked and found none" (#619).
+    skewed = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0, "declared_suppressed": "lots"})
+    assert "? user-declared class types (--all to show)" in skewed
+
+    # ... but the ADVICE is only advice when it is still actionable. An `--all`
+    # run whose declared set could not be read still has to state the unknown,
+    # and telling the reader to pass the flag they just passed reads as a
+    # different, unsatisfied suggestion (#907 review rounds 4 and 5).
+    skewed_all = _render_class_list_text({
+        "kind": "classes", "items": [], "total": 0,
+        "include_all": True, "declared_suppressed": "lots"})
+    assert "? user-declared class types" in skewed_all
+    assert "(--all to show)" not in skewed_all, skewed_all
