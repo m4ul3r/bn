@@ -11,6 +11,9 @@ from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, 
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
+    _discloses,
+    _field_skewed,
+    _nonnegative_count,
     _render_data_symbols_text,
     _render_data_vars_text,
     _render_function_bundle_text,
@@ -24,8 +27,44 @@ from ..formatters import (
     _render_read_text,
     _render_sections_text,
     _render_strings_text,
+    _stated_count,
 )
 from ..transport import BridgeError, unwrap_result
+
+
+@_discloses
+def _strings_count_text(value: Any) -> str:
+    """The `strings --count` line, with the filter's denominator (#795).
+
+    `Total strings: 30` from a `--probable-format-strings` run said nothing about
+    the 1329 strings the filter dropped, so the denominator cost a SECOND
+    unfiltered invocation. Mirrors `_imports_count_text`'s excluded-count tail:
+    the bridge's own `filtered` count is disclosed parenthetically when it is
+    non-zero, and the line is unchanged on an unfiltered dump.
+
+    Both numbers are read through the COUNT CHOKE POINT, which is the same
+    reading `_render_strings_text` gives them one surface over (#619 review).
+    An `isinstance(int)` test here was a second decider over a question this
+    codebase already answers, and it answered wrong in both directions: a
+    producer that spells counts as text (`"1329"`) had its disclosure dropped
+    entirely -- reinstating the extra invocation #795 removed -- while `bool` IS
+    an `int`, so `filtered: true` rendered "(True filtered out by the active
+    filters)". The headline goes through `_stated_count` for the same reason it
+    does everywhere else: `Total strings: 0` fabricated from an unreadable
+    counter reads byte-identically to an empty binary. The denominator goes
+    through the CARDINALITY reader the listing surface uses, so a filter that
+    claims to have dropped a negative number of strings is disclosed rather
+    than restated as a quantity (#795 round-5 review)."""
+    line = f"Total strings: {_stated_count(value, 'count')}"
+    dropped = _nonnegative_count(value, "filtered")
+    if dropped:
+        line += f" ({dropped} filtered out by the active filters)"
+    elif _field_skewed("filtered"):
+        # The same wording the listing surface uses, so one payload cannot be
+        # described two ways depending on which flag the caller passed.
+        line += ("\n// the payload's filtered-string count is not a number that "
+                 "can be read (use --format json)")
+    return line
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
@@ -50,7 +89,8 @@ from ..transport import BridgeError, unwrap_result
                       "assert a format-string vulnerability."),
              arg("--count", action="store_true", default=False,
                  help="Show the matching string count instead of listing"),
-         ])
+         ],
+         estimable=True)
 def _strings(args: argparse.Namespace) -> int:
     common = {
         "query": args.query,
@@ -67,7 +107,7 @@ def _strings(args: argparse.Namespace) -> int:
             "strings",
             {**common, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total strings: {value.get('count', 0)}",
+            text_renderer=_strings_count_text,
             stem="strings-count",
             regex_hint_query=args.query,
         )
@@ -103,12 +143,59 @@ def _strings(args: argparse.Namespace) -> int:
     return rc
 
 
+@_discloses
 def _imports_count_text(value: Any) -> str:
-    line = f"Total imports: {value.get('count', 0)}"
-    excluded = value.get("self_defined_excluded")
-    if isinstance(excluded, int) and excluded > 0:
+    """The `imports --count` line, with the filter's excluded-count tail.
+
+    The sibling `_strings_count_text` is modelled on this line, and #795's
+    round-2 review found the model was the defective one: `isinstance(int)` is a
+    SECOND decider over a question the count choke point already answers, and it
+    gets all three of the same shapes wrong. `bool` IS an `int`, so
+    `self_defined_excluded: true` rendered "(True self-defined excluded)" -- a
+    flag printed as a quantity; a producer that spells counts as text dropped
+    the tail entirely; and the headline was interpolated raw, so a container
+    landed in the line as a Python repr. Both numbers go through the choke
+    point, under the boundary that discloses what it could not read (#619) --
+    and the excluded count through the ONE reader the paged listing and the
+    `--summary` card share, so the three surfaces cannot decide it three ways
+    (#795 round-4 review, where this line alone stated a negative count).
+    """
+    line = f"Total imports: {_stated_count(value, 'count')}"
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         line += f" ({excluded} self-defined excluded)"
+    elif _field_skewed("self_defined_excluded"):
+        line += ("\n// the payload's self-defined-excluded count is not a number "
+                 "that can be read (use --format json)")
     return line
+
+
+def _plain_count_text(label: str, value: Any) -> str:
+    """A `--count` line that states ONE number and nothing else.
+
+    The three surfaces below were inline `lambda value: f"{label}:
+    {value.get('count', 0)}"` renderers -- the raw read this module's two other
+    count lines were just taken off, and invisible to any guard because a
+    lambda has no name to probe. One named renderer each, all reading through
+    the choke point, so every `--count` line in the module answers the same way
+    and a new one cannot be written as a lambda without tripping the guard in
+    `tests/test_cli_misc.py` (#619/#795)."""
+    return f"{label}: {_stated_count(value, 'count')}"
+
+
+@_discloses
+def _exports_count_text(value: Any) -> str:
+    return _plain_count_text("Total exports", value)
+
+
+@_discloses
+def _sections_count_text(value: Any) -> str:
+    return _plain_count_text("Total sections", value)
+
+
+@_discloses
+def _go_functions_count_text(value: Any) -> str:
+    return _plain_count_text("Go functions", value)
 
 
 @command("imports", help="List imports", target=True, paged=True,
@@ -124,7 +211,8 @@ def _imports_count_text(value: Any) -> str:
                    help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
-                        "(collapsed by default)")])
+                        "(collapsed by default)")],
+         estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
@@ -177,6 +265,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 @command(
     "exports",
@@ -186,6 +275,7 @@ _EXPORT_ARGS = [
     paged=True,
     fanout=True,
     args=_EXPORT_ARGS,
+         estimable=True
 )
 def _exports(args: argparse.Namespace) -> int:
     if args.count:
@@ -194,7 +284,7 @@ def _exports(args: argparse.Namespace) -> int:
             "list_exports",
             {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total exports: {value.get('count', 0)}",
+            text_renderer=_exports_count_text,
             stem="exports-count",
         )
     params = {"offset": args.offset, "limit": _effective_limit(args)}
@@ -217,7 +307,8 @@ def _exports(args: argparse.Namespace) -> int:
                                     "label (e.g. 'code' matches .text=ReadOnlyCode); broadens to "
                                     "all matching-semantics sections, not just name matches"),
                            arg("--count", action="store_true", default=False,
-                               help="Show the section count instead of listing")])
+                               help="Show the section count instead of listing")],
+         estimable=True)
 def _sections(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
@@ -225,7 +316,7 @@ def _sections(args: argparse.Namespace) -> int:
             "sections",
             {"query": args.query, "count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Total sections: {value.get('count', 0)}",
+            text_renderer=_sections_count_text,
             stem="sections-count",
         )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
@@ -256,7 +347,8 @@ def _sections(args: argparse.Namespace) -> int:
              arg("--limit", type=_positive_int, default=None, metavar="N",
                  help="Maximum rows to return (default 400); when truncated the result "
                       "sets has_more and text mode prints a --start resume hint"),
-         ])
+         ],
+         estimable=True)
 def _data_vars(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -282,7 +374,8 @@ def _data_vars(args: argparse.Namespace) -> int:
                       "with --limit/--offset)"),
              arg("--offset", type=_non_negative_int, default=0, metavar="N",
                  help="Skip the first N symbols (paging)"),
-         ])
+         ],
+         estimable=True)
 def _data_symbols(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -307,13 +400,14 @@ def _data_symbols(args: argparse.Namespace) -> int:
                        help="Show the recovered Go function count instead of listing"),
                    arg("--summary", action="store_true", default=False,
                        help="Show recovered/defined/renamable counts + pclntab status (decide whether to `go rename`)")),
-         ])
+         ],
+         estimable=True)
 def _go_functions(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
             args, "go_functions", {"count_only": True},
             require_target=True,
-            text_renderer=lambda value: f"Go functions: {value.get('count', 0)}",
+            text_renderer=_go_functions_count_text,
             stem="go-functions-count",
         )
     if args.summary:
@@ -392,7 +486,8 @@ def _resolved_out_format(args: argparse.Namespace) -> str:
          args=[arg("identifier"),
                arg("--include-annotations", action="store_true", default=False,
                    help="Include inherited comment bodies in the bundle's "
-                        "decompilation (default: redact, matching bn decompile)")])
+                        "decompilation (default: redact, matching bn decompile)")],
+         estimable=True)
 def _bundle_function(args: argparse.Namespace) -> int:
     # #665: `--out` is already absolute here (`_resolve_out_path`), so the
     # bridge writes it where the CALLER meant. The one destination the bridge
@@ -444,7 +539,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
              arg("--encoding", choices=("hex", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default) or raw bytes"),
-         ])
+         ],
+         estimable=True)
 def _read(args: argparse.Namespace) -> int:
     address = _pick(args.address, args.address_flag, "read address")
     if args.encoding == "bytes":
@@ -477,6 +573,24 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         data = bytes.fromhex(hex_payload)
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
+    summary = {"kind": "bytes", "address": address, "length": len(data)}
+    if getattr(args, "estimate_output", False):
+        # #796: this is `read`'s SECOND emit path, and the flag has to mean the
+        # same thing on it. `_call` -> `_render_result` implements the preflight
+        # for the `--encoding hex` half; this branch returns above that call, so
+        # asking here is the only place the raw-byte payload can be measured
+        # instead of written. `--out` is refused beside the flag by the parser's
+        # own mutually exclusive group, so there is no destination to resolve.
+        from ..output import estimate_bytes_result
+
+        estimate = estimate_bytes_result(
+            data,
+            fmt=args.format,
+            summary=summary,
+            rerun_hint=cli._slice_hint_for_args(args, args.format),
+        )
+        sys.stdout.write(estimate.rendered)
+        return 0
     if args.out:
         from ..output import write_bytes_result
 
@@ -484,7 +598,7 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             data,
             out_path=args.out,
             fmt=args.format,
-            summary={"kind": "bytes", "address": address, "length": len(data)},
+            summary=summary,
         )
         sys.stdout.write(result.rendered)
     else:

@@ -348,7 +348,11 @@ def test_strings_query_filter_pages_without_building_the_rest(monkeypatch):
     assert built <= 11, f"{built} row(s) materialized for a 10-row filtered page"
 
     counted = instance._strings(None, query="err", offset=0, limit=10, count_only=True)
-    assert counted == {"kind": "strings", "count": 500, "total": 500}
+    # #795: the count envelope also states how many candidates the filter dropped
+    # (1000 scanned - 500 kept), so the denominator needs no second invocation.
+    assert counted == {"kind": "strings", "count": 500, "total": 500, "filtered": 500}
+    # ...and the LIST envelope carries the same disclosed number.
+    assert result["filtered"] == 500
 
 
 @pytest.mark.parametrize("offset,limit,expected", [

@@ -23,7 +23,8 @@ from .formatters import (
     _render_mutation_text,
     _render_target_choices,
 )
-from .output import render_envelope, render_error, render_value, write_output_result
+from .output import (estimate_output_result, render_envelope, render_error, render_value,
+                     write_output_result)
 from .target_hint import SELECT_HINT_LINE
 
 # The names below are re-exported through this module on purpose: command
@@ -366,6 +367,7 @@ def _common_io_options(
     parser: argparse.ArgumentParser,
     *,
     default_format: str = "text",
+    estimable: bool = False,
 ) -> None:
     parser.add_argument(
         "--format",
@@ -374,11 +376,35 @@ def _common_io_options(
         action=_RecordExplicitFormat,
         help="Output format",
     )
-    parser.add_argument(
-        "--out", type=_resolve_out_path,
-        help="Write output to a file instead of stdout (a .json/.ndjson path "
-             "infers --format unless one is given). Relative paths are resolved "
-             "against the invoking shell's cwd, not the bridge's.",
+    out_help = ("Write output to a file instead of stdout (a .json/.ndjson path "
+                "infers --format unless one is given). Relative paths are resolved "
+                "against the invoking shell's cwd, not the bridge's.")
+    # #796: the preflight half of #409's "bound the next read" -- the size of the
+    # payload the caller would otherwise pay for, and the flag that slices it.
+    # Advertised ONLY on the commands whose emit path implements it
+    # (`estimable=True`, set by the decorator of a read that renders through
+    # `_call` -> `_render_result`), because a flag whose behaviour depends on
+    # which emit path the handler happens to take is not a shared output option:
+    # `--format`/`--out` are honored by every command, this one is not. Placement
+    # follows the code path that implements it, exactly as `fanout=True` does
+    # (#169 L1 review) -- and a command that does not advertise it refuses it for
+    # free through argparse's unrecognized-arguments, at the same exit code the
+    # bespoke refusal used to produce.
+    if not estimable:
+        parser.add_argument("--out", type=_resolve_out_path, help=out_help)
+        return
+    # Reproduced as a preflight, a size and a write path are two answers to one
+    # question, so argparse refuses the pair itself (`not allowed with argument`)
+    # rather than one of them silently winning.
+    exclusive = parser.add_mutually_exclusive_group()
+    exclusive.add_argument("--out", type=_resolve_out_path, help=out_help)
+    exclusive.add_argument(
+        "--estimate-output", action="store_true", default=False,
+        dest="estimate_output",
+        help="Report the estimated token/byte size of this command's output and "
+             "the flag that slices it, INSTEAD of printing or writing it (the read "
+             "still runs; nothing is written to disk and no spill artifact is "
+             "created). Mutually exclusive with --out.",
     )
 
 
@@ -530,6 +556,7 @@ def command(
     prefer_when: str = "",
     see_also: tuple[str, ...] = (),
     fanout: bool = False,
+    estimable: bool = False,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -544,6 +571,15 @@ def command(
     (no per-function/address identifier) set it, so a write or side-effecting
     command -- several of which default to ``fmt="text"`` (save/close/refresh/py
     exec/load) -- can never be fanned across every instance.
+
+    ``estimable`` advertises ``--estimate-output`` (#796) on the same terms: an
+    explicit allow-list for the commands whose handler renders through ``_call``
+    -- ``_render_result``, which is the only path that implements the preflight.
+    A mutation (refused anyway), a side-effecting command whose result IS its
+    status (save/close/load/refresh/py exec), and a command that emits through
+    ``_emit_result`` (capabilities/doctor/session/plugin/skill/pins) all leave it
+    off, so the flag can neither replace an outcome with a byte count nor be
+    accepted-and-ignored.
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -566,16 +602,44 @@ def command(
             "prefer_when": prefer_when,
             "see_also": tuple(see_also),
             "fanout": fanout,
+            # #796: an EXPLICIT allow-list for `--estimate-output`, like `fanout`
+            # above and for the same reason -- the flag is implemented by ONE emit
+            # path (`_call` -> `_render_result`), so inferring it from the format
+            # or the target requirement would advertise it on commands that
+            # silently ignore it (or, worse, on a command whose side effect the
+            # estimate then replaces with a byte count).
+            "estimable": estimable,
         })
         return fn
 
     return decorator
 
 
+def _group_paths() -> frozenset[tuple[str, ...]]:
+    """Every registered path that is a proper PREFIX of another one (#796 r2).
+
+    Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
+    path like ``types``/``exports``, the very same parser object also serves as
+    the node's own leaf. A flag attached there is therefore accepted BEFORE the
+    subcommand is dispatched, which is why the estimate flag cannot be advertised
+    on such a node: `bn types --estimate-output declare ...` ran the declaration
+    and printed a byte count over it, and `bn types --estimate-output show X` had
+    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
+    (a real default on an intermediate-level parser) landing on the one node
+    class where "intermediate" and "leaf" are the same object.
+
+    Derived from the registry rather than a second hand-kept list, so a new
+    command or subcommand cannot reopen the hole silently.
+    """
+    return frozenset(spec["path"][:i] for spec in _COMMANDS
+                     for i in range(1, len(spec["path"])))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
+    group_paths = _group_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -621,7 +685,12 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             cmd = _get_subparsers(parent).add_parser(path[-1], help=spec["help"])
             node_parsers[path] = cmd
 
-        _common_io_options(cmd, default_format=spec["fmt"])
+        # A group node never carries the estimate flag, even when the node is also
+        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
+        # for the two live failure shapes that buys.
+        _common_io_options(cmd, default_format=spec["fmt"],
+                           estimable=(bool(spec.get("estimable"))
+                                      and path not in group_paths))
         _instance_option(cmd)
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting
@@ -673,12 +742,26 @@ def _render_result(
     spill_status: tuple[Any, Callable[[Any], str] | None] | None = None,
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
+    estimate_only: bool = False,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
     The spilled flag lets the caller decide whether to add a further note (e.g. a
     display-truncation warning): a spill already prints its own pipe-trap note, so
-    a caller-side note would be redundant when it fires."""
+    a caller-side note would be redundant when it fires.
+
+    *estimate_only* (#796) replaces the whole write/spill decision with the
+    preflight one: the payload is measured and only its size reaches stdout, so
+    nothing is written and there is nothing to spill. It sits ABOVE the
+    ``artifact_path`` passthrough because an already-materialized artifact
+    envelope is a payload like any other -- a caller asking what it costs gets
+    its size, not a re-render of a file it may not have."""
+    if estimate_only:
+        result = _apply_result_transform(
+            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+            value, f"estimate the {stem} output size as {fmt}")
+        sys.stdout.write(result.rendered)
+        return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
     # deeply nested response raises RecursionError, and a renderer meeting a
     # field shape it cannot read raises out of `main()`, which catches only
@@ -1565,6 +1648,12 @@ def _call(
         spill_status_renderer, f"render the {op} status line as text",
         advice="Rerun with --format json to see the raw status.")
     request_params = dict(params or {})
+    # #796: the preflight flag. Only commands whose registry entry says
+    # `estimable=True` advertise it (see `_common_io_options`), so there is no
+    # gate to write here: a mutation, a side-effecting command or an
+    # `_emit_result` command never sees it, and `--out`/`--estimate-output`
+    # together are refused by the parser's own mutually exclusive group.
+    estimate_only = bool(getattr(args, "estimate_output", False))
     # A long one-time op (load/refresh full analysis) raises its no-env default
     # client timeout so it isn't abandoned at the 600s read-op default on a very
     # large binary; BN_REQUEST_TIMEOUT still overrides it (#321).
@@ -1714,6 +1803,9 @@ def _call(
         # commands (function list/search) that page bridge-side and so don't set
         # the client-side page_limit (#59).
         paged=(page_limit is not None) or paged_spill,
+        # #796: hand the preflight decision to the one place that would otherwise
+        # have written or spilled the payload.
+        estimate_only=estimate_only,
     )
     # A text renderer that display-truncates (e.g. xrefs capping caller groups)
     # produces output too small to spill, so the spill pipe-note never fires and a
@@ -1922,6 +2014,10 @@ def _fanout_call(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
         slice_hint=_slice_hint_for_args(args, fmt),
+        # #796: a fan-out is a survey of whole targets, so "how big is this going
+        # to be" is exactly the question it should be able to answer without
+        # dumping every instance's rows.
+        estimate_only=bool(getattr(args, "estimate_output", False)),
     )
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A

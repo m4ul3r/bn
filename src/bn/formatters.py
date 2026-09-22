@@ -207,12 +207,37 @@ def _count_field(source: Any, key: str) -> int:
     and quietly answering ``0`` instead is the other half of the same bug: a
     fabricated zero is indistinguishable from a real one, and a zero on this op
     is exactly the "nothing changed, don't save" reading that #683 discarded a
-    rename batch to. A numeric string or float still reads, as it always did;
-    anything else is a skew for the enclosing boundary to disclose (#619) --
-    including a NON-FINITE number, which JSON can spell (``1e999`` decodes to
-    ``inf``, and ``json.dumps`` round-trips it as ``Infinity``) and ``int()``
-    answers with an ``ArithmeticError``. That is refused like any other
-    unreadable shape rather than costing the whole render."""
+    rename batch to. A numeric string or an INTEGRAL float still reads, as it
+    always did; anything else is a skew for the enclosing boundary to disclose
+    (#619) -- including a NON-FINITE number, which JSON can spell (``1e999``
+    decodes to ``inf``, and ``json.dumps`` round-trips it as ``Infinity``) and
+    ``int()`` answers with an ``ArithmeticError``. That is refused like any
+    other unreadable shape rather than costing the whole render.
+
+    And the value must STATE the integer it is read as (#866). A bare
+    ``int(raw)`` TRUNCATES every shape that carries a fraction -- ``1.5``,
+    ``Decimal("2.5")``, ``Fraction(7, 2)`` -- so a header rendered ``arg[1]``
+    for a payload that said ``1.5``: not a disclosure of a skew but a confident,
+    plausible number the producer never wrote, which is worse than the ``?``
+    the same reader gives a dict. Same rule the flag sibling applies to a
+    non-flag: read it only when the value IS the thing being read.
+
+    Two ways a count can be stated, and only two. It IS the integer (``2.0``,
+    ``Decimal("2")``, ``Fraction(4, 2)``), or its TEXT reads back as one --
+    whatever Python's own numeric parsers accept, because the numeric-string
+    contract is about a producer that SPELLS counts as text: ``"2"``, and
+    equally the honest spellings a canonical-rendering comparison used to
+    reject (``"+2"``, ``"02"``, ``"0002"``, ``"-02"``, ``"+0"``, ``"1_0"``,
+    ``" 2 "``), plus a text spelling of the integral VALUE (``"2.0"``,
+    ``"2e0"``). A fraction is still refused in every spelling (``1.5``,
+    ``"1.5"``, ``Decimal("2.5")``, ``Fraction(7, 2)``): truncation is the one
+    thing this reader will not do.
+
+    ``bytes``/``bytearray`` state neither: ``int(b"1")`` is a coercion Python
+    hands out for the string-literal spelling, not a count a wire format states,
+    so it is refused with everything else that is present but not the integer it
+    looks like -- as is an ``__int__``-only object, whose integer nothing in the
+    payload's own text corroborates."""
     src = _as_dict(source)
     if key not in src:
         return 0
@@ -224,11 +249,37 @@ def _count_field(source: Any, key: str) -> int:
         return 0
     if isinstance(raw, int):
         return raw
+    # ONE try, and ONE rule: every dunder and every parser below is fed an
+    # untrusted payload, so anything a hostile shape raises is a skew for the
+    # enclosing boundary rather than an exception out of a renderer -- EXCEPT a
+    # BridgeError, which is the CLI refusing to trust the whole reply and must
+    # reach `main()` as exit 2 (re-raised first, ahead of the catch-all).
     try:
-        return int(raw)
-    except (ArithmeticError, TypeError, ValueError):
-        _record_skew(key)
-        return 0
+        # Does the VALUE state the integer? A fraction that truncates must NOT
+        # fall through to the text route with a truncated `exact`, so the two
+        # routes are separate: this one either returns or declines.
+        try:
+            exact = int(raw)
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+        else:
+            if raw == exact:
+                return exact
+        # Otherwise its TEXT must, parsed the way the count's own producers spell
+        # numbers: as an integer, else as a number that has to BE integral.
+        text = f"{raw}".strip()
+        try:
+            return int(text)
+        except ValueError:
+            number = float(text)
+        if number.is_integer():
+            return int(number)
+    except BridgeError:
+        raise
+    except Exception:
+        pass
+    _record_skew(key)
+    return 0
 
 
 def _stated_count(source: Any, key: str) -> str:
@@ -244,6 +295,39 @@ def _stated_count(source: Any, key: str) -> str:
     """
     count = _count_field(source, key)
     return "?" if _field_skewed(key) else str(count)
+
+
+def _nonnegative_count(source: Any, key: str) -> int:
+    """``_count_field`` for a key whose count is a CARDINALITY: how many rows a
+    survey dropped, excluded or filtered. A negative one is not a count.
+
+    The third member of the count family, and it exists because the reading
+    rule and the DOMAIN rule are different questions. ``_count_field`` answers
+    "does the value state this integer", and by the #866 contract ``-2`` --
+    and the text spelling ``"-02"`` -- states one, correctly: a delta, an
+    offset or a difference is legitimately negative. A count of things
+    EXCLUDED is not, and a renderer that restates it as a quantity prints the
+    confident wrong number the choke point exists to end.
+
+    Round-4 review, on the imports trio: taking the paged listing and the
+    ``--summary`` card off ``isinstance(int)`` fixed the READING but left the
+    decision copied three times, and the copies disagreed on the one shape the
+    agreement matrix did not probe -- the ``--count`` line stated
+    "(-2 self-defined excluded)" while the other two tested ``> 0`` and said
+    nothing at all. Base had agreed (all three silent), so the repair turned
+    one consistent answer into a disagreement: exactly the harm the finding it
+    answered had named. Deciding it HERE is what makes that unrepeatable --
+    a surface cannot hold a different opinion about a value it never reads.
+
+    Refused the way every other unreadable shape is refused: the skew is
+    recorded for the enclosing ``@_discloses`` boundary and the caller gets 0,
+    so the ``_field_skewed`` branch each surface already has states it instead
+    of one surface restating an impossible quantity and two saying nothing."""
+    count = _count_field(source, key)
+    if count < 0:
+        _record_skew(key)
+        return 0
+    return count
 
 
 def _text_value(source: Any, key: str) -> str | None:
@@ -946,19 +1030,19 @@ def _render_field_xrefs_text(value: Any) -> str:
         for ref in malformed_refs:
             lines.append(f"- {ref!r}")
 
-    # #532: field xrefs now page like every other xref path. Surface the paging
-    # metadata whenever the page isn't the whole ref set -- either more pages remain
-    # (has_more) or an --offset skipped earlier refs -- so a partial view (including
-    # the last, has_more=False page of an --offset run) isn't read as the full set.
-    total = value.get("total")
-    returned = value.get("returned", len(items))
-    offset = value.get("offset", 0) or 0
-    has_more = bool(value.get("has_more"))
-    if isinstance(total, int) and (has_more or offset or returned != total):
-        note = f"showing {returned} of {total} refs (offset {offset})"
-        if has_more:
-            note += "; more available -- raise --limit or use --offset"
-        lines.extend(["", note])
+    # #532/#770: field xrefs page like every other xref path, so the footer is the
+    # SHARED one. This renderer's own "showing {n} of {total} refs (offset {o});
+    # more available -- raise --limit or use --offset" was a second footer with a
+    # second wording and none of the shared one's refusals: it stated a position
+    # from counts it had read raw (a string `total` killed the footer silently,
+    # an impossible window rendered like a partial page), and it said "more
+    # available" where the shared footer states the actual resume offset. The
+    # page key here is a literal, so the page's third state is askable at the
+    # read above -- the same question `_render_paged_list_text` asks of its
+    # runtime key (#619).
+    footer = _paging_footer(value, items, _field_skewed("items"))
+    if footer:
+        lines.extend(["", footer])
 
     return "\n".join(lines)
 
@@ -1706,13 +1790,26 @@ def _render_name_address_list_text(value: Any) -> str:
     or a bare list for back-compat / internal callers (#122)."""
     body = _render_paged_list_text(value, "items", _render_name_address_rows)
     # Surface PIC self-references dropped from the survey so the exclusion isn't
-    # silent (#202).
-    excluded = value.get("self_defined_excluded") if isinstance(value, dict) else None
-    if isinstance(excluded, int) and excluded > 0:
+    # silent (#202) -- through the ONE READER the three imports surfaces share,
+    # so the decision cannot be made three ways. `isinstance(excluded, int)`
+    # made this surface answer differently from the other two about the same
+    # payload: a text-spelled count dropped the note entirely and a bool
+    # rendered as a quantity (#619/#795 round-3 review); reading through the
+    # choke point separately on each surface then disagreed about a negative
+    # one (round-4 review).
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         note = (
             f"// {excluded} self-defined export(s) excluded "
             "(this module's own symbols modeled as import veneers / GOT slots)"
         )
+        body = note if body == "none" else f"{body}\n{note}"
+    elif _field_skewed("self_defined_excluded"):
+        # STATED, not left to the trailing boundary note: omitting the line is
+        # byte-identical to a page where nothing was excluded, which is the
+        # fabricated zero the choke point exists to stop (#619/#683).
+        note = ("// the payload's self-defined-excluded count is not a number "
+                "that can be read (use --format json)")
         body = note if body == "none" else f"{body}\n{note}"
     return body
 
@@ -2045,8 +2142,16 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     #653.1: `function search <q> --count` used the SAME "Total functions:" label as
     the whole-binary `function list --count`, so "Total functions: 17" beside
     "Total functions: 175" read as a contradiction rather than as matches vs total.
+
+    #795 round-4 review: the count is read through the CHOKE POINT, like every
+    other `--count` line. Interpolated raw, `count: true` rendered "Total
+    functions: True" -- a flag stated as a quantity -- a container rendered a
+    Python repr, and a text-spelled count that IS a number was dropped to a
+    fabricated 0, which on this line reads byte-identically to a binary with no
+    functions (#683). Three CLI surfaces install this renderer, so it was the
+    widest raw count read left in the module.
     """
-    count = value.get("count", 0) if isinstance(value, dict) else 0
+    count = _stated_count(value, "count")
     return f"{_quick_partial_prefix(value, what)}{label}: {count}"
 
 
@@ -2973,15 +3078,26 @@ def _render_message_lens_text(value: Any) -> str:
         if suffix:
             lines.append(f"  context{suffix}")
         xrefs = _field_dict(match, "xrefs")
-        code_count = len(_field_list(xrefs, "code_refs"))
-        data_count = len(_field_list(xrefs, "data_refs"))
+        code_refs = _field_list(xrefs, "code_refs")
+        data_refs = _field_list(xrefs, "data_refs")
+        code_count = len(code_refs)
+        data_count = len(data_refs)
         lines.append(f"  xrefs: {code_count} code, {data_count} data")
-        for ref in _field_list(xrefs, "code_refs")[:3]:
-            if isinstance(ref, dict):
-                lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(_field_dict(ref, 'context'))}")
-        for ref in _field_list(xrefs, "data_refs")[:3]:
-            if isinstance(ref, dict):
-                lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(_field_dict(ref, 'context'))}")
+        # #770: the per-match rows are display-capped at 3, and the cap said
+        # nothing -- an 8-code-ref match rendered three rows under a header that
+        # stated 8, so the five missing ones were unaccounted for. State the true
+        # total and how many are shown, the convention `_render_xrefs_text` uses
+        # for the same cap (a bare cap with no "N more" hides that refs exist).
+        code_shown = [r for r in code_refs[:3] if isinstance(r, dict)]
+        for ref in code_shown:
+            lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(_field_dict(ref, 'context'))}")
+        if code_count > len(code_shown):
+            lines.append(f"    code refs: {code_count} total, showing first {len(code_shown)}")
+        data_shown = [r for r in data_refs[:3] if isinstance(r, dict)]
+        for ref in data_shown:
+            lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(_field_dict(ref, 'context'))}")
+        if data_count > len(data_shown):
+            lines.append(f"    data refs: {data_count} total, showing first {len(data_shown)}")
         table_windows = _field_list(match, "metadata_table_windows")
         if table_windows:
             lines.append(f"  metadata table windows: {len(table_windows)}")
@@ -3424,6 +3540,12 @@ def _render_defuse_text(value: Any) -> str:
             (str(s.get("ssa", s.get("name", "?"))) if isinstance(s, dict) else repr(s))
             for s in _field_list(value, "phi_sources"))
         lines.append(f"phi sources: {srcs}")
+    # #797 (the defuse half of #489): a use that is argument set-up for a call
+    # whose recovered model DROPS its stack-passed arguments reads like any other
+    # use -- and `trace` already says so in its frontier, so the same prose is
+    # stated here, right above the listing it explains.
+    for hint in _field_list(value, "hints"):
+        lines.append(f"hint: {hint}")
     uses = _field_list(value, "uses")
     lines.append(f"uses ({len(uses)}):")
     for u in uses:
@@ -4079,9 +4201,16 @@ def _render_imports_summary_text(value: Any) -> str:
     # Label matches the JSON key (`total_symbols`) instead of drifting to
     # "total imports".
     lines = [f"total symbols: {total}"]
-    excluded = value.get("self_defined_excluded")
-    if isinstance(excluded, int) and excluded > 0:
+    # The same ONE reader the `--count` line and the paged listing use, so the
+    # three surfaces cannot decide this key three ways (#619/#795).
+    excluded = _nonnegative_count(value, "self_defined_excluded")
+    if excluded:
         lines.append(f"self-defined excluded: {excluded}")
+    elif _field_skewed("self_defined_excluded"):
+        # STATED on the card, for the same reason the sibling surfaces state
+        # it: dropping the row renders byte-identically to a survey that
+        # excluded nothing (#619/#683).
+        lines.append("self-defined excluded: ?")
     needed = _field_list(value, "needed_libraries")
     if needed:
         lines.append("")
@@ -4148,7 +4277,29 @@ def _render_strings_rows(value: Any) -> str:
 def _render_strings_text(value: Any) -> str:
     """Render strings: the paged {items, total, ...} envelope (with a footer),
     or a bare list for back-compat / internal callers (#122)."""
-    return _render_paged_list_text(value, "items", _render_strings_rows)
+    body = _render_paged_list_text(value, "items", _render_strings_rows)
+    # #795: state how many strings the ACTIVE filter chain dropped, so the
+    # denominator does not need a second unfiltered invocation (`strings --count`
+    # reported 1359 where `--probable-format-strings --count` reported 30, and
+    # nothing named the 1329 in between). Same shape as `imports`' note for the
+    # exports its own filter excludes (#202).
+    if isinstance(value, dict):
+        # ONE read, through the CARDINALITY reader: absent/null answer 0
+        # (nothing claimed, so nothing to say), a readable count states the
+        # filter's denominator, and a count no filter could have produced --
+        # unreadable, or negative -- is disclosed as unreadable rather than
+        # rendered as an unfiltered page or as an impossible quantity (#619).
+        dropped = _nonnegative_count(value, "filtered")
+        if dropped:
+            note = (f"// {dropped} string(s) filtered out by the active filters "
+                    f"(--query/--regex, --min-length/--max-length, --section, "
+                    f"--no-crt, --probable-format-strings)")
+            body = note if body == "none" else f"{body}\n{note}"
+        elif _field_skewed("filtered"):
+            note = ("// the payload's filtered-string count is not a number that "
+                    "can be read (use --format json)")
+            body = note if body == "none" else f"{body}\n{note}"
+    return body
 
 
 def _render_sections_rows(value: Any) -> str:
@@ -5703,27 +5854,73 @@ def _render_class_list_text(value: Any) -> str:
     # disclosure. Reading first leaves the branch condition alone and still
     # makes the skew reach the note (#619).
     rows = _field_list(value, "items", "classes")
+    # The third state of the PAGE, asked right after the read (and before any row
+    # can record a same-named key of its own), exactly as
+    # `_render_paged_list_text` asks it of its runtime key (#619). The page key
+    # here is the `items`/`classes` alias pair, so either spelling being wrong is
+    # a page nobody could read.
+    page_unreadable = _field_skewed("items") or _field_skewed("classes")
+    # Every number this renderer states besides its rows is folded-out share
+    # bookkeeping: how many of the surveyed rows it did NOT show. That makes
+    # each one a CARDINALITY, so each reads through `_nonnegative_count` -- a
+    # survey cannot have folded out -2 rows -- and each states an unreadable
+    # one as `?` through the `elif _field_skewed(...)` branch the imports card
+    # beside it already uses. Dropping the share instead (what the raw `or 0`
+    # did) renders byte-identically to a survey that folded out NOTHING, so
+    # the boundary note would arrive after the reader had already decided
+    # (#619/#683). The keys stay literal at every read on purpose: a local
+    # helper taking the key as a parameter hides all five from the module's
+    # own (renderer, key) count differential.
     if "count" in value and not value.get("items") and not value.get("classes"):
-        n = value.get("count", 0)
-        art = value.get("artifact_count") or 0
-        tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
+        # The headline STATES the number, so `_stated_count`. Read raw, this
+        # line described a payload two ways depending on which surface the
+        # caller hit: a flag as a quantity, a container as a Python repr, and
+        # an impossible "-2 non-class artifacts" at rc 0 with nothing said.
+        n = _stated_count(value, "count")
+        art = _nonnegative_count(value, "artifact_count")
+        if art:
+            tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})"
+        elif _field_skewed("artifact_count"):
+            tail = " (? non-class RTTI/type artifacts)"
+        else:
+            tail = ""
         return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
-    total = value.get("total", len(rows))
-    header = f"classes: {len(rows)} shown of {total}"
+    # #770: the count line states the PAGE, and the shared paging footer carries
+    # the total/resume half -- the same split every other paged list uses. This
+    # header used to assert "classes: N shown of TOTAL" unconditionally, so a
+    # COMPLETE page claimed a paging comparison nobody asked for (and diverged
+    # from the --count line, which has always been a bare `classes: N`), while a
+    # partial page stated no resume instruction at all.
+    header = f"classes: {len(rows)}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
     hidden_parts = []
-    cv = value.get("construction_vtables_suppressed") or 0
+    cv = _nonnegative_count(value, "construction_vtables_suppressed")
     if cv:
         hidden_parts.append(f"{cv} construction-vtable artifact{'s' if cv != 1 else ''} (--all to show)")
-    th = value.get("thunks_suppressed") or 0
+    elif _field_skewed("construction_vtables_suppressed"):
+        hidden_parts.append("? construction-vtable artifacts (--all to show)")
+    th = _nonnegative_count(value, "thunks_suppressed")
     if th:
         hidden_parts.append(f"{th} thunk{'s' if th != 1 else ''}")
-    lib = value.get("library_suppressed") or 0
-    if value.get("no_stl") and lib:
-        hidden_parts.append(f"{lib} library/STL")
-    ven = value.get("vendor_suppressed") or 0
-    if value.get("no_vendor") and ven:
-        hidden_parts.append(f"{ven} vendored")
+    elif _field_skewed("thunks_suppressed"):
+        hidden_parts.append("? thunks")
+    # These two are read INSIDE their gate, not before it. A share the run
+    # never asked to fold out is a number this line was never going to print,
+    # so reading it early recorded a skew and drew a `! malformed` note about
+    # a value with nothing in the `hidden:` tail to act on -- a disclosure
+    # pointing at nothing, which is its own kind of wrong number.
+    if value.get("no_stl"):
+        lib = _nonnegative_count(value, "library_suppressed")
+        if lib:
+            hidden_parts.append(f"{lib} library/STL")
+        elif _field_skewed("library_suppressed"):
+            hidden_parts.append("? library/STL")
+    if value.get("no_vendor"):
+        ven = _nonnegative_count(value, "vendor_suppressed")
+        if ven:
+            hidden_parts.append(f"{ven} vendored")
+        elif _field_skewed("vendor_suppressed"):
+            hidden_parts.append("? vendored")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
@@ -5743,12 +5940,34 @@ def _render_class_list_text(value: Any) -> str:
         # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
         # methods and no vtable) so it doesn't read as a domain class.
         art_s = "  [artifact: non-class RTTI]" if rec.get("artifact") else ""
+        # The row's method count is STATED, so `_stated_count` -- the one
+        # number in this renderer the round-6 repair walked past, in the very
+        # renderer that repair was filed against. Raw, it printed a flag as a
+        # quantity and a container as a Python repr, undisclosed, at rc 0.
+        #
+        # Read inside a per-ROW capture, the same way the struct-batch card
+        # reads a per-ENTRY one: `_field_skewed` answers for the WHOLE render,
+        # so a single malformed row made every LATER row state `?` for a count
+        # that read perfectly -- the fabricated reading this choke point exists
+        # to end, pointed the other way, and position-dependent besides. Then
+        # re-record, so the render's boundary note still names the field.
+        token = _SKEWED_FIELDS.set([])
+        try:
+            methods = _stated_count(rec, "method_count")
+            row_unreadable = list(_SKEWED_FIELDS.get() or ())
+        finally:
+            _SKEWED_FIELDS.reset(token)
+        for key in row_unreadable:
+            _record_skew(key)
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
-            f"methods={rec.get('method_count', 0)}  {vt}  "
+            f"methods={methods}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )
+    footer = _paging_footer(value, rows, page_unreadable)
+    if footer is not None:
+        lines.extend(["", footer])
     return quick_prefix + "\n".join(lines)
 
 

@@ -8,7 +8,8 @@ from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_ta
 from ..transport import BridgeError
 
 
-@command("tag", "types", help="List tag types (name, icon, built-in)", target=True)
+@command("tag", "types", help="List tag types (name, icon, built-in)", target=True,
+         estimable=True)
 def _tag_types(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -43,7 +44,8 @@ def _tag_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, str |
 
 
 @command("tag", "get", help="Get tags at an address or on a function", target=True,
-         args=_tag_locator_args())
+         args=_tag_locator_args(),
+         estimable=True)
 def _tag_get(args: argparse.Namespace) -> int:
     address, function = _tag_locator(args, "get")
     return _call(
@@ -64,7 +66,8 @@ def _tag_get(args: argparse.Namespace) -> int:
              arg("--data", dest="data_only", action="store_true",
                  help="Only data-scope tags (not function/address tags)"),
              arg("--query", default=None, help="Filter by substring of the tag data"),
-         ])
+         ],
+         estimable=True)
 def _tag_list(args: argparse.Namespace) -> int:
     return _call(
         args,

@@ -1651,3 +1651,936 @@ def test_spill_gc_help_lists_the_three_flags_and_refuses_a_degenerate_window_823
     args = bn.cli.build_parser().parse_args(
         ["spill", "gc", "--older-than", "30d", "--max-bytes", "0x40000000"])
     assert args.older_than == 30 and args.max_bytes == 1024 ** 3
+
+def test_strings_discloses_the_dropped_count_795(fake_transport, capsys):
+    """#795: the filter's denominator cost a SECOND invocation.
+
+    `strings --count --format json` reported 1359 and the same command with
+    `--probable-format-strings` reported 30, and NOTHING in either answer said
+    what happened to the 1329 in between -- so an agent had to spend a second
+    unfiltered call to learn the filter's denominator. The bridge now reports the
+    dropped count on both the count result and the list envelope, and text mode
+    states it next to the page (the same shape `imports` uses for the exports its
+    own filter excludes, #202).
+    """
+    envelope = {"items": [{"address": "0x401000", "length": 6, "chars": 6,
+                           "type": "ascii", "value": "%s%s"}],
+                "total": 30, "offset": 0, "limit": 1, "returned": 1,
+                "has_more": True, "filtered": 1329}
+    calls = fake_transport({"strings": {"ok": True, "result": envelope}})
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--limit", "1", "--format", "text"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert "%s%s" in stdout
+    assert "// showing 1 of 30 (29 more)" in stdout
+    assert "// 1329 string(s) filtered out by the active filters" in stdout
+
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    assert calls[-1]["params"]["count_only"] is True
+    capsys.readouterr()          # the list envelope this fake still answers with
+    # The count result carries the same denominator (`filtered`), so the JSON
+    # consumer reads 30 and 1329 from ONE invocation.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "json"])
+    assert rc == 0
+    counted = json.loads(capsys.readouterr().out)
+    assert counted["count"] == 30 and counted["filtered"] == 1329
+
+
+def test_strings_count_text_states_the_dropped_count_795(fake_transport, capsys):
+    """The `--count` line is the one an agent stops on, so it carries the
+    denominator itself: `Total strings: 30 (1329 filtered out ...)`. An
+    unfiltered dump is unchanged (nothing was dropped, nothing to disclose)."""
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": 1329}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total strings: 30 (1329 filtered out by the active filters)")
+
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 1359, "total": 1359, "filtered": 0}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--count", "--format", "text"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "Total strings: 1359"
+
+
+def test_strings_count_line_reads_the_denominator_through_the_choke_point_795(
+        fake_transport, capsys):
+    """One count contract, on BOTH surfaces that state this number (#619/#795).
+
+    The listing renderer reads `filtered` through `_count_field`; the `--count`
+    line tested it with `isinstance(int)` -- a SECOND decider over a question
+    this codebase already decided, and it answers differently in both
+    directions. A producer that spells counts as text (`"1329"`) dropped the
+    disclosure entirely, which is the second unfiltered invocation #795 exists
+    to remove; and `bool` IS an `int` in Python, so `filtered: true` rendered
+    "(True filtered out by the active filters)" -- a flag printed as a quantity,
+    with nothing saying the number was unreadable.
+    """
+    # (a) A numeric-string count states the same denominator an int one does.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": "30", "total": "30", "filtered": "1329"}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--probable-format-strings", "--format", "text"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total strings: 30 (1329 filtered out by the active filters)")
+
+    # (b) A bool is not a count. It is disclosed as unreadable -- the same
+    # reading the listing renderer already gives it -- never rendered as one.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": 30, "total": 30, "filtered": True}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--format", "text"]) == 0
+    flagged = capsys.readouterr().out
+    assert "True filtered out" not in flagged
+    assert flagged.startswith("Total strings: 30")
+    assert "filtered-string count is not a number that can be read" in flagged
+
+    # (c) An unreadable HEADLINE count is `?`, not a fabricated 0: "Total
+    # strings: 0" from a container reads byte-identically to a real empty
+    # binary, which is the #683 harm the choke point's stated sibling exists for.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "count": {"n": 30}, "total": 30}}})
+    assert bn.cli.main(["strings", "--target", "active", "--count",
+                        "--format", "text"]) == 0
+    unreadable = capsys.readouterr().out
+    assert unreadable.startswith("Total strings: ?")
+    assert "Total strings: 0" not in unreadable
+
+    # (d) The filter cannot have dropped a NEGATIVE number of strings, and
+    # both surfaces that state this number say so rather than restating the
+    # impossible quantity. `-2 filtered out by the active filters` is the
+    # confident-wrong-number harm the choke point exists to end, and it
+    # survived the imports repair because the cardinality rule was wired to
+    # the excluded key only (#795 round-5 review).
+    from bn import formatters
+    from bn.commands.misc import _strings_count_text
+
+    for dropped in (-2, "-02"):
+        line = _strings_count_text({"count": 30, "filtered": dropped})
+        listing = formatters._render_strings_text(
+            {"items": [], "total": 0, "count": 30, "filtered": dropped})
+        for rendered in (line, listing):
+            assert "-2" not in rendered, (dropped, rendered)
+            assert "malformed filtered field" in rendered, (dropped, rendered)
+        # ...and neither renders byte-identically to the unfiltered dump, which
+        # is the reading a silent drop would have given it.
+        quiet_line = _strings_count_text({"count": 30})
+        quiet_listing = formatters._render_strings_text(
+            {"items": [], "total": 0, "count": 30})
+        assert line.split("\n! malformed")[0] != quiet_line, (dropped, line)
+        assert listing.split("\n! malformed")[0] != quiet_listing, (dropped, listing)
+
+
+# Every `text_renderer=` this module installs, and what this guard pins about
+# each. An ENUMERATED inventory, deliberately: eight rounds went into a
+# DERIVED guard claiming "no renderer this module installs reads a count raw",
+# through three derivations -- a name suffix, a source scan, an observational
+# probe harness -- and each was walked past by one more renderer shape. That
+# is no defect in any round's work: the claim is universal over a registry
+# assembled at import time out of arbitrary callables and no derivation is
+# total over that, so it is narrowed to what can be proven. The inventory IS
+# the claim, and stays load-bearing because a renderer installed WITHOUT a
+# classification is a FAILURE here, not a silent pass. Two classifications:
+#   * a tuple of payload key PATHS -- this renderer STATES a count read off
+#     each of them, and each is driven over the shapes a raw read gets wrong.
+#   * `_COVERED_IN_FORMATTERS` -- this renderer IS `bn.formatters.<label>`,
+#     checked by identity, its counts covered by that module's own sweeps.
+_COVERED_IN_FORMATTERS = "covered by tests/test_cli_formatters.py"
+
+_MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
+    "_exports_count_text": (("count",),),
+    "_go_functions_count_text": (("count",),),
+    "_imports_count_text": (("count",), ("self_defined_excluded",)),
+    "_sections_count_text": (("count",),),
+    "_strings_count_text": (("count",), ("filtered",)),
+    "_render_data_symbols_text": _COVERED_IN_FORMATTERS,
+    "_render_data_vars_text": _COVERED_IN_FORMATTERS,
+    "_render_function_bundle_text": _COVERED_IN_FORMATTERS,
+    "_render_go_functions_summary_text": _COVERED_IN_FORMATTERS,
+    "_render_go_functions_text": _COVERED_IN_FORMATTERS,
+    "_render_imports_summary_text": _COVERED_IN_FORMATTERS,
+    "_render_name_address_list_text": _COVERED_IN_FORMATTERS,
+    "_render_py_exec_text": _COVERED_IN_FORMATTERS,
+    "_render_read_text": _COVERED_IN_FORMATTERS,
+    "_render_sections_text": _COVERED_IN_FORMATTERS,
+    "_render_strings_text": _COVERED_IN_FORMATTERS,
+}
+
+
+def _payload_at(path, value):
+    """`value` placed at `path` in an otherwise empty payload."""
+    placed = value
+    for key in reversed(path):
+        placed = {key: placed}
+    return placed
+
+
+def _installed_text_renderers(module):
+    """Every `text_renderer=` a module installs, as `{label: callable or None}`.
+
+    The registry is assembled at import time, so the population is read out of
+    the module's AST: a `text_renderer=` keyword anywhere in the file, resolved
+    to the object it names. `A if flag else B` installs both. A lambda is not
+    unprobeable, only unNAMEable -- compiling its expression in the module's
+    own namespace yields the same callable the registry installs. Anything
+    else (a call, a `functools.partial`, an attribute chain) resolves to
+    `None` under its source text as the label, which is enough for the
+    inventory to demand a classification for it.
+
+    A name resolves against the MODULE only when the enclosing function does
+    not BIND it. Resolving unconditionally was a lie the guard told about
+    itself: a command installing `text_renderer=_x_count_text` while binding
+    its own `_x_count_text` runs the LOCAL one while `getattr(module, ...)`
+    handed the probe the module-level twin -- so the guard probed a renderer
+    that was not installed, called the label covered, and a raw-count local
+    shipped GREEN. A bound name has no static value, so it resolves to `None`
+    and the inventory refuses it both ways."""
+    import ast
+    import inspect
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(inspect.getfile(module)).read_text(encoding="utf-8"))
+
+    def bound_names(fn):
+        """Every name `fn` binds, over-approximated (a name bound in a NESTED
+        function counts): erring toward "unresolvable" fails closed."""
+        args = fn.args
+        names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+        names |= {spec.arg for spec in (args.vararg, args.kwarg) if spec}
+        for sub in ast.walk(fn):
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(sub.name)
+            elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                names.add(sub.id)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                names.update((a.asname or a.name).split(".")[0] for a in sub.names)
+        return names - {fn.name}
+
+    def resolve(node, bound):
+        if isinstance(node, ast.Name):
+            if node.id in bound:               # a LOCAL of that name is installed
+                return [(node.id, None)]
+            return [(node.id, getattr(module, node.id, None))]
+        if isinstance(node, ast.IfExp):        # `A if flag else B` installs both
+            return resolve(node.body, bound) + resolve(node.orelse, bound)
+        if isinstance(node, ast.Lambda):
+            params = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+            if {n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name)} & (bound - params):
+                return [(ast.unparse(node), None)]   # reads a call-site local
+            expression = ast.Expression(body=node)
+            ast.fix_missing_locations(expression)
+            try:
+                fn = eval(compile(expression, "<text_renderer>", "eval"),
+                          vars(module))
+            except Exception:                  # closes over a local
+                fn = None
+            return [(ast.unparse(node), fn)]
+        return [(ast.unparse(node), None)]
+
+    installed = {}
+
+    def visit(node, bound):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound = bound | bound_names(node)
+        if isinstance(node, ast.keyword) and node.arg == "text_renderer":
+            installed.update(resolve(node.value, bound))
+        for child in ast.iter_child_nodes(node):
+            visit(child, bound)
+
+    visit(tree, frozenset())
+    return installed
+
+
+def _states_a_count(renderer, path):
+    """Does this renderer's rendering CHANGE with the number at `path`?
+
+    Decided by driving the renderer, so a number formatted, truncated or mapped
+    through a lookup before printing still answers yes: the rendering merely
+    has to move with the value."""
+    try:
+        stated, nudged = (renderer(_payload_at(path, 4242)),
+                          renderer(_payload_at(path, 4243)))
+    except Exception:
+        return False
+    return isinstance(stated, str) and ("4242" in stated or stated != nudged)
+
+
+def test_every_count_line_this_module_installs_reads_through_the_choke_point_795():
+    """One count contract, on every `--count` line this module renders (#619).
+
+    `bn.formatters` keeps the reading honest for the renderers that live
+    there, and the probe population in `tests/test_cli_formatters.py` is
+    derived from that module -- so a `text_renderer=` DEFINED in a command
+    module is reached by no differential, no mirror and no raise sweep. This
+    module's count lines were all written that way.
+
+    What this PROVES -- the enumerated inventory above, not a universal claim
+    over the registry:
+
+    * every renderer this module installs is classified, and the two sets
+      agree EXACTLY -- one added to the registry unclassified fails here, and
+      so does one removed or renamed;
+    * every renderer classified as stating a count still states it, off the
+      key the inventory names -- a count line deleted, or re-pointed at a
+      different payload key, fails here;
+    * every such count line refuses the four shapes a raw read gets wrong: a
+      flag rendered as a quantity, a numeric string silently dropped, a float
+      truncated into a count, a container interpolated as a Python repr --
+      judged on the LINE, with the `@_discloses` note cut off, so fabricating
+      the count and footnoting it is no way past any of the four;
+    * every renderer classified as living in `bn.formatters` IS that module's
+      object by identity, and no `text_renderer=<name>` whose name the
+      enclosing function BINDS resolves against the module at all -- neither
+      classification can excuse a locally-defined renderer from being probed.
+
+    What it does NOT cover, stated rather than implied:
+
+    * the keys are DECLARED, not derived. A listed renderer that states a
+      SECOND count off a key its entry does not name is not probed.
+    * a count stated only in the presence of a SIBLING key. Each probe payload
+      holds the probed key alone, so such a line renders its count-free branch;
+      this guard reports the declared key as no longer stated rather than
+      probing that count.
+    * a renderer classified `_COVERED_IN_FORMATTERS` is TRUSTED to be covered
+      there. This checks the object's identity, not that the other module's
+      sweeps reach its counts.
+    * only counter-shaped count lines are in the inventory today. One stating
+      `len(<rows>)` would fail the "still states a count" assertion rather than
+      being probed in a shape of its own.
+    * the POPULATION is the `text_renderer=` keyword arguments in this
+      module's AST, so "an unclassified renderer fails" reaches exactly the
+      renderers installed that way. One reaching the registry by another route
+      -- a `**kwargs` spread, a runtime options dict, an attribute assigned
+      after construction -- is outside it. MEASURED, not assumed: installing a
+      raw-count renderer as `_call(args, op, {}, **OPTS)` leaves this test
+      GREEN. Named rather than chased, because widening the scan for it is the
+      same "one more shape" move the enumerated claim replaced, and no
+      renderer here is installed that way.
+    * nothing is inferred from a renderer's `__module__`. Round 8's guard
+      claimed to fail CLOSED on a callable whose home module could not be told
+      and did not -- `functools.partial(...).__module__` is `'functools'`,
+      never `None`, so the fallback behind that claim was dead code. Deleted
+      rather than repaired into a third mechanism: a partial, like any
+      expression that is not a name, a conditional or a lambda, resolves to
+      its source text with no callable, which the inventory can classify
+      neither way.
+    """
+    from bn import formatters
+    from bn.commands import misc
+
+    installed = _installed_text_renderers(misc)
+    assert set(installed) == set(_MISC_TEXT_RENDERERS), (
+        "the `text_renderer=` registry and this inventory disagree, which is "
+        "the failure this guard exists for -- an unclassified renderer is not "
+        "a silent pass. Classify it: the payload key paths whose counts it "
+        f"states, or {_COVERED_IN_FORMATTERS!r}.\n"
+        f"  installed, unclassified: {sorted(set(installed) - set(_MISC_TEXT_RENDERERS))}\n"
+        f"  classified, not installed: {sorted(set(_MISC_TEXT_RENDERERS) - set(installed))}")
+
+    for label, classification in sorted(_MISC_TEXT_RENDERERS.items()):
+        renderer = installed[label]
+        if classification == _COVERED_IN_FORMATTERS:
+            assert renderer is getattr(formatters, label, None), (
+                f"{label} is classified as covered by bn.formatters, but that "
+                "is not the object this module installs")
+            continue
+        assert callable(renderer), (
+            f"{label} is classified as stating a count, but no callable could "
+            "be resolved for it, so nothing here can probe what it renders")
+
+        for path in classification:
+            where = (label, ".".join(path))
+            assert _states_a_count(renderer, path), where + (
+                "is classified as stating a count read off this key, but its "
+                "rendering does not move with the number there: the count line "
+                "was removed, or re-pointed at another payload key",)
+
+            def render(value, _r=renderer, _p=path):
+                return _r(_payload_at(_p, value))
+
+            def stated(value):
+                """The LINE a caller reads, with the boundary note cut off.
+
+                Every shape below compares this, not the whole render:
+                `@_discloses` appends `! malformed <field>`, so a renderer
+                that FABRICATES the count and footnotes it differs from the
+                well-formed rendering by the note ALONE and a whole-string
+                comparison passes it. Measured escape -- swapping the stating
+                reader for the coercing one rendered "Total exports: 0" for
+                an unreadable counter and left this module green."""
+                return render(value).split("\n! malformed")[0]
+
+            zero = stated(0)
+
+            # (a) A bool is not a count. `bool` IS an `int`, so a raw read
+            # prints the flag as a quantity -- and a read that coerces with
+            # `int()` prints it as the quantity `1`, which is why this asks
+            # whether the flag renders like a NUMBER rather than whether the
+            # word "True" appears.
+            flagged = stated(True)
+            assert "True" not in flagged, where + (flagged,)
+            assert flagged != stated(1), where + (flagged,)
+            assert stated(False) != zero, where + (stated(False),)
+
+            # (b) A numeric string IS a count, and states the same line the
+            # integer spelling does. A raw `isinstance(int)` silently drops
+            # the whole qualifier for a producer that spells counts as text.
+            assert render("7") == render(7), where
+
+            # (c) A non-integral number is not a count, and must not be
+            # quietly truncated into one.
+            assert stated(1.5) != stated(1), where + (stated(1.5),)
+
+            # (d) A container is disclosed, never interpolated into the line
+            # as a raw Python repr -- and never rendered as the real zero it
+            # is not. Compared against the well-formed zero rather than
+            # pattern-matched on `": 0"`, which a renderer with a different
+            # separator walks past.
+            unreadable = stated({"n": 1})
+            assert "{" not in unreadable and "}" not in unreadable, where + (unreadable,)
+            assert unreadable != zero, where + (unreadable,)
+
+
+def test_the_three_imports_surfaces_agree_about_the_excluded_count_795():
+    """One payload, one answer -- across all three surfaces that state it.
+
+    Making only the `--count` line strict was a regression dressed as a fix:
+    the paged listing and the `--summary` card still tested the same key with
+    `isinstance(int)`, so a bridge reporting it as text got the denominator
+    from one surface and silence from the other two, and a bool got
+    "(True self-defined excluded)", "// True self-defined export(s) excluded"
+    and "self-defined excluded: True" -- three descriptions of one payload,
+    which is worse than the single wrong answer they agreed on before.
+
+    Round-4 review found the repair had left the DECISION duplicated three
+    times and the copies disagreeing on the one shape this matrix did not
+    probe: a NEGATIVE count was stated by the `--count` line and dropped
+    silently by the other two, where base had agreed. It also found the
+    listing's unreadable branch measured by nothing -- every assertion here
+    was satisfied by the trailing `@_discloses` boundary note, which the
+    renderer gets whether or not it states the row itself. So the property is
+    now asserted per surface on the renderer's OWN body, with the boundary
+    note cut off.
+    """
+    from bn import formatters
+    from bn.commands.misc import _imports_count_text
+
+    def surfaces(excluded):
+        return (_imports_count_text({"count": 9, "self_defined_excluded": excluded}),
+                formatters._render_name_address_list_text(
+                    {"items": [], "total": 0, "self_defined_excluded": excluded}),
+                formatters._render_imports_summary_text(
+                    {"total_symbols": 9, "self_defined_excluded": excluded}))
+
+    def bodies(rendered):
+        """Each surface's own text, with the shared boundary note removed.
+
+        `@_discloses` appends `! malformed <key> field: ...` to EVERY renderer
+        that recorded a skew, so an assertion over the whole string is
+        satisfied by the boundary even when the renderer states nothing --
+        which is how the listing's `elif _field_skewed` branch shipped
+        unmeasured. Cutting the note is what makes each surface answer for
+        itself."""
+        return tuple(r.split("\n! malformed")[0] for r in rendered)
+
+    silent = bodies((_imports_count_text({"count": 9}),
+                     formatters._render_name_address_list_text({"items": [], "total": 0}),
+                     formatters._render_imports_summary_text({"total_symbols": 9})))
+
+    # A text-spelled count IS a count, and every surface states it exactly as
+    # it states the integer spelling.
+    assert surfaces("3") == surfaces(3)
+    for rendered in surfaces("3"):
+        assert "3" in rendered and "excluded" in rendered, rendered
+
+    # Every shape no count reads out of is stated AS unreadable, by each
+    # surface in its own words -- so the three agree, and none of them renders
+    # byte-identically to the page where the key claimed nothing.
+    #
+    # A NEGATIVE count is in this set on purpose: `_count_field` reads `-02`
+    # back as -2 by the #866 contract, but a survey cannot exclude a negative
+    # number of symbols, so it is not a count either. Base agreed (all three
+    # silent); the round-3 repair made the `--count` line state `(-2
+    # self-defined excluded)` while the other two stayed silent.
+    for excluded in (True, {"n": 3}, [1, 2, 3], "lots", 1.5, -2, "-02"):
+        rendered = surfaces(excluded)
+        for one in rendered:
+            assert f"{excluded}" not in one, (excluded, one)
+            assert "malformed self_defined_excluded field" in one, (excluded, one)
+        for surface, body, quiet in zip(("count", "listing", "summary"),
+                                        bodies(rendered), silent):
+            assert body != quiet, (
+                f"the imports {surface} surface renders an unreadable "
+                f"{excluded!r} byte-identically to a payload that claimed "
+                "nothing, so the whole disclosure is the shared boundary "
+                "note -- state it on the surface itself")
+
+    # ...and an ABSENT key claimed nothing, so every surface stays silent.
+    for rendered in (_imports_count_text({"count": 9}),
+                     formatters._render_name_address_list_text({"items": [], "total": 0}),
+                     formatters._render_imports_summary_text({"total_symbols": 9})):
+        assert "excluded" not in rendered and "malformed" not in rendered, rendered
+
+
+def test_estimate_output_preflights_the_raw_bytes_read_796(fake_transport, capsys):
+    """#796: `read --encoding bytes` is a SECOND emit path, and it must preflight
+    like the first one.
+
+    `read` is marked estimable, but its `--encoding bytes` branch returns before
+    `_call` and wrote the payload straight to `sys.stdout.buffer` -- so
+    `--estimate-output` was accepted and ignored at rc 0, dumping the very bytes
+    the flag's own help promises it prints INSTEAD of ("the read still runs;
+    nothing is written"). The same command with `--encoding hex` printed the
+    estimate, so one command's two halves disagreed about what the flag means.
+    """
+    payload = "41" * 64                      # 64 bytes of 'A'
+    fake_transport({"read": {"ok": True, "result": {
+        "kind": "bytes", "address": "0x401000", "length": 64, "hex": payload}}})
+
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--estimate-output", "--target", "active"]) == 0
+    text = capsys.readouterr().out
+    assert "estimated: true" in text
+    assert "tokens: " in text and "tokenizer: estimate" in text
+    assert "bytes: 64" in text                   # the raw payload's real size
+    assert "--length" in text                    # this command's own slicing knob
+    assert "AAAA" not in text                    # ...and NOT the payload itself
+
+    # Machine-readable under --format json, and it measures the RAW byte payload
+    # (64 bytes), not a hex rendering of it.
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--estimate-output", "--format", "json",
+                        "--target", "active"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["estimated"] is True and envelope["format"] == "bytes"
+    assert envelope["bytes"] == 64 and envelope["tokens"] > 0
+    assert envelope["summary"] == {"kind": "bytes", "address": "0x401000", "length": 64}
+    assert "hex" not in envelope
+
+    # Without the flag the raw bytes still reach stdout unchanged: the preflight
+    # is opt-in and replaces nothing when it is not asked for.
+    assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
+                        "--target", "active"]) == 0
+    assert capsys.readouterr().out == "A" * 64
+
+
+def test_estimate_output_preflights_a_large_read_796(fake_transport, capsys):
+    """#796: `--estimate-output` on the reads whose cost you want to know FIRST.
+
+    The issue's own repro was `bn function list --limit 5 --estimate-output` ->
+    `error: unrecognized arguments` (rc 2), with no way to learn a read's size
+    before paying for it in context. The flag is accepted by every command that
+    renders a payload; under text it prints the size and this command's own
+    slicing knob, and it does NOT print the rows.
+    """
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"name": f"sub_{i:06d}", "address": hex(0x401000 + i * 0x10)}
+                  for i in range(200)],
+        "total": 200, "offset": 0, "limit": 5, "returned": 200, "has_more": True}}})
+
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "estimated: true" in out
+    assert "tokens: " in out and "tokenizer: estimate" in out
+    assert "--limit" in out                      # the slicing knob this command takes
+    assert "sub_000000" not in out               # ...and NOT the payload itself
+    assert calls[-1]["op"] == "list_functions"
+
+    # Under --format json the same run is machine-readable, so a caller can branch
+    # on the cost without parsing prose.
+    rc = bn.cli.main(["function", "list", "--limit", "5", "--estimate-output",
+                      "--format", "json", "--target", "active"])
+    assert rc == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["estimated"] is True and envelope["tokens"] > 0
+    assert envelope["summary"]["total"] == 200
+    assert "items" not in envelope
+
+
+def test_estimate_output_covers_per_function_reads_796(fake_transport, capsys):
+    """The same preflight for the large PER-FUNCTION reads (`decompile`, `il`,
+    `strings`), whose cost is the one an agent most often misjudges: the flag
+    reports the size of the rendering the caller would have received, and names
+    that command's own slicing flag (`decompile`/`il` slice with --lines)."""
+    fake_transport({
+        "decompile": {"ok": True, "result": {"text": "int parse_hdr(char *p)\n{\n" + "  *p++;\n" * 500 + "}\n"}},
+        "strings": {"ok": True, "result": {
+            "items": [{"address": hex(0x402000 + i), "length": 5, "chars": 5,
+                       "type": "ascii", "value": f"str{i}"} for i in range(50)],
+            "total": 50, "offset": 0, "limit": 50, "returned": 50, "has_more": False,
+            "filtered": 0}},
+    })
+
+    assert bn.cli.main(["decompile", "parse_hdr", "--estimate-output",
+                        "--target", "active"]) == 0
+    decompile_out = capsys.readouterr().out
+    assert "estimated: true" in decompile_out
+    assert "--lines START:END" in decompile_out
+    assert "*p++" not in decompile_out            # the decompilation is NOT printed
+    assert "tokens: " in decompile_out
+
+    assert bn.cli.main(["strings", "--estimate-output", "--target", "active"]) == 0
+    strings_out = capsys.readouterr().out
+    assert "estimated: true" in strings_out
+    assert "--limit" in strings_out
+    assert '"str0"' not in strings_out            # the rows are NOT printed
+
+
+# Argument values that make a read command's parser accept an invocation, keyed
+# by the registry's OWN argument name (positionals) or the parser's `dest`
+# (required options). One vocabulary, not a per-command argv list: a command
+# that grows a required argument this table cannot fill fails the sweep loudly
+# instead of silently dropping out of the coverage claim.
+_ESTIMATE_ARG_VALUES = {
+    "identifier": "main", "callee": "main", "function": "main",
+    "name": "Widget", "query": "a", "address": "0x401000",
+    "type_name": "int32_t", "struct_name": "hdr",
+    "at": "0x401000", "var": "x#1", "start": "0x401000", "end": "0x402000",
+    "arg_index": "1", "sinks": "arg:memcpy:0", "sources": "call:recv",
+}
+# One permissive reply for every op. The sweep is about which EMIT PATH a
+# handler takes, not about any single op's payload shape.
+_ESTIMATE_STUB = {"ok": True, "result": {
+    "kind": "probe", "items": [], "total": 0, "offset": 0, "limit": 10,
+    "returned": 0, "has_more": False, "count": 0, "hex": "41414141",
+    "text": "probe\n", "name": "probe", "address": "0x401000",
+}}
+
+
+def _estimate_emit_modes(leaf_parser):
+    """Every alternate emit mode a command's OWN parser offers, derived from it.
+
+    A handler is free to branch on its own flags and take a different way out --
+    `read --encoding bytes` returns before `_call` and writes to
+    `sys.stdout.buffer` -- so sweeping the boolean flags and every value of
+    every choice flag is what reaches the second path. Deriving the modes from
+    the parser (rather than listing them) is what makes the sweep grow with the
+    surface instead of going stale the next time a handler grows a branch.
+    """
+    import argparse
+
+    modes = [[]]
+    for action in leaf_parser._actions:
+        if not action.option_strings:
+            continue
+        flag = action.option_strings[0]
+        # --out is mutually exclusive with the flag under test (argparse rc 2),
+        # --stdin would block on a tty, and --help exits before dispatch.
+        if flag in ("--estimate-output", "--out", "--help", "--stdin"):
+            continue
+        if isinstance(action, argparse._StoreTrueAction):
+            modes.append([flag])
+        elif action.choices:
+            modes.extend([flag, str(choice)] for choice in action.choices)
+    return modes
+
+
+def _estimate_required_flags(leaf_parser):
+    """The command's own REQUIRED options, filled from the shared vocabulary.
+
+    Derived from the parser rather than listed per command: `taint forward`
+    needs `--source`, `evidence virtual-call` needs `--at`, and a command that
+    grows a new required option must either be fillable or say so."""
+    argv, unfillable = [], []
+    for action in leaf_parser._actions:
+        if not action.option_strings or not action.required:
+            continue
+        if action.dest not in _ESTIMATE_ARG_VALUES:
+            unfillable.append(action.dest)
+            continue
+        argv += [action.option_strings[0], _ESTIMATE_ARG_VALUES[action.dest]]
+    return argv, unfillable
+
+
+def _is_error_envelope(out: str) -> bool:
+    """A refusal reported as a machine-readable envelope is not a payload."""
+    try:
+        return json.loads(out).get("ok") is False
+    except (ValueError, AttributeError):
+        return False
+
+
+def _is_estimate_envelope(out: str) -> bool:
+    """Did this invocation print the preflight instead of the payload?"""
+    try:
+        return json.loads(out).get("estimated") is True
+    except (ValueError, AttributeError):
+        return any(line.strip() == "estimated: true" for line in out.splitlines())
+
+
+def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
+        fake_transport, capsys, monkeypatch):
+    """#796 review: the flag lives on the code path that implements it, not on
+    every command that happens to share an output-option group.
+
+    The wide placement advertised `--estimate-output` on all 90 leaf parsers while
+    only the `_call` -> `_render_result` path honors it, so `bn close`, `bn save`,
+    `bn load`, `bn refresh` and `bn py exec` executed their side effect and then
+    printed a byte count over the outcome (`save` wrote a BNDB while the flag's own
+    help promised nothing was written), and 18 `_emit_result` commands ignored it
+    outright -- `bn capabilities --estimate-output` printed the very payload the
+    flag exists to avoid.
+
+    The rule is the `fanout=True` precedent (#169 L1 review): an EXPLICIT
+    allow-list on the registry. What proves the allow-list is a coverage claim
+    rather than a wish is the sweep below, which RUNS every marked command in
+    every emit mode its parser offers and reads what landed on stdout.
+
+    That is deliberately not a source-text derivation. The previous version of
+    this test derived the set by grepping each handler for `_call(` with no
+    `_mutate`/`_emit_result` beside it, and `read` satisfies that grep while its
+    `--encoding bytes` branch returns above the `_call` and writes the payload
+    straight to `sys.stdout.buffer` -- a second emit path no reading of the
+    source's call names can see, which shipped the flag accepted-and-ignored at
+    rc 0 on exactly the read whose size a caller most wants to preflight.
+    """
+    import argparse
+
+    parser = bn.cli.build_parser()
+    # `main()` rebuilds the whole argparse tree per call (~110 ms x 285 probes),
+    # and it only ever PARSES with it -- nothing below mutates parser state --
+    # so the sweep hands it the one tree it already built.
+    monkeypatch.setattr(bn.cli, "build_parser", lambda: parser)
+
+    def leaf(path):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        return current
+
+    advertised = {tuple(spec["path"]) for spec in bn.cli._COMMANDS
+                  if "--estimate-output" in bn.cli._known_option_strings(leaf(spec["path"]))}
+    marked = {tuple(spec["path"]) for spec in bn.cli._COMMANDS if spec.get("estimable")}
+
+    # A DUAL-ROLE node (`types`, `exports`) is a leaf AND a group: argparse builds
+    # ONE parser for both roles, so a flag attached there is accepted BEFORE the
+    # subcommand is dispatched -- `bn types --estimate-output declare ...` ran the
+    # declaration and printed a byte count over it, and `bn types --estimate-output
+    # show X` had the flag clobbered back to False by the leaf default (#251's
+    # hazard, on the one node class where an "intermediate" parser and a leaf are
+    # the same object). The builder therefore declines to advertise it on any
+    # group node, derived from the registry rather than a second hand-kept list --
+    # and that derivation is what the assertions below check in both
+    # directions, so neither a new command nor a new subcommand can reopen it.
+    groups = {tuple(spec["path"])[:i] for spec in bn.cli._COMMANDS
+              for i in range(1, len(tuple(spec["path"])))}
+    assert groups, "no group paths at all -- the derivation is broken"
+    assert all("--estimate-output" not in bn.cli._known_option_strings(leaf(path))
+               for path in groups), (
+        "a GROUP parser carries --estimate-output, so it is accepted before the "
+        "subcommand is dispatched: a mutation behind it runs while its outcome is "
+        f"replaced by a size ({sorted(p for p in groups if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
+
+    assert advertised == marked - groups, (
+        f"advertised {sorted(advertised - (marked - groups))} without being marked, "
+        f"or marked-and-advertisable but not advertised "
+        f"{sorted((marked - groups) - advertised)}")
+    assert len(marked) == 49, (
+        f"{len(marked)} commands are marked estimable, not 49 -- a command that "
+        "joins or leaves this set is a deliberate change to the coverage claim, so "
+        "move the number in the same commit")
+    # ...of which the two dual-role leaves cannot carry the flag (see above), so
+    # 47 advertise it and 46 refuse it by absence: default added `spill gc`,
+    # which is an administrative mutation and cannot estimate a read payload.
+    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 46
+    # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
+    # stronger than a bespoke refusal: there is no path on which the flag is
+    # accepted and ignored, because the parser never builds it.
+    assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
+               if tuple(spec["path"]) not in marked)
+    assert len(bn.cli._COMMANDS) - len(marked) == 44
+
+    # THE COVERAGE CLAIM, observed. One invariant over every marked command in
+    # every emit mode its parser offers: whatever lands on stdout is the
+    # ESTIMATE ENVELOPE or a machine-readable refusal -- never a payload -- and
+    # a run that exits 0 produced the envelope. A handler that reaches an emit
+    # path the flag does not gate lands in `leaked` with the argv that got there.
+    positionals = {tuple(spec["path"]): [a[0][0] for a in spec["args"]
+                                         if not a[0][0].startswith("-")]
+                   for spec in bn.cli._COMMANDS}
+    leaked, probed, emitted, covered = [], 0, 0, set()
+    for path in sorted(advertised):
+        required, unfillable = _estimate_required_flags(leaf(path))
+        unfillable += [p for p in positionals[path]
+                       if p not in _ESTIMATE_ARG_VALUES]
+        assert not unfillable, (
+            f"{' '.join(path)} takes arguments this sweep cannot synthesize "
+            f"({unfillable}); add them to _ESTIMATE_ARG_VALUES rather than "
+            "letting the command drop out of the coverage claim")
+        # A NONEXISTENT instance id on every probe, never a bare `--target
+        # active`. The transport is stubbed here so nothing can leave the
+        # process either way, but `active` resolves to whatever target some
+        # other session has focused, and a sweep this wide is exactly the shape
+        # that must not depend on a fixture to stay harmless: if a change ever
+        # re-routes one of these 285 invocations past the stub, it must find
+        # nothing on the other end rather than a live view.
+        base = (list(path)
+                + [_ESTIMATE_ARG_VALUES[p] for p in positionals[path]]
+                + required
+                + ["--instance", "prfleet-nonexistent-879", "--target", "active"])
+        for mode in _estimate_emit_modes(leaf(path)):
+            argv = base + mode + ["--estimate-output"]
+            fake_transport(default=_ESTIMATE_STUB)
+            try:
+                rc = bn.cli.main(argv)
+            except SystemExit as exc:                 # argparse refusals
+                rc = exc.code
+            out = capsys.readouterr().out
+            probed += 1
+            estimated = _is_estimate_envelope(out)
+            if rc == 0:
+                emitted += 1
+                covered.add(path)
+            if estimated:
+                continue
+            if rc == 0 or (out.strip() and not _is_error_envelope(out)):
+                leaked.append((" ".join(argv), out[:160]))
+    assert not leaked, (
+        "these invocations of --estimate-output put something other than the "
+        f"estimate envelope on stdout: {leaked[:6]}")
+    # ...and the sweep cannot quietly degrade into "every probe errored out":
+    # every advertised command reached an emitting path at least once, and the
+    # probe count is pinned so a mode class cannot silently stop being swept.
+    assert covered == advertised, (
+        f"never reached an emitting path: {sorted(advertised - covered)}")
+    assert probed == 285, (
+        f"the sweep ran {probed} probes, not 285 -- a flag class joining or "
+        "leaving the derivation changes the coverage claim, so move the number "
+        "in the same commit")
+    assert emitted, "no probe reached an emit path at all"
+
+
+def test_the_output_reference_documents_the_estimate_preflight_796(monkeypatch):
+    """#796: the preflight has to be discoverable where an agent looks for it.
+
+    The issue's own repro grepped `src/`, `skills/`, `README.md` and
+    `CLAUDE.md`, and `--estimate-output` had zero hits outside `src/` -- so a
+    flag whose whole purpose is letting an agent bound a read before paying for
+    it shipped invisible to the agent surface it was filed for. Two places
+    carry it: the runtime reference that enumerates the output flags and the
+    envelope keys, and the reading reference's "bound the read" guidance, which
+    is where a reader is already being told to slice.
+
+    The envelope half is derived from the envelopes this CLI actually emits, so
+    the reference cannot drift from the payload the next time a key is added.
+    All THREE envelopes are drained, because a key that only one of them
+    carries is exactly the one a hand-kept list forgets: the spill threshold is
+    conditional (`spill_token_limit` appears only when `BN_SPILL_TOKENS` is
+    armed), and the raw-byte preflight is a second payload kind.
+    """
+    from bn.output import estimate_bytes_result, estimate_output_result
+
+    root = Path(bn.cli.__file__).resolve().parents[2]
+    runtime = (root / "skills" / "bn" / "reference" / "runtime.md").read_text(encoding="utf-8")
+    reading = (root / "skills" / "bn" / "reference" / "reading.md").read_text(encoding="utf-8")
+
+    assert "--estimate-output" in runtime, (
+        "the reference that enumerates every output flag does not name "
+        "--estimate-output, so the preflight is undiscoverable from the skill")
+    assert "--estimate-output" in reading, (
+        "the reading reference tells an agent to bound a large read but never "
+        "names the flag that measures one first")
+
+    envelopes = [estimate_output_result({"items": [], "total": 0}, fmt="json",
+                                        rerun_hint="rerun with --limit").artifact]
+    monkeypatch.setenv("BN_SPILL_TOKENS", "40000")
+    envelopes.append(estimate_output_result({"items": [], "total": 0}, fmt="json",
+                                            rerun_hint="rerun with --limit").artifact)
+    envelopes.append(estimate_bytes_result(b"AAAA", fmt="json",
+                                           summary={"kind": "bytes"},
+                                           rerun_hint="rerun with --length").artifact)
+    assert "spill_token_limit" in envelopes[1], (
+        "the armed envelope no longer carries the conditional key this guard "
+        "exists to reach")
+    undocumented = sorted({key for envelope in envelopes for key in envelope
+                           if f"`{key}`" not in runtime})
+    assert not undocumented, (
+        f"the estimate envelope carries keys the reference never states: "
+        f"{undocumented}")
+
+
+def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_commands_796(
+        fake_transport, capsys):
+    """The other half of the scoping: the commands that must never take it.
+
+    A mutation prints a status line because that line IS the answer (#645), and a
+    side-effecting `_call` command (`save`/`close`/`load`/`refresh`/`py exec`)
+    performs its work and then reports it -- for both, `--estimate-output` would
+    replace an outcome with a byte count. Neither advertises the flag, so both
+    refuse it the way argparse refuses any unknown option (rc 2), before any
+    request is sent.
+    """
+    import argparse
+
+    a_mutation = bn.cli._selected_parser_for_argv(
+        bn.cli.build_parser(), ["comment", "set", "0x401000", "note"])
+    assert "--estimate-output" not in bn.cli._known_option_strings(a_mutation)
+
+    parser = bn.cli.build_parser()
+    calls = fake_transport()
+
+    # An argparse refusal exits 2 the same way a usage error always does (the
+    # text-format path raises SystemExit; see `test_argparse_error_text_format_
+    # keeps_stdout_empty`), so the flag is refused by the PARSER, not by a gate
+    # somebody has to remember to write.
+    with pytest.raises(SystemExit) as refused:
+        bn.cli.main(["comment", "set", "0x401000", "note", "--estimate-output",
+                     "--target", "active"])
+    assert refused.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+    assert not calls                       # refused by the parser, before the request
+
+    # THE DUAL-ROLE NODES, behaviourally. The flag must not be accepted BEFORE the
+    # subcommand, because that occurrence belongs to the group parser: the
+    # mutation behind it (`types declare`) executed and reported a size in R2 of
+    # this review, and the read behind it (`types show`) ran with the flag
+    # silently dropped by the leaf default. Both refuse now, before any request.
+    for argv in (["types", "--estimate-output", "declare",
+                  "struct DF879Leak { int a; int b; };"],
+                 ["types", "--estimate-output", "show", "DF879Leak"],
+                 ["exports", "--estimate-output", "list"]):
+        calls = fake_transport()
+        with pytest.raises(SystemExit) as hijacked:
+            bn.cli.main(argv + ["--target", "active"])
+        assert hijacked.value.code == 2, argv
+        captured = capsys.readouterr()
+        assert "unrecognized arguments: --estimate-output" in captured.err, argv
+        assert captured.out == "", argv        # NO payload
+        assert not calls, argv                 # and NO side effect
+
+    for path in (["save"], ["close"], ["target", "close"], ["load"], ["refresh"],
+                 ["py", "exec"], ["go", "rename"], ["batch", "apply"]):
+        current = parser
+        for name in path:
+            action = next(a for a in current._actions
+                          if isinstance(a, argparse._SubParsersAction))
+            current = action.choices[name]
+        assert "--estimate-output" not in bn.cli._known_option_strings(current), path
+
+    # Where it IS advertised, the two answers to "where does this go" are refused
+    # by argparse's own mutually exclusive group rather than one silently winning:
+    # a caller who asked for a size AND a file asked for two different things.
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "items": [], "total": 0, "offset": 0, "limit": 5, "returned": 0,
+        "has_more": False}}})
+    with pytest.raises(SystemExit) as conflicting:
+        bn.cli.main(["function", "list", "--estimate-output", "--out", "/tmp/bn-est.json",
+                     "--target", "active"])
+    assert conflicting.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+    assert not calls

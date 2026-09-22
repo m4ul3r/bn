@@ -257,7 +257,15 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # to `_string_entry`, which runs for the returned page only. Before #814 a
     # `strings --limit 20` paid both for every survivor of a 50k-string scan.
     survivors: list[tuple[int, str, int, Any, list[str] | None]] = []
-    for item in list(getattr(bv, "strings", [])):
+    # #795: the candidate list is materialized so the read can disclose HOW MUCH
+    # the active filters dropped. Without it the only way to the denominator was a
+    # second, unfiltered invocation (`strings --count` said 1359 where
+    # `--probable-format-strings --count` said 30, and nothing named the 1329 in
+    # between). Counting candidates - survivors is the whole disclosure: it is the
+    # same measurement `total` already is, taken one step earlier in the pipeline,
+    # so it cannot disagree with the page about what the filter kept.
+    candidates = list(getattr(bv, "strings", []))
+    for item in candidates:
         value = str(getattr(item, "value", ""))
         length = int(getattr(item, "length", 0))
         address = int(getattr(item, "start", 0))
@@ -296,20 +304,28 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
                 continue
 
         survivors.append((address, value, length, item, directives))
+    # #795: how many candidates the ACTIVE filters dropped. An int on EVERY
+    # result (0 when nothing filtered), so `jq '.filtered'` is a stable read
+    # rather than a key that appears only sometimes -- the same reason `total`
+    # and `has_more` are always present.
+    filtered = len(candidates) - len(survivors)
     if count_only:
         # `total` mirrors the list envelope key for the same number (#165).
-        return {"kind": "strings", "count": len(survivors), "total": len(survivors)}
+        return {"kind": "strings", "count": len(survivors), "total": len(survivors),
+                "filtered": filtered}
     # Same order as the pre-#814 full build: (address, value), stable against the
     # scan order for ties -- only now over the lightweight survivors.
     survivors.sort(key=lambda row: (row[0], row[1]))
     start, stop = _page_window(len(survivors), offset=offset, limit=limit)
-    return _paged_envelope(
+    page = _paged_envelope(
         kind="strings",
         items=[_string_entry(row, bv) for row in survivors[start:stop]],
         total=len(survivors),
         offset=offset,
         limit=limit,
     )
+    page["filtered"] = filtered
+    return page
 
 
 def _string_entry(row: tuple[int, str, int, Any, list[str] | None], bv) -> dict[str, Any]:
