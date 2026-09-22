@@ -10,12 +10,14 @@ from typing import Any, Callable, Iterator, Sequence
 from .target_hint import open_target_lines, target_row
 from .transport import BridgeError
 
-# "rollback_failed" = an op succeeded but the batch revert that should have
-# undone it failed, so the view may be left modified -- a real failure. A
-# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
-# "internal_error" = an unexpected engine bug (distinct from an unsupported
-# request); still a failure, so exit codes/rendering flag it (#122).
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed", "internal_error"}
+# FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
+# module symlinked into the bridge package, and re-exported here. Two owners is
+# how #777 happened: this module classified the statuses while the BRIDGE
+# produced them from its own narrower inline copy, so a `_verify_*` raising
+# anything outside that copy would silently skip the revert-on-failure path.
+# Re-exported under this name because CLAUDE.md documents it here and tests pin
+# `bn.formatters.FAILED_MUTATION_STATUSES`.
+from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
@@ -2648,11 +2650,42 @@ def _render_function_evidence_text(value: Any) -> str:
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
+            #
+            # #827 item 6: both lines below are derived from an ABI+format
+            # HEURISTIC -- `read_evidence` stamps the diagnostic
+            # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
+            # that stamp reached JSON only. A text reader saw "expected >= N
+            # argument(s)" in the same authoritative voice the recovered facts on
+            # this card use, with nothing saying the count came from counting
+            # conversion specifiers in a string literal. Print the marker the
+            # payload already carries rather than inventing a second vocabulary.
+            #
+            # Spelled `count: <confidence>` because #886 asks for a marker that
+            # reads as "this COUNT is a heuristic". That spelling is also why
+            # there is NO omission rule: `[count: authoritative]` STATES the
+            # count is authoritative, so printing a firm word does not hedge it,
+            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
+            # hedged the whole finding. An earlier cut omitted the marker for the
+            # firm word instead, and that made a payload CALLING the count firm
+            # render byte-identically to one that said nothing about it -- the
+            # silent absence this marker exists to close, on a branch no producer
+            # in this repo can even reach.
+            #
+            # Read through `_text_value`, not an inline isinstance: a bare shape
+            # test DROPS a present-but-unreadable confidence with nothing
+            # rendered and nothing recorded, so the line comes out
+            # byte-identical to a payload that never carried the field -- the
+            # same defect again. `_text_value` already treats PRESENT-AND-EMPTY
+            # as a real "no text here" answer; a whitespace-only word is that
+            # answer with padding, so it is stripped to nothing rather than
+            # rendered as `[count:    ]`, a marker with no word in it.
+            _conf = (_text_value(variadic, "confidence") or "").strip()
+            _mark = f" [count: {_conf}]" if _conf else ""
             if variadic.get("under_recovered") and variadic.get("warning"):
-                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+                lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:
                 lines.append(
-                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"  variadic: {variadic.get('callee', '?')}{_mark} "
                     f"format={variadic['format_string']!r} "
                     f"conversions={variadic.get('format_conversions')}"
                 )
@@ -4487,8 +4520,29 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         # internal noise and moves out of the default line.
         declared = _field_dict(item, "defined_types")
         names = [str(name) for name in declared]
+        # #890 obs 2: the #778 disclosure was JSON-only, so a text-mode reader
+        # of a MIXED declare saw `verified` and was never told the prototype
+        # or variable in the same source went unapplied -- the same family as
+        # #883 and #887 item 6. The types really were defined, so the row
+        # stays a success; it just stops being silent about the rest.
+        unapplied = _field_dict(item, "unapplied_prototypes")
+        extra = ""
+        if unapplied:
+            parts = []
+            for kind in ("functions", "variables"):
+                # Read through the choke point, not a bare isinstance: a
+                # `functions` that arrives malformed would otherwise be
+                # skipped and render BYTE-IDENTICALLY to a clean declare --
+                # telling a reader nothing was unapplied on exactly the
+                # payload that said otherwise. #619's boundary discloses it.
+                entries = _field_list(unapplied, kind)
+                if entries:
+                    listed = ", ".join(str(name) for name in entries)
+                    parts.append(f"{kind}: {listed}")
+            if parts:
+                extra = f"  [unapplied -- {'; '.join(parts)}]"
         if names:
-            return f"types_declare {', '.join(names)}"
+            return f"types_declare {', '.join(names)}{extra}"
         # No names, so the COUNT is the whole claim -- and it may only be stated
         # when the payload stated it. `item.get("count", 0)` over an UNREADABLE
         # listing printed "types_declare 0 types", which reads as a declare that

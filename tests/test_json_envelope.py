@@ -33,12 +33,34 @@ COUNT_READS = [
     ("exports", lambda i: i._exports("active", offset=0, limit=None, count_only=True)),
 ]
 
+# #819 stamped `kind` on three more reads, none of them a paged `items`
+# collection: an object-shaped card (`evidence function`, rows under `calls`)
+# and two scoped tag reads. They are exempt from `items` -- the envelope-tier
+# list in `skills/bn/reference/reading.md` names the container each one uses --
+# but NOT from the discriminator rule, which is why `tag list` is listed here
+# beside them.
+# (op label, expected kind, callable(instance) -> result, container key)
+KINDED_READS = [
+    ("evidence function", "function_evidence",
+     lambda i: i._function_evidence("active", "probe", context=0), "calls"),
+    ("tag types", "tag_types", lambda i: i._list_tag_types("active"), "tag_types"),
+    ("tag get", "tags_at", lambda i: i._get_tags("active", "0x401000", None), "tags"),
+    ("tag list", "tags", lambda i: i._list_tags("active"), "items"),
+]
 
-def _instance(monkeypatch):
+
+def _instance(monkeypatch, bv=None):
     bridge = _load_bridge(monkeypatch)
     inst = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda selector: _FakeBV())
+    view = _FakeBV() if bv is None else bv
+    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda selector: view)
     return inst
+
+
+def _kinded_instance(monkeypatch):
+    """`evidence function` needs a function to read; the rest of `KINDED_READS`
+    is driven against the same empty view as the collection gate above."""
+    return _instance(monkeypatch, _FakeBV(functions=[_FakeFunction(0x401000, "probe")]))
 
 
 def test_collection_reads_are_canonical(monkeypatch):
@@ -75,3 +97,39 @@ def test_shared_builders_emit_canonical_shape_without_aliases(monkeypatch):
         assert env["items"] == [] and env["total"] == 0
         assert {"offset", "limit", "returned", "has_more"} <= env.keys()
         assert not (ALIAS_KEYS & env.keys())
+
+
+def test_kinded_non_collection_reads_declare_their_container(monkeypatch):
+    """#819/#275: a `kind` stamp is a promise about the payload's shape, so each
+    read that carries one must name the container the reference documents for it
+    and must not resurrect a dropped alias key."""
+    inst = _kinded_instance(monkeypatch)
+    for label, expected_kind, call, container in KINDED_READS:
+        res = call(inst)
+        assert res.get("kind") == expected_kind, f"{label}: kind={res.get('kind')!r}"
+        assert isinstance(res.get(container), list), f"{label}: {container} not a list"
+        leaked = (ALIAS_KEYS - {container}) & res.keys()
+        assert not leaked, f"{label}: leaked alias key(s) {leaked}"
+
+
+def test_one_kind_never_names_two_shapes(monkeypatch):
+    """#819: `kind` is the field a consumer branches on, so it must identify the
+    payload's SHAPE and not merely its subject. `tag list` (paged, rows under
+    `items`) and `tag get` (unpaged, rows under `tags`) both answered to `tags`,
+    so a reader that branched on `kind` and read `.items[]` got rows from one and
+    null from the other -- the silent-null failure the #275 contract exists to
+    stop. Derives the discriminator from the payload rather than asserting it, so
+    this fails on the COLLISION and not on a renamed constant."""
+    inst = _kinded_instance(monkeypatch)
+    seen: dict[str, tuple[str, str]] = {}
+    everything = ([(kind, kind, call, "items") for kind, call, _paged in COLLECTION_READS]
+                  + KINDED_READS)
+    for label, _expected_kind, call, container in everything:
+        res = call(inst)
+        kind = res.get("kind")
+        assert isinstance(kind, str), f"{label}: no kind discriminator"
+        prior_label, prior_container = seen.setdefault(kind, (label, container))
+        assert prior_container == container, (
+            f"kind {kind!r} names two shapes: `{prior_label}` keeps its rows under "
+            f"{prior_container!r} and `{label}` under {container!r} -- a consumer "
+            f"branching on kind gets a silent null from one of them")

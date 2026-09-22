@@ -14,7 +14,8 @@ Outbound calls resolve through:
   * ``il_format`` -- the pure IL/HLIL/disasm renderers and iteration helpers
     (``_structured_disasm_entries``, ``_iter_llil_instructions``, ``_il_op_name``,
     ``_hlil_statement_text``, ``_hlil_pre_branch_condition``,
-    ``_instruction_length``, ``_llil_constant_value``);
+    ``_instruction_length``, ``_llil_constant_value``, ``_decompile_text`` for
+    the callsite decompile excerpt);
   * ``_shared`` -- module-free helpers (``_validate_count``, ``_parse_address``,
     ``OperationFailure``).
 
@@ -71,6 +72,137 @@ def _callee_variadic_hint(callee) -> dict[str, Any] | None:
             "`bn disasm <caller> --linear`."
         ),
     }
+
+
+# #792: decompiled lines of context the callsite excerpt carries on either side of
+# the callsite when its HLIL statement cannot be localized.
+_DECOMPILE_EXCERPT_WINDOW = 3
+# #792 review: the per-LINE cap for that window, set to the same 240 characters
+# `il_format._hlil_text_is_local` refuses, so a statement too long to be a local
+# statement cannot reappear in full through the excerpt.
+_EXCERPT_LINE_MAX_CHARS = 240
+
+
+def _callsite_decompile_render(bv, func) -> tuple[list[str], list[int]]:
+    """The decompiled body of *func*, plus the gutter address of each line (#792).
+
+    Both renderers this can excerpt (``il_format._pseudo_c_text`` and its HLIL
+    fallback) prefix a line with ``hex(address)`` and eight spaces, so the leading
+    token is the line's address; ``-1`` marks a line without one (a blank spacer,
+    a closing brace, or a ``// bn:`` degradation marker). A rendering failure is
+    reported as an empty render -- the callsite's identity never depends on it."""
+    try:
+        text = il_format._decompile_text(bv, func, addresses=True)
+    except Exception:
+        text = ""
+    lines = text.splitlines() if text else []
+    addresses: list[int] = []
+    for line in lines:
+        head = line.split(None, 1)[0] if line.strip() else ""
+        try:
+            addresses.append(int(head, 16) if head[:2] == "0x" else -1)
+        except ValueError:
+            addresses.append(-1)
+    return lines, addresses
+
+
+def _callsite_decompile_excerpt(render: tuple[list[str], list[int]], call_addr: int,
+                                func_start: int) -> dict[str, Any]:
+    """A bounded decompiled window around *call_addr* (#792).
+
+    When ``hlil_statement`` cannot be localized, the callsite is still readable in
+    the decompilation -- this is what ``bn decompile <caller>`` renders, captured
+    in-row so an agent need not re-run it and correlate addresses by hand. A row
+    that did not carry it offered only disassembly fields for a call the
+    decompiler plainly shows.
+
+    The render is in CONTROL-FLOW order, not address order (#792 review): a switch
+    emits its cases out of sequence and the closing brace carries the FUNCTION
+    START, so a positional/scan-order rule anchors on the epilogue. The callsite's
+    own line is found by EXACT address, and only that miss falls back to proximity.
+    """
+    lines, addresses = render
+    excerpt: dict[str, Any] = {"window": _DECOMPILE_EXCERPT_WINDOW, "lines": []}
+    if not lines:
+        excerpt["reason"] = "decompile_text_unavailable"
+        return excerpt
+    # The renderer emits the callsite's statement with the call's own address, so an
+    # exact match IS the callsite and needs no order assumption at all.
+    anchor = next((index for index, address in enumerate(addresses)
+                   if address == call_addr), None)
+    if anchor is None:
+        # No exact hit (the statement's gutter can carry an earlier instruction of
+        # the same statement, or the call sits inside a line keyed elsewhere): fall
+        # back to the numerically nearest guttered line, EXCLUDING the
+        # function-entry address -- a real render puts that on the closing brace,
+        # which in control-flow order is often the LAST line and would otherwise
+        # win every proximity contest. Ties prefer the earlier line, which is the
+        # one a statement's first-instruction key puts before the call.
+        candidates = [index for index, address in enumerate(addresses)
+                      if address >= 0 and address != func_start]
+        if candidates:
+            anchor = min(candidates, key=lambda index: (abs(addresses[index] - call_addr),
+                                                        addresses[index] > call_addr, index))
+    if anchor is None:
+        # Nothing in this render is attributable to the callsite: say so rather
+        # than pointing at the function's tail (#792 review).
+        excerpt["reason"] = "statement_not_located"
+        return excerpt
+    excerpt["anchor_address"] = hex(addresses[anchor])
+    window = _DECOMPILE_EXCERPT_WINDOW
+    excerpt["lines"] = _cap_excerpt_lines(lines[max(0, anchor - window):anchor + window + 1],
+                                          excerpt)
+    return excerpt
+
+
+def _cap_excerpt_lines(lines: list[str], excerpt: dict[str, Any]) -> list[str]:
+    """Cap each excerpted line at ``_EXCERPT_LINE_MAX_CHARS`` (#792 review).
+
+    A window bounds the line COUNT, not the bytes: one measured render emits a
+    583-character statement line, and such a row is exactly the null-statement row
+    that needs an excerpt -- 7 of them is the whole-function blob #557 refuses to
+    put in ``hlil_statement``. The cap and the per-line count of capped lines keep
+    the excerpt's cost bounded and its shape self-describing; a truncated line is
+    never presented as verbatim."""
+    capped: list[str] = []
+    truncated = 0
+    for line in lines:
+        if len(line) > _EXCERPT_LINE_MAX_CHARS:
+            truncated += 1
+            line = (line[:_EXCERPT_LINE_MAX_CHARS]
+                    + f" ... [+{len(line) - _EXCERPT_LINE_MAX_CHARS} chars]")
+        capped.append(line)
+    if truncated:
+        excerpt["truncated_lines"] = truncated
+    return capped
+
+
+def _attach_callsite_excerpts(bv, page_rows: list[dict[str, Any]]) -> None:
+    """Fill ``decompile_excerpt`` on the rows of the RETURNED PAGE, in place (#792).
+
+    The excerpt is the only callsite field that costs a whole-function
+    decompilation, so it is a PAGE projection, not a scan-time one. `_callsites`
+    scans until it holds ``offset + limit + 1`` rows to answer the paging
+    contract, so building the excerpt while scanning paid a render for every
+    caller the `--offset`/`--limit` window then discarded -- the population-wide
+    per-row work #814 forbids. Here the cost is bounded by the page the caller
+    asked for, and one render still serves every row of the same caller.
+
+    Rows carrying no ``_excerpt_fn`` (their HLIL statement localized, or they
+    came from a test double) are left exactly as they are.
+    """
+    renders: dict[int, tuple[list[str], list[int]]] = {}
+    for row in page_rows:
+        func = row.pop("_excerpt_fn", None)
+        if func is None:
+            continue
+        start = int(func.start)
+        render = renders.get(start)
+        if render is None:
+            render = renders[start] = _callsite_decompile_render(bv, func)
+        row["decompile_excerpt"] = _callsite_decompile_excerpt(
+            render, int(row["call_addr"], 16), start
+        )
 
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
@@ -181,6 +313,17 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         )
         if variadic_hint is not None:
             rows[-1]["callee_variadic"] = variadic_hint
+        if hlil_statement is None:
+            # #792: the statement is null (with a reason), but the callsite is
+            # still visible in the decompilation. Rendering that body is by far
+            # the most expensive thing this row can carry, so the row only
+            # RECORDS which function would have to be rendered and
+            # `_attach_callsite_excerpts` fills the excerpt for the returned page
+            # -- the same transient-handle convention `_fn` uses for the function
+            # listing, and the same reason (#814): a scan that reads
+            # `offset + limit + 1` rows must not pay a whole-function
+            # decompilation for the rows paging then drops.
+            rows[-1]["_excerpt_fn"] = func
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
 
@@ -416,11 +559,13 @@ def _callsites(
                 "callee_symbol_only": callee_symbol_only,
             }
         )
+        _attach_callsite_excerpts(bv, result["items"])
         return result
 
     if scan_truncated:
         assert limit is not None
         page = rows[offset:offset + limit]
+        _attach_callsite_excerpts(bv, page)
         return {
             "kind": "callsites",
             "items": page,
@@ -451,6 +596,7 @@ def _callsites(
             "callee_symbol_only": callee_symbol_only,
         }
     )
+    _attach_callsite_excerpts(bv, result["items"])
     return result
 
 
@@ -967,10 +1113,15 @@ def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
     (#59). `kind` is the envelope discriminator (#275); `items` is the sole data
     container (the legacy `functions` alias was dropped in the #275 clean
     break)."""
-    start, stop = read_misc._page_window(len(items), offset=offset, limit=limit)
-    return read_misc._paged_envelope(
-        kind=kind, items=items[start:stop], total=len(items), offset=offset, limit=limit,
-    )
+    # #827 item 3: this body was a verbatim twin of
+    # `read_misc._paged_list_result` -- both sliced with `_page_window` and
+    # wrapped with `_paged_envelope`, in that order, with the same arguments.
+    # The shared rule already existed; these were two thin wrappers over it that
+    # could drift independently. Delegated rather than deleted because the
+    # signature differs deliberately: this one takes `ctx` (for call-shape
+    # parity with its sibling listing helpers) and defaults `kind` to
+    # "functions", so every caller keeps working unchanged.
+    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind=kind)
 
 
 def _search_functions(

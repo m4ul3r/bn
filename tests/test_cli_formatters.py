@@ -1150,6 +1150,51 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
+def test_types_declare_text_row_discloses_unapplied_prototypes_890():
+    # #890 obs 2: the #778 disclosure reached JSON only, so a text-mode reader
+    # of a MIXED declare was told `verified` and never told that the function
+    # prototype and variable in the same source went unapplied.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {
+            "functions": ["parse_frame"],
+            "variables": ["g_session_count"],
+        },
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "packet_header" in out
+    assert "unapplied" in out
+    assert "parse_frame" in out and "g_session_count" in out
+
+
+def test_types_declare_text_row_stays_bare_for_a_types_only_declare_890():
+    # Must-not-fire twin: an ordinary types-only declaration carries no
+    # unapplied buckets and must read exactly as it did before.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+    })
+    assert out == "types_declare packet_header"
+
+
+def test_types_declare_text_row_omits_an_empty_unapplied_bucket_890():
+    # A declare that could not bind a FUNCTION says so without inventing an
+    # empty "variables:" clause -- the disclosure names what happened, not
+    # every bucket it checked.
+    from bn.formatters import _operation_row_text
+    out = _operation_row_text({
+        "op": "types_declare",
+        "defined_types": {"packet_header": "struct packet_header"},
+        "unapplied_prototypes": {"functions": ["parse_frame"], "variables": []},
+        "unapplied_note": "parsed but not bound",
+    })
+    assert "functions: parse_frame" in out
+    assert "variables" not in out
+
+
 def test_the_disclosure_reaches_an_early_return_path():
     # The whole point of declaring the coerced keys per renderer instead of
     # appending a line per branch: several renderers bail out BEFORE their
@@ -4244,12 +4289,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    # #823: `_render_spill_gc_text` joins the population with three
-    # discovered container reads (`candidates`, `skipped`, `errors`), so every
-    # derived count here moves by its contribution alone. Measured.
-    # 1212 + 18 (#823) = 1230.
-    assert checked == 1230, f"the differential ran {checked} cases, not 1230"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 1236 cases.
+    assert checked == 1236, f"the differential ran {checked} cases, not 1236"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4294,12 +4337,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    # #823: `_render_spill_gc_text` joins the population with three
-    # discovered container reads (`candidates`, `skipped`, `errors`), so every
-    # derived count here moves by its contribution alone. Measured.
-    # 4896 + 72 (#823) = 4968.
-    assert swept == 4968, f"the raise sweep ran {swept} renders, not 4968"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 4976 renders.
+    assert swept == 4976, f"the raise sweep ran {swept} renders, not 4976"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4454,12 +4495,10 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    # #823: `_render_spill_gc_text` joins the population with three
-    # discovered container reads (`candidates`, `skipped`, `errors`), so every
-    # derived count here moves by its contribution alone. Measured.
-    # 1426 + 21 (#823) = 1447.
-    assert checked == 1447, f"the mirror ran {checked} renders, not 1447"
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 1450 renders.
+    assert checked == 1450, f"the mirror ran {checked} renders, not 1450"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7084,7 +7123,8 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    assert len(keys) == 10, f"the op row reads {sorted(keys)}, not 10 keys"
+    # #890 obs 2: `_operation_row_text` now reads the `unapplied_prototypes` container and its nested `functions`/`variables` lists, so a text reader of a mixed declare is told what went unapplied. Three new discovered reads, and these derived populations grow with them. The row reads one more top-level key than before.
+    assert len(keys) == 11, f"the op row reads {sorted(keys)}, not 11 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7111,9 +7151,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    assert (rendered, checked) == (1980, 1188), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 1980, and "
-        f"CHECKED {checked} of them, not 1188. Two sizes, because they are two "
+    # #890 obs 2: the row now reads `unapplied_prototypes` (and its nested
+    # `functions`/`variables`), so both sizes grow with the new key: the
+    # rendered population 1980 -> 2178 and the checked subset 1188 -> 1298.
+    assert (rendered, checked) == (2178, 1298), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 2178, and "
+        f"CHECKED {checked} of them, not 1298. Two sizes, because they are two "
         "different claims: the carve-out for a readable container skips 792 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")

@@ -131,7 +131,10 @@ def test_a_test_may_still_opt_into_color(monkeypatch):
 
 
 def test_color_override_is_restored_to_the_isolated_state():
-    """Runs after the override test above: monkeypatch put the pin back."""
+    """The pin comes from the autouse `_hermetic_env` fixture, not from the
+    override test above: run this standalone and the fixture still sets it.
+    Ordering is not a guarantee anyway -- `-n` splits tests across workers, so a
+    session-order claim would hold only in serial runs."""
     assert os.environ.get("NO_COLOR") == "1"
     assert "FORCE_COLOR" not in os.environ
 
