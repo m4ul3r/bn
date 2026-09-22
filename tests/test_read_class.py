@@ -2795,6 +2795,32 @@ def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypa
     assert read_class._class_list(ctx, None, limit=1)["declared_suppressed"] == 3
 
 
+def test_filtered_declared_classes_are_disclosed_on_the_default_listing_675(monkeypatch):
+    """A filter must name a declaration it hides even when --all was omitted.
+
+    The confidence gate used to run first and skip the declaration without
+    counting it under either the declared or library/vendor suppression.
+    """
+    from bn.formatters import _render_class_list_text
+
+    bv = _declared_bv(**{"std::Box": _DeclaredType(name="std::Box"),
+                          "boost::Ref": _DeclaredType(name="boost::Ref"),
+                          "Widget": _DeclaredType(name="Widget")})
+    ctx = _declared_ctx(monkeypatch, bv)
+    listing = read_class._class_list(ctx, None, no_stl=True, no_vendor=True)
+    assert listing["declared_suppressed"] == 1
+    assert listing["library_suppressed"] == 1
+    assert listing["vendor_suppressed"] == 1
+    text = _render_class_list_text(listing)
+    assert "1 user-declared class type (--all to show)" in text
+    assert "1 library/STL" in text and "1 vendored" in text
+
+    expanded = read_class._class_list(
+        ctx, None, include_all=True, no_stl=True, no_vendor=True)
+    assert [row["name"] for row in expanded["items"]
+            if row["confidence"] == "declared-only"] == ["Widget"]
+
+
 def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
     """`typedef struct { ... } Widget;` is how C++ code most often reaches a
     view: BN registers the body as an auto-named struct and `Widget` as a
@@ -3205,8 +3231,10 @@ def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675
     # while the card silently lost the RTTI-absence note -- so its empty
     # vtable/methods/instances read as "this class has none", which is the exact
     # blindness #675.2 exists to remove (#907 review round 6).
-    assert any("RTTI" in note for note in shown["notes"]), shown["notes"]
-    assert len(shown["notes"]) >= 2, shown["notes"]
+    assert len(shown["notes"]) == 2, shown["notes"]
+    assert sum("could not be read" in note for note in shown["notes"]) == 1
+    assert any("RTTI evidence that is absent, NOT evidence this class has none"
+               in note for note in shown["notes"]), shown["notes"]
 
     # A query that reaches no unreadable declaration carries no such note.
     clean = read_class._class_show(ctx, None, "ns::Widget")
@@ -3270,6 +3298,28 @@ def test_an_artifact_shaped_DECLARATION_is_listed_and_shown_as_one_set_675(monke
     # And `class show` answers for exactly the set the listing offered.
     for name in rows:
         assert read_class._class_show(ctx, None, name)["confidence"] == "declared-only"
+
+
+def test_declared_class_survives_a_same_name_thunk_artifact_675(monkeypatch):
+    """The symbol half's thunk is not a class, even when it has the exact name
+    of a class in the user type container. Listing and show must choose the
+    declaration together, while the artifact is still counted as suppressed."""
+    name = "non-virtual thunk to Widget"
+    bv = _declared_bv(**{name: _DeclaredType(name=name)})
+    ctx = _declared_ctx(monkeypatch, bv)
+    artifact = {"name": name, "confidence": "name-only", "methods": [],
+                "vtable": None, "typeinfo": None, "typeinfo_name": None,
+                "size": None, "bases": [], "instances": []}
+    monkeypatch.setattr(read_class, "_build_class_registry",
+                        lambda _ctx, _bv, query=None: {name: artifact})
+
+    listed = read_class._class_list(ctx, None, include_all=True)
+    assert listed["thunks_suppressed"] == 1
+    assert [(row["name"], row["confidence"]) for row in listed["items"]] == [
+        (name, "declared-only")]
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
+    shown = read_class._class_show(ctx, None, name)
+    assert shown["name"] == name and shown["confidence"] == "declared-only"
 
 
 def test_only_types_the_USER_declared_are_classes_of_the_lens_675(monkeypatch):

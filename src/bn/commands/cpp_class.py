@@ -18,8 +18,9 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                        "class/struct/union in the view's USER type container (what "
                        "`types declare` writes -- not types Binary Ninja imported), "
                        "with no filtering by the shape of a name. --no-stl and "
-                       "--no-vendor still narrow these rows and each reports how many "
-                       "it hid; --query narrows them and reports no count. BN's C "
+                       "--no-vendor still narrow these rows; a normal listing "
+                       "reports how many each hid, while --count returns only "
+                       "the included count. --query reports no hidden count. BN's C "
                        "parser registers an anonymous typedef's body as a "
                        "second type (`typedef struct { ... } T;` yields `T` and `_T`), "
                        "and that half lists too. Not just RTTI/ctor-confirmed classes"),

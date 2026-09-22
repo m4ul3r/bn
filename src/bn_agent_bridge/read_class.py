@@ -903,9 +903,9 @@ def _class_list(
     registry = _build_class_registry(ctx, bv, query=query)
     # #675.2: the DECLARED records join the candidates -- read live, never folded
     # into the memoised registry (see `_declared_type_records`). A name the RTTI
-    # half already clustered keeps its RTTI record: the declared one adds no
-    # evidence, and `--all` (the gate that admits non-RTTI clusters) is what
-    # surfaces the rest.
+    # half already clustered keeps its RTTI record, except when that "class" is
+    # a thunk-shaped symbol artifact. A declared class under that same spelling
+    # remains a real type and must not be lost with the artifact.
     needle = query.lower() if query else None
     # ONE live reading of the view's declared class types: the records below and
     # the type objects their returned rows take a size from (`_declared_size`)
@@ -923,9 +923,10 @@ def _class_list(
     # against without one surface asserting an absence the other contradicts
     # (see :class:`_DeclaredSet`). BN's own parser half for an anonymous
     # typedef therefore lists as a peer row, and that is honest.
+    declared_records = _declared_type_records(declared_types)
     declared_only = [
-        rec for name, rec in _declared_type_records(declared_types).items()
-        if name not in registry
+        rec for name, rec in declared_records.items()
+        if (name not in registry or _is_thunk_artifact(name))
         and (needle is None or needle in name.lower())
     ]
     candidates = []
@@ -955,29 +956,24 @@ def _class_list(
         if symbol_artifact and not include_all and _is_construction_vtable_artifact(name):
             construction_vtables_suppressed += 1
             continue
+        if no_stl and _is_library_class(name):
+            library_suppressed += 1
+            continue
+        if no_vendor and _is_vendor_class(name):
+            vendor_suppressed += 1
+            continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
             # #675.2: a declared class type is not RTTI/ctor-confirmed either, so
             # the same gate folds it out of the default listing -- counted, so the
             # fold-out is disclosed the way the library/vendor suppressions are
             # rather than leaving `class list` silently blind to it.
             #
-            # Counted only when the REMAINING filters would have kept it, because
-            # the number is read as "what `--all` would add" (#907 review): the
-            # gate fires before --no-stl/--no-vendor, so an unconditional count
-            # promised two more classes under `--no-stl` where `--all --no-stl`
-            # then showed one. The suppression the user asked for is disclosed by
-            # its own counter on the `--all` run, not twice.
-            if rec["confidence"] == _DECLARED_CONFIDENCE and not (
-                (no_stl and _is_library_class(name))
-                or (no_vendor and _is_vendor_class(name))
-            ):
+            # The library/vendor filters already ran, so this count is exactly
+            # the declared rows `--all` would add under the same flags. A
+            # filtered declaration is counted under the filter that hid it,
+            # even on the default listing.
+            if rec["confidence"] == _DECLARED_CONFIDENCE:
                 declared_suppressed += 1
-            continue
-        if no_stl and _is_library_class(name):
-            library_suppressed += 1
-            continue
-        if no_vendor and _is_vendor_class(name):
-            vendor_suppressed += 1
             continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
@@ -1692,10 +1688,13 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     declared_set = _declared_types(bv)
     declared_types = declared_set.types if declared_set is not None else {}
     declared = _declared_type_records(declared_types)
-    # A name BOTH halves carry keeps its RTTI record: the declared one adds no
-    # evidence to a class that already has a vtable, exactly as the listing dedups
-    # it (`name not in registry`).
-    candidates = {**declared, **registry}
+    # A name BOTH halves carry keeps its RTTI record unless the registry entry
+    # is a thunk-shaped artifact, which is never a class. The listing drops
+    # that artifact and keeps the declaration; show must resolve the same name
+    # to the declared card.
+    registry_classes = {key: rec for key, rec in registry.items()
+                        if key not in declared or not _is_thunk_artifact(key)}
+    candidates = {**declared, **registry_classes}
     matches = _resolve_class_names(candidates, name)
     # Whether this query ALSO reaches a declaration whose kind could not be
     # established. Resolved over the same namespace PLUS the unreadable names, so
@@ -1751,8 +1750,8 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
         )
     records = []
     for match in matches:
-        if match in registry:
-            rec = _enrich(ctx, bv, registry[match])
+        if match in registry_classes:
+            rec = _enrich(ctx, bv, registry_classes[match])
         else:
             # A declared record comes back as it was BUILT: `_enrich`'s RTTI
             # drill-downs (vtable layout, bases, instances) are precisely what
