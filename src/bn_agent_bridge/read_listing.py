@@ -1113,10 +1113,15 @@ def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
     (#59). `kind` is the envelope discriminator (#275); `items` is the sole data
     container (the legacy `functions` alias was dropped in the #275 clean
     break)."""
-    start, stop = read_misc._page_window(len(items), offset=offset, limit=limit)
-    return read_misc._paged_envelope(
-        kind=kind, items=items[start:stop], total=len(items), offset=offset, limit=limit,
-    )
+    # #827 item 3: this body was a verbatim twin of
+    # `read_misc._paged_list_result` -- both sliced with `_page_window` and
+    # wrapped with `_paged_envelope`, in that order, with the same arguments.
+    # The shared rule already existed; these were two thin wrappers over it that
+    # could drift independently. Delegated rather than deleted because the
+    # signature differs deliberately: this one takes `ctx` (for call-shape
+    # parity with its sibling listing helpers) and defaults `kind` to
+    # "functions", so every caller keeps working unchanged.
+    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind=kind)
 
 
 def _search_functions(

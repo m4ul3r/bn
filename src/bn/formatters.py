@@ -2618,11 +2618,42 @@ def _render_function_evidence_text(value: Any) -> str:
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
+            #
+            # #827 item 6: both lines below are derived from an ABI+format
+            # HEURISTIC -- `read_evidence` stamps the diagnostic
+            # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
+            # that stamp reached JSON only. A text reader saw "expected >= N
+            # argument(s)" in the same authoritative voice the recovered facts on
+            # this card use, with nothing saying the count came from counting
+            # conversion specifiers in a string literal. Print the marker the
+            # payload already carries rather than inventing a second vocabulary.
+            #
+            # Spelled `count: <confidence>` because #886 asks for a marker that
+            # reads as "this COUNT is a heuristic". That spelling is also why
+            # there is NO omission rule: `[count: authoritative]` STATES the
+            # count is authoritative, so printing a firm word does not hedge it,
+            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
+            # hedged the whole finding. An earlier cut omitted the marker for the
+            # firm word instead, and that made a payload CALLING the count firm
+            # render byte-identically to one that said nothing about it -- the
+            # silent absence this marker exists to close, on a branch no producer
+            # in this repo can even reach.
+            #
+            # Read through `_text_value`, not an inline isinstance: a bare shape
+            # test DROPS a present-but-unreadable confidence with nothing
+            # rendered and nothing recorded, so the line comes out
+            # byte-identical to a payload that never carried the field -- the
+            # same defect again. `_text_value` already treats PRESENT-AND-EMPTY
+            # as a real "no text here" answer; a whitespace-only word is that
+            # answer with padding, so it is stripped to nothing rather than
+            # rendered as `[count:    ]`, a marker with no word in it.
+            _conf = (_text_value(variadic, "confidence") or "").strip()
+            _mark = f" [count: {_conf}]" if _conf else ""
             if variadic.get("under_recovered") and variadic.get("warning"):
-                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+                lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:
                 lines.append(
-                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"  variadic: {variadic.get('callee', '?')}{_mark} "
                     f"format={variadic['format_string']!r} "
                     f"conversions={variadic.get('format_conversions')}"
                 )

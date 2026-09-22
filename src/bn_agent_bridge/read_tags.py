@@ -126,6 +126,14 @@ def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, An
         funcs = bv.get_functions_containing(addr)
         fname = funcs[0].name if funcs else None
         push(_tag_entry(t, scope="data", address=addr, function=fname))
+    # #827 item 7: with no --function and no --data this is a WHOLE-VIEW
+    # sweep -- every function, its function tags and its address tags. That is
+    # the correct answer for "tags at all scopes" and is deliberately not
+    # capped here (the caller pages the result), but it is the one read on this
+    # surface whose cost scales with the binary rather than the answer, so the
+    # narrowing flags are documented beside the command in
+    # skills/bn/reference/reading.md rather than left for a user to discover on
+    # a large target.
     if not data_only:
         for fn in list(bv.functions):
             for t in fn.get_function_tags(auto=False):
