@@ -447,7 +447,9 @@ def test_empty_type_parse_rolls_back_and_reports_reason(
 
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _FakeCommentMutationBV(comments={0x1000: "original"})
+    bv = _FakeCommentMutationBV(
+        comments={0x1000: "original"}, memory={0x1000: b"\x00"}
+    )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult(), raising=False)
     result = instance._mutation("active", preview, [
