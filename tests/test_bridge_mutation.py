@@ -4589,7 +4589,7 @@ def test_preview_set_comment_revert_clears_the_view_624(monkeypatch):
     the comment store shipped green (#173's rollback contract, #624)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _FakeCommentMutationBV()
+    bv = _FakeCommentMutationBV(memory={0x1000: b"\x00"})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._mutation("active", True, [
@@ -4611,7 +4611,7 @@ def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
     #624's dual-store/undo fixes are what make the readback below meaningful."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _FakeCommentMutationBV()
+    bv = _FakeCommentMutationBV(memory={0x1000: b"\x00"})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._mutation("active", False, [
@@ -4905,6 +4905,7 @@ def test_set_comment_on_an_indeterminate_view_still_works_781(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, _fn = _tag_comment_bv()
+    monkeypatch.delattr(_FakeBV, "is_valid_offset")
     assert not hasattr(bv, "is_valid_offset")
 
     result = _commit_mutation(monkeypatch, instance, bv, [

@@ -76,19 +76,22 @@ def test_get_tags_rejects_both_locators():
 
 def test_get_tags_rejects_unmapped_address():
     """tag get on an unmapped, tag-less address must reject (parity with
-    comment get / xrefs, #374) instead of returning a false empty result."""
+    comment get / xrefs, #374) instead of returning a false empty result.
+
+    No `is_valid_offset` patch: the view maps only its function's body, so 0x2000
+    is unmapped by DEFAULT (#783)."""
     bv, _ = _bv_with_tagged_fn()
-    bv.is_valid_offset = lambda addr: False
     with pytest.raises(RuntimeError, match="not mapped"):
         read_tags._get_tags(_CtxFn(bv), None, "0x2000", None)
 
 
 def test_get_tags_mapped_address_without_tags_stays_clean():
     """A MAPPED address with no tags is a clean empty result -- only the
-    unmapped case is rejected (#374)."""
+    unmapped case is rejected (#374). 0x1020 is inside the function's body, so it
+    is mapped by the view's own structure and carries no tag."""
     bv, _ = _bv_with_tagged_fn()
-    bv.is_valid_offset = lambda addr: True
-    result = read_tags._get_tags(_CtxFn(bv), None, "0x2000", None)
+    assert bv.is_valid_offset(0x1020) is True
+    result = read_tags._get_tags(_CtxFn(bv), None, "0x1020", None)
     assert result["tags"] == []
     assert result["count"] == 0
 

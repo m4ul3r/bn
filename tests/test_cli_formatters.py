@@ -4287,9 +4287,9 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
-    # #823 and #890 both add discovered container reads. Measured on the
-    # merged tree: 1236 cases.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 1236 cases.
     assert checked == 1236, f"the differential ran {checked} cases, not 1236"
 
 
@@ -4335,9 +4335,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # the top-level `callee` to tell an unresolved callee from a callee nothing
     # was computed for -- 1 pair x 8 bogus values, measured the same way.
     #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    # #823 and #890 both add discovered container reads. Measured on the
-    # merged tree: 4976 renders.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 4976 renders.
     assert swept == 4976, f"the raise sweep ran {swept} renders, not 4976"
 
 
@@ -4493,9 +4493,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
     # sweep also gained, x 2 benign payloads.
     #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    # #823 and #890 both add discovered container reads. Measured on the
-    # merged tree: 1450 renders.
+    # #857 adds one top-level container read; its nested `attempted_path`
+    # read adds no population pair. #823 and #890 add their own reads.
+    # Measured on this combined tree: 1450 renders.
     assert checked == 1450, f"the mirror ran {checked} renders, not 1450"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
