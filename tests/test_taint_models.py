@@ -306,6 +306,11 @@ def test_present_callsites_label_import_thunk_560():
     assert system["audit_callsite_count"] == 1
 
 
+class _BVDisasm(_BVTriage):
+    def get_disassembly(self, a):
+        return {0x5010: "call    system", 0x2000: "jmp     qword [rip+0x2f1a]"}.get(a, "")
+
+
 def test_present_callsites_carry_one_line_of_context_794():
     # #794: the row answered {address, function, kind}, which says WHERE a
     # modeled sink is called but nothing about WHAT the call looks like, so
@@ -315,10 +320,6 @@ def test_present_callsites_carry_one_line_of_context_794():
     # rather than inventing a second spelling for one field. (`read_evidence` is
     # NOT one of them: `il_format._disasm_entry` returns {address, text} under a
     # different key. An earlier version of this comment cited it and was wrong.)
-    class _BVDisasm(_BVTriage):
-        def get_disassembly(self, a):
-            return {0x5010: "call    system", 0x2000: "jmp     qword [rip+0x2f1a]"}.get(a, "")
-
     res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
                                {"present": True, "callsites": True})
     rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
@@ -327,6 +328,19 @@ def test_present_callsites_carry_one_line_of_context_794():
     # The pre-existing fields are untouched -- this is additive.
     assert rows["0x5010"]["function"] == "parse_record"
     assert rows["0x5010"]["kind"] == "app_caller"
+
+
+def test_present_callsite_context_reaches_catalog_text_794():
+    """The text catalog is the default read surface. A row that has disasm on
+    the wire must print it beside the address and function; the existing JSON
+    test alone cannot detect the renderer silently dropping the new column."""
+    from bn.formatters import _render_taint_models_text
+
+    res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
+                               {"present": True, "callsites": True})
+    text = _render_taint_models_text(res)
+    assert "0x5010  parse_record  call    system" in text
+    assert "0x2000  system [import_thunk]  jmp     qword [rip+0x2f1a]" in text
 
 
 def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
@@ -338,6 +352,25 @@ def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
     rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
     assert rows["0x5010"]["disasm"] == ""
     assert rows["0x5010"]["function"] == "parse_record"
+
+
+def test_present_callsites_degrade_when_disassembly_raises_794():
+    """A failed read at one address must not discard the catalog or its other
+    callsites. A missing get_disassembly method exercises a different guard."""
+    class _BVFailingDisasm(_BVDisasm):
+        def get_disassembly(self, a):
+            if a == 0x5010:
+                raise RuntimeError("unmapped address")
+            return super().get_disassembly(a)
+
+    res = rts._taint_models_op(_CtxWithBV(_BVFailingDisasm()), "active",
+                               {"present": True, "callsites": True})
+    system = _sink_entry(res, "system")
+    rows = {c["address"]: c for c in system["callsites"]}
+    assert system["callsite_count"] == 2
+    assert rows["0x5010"]["disasm"] == ""
+    assert rows["0x5010"]["function"] == "parse_record"
+    assert rows["0x2000"]["disasm"] == "jmp     qword [rip+0x2f1a]"
 
 
 class _BVPlain:
