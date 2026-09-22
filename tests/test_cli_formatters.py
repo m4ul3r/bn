@@ -3834,9 +3834,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # through `_stated_count`, which is a read this differential covers.
     # 19 -> 20 (#675.2): `_render_class_list_text` reads `declared_suppressed`
     # through `_count_field`, so a folded-out declared count cannot print as 0.
-    assert len(sites) == 20, (
+    # 20 -> 27 (#823): `_render_spill_gc_text` states five top-level counters
+    # (candidate_count/candidate_bytes/removed_count/reclaimed_bytes/kept_count)
+    # and reads `bytes`/`files` off each candidate ROW. The five top-level reads
+    # are the headline's numbers; the two row reads are nested, which is why
+    # they are named in the skipped set below rather than silently dropped.
+    assert len(sites) == 27, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 20. The number is the size of the covered set: a "
+        "count helper, not 27. The number is the size of the covered set: a "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -3904,6 +3909,18 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_render_orient_text(analyst_symbols) [count not stated in this context]",
         "_render_orient_text(placeholder_symbols) [count not stated in this "
         "context]",
+        # `_render_spill_gc_text` (#823). `removed_count`/`reclaimed_bytes` are
+        # stated on the branch a NON-dry sweep takes, and the probe payload
+        # carries no `dry_run` flag at all; `bytes`/`files` are read off each
+        # candidate ROW, one level below anything a top-level probe reaches.
+        # All four are driven on the real shapes by
+        # `test_render_spill_gc_text_states_an_unreadable_counter_as_unknown_823`
+        # (`tests/test_output.py`), which asserts `?` in the body a caller acts
+        # on rather than a fabricated number.
+        "_render_spill_gc_text(bytes) [count not stated in this context]",
+        "_render_spill_gc_text(files) [count not stated in this context]",
+        "_render_spill_gc_text(reclaimed_bytes) [count not stated in this context]",
+        "_render_spill_gc_text(removed_count) [count not stated in this context]",
     ], sorted(not_stated)
 
 
@@ -4230,7 +4247,11 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured.
     # #675.2: the class card gained the `notes` read, discovered in `_render_class_show_text` and `_render_one_class` -- two positions x six malformed kinds. 1212 + 12 = 1224.
     # #675.2 (#907 review r3): the same card now also reads the canonical `type` entry, so a declared class shows its declaration in TEXT and not only in JSON. Same two positions, same six malformed kinds. 1224 + 12 = 1236.
-    assert checked == 1236, f"the differential ran {checked} cases, not 1236"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1236 + 18 (#823) = 1254.
+    assert checked == 1254, f"the differential ran {checked} cases, not 1254"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4279,7 +4300,11 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #675.2: the class card's `notes` read adds two discovered positions to the same sweep. 4896 + 24 = 4920.
     # #675.2 (#907 review r3): the card's canonical `type` read adds two more discovered positions, plus the nested `layout`/`decl` reads it opens under them. 4920 + 16 = 4936.
     # #907 review r5: `_render_class_list_text` now reads `include_all` to decide whether `(--all to show)` is still actionable advice -- one new discovered key on the classes payload. 4936 + 8 = 4944.
-    assert swept == 4944, f"the raise sweep ran {swept} renders, not 4944"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4944 + 72 (#823) = 5016.
+    assert swept == 5016, f"the raise sweep ran {swept} renders, not 5016"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4437,7 +4462,11 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426, + 8 (#675.2's two `notes` positions) = 1434.
     # #675.2 (#907 review r3): the card's canonical `type` read and the `layout`/`decl` reads under it. 1434 + 6 = 1440.
     # #907 review r5: `_render_class_list_text` now reads `include_all` to decide whether `(--all to show)` is still actionable advice -- one new discovered key on the classes payload, x 2 benign payloads. 1440 + 2 = 1442.
-    assert checked == 1442, f"the mirror ran {checked} renders, not 1442"
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 1442 + 21 (#823) = 1463.
+    assert checked == 1463, f"the mirror ran {checked} renders, not 1463"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7190,8 +7219,12 @@ def test_no_list_ELEMENT_costs_the_whole_render():
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
     # #675.2: + 2 `notes` list positions x 6 junk element kinds x 6 element shapes = 4644.
-    assert swept == 4644, (
-        f"the element sweep ran {swept} renders, not 4644 -- the size of the "
+    # #823: `_render_spill_gc_text` joins the population with three
+    # discovered container reads (`candidates`, `skipped`, `errors`), so every
+    # derived count here moves by its contribution alone. Measured.
+    # 4644 + 108 (#823) = 4752.
+    assert swept == 4752, (
+        f"the element sweep ran {swept} renders, not 4752 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

@@ -1597,6 +1597,60 @@ def _render_instance_gc_text(value: Any) -> str:
     )
 
 
+@_discloses
+def _render_spill_gc_text(value: Any) -> str:
+    """Render the `spill gc` reclamation summary (#823).
+
+    Every count here is STATED rather than coerced: "reclaimed 0 day(s)" from
+    an unreadable counter is byte-identical to a real zero, and it is the
+    reading a caller acts on -- `_stated_count` prints `?` instead (#619).
+
+    The ACTION is the other thing that must not be inferred. A dry run and a
+    real sweep carry the same candidate rows, so an unreadable `dry_run` flag
+    prints `?` through the flag choke point rather than falling back to the
+    destructive-looking half (`has_more: "false"` is the same shape, one
+    command over).
+    """
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    candidates = _stated_count(value, "candidate_count")
+    candidate_bytes = _stated_count(value, "candidate_bytes")
+    removed = _stated_count(value, "removed_count")
+    reclaimed = _stated_count(value, "reclaimed_bytes")
+    kept = _stated_count(value, "kept_count")
+    dry_run = _flag_field(value, "dry_run")
+    if dry_run is True:
+        head = (f"spill gc: dry run, {candidates} day(s) would be reclaimed "
+                f"({candidate_bytes} bytes), {kept} kept")
+    elif dry_run is False:
+        # Candidates vs removed, because the two differ exactly when a removal
+        # failed -- which is reported per row below, not folded into a count.
+        head = (f"spill gc: reclaimed {removed} of {candidates} candidate day(s) "
+                f"({reclaimed} bytes), {kept} kept")
+    else:
+        head = (f"spill gc: ? dry run unknown -- {candidates} candidate day(s) "
+                f"({candidate_bytes} bytes), {kept} kept")
+    lines = [head]
+    for row in _row_list(value, "candidates"):
+        # `_stated_count` for the row counters too: they are PRINTED, so an
+        # unreadable one must not appear as a real 0 beside the day it belongs
+        # to (`0 bytes` on a day that holds a decompile is the fabricated-zero
+        # harm with a footnote, exactly as the headline would be).
+        files = _stated_count(row, "files")
+        lines.append(f"  {_escape_control_chars(row.get('day', '?'))}  "
+                     f"{_stated_count(row, 'bytes')} bytes  "
+                     f"{files} file{'' if files == '1' else 's'}")
+    for row in _row_list(value, "skipped"):
+        reason = _text_value(row, "reason") or "?"
+        lines.append("  left alone: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({reason})")
+    for row in _row_list(value, "errors"):
+        detail = _text_value(row, "error") or "?"
+        lines.append("  failed: "
+                     f"{_escape_control_chars(row.get('path', '<unknown>'))} ({detail})")
+    return "\n".join(lines)
+
+
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
     """Render a BARE list of name/address rows (imports, function pages). With
     ``demangle``, show the demangled ``display_name`` instead of the raw name so
@@ -2564,11 +2618,42 @@ def _render_function_evidence_text(value: Any) -> str:
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
+            #
+            # #827 item 6: both lines below are derived from an ABI+format
+            # HEURISTIC -- `read_evidence` stamps the diagnostic
+            # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
+            # that stamp reached JSON only. A text reader saw "expected >= N
+            # argument(s)" in the same authoritative voice the recovered facts on
+            # this card use, with nothing saying the count came from counting
+            # conversion specifiers in a string literal. Print the marker the
+            # payload already carries rather than inventing a second vocabulary.
+            #
+            # Spelled `count: <confidence>` because #886 asks for a marker that
+            # reads as "this COUNT is a heuristic". That spelling is also why
+            # there is NO omission rule: `[count: authoritative]` STATES the
+            # count is authoritative, so printing a firm word does not hedge it,
+            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
+            # hedged the whole finding. An earlier cut omitted the marker for the
+            # firm word instead, and that made a payload CALLING the count firm
+            # render byte-identically to one that said nothing about it -- the
+            # silent absence this marker exists to close, on a branch no producer
+            # in this repo can even reach.
+            #
+            # Read through `_text_value`, not an inline isinstance: a bare shape
+            # test DROPS a present-but-unreadable confidence with nothing
+            # rendered and nothing recorded, so the line comes out
+            # byte-identical to a payload that never carried the field -- the
+            # same defect again. `_text_value` already treats PRESENT-AND-EMPTY
+            # as a real "no text here" answer; a whitespace-only word is that
+            # answer with padding, so it is stripped to nothing rather than
+            # rendered as `[count:    ]`, a marker with no word in it.
+            _conf = (_text_value(variadic, "confidence") or "").strip()
+            _mark = f" [count: {_conf}]" if _conf else ""
             if variadic.get("under_recovered") and variadic.get("warning"):
-                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+                lines.append(f"  variadic: UNDER-RECOVERED{_mark} — {variadic['warning']}")
             elif variadic.get("format_string") is not None:
                 lines.append(
-                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"  variadic: {variadic.get('callee', '?')}{_mark} "
                     f"format={variadic['format_string']!r} "
                     f"conversions={variadic.get('format_conversions')}"
                 )

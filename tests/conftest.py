@@ -220,6 +220,13 @@ def build_integration_fixtures(
     them. Tests that only exercise the build itself pass a tmp dir, so a
     unit-only run stays side-effect-free.
 
+    That default is the WORKING TREE, and the build leaves things in it: the
+    `*_x86_64` binaries and the `.build.lock` flock file stay in `tests/fixtures/`
+    after the run. Both are gitignored (.gitignore's fixture block), so a real-BN
+    run dirties the directory without dirtying `git status` -- but a sandbox that
+    requires a pristine tree should pass *out_dir* and read the binaries from
+    there.
+
     Race-safe across pytest-xdist workers (an flock on `.build.lock`) and
     across threads in one process (`fcntl` locks are per-process, so the
     threading lock is not redundant). Every failure mode -- missing toolchain,

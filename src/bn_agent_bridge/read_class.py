@@ -1473,11 +1473,27 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
+#: #817: the ctor-new path cannot search at all -- the seam's
+#: ``_operator_new_size_at_ctor`` is still an unconditional ``return None`` stub
+#: (the #205 its TODO defers to is CLOSED). A size miss therefore means "one path
+#: was exhausted and the other was never tried", which is what this reason code
+#: says; a bare null said only "unknown".
+_SIZE_UNAVAILABLE_REASON = "operator_new_recovery_unimplemented"
+
+
 def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
     """Object size with provenance. A defined BN type's width wins (authoritative
     when present); else the operator-new size at a construction site; else None
     (never fabricated). ``ctx._find_type`` raises on a miss, so the lookup is
-    guarded."""
+    guarded.
+
+    A miss stays ``None`` rather than becoming a value-less envelope: the class
+    card renders any ``size`` DICT as ``size ?`` because #619 requires that "an
+    envelope that carries no value still CLAIMED a size" be visible, so returning
+    one for every miss would both change the default card of every class whose
+    size is unrecoverable and make that distinction vacuous. The provenance of a
+    miss travels beside the size instead -- see ``_enrich``'s ``size_source`` /
+    ``size_reason`` (#817)."""
     try:
         found = ctx._find_type(bv, record["name"])
     except Exception:
@@ -1577,7 +1593,17 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                 rec["secondary_vtables"] = recovered["secondary"]   # #412
             rec.setdefault("notes", []).append(
                 "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
-    rec["size"] = ctx._object_size_for(bv, rec)
+    size = ctx._object_size_for(bv, rec)
+    rec["size"] = size
+    # #817: where the size came from is a JSON-surface fact of its own, so it
+    # rides BESIDE the size instead of inside it -- one place to read the
+    # provenance whether or not a size was recovered, and the default text card
+    # (which renders only `size`) is unchanged for a class that has none. The
+    # `size_reason` code then distinguishes "both paths searched, nothing found"
+    # from what actually happens today: the ctor-new path is a stub and was
+    # never tried. Null on a hit, mirroring `hlil_statement_reason`.
+    rec["size_source"] = size["source"] if size else "unavailable"
+    rec["size_reason"] = None if size else _SIZE_UNAVAILABLE_REASON
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
     return rec

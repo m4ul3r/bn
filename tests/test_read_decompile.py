@@ -1684,6 +1684,10 @@ def test_preload_binary_marks_quick_views_for_honesty(monkeypatch, tmp_path):
     instance = bridge.BinaryNinjaBridge()
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
     info = instance._target_info("active")
     assert info["analyzed"] is False and info["analysis_state"] == "quick"
@@ -2487,6 +2491,10 @@ def test_target_info_reports_quick_analysis_state(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     bridge._quick_loaded_views.add(bv)
@@ -2508,6 +2516,10 @@ def test_target_info_reports_unanalyzed_state_for_raw_bndb(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     bridge._unanalyzed_views.add(bv)
@@ -3598,3 +3610,221 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     # reverting the source); post-fix the map is materialised before the walk,
     # so the answer is the one entry that existed when the call started.
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
+
+
+def test_the_two_mapped_address_guards_diverge_on_an_indeterminate_view_827():
+    """#827 item 3 / #888: `_require_mapped_address` and `_address_is_mapped`
+    are NOT interchangeable, and the difference is only visible on a view that
+    cannot answer.
+
+    This exists because the divergence was real and UNTESTED: substituting one
+    policy for the other left 145 tests passing across the three touched
+    modules, so the only thing standing between a future "these two are
+    duplicates" cleanup and a behaviour flip was a comment. A comment is not a
+    test.
+
+    Both policies are pinned here, on the SAME object, so a merge in either
+    direction goes red:
+      * no `is_valid_offset` at all, and
+      * an `is_valid_offset` that raises
+    are the two shapes of "the view cannot answer".
+
+    #888's stated observable is one layer up -- the read OP answers a clean
+    zero rather than raising -- so `tag get` is driven over the same two views
+    as well: a caller-side change that starts rejecting an indeterminate probe
+    would otherwise break the #374 contract with the helper-level pins still
+    green.
+    """
+    import importlib
+
+    _shared = importlib.import_module("bn_agent_bridge._shared")
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    read_tags = importlib.import_module("bn_agent_bridge.read_tags")
+
+    class _NoAnswer:
+        """A view with no `is_valid_offset`; its 1-byte read also fails."""
+        def read(self, addr, length):
+            raise RuntimeError("cannot read")
+
+        def get_functions_containing(self, addr):
+            return []
+
+        def get_tags_at(self, addr, auto=False):
+            return []
+
+    class _RaisingAnswer(_NoAnswer):
+        def is_valid_offset(self, addr):
+            raise RuntimeError("core error")
+
+    class _Ctx:
+        def __init__(self, bv):
+            self._bv = bv
+
+        def _resolve_view(self, selector):
+            return self._bv
+
+    for bv in (_NoAnswer(), _RaisingAnswer()):
+        label = type(bv).__name__
+        # PERMISSIVE: returns quietly, so its caller proceeds. #374 depends on
+        # this -- a mapped address with zero refs must stay a clean exit 0, and
+        # rejecting on "cannot tell" would turn that into an error.
+        assert _shared._require_mapped_address(bv, 0x1000) is None, label
+        # STRICT: answers False, i.e. treats "cannot tell" as "not mapped".
+        assert read_decompile._address_is_mapped(bv, 0x1000) is False, label
+        # The op the permissive policy exists for: a clean zero, not a raise.
+        tags = read_tags._get_tags(_Ctx(bv), None, "0x1000", None)
+        assert tags["address"] == "0x1000", label
+        assert tags["tags"] == [], label
+        assert tags["count"] == 0, label
+
+
+def test_the_arm_predicates_disagree_on_every_bn_platform_name_827():
+    """#827 item 3: the other pair deliberately left un-merged.
+
+    `_is_classic_arm_or_thumb_arch` matches by PREFIX; the seam's
+    `_supports_thumb_pointer_tags` matches by SUBSTRING. Measured against the
+    installed BN API, they agree on every ARM *arch* name and disagree on every
+    ARM *platform* name, because BN spells platforms `<os>-<arch>`. The names
+    are pinned as literals so this test needs no BN: it is guarding the RULE,
+    not BN's catalogue.
+
+    The seam side calls the REAL predicate through a minimal view. The first
+    cut re-declared the substring rule as a local closure, and a test that
+    asserts a COPY of the rule is green whatever the rule does: rewriting the
+    seam's last line to `joined.startswith(...)` -- the exact merge this pair
+    exists to forbid, and the one #600 already paid for once -- left it
+    passing. The whole point of the test is that that mutation goes red.
+    """
+    import importlib
+
+    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    seam = importlib.import_module("bn_agent_bridge.seam")
+    prefix = read_decompile._is_classic_arm_or_thumb_arch
+    ctx = seam.BridgeContext(None)
+
+    class _Named:
+        """An arch/platform object shaped the way the seam reads one: it takes
+        `.name`, and also `str()`, which BN's objects answer with the name."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __str__(self) -> str:
+            return self.name
+
+    class _View:
+        """The minimum the seam predicate reads. `arch` is absent on purpose:
+        the seam joins arch AND platform names, so an ARM arch name sitting
+        beside the platform name would satisfy either rule and hide the very
+        divergence under test."""
+
+        address_size = 4
+        arch = None
+
+        def __init__(self, name: str) -> None:
+            self.platform = _Named(name)
+
+    def substring(name: str) -> bool:
+        return ctx._supports_thumb_pointer_tags(_View(name))
+
+    # Arch names: the two rules agree, which is why the divergence is invisible
+    # on an ordinary ARM binary (the seam joins arch AND platform, and the arch
+    # name alone already matches under either rule).
+    for arch in ("armv7", "armv7eb", "thumb2", "thumb2eb"):
+        assert prefix(arch) is substring(arch) is True, arch
+
+    # Platform names: every one is `<os>-<arch>`, so NONE starts with
+    # arm/thumb and the two rules disagree on all of them.
+    for platform in ("linux-armv7", "linux-armv7eb", "linux-thumb2",
+                     "ios-armv7", "ios-kernel-thumb2", "mac-armv7",
+                     "windows-thumb2", "efi-armv7", "freebsd-thumb2"):
+        assert prefix(platform) is False, platform
+        assert substring(platform) is True, platform
+
+    # The #600 exclusion is the part they DO share, in both spellings.
+    for arm64 in ("aarch64", "linux-aarch64", "arm64", "mac-arm64"):
+        assert prefix(arm64) is substring(arm64) is False, arm64
+
+    # The seam's 4-byte gate is part of the rule it is being pinned against: a
+    # 64-bit view is never Thumb-tagged whatever its names say, so a future
+    # "just use the arch predicate" merge cannot claim equivalence here either.
+    class _WideView(_View):
+        address_size = 8
+
+    assert ctx._supports_thumb_pointer_tags(_WideView("linux-armv7")) is False
+
+
+def test_variadic_text_marks_the_count_with_the_stated_confidence_886():
+    """#827 item 6 / #886: the variadic count's confidence must reach TEXT, and
+    must read as a claim about the COUNT.
+
+    `read_evidence` stamps `confidence: heuristic` / `provenance:
+    abi-format-heuristic` on the diagnostic, and the text renderer printed
+    `expected >= N argument(s)` in the same voice as the recovered facts beside
+    it -- JSON-only disclosure, the #883 shape. #886 asks specifically that the
+    marker read as "this count is a heuristic" rather than as a hedge on the
+    whole finding, which is why it is spelled `count: <confidence>` and sits
+    directly after the verdict token it qualifies.
+
+    Pinned here, because the marker shipped with NONE of it -- reverting the
+    render site left every selected variadic test green, so deleting the
+    marker was invisible to CI:
+      * the EXACT line, so neither the `count:` spelling nor the marker's
+        placement can drift away from the wording #886 asked for;
+      * a FIRM word renders too, and is never omitted: `count: authoritative`
+        states the count is authoritative, which is not a hedge. An earlier
+        cut omitted it, which made a payload that calls the count firm render
+        byte-identically to one that said nothing about it;
+      * a payload that stated NOTHING renders no marker, and must not collide
+        with either of the above;
+      * a present-but-UNREADABLE confidence is disclosed by the render
+        boundary rather than dropped, which is the whole reason the field is
+        read through `_text_value` and not an inline isinstance (#619);
+      * a whitespace-only word is `_text_value`'s PRESENT-AND-EMPTY case --
+        no word was stated -- so it renders no marker rather than an empty
+        `[count:    ]`.
+    """
+    from bn.formatters import _render_function_evidence_text
+
+    def render(variadic: dict) -> str:
+        return _render_function_evidence_text(
+            {"calls": [{"address": "0x1000",
+                        "variadic": {"is_variadic": True, **variadic}}]}
+        )
+
+    def variadic_line(variadic: dict) -> str:
+        return [ln for ln in render(variadic).splitlines()
+                if ln.startswith("  variadic: ")][0]
+
+    warning = ("imported variadic call `f` under-recovered in HLIL: "
+               "recovered 1 of an expected >= 3 argument(s)")
+    under = {"under_recovered": True, "warning": warning}
+    fmt = {"callee": "f", "format_string": "%s%d", "format_conversions": 2}
+
+    # The exact line, both branches: `count:` names the subject, and the marker
+    # sits on the verdict/callee token, not trailing the sentence after it.
+    assert variadic_line({**under, "confidence": "heuristic"}) == (
+        f"  variadic: UNDER-RECOVERED [count: heuristic] — {warning}")
+    assert variadic_line({**fmt, "confidence": "heuristic"}) == (
+        "  variadic: f [count: heuristic] format='%s%d' conversions=2")
+
+    # A firm word is rendered, not omitted -- and the three states stay
+    # distinguishable, which omitting the firm one destroyed.
+    for payload in (under, fmt):
+        firm = variadic_line({**payload, "confidence": "authoritative"})
+        assert "[count: authoritative]" in firm, firm
+        silent = variadic_line(payload)
+        assert "[count:" not in silent, silent
+        assert firm != silent != variadic_line({**payload, "confidence": "heuristic"})
+
+    # An unrecognised word is the payload's to state; the renderer relays it.
+    assert "[count: medium]" in variadic_line({**under, "confidence": "medium"})
+
+    # Present but unreadable: no marker, but the boundary says the field was
+    # there and could not be used.
+    skewed = render({**under, "confidence": {"level": "heuristic"}})
+    assert "[count:" not in skewed and "malformed confidence field" in skewed, skewed
+
+    # Whitespace-only states no word: no empty marker, and no skew claimed.
+    blank = render({**under, "confidence": "   "})
+    assert "[count:" not in blank and "malformed" not in blank, blank

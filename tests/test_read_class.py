@@ -964,9 +964,54 @@ def test_size_from_operator_new_when_no_type():
     assert out["at"] == "0x443abc"
 
 
+class _EnrichCtx(_SizeCtx):
+    """The record-level seam `class show` fills: everything but the size is
+    stubbed out, because the size and its provenance are what these pin."""
+
+    def _object_size_for(self, bv, record):
+        return read_class._object_size(self, bv, record)
+
+    def _bases_for(self, bv, record):
+        return []
+
+    def _instances_for(self, bv, record):
+        return {}
+
+
 def test_size_none_when_nothing_resolves():
+    """A miss stays a bare `None`, NOT a value-less envelope: `_render_one_class`
+    renders any `size` dict as `size ?` on purpose (#619 -- an envelope that
+    carries no value still CLAIMED a size), so an envelope per miss would change
+    the default card of every size-less class and make that #619 distinction
+    vacuous. #817's provenance lives beside the size instead."""
     rec = {"name": "net::Session", "methods": []}
     assert read_class._object_size(_SizeCtx(), object(), rec) is None
+
+
+def test_class_card_for_a_sizeless_class_is_unchanged_817():
+    """The size-less default card, composed end to end: what `_object_size`
+    produces, rendered by the real text formatter."""
+    formatters = importlib.import_module("bn.formatters")
+    rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
+    read_class._enrich(_EnrichCtx(), object(), rec)
+
+    assert formatters._render_one_class(rec).splitlines()[0] == "class net::Session"
+
+
+def test_class_record_states_where_the_size_came_from_817():
+    """#817: `class show` reported `size: null` with no `size_source` and no note
+    that the ctor-new path is a permanent stub, so a miss was indistinguishable
+    from a search that tried both paths. Provenance is now always readable in one
+    place, and the miss names the stub."""
+    missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
+    assert missed["size"] is None
+    assert missed["size_source"] == "unavailable"
+    assert missed["size_reason"] == "operator_new_recovery_unimplemented"
+
+    hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
+                             {"name": "net::Session", "methods": []})
+    assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
+    assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
 
 
 def test_size_survives_find_type_raising():
