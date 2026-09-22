@@ -1166,6 +1166,10 @@ def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     bv = _FakeBV(strings=[])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    # #775: `target_info` takes ONE snapshot now (view + listing from the
+    # same refresh), so the composed seam needs stubbing too.
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
 
     bridge._quick_loaded_views.add(bv)

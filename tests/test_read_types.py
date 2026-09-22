@@ -198,7 +198,7 @@ def test_types_declare_refuses_a_partially_dropped_declaration_760(monkeypatch):
 
 
 def _declare_probe_bv(monkeypatch, *, good=("widget_a_t", "widget_b_t"),
-                      variables=("widget_inst",), raise_when=None):
+                      variables=("widget_inst",), functions=(), raise_when=None):
     """A view whose platform parser behaves the way the real one does for #760.
 
     `good` are the names it materializes; anything else in an inspected fragment is
@@ -206,7 +206,9 @@ def _declare_probe_bv(monkeypatch, *, good=("widget_a_t", "widget_b_t"),
     name collides with a built-in type disappears. `variables` come back through the
     `variables` slot, so a variable declaration with a brace initializer parses to
     zero types WITHOUT raising (the shape that broke an earlier cut of the guard).
-    `raise_when` models a fragment that cannot parse on its own.
+    `functions` does the same for the prototype slot, the third bucket BN's parser
+    returns and the one #778 is about. `raise_when` models a fragment that cannot
+    parse on its own.
     """
 
     class _Platform:
@@ -217,6 +219,7 @@ def _declare_probe_bv(monkeypatch, *, good=("widget_a_t", "widget_b_t"),
                 types={name: _FakeType(name, width=4, members=[])
                        for name in good if name in source},
                 variables={name: "int" for name in variables if name in source},
+                functions={name: "int ()" for name in functions if name in source},
             )
 
     class _DeclareBV(_FakeBV):
@@ -334,6 +337,52 @@ def test_types_declare_allows_a_variable_declaration_with_a_brace_initializer_76
     assert set(result["defined_types"]) == {"widget_a_t"}
     assert result["count"] == 1
     assert bv.defined == ["widget_a_t"]          # nothing refused, nothing extra applied
+
+
+def test_types_declare_discloses_prototypes_it_cannot_apply_778(monkeypatch):
+    """#778: a declaration carrying function/variable prototypes alongside its
+    types applied only the types and still reported success, with nothing saying
+    the rest had been left alone -- the caller had to infer it from a bare
+    `parsed_function_count`. The types still land (refusing would reject the
+    normal shape of a header, and #760 already settled that a variable
+    declaration must not break the request); what changes is that the result now
+    SAYS what it did not apply, and names the verbs that can."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch, functions=("widget_update",),
+                           variables=("widget_inst",))
+
+    result = _declare(instance, bv, (
+        "struct widget_a_t { int a; }; "
+        "int widget_update(struct widget_a_t *w); "
+        "struct widget_known_t widget_inst = {};"
+    ))
+
+    # The type still lands -- this is a disclosure, not a refusal.
+    assert set(result["defined_types"]) == {"widget_a_t"}
+    assert bv.defined == ["widget_a_t"]
+    unapplied = result["unapplied_prototypes"]
+    assert unapplied["functions"] == ["widget_update"]
+    assert unapplied["variables"] == ["widget_inst"]
+    note = result["unapplied_note"]
+    assert "NOT applied" in note
+    # The note must point at the address-aware verbs, since the reason these
+    # cannot be applied here is that a bare prototype carries no address.
+    assert "proto set" in note and "data retype" in note
+
+
+def test_types_declare_types_only_grows_no_disclosure_keys_778(monkeypatch):
+    """The must-not-fire twin: an ordinary types-only declaration must read
+    exactly as it did before, or every clean request pays for the disclosure."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _declare_probe_bv(monkeypatch)
+
+    result = _declare(instance, bv, "struct widget_a_t { int a; };")
+
+    assert set(result["defined_types"]) == {"widget_a_t"}
+    assert "unapplied_prototypes" not in result
+    assert "unapplied_note" not in result
 
 
 def test_types_declare_allows_a_multi_declaration_that_all_land_760(monkeypatch):
@@ -454,7 +503,9 @@ def test_empty_type_parse_rolls_back_and_reports_reason(
 
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    bv = _FakeCommentMutationBV(comments={0x1000: "original"})
+    bv = _FakeCommentMutationBV(
+        comments={0x1000: "original"}, memory={0x1000: b"\x00"}
+    )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult(), raising=False)
     result = instance._mutation("active", preview, [

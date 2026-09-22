@@ -964,9 +964,54 @@ def test_size_from_operator_new_when_no_type():
     assert out["at"] == "0x443abc"
 
 
+class _EnrichCtx(_SizeCtx):
+    """The record-level seam `class show` fills: everything but the size is
+    stubbed out, because the size and its provenance are what these pin."""
+
+    def _object_size_for(self, bv, record):
+        return read_class._object_size(self, bv, record)
+
+    def _bases_for(self, bv, record):
+        return []
+
+    def _instances_for(self, bv, record):
+        return {}
+
+
 def test_size_none_when_nothing_resolves():
+    """A miss stays a bare `None`, NOT a value-less envelope: `_render_one_class`
+    renders any `size` dict as `size ?` on purpose (#619 -- an envelope that
+    carries no value still CLAIMED a size), so an envelope per miss would change
+    the default card of every size-less class and make that #619 distinction
+    vacuous. #817's provenance lives beside the size instead."""
     rec = {"name": "net::Session", "methods": []}
     assert read_class._object_size(_SizeCtx(), object(), rec) is None
+
+
+def test_class_card_for_a_sizeless_class_is_unchanged_817():
+    """The size-less default card, composed end to end: what `_object_size`
+    produces, rendered by the real text formatter."""
+    formatters = importlib.import_module("bn.formatters")
+    rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
+    read_class._enrich(_EnrichCtx(), object(), rec)
+
+    assert formatters._render_one_class(rec).splitlines()[0] == "class net::Session"
+
+
+def test_class_record_states_where_the_size_came_from_817():
+    """#817: `class show` reported `size: null` with no `size_source` and no note
+    that the ctor-new path is a permanent stub, so a miss was indistinguishable
+    from a search that tried both paths. Provenance is now always readable in one
+    place, and the miss names the stub."""
+    missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
+    assert missed["size"] is None
+    assert missed["size_source"] == "unavailable"
+    assert missed["size_reason"] == "operator_new_recovery_unimplemented"
+
+    hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
+                             {"name": "net::Session", "methods": []})
+    assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
+    assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
 
 
 def test_size_survives_find_type_raising():
@@ -2433,3 +2478,1261 @@ def test_the_scan_does_not_over_terminate_on_exact_starts_821():
 
     assert [s["index"] for s in layout["slots"]] == [0, 1, 2]
     assert layout["total"] == 3
+
+# --- #675.2: the DECLARED-type fallback for `class list` / `class show` -------
+#
+# The class lens clusters classes from symbols and RTTI, so a class the user
+# DECLARED -- `bn types declare 'class Widget { virtual void draw(); };'` -- is
+# invisible to it: there is no `_ZTV`/`_ZTI` symbol and no demangled method
+# symbol, so `class show Widget` answered "No class named 'Widget'" while
+# `types --query Widget` found it. The fallback reads `bv.types` LIVE on every
+# call: a `types declare` (`define_user_type`) emits no BN symbol/function
+# notification, so it cannot invalidate the memoised class registry -- merging
+# the declared records INTO that memo would serve a stale "no such class" for a
+# type declared a moment ago (#622's cache, #675's triage comment).
+
+class _DeclaredType:
+    """A view type in the minimum shape the fallback reads: a width, a name and
+    a KIND. No `members`, so the seam's `_type_entry` renders the header-only
+    layout BN gives a declaration whose fields it does not enumerate.
+
+    `type_class` is BN's `TypeClass` value -- 4 (`StructureTypeClass`) is the one
+    kind that is a C++ class type, and it is what the declared half filters on
+    (#907 review). Left a class attribute with an instance override so
+    `_CountingDeclaredType`, which deliberately does not call `__init__`, still
+    states a kind."""
+    type_class = 4          # StructureTypeClass
+
+    def __init__(self, width=0x10, name="Widget", type_class=None):
+        self.width = width
+        self.name = name
+        if type_class is not None:
+            self.type_class = type_class
+
+    def __str__(self):
+        return f"struct {self.name}"
+
+
+# The kinds BN registers in `bv.types` alongside structures. Every one of these
+# answered `class show` as a `[declared-only]` class before the kind filter
+# (#907 review): `class Color (size 0x4)` for an ENUM, with the note asserting
+# its empty vtable is "RTTI evidence that is absent" about a type that can never
+# carry one. Both spellings of `type_class` are covered because BN's is an
+# IntEnum and the unit fakes elsewhere carry the plain string.
+_NON_CLASS_DECLARED_KINDS = (
+    ("Color", 5, "enum Color"),                      # EnumerationTypeClass
+    ("handle_t", 2, "int32_t"),                      # IntegerTypeClass
+    ("cb_t", 6, "void (*)()"),                       # PointerTypeClass
+    ("row_t", 7, "char [16]"),                       # ArrayTypeClass
+    ("op_t", 8, "int32_t (void*)"),                  # FunctionTypeClass
+    ("Flags", "EnumerationTypeClass", "enum Flags"),  # the string-typed spelling
+)
+
+# A handle that states no kind at all is a different answer: nothing was read,
+# so it is neither a class nor a proven non-class. It misses like the kinds
+# above but the miss DISCLOSES, and it is excluded from the count identity --
+# a count cannot describe a set with an unclassified member (#907 review r3).
+_UNCLASSIFIABLE_DECLARED_KINDS = (
+    ("Nameless", None, "?"),
+)
+
+
+class _DeclaredKind:
+    """A declared type of an arbitrary kind, rendering as its own declaration."""
+
+    def __init__(self, name, type_class, decl, width=4):
+        self.name = name
+        self.type_class = type_class
+        self._decl = decl
+        self.width = width
+
+    def __str__(self):
+        return self._decl
+
+
+class _FakeTypeContainer:
+    """BN's `bv.user_type_container`, in the shape the real one has: `.types` is
+    `{type_id: (QualifiedName, Type)}`, keyed by ID with the NAME in the value.
+
+    Mirrored rather than simplified because the fidelity is the point: the
+    declared half's population is this container and NOT `bv.types`, which also
+    holds every type BN imported (measured on a stock system ELF: 53 types, 25 of
+    them structure-kind, user container empty -- #907 review)."""
+
+    def __init__(self, declared):
+        self.types = {f"id-{i}": (name, type_obj)
+                      for i, (name, type_obj) in enumerate(declared.items())}
+
+
+def _declared_bv(_also_in_type_table=None, **types_):
+    """The registry view plus USER-declared types -- the half the fallback reads.
+    Nothing here has RTTI, so every type in it is declared-only.
+
+    `bv.types` gets the same entries plus anything in *_also_in_type_table*: the
+    view's type table legitimately holds BN's own imports alongside the user's
+    declarations, and a test that only populated the user container could not
+    catch the lens reading the wrong one."""
+    bv = _make_registry_bv()
+    bv.types = dict(types_, **(_also_in_type_table or {}))
+    bv.user_type_container = _FakeTypeContainer(dict(types_))
+    return bv
+
+
+class _CountingDeclaredType(_DeclaredType):
+    """A defined type that counts how many times its WIDTH is read.
+
+    A BN type's width is computed lazily on first touch (~1 ms per type,
+    measured), so the declared half takes it only for a record it actually
+    returns. Nothing functional fails if that moves into the record builder --
+    only latency on a view with thousands of types -- which is what this counts.
+    """
+
+    def __init__(self, width=0x10, name="Widget"):
+        # Deliberately not `super().__init__(...)`: that assigns `self.width`,
+        # which this class shadows with the counting property.
+        self._width = width
+        self.name = name
+        self.width_reads = 0
+
+    @property
+    def width(self):
+        self.width_reads += 1
+        return self._width
+
+
+def _declared_ctx(monkeypatch, bv):
+    """A real `BridgeContext` with only the view pinned: `_type_entry` is the
+    seam's own builder, so the test reads the shape a live call produces."""
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: None)
+    monkeypatch.setattr(ctx, "_bases_for", lambda b, r: [])
+    monkeypatch.setattr(ctx, "_instances_for", lambda b, r: {
+        "construction_sites": [], "stored_globals": []})
+    return ctx
+
+
+def test_class_show_falls_back_to_a_declared_type_675(monkeypatch):
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["name"] == "Widget"
+    assert out["confidence"] == "declared-only"
+    assert out["size"] == {"value": "0x10", "source": "declared_type"}
+    # The class-specific evidence is RTTI-driven, and this view has no RTTI class
+    # for the name -- so an empty methods/vtable must not read as "has none".
+    assert out["methods"] == [] and out["vtable"] is None and out["bases"] == []
+    assert any("RTTI" in note for note in out["notes"]), out["notes"]
+    # The card reads `instances` as a container, so a pre-`_enrich` `[]` would be
+    # disclosed as a malformed field on every declared card (#619).
+    from bn.formatters import _render_class_show_text
+    text = _render_class_show_text(out)
+    assert "malformed" not in text
+    assert "no RTTI class" in text
+
+
+def test_class_show_declared_fallback_is_live_not_memoised_675(view_memo_live):
+    """The staleness case #675's triage names: a type the user declares enters the
+    view while the registry memo stays primed, so a fallback folded INTO that memo
+    answers the stale "No class named".
+
+    SCOPE, because the premise needs stating honestly (#907 dogfood measured it
+    false through the CLI): on BN 6.1 a real `types declare` DOES move the
+    per-view generation counter and so DOES invalidate the registry memo. This
+    test's `enumerations == 1` therefore asserts a property of THIS FIXTURE -- a
+    plain `bv.types` assignment fires no notification -- and not a property of the
+    live system. What it proves is the wiring the fix needs: the declared half is
+    read OUTSIDE the registry, so it is fresh regardless of whether the registry
+    was rebuilt. The live-session redefinition case is the one that justifies the
+    live read on its own merits, and it is covered by
+    `test_class_show_tracks_a_REDEFINED_declared_type_675`."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+    bv.types = {}
+    bv.user_type_container = _FakeTypeContainer({})
+
+    ctx = seam.BridgeContext(None)
+    ctx._resolve_view = lambda sel: bv          # instance attribute shadows the seam
+
+    primed = read_class._class_list(ctx, None)
+    assert "Widget" not in [row["name"] for row in primed["items"]]
+    assert bv.functions.enumerations == 1
+
+    # A declare: the type enters the USER container, no notification is fired.
+    bv.user_type_container = _FakeTypeContainer({"Widget": _DeclaredType()})
+
+    out = read_class._class_show(ctx, None, "Widget")
+    assert out["name"] == "Widget"
+    assert out["confidence"] == "declared-only"
+    assert bv.functions.enumerations == 1, (
+        "the registry must still be the memoised one -- otherwise this test is "
+        "not exercising the staleness it claims to"
+    )
+
+
+def test_class_show_prefers_the_rtti_record_over_a_declared_type_of_the_same_name_675(
+    monkeypatch,
+):
+    """The twin: a name that is BOTH a defined type and an RTTI-recovered class
+    keeps the RTTI record. The registry is consulted first, so the declared
+    fallback cannot shadow real evidence with a no-evidence record."""
+    bv = _declared_bv(**{"net::Session": _DeclaredType(name="net::Session")})
+    ctx = _declared_ctx(monkeypatch, bv)
+    monkeypatch.setattr(ctx, "_vtable_layout_for", lambda b, a: None)
+
+    out = read_class._class_show(ctx, None, "net::Session")
+
+    assert out["confidence"] == "rtti"
+    assert read_class._DECLARED_TYPE_NOTE not in (out.get("notes") or [])
+    assert "type" not in out, "the declared drill-down must not reach an RTTI record"
+
+
+def test_class_show_unknown_name_still_misses_byte_identically_675(monkeypatch):
+    """A genuinely unknown name must not start reporting the declared records --
+    the fallback is a name lookup, not a looser matcher -- and the hint text stays
+    exactly what it was."""
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(ctx, None, "net::Sesion")     # typo of net::Session
+    assert str(exc.value) == (
+        "No class named 'net::Sesion'. Did you mean: net::Session, net::Pool? Run "
+        "`bn class list` (add --all for name-only clusters) to discover available "
+        "classes."
+    )
+
+
+def test_class_show_resolves_a_declared_type_by_leaf_and_reports_ambiguity_675(
+    monkeypatch,
+):
+    """Declared names go through the registry's OWN name resolution: a bare leaf
+    still reaches a namespaced declaration, and two of them are ambiguous (the
+    envelope the RTTI half already returns), not a silent first-wins pick."""
+    bv = _declared_bv(**{"a::Widget": _DeclaredType(name="a::Widget"),
+                         "b::Widget": _DeclaredType(name="b::Widget")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["ambiguous"] is True
+    assert out["query"] == "Widget"
+    assert {m["name"] for m in out["matches"]} == {"a::Widget", "b::Widget"}
+    assert all(m["confidence"] == "declared-only" for m in out["matches"])
+
+
+def test_class_show_declared_record_carries_the_canonical_type_entry_675(monkeypatch):
+    """The declaration itself is the drill-down: the `type` entry is the seam's
+    canonical `_type_entry` for that name, the same shape `types` reports, so the
+    class answer and the type answer cannot drift."""
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+
+    assert out["type"] == ctx._type_entry(
+        "Widget", bv.user_type_container.types["id-0"][1])
+    assert out["type"]["name"] == "Widget"
+    assert out["type"]["kind"] == "struct"
+
+
+def test_class_list_folds_declared_types_out_by_default_and_counts_them_675(monkeypatch):
+    """`class list` is a listing of RTTI/ctor-confirmed classes, so a declared
+    type joins it under `--all` (the flag that already admits non-RTTI clusters)
+    and is counted when folded out -- a default listing that stayed silent about
+    it would read as the blindness #675.2 fixes."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      Gadget=_DeclaredType(name="Gadget", width=0x20))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    default = read_class._class_list(ctx, None)
+    assert "Widget" not in [row["name"] for row in default["items"]]
+    assert default["declared_suppressed"] == 2
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert counted["declared_suppressed"] == 2
+    assert counted["count"] == default["total"]
+
+    full = read_class._class_list(ctx, None, include_all=True)
+    rows = {row["name"]: row for row in full["items"]}
+    assert rows["Widget"]["confidence"] == "declared-only"
+    assert rows["Widget"]["size"] == {"value": "0x10", "source": "declared_type"}
+    assert rows["Widget"]["method_count"] == 0
+    assert rows["Widget"]["has_vtable"] is False
+    assert rows["Gadget"]["size"] == {"value": "0x20", "source": "declared_type"}
+    assert full["declared_suppressed"] == 0
+
+
+def test_class_list_declared_rows_pass_the_existing_filters_675(monkeypatch):
+    """Every filter keeps working on the declared half: `--query` matches the
+    name, `--no-stl` folds a declaration inside `std`, and the RTTI half is
+    untouched."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{"std::Box": _DeclaredType(name="std::Box")})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    all_rows = read_class._class_list(ctx, None, include_all=True)
+    assert {"Widget", "std::Box"} <= {row["name"] for row in all_rows["items"]}
+
+    queried = read_class._class_list(ctx, None, include_all=True, query="widget")
+    assert [row["name"] for row in queried["items"]] == ["Widget"]
+
+    stl = read_class._class_list(ctx, None, include_all=True, no_stl=True)
+    assert "std::Box" not in [row["name"] for row in stl["items"]]
+    assert stl["library_suppressed"] == 1
+
+    paged = read_class._class_list(ctx, None, include_all=True, limit=1)
+    assert paged["returned"] == 1 and paged["has_more"] is True
+
+
+def test_declared_width_is_read_only_for_a_record_that_is_returned_675(monkeypatch):
+    """The eager alternative: build the `size` envelope for every defined type.
+    A BN type's width is computed LAZILY on first touch, so that would put the
+    cost of every type in the view on every `class list` -- including the default
+    listing, which counts the declared types and renders none of them -- and no
+    functional assertion would notice. The declared half therefore reads a width
+    exactly where a record states one."""
+    declared = _CountingDeclaredType()
+    bv = _declared_bv(Widget=declared)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    counted = read_class._class_list(ctx, None)            # gated out, none rendered
+    assert counted["declared_suppressed"] == 1
+    assert declared.width_reads == 0
+
+    paged = read_class._class_list(ctx, None, include_all=True)   # a row that states size
+    row = next(r for r in paged["items"] if r["name"] == "Widget")
+    assert row["size"] == {"value": "0x10", "source": "declared_type"}
+    assert declared.width_reads >= 1
+
+    before = declared.width_reads
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["size"] == {"value": "0x10", "source": "declared_type"}
+    assert declared.width_reads > before
+
+
+def test_class_show_tracks_a_REDEFINED_declared_type_675(view_memo_live):
+    """The SECOND staleness axis (#675 item 2 dogfood): redefinition, not first
+    definition. A name whose DEFINITION changes under a primed registry must be
+    reported at its new size -- and the first axis cannot see this, because a
+    fallback that cached per-NAME would answer the old width here while passing
+    `..._is_live_not_memoised_675` unchanged. Two axes because they fail
+    differently: this one moves the value, that one moves the population.
+
+    `enumerations` stays at 1 throughout: the RTTI registry is still the memoised
+    one, so the only moving part is the declared half the fallback rebuilds."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+    bv.types = {}
+    bv.user_type_container = _FakeTypeContainer({})
+
+    ctx = seam.BridgeContext(None)
+    ctx._resolve_view = lambda sel: bv          # instance attribute shadows the seam
+
+    read_class._class_list(ctx, None)           # prime the registry memo
+    assert bv.functions.enumerations == 1
+
+    bv.user_type_container = _FakeTypeContainer(
+        {"Sprocket": _DeclaredType(width=0x14, name="Sprocket")})
+    first = read_class._class_show(ctx, None, "Sprocket")
+    assert first["size"] == {"value": "0x14", "source": "declared_type"}
+
+    # A re-declare: same name, wider body, and still no notification fired.
+    bv.user_type_container = _FakeTypeContainer(
+        {"Sprocket": _DeclaredType(width=0x28, name="Sprocket")})
+    again = read_class._class_show(ctx, None, "Sprocket")
+
+    assert again["size"] == {"value": "0x28", "source": "declared_type"}, (
+        "a redefined declared type must report its NEW width; a per-name cache "
+        "would still answer 0x14 here while passing the first-definition axis"
+    )
+    assert bv.functions.enumerations == 1, (
+        "the registry must still be the memoised one -- otherwise this test is "
+        "not exercising the staleness it claims to"
+    )
+
+
+@pytest.mark.parametrize("name,type_class,decl",
+                         _NON_CLASS_DECLARED_KINDS + _UNCLASSIFIABLE_DECLARED_KINDS)
+def test_class_show_refuses_a_declared_NON_CLASS_type_675(monkeypatch, name, type_class, decl):
+    """`bv.types` is the view's whole type table, so the declared half must ask
+    WHICH kind it is holding. An enum / scalar / pointer / array / function
+    declaration is not a class, and answering `class show Color` with
+    `class Color (size 0x4) [declared-only]` is wrong in a way a reader believes
+    -- the note even asserts the empty vtable is "RTTI evidence that is absent"
+    about a type that can never carry one (#907 review).
+
+    Each miss says which KIND of answer it is. A kind that was READ and is not a
+    class is a plain miss -- nothing about it was left unexamined -- while a
+    handle stating no kind at all has established nothing, so its miss discloses
+    rather than asserting the name is absent (#907 review round 3).
+
+    The real class in the same view is asserted alongside, so a filter that
+    simply refuses the declared half everywhere cannot pass this."""
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{name: _DeclaredKind(name, type_class, decl)})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, name)
+    assert err.value.status == "unknown_class"
+    assert ("could not be read" in str(err.value)) is (type_class is None), str(err.value)
+
+    still = read_class._class_show(ctx, None, "Widget")
+    assert still["confidence"] == "declared-only"
+
+
+def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypatch):
+    """The count and the listing are one population or neither is trustworthy.
+
+    Before the kind filter the hidden line said `5 declared types` on a view
+    holding ONE declared class, because the count was taken over the whole type
+    table -- a number describing a different population than the rows `--all`
+    then shows (#907 review). Both flow through the same enumeration now, which
+    is what keeps them from re-splitting: the identity assertion below fails if
+    a future change filters one side only.
+
+    Asserted under each flag that can move one side and not the other, because
+    the confidence gate fires BEFORE --no-stl/--no-vendor: the number is read as
+    "what `--all` would add", so a `std::` declaration counted under `--no-stl`
+    promises a row `--all --no-stl` does not show. Compared against the UNPAGED
+    listing throughout -- `--limit` windows the rows and the count is not a page
+    count."""
+    from bn.formatters import _render_class_list_text
+
+    def declared_rows(**kw):
+        listing = read_class._class_list(ctx, None, include_all=True, **kw)
+        return sorted(row["name"] for row in listing["items"]
+                      if row["confidence"] == "declared-only")
+
+    bv = _declared_bv(Widget=_DeclaredType(),
+                      **{n: _DeclaredKind(n, tc, decl)
+                         for n, tc, decl in _NON_CLASS_DECLARED_KINDS})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listed = declared_rows()
+    assert listed == ["Widget"], (
+        "only a declared CLASS type may be listed as a class; the enum/scalar/"
+        f"pointer/array/function declarations must not appear: {listed}")
+
+    default = read_class._class_list(ctx, None)
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert default["declared_suppressed"] == len(listed), (
+        "the hidden count must count the rows `--all` lists, not the type table: "
+        f"{default['declared_suppressed']} counted vs {len(listed)} listed")
+    assert counted["declared_suppressed"] == len(listed)
+    assert ("1 user-declared class type (--all to show)"
+            in _render_class_list_text(default))
+
+    # Same identity under the flags that fold rows out AFTER the confidence gate.
+    bv.user_type_container.types["id-std"] = ("std::Box", _DeclaredType(name="std::Box"))
+    bv.user_type_container.types["id-boost"] = ("boost::Ref",
+                                                _DeclaredType(name="boost::Ref"))
+    assert declared_rows() == sorted(["Widget", "boost::Ref", "std::Box"])
+    for flags in ({}, {"no_stl": True}, {"no_vendor": True},
+                  {"no_stl": True, "no_vendor": True}, {"query": "box"},
+                  {"query": "widget"}, {"query": "handle"}):
+        rows = declared_rows(**flags)
+        for mode in ({}, {"count_only": True}):
+            envelope = read_class._class_list(ctx, None, **flags, **mode)
+            assert envelope["declared_suppressed"] == len(rows), (
+                f"under {flags or 'no flags'}{' --count' if mode else ''} the "
+                f"hidden count says {envelope['declared_suppressed']} declared "
+                f"class type(s) while `--all` lists {len(rows)}: {rows}")
+
+    # A page window moves the ROWS, never the count: the count is not a page count.
+    paged = read_class._class_list(ctx, None, include_all=True, limit=1)
+    assert paged["returned"] == 1 and paged["has_more"] is True
+    assert read_class._class_list(ctx, None, limit=1)["declared_suppressed"] == 3
+
+
+def test_filtered_declared_classes_are_disclosed_on_the_default_listing_675(monkeypatch):
+    """A filter must name a declaration it hides even when --all was omitted.
+
+    The confidence gate used to run first and skip the declaration without
+    counting it under either the declared or library/vendor suppression.
+    """
+    from bn.formatters import _render_class_list_text
+
+    bv = _declared_bv(**{"std::Box": _DeclaredType(name="std::Box"),
+                          "boost::Ref": _DeclaredType(name="boost::Ref"),
+                          "Widget": _DeclaredType(name="Widget")})
+    ctx = _declared_ctx(monkeypatch, bv)
+    listing = read_class._class_list(ctx, None, no_stl=True, no_vendor=True)
+    assert listing["declared_suppressed"] == 1
+    assert listing["library_suppressed"] == 1
+    assert listing["vendor_suppressed"] == 1
+    text = _render_class_list_text(listing)
+    assert "1 user-declared class type (--all to show)" in text
+    assert "1 library/STL" in text and "1 vendored" in text
+
+    expanded = read_class._class_list(
+        ctx, None, include_all=True, no_stl=True, no_vendor=True)
+    assert [row["name"] for row in expanded["items"]
+            if row["confidence"] == "declared-only"] == ["Widget"]
+
+
+def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
+    """`typedef struct { ... } Widget;` is how C++ code most often reaches a
+    view: BN registers the body as an auto-named struct and `Widget` as a
+    NamedTypeReference to it (see `read_types._follow_typedef`, #674). Filtering
+    on the ALIAS's own kind would leave `class show Widget` answering only for
+    the internal `_Widget`, so the kind test follows the chain -- and a chain
+    that terminates at an enum is still refused."""
+    class _Alias:
+        type_class = 11         # NamedTypeReferenceClass
+
+        def __init__(self, target, width=0x10):
+            self._target = target
+            self.width = width
+
+        def target(self, bv):
+            return self._target
+
+        def __str__(self):
+            return "alias"
+
+    bv = _declared_bv(Widget=_Alias(_DeclaredType(name="_Widget")),
+                      Color=_Alias(_DeclaredKind("_Color", 5, "enum _Color")),
+                      Broken=_Alias(None))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "Widget")
+    assert out["name"] == "Widget" and out["confidence"] == "declared-only"
+
+    for refused in ("Color", "Broken"):
+        with pytest.raises(read_class.OperationFailure) as err:
+            read_class._class_show(ctx, None, refused)
+        assert err.value.status == "unknown_class", refused
+
+    full = read_class._class_list(ctx, None, include_all=True)
+    assert [row["name"] for row in full["items"]
+            if row["confidence"] == "declared-only"] == ["Widget"]
+
+
+def test_the_declared_type_set_is_read_ONCE_per_call_675(monkeypatch):
+    """The filters make the enumeration do real work per entry -- each declaration
+    is kind-tested and its typedef chain followed -- so the records and the
+    handles their rows take a size from must come from ONE reading. Two readings
+    cost the user's whole declaration set twice on every `class list` and every
+    `class show` miss, and let a record be paired with a handle from a different
+    moment of a live view.
+
+    Nothing functional fails when this regresses, which is exactly why it is
+    counted (the sibling `..._width_is_read_only_for_a_record_that_is_returned`
+    exists for the same reason)."""
+    class _CountingContainer:
+        reads = 0
+
+        def __init__(self, declared):
+            self._types = {f"id-{i}": (n, t)
+                           for i, (n, t) in enumerate(declared.items())}
+
+        @property
+        def types(self):
+            type(self).reads += 1
+            return self._types
+
+    class _CountingBV:
+        def __init__(self, inner, container):
+            self._inner = inner
+            self.user_type_container = container
+            self.types = {}
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    container = _CountingContainer({"Widget": _DeclaredType()})
+    _CountingContainer.reads = 0
+    bv = _CountingBV(_make_registry_bv(), container)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    read_class._class_list(ctx, None, include_all=True)
+    assert _CountingContainer.reads == 1, (
+        f"`class list` read the user's declarations {_CountingContainer.reads} times")
+
+    _CountingContainer.reads = 0
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["size"] == {"value": "0x10", "source": "declared_type"}
+    assert _CountingContainer.reads == 1, (
+        f"`class show`'s miss path read them {_CountingContainer.reads} times")
+
+
+class _AliasTo:
+    """A NamedTypeReference, the shape BN registers for `typedef struct {...} T;`.
+
+    Carries NO width and NO members of its own -- that is the whole point of the
+    handle: the facts live on the target it resolves to. It DOES carry `.name`,
+    the name it REFERENCES: measured on a live view, the alias BN registers for
+    `typedef struct { int a; int b; int c; } T;` reads `.name == '_T'`, the
+    name BN's C parser gave the anonymous body. The fake states it because that
+    is how the chain is followed to the body's facts."""
+    type_class = 11             # NamedTypeReferenceClass
+    width = 0
+
+    def __init__(self, target, decl="typedef struct _W W", name=None):
+        self._target = target
+        self._decl = decl
+        self.name = name if name is not None else getattr(target, "name", None)
+
+    def target(self, bv):
+        return self._target
+
+    def __str__(self):
+        return self._decl
+
+
+class _StructBody:
+    """The auto-named struct body behind an anonymous typedef."""
+    type_class = 4
+
+    def __init__(self, width=0x30, name="_W", members=()):
+        self.width = width
+        self.name = name
+        self.members = list(members)
+
+    def __str__(self):
+        return f"struct {self.name}"
+
+
+def test_a_declared_alias_reports_the_STRUCTURE_it_resolves_to_675(monkeypatch):
+    """A declaration's facts live on the structure, not on the alias handle.
+
+    `typedef struct Body T;` registers `T` as a NamedTypeReference, which states
+    no members and no width of its own. Admitting the alias (right) while building
+    its record from the alias (wrong) produced a card that could not show the
+    class the user asked for: `kind: named_type_ref`, no members, and `size: null`
+    beside a body 0x30 wide -- and the reference clause this PR adds for exactly
+    this input promises the object size and the canonical `types` entry (#907
+    review). `read_types`' struct reader resolves the same way (#674); one
+    convention, not two."""
+    body = _StructBody(width=0x30, members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+    bv = _declared_bv(W=_AliasTo(body))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    out = read_class._class_show(ctx, None, "W")
+
+    assert out["name"] == "W" and out["confidence"] == "declared-only"
+    assert out["size"] == {"value": "0x30", "source": "declared_type"}, out["size"]
+    entry = out["type"]
+    assert entry["kind"] != "named_type_ref", entry
+    assert entry.get("members"), entry
+    # The listing row states the same width, from the same resolution.
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "W")
+    assert row["size"] == {"value": "0x30", "source": "declared_type"}, row["size"]
+
+
+def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch):
+    """A reference the chain cannot be followed through is still admitted on the
+    kind it NAMES.
+
+    Measured on BN 6.1: a NAMESPACED anonymous typedef --
+    `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of None,
+    as does any alias whose body is defined without it, while the alias itself
+    states `named_type_class = StructNamedTypeClass` and a width of its own.
+    Refusing on an unresolvable target alone therefore dropped a common way a
+    declared class reaches a view -- `class show` missed it (#907 review).
+
+    So an unfollowable reference is admitted on the kind it NAMES, with the
+    facts it does carry, and an enum alias in the identical shape is still
+    refused. The round-3 fixture could not see this: its `target()` resolved,
+    which made it more forgiving than BN."""
+    unresolvable_struct = _AliasTo(None, decl="struct _T T")
+    unresolvable_struct.width = 0x10
+    unresolvable_struct.named_type_class = 3         # StructNamedTypeClass
+    unresolvable_class = _AliasTo(None, decl="class _C C")
+    unresolvable_class.named_type_class = types.SimpleNamespace(
+        name="ClassNamedTypeClass")                  # the string-spelled form
+    unresolvable_enum = _AliasTo(None, decl="enum _M M")
+    unresolvable_enum.named_type_class = 5           # EnumNamedTypeClass
+    unnamed = _AliasTo(None, decl="typedef ? X")     # names nothing at all
+
+    bv = _declared_bv(T=unresolvable_struct, C=unresolvable_class,
+                      M=unresolvable_enum, X=unnamed)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    shown = read_class._class_show(ctx, None, "T")
+    assert shown["confidence"] == "declared-only"
+    # Its own width, which is the only one it has -- never fabricated from the
+    # body it could not reach.
+    assert shown["size"] == {"value": "0x10", "source": "declared_type"}
+
+    assert read_class._class_show(ctx, None, "C")["confidence"] == "declared-only"
+
+    # `M` names an ENUM: the kind was READ and it is positively not a class, so
+    # the miss is the plain one -- nothing was left unexamined.
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "M")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" not in str(err.value), str(err.value)
+    # `X` names NOTHING the lens can classify. That is not the same answer: the
+    # kind was never established, so the miss must not assert the name is absent
+    # (#907 review round 3).
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "X")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" in str(err.value), str(err.value)
+
+    assert sorted(r["name"] for r in
+                  read_class._class_list(ctx, None, include_all=True)["items"]
+                  if r["confidence"] == "declared-only") == ["C", "T"]
+
+
+def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
+    """The declared population is exactly what the USER TYPE CONTAINER holds.
+
+    Three rounds shipped a name-shape rule that tried to fold BN's C-parser
+    companion out of the listing -- the `_T` its parser registers beside
+    `typedef struct { ... } T;`. Each round measured a new escape (the
+    underscore goes on the LEAF of a namespaced name, a POINTER or ARRAY
+    declarator hides the body, re-declaring the alias orphans it), and the
+    decisive one is not an escape at all: the spelling cannot tell BN's `_T`
+    from a `struct _X { ... };` the user HAND-WROTE beside
+    `typedef struct _X X;` (the GLib/GTK idiom), because they are the same
+    name. Folding therefore dropped a class the user declared, and #675.2's
+    whole point is that `class show` must stop answering a confident absence
+    about a type this view has. The rule was WITHDRAWN rather than refined
+    (#907 review round 5): a name-shape test cannot separate a generated body
+    from a user declaration of the same name, and no further case analysis
+    changes that.
+
+    The invariant it leaves behind, and the one this test exists to hold: no
+    name in the user type container may produce a confident absence, and the
+    listing omits none of them. Seeing BN's own `_T` as a peer row is
+    cosmetic; being told a class you declared does not exist is not."""
+    from bn.formatters import _render_class_list_text
+
+    def body(name, width=0xc):
+        return _StructBody(width=width, name=name, members=[
+            types.SimpleNamespace(offset=0, name="a", type="int32_t")])
+
+    plain, pointed, arrayed = body("_T"), body("_P", 0x4), body("anonymous_0", 0x4)
+    qualified, orphan, glib = body("n::_Q", 0x8), body("_T1", 0x8), body("_X", 0x8)
+    bv = _declared_bv(**{
+        # the plain declarator: alias -> the body BN named for it
+        "T": _AliasTo(plain, decl="struct _T T"), "_T": plain,
+        # a POINTER declarator: nothing resolvable reaches `_P`
+        "P": _DeclaredKind("P", 6, "struct _P *", width=8), "_P": pointed,
+        # an ARRAY declarator, under BN's own anonymous spelling
+        "A": _DeclaredKind("A", 7, "struct anonymous_0 [4]", width=0x10),
+        "anonymous_0": arrayed,
+        # NAMESPACED: BN puts the underscore on the LEAF
+        "n::Q": _AliasTo(qualified, decl="struct n::_Q n::Q"), "n::_Q": qualified,
+        # an ORPHANED body: its alias was re-declared onto a named struct
+        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan,
+        # the GLib/GTK idiom -- the user WROTE `_X`, and the heuristic could
+        # never have known that
+        "_X": glib, "X": _AliasTo(glib, decl="struct _X X"),
+    })
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = sorted(r["name"] for r in
+                      read_class._class_list(ctx, None, include_all=True)["items"]
+                      if r["confidence"] == "declared-only")
+    assert declared == ["T", "T1", "X", "_P", "_T", "_T1", "_X",
+                        "anonymous_0", "n::Q", "n::_Q"], declared
+
+    # Every listed name answers, and -- the invariant -- every name the
+    # container holds as a class type is BOTH listed and resolvable. A row the
+    # listing omits is the only way a confident absence can be manufactured.
+    for name in declared:
+        assert read_class._class_show(ctx, None, name)["confidence"] == "declared-only"
+
+    # The count describes the same set the rows do, under every flag.
+    default = read_class._class_list(ctx, None)
+    assert default["declared_suppressed"] == len(declared), default["declared_suppressed"]
+    assert ("10 user-declared class types (--all to show)"
+            in _render_class_list_text(default))
+
+
+def test_a_declared_class_is_not_SHADOWED_by_a_same_leaf_RTTI_class_675(monkeypatch):
+    """`class show` resolves over BOTH halves at once, not the registry first.
+
+    Resolving the registry alone and falling back to the declared half only on a
+    MISS let an RTTI class in ANY namespace swallow every bare-leaf query. A user
+    who declared `Session` in a view whose binary exposes `net::Session` got the
+    RTTI card back, `ambiguous` unset and nothing disclosed, while
+    `class list --all` listed and counted the declaration the card could no
+    longer reach -- the two surfaces disagreeing about which names exist, which
+    is the one thing round 5's contract forbids (#907 review round 5).
+
+    One namespace puts the resolver's documented exact-match-first rule in
+    charge: an exact declared name beats a registry LEAF match, and a genuine
+    leaf collision across the two halves is AMBIGUOUS and shows both rather than
+    silently picking one."""
+    bv = _declared_bv(Session=_DeclaredType(name="Session"))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    # The listing carries both: the RTTI `net::Session` and the declared `Session`.
+    rows = {r["name"]: r["confidence"]
+            for r in read_class._class_list(ctx, None, include_all=True)["items"]}
+    assert rows.get("Session") == "declared-only", rows
+    assert rows.get("net::Session") == "rtti", rows
+
+    # ... and the exact name the user declared reaches the declaration, not the
+    # RTTI class that merely shares its leaf.
+    shown = read_class._class_show(ctx, None, "Session")
+    assert shown.get("ambiguous") is not True, shown
+    assert shown["name"] == "Session", shown["name"]
+    assert shown["confidence"] == "declared-only", shown["confidence"]
+
+    # A QUALIFIED declaration sharing only the leaf is a real collision: both
+    # halves answer, and the card says so instead of picking one.
+    bv2 = _declared_bv(**{"app::Session": _DeclaredType(name="app::Session")})
+    ctx2 = _declared_ctx(monkeypatch, bv2)
+    amb = read_class._class_show(ctx2, None, "Session")
+    assert amb.get("ambiguous") is True, amb
+    assert sorted(m["name"] for m in amb["matches"]) == ["app::Session", "net::Session"]
+    # Each half still answers under its own exact name.
+    assert read_class._class_show(
+        ctx2, None, "app::Session")["confidence"] == "declared-only"
+    assert read_class._class_show(
+        ctx2, None, "net::Session")["confidence"] == "rtti"
+
+
+def test_an_RTTI_card_discloses_a_declared_set_it_could_not_read_675(monkeypatch):
+    """The round-4 rule -- a match is not a licence to stop disclosing -- applies
+    to the REGISTRY-match path too.
+
+    It was implemented only on the declared-match path, so a query that landed on
+    an RTTI class returned a confident card while `class list` printed
+    `? user-declared class types` about the very same view at the very same
+    moment. Whether the reader is told depends on which half answered, which is
+    exactly the disagreement the disclosure exists to prevent (#907 review
+    round 5)."""
+    from bn.formatters import _render_class_show_text
+
+    class _ExplodingContainer:
+        @property
+        def types(self):
+            raise RuntimeError("the type container is no longer valid")
+
+    bv = _declared_bv()
+    bv.user_type_container = _ExplodingContainer()
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    # The listing states the unknown.
+    assert read_class._class_list(
+        ctx, None, include_all=True)["declared_suppressed"] == "unreadable"
+    # So the card must not present itself as the whole answer.
+    shown = read_class._class_show(ctx, None, "net::Session")
+    assert shown["confidence"] == "rtti"
+    assert any("could not be read" in note for note in shown.get("notes") or []), shown
+    assert "could not be read" in _render_class_show_text(shown)
+
+    # A same-LEAF declaration whose own kind cannot be read discloses on the
+    # RTTI card the leaf query lands on, too.
+    class _Unreadable:
+        name = "other::Session"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct other::Session"
+
+    bv2 = _declared_bv(**{"other::Session": _Unreadable()})
+    ctx2 = _declared_ctx(monkeypatch, bv2)
+    leaf = read_class._class_show(ctx2, None, "Session")
+    assert leaf["confidence"] == "rtti" and leaf["name"] == "net::Session"
+    assert any("could not be read" in note for note in leaf.get("notes") or []), leaf
+    # A fully qualified query names one class and discloses nothing.
+    exact = read_class._class_show(ctx2, None, "net::Session")
+    assert not any("could not be read" in note
+                   for note in exact.get("notes") or []), exact
+
+
+def test_class_show_discloses_an_unreadable_SAME_NAME_declaration_on_a_match_675(monkeypatch):
+    """A match is not a licence to stop disclosing.
+
+    The per-declaration unreadable channel reached only the MISS path, so a leaf
+    query that DID match one declaration answered a single confident card while
+    another declaration resolving to the same query could not be read at all --
+    the listing said `? user-declared class types` about the very same set at
+    the very same moment (#907 review round 4). The two surfaces must agree:
+    the card carries the unknown as a note rather than presenting itself as the
+    whole answer."""
+    from bn.formatters import _render_class_show_text
+
+    class _Unreadable:
+        name = "other::Widget"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct other::Widget"
+
+    bv = _declared_bv(**{"ns::Widget": _DeclaredType(name="ns::Widget"),
+                         "other::Widget": _Unreadable()})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    shown = read_class._class_show(ctx, None, "Widget")
+    assert shown["name"] == "ns::Widget"
+    assert any("could not be read" in note for note in shown["notes"]), shown["notes"]
+    assert "could not be read" in _render_class_show_text(shown)
+    # The disclosure JOINS the record's notes, it does not become them. Writing
+    # `rec["notes"] = [disclosure]` instead left the whole targeted suite green
+    # while the card silently lost the RTTI-absence note -- so its empty
+    # vtable/methods/instances read as "this class has none", which is the exact
+    # blindness #675.2 exists to remove (#907 review round 6).
+    assert len(shown["notes"]) == 2, shown["notes"]
+    assert sum("could not be read" in note for note in shown["notes"]) == 1
+    assert any("RTTI evidence that is absent, NOT evidence this class has none"
+               in note for note in shown["notes"]), shown["notes"]
+
+    # A query that reaches no unreadable declaration carries no such note.
+    clean = read_class._class_show(ctx, None, "ns::Widget")
+    assert not any("could not be read" in note for note in clean["notes"]), clean["notes"]
+
+
+def test_a_width_that_cannot_be_READ_states_no_size_675(monkeypatch):
+    """The sibling of the zero-width rule, on the branch that made the guard
+    exist: a `width` read that RAISES states no size.
+
+    Unpinned, replacing the guard's `return None` with a size envelope left the
+    targeted suite green, so a handle whose width could not be read could begin
+    asserting an object size for a class whose layout is simply unknown (#907
+    review round 4)."""
+    class _UnreadableWidth(_DeclaredType):
+        # Deliberately not `super().__init__(...)`: that assigns `self.width`,
+        # which this class shadows with the raising property (the shape
+        # `_CountingDeclaredType` uses for the same reason).
+        def __init__(self):
+            self.name = "Widget"
+
+        @property
+        def width(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+    bv = _declared_bv(Widget=_UnreadableWidth())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    assert read_class._class_show(ctx, None, "Widget")["size"] is None
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "Widget")
+    assert row["size"] is None, row["size"]
+
+
+def test_an_artifact_shaped_DECLARATION_is_listed_and_shown_as_one_set_675(monkeypatch):
+    """The thunk / construction-vtable filters read a DEMANGLED SYMBOL's shape,
+    so they have no standing over a name the user typed into `types declare`.
+
+    Applied to the declared half they split the two surfaces: measured live, a
+    declaration whose name matches the thunk spelling was dropped from
+    `class list --all` entirely and attributed to `1 thunk`, while `class show`
+    of the same name returned a full declared-only card -- a row the user could
+    never reach through the listing (#907 review round 3). The
+    construction-vtable filter splits count from rows the same way: it fires
+    before the declared counter, so the default header promises one fewer class
+    than `--all` then lists."""
+    thunk_shaped = "non-virtual thunk to Widget"
+    ctor_vtable_shaped = "Derived{for `Base'}"
+    bv = _declared_bv(**{
+        thunk_shaped: _DeclaredType(name=thunk_shaped),
+        ctor_vtable_shaped: _DeclaredType(name=ctor_vtable_shaped),
+    })
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    rows = sorted(r["name"] for r in listing["items"]
+                  if r["confidence"] == "declared-only")
+    assert rows == sorted((ctor_vtable_shaped, thunk_shaped)), rows
+    # Count and rows describe ONE set: what the default hides is what --all adds.
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == len(rows)
+    # And `class show` answers for exactly the set the listing offered.
+    for name in rows:
+        assert read_class._class_show(ctx, None, name)["confidence"] == "declared-only"
+
+
+def test_declared_class_survives_a_same_name_thunk_artifact_675(monkeypatch):
+    """The symbol half's thunk is not a class, even when it has the exact name
+    of a class in the user type container. Listing and show must choose the
+    declaration together, while the artifact is still counted as suppressed."""
+    name = "non-virtual thunk to Widget"
+    bv = _declared_bv(**{name: _DeclaredType(name=name)})
+    ctx = _declared_ctx(monkeypatch, bv)
+    artifact = {"name": name, "confidence": "name-only", "methods": [],
+                "vtable": None, "typeinfo": None, "typeinfo_name": None,
+                "size": None, "bases": [], "instances": []}
+    monkeypatch.setattr(read_class, "_build_class_registry",
+                        lambda _ctx, _bv, query=None: {name: artifact})
+
+    listed = read_class._class_list(ctx, None, include_all=True)
+    assert listed["thunks_suppressed"] == 1
+    assert [(row["name"], row["confidence"]) for row in listed["items"]] == [
+        (name, "declared-only")]
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
+    shown = read_class._class_show(ctx, None, name)
+    assert shown["name"] == name and shown["confidence"] == "declared-only"
+
+
+def test_only_types_the_USER_declared_are_classes_of_the_lens_675(monkeypatch):
+    """The declared half's population is the USER's declarations, not `bv.types`.
+
+    `bv.types` is every type BN has, including the ones IT imported. Measured on a
+    stock system ELF with ZERO user declarations: 53 types, 25 structure-kind (the
+    ELF format structs, `FILE`, the libc `_IO_*` family), so the lens rendered
+    `classes: 0 shown of 0 (hidden: 25 declared class types (--all to show))`
+    directly above its own note saying the target has no C++ type evidence, and
+    `class show <an ELF format struct>` answered a class card whose note asserts
+    absent RTTI about a type that can never carry any. On a C++ target the same
+    population listed BN's own generated `<Class>::VTable` structs as peer
+    "classes" of the class they belong to -- the artifact family #309/#481 exist
+    to suppress (#907 review)."""
+    from bn.formatters import _render_class_list_text
+
+    bv = _declared_bv(
+        Widget=_DeclaredType(),
+        _also_in_type_table={
+            # What BN imports on its own: format structs, libc internals, and the
+            # vtable struct it generates for a class it recovered itself.
+            "Elf64_Header": _DeclaredType(name="Elf64_Header", width=0x40),
+            "_IO_FILE": _DeclaredType(name="_IO_FILE", width=0xd8),
+            "net::Session::VTable": _DeclaredType(name="net::Session::VTable",
+                                                  width=0x18),
+        })
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    declared = sorted(r["name"] for r in
+                      read_class._class_list(ctx, None, include_all=True)["items"]
+                      if r["confidence"] == "declared-only")
+    assert declared == ["Widget"], (
+        f"only the user's own declarations may be declared-only classes: {declared}")
+
+    default = read_class._class_list(ctx, None)
+    assert default["declared_suppressed"] == 1
+    assert ("1 user-declared class type (--all to show)"
+            in _render_class_list_text(default))
+
+    for imported in ("Elf64_Header", "_IO_FILE", "net::Session::VTable"):
+        with pytest.raises(read_class.OperationFailure) as err:
+            read_class._class_show(ctx, None, imported)
+        assert err.value.status == "unknown_class", imported
+
+
+def test_a_view_with_no_user_container_has_no_declared_half_675(monkeypatch):
+    """A view that exposes no user type container has no user declarations to
+    offer: an empty answer, not a failed read, so the listing says nothing about
+    declared classes rather than printing `?` on every call."""
+    bv = _make_registry_bv()
+    bv.types = {"Elf64_Header": _DeclaredType(name="Elf64_Header")}
+    assert not hasattr(bv, "user_type_container")
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None)
+    assert listing["declared_suppressed"] == 0
+    from bn.formatters import _render_class_list_text
+    assert "declared" not in _render_class_list_text(listing)
+    with pytest.raises(read_class.OperationFailure):
+        read_class._class_show(ctx, None, "Elf64_Header")
+
+
+def test_an_unreadable_declared_SET_is_disclosed_not_reported_as_zero_675(monkeypatch):
+    """A view whose user type container raises must not take `class list` down,
+    and must not answer `0 user-declared class types` either.
+
+    Before this PR nothing in `class list` touched the user's declarations, so a
+    raising container could not affect it at all; with every declaration
+    kind-tested, an unguarded read propagated a raw RuntimeError out of BOTH the
+    listing (RTTI half included, which has no stake in the declared types) and the
+    `class show` miss path (#907 review). A flattened `0` would be just as wrong
+    the other way: the renderer prints nothing for it, which is the "the lens
+    never saw your class" reading #675.2 exists to remove -- so the counter
+    states the unknown and the text says `?`."""
+    from bn.formatters import _render_class_list_text
+
+    class _RaisingContainer:
+        @property
+        def types(self):
+            raise RuntimeError("the user type container is no longer valid")
+
+    class _RaisingValues(dict):
+        def values(self):
+            raise RuntimeError("the declarations cannot be enumerated")
+
+    raising_property = _declared_bv(Widget=_DeclaredType())
+    raising_property.user_type_container = _RaisingContainer()
+    raising_values = _declared_bv(Widget=_DeclaredType())
+    raising_values.user_type_container.types = _RaisingValues(
+        {"id-0": ("Widget", _DeclaredType())})
+
+    for label, bv in (("raising property", raising_property),
+                      ("raising values()", raising_values)):
+        ctx = _declared_ctx(monkeypatch, bv)
+
+        listing = read_class._class_list(ctx, None)
+        assert listing["declared_suppressed"] == "unreadable", label
+        text = _render_class_list_text(listing)
+        assert "? user-declared class types (--all to show)" in text, label
+        # `?` IS the disclosure. The generic malformed-payload sentence beside it
+        # would say the response's rows or counts may be missing or partial,
+        # which reads as a corrupt answer rather than this documented state
+        # (#907 review round 3).
+        assert "malformed" not in text, f"{label}: {text}"
+        # The RTTI half of the same listing still answers.
+        assert listing["total"], f"{label}: the RTTI half went down with it"
+        assert read_class._class_list(
+            ctx, None, count_only=True)["declared_suppressed"] == "unreadable", label
+
+        # A miss must not claim the name is absent on a read it could not make.
+        with pytest.raises(read_class.OperationFailure) as err:
+            read_class._class_show(ctx, None, "Widget")
+        assert err.value.status == "unknown_class", label
+        assert "could not be read" in str(err.value), label
+
+
+def test_ONE_unreadable_declaration_unmeasures_the_count_and_its_own_miss_675(monkeypatch):
+    """A declaration whose KIND could not be established is neither a class nor
+    a proven absence, and neither surface may pretend otherwise.
+
+    The set-level guard already stops a raising container taking `class list`
+    down. One level below it the same failure was rendered as a FACT: the entry
+    was swallowed, so the header stated a measured `N user-declared class types`
+    that silently excluded it, and `class show` of that very name answered a
+    confident `No class named` -- a fabricated count and a fabricated absence off
+    a read that failed, which is the blindness #675.2 exists to remove (#907
+    review round 3).
+
+    So: the count becomes the same stated unknown the set-level failure prints
+    (`?`, #619's rule -- it cannot be measured while a declaration's kind is
+    unknown), the declarations that DID read still list and still show, and the
+    unreadable name's miss says it could not be read. A name that simply is not
+    declared keeps the plain miss: nothing about IT was left unexamined."""
+    from bn.formatters import _render_class_list_text
+
+    class _Unreadable:
+        name = "Poisoned"
+        width = 0x10
+
+        @property
+        def type_class(self):
+            raise RuntimeError("the type handle is no longer valid")
+
+        def __str__(self):
+            return "struct Poisoned"
+
+    bv = _declared_bv(Widget=_DeclaredType(), Poisoned=_Unreadable())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    declared = [row["name"] for row in listing["items"]
+                if row["confidence"] == "declared-only"]
+    assert declared == ["Widget"], declared
+    # The RTTI half, and every declaration that DID read, still answer.
+    assert [row["name"] for row in listing["items"]
+            if row["confidence"] == "rtti"], listing["items"]
+    assert read_class._class_show(ctx, None, "Widget")["confidence"] == "declared-only"
+
+    default = read_class._class_list(ctx, None)
+    assert default["declared_suppressed"] == "unreadable", (
+        f"a count that excludes an unreadable declaration is not measured: "
+        f"{default['declared_suppressed']}")
+    assert ("? user-declared class types (--all to show)"
+            in _render_class_list_text(default))
+    assert read_class._class_list(
+        ctx, None, count_only=True)["declared_suppressed"] == "unreadable"
+
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "Poisoned")
+    assert err.value.status == "unknown_class"
+    assert "could not be read" in str(err.value), str(err.value)
+
+    # A name that was never declared at all keeps the plain miss.
+    with pytest.raises(read_class.OperationFailure) as err:
+        read_class._class_show(ctx, None, "NeverDeclared")
+    assert "could not be read" not in str(err.value), str(err.value)
+
+
+def test_a_declared_name_the_RTTI_half_already_clusters_is_not_listed_twice_675(monkeypatch):
+    """A name carried by BOTH halves keeps its RTTI record and is counted once.
+
+    The declared record adds no evidence to a class that already has a vtable and
+    demangled methods, and a second row under the same name reads as two classes.
+    Unpinned, dropping the dedup left the whole targeted suite green while the
+    listing grew a duplicate `[declared-only]` row beside the `[rtti]` one and the
+    hidden count went up by one (#907 review round 3)."""
+    rtti_class = "net::Session"          # the registry double's vtable+typeinfo class
+    bv = _declared_bv(**{rtti_class: _DeclaredType(name=rtti_class),
+                         "Widget": _DeclaredType()})
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    listing = read_class._class_list(ctx, None, include_all=True)
+    rows = [(r["name"], r["confidence"]) for r in listing["items"]
+            if r["name"] == rtti_class]
+    assert rows == [(rtti_class, "rtti")], rows
+    # Only the name the RTTI half does NOT carry is a hidden declared class.
+    assert read_class._class_list(ctx, None)["declared_suppressed"] == 1
+
+
+def test_a_zero_width_declaration_states_no_size_rather_than_0x0_675(monkeypatch):
+    """A forward declaration (`struct F;`) has no width, and `size: 0x0` is a
+    fabricated fact about its layout, not a measurement.
+
+    Live-reachable and previously unpinned: every fixture had a positive width,
+    so widening the guard to `width >= 0` left the targeted suite green while the
+    card began asserting a zero object size for a class whose body is simply not
+    known (#907 review round 3)."""
+    from bn.formatters import _render_class_list_text
+
+    bv = _declared_bv(Forward=_DeclaredType(name="Forward", width=0))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    assert read_class._class_show(ctx, None, "Forward")["size"] is None
+    row = next(r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+               if r["name"] == "Forward")
+    assert row["size"] is None, row["size"]
+    assert "0x0" not in _render_class_list_text(
+        read_class._class_list(ctx, None, include_all=True))
+
+
+def test_a_declared_card_shows_its_declaration_in_TEXT_not_only_in_json_675(monkeypatch):
+    """The default output format is text, and the reference promises the
+    declared-only card carries "object size and the canonical `types` entry".
+
+    The record carried the entry and no renderer read it, so the shipped default
+    printed a size and a note and nothing else: an agent that had just declared a
+    class with members saw a card with none and could reasonably read the
+    declaration as empty (#907 review round 3)."""
+    from bn.formatters import _render_class_show_text
+
+    body = _StructBody(width=0x8, name="Body", members=[
+        types.SimpleNamespace(offset=0, name="a", type="int32_t"),
+        types.SimpleNamespace(offset=4, name="b", type="int32_t")])
+    bv = _declared_bv(Body=body)
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    text = _render_class_show_text(read_class._class_show(ctx, None, "Body"))
+
+    assert "a" in text and "b" in text, text
+    assert "int32_t" in text, text
+    assert "malformed" not in text, text
+
+
+def test_both_spellings_of_the_structure_kind_are_admitted_675(monkeypatch):
+    """The kind test is duck-typed because BN's `type_class` is an IntEnum while
+    the unit fakes across this repo carry a plain string. The ACCEPT direction of
+    the string branch needs its own case: the refusal parametrization exercises
+    only its reject side, so replacing the whole branch with `return False` left
+    the suite green (#907 review)."""
+    bv = _declared_bv(ByInt=_DeclaredType(name="ByInt"),
+                      ByName=_DeclaredKind("ByName", "StructureTypeClass",
+                                           "struct ByName", width=0x18))
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    for name, width in (("ByInt", "0x10"), ("ByName", "0x18")):
+        out = read_class._class_show(ctx, None, name)
+        assert out["confidence"] == "declared-only", name
+        assert out["size"] == {"value": width, "source": "declared_type"}, name
+    assert sorted(row["name"] for row in
+                  read_class._class_list(ctx, None, include_all=True)["items"]
+                  if row["confidence"] == "declared-only") == ["ByInt", "ByName"]

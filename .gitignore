@@ -33,6 +33,10 @@ AGENTS.md
 CODEX_*.md
 DOGFOOD_*.md
 FORWARD_TAINT_DESIGN.md
+# The audit passes write these at the repo root too (#789); anchored so a
+# nested `GOAL_*.md` elsewhere in the tree is not hidden from git.
+/GOAL_*.md
+/GROK_REVIEW_*.md
 IDEA_001.md
 TESTING_PLAN_*.md
 WORK_POOLS.md

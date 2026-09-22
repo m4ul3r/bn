@@ -76,19 +76,22 @@ def test_get_tags_rejects_both_locators():
 
 def test_get_tags_rejects_unmapped_address():
     """tag get on an unmapped, tag-less address must reject (parity with
-    comment get / xrefs, #374) instead of returning a false empty result."""
+    comment get / xrefs, #374) instead of returning a false empty result.
+
+    No `is_valid_offset` patch: the view maps only its function's body, so 0x2000
+    is unmapped by DEFAULT (#783)."""
     bv, _ = _bv_with_tagged_fn()
-    bv.is_valid_offset = lambda addr: False
     with pytest.raises(RuntimeError, match="not mapped"):
         read_tags._get_tags(_CtxFn(bv), None, "0x2000", None)
 
 
 def test_get_tags_mapped_address_without_tags_stays_clean():
     """A MAPPED address with no tags is a clean empty result -- only the
-    unmapped case is rejected (#374)."""
+    unmapped case is rejected (#374). 0x1020 is inside the function's body, so it
+    is mapped by the view's own structure and carries no tag."""
     bv, _ = _bv_with_tagged_fn()
-    bv.is_valid_offset = lambda addr: True
-    result = read_tags._get_tags(_CtxFn(bv), None, "0x2000", None)
+    assert bv.is_valid_offset(0x1020) is True
+    result = read_tags._get_tags(_CtxFn(bv), None, "0x1020", None)
     assert result["tags"] == []
     assert result["count"] == 0
 
@@ -98,6 +101,36 @@ def test_get_tags_data_scope_outside_any_function():
     result = read_tags._get_tags(_CtxFn(bv), None, "0x9000", None)
     datas = {(t["type"], t["data"], t["scope"], t["function"]) for t in result["tags"]}
     assert ("Bugs", "data tag", "data", None) in datas
+
+
+def test_tag_get_and_types_carry_the_kind_discriminator_819():
+    """#819: `tag types` and `tag get` answered with no `kind`, so a generic
+    consumer could not tell either payload apart from any other object read --
+    the discriminator is what #275 makes the one thing every read shares. Both
+    are unpaged (they return the whole set), so neither carries the paging quad;
+    `count` stays the size of the container the renderers read.
+
+    `tag get` is `tags_at`, NOT `tags`: the paged `tag list` already answers to
+    `tags` with its rows under `items`, and one discriminator naming two shapes
+    hands a consumer that branches on it a silent null from whichever it did not
+    expect."""
+    bv, fn = _bv_with_tagged_fn()
+
+    types = read_tags._list_tag_types(_CtxFn(bv), None)
+    assert types["kind"] == "tag_types"
+    assert types["count"] == len(types["tag_types"])
+
+    by_address = read_tags._get_tags(_CtxFn(bv), None, "0x1010", None)
+    assert by_address["kind"] == "tags_at"
+    assert by_address["count"] == len(by_address["tags"])
+
+    by_function = read_tags._get_tags(_CtxFn(bv), None, None, "sub_1000")
+    assert by_function["kind"] == "tags_at"
+    assert by_function["count"] == len(by_function["tags"])
+
+    paged = read_tags._list_tags(_CtxFn(bv), None)
+    assert paged["kind"] == "tags" and "items" in paged
+    assert by_address["kind"] != paged["kind"]
 
 
 def test_list_tags_all_scopes_deduped_and_paged():
