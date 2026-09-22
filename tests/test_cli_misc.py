@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import bn.cli
@@ -1981,3 +1982,95 @@ def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--target is empty" in capsys.readouterr().err
+
+
+# --- #823: `bn spill gc` ---------------------------------------------------
+
+
+def _spill_day_dir(root: Path, day: str, *, payload: bytes = b"artifact") -> Path:
+    directory = root / day
+    directory.mkdir(parents=True)
+    (directory / "decompile-120000-1-ab.txt").write_bytes(payload)
+    return directory
+
+
+def test_spill_gc_dry_run_reports_the_structured_summary_823(tmp_path, monkeypatch, capsys):
+    """`bn spill gc --dry-run --format json` is the inspect surface the issue
+    asked for: the spill family exists at all, and the summary -- candidates vs
+    removed, bytes reclaimed, kept counts, the dry run flag -- is machine
+    readable instead of a sentence. On an empty cache it is a clean all-zero
+    report, not an error."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    rc = bn.cli.main(["spill", "gc", "--dry-run", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "spill_gc"
+    assert payload["dry_run"] is True
+    assert payload["root"] == str(tmp_path / "spills")
+    assert payload["candidate_count"] == 0 and payload["removed_count"] == 0
+    assert payload["reclaimed_bytes"] == 0 and payload["kept_count"] == 0
+    assert payload["candidates"] == [] and payload["removed"] == []
+
+
+def test_spill_gc_text_reports_candidates_and_left_alone_entries_823(tmp_path, monkeypatch, capsys):
+    """End to end through the CLI: a stale day goes, and the two entries this
+    must never touch -- a symlink named as an old day and a plain file with a
+    day's name -- stay put and are NAMED on the report rather than skipped in
+    silence. The symlink's target is the real assertion: it is outside the spill
+    root and holds data this command has no business deleting."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    today = datetime.now(timezone.utc).date()
+    spill_root = tmp_path / "spills"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("someone else's data")
+    old_day = _spill_day_dir(spill_root, (today - timedelta(days=30)).strftime("%Y%m%d"))
+    link = spill_root / (today - timedelta(days=40)).strftime("%Y%m%d")
+    link.symlink_to(outside, target_is_directory=True)
+    loose = spill_root / (today - timedelta(days=45)).strftime("%Y%m%d")
+    loose.write_text("someone else's file")
+
+    rc = bn.cli.main(["spill", "gc"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.startswith("spill gc: reclaimed 1 of 1 candidate day(s)")
+    assert f"left alone: {link} (symlink)" in out
+    assert f"left alone: {loose} (not a directory)" in out
+    assert not old_day.exists()
+    assert link.is_symlink() and loose.read_text() == "someone else's file"
+    assert (outside / "keep.txt").read_text() == "someone else's data"
+
+
+def test_spill_gc_help_lists_the_three_flags_and_refuses_a_degenerate_window_823(
+    tmp_path, monkeypatch, capsys
+):
+    """The flags are the interface an agent learns, so `--help` must name all
+    three -- and the two parse-layer refusals must be argparse errors (exit 2,
+    nothing touched) rather than a gc that quietly reads `--older-than 0` as
+    "keep everything" the way the env var does, or a negative byte cap as an
+    even smaller cap."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    with pytest.raises(SystemExit) as excinfo:
+        bn.cli.main(["spill", "gc", "--help"])
+    help_text = capsys.readouterr().out
+    assert excinfo.value.code == 0
+    for flag in ("--dry-run", "--older-than", "--max-bytes"):
+        assert flag in help_text
+
+    for argv in (["spill", "gc", "--older-than", "0"],
+                 ["spill", "gc", "--older-than", "soon"],
+                 ["spill", "gc", "--max-bytes", "-1"]):
+        with pytest.raises(SystemExit) as bad:
+            bn.cli.main(argv)
+        assert bad.value.code == 2
+        assert "spill gc: error:" in capsys.readouterr().err
+
+    # The accepted spellings of both numeric forms reach the handler: a `d`
+    # suffix on the window, and a hex byte cap through the shared size parser.
+    args = bn.cli.build_parser().parse_args(
+        ["spill", "gc", "--older-than", "30d", "--max-bytes", "0x40000000"])
+    assert args.older_than == 30 and args.max_bytes == 1024 ** 3

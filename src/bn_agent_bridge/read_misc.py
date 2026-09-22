@@ -106,11 +106,11 @@ _NO_CRT_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-_IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
-    ("ImportedFunctionSymbol", "function"),
-    ("ImportedDataSymbol", "data"),
-    ("ImportAddressSymbol", "address"),
-]
+# #827 item 3: read from the one owner rather than keeping a verbatim twin.
+# Re-bound at module scope so every existing reference in this file (and any
+# `read_misc._IMPORT_SYMBOL_TYPES` reader) keeps working unchanged; the list is
+# defined once, in the module this one already imports.
+_IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = read_xrefs._IMPORT_SYMBOL_TYPES
 
 # BN tags standard-ELF import symbols with these namespace sentinels rather
 # than a real shared-object name (the dynamic linker only resolves the actual
@@ -375,7 +375,11 @@ def _defined_symbol_names(bv) -> set[str]:
     self-export def sits at its own .text/.data address, distinct from the
     veneer, so it is kept."""
     import_addrs: set[int] = set()
-    for attr in ("ImportedFunctionSymbol", "ImportedDataSymbol", "ImportAddressSymbol"):
+    # #827 item 3 / #888: the THIRD copy of the same symbol-kind family, inline
+    # rather than as a constant, which is why the original bullet did not name
+    # it. Read from the one owner too -- the kind names are the part that must
+    # not drift; this loop needs only the names, not the (name, kind) pairing.
+    for attr, _kind in read_xrefs._IMPORT_SYMBOL_TYPES:
         sym_type = getattr(bn.SymbolType, attr, None)
         if sym_type is None:
             continue
