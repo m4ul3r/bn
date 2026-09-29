@@ -469,6 +469,122 @@ def test_list_locals_without_hlil_falls_back_to_param_and_stack(monkeypatch):
     assert [item["name"] for item in locals_list] == ["arg1", "var_4"]
 
 
+def _mlil(operation: str, **fields):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=operation), **fields)
+
+
+def _aliased_frame_function():
+    """An AArch64-shaped frame: four SSA versions of one word, three of the
+    next, a saved-register pair, a 48-byte buffer recovered as six 8-byte slots,
+    the canary, and the caller's argument area. The prologue copies the guard
+    through a GOT-style symbol load into x8, then into var_28."""
+    fn = _FakeFunction(0x40c3a0, "format_report")
+    ident = iter(range(3000, 4000))
+
+    def stack(name, storage, var_type="int64_t", index=0):
+        return _FakeVariable(name=name, storage=storage, var_type=var_type, identifier=next(ident), index=index)
+
+    fn.stack_layout = [
+        *(stack(f"var_a0{suffix}", -160, "uint16_t", i) for i, suffix in enumerate(("", "_1", "_2", "_3"))),
+        *(stack(f"var_98{suffix}", -152, "uint16_t", i) for i, suffix in enumerate(("", "_1", "_2"))),
+        stack("__saved_fp", -112),
+        stack("__saved_lr", -104),
+        *(stack(f"var_{-offset:x}", offset) for offset in (-88, -80, -72, -64, -56, -48)),
+        stack("var_28", -40),
+        stack("arg_0", 0, "void"),
+    ]
+    x8 = _FakeVariable(name="x8", storage=8, var_type="int64_t", identifier=9008,
+                       source_type="RegisterVariableSourceType")
+    canary = next(v for v in fn.stack_layout if v.name == "var_28")
+    fn.mlil = types.SimpleNamespace(basic_blocks=[[
+        _mlil("MLIL_SET_VAR", dest=x8, src=_mlil("MLIL_LOAD", src=_mlil("MLIL_CONST_PTR", constant=0x42e110))),
+        _mlil("MLIL_SET_VAR", dest=canary, src=_mlil("MLIL_VAR", src=x8)),
+    ]])
+    guard = types.SimpleNamespace(name="__stack_chk_guard")
+    fn.view = types.SimpleNamespace(get_symbol_at=lambda address: guard if address == 0x42e110 else None)
+    return fn
+
+
+def test_frame_collapses_aliases_to_one_row_per_distinct_offset(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _aliased_frame_function()
+
+    frame = bridge.vars_mod._list_frame(fn)
+    slots = frame["slots"]
+
+    distinct = sorted({int(v.storage) for v in fn.stack_layout})
+    assert [slot["storage"] for slot in slots] == distinct
+    assert frame["slot_count"] == len(distinct) < frame["variable_count"] == len(fn.stack_layout)
+    by_storage = {slot["storage"]: slot for slot in slots}
+    assert by_storage[-160]["names"] == ["var_a0", "var_a0_1", "var_a0_2", "var_a0_3"]
+    assert by_storage[-160]["types"] == ["uint16_t"]
+    assert by_storage[-160]["distance_to_next_slot"] == 8
+    assert by_storage[-152]["distance_to_next_slot"] == 40   # to __saved_fp at -112
+    # The buffer BN split into 8-byte slots: pitch says 8, the canary says 48.
+    assert by_storage[-88]["distance_to_next_slot"] == 8
+    assert by_storage[-88]["to_canary"] == 48
+    assert frame["canary_storage"] == -40
+    assert {s: slot["kind"] for s, slot in by_storage.items() if slot["kind"] != "local"} == {
+        -112: "saved_register", -104: "saved_register", -40: "canary", 0: "caller_frame",
+    }
+    assert by_storage[-40]["to_canary"] is None and by_storage[0]["distance_to_next_slot"] is None
+
+    # The listing keeps every alias (the frame collapses them, the resolver does
+    # not), and every local_id the frame prints still resolves for rename/retype.
+    assert len(instance._list_locals(fn)) == len(fn.stack_layout)
+    for slot in slots:
+        for item in slot["variables"]:
+            found, is_parameter = instance._find_variable_selector(fn, item["local_id"])
+            assert (str(found.name), int(found.storage), is_parameter) == (item["name"], slot["storage"], False)
+
+
+def test_frame_detects_the_x86_tls_canary_and_ignores_a_clobbered_guard_register(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _FakeFunction(0x401189, "copy_name")
+    buf = _FakeVariable(name="str", storage=-56, var_type="char[0x28]", identifier=1)
+    slot = _FakeVariable(name="var_10", storage=-16, var_type="int64_t", identifier=2)
+    spill = _FakeVariable(name="var_18", storage=-24, var_type="int64_t", identifier=3)
+    fn.stack_layout = [buf, spill, slot]
+    rax = _FakeVariable(name="rax", storage=0, var_type="int64_t", identifier=10,
+                        source_type="RegisterVariableSourceType")
+    fsbase = _FakeVariable(name="fsbase", storage=1, var_type="int64_t", identifier=11,
+                           source_type="RegisterVariableSourceType")
+    tls_guard = _mlil("MLIL_LOAD", src=_mlil(
+        "MLIL_ADD", left=_mlil("MLIL_VAR", src=fsbase), right=_mlil("MLIL_CONST", constant=0x28)))
+    fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
+    fn.mlil = types.SimpleNamespace(basic_blocks=[[
+        _mlil("MLIL_SET_VAR", dest=rax, src=tls_guard),
+        _mlil("MLIL_SET_VAR", dest=rax, src=_mlil("MLIL_CONST", constant=0)),
+        _mlil("MLIL_SET_VAR", dest=spill, src=_mlil("MLIL_VAR", src=rax)),   # rax no longer holds the guard
+        _mlil("MLIL_SET_VAR", dest=rax, src=tls_guard),
+        _mlil("MLIL_SET_VAR", dest=slot, src=_mlil("MLIL_VAR", src=rax)),
+    ]])
+
+    frame = bridge.vars_mod._list_frame(fn)
+
+    assert frame["canary_storage"] == -16
+    assert [(s["storage"], s["kind"], s["to_canary"]) for s in frame["slots"]] == [
+        (-56, "local", 40), (-24, "local", 8), (-16, "canary", None),
+    ]
+
+
+def test_frame_without_canary_evidence_marks_no_canary(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _FakeFunction(0x401000, "leaf")   # no `.mlil`: no evidence, no guess
+    fn.stack_layout = [
+        _FakeVariable(name="var_18", storage=-24, var_type="int64_t", identifier=1),
+        _FakeVariable(name="var_8", storage=-8, var_type="int64_t", identifier=2),
+    ]
+
+    frame = bridge.vars_mod._list_frame(fn)
+
+    assert frame["canary_storage"] is None
+    assert [(s["kind"], s["distance_to_next_slot"], s["to_canary"]) for s in frame["slots"]] == [
+        ("local", 16, None), ("local", 8, None),
+    ]
+
+
 def test_find_variable_selector_prefers_local_id(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

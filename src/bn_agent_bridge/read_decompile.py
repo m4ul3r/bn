@@ -5,7 +5,7 @@ The decompile/IL/disasm read-op cluster that used to live on
 ``BridgeContext`` seam (``ctx``) in place of ``self``. ``BinaryNinjaBridge``
 keeps a thin delegating shim for every name the test suite / op binders
 reference (``_decompile``, ``_function_info``, ``_get_prototype``,
-``_list_locals_for_function``, ``_il``, ``_disasm``, ``_structured_il``,
+``_list_locals_for_function``, ``_list_frame_for_function``, ``_il``, ``_disasm``, ``_structured_il``,
 ``_defuse``, ``_resolved_calls``, ``_possible_values``, ``_pvs_targets``,
 ``_force_function_analysis``).
 
@@ -577,6 +577,26 @@ def _list_locals_for_function(ctx, selector: str | None, identifier):
         "kind": "locals",
         "items": variables,
         "locals": variables,
+    }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
+
+
+def _list_frame_for_function(ctx, selector: str | None, identifier):
+    bv = ctx._resolve_view(selector)
+    func = ctx._find_function(bv, identifier, contained=True)
+    frame = vars_mod._list_frame(func)
+    result = {
+        "function": {
+            "name": func.name,
+            "address": hex(func.start),
+            "raw_name": getattr(func, "raw_name", func.name),
+        },
+        "kind": "frame",
+        "items": frame["slots"],
+        "slot_count": frame["slot_count"],
+        "variable_count": frame["variable_count"],
+        "canary_storage": frame["canary_storage"],
     }
     _annotate_containment(ctx, result, identifier, func)
     return result

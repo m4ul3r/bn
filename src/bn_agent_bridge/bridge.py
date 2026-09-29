@@ -3330,6 +3330,9 @@ class BinaryNinjaBridge:
     def _list_locals_for_function(self, *a, **k):
         return read_decompile._list_locals_for_function(self.ctx, *a, **k)
 
+    def _list_frame_for_function(self, *a, **k):
+        return read_decompile._list_frame_for_function(self.ctx, *a, **k)
+
     def _il(self, *a, **k):
         return read_decompile._il(self.ctx, *a, **k)
 
@@ -4469,6 +4472,11 @@ def _bind_get_prototype(bridge, params, target):
 @op("list_locals", lock="read")
 def _bind_list_locals(bridge, params, target):
     return bridge._list_locals_for_function(target, params["identifier"])
+
+
+@op("list_frame", lock="read")
+def _bind_list_frame(bridge, params, target):
+    return bridge._list_frame_for_function(target, params["identifier"])
 
 
 @op("decompile", lock="read",

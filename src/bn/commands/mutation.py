@@ -6,6 +6,7 @@ from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _pick, 
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
+    _render_local_frame_text,
     _render_local_list_text,
     _render_proto_text,
 )
@@ -217,9 +218,24 @@ def _proto_get(args: argparse.Namespace) -> int:
 
 
 @command("local", "list", help="List locals with stable IDs", target=True,
-         args=[arg("function")],
+         args=[
+             arg("--frame", action="store_true",
+                 help="Stack frame map: one row per distinct stack offset (aliases collapsed), "
+                      "with distance to the next slot, saved-register/canary markers and "
+                      "bytes to the canary"),
+             arg("function"),
+         ],
          estimable=True)
 def _local_list(args: argparse.Namespace) -> int:
+    if args.frame:
+        return _call(
+            args,
+            "list_frame",
+            {"identifier": args.function},
+            require_target=True,
+            text_renderer=_render_local_frame_text,
+            stem="local-frame",
+        )
     return _call(
         args,
         "list_locals",

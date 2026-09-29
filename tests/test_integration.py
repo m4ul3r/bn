@@ -24,6 +24,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
+CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -2114,3 +2115,28 @@ class TestTypesDeclarePartialDrop760:
         parsed = json.loads(res.stdout)
         assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
         assert parsed["committed"] is False, parsed
+
+
+class TestStackFrameMap:
+    """`local list --frame` on a real stack-protected frame: the canary slot is
+    found from the guard copy BN lifts in the prologue, and every row is one
+    distinct stack offset."""
+
+    def test_frame_marks_canary_and_measures_buffer_headroom(self, shared_bn):
+        shared_bn.load(CANARY_BINARY)
+        frame = shared_bn.json("local", "list", "--frame", "copy_label")
+        locals_ = shared_bn.json("local", "list", "copy_label")["items"]
+
+        slots = frame["items"]
+        stack_offsets = {item["storage"] for item in locals_ if item["storage"] <= 0
+                         and item["source_type"] == "StackVariableSourceType"}
+        assert [slot["storage"] for slot in slots] == sorted(stack_offsets)
+        assert frame["slot_count"] == len(slots)
+
+        canary = frame["canary_storage"]
+        assert canary is not None, frame
+        assert [slot["storage"] for slot in slots if slot["kind"] == "canary"] == [canary]
+        # The 44-byte buffer sits below the canary with at least its own size of
+        # headroom; `to_canary` is measured from its offset to the canary slot.
+        buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
+        assert buffer["to_canary"] == canary - buffer["storage"] >= 44

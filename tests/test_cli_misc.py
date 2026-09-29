@@ -3149,8 +3149,9 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
     # probe count is pinned so a mode class cannot silently stop being swept.
     assert covered == advertised, (
         f"never reached an emitting path: {sorted(advertised - covered)}")
-    assert probed == 285, (
-        f"the sweep ran {probed} probes, not 285 -- a flag class joining or "
+    # `local list --frame` is one more store_true mode swept on an estimable command.
+    assert probed == 286, (
+        f"the sweep ran {probed} probes, not 286 -- a flag class joining or "
         "leaving the derivation changes the coverage claim, so move the number "
         "in the same commit")
     assert emitted, "no probe reached an emit path at all"

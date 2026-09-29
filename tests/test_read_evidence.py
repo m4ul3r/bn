@@ -34,23 +34,46 @@ def test_evidence_mlil_drops_clobber_lhs(monkeypatch):
     assert render(_M()) == "call(0x471d60, arg1, arg2, x2, stack = &fp)"
 
 
-def test_stack_var_span_annotation(monkeypatch):
-    """Stack vars carry span_to_next (bytes to the next stack slot = the slot's
-    capacity); register/flag locals (non-negative storage) do not. (F20)"""
+def test_stack_var_distance_to_next_slot(monkeypatch):
+    """Stack vars carry distance_to_next_slot (bytes to the next DISTINCT stack
+    offset); register/flag locals (non-negative storage) do not. span_to_next is
+    the same value under its retained F20 name."""
     bridge = _load_bridge(monkeypatch)
     entries = [
         {"name": "buf", "storage": -1016},
         {"name": "x", "storage": -8},
-        {"name": "reg", "storage": 53},     # register var -> no span
+        {"name": "reg", "storage": 53},     # register var -> no distance
         {"name": "buf2", "storage": -1024},
     ]
     bridge.vars_mod._annotate_stack_spans(entries)
     by = {e["name"]: e for e in entries}
     # sorted stack: -1024 (buf2) -> -1016 (buf) -> -8 (x) -> 0 (frame base)
-    assert by["buf2"]["span_to_next"] == 8       # -1016 - (-1024)
-    assert by["buf"]["span_to_next"] == 1008     # -8 - (-1016)
-    assert by["x"]["span_to_next"] == 8          # 0 - (-8)
-    assert "span_to_next" not in by["reg"]       # register var untouched
+    assert by["buf2"]["distance_to_next_slot"] == 8       # -1016 - (-1024)
+    assert by["buf"]["distance_to_next_slot"] == 1008     # -8 - (-1016)
+    assert by["x"]["distance_to_next_slot"] == 8          # 0 - (-8)
+    assert all(e["span_to_next"] == e["distance_to_next_slot"] for e in entries if e["name"] != "reg")
+    assert "distance_to_next_slot" not in by["reg"]       # register var untouched
+    assert "span_to_next" not in by["reg"]
+
+
+def test_stack_aliases_share_their_slot_distance(monkeypatch):
+    """Several variables at one offset (SSA versions / HLIL aliases) all measure
+    to the next DISTINCT offset. Sorting per variable gave every alias but the
+    last a distance of 0 to its own sibling."""
+    bridge = _load_bridge(monkeypatch)
+    entries = [
+        {"name": "var_a0", "storage": -160},
+        {"name": "var_a0_1", "storage": -160},
+        {"name": "var_a0_2", "storage": -160},
+        {"name": "var_98", "storage": -152},
+        {"name": "var_98_1", "storage": -152},
+        {"name": "var_10", "storage": -16},
+    ]
+    bridge.vars_mod._annotate_stack_spans(entries)
+    by_storage: dict[int, set[int]] = {}
+    for entry in entries:
+        by_storage.setdefault(entry["storage"], set()).add(entry["distance_to_next_slot"])
+    assert by_storage == {-160: {8}, -152: {136}, -16: {16}}
 
 
 def test_segment_entries_for_verbose_target_info(monkeypatch):

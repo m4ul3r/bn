@@ -64,6 +64,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "statemachine_x86_64",
     "parser_x86_64",
     "dispatch_table_x86_64",
+    "canary_x86_64",
 )
 
 _BUILD_LOCK_NAME = ".build.lock"

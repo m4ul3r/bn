@@ -17,7 +17,7 @@ SRCDIR  := src
 # integration lane reads); tests that only exercise the *build* pass a tmp dir
 # so a unit-only run leaves no working-tree side effects.
 OUTDIR  ?= .
-NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64
+NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64 canary_x86_64
 BINS    := $(addprefix $(OUTDIR)/,$(NAMES))
 # The bridge prefers an adjacent <binary>.bndb over the binary it caches, so a
 # sidecar left behind by an earlier build silently shadows the fresh one.
@@ -28,6 +28,10 @@ all: $(BINS)
 $(OUTDIR)/%_x86_64: $(SRCDIR)/%.c
 	@mkdir -p $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $<
+
+# The one fixture that needs a stack canary: `local list --frame` must find it.
+# Appended after -fno-stack-protector, so it wins.
+$(OUTDIR)/canary_x86_64: CFLAGS += -fstack-protector-all
 
 clean:
 	rm -f $(BINS) $(BNDBS)
