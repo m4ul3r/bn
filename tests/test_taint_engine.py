@@ -10088,7 +10088,8 @@ def test_strtok_conditional_clean_reset_keeps_the_continuation_tainted_928():
     sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
     assert sinks == [("system", "command_injection")], result["reached_sinks"]
     cont = [a for a in result["assumptions"] if "continues the tokenizer state" in a]
-    assert cont and "does not dominate" in cont[0] and "0x14" in cont[0], result["assumptions"]
+    assert cont and "not on every path from the tainted call" in cont[0] and "0x14" in cont[0], \
+        result["assumptions"]
     # The same dominance test at return: the state is tainted on the
     # `mode == 0` path when the function returns, so the escape is disclosed.
     esc = [a for a in result["assumptions"] if a.startswith("tokenizer_state_escapes")]
@@ -10117,7 +10118,8 @@ def test_strtok_clean_reset_without_block_info_is_not_a_kill_928():
     result = te.TaintEngine(FBV({STRTOK: "strtok", SYS: "system"}), te.load_models()).forward(
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result["reached_sinks"]
-    assert any("does not dominate" in a for a in result["assumptions"]), result["assumptions"]
+    assert any("not on every path from the tainted call" in a for a in result["assumptions"]), \
+        result["assumptions"]
 
 
 def test_backward_diagnostics_name_the_memory_chain_cut_928():
@@ -10704,6 +10706,77 @@ def test_backward_coverage_is_by_bytes_not_by_writer_kind_928r4():
     pg.sink(buf)
     result, reasons, aol = _bw(pg.func())
     assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+
+class _FEdge:
+    def __init__(self, target):
+        self.target = target
+
+
+def _strtok_priming_loop(*, reset_inside_loop: bool):
+    """tok(line#0): [strtok(&other)]; loop { [strtok(&other)]; x = strtok(NULL);
+    system(x); strtok(&line) }; return. With the reset BEFORE the loop (a
+    priming call) the tainted `strtok(&line)` at the bottom of the body
+    reaches the NULL call around the back-edge without passing it; with the
+    reset at the TOP of the body every such path passes it."""
+    line = FVar("line", typ="char[0x40]"); other = FVar("other", typ="char[0x40]")
+    t0, t1, t3 = FSSA(FVar("t0"), 1), FSSA(FVar("t1"), 1), FSSA(FVar("t3"), 1)
+    STRTOK, SYS = 0x900, 0x901
+    idx = iter(range(10))
+    clean = _ext_call(next(idx), 0x10, 't0#1 = strtok(&other, " ")', STRTOK,
+                      [_addr_of(other), _cstr(0x700)], writes=[t0])
+    if reset_inside_loop:
+        pre = []
+        body = [clean]
+    else:
+        pre = [clean]
+        body = []
+    cont = _ext_call(next(idx), 0x14, 't3#1 = strtok(nullptr, " ")', STRTOK,
+                     [FExpr("MLIL_CONST", "0", constant=0), _cstr(0x700)], writes=[t3])
+    sink = _ext_call(next(idx), 0x18, "system(t3#1)", SYS,
+                     [FExpr("MLIL_VAR_SSA", "t3#1", reads=[t3])], reads=[t3])
+    tainted = _ext_call(next(idx), 0x1c, 't1#1 = strtok(&line, " ")', STRTOK,
+                        [_addr_of(line), _cstr(0x700)], writes=[t1])
+    ret = FInstr(next(idx), 0x20, "MLIL_RET", "return")
+    body += [cont, sink, tainted]
+    ordered = pre + body + [ret]
+    for k, ins in enumerate(ordered):
+        ins.instr_index = k
+    entry = FBlock(0, len(pre)) if pre else None
+    loop = FBlock(len(pre), len(pre) + len(body))
+    exit_ = FBlock(len(pre) + len(body), len(ordered))
+    loop.outgoing_edges = [_FEdge(loop), _FEdge(exit_)]
+    exit_.outgoing_edges = []
+    if entry is not None:
+        entry.outgoing_edges = [_FEdge(loop)]
+        for ins in pre:
+            ins.il_basic_block = entry
+    for ins in body:
+        ins.il_basic_block = loop
+    ret.il_basic_block = exit_
+    func = FFunc("tok", 0x10, FSSAFunc(ordered), params=[line])
+    return func, FBV({STRTOK: "strtok", SYS: "system"})
+
+
+def test_strtok_priming_reset_before_a_loop_does_not_kill_the_back_edge_928r4():
+    # P2: `strtok(other); for (..) { x = strtok(NULL); if (x) system(x);
+    # strtok(line); }` -- on iteration 2 the NULL call continues `line`. The
+    # priming reset DOMINATES the NULL call, which is why the dominance test
+    # killed the flow (`reached_sinks: []`); it is not on the back-edge path.
+    func, bv = _strtok_priming_loop(reset_inside_loop=False)
+    result = te.TaintEngine(bv, te.load_models()).forward(func, [te.parse_locator("param:0")])
+    sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
+    assert sinks == [("system", "command_injection")], result["reached_sinks"]
+    cont = [a for a in result["assumptions"] if "continues the tokenizer state" in a]
+    assert cont and "not on every path from the tainted call" in cont[0], result["assumptions"]
+
+    # Guard: the reset at the TOP of the body lies on every path from the
+    # tainted call back to the NULL call -- a precise kill. The loop can exit
+    # straight after the tainted call, so the state still escapes at return.
+    func2, bv2 = _strtok_priming_loop(reset_inside_loop=True)
+    result2 = te.TaintEngine(bv2, te.load_models()).forward(func2, [te.parse_locator("param:0")])
+    assert result2["reached_sinks"] == [], result2["reached_sinks"]
+    assert any(a.startswith("tokenizer_state_escapes") for a in result2["assumptions"]), result2["assumptions"]
 
 
 def test_benign_model_handed_the_buffer_is_disclosed_928r4():

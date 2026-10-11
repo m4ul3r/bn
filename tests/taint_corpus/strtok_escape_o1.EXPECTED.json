@@ -1,5 +1,5 @@
 {
-  "description": "`strtok_escape.c` rebuilt at -O1: strtok state left tainted at return is disclosed (tokenizer_state_escapes) and withholds the all-clear; a clean non-NULL strtok whose block dominates the strtok(NULL) resets the continuation so the later strtok(NULL) -> system is not a flow (negative); a clean strtok under `if (mode)` does NOT dominate it, so the continuation stays a real command injection and the partial reset is named",
+  "description": "`strtok_escape.c` rebuilt at -O1: strtok state left tainted at return is disclosed (tokenizer_state_escapes) and withholds the all-clear; a clean non-NULL strtok that lies on every path from the tainted call to the strtok(NULL) resets the continuation so the later strtok(NULL) -> system is not a flow (negative); a clean strtok under `if (mode)` is not on every path, and a priming strtok before a loop is bypassed by the back-edge, so in both the continuation stays a real command injection and the partial reset is named",
   "lang": "c",
   "cflags": ["-O1"],
   "forward": [
@@ -8,7 +8,10 @@
      "all_clear": false},
     {"function": "tok_reset_conditional", "source": "arg:read:1",
      "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}],
-     "assumptions_contain": ["continues the tokenizer state", "does not dominate", "tokenizer_state_escapes"]}
+     "assumptions_contain": ["continues the tokenizer state", "not on every path from the tainted call", "tokenizer_state_escapes"]},
+    {"function": "tok_prime_loop", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}],
+     "assumptions_contain": ["continues the tokenizer state", "not on every path from the tainted call"]}
   ],
   "negative": [
     {"function": "tok_reset", "source": "arg:read:1",

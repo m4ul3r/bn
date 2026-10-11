@@ -1574,26 +1574,62 @@ class TaintEngine:
         return None
 
     @staticmethod
-    def _block_dominates(a: Any, b: Any) -> bool | None:
-        """Does the IL basic block of instruction *a* dominate that of *b*
-        (every path from the entry to *b* passes through *a*'s block)? None
-        when the view exposes no block or dominator information -- an answer
-        the caller must treat as "not proven", never as a kill."""
-        ba = getattr(a, "il_basic_block", None)
-        bb = getattr(b, "il_basic_block", None)
-        if ba is None or bb is None:
+    def _reaches_avoiding(src: Any, dst: Any, avoid: list[Any]) -> bool | None:
+        """Can control flow run from just after instruction *src* to *dst*
+        without executing any instruction in *avoid*? An instruction-granular
+        search over the IL basic blocks (``start``/``end`` instruction-index
+        ranges, ``outgoing_edges``), so a loop back-edge that re-enters the
+        source block before the reset is a path (round 4 P2: a priming
+        reset before a loop DOMINATES the `strtok(NULL)` yet the tainted
+        call at the bottom of the body reaches it around the back-edge).
+        None when the view exposes no block / edge information -- an answer
+        the caller must treat as "reachable", never as a kill. An *avoid*
+        instruction without block information is ignored (it proves no cut)."""
+        def _idx(i: Any) -> int | None:
+            try:
+                return int(getattr(i, "instr_index"))
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        sb = getattr(src, "il_basic_block", None)
+        si, di = _idx(src), _idx(dst)
+        if sb is None or getattr(dst, "il_basic_block", None) is None or si is None or di is None:
             return None
+        stop: dict[int, bool] = {}
+        for a in avoid:
+            ai = _idx(a)
+            if ai is not None and getattr(a, "il_basic_block", None) is not None:
+                stop[ai] = False
+        stop[di] = True
+
+        def _scan(block: Any, lo: int) -> bool | None:
+            """True: *dst* is the first stop at or after *lo* in *block*;
+            False: a reset is; None: control falls through to the successors."""
+            hits = [i for i in stop if lo <= i < int(block.end)]
+            return stop[min(hits)] if hits else None
+
         try:
-            doms = list(getattr(bb, "dominators", None) or [])
-        except Exception:
+            first = _scan(sb, si + 1)
+            if first is not None:
+                return first
+            seen: set[tuple[int, int]] = set()
+            work = [sb]
+            while work:
+                for edge in list(work.pop().outgoing_edges):
+                    t = getattr(edge, "target", None)
+                    if t is None:
+                        return None     # an undetermined successor: unproven
+                    key = (int(t.start), int(t.end))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    r = _scan(t, int(t.start))
+                    if r is True:
+                        return True
+                    if r is None:
+                        work.append(t)
+        except Exception:   # noqa: BLE001 - a view without edges/ranges proves nothing
             return None
-        if not doms:
-            return None
-        start = getattr(ba, "start", None)
-        for d in doms:
-            if d is ba or d == ba or (start is not None and getattr(d, "start", None) == start
-                                      and getattr(d, "end", None) == getattr(ba, "end", None)):
-                return True
         return False
 
     def _address_terms(self, expr: Any) -> tuple[list[Any], list[int]]:
@@ -4036,13 +4072,14 @@ class TaintEngine:
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
         # Static-state tokenizers (`continuation` models, e.g. strtok): the most
         # recent call in THIS function whose `null_arg` was tainted, keyed by
-        # model key -> (tainted node, call address). A later `strtok(NULL, ..)`
+        # model key -> (tainted node, call address, call instruction). A later `strtok(NULL, ..)`
         # reads that state, not an argument, so without it every token after
         # the first silently dropped taint -- no leaf, no assumption.
         continuation_state: dict[str, tuple] = {}
         # model key -> [(addr, call instruction)] of the CLEAN non-NULL calls
-        # seen after the tainted one (address order): a reset kills the
-        # continuation only where its block dominates the `strtok(NULL)`.
+        # seen after the tainted one (address order): together they kill the
+        # continuation only when they lie on every path from the tainted call
+        # to the `strtok(NULL)` (`_reaches_avoiding`).
         clean_resets: dict[str, list[tuple]] = {}
         reached_return = False
 
@@ -4603,19 +4640,21 @@ class TaintEngine:
                     if self._int_const(params[cidx]) == 0:
                         st = continuation_state.get(ckey)
                         if st is not None:
-                            st_node, st_addr = st
+                            st_node, st_addr, st_ins = st
                             # A clean non-NULL call resets libc's state -- but
-                            # it kills the continuation only when it runs on
-                            # EVERY path from the tainted call to this one, i.e.
-                            # its block dominates this block. A clean call under
-                            # `if (mode)` leaves the tainted line on the other
-                            # path (round 3 P1: the pop was address-ordered and
-                            # flow-insensitive, so a guarded reset granted a
-                            # false all-clear on a real `system(strtok(NULL))`).
+                            # it kills the continuation only when the clean
+                            # calls lie on EVERY path from the tainted call to
+                            # this one. A clean call under `if (mode)` leaves the
+                            # tainted line on the other path (round 3 P1), and a
+                            # priming reset before a loop DOMINATES the NULL
+                            # call yet the tainted call at the bottom of the
+                            # body reaches it around the back-edge (round 4
+                            # P2) -- so the test is reachability with the
+                            # resets removed, not dominance.
                             resets = clean_resets.get(ckey) or []
-                            killer = next((ra for ra, rins in resets
-                                           if self._block_dominates(rins, ins) is True), None)
-                            if killer is None:
+                            killed = bool(resets) and self._reaches_avoiding(
+                                st_ins, ins, [rins for _, rins in resets]) is False
+                            if not killed:
                                 for rule in model.get("propagates") or []:
                                     if _try_arg_index(str(rule.get("from") or "")) != cidx:
                                         continue
@@ -4628,9 +4667,9 @@ class TaintEngine:
                                     partial = (
                                         f"; a clean {name or mkey} @ "
                                         f"{', '.join(hex(ra) for ra, _ in resets)} resets "
-                                        f"the state on SOME path but does not dominate "
-                                        f"this call, so the tainted line continues on the "
-                                        f"others")
+                                        f"the state on SOME path but not on every path "
+                                        f"from the tainted call to this one, so the tainted "
+                                        f"line continues on the others")
                                 add_assumption(
                                     f"{name or mkey}(NULL, ...) @ {hex(addr)} continues the "
                                     f"tokenizer state of the tainted {name or mkey} call @ "
@@ -4641,7 +4680,7 @@ class TaintEngine:
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
                         if hit is not None:
-                            continuation_state[ckey] = (hit, addr)
+                            continuation_state[ckey] = (hit, addr, ins)
                             # Resets recorded before this (address-ordered)
                             # tainted call cannot kill what it re-arms.
                             clean_resets.pop(ckey, None)
@@ -5403,14 +5442,16 @@ class TaintEngine:
         # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
         # a marker the zero-sink gate withholds the all-clear on.
         rets = [i for i in instrs if op_name(i) == "MLIL_RET"]
-        for ckey, (_, st_addr) in continuation_state.items():
+        for ckey, (_, st_addr, st_ins) in continuation_state.items():
             resets = clean_resets.get(ckey) or []
-            # A clean reset that dominates EVERY return leaves the state clean
-            # at return; one that dominates only some (or none, or whose
-            # block the view does not expose) leaves it tainted on a path.
-            if rets and resets and any(
-                    all(self._block_dominates(rins, r) is True for r in rets)
-                    for _, rins in resets):
+            # The state is clean at return only when the clean resets lie on
+            # EVERY path from the tainted call to every return (the same
+            # reachability test as the in-function continuation, round 4 P2);
+            # a return reachable around them -- or a view without block
+            # information -- leaves it tainted on a path.
+            if rets and resets and all(
+                    self._reaches_avoiding(st_ins, r, [rins for _, rins in resets]) is False
+                    for r in rets):
                 continue
             partial = ""
             if resets:
