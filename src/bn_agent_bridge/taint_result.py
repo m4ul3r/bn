@@ -456,6 +456,11 @@ def backward_diagnostics(
             "the caller ascent was capped, so some calling sites were never "
             "followed; re-run against a specific caller or narrow the sink to "
             "see the origins behind the dropped sites")
+    elif truncated and truncation_cause:
+        # A named cut (the memory-chain budget, a depth bound) has its own
+        # remediation; the generic unresolved text below would send the reader
+        # to `bn proto set` for a walk that simply ran out of budget (round 3).
+        next_action = _truncation_hint(truncation_cause)
     elif unresolved_n:
         next_action = (
             "the walk bottomed out at an unresolved def (an indirect call, a "
