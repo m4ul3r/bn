@@ -1671,8 +1671,14 @@ def test_orient_digest_composes_subreads_and_handles_quick(monkeypatch):
 
 
 class _StringsSection:
-    def __init__(self, name, start, end):
+    def __init__(self, name, start, end, semantics=0, type=""):
         self.name = name; self.start = start; self.end = end
+        self.semantics = semantics; self.type = type
+
+
+class _StringsSegment:
+    def __init__(self, start, end, executable):
+        self.start = start; self.end = end; self.executable = executable
 
 
 class _FakeString:
@@ -1682,30 +1688,54 @@ class _FakeString:
 
 class _StringsBV:
     """The #646 ELF shape: the LOWEST string addresses are loader/linker metadata
-    (`.interp`, then `.dynstr` import names), and the domain literals live much
-    higher up in `.rodata`."""
-    def __init__(self, *, rodata=True):
+    (`.interp`, `.dynstr`), so an address-ordered head sample is deterministically
+    the loader path, `__gmon_start__`, and imported symbol names -- and the M-12
+    shape on top of it: the ELF header (claimed by no section, inside the r-x
+    load segment) and `.text` (ReadOnlyCode, named `.code` so the name list
+    cannot be what excludes it) both decode as printable ASCII and sit below
+    `.rodata`, so they owned the head even after the metadata names were
+    dropped. `.synthetic_builtins` is the ExternalSection BN 6.1 adds to EVERY
+    view, so it is here on purpose: it must not count as a section."""
+
+    def __init__(self, *, rodata=True, data=False):
         self.strings = [
+            _FakeString(0x400034, "@8\t@"),
             _FakeString(0x400240, "/lib/ld-linux-aarch64.so.1"),
             _FakeString(0x400a10, "libwidget.so.1"),
             _FakeString(0x400a20, "_ITM_deregisterTMCloneTable"),
             _FakeString(0x400a3c, "__gmon_start__"),
             _FakeString(0x400a65, "WIDGET_UpdateCertificate"),
+            _FakeString(0x401a40, "4@CA9`!\\"),
+            _FakeString(0x401c77, "a@9h0B9i6`"),
         ]
         self.sections = {
-            ".interp": _StringsSection(".interp", 0x400240, 0x400260),
-            ".dynstr": _StringsSection(".dynstr", 0x400a00, 0x400b00),
+            ".interp": _StringsSection(".interp", 0x400240, 0x400260, semantics=2),
+            ".dynstr": _StringsSection(".dynstr", 0x400a00, 0x400b00, semantics=2),
+            ".code": _StringsSection(".code", 0x401000, 0x440000, semantics=1),
+            ".synthetic_builtins": _StringsSection(".synthetic_builtins", 0x4a0000, 0x4a0030,
+                                                   semantics=4),
         }
+        self.segments = [
+            _StringsSegment(0x400000, 0x460000, executable=True),
+            _StringsSegment(0x470000, 0x4a0000, executable=False),
+        ]
         if rodata:
             self.strings += [
                 _FakeString(0x452100, "config parse failed: %s"),
                 _FakeString(0x452180, "Set Channel Index"),
             ]
-            self.sections[".rodata"] = _StringsSection(".rodata", 0x452000, 0x460000)
+            self.sections[".rodata"] = _StringsSection(".rodata", 0x452000, 0x460000, semantics=2)
+        if data:
+            self.strings += [_FakeString(0x470010, "default.cfg")]
+            self.sections[".data"] = _StringsSection(".data", 0x470000, 0x480000, semantics=3)
 
     def get_sections_at(self, addr):
         addr = int(addr)
         return [s for s in self.sections.values() if s.start <= addr < s.end]
+
+    def get_segment_at(self, addr):
+        addr = int(addr)
+        return next((s for s in self.segments if s.start <= addr < s.end), None)
 
 
 def _strings_ctx(bv):
@@ -1730,10 +1760,305 @@ def test_strings_domain_sections_only_skips_elf_metadata_646(monkeypatch):
     assert values == ["config parse failed: %s", "Set Channel Index"]
     assert not any("gmon" in v or "ld-linux" in v or "ITM_" in v for v in values)
 
-    # Unfiltered, the head is exactly the metadata the bug reported.
+    # Unfiltered, the same strings are still LISTED -- ranked after the data
+    # sections (M-12), not dropped: `total` stays the honest population.
     head = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=3,
                               min_length=6)
-    assert head["items"][0]["value"] == "/lib/ld-linux-aarch64.so.1"
+    assert head["total"] == 9
+    assert [i["value"] for i in head["items"]] == [
+        "config parse failed: %s", "Set Channel Index", "/lib/ld-linux-aarch64.so.1"]
+
+
+def test_strings_domain_sections_only_skips_code_and_header_m12(monkeypatch):
+    """M-12: on every AArch64 ELF the sample was twenty rows of `.text`
+    instruction bytes plus the ELF header at 0x400034 (no section), while
+    `strings --section .rodata` had ~1500 real literals. Code is excluded by its
+    ReadOnlyCode semantics (the section here is named `.code`, not `.text`), and
+    an address outside every section of a sectioned view is excluded too."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=20,
+                             min_length=4, domain_sections_only=True)
+    values = [i["value"] for i in out["items"]]
+    assert values == ["config parse failed: %s", "Set Channel Index"]
+    assert "@8\t@" not in values and "4@CA9`!\\" not in values
+
+
+def test_strings_default_dump_ranks_rodata_then_data_then_noise_m12(monkeypatch):
+    """The default `bn strings` dump used to START with the header and `.text`
+    bytes (lowest addresses). Ranking: `.rodata`-like, then `.data`-like, then
+    code / metadata / sectionless -- address order within a tier -- and the
+    envelope names the sections that contributed the noise so the CLI tip can."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV(data=True)
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+    values = [i["value"] for i in out["items"]]
+    assert values[:3] == ["config parse failed: %s", "Set Channel Index", "default.cfg"]
+    assert values[3:5] == ["@8\t@", "/lib/ld-linux-aarch64.so.1"]
+    assert values[-2:] == ["4@CA9`!\\", "a@9h0B9i6`"]
+    assert out["total"] == 11 and out["filtered"] == 0
+    assert out["noise_strings"] == 8
+    # most noise first, ties by name; the sectionless header is named as such
+    assert out["noise_sections"] == [".dynstr", ".code", "(no section)", ".interp"]
+
+    # Paging walks the RANKED order, so page 2 continues where page 1 stopped.
+    page2 = read_misc._strings(_strings_ctx(bv), None, query=None, offset=3, limit=2)
+    assert [i["value"] for i in page2["items"]] == ["@8\t@", "/lib/ld-linux-aarch64.so.1"]
+
+
+def test_strings_section_pin_keeps_address_order_and_reports_no_noise_m12(monkeypatch):
+    """`--section` is unchanged: the pinned population is in address order and
+    the noise counters stay empty (that population is what the caller asked for)."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None,
+                             section=".code")
+    assert [i["value"] for i in out["items"]] == ["4@CA9`!\\", "a@9h0B9i6`"]
+    assert out["noise_strings"] == 0 and out["noise_sections"] == []
+
+
+class _RawBV:
+    """The shape BN 6.1 gives a raw / monolithic image opened as a Mapped view,
+    and -- apart from the loader-recovered `.interp` / `.dynamic` / `.got_*`
+    sections -- a section-header-stripped ELF: NEVER sectionless, because every
+    loader adds `.synthetic_builtins` (an ExternalSection), and one r-x
+    segment over the whole image. A fake with no `sections` attribute at all is
+    a shape BN never produces, and it is exactly what hid the regression where
+    every string of such a view was ranked as `(no section)` noise."""
+
+    def __init__(self, strings, *, sections=None, executable=True):
+        self.strings = list(strings)
+        self.sections = {".synthetic_builtins": _StringsSection(
+            ".synthetic_builtins", 0x80010000, 0x80010030, semantics=4)}
+        self.sections.update(sections or {})
+        self.segments = [_StringsSegment(0x80000000, 0x80010000, executable=executable)]
+
+    def get_sections_at(self, addr):
+        addr = int(addr)
+        return [s for s in self.sections.values() if s.start <= addr < s.end]
+
+    def get_segment_at(self, addr):
+        addr = int(addr)
+        return next((s for s in self.segments if s.start <= addr < s.end), None)
+
+
+def test_strings_raw_view_with_only_synthetic_builtins_is_not_ranked_m12(monkeypatch):
+    """A raw image has nothing to rank by: address order, no noise, no tip. BN
+    gives it `.synthetic_builtins` (ExternalSection) and an r-x segment, so a
+    classifier that treats "any section" as sectioned, or an executable segment
+    as code, calls every literal on the image noise."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _RawBV([_FakeString(0x80000200, "boot: %s"), _FakeString(0x80000100, "vxWorks boot"),
+                 _FakeString(0x80000300, "default.cfg")])
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+    assert [i["value"] for i in out["items"]] == ["vxWorks boot", "boot: %s", "default.cfg"]
+    assert out["noise_strings"] == 0 and out["noise_sections"] == []
+    assert out["data_sections"] == []
+
+    # ...and the orient sample is the literals, with no fallback claimed.
+    inst = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections", lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 0})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda sel: bv)
+    sample = inst._orient_digest(None)["strings_sample"]
+    assert [i["value"] for i in sample["items"]] == ["vxWorks boot", "boot: %s", "default.cfg"]
+    assert "sample_fallback" not in sample
+    assert sample["sample_sections"] == []
+
+
+def test_strings_stripped_elf_without_code_sections_keeps_literals_as_data_m12(monkeypatch):
+    """A section-header-stripped PIE: BN recovers `.interp` / `.dynamic` /
+    `.got_recovered_*` from the dynamic segment (all ReadOnlyData, no
+    ReadOnlyCode) and the rest -- `.text` bytes AND the literals -- is
+    unclaimed, inside the r-x load segment. Without a code section BN has not
+    said where code is, so the unclaimed addresses are data in address order,
+    never noise; only the named metadata is ranked last."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _RawBV(
+        [_FakeString(0x80000238, "/lib/ld-linux-aarch64.so.1"),
+         _FakeString(0x800004db, "5`\n@"), _FakeString(0x80000878, "default.cfg")],
+        sections={
+            ".interp": _StringsSection(".interp", 0x80000238, 0x80000253, semantics=2),
+            ".dynamic": _StringsSection(".dynamic", 0x8000fd98, 0x8000ff88, semantics=2),
+            ".got_recovered_8000ff88": _StringsSection(
+                ".got_recovered_8000ff88", 0x8000ff88, 0x8000ff90, semantics=2),
+        })
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+    assert [i["value"] for i in out["items"]] == [
+        "5`\n@", "default.cfg", "/lib/ld-linux-aarch64.so.1"]
+    assert out["noise_strings"] == 1 and out["noise_sections"] == [".interp"]
+    assert out["data_sections"] == []
+    sampled = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None,
+                                 min_length=6, domain_sections_only=True)
+    assert [i["value"] for i in sampled["items"]] == ["default.cfg"]
+
+
+def test_strings_unclaimed_address_is_noise_only_in_an_executable_segment_m12(monkeypatch):
+    """On a view WITH a ReadOnlyCode section, an unclaimed address is judged by
+    its segment: the ELF header in the r-x load segment is noise; an unclaimed
+    address in a non-executable segment is data."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+    bv.strings.append(_FakeString(0x490100, "padding literal"))  # rw- segment, no section
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+    values = [i["value"] for i in out["items"]]
+    assert values[:3] == ["config parse failed: %s", "Set Channel Index", "padding literal"]
+    assert values[3] == "@8\t@"
+    assert out["noise_sections"] == [".dynstr", ".code", "(no section)", ".interp"]
+    assert out["noise_strings"] == 8
+
+    ranges = read_misc._string_section_ranges(bv)
+    assert read_misc._string_tier_at(ranges, 0x400034) == (read_misc._STRING_TIER_NOISE, "(no section)")
+    assert read_misc._string_tier_at(ranges, 0x490100) == (read_misc._STRING_TIER_DATA, "(no section)")
+
+
+def _overlap_bv(order):
+    """A ReadOnlyData `.container` over [0, 1024) with a ReadOnlyCode `.text`
+    nested at [128, 384) -- the shape `add_user_section` produces on real BN --
+    in either `bv.sections` order."""
+    sections = {
+        ".container": _StringsSection(".container", 0, 1024, semantics=2),
+        ".text": _StringsSection(".text", 128, 384, semantics=1),
+    }
+    bv = _RawBV([_FakeString(50, "literal"), _FakeString(192, "codebyte"),
+                 _FakeString(600, "second literal")],
+                sections={name: sections[name] for name in order})
+    bv.segments = [_StringsSegment(0, 1024, executable=True)]
+    return bv
+
+
+def test_strings_overlapping_sections_narrowest_wins_in_either_order_m12(monkeypatch):
+    """Overlap resolution is an explicit precedence, not `bv.sections` order:
+    the narrowest claiming section decides, so a broad data section can never
+    hide the code nested inside it (address 192 was tier 0 / `.container` when
+    `.container` was listed first, and the ordinary listing reported no noise)."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    for order in ((".container", ".text"), (".text", ".container")):
+        bv = _overlap_bv(order)
+        ranges = read_misc._string_section_ranges(bv)
+        assert read_misc._string_tier_at(ranges, 192) == (read_misc._STRING_TIER_NOISE, ".text"), order
+        assert read_misc._string_tier_at(ranges, 50) == (read_misc._STRING_TIER_RODATA, ".container")
+        assert read_misc._string_tier_at(ranges, 600) == (read_misc._STRING_TIER_RODATA, ".container")
+
+        out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+        assert [i["value"] for i in out["items"]] == ["literal", "second literal", "codebyte"], order
+        assert out["noise_strings"] == 1 and out["noise_sections"] == [".text"], order
+        assert out["data_sections"] == [".container"]
+        sampled = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None,
+                                     domain_sections_only=True)
+        assert [i["value"] for i in sampled["items"]] == ["literal", "second literal"], order
+
+
+def test_strings_section_pin_keeps_address_order_across_an_overlap_m12(monkeypatch):
+    """`--section .container` lists the pinned population in ADDRESS order even
+    though the nested `.text` ranks one of its addresses as noise: a pin is a
+    population, not a tier. Noise counters stay empty, as for any pin."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _overlap_bv((".container", ".text"))
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None,
+                             section=".container")
+    assert [i["value"] for i in out["items"]] == ["literal", "codebyte", "second literal"]
+    assert out["noise_strings"] == 0 and out["noise_sections"] == [] and out["data_sections"] == []
+
+
+def test_strings_nobits_sections_do_not_claim_addresses_m12(monkeypatch):
+    """`.tbss` (NOBITS, ReadWriteData) overlaps the head of `.data.rel.ro` on a
+    static AArch64 ELF. It has no file bytes, so it cannot hold a string: the
+    ranking skips it, and the orient disclosure names the section the ranking
+    used, not whichever `get_sections_at` listed first."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV(rodata=False)
+    bv.strings.append(_FakeString(0x48c2f0, "relro literal"))
+    bv.sections[".tbss"] = _StringsSection(".tbss", 0x48c2c0, 0x48c300, semantics=3, type="NOBITS")
+    bv.sections[".data.rel.ro"] = _StringsSection(".data.rel.ro", 0x48c2e0, 0x48fc28, semantics=2)
+    bv.segments.append(_StringsSegment(0x48c000, 0x490000, executable=False))
+
+    ranges = read_misc._string_section_ranges(bv)
+    assert read_misc._string_tier_at(ranges, 0x48c2f0) == (read_misc._STRING_TIER_RODATA, ".data.rel.ro")
+
+    inst = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+    sample = {"items": [{"address": "0x48c2f0", "value": "relro literal"}]}
+    inst._disclose_sample_sections(None, sample)
+    assert sample["sample_sections"] == [".data.rel.ro"]
+
+
+def test_string_tier_lookup_honours_half_open_section_bounds_m12(monkeypatch):
+    """The sorted table is bisected: a section's start is inside, its end is
+    not, and the gap between two sections is unclaimed."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+    ranges = read_misc._string_section_ranges(bv)
+    assert ranges.starts == sorted(ranges.starts)
+    assert all(e <= s for e, s in zip(ranges.ends, ranges.starts[1:]))  # non-overlapping
+    assert ".synthetic_builtins" not in ranges.names
+    assert read_misc._string_tier_at(ranges, 0x452000)[1] == ".rodata"
+    assert read_misc._string_tier_at(ranges, 0x45ffff)[1] == ".rodata"
+    assert read_misc._string_tier_at(ranges, 0x460000)[1] == "(no section)"
+    assert read_misc._string_tier_at(ranges, 0x400260)[1] == "(no section)"  # end of .interp
+    assert read_misc._string_tier_at(ranges, 0x400240)[1] == ".interp"
+
+
+def test_strings_data_sections_name_the_views_own_data_section_m12(monkeypatch):
+    """`data_sections` lists the data sections the listing drew on, preferred
+    tier first, so the CLI tip can recommend `--section .rdata` on a PE instead
+    of a `.rodata` the view does not have."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+
+    out = read_misc._strings(_strings_ctx(_StringsBV(data=True)), None, query=None,
+                             offset=0, limit=None)
+    assert out["data_sections"] == [".rodata", ".data"]
+
+    pe = _StringsBV(rodata=False)
+    pe.strings.append(_FakeString(0x452100, "pe literal"))
+    pe.sections[".rdata"] = _StringsSection(".rdata", 0x452000, 0x460000, semantics=2)
+    out = read_misc._strings(_strings_ctx(pe), None, query=None, offset=0, limit=None)
+    assert out["data_sections"] == [".rdata"]
+    assert out["noise_strings"] == 8
+
+
+def test_strings_metadata_names_match_as_prefixes_m12(monkeypatch):
+    """`.data.rel.ro` is relocated read-only DATA, not `.rel.dyn`: the metadata
+    list matches section-name prefixes, so a substring cannot demote it -- and
+    `.relr.dyn` (packed relative relocations, which neither `.rel.` nor `.rela`
+    covers) is metadata like its siblings."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV(rodata=False)
+    bv.strings.append(_FakeString(0x480100, "relro literal"))
+    bv.sections[".data.rel.ro"] = _StringsSection(".data.rel.ro", 0x480000, 0x481000, semantics=2)
+    bv.strings.append(_FakeString(0x490100, "reloc entry"))
+    bv.sections[".rel.dyn"] = _StringsSection(".rel.dyn", 0x490000, 0x491000, semantics=2)
+    bv.strings.append(_FakeString(0x492100, "packed reloc"))
+    bv.sections[".relr.dyn"] = _StringsSection(".relr.dyn", 0x492000, 0x493000, semantics=2)
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None,
+                             domain_sections_only=True)
+    assert [i["value"] for i in out["items"]] == ["relro literal"]
+    listing = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=None)
+    assert ".relr.dyn" in listing["noise_sections"] and ".data.rel.ro" not in listing["noise_sections"]
 
 
 def test_orient_prefers_rodata_and_discloses_sections_646(monkeypatch):
@@ -1751,8 +2076,29 @@ def test_orient_prefers_rodata_and_discloses_sections_646(monkeypatch):
     sample = inst._orient_digest(None)["strings_sample"]
     assert [i["value"] for i in sample["items"]] == [
         "config parse failed: %s", "Set Channel Index"]
-    # option (3): the sample is attributable.
+    # option (3): the sample is attributable -- and it is ONLY `.rodata`: not the
+    # ReadOnlyCode section, not the sectionless ELF header (M-12).
     assert sample["sample_sections"] == [".rodata"]
+    assert "sample_fallback" not in sample
+
+
+def test_orient_sample_lists_rodata_before_data_m12(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    bv = _StringsBV(data=True)
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections", lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 3})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda sel: bv)
+
+    sample = inst._orient_digest(None)["strings_sample"]
+    assert [i["value"] for i in sample["items"]] == [
+        "config parse failed: %s", "Set Channel Index", "default.cfg"]
+    # ordered as sampled (preferred tier first), not alphabetically
+    assert sample["sample_sections"] == [".rodata", ".data"]
 
 
 def test_orient_strings_degrades_when_no_rodata_646(monkeypatch):
@@ -1771,21 +2117,34 @@ def test_orient_strings_degrades_when_no_rodata_646(monkeypatch):
 
     sample = inst._orient_digest(None)["strings_sample"]
     assert sample["items"], "must fall back rather than report an empty sample"
+    # The fallback is the full ranked set and SAYS it fell back (M-12), so the
+    # reader does not take the header / code bytes for domain literals.
     assert sample["items"][0]["value"] == "/lib/ld-linux-aarch64.so.1"
+    assert sample["sample_fallback"] == "no strings in data sections; sampled every section"
+    assert sample["sample_sections"] == [".interp", ".dynstr", ".code"]
+
+
+def test_render_orient_text_discloses_sample_fallback_m12():
+    from bn.formatters import _render_orient_text
+    d = {"kind": "orient_digest", "target": {"basename": "foo"}, "analyzed": True,
+         "analysis_state": "full", "function_count": 42, "strings_min_length": 6,
+         "strings_sample": {"items": [{"address": "0x401a40", "value": "4@CA9`!"}],
+                            "total": 1, "sample_sections": [".interp", ".text"],
+                            "sample_fallback": "no strings in data sections; sampled every section"}}
+    out = _render_orient_text(d)
+    assert ("strings (min-length 6; sample 1 of 1; from .interp, .text; "
+            "no strings in data sections; sampled every section):") in out
 
 
 def test_strings_domain_filter_keeps_sectionless_views_646(monkeypatch):
     """#646: a raw/monolithic firmware image with no named sections must not be
-    blinded by the filter."""
+    blinded by the filter -- in the shape BN really gives it (`.synthetic_builtins`
+    only, one r-x segment), not a fake with no `sections` attribute at all."""
     bridge = _load_bridge(monkeypatch)
     read_misc = bridge.read_misc
 
-    class _RawBV:
-        strings = [_FakeString(0x80000000, "vxWorks boot")]
-        def get_sections_at(self, addr):
-            return []
-
-    out = read_misc._strings(_strings_ctx(_RawBV()), None, query=None, offset=0,
+    out = read_misc._strings(_strings_ctx(_RawBV([_FakeString(0x80000000, "vxWorks boot")])),
+                             None, query=None, offset=0,
                              limit=5, min_length=6, domain_sections_only=True)
     assert [i["value"] for i in out["items"]] == ["vxWorks boot"]
 

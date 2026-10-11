@@ -4065,9 +4065,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # they are named in the skipped set below rather than silently dropped.
     # #795 adds eleven further CLI count reads to this combined population.
     # #889 adds the data-symbol total read; its offset read was already covered.
-    assert len(sites) == 54, (
+    # M-12 adds the strings `noise_strings` count read.
+    assert len(sites) == 55, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 54. A "
+        "count helper, not 55. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4227,9 +4228,12 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "stated in this context]",
         "_render_target_info_annotations_text(user_symbols) [count not stated "
         "in this context]",
-        # The inner paging disclosure obscures this count in the probe body;
-        # dedicated string-count tests cover both output contexts.
-        "_render_strings_text(filtered) [count not stated in this context]",
+        # The `strings` listing body behind both CLI faces (`_render_strings_text`
+        # and the M-12 `_render_strings_narrowed_text`), which is where the AST
+        # finds these reads; the faces are what the runtime population probes,
+        # and dedicated string-count / noise-tip tests cover both output contexts.
+        "_strings_listing_text(filtered) [not a payload renderer]",
+        "_strings_listing_text(noise_strings) [not a payload renderer]",
     ]), sorted(not_stated)
 
 
@@ -4614,8 +4618,13 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # anti-vacuity count it also changes.
     # Combined #873 and #879 renderer population; remeasured below.
     # M-01 adds the `discarded_unsaved` list read to the session-start and
-    # session-stop renderers: two pairs x six malformed values. Measured: 1296.
-    assert checked == 1296, f"the differential ran {checked} cases, not 1296"
+    # session-stop renderers: two pairs x six malformed values (+12).
+    # M-12 adds the strings `noise_sections` list read (6 malformed list shapes,
+    # +6); its round 2 adds the `data_sections` list read and the narrowed
+    # `strings` face (`_render_strings_narrowed_text`, which reaches the same
+    # `items` / `noise_sections` lists), three list reads x 6 (+18). Measured:
+    # 1320.
+    assert checked == 1320, f"the differential ran {checked} cases, not 1320"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4692,10 +4701,14 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #907 adds 48 malformed probes for its class-list reads.
     # #693 adds 16 more for two go-rename reads.
     # Combined #873/#879/#889 population is 5280. #693 adds two go-rename
-    # reads, each probed with eight malformed values, for 5296 total.
-    # M-01 adds the `discarded_unsaved` read on the session-start and
-    # session-stop renderers: two pairs x eight, for 5312.
-    assert swept == 5312, f"the raise sweep ran {swept} renders, not 5312"
+    # reads, each probed with eight malformed values, for 5296 total. M-01 adds
+    # the `discarded_unsaved` read on the session-start and session-stop
+    # renderers: two pairs x eight (+16). M-12 adds the strings
+    # `noise_strings`/`noise_sections` reads (+16); its round 2 adds the
+    # `data_sections` read plus the narrowed `strings` face's nine reads (the
+    # same envelope through `_render_strings_narrowed_text`): 10 x 8 (+80).
+    # Total 5408.
+    assert swept == 5408, f"the raise sweep ran {swept} renders, not 5408"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4875,10 +4888,12 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #907 adds 16 benign probes for those reads.
     # #693 adds four more for the same go-rename pairs.
     # Combined #873/#879/#889 mirror is 1534. #693's two reads add four
-    # benign probes, for 1538 total.
-    # M-01 adds the `discarded_unsaved` read on the session-start and
-    # session-stop renderers: two pairs x three benign probes, for 1544.
-    assert checked == 1544, f"the mirror ran {checked} renders, not 1544"
+    # benign probes, for 1538 total. M-01 adds the `discarded_unsaved` read on
+    # the session-start and session-stop renderers: two pairs x three benign
+    # probes (+6). M-12's strings noise reads add five (+5); its round 2 adds
+    # the `data_sections` list read (3) and the narrowed `strings` face's nine
+    # reads (two lists x 3 + seven scalars x 2 = 20) (+23). Total 1572.
+    assert checked == 1572, f"the mirror ran {checked} renders, not 1572"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7733,11 +7748,14 @@ def test_no_list_ELEMENT_costs_the_whole_render():
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
     # #907 adds two class-note list positions, each tested with nine junk
-    # elements at four shapes, to the PR-integrated 4716. Measured: 4788.
-    # M-01 adds the `discarded_unsaved` list position on the session-start and
-    # session-stop renderers: two x nine x four. Measured: 4860.
-    assert swept == 4860, (
-        f"the element sweep ran {swept} renders, not 4860 -- the size of the "
+    # elements at four shapes, to the PR-integrated 4716. Measured: 4788. M-01
+    # adds the `discarded_unsaved` list position on the session-start and
+    # session-stop renderers: two x nine x four (+72). M-12 adds the strings
+    # `noise_sections` list position (+36); its round 2 adds `data_sections` and
+    # the narrowed `strings` face's `items` / `noise_sections` positions, three x
+    # 36 (+108). Measured: 5004.
+    assert swept == 5004, (
+        f"the element sweep ran {swept} renders, not 5004 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
@@ -8635,7 +8653,8 @@ def test_every_generic_empty_render_uses_the_shared_marker():
         "_render_paged_list_text": ((page, "items", formatters._render_name_address_rows), {}),
         "_render_type_list_text": ((page,), {}),
         "_render_strings_rows": (([],), {}),
-        "_render_strings_text": ((page,), {}),
+        # M-12: the two `strings` faces share one body, which is the marker's caller.
+        "_strings_listing_text": ((page,), {"narrowed": False}),
         "_render_sections_rows": (([],), {}),
         "_render_data_vars_text": ((page,), {}),
         "_render_data_symbols_text": ((page,), {}),

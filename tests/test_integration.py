@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import struct
 import sys
 import threading
 import time
@@ -980,10 +981,18 @@ def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
 
     A plain function, not the fixture body, so the budget guard below can call
     it with a recording stand-in instead of spending the 20s for real.
+
+    A missing cross-compiler or a failed cross-compile is a visible skip by
+    default and a FAILURE under `BN_REQUIRE_REAL_TESTS=1` (`refuse_silent_skip`):
+    every test on this probe is a real-architecture guard the mocked suite
+    cannot stand in for, so a strict lane that lost the toolchain must say so
+    rather than report green with the guard unexercised.
     """
     cc = shutil.which("aarch64-linux-gnu-gcc")
     if cc is None:
-        pytest.skip("aarch64-linux-gnu-gcc not available")
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc not available, so the AArch64 probe lane did not "
+            "run; install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
     workdir = tmp_path_factory.mktemp("aarch64-probe")
     src = workdir / "probe.c"
     src.write_text("int add(int a, int b){return a + b;}\nint main(){return add(1, 2);}\n")
@@ -993,7 +1002,9 @@ def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
         capture_output=True, text=True, timeout=120,
     )
     if build.returncode != 0:
-        pytest.skip(f"aarch64 cross-compile failed: {build.stderr}")
+        refuse_silent_skip(
+            f"aarch64 cross-compile failed (exit {build.returncode}), so the AArch64 "
+            f"probe lane did not run; fix the cross toolchain: {build.stderr.strip()}")
     selector = bridge.load(probe, copy=False, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
     saved = bridge.run("save", "--target", selector, "--format", "json")
     assert saved.returncode == 0, f"priming save failed: {saved.stderr}\n{saved.stdout}"
@@ -1059,6 +1070,193 @@ class TestDisasmLinearAArch64:
                             "--mode", "arm", "--format", "json")
         assert res.returncode != 0, res.stdout
         assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
+
+
+class TestOrientStringsSampleAArch64:
+    """M-12 real-path guard. On a static AArch64 ELF, BN's string scan accepts
+    runs of instruction bytes that happen to decode as printable ASCII, and
+    `.text` sits below `.rodata` in the address space -- so the orient sample,
+    the head of an address-ordered scan, was twenty rows of `@8\\t@`-shaped junk
+    (plus the ELF header, which no section claims) on every such file, while
+    `strings --section .rodata` had the real literals. The mocked tests prove
+    the ranking; this proves BN's real section semantics drive it: no sampled
+    section is `ReadOnlyCode`, the sample names its sections, and the default
+    `strings` dump leads with the same sections."""
+
+    def test_orient_sample_comes_from_data_sections(self, shared_bn, aarch64_probe):
+        shared_bn.load(aarch64_probe, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        semantics = {s["name"]: s["semantics"] for s in sections["items"]}
+        assert "ReadOnlyCode" in semantics.values(), semantics  # premise: BN marks code
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert sample["items"], orient
+        assert "sample_fallback" not in sample, sample
+        drawn = sample["sample_sections"]
+        assert drawn, sample
+        assert all(semantics[name] != "ReadOnlyCode" for name in drawn), (drawn, semantics)
+        # every sampled row is claimed by one of the named sections -- no header row
+        starts = {name: (int(s["start"], 16), int(s["end"], 16))
+                  for name, s in ((s["name"], s) for s in sections["items"])}
+        for row in sample["items"]:
+            addr = int(row["address"], 16)
+            assert any(lo <= addr < hi for lo, hi in (starts[n] for n in drawn)), (row, drawn)
+
+        # The default dump (at orient's min-length) leads with the same
+        # data-section strings, names the code / metadata sections it ranked
+        # last -- never `.rodata` -- and `.rodata` is the data section the tip
+        # recommends narrowing to.
+        dump = json.loads(shared_bn.run(
+            "strings", "--limit", "5", "--min-length", str(orient["strings_min_length"]),
+            "--format", "json").stdout)
+        assert [r["value"] for r in dump["items"]] == [r["value"] for r in sample["items"][:5]]
+        assert dump["noise_strings"] > 0, dump
+        assert ".rodata" not in dump["noise_sections"], dump["noise_sections"]
+        assert dump["data_sections"][0] == ".rodata", dump["data_sections"]
+        text = shared_bn.run("strings", "--limit", "5").stdout
+        assert "// tip:" in text and "--section .rodata" in text, text
+        # Under a filter the caller chose, the text states where the matches
+        # sit instead of recommending the flag already in use.
+        narrowed = shared_bn.run("strings", "--limit", "5", "--min-length",
+                                 str(orient["strings_min_length"])).stdout
+        assert "// note:" in narrowed and "narrow with" not in narrowed, narrowed
+
+
+def _strip_section_headers(binary: Path, out: Path) -> Path:
+    """*binary* with its ELF64 section-header table unlinked (e_shoff / e_shnum /
+    e_shstrndx zeroed) -- what `objcopy --strip-section-headers` produces,
+    without needing a binutils new enough to have that flag. BN then recovers
+    only what the dynamic segment describes (`.interp`, `.dynamic`, `.got_*`)
+    and marks no code section at all."""
+    data = bytearray(binary.read_bytes())
+    assert data[:4] == b"\x7fELF" and data[4] == 2, "an ELF64 fixture"
+    struct.pack_into("<Q", data, 0x28, 0)
+    struct.pack_into("<H", data, 0x3c, 0)
+    struct.pack_into("<H", data, 0x3e, 0)
+    out.write_bytes(data)
+    out.chmod(0o755)
+    return out
+
+
+class TestStringsRankingWithoutCodeSections:
+    """M-12 round 2: BN 6.1 never produces a sectionless view -- every loader
+    adds `.synthetic_builtins` (an ExternalSection) -- so a classifier that
+    treats "has any section" as "sectioned" and "no section claims it" as
+    noise ranks EVERY string of a raw image or a section-header-stripped ELF
+    as `(no section)` noise: the literals printed under a tip calling them
+    code bytes, and orient claiming it fell back past the data sections. The
+    mocked `_RawBV` used to have no `sections` attribute at all, a shape BN
+    never gives, which is why the suite could not see it; these drive the real
+    loader."""
+
+    _LITERALS = ("vxWorks boot loader", "boot: %s", "default.cfg")
+
+    def test_raw_mapped_view_strings_are_literals_not_noise(self, shared_bn, tmp_path):
+        image = bytearray(0x400)
+        for offset, literal in zip((0x100, 0x200, 0x300), self._LITERALS):
+            image[offset:offset + len(literal) + 1] = literal.encode() + b"\0"
+        blob = tmp_path / "firmware.bin"
+        blob.write_bytes(image)
+        shared_bn.load(blob, copy=False)
+
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        # premise: the raw view is NOT sectionless -- only the synthetic one
+        assert {s["semantics"] for s in sections["items"]} == {"ExternalSection"}, sections
+
+        dump = json.loads(shared_bn.run("strings", "--format", "json").stdout)
+        assert [r["value"] for r in dump["items"]] == list(self._LITERALS), dump
+        assert dump["noise_strings"] == 0 and dump["noise_sections"] == [], dump
+        assert dump["data_sections"] == [], dump
+        text = shared_bn.run("strings").stdout
+        assert "tip:" not in text and "code bytes" not in text, text
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert "sample_fallback" not in sample, sample
+        assert [r["value"] for r in sample["items"]] == list(self._LITERALS), sample
+        assert sample["sample_sections"] == [], sample
+
+    def test_section_header_stripped_elf_keeps_literals_as_data(self, shared_bn, tmp_path):
+        stripped = _strip_section_headers(HELLO_BINARY, tmp_path / "hello_stripped")
+        shared_bn.load(stripped, copy=False)
+
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        semantics = {s["name"]: s["semantics"] for s in sections["items"]}
+        # premise: BN recovered loader metadata from the dynamic segment, but
+        # marked no code section -- so it has not said where code is.
+        assert "ReadOnlyCode" not in semantics.values(), semantics
+        assert any(name.startswith(".interp") for name in semantics), semantics
+
+        dump = json.loads(shared_bn.run("strings", "--format", "json").stdout)
+        values = [r["value"] for r in dump["items"]]
+        assert "starting up" in values and "greeting length: %d\n" in values, values
+        # the unclaimed addresses (code AND literals) are data, in address
+        # order; only the recovered metadata sections rank last
+        assert "(no section)" not in dump["noise_sections"], dump["noise_sections"]
+        assert all(name.startswith((".interp", ".dynamic", ".got")) for name in dump["noise_sections"]), dump
+        unclaimed = [int(r["address"], 16) for r in dump["items"]
+                     if r["value"] in ("starting up", "greeting length: %d\n")]
+        data_rows = [int(r["address"], 16) for r in dump["items"]][:len(dump["items"]) - dump["noise_strings"]]
+        assert data_rows == sorted(data_rows) and all(a in data_rows for a in unclaimed), dump
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert "sample_fallback" not in sample, sample
+        assert "starting up" in [r["value"] for r in sample["items"]], sample
+
+
+class TestAArch64ProbeStrictGate:
+    """The AArch64 probe is the only real-architecture guard the lane has; a
+    missing cross-compiler or a failed cross-compile must be a visible skip by
+    default and a FAILURE -- carrying the build diagnostics -- under
+    `BN_REQUIRE_REAL_TESTS=1`, never a silent pass of an unexercised guard."""
+
+    @staticmethod
+    def _prime(monkeypatch, tmp_path_factory, *, which, build):
+        monkeypatch.setattr(shutil, "which", which)
+        monkeypatch.setattr(subprocess, "run", build)
+        _build_and_prime_aarch64_probe(None, tmp_path_factory)
+
+    def test_missing_cross_compiler_fails_in_strict_mode(self, monkeypatch, tmp_path_factory):
+        from _pytest.outcomes import Failed, Skipped
+
+        def no_build(*a, **k):
+            raise AssertionError("must not try to compile without a compiler")
+
+        monkeypatch.delenv("BN_REQUIRE_REAL_TESTS", raising=False)
+        with pytest.raises(Skipped) as skipped:
+            self._prime(monkeypatch, tmp_path_factory, which=lambda name: None, build=no_build)
+        assert "aarch64-linux-gnu-gcc" in str(skipped.value)
+
+        monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
+        with pytest.raises((Failed, Skipped)) as failed:
+            self._prime(monkeypatch, tmp_path_factory, which=lambda name: None, build=no_build)
+        assert isinstance(failed.value, Failed), failed.value
+        assert "aarch64-linux-gnu-gcc" in str(failed.value)
+        assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
+
+    def test_failed_cross_compile_fails_in_strict_mode_with_diagnostics(self, monkeypatch,
+                                                                        tmp_path_factory):
+        from _pytest.outcomes import Failed, Skipped
+
+        def broken_build(*a, **k):
+            return subprocess.CompletedProcess(a[0] if a else [], 1, stdout="",
+                                               stderr="ld: cannot find crt1.o")
+
+        monkeypatch.delenv("BN_REQUIRE_REAL_TESTS", raising=False)
+        with pytest.raises(Skipped) as skipped:
+            self._prime(monkeypatch, tmp_path_factory,
+                        which=lambda name: "/usr/bin/" + name, build=broken_build)
+        assert "cannot find crt1.o" in str(skipped.value)
+
+        monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
+        with pytest.raises((Failed, Skipped)) as failed:
+            self._prime(monkeypatch, tmp_path_factory,
+                        which=lambda name: "/usr/bin/" + name, build=broken_build)
+        assert isinstance(failed.value, Failed), failed.value
+        assert "cannot find crt1.o" in str(failed.value) and "exit 1" in str(failed.value)
+        assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
 
 
 class TestSessionStartTimeoutDiagnostics:

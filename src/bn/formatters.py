@@ -3621,9 +3621,14 @@ def _render_orient_text(value: Any) -> str:
         mn = value.get("strings_min_length")
         filt = f"min-length {mn}; " if mn is not None else ""
         # #646: name the sections the sample came from, so a low-signal sample is
-        # attributable instead of looking like the whole binary's flavour.
+        # attributable instead of looking like the whole binary's flavour -- and
+        # when the bridge had to fall back past the data sections (M-12), say so,
+        # so instruction bytes are not read as literals.
         drawn = _field_list(ss, "sample_sections")
         from_where = f"; from {', '.join(str(d) for d in drawn)}" if drawn else ""
+        fallback = ss.get("sample_fallback")
+        if fallback:
+            from_where += f"; {fallback}"
         lines.append(
             f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
         for s in items[:15]:
@@ -4742,10 +4747,14 @@ def _render_strings_rows(value: Any) -> str:
     return "\n".join(lines)
 
 
-@_discloses
-def _render_strings_text(value: Any) -> str:
-    """Render strings: the paged {items, total, ...} envelope (with a footer),
-    or a bare list for back-compat / internal callers (#122)."""
+def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
+    """The body of the two `strings` listing faces below: the paged {items,
+    total, ...} envelope (with a footer), or a bare list for back-compat /
+    internal callers (#122). *narrowed* is whether the caller's own filters
+    (--query, --min-length, --no-crt, ...) already shaped the listing: the
+    noise tip then states where the matches sit instead of recommending a
+    flag the caller is already using. The faces are the `@_discloses`
+    boundaries; this records through them."""
     body = _render_paged_list_text(value, "items", _render_strings_rows)
     # #795: state how many strings the ACTIVE filter chain dropped, so the
     # denominator does not need a second unfiltered invocation (`strings --count`
@@ -4768,7 +4777,50 @@ def _render_strings_text(value: Any) -> str:
             note = ("// the payload's filtered-string count is not a number that "
                     "can be read (use --format json)")
             body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        # M-12: the "narrow your noisy dump" tip names the sections that actually
+        # contributed code / linker-metadata noise to THIS listing (the bridge
+        # ranks them last), and is absent when there are none -- it used to blame
+        # `.dynsym/.hash/.symtab` unconditionally, on static files that have none.
+        # The `--section` it recommends is the view's own top data section
+        # (`.rdata` on a PE, never an assumed `.rodata`), and under a filter the
+        # caller chose it only states where the matches sit.
+        noisy = _nonnegative_count(value, "noise_strings")
+        if noisy:
+            named = ", ".join(str(n) for n in _field_list(value, "noise_sections"))
+            where = f" from {named}" if named else ""
+            data_sections = _field_list(value, "data_sections")
+            if narrowed:
+                note = (f"// note: {noisy} of the listed string(s){where} are code "
+                        f"bytes or linker metadata (ranked last).")
+            elif data_sections:
+                note = (f"// tip: {noisy} string(s){where} are code bytes or linker "
+                        f"metadata (ranked last); narrow with --section "
+                        f"{data_sections[0]} (or --query / --min-length) for signal.")
+            else:
+                note = (f"// tip: {noisy} string(s){where} are code bytes or linker "
+                        f"metadata (ranked last); narrow with --query / --min-length "
+                        f"for signal.")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        elif _field_skewed("noise_strings"):
+            note = ("// the payload's noise-string count is not a number that "
+                    "can be read (use --format json)")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
+
+
+@_discloses
+def _render_strings_text(value: Any) -> str:
+    """Render the unfiltered `strings` listing (the tip recommends how to narrow)."""
+    return _strings_listing_text(value, narrowed=False)
+
+
+@_discloses
+def _render_strings_narrowed_text(value: Any) -> str:
+    """Render a `strings` listing the caller's own filters (--query,
+    --min-length/--max-length, --no-crt, --probable-format-strings) already
+    shaped: the noise note states where the matches sit instead of
+    recommending a flag in use (M-12)."""
+    return _strings_listing_text(value, narrowed=True)
 
 
 def _render_sections_rows(value: Any) -> str:
