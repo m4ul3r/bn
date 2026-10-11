@@ -486,7 +486,10 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
                               if isinstance(rec["typeinfo_name"], dict) else rec["typeinfo_name"]),
         }
         for name, rec in registry.items()
-        if needle is None or needle in name.lower()
+        # #922 (d) review: the absorbed spellings are part of the record, so
+        # `--query basic_string` finds the `Holder<std::string>` card whose alias
+        # carries the expansion -- once, under its canonical name.
+        if needle is None or any(needle in s.lower() for s in (name, *rec["aliases"]))
     }
 
 
