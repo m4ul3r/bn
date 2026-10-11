@@ -1,0 +1,18 @@
+{
+  "description": "`strtok_escape.c` rebuilt at -O1: strtok state left tainted at return is disclosed (tokenizer_state_escapes) and withholds the all-clear; a clean non-NULL strtok whose block dominates the strtok(NULL) resets the continuation so the later strtok(NULL) -> system is not a flow (negative); a clean strtok under `if (mode)` does NOT dominate it, so the continuation stays a real command injection and the partial reset is named",
+  "lang": "c",
+  "cflags": ["-O1"],
+  "forward": [
+    {"function": "tok_escape", "source": "arg:read:1",
+     "assumptions_contain": ["tokenizer_state_escapes"],
+     "all_clear": false},
+    {"function": "tok_reset_conditional", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}],
+     "assumptions_contain": ["continues the tokenizer state", "does not dominate", "tokenizer_state_escapes"]}
+  ],
+  "negative": [
+    {"function": "tok_reset", "source": "arg:read:1",
+     "forbid_sink_classes": ["command_injection"],
+     "all_clear": true}
+  ]
+}

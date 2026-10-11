@@ -162,12 +162,17 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         kinds = {sl["origin"]["kind"] for sl in result["slices"]}
         assert kinds & set(case["origin_kinds"]), \
             f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
+        assert not (kinds & set(case.get("forbid_origin_kinds", []))), \
+            f"{stem}: forbidden backward origin kind in {kinds}"
         for want_leaf in case.get("leaves", []):
             assert any(l["kind"] == want_leaf["kind"] for l in result["leaves"]), \
                 f"{stem}: expected backward leaf {want_leaf} not in {result['leaves']}"
         for forbid in case.get("forbid_leaves", []):
             assert not any(l["kind"] == forbid["kind"] for l in result["leaves"]), \
                 f"{stem}: forbidden backward leaf {forbid} in {result['leaves']}"
+        for sub in case.get("leaf_details_contain", []):
+            assert any(sub in str(l.get("detail") or "") for l in result["leaves"]), \
+                f"{stem}: no backward leaf detail containing {sub!r} in {result['leaves']}"
         for sub in case.get("step_reasons_contain", []):
             reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
             assert any(sub in r for r in reasons), \
@@ -191,6 +196,10 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         classes = {s["sink"]["class"] for s in result["reached_sinks"]}
         assert not (classes & forbidden), \
             f"{stem}: false-positive sink classes {classes & forbidden}"
+        if "all_clear" in case:
+            gate = result["diagnostics"]["safe_to_report_all_clear"]
+            assert gate is case["all_clear"], \
+                f"{stem}: safe_to_report_all_clear={gate}, expected {case['all_clear']}: {result['diagnostics']}"
 
     for case in spec.get("callgraph", []):
         addr = _resolve_addr(shared_bn, case["function"])

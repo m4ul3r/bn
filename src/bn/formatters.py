@@ -4178,6 +4178,14 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
         # Name the cause and where the dropped count lives -- the frontier leaf.
         parts.append("caller-site cap reached (not every caller was followed; "
                      "see the caller_sites_truncated frontier)")
+    if "memory_chain" in causes:
+        # Backward-only: the local-buffer writer walk ran out of memory-SSA
+        # versions before the function entry; the cut is named by the
+        # address_of_local_unresolved leaf (PR-928 round 3 P3).
+        parts.append("memory-chain budget exhausted while walking a local "
+                     "buffer's writers (older writers were never examined; seed "
+                     "closer to the sink -- see the address_of_local_unresolved "
+                     "frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)
@@ -4432,7 +4440,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
                     _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
                 else:
-                    _extra = origin.get("callee") or origin.get("var") or ""
+                    _extra = origin.get("callee") or origin.get("var") or origin.get("address") or ""
                 _spill = " (via spill)" if origin.get("via_spill") else ""
                 lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
