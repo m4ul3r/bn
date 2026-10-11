@@ -108,17 +108,60 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
     return raw
 
 
+# The keys the engine indexes on a model -- a model's ROLE vocabulary. An entry
+# that declares none of them is not a model: a sink's fields pasted at the root
+# (`{"app_recv": {"class": "overflow_len", "len_arg": 1}}`) counted as an
+# active overlay model, rendered in no catalog, and never armed the sink the
+# author meant (#915). The one roleless shape that IS meaningful is the EMPTY
+# object: the builtin DB marks functions that neither source, propagate nor
+# sink taint with `{}` so a tainted argument does not trigger the conservative
+# "unmodeled external" fallback (`_comment_benign` in taint_models.json).
+_MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
+                    "return_bound", "arity_capped", "destinations_unmodeled")
+# Fields that belong INSIDE `sink`; at the root they are the #915 flat shape.
+_SINK_INTERIOR_KEYS = ("class", "tainted_args", "len_arg", "buf_arg", "detail",
+                       "optional", "gate")
+
+
+def model_has_role(model: Any) -> bool:
+    """True when *model* carries at least one recognised role key -- the entries
+    the overlay disclosure counts as models (a benign `{}` is disclosed
+    separately, #915)."""
+    return isinstance(model, dict) and any(k in model for k in _MODEL_ROLE_KEYS)
+
+
 def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> None:
     """Validate the interior shape of a single model so a structurally-malformed
     USER model (`taint --models`, #317) is a clean, attributable error naming the
     model+field -- not an unhandled AttributeError/TypeError deep in apply_model
     that surfaces as a misleading `internal error:` (#317 review). Only the fields
-    the engine indexes are checked; unknown keys are left alone for forward-compat."""
+    the engine indexes are checked; unknown keys beside a recognised role are
+    left alone for forward-compat. A NON-EMPTY entry with no recognised role at
+    all is rejected (#915): it merges to nothing, yet it was counted as an active
+    model and, being a truthy dict, took every `model is not None` branch of the
+    walk (skipping the unrecovered-arg frontier a genuinely unmodeled call would
+    have raised) -- a no-op that still changed the result."""
     def _fail(msg: str) -> None:
         raise TaintError(f"{source}: model {name!r} {msg}")
 
     def _is_int(v: Any) -> bool:
         return isinstance(v, int) and not isinstance(v, bool)
+
+    misplaced = [k for k in _SINK_INTERIOR_KEYS if k in model]
+    if misplaced:
+        # The #915 flat shape, whether or not a role sits beside it: these
+        # fields do nothing at the root, so the sink the author wrote is never
+        # armed. Name the key and the nesting that would arm it.
+        shown = ", ".join(f"`{k}`" for k in misplaced)
+        _fail(f"has sink field(s) {shown} at the top level; they must be nested "
+              f"under `sink` -- {{\"{name}\": {{\"sink\": {{\"class\": ..., "
+              f"\"tainted_args\": [...]}}}}}}")
+    if model and not model_has_role(model):
+        _fail(f"declares no recognised model role (keys: "
+              f"{', '.join(repr(k) for k in model)}); a model needs at least one of "
+              f"{'/'.join(_MODEL_ROLE_KEYS)}, each nested under the symbol name "
+              f"({{\"{name}\": {{\"sink\": {{...}}}}}}); an empty {{}} marks a benign "
+              f"function that neither sources, propagates nor sinks taint")
 
     if "sink" in model:
         sink = model["sink"]
@@ -153,6 +196,15 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         fi = va.get("first_index")
         if fi is not None and not _is_int(fi):
             _fail("`varargs.first_index` must be an integer")
+    if "continuation" in model:
+        # A static-state tokenizer (strtok): a call whose `null_arg` is the
+        # NULL constant continues the state a previous non-NULL call set.
+        co = model["continuation"]
+        if not isinstance(co, dict):
+            _fail(f"`continuation` must be an object, got {type(co).__name__}")
+        na = co.get("null_arg")
+        if not _is_int(na) or na < 0:
+            _fail("`continuation.null_arg` must be a non-negative integer argument index")
 
 
 def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -230,9 +282,17 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
         # Count the actual models the way load_models()/_coerce_model_map does:
         # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
         # so the disclosed count matches what was really merged (review: a wrapped
-        # file with two inner models otherwise reported count 1).
+        # file with two inner models otherwise reported count 1). #915: `count`
+        # is the entries that contributed a ROLE (sink/sources/propagates/...);
+        # a benign `{}` marker merges a real no-op and is disclosed under its own
+        # `benign` key, so "1 model(s)" can never describe an entry that armed
+        # nothing. (A non-empty roleless entry never gets here -- load_models
+        # rejects it before the walk.)
         inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
-        count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
+        entries = ([m for k, m in inner.items() if not str(k).startswith("_comment")]
+                   if isinstance(inner, dict) else [])
+        count = sum(1 for m in entries if model_has_role(m))
+        benign = sum(1 for m in entries if isinstance(m, dict) and not m)
         # #615 review F8: when the bridge was ALSO spawned with BN_TAINT_MODELS
         # pointed at this SAME file, the override above already discloses it --
         # skip the duplicate `user` entry so the same file isn't listed twice
@@ -245,6 +305,8 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
         if not same_file_as_override:
             user: dict[str, Any] = {"kind": "user", "via": user_models_via or "--models",
                                     "count": count}
+            if benign:
+                user["benign"] = benign
             if user_models_path:
                 user["path"] = str(user_models_path)
             sources.append(user)
@@ -257,6 +319,8 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
             for entry in reversed(sources):
                 if entry.get("kind") in ("env_override", "override_default"):
                     entry["count"] = count
+                    if benign:
+                        entry["benign"] = benign
                     break
     return sources
 

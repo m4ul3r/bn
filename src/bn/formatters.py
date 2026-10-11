@@ -4635,7 +4635,11 @@ def _render_model_sources(sources: Any) -> str:
             parts.append(f"override ({s.get('path')})")
         elif kind == "user":
             loc = s.get("path") or s.get("via", "--models")
-            parts.append(f"--models {loc} ({s.get('count', 0)} model(s))")
+            # #915: `count` is the role-bearing entries; a benign `{}` marker
+            # armed nothing and is shown as what it is, not as a model.
+            benign = s.get("benign")
+            tail = f", {benign} benign" if benign else ""
+            parts.append(f"--models {loc} ({s.get('count', 0)} model(s){tail})")
     return ("models: " + " + ".join(parts)) if parts else ""
 
 
@@ -4651,6 +4655,10 @@ def _describe_loc(loc: Any) -> str:
         return f"ret:{loc.get('callee')}"
     if kind == "arg":
         return f"arg:{loc.get('callee')}:{loc.get('index')}"
+    if kind in ("call", "model"):
+        # The header used to print a bare `call` while every flow line said
+        # `call:<callee>` -- the one locator kind whose callee was dropped.
+        return f"{kind}:{loc.get('callee')}"
     return str(kind)
 
 

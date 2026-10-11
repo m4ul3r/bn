@@ -257,6 +257,11 @@ def test_builtin_models_load():
     assert "system" in models and "recv" in models
 
 
+# A minimal role-bearing user model for overlay-disclosure tests. An empty `{}`
+# is the benign marker and is disclosed under `benign`, not `count` (#915).
+_SINK_MODEL = {"sink": {"class": "overflow_len", "tainted_args": [1]}}
+
+
 def test_model_overlay_sources_discloses_active_overlays():
     # #415: the active overlay sources are disclosed (builtin always; user --models
     # when supplied), so an agent can confirm a model landed without a restart.
@@ -264,7 +269,7 @@ def test_model_overlay_sources_discloses_active_overlays():
     assert builtin_only[0]["kind"] == "builtin" and "path" in builtin_only[0]
     assert all(s["kind"] != "user" for s in builtin_only)
 
-    with_user = te.model_overlay_sources({"xmalloc": {}, "xcalloc": {}})
+    with_user = te.model_overlay_sources({"xmalloc": _SINK_MODEL, "xcalloc": _SINK_MODEL})
     user = [s for s in with_user if s["kind"] == "user"]
     assert len(user) == 1
     assert user[0]["via"] == "--models" and user[0]["count"] == 2
@@ -275,7 +280,7 @@ def test_model_overlay_sources_unwraps_models_envelope_and_path():
     # unwraps it), so the disclosed count must reflect the INNER models -- and skip
     # ``_comment*`` doc keys -- not the outer one-key dict. The --models path is
     # surfaced too so an agent sees WHICH file landed.
-    wrapped = {"models": {"a": {}, "b": {}, "_comment": "doc"}}
+    wrapped = {"models": {"a": _SINK_MODEL, "b": _SINK_MODEL, "_comment": "doc"}}
     src = te.model_overlay_sources(wrapped, user_models_path="proj/models.json")
     user = [s for s in src if s["kind"] == "user"]
     assert len(user) == 1
@@ -7829,7 +7834,8 @@ def test_model_overlay_sources_folded_entry_keeps_model_count(monkeypatch, tmp_p
     }))
     monkeypatch.setenv("BN_TAINT_MODELS", str(shared))
     monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: shared)
-    sources = te.model_overlay_sources({"app_copy": {}, "app_fmt": {}}, user_models_path=str(shared),
+    sources = te.model_overlay_sources({"app_copy": _SINK_MODEL, "app_fmt": _SINK_MODEL},
+                                       user_models_path=str(shared),
                                        user_models_via="$BN_TAINT_MODELS")
     folded = [s for s in sources if s["kind"] == "env_override"]
     assert len(folded) == 1, sources
@@ -7838,7 +7844,7 @@ def test_model_overlay_sources_folded_entry_keeps_model_count(monkeypatch, tmp_p
     # the override_default fold path (no BN_TAINT_MODELS set, but the client's
     # --models happens to match the default override file) must carry it too.
     monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
-    sources2 = te.model_overlay_sources({"app_copy": {}}, user_models_path=str(shared),
+    sources2 = te.model_overlay_sources({"app_copy": _SINK_MODEL}, user_models_path=str(shared),
                                         user_models_via="--models")
     folded2 = [s for s in sources2 if s["kind"] == "override_default"]
     assert len(folded2) == 1, sources2
@@ -9355,3 +9361,226 @@ def test_forward_attributed_union_keeps_the_unread_callee_disclosure_811(models)
     assert diag.get("analysis_incomplete") is True, diag
     assert diag.get("safe_to_report_all_clear") is False, diag
     assert "could not be analysed" in (diag.get("all_clear_reason") or ""), diag
+
+
+# --- #915 trio: backward address-of-local, strtok continuation, roleless overlay --
+
+def _popen_of_local_program(*, fill, with_memory=True):
+    """build_cmd(ctx#0): [<fill>(&cmd, ...);] p#1 = &cmd; popen(p#1, "r").
+
+    ``fill`` is ``"snprintf"`` (modeled propagator writing *arg:0 from the
+    varargs), ``"compose"`` (an UNMODELED in-binary helper handed &cmd) or
+    None (nothing writes the buffer in scope). ``with_memory`` gives the sink
+    call its memory version so the writer chain can be walked."""
+    cmd = FVar("cmd", typ="char[0x100]"); p = FVar("p"); ctx = FVar("ctx", ident=77)
+    p1 = FSSA(p, 1); ctx0 = FSSA(ctx, 0)
+    FILL, POPEN = 0xa00, 0xa10
+    instrs = []
+    mem_defs = {}
+    if fill is not None:
+        fill_call = FInstr(0, 0x10, "MLIL_CALL_SSA", f"{fill}(&cmd, 0x100, \"run %s\", ctx#0)",
+                           reads=[ctx0], writes=[],
+                           dest=FExpr("MLIL_CONST_PTR", hex(FILL), constant=FILL),
+                           params=[FExpr("MLIL_ADDRESS_OF", "&cmd", src=cmd),
+                                   FExpr("MLIL_CONST", "0x100", constant=0x100),
+                                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                                   FExpr("MLIL_VAR_SSA", "ctx#0", reads=[ctx0])])
+        fill_call.src_memory = 0
+        fill_call.dest_memory = 1
+        instrs.append(fill_call)
+        mem_defs[1] = fill_call
+    take = FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "p#1 = &cmd", writes=[p1],
+                  src=FExpr("MLIL_ADDRESS_OF", "&cmd", src=cmd))
+    sink = FInstr(2, 0x18, "MLIL_CALL_SSA", "popen(p#1, \"r\")", reads=[p1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(POPEN), constant=POPEN),
+                  params=[FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]),
+                          FExpr("MLIL_CONST_PTR", "0x710", constant=0x710)])
+    if with_memory:
+        sink.src_memory = 1 if fill is not None else 0
+    instrs += [take, sink]
+    names = {POPEN: "popen"}
+    if fill is not None:
+        names[FILL] = fill
+    func = FFunc("build_cmd", 0x10, FSSAFunc(instrs, mem_defs=mem_defs), params=[ctx])
+    return func, FBV(names)
+
+
+def test_backward_unresolved_origin_withholds_completeness_915(models):
+    # M-06: `p = &cmd; popen(p)` with nothing in scope writing `cmd` used to
+    # come back as ONE step, origin `unresolved`, `leaves: []`,
+    # `frontier.unresolved: 0` and `safe_to_report_complete_slice: true` --
+    # "the slice reached its origins" beside `traverses_unresolved: true`. The
+    # sink reads the buffer's CONTENTS, so a slice that stops at the address-of
+    # is not complete: the gate must withhold and the frontier must count it.
+    func, bv = _popen_of_local_program(fill=None, with_memory=False)
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    assert result["slices"], result
+    sl = result["slices"][0]
+    assert sl["origin"] == {"kind": "address_of_local_unresolved", "buffer": "cmd"}, sl["origin"]
+    assert sl["metrics"]["traverses_unresolved"] is True
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_complete_slice"] is False, diag
+    assert diag["frontier"]["unresolved"] == 1, diag
+    assert "address_of_local_unresolved" in diag["complete_slice_reason"], diag
+    assert "reached its origins" not in diag["next_action"], diag
+    leaf = next((l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"), None)
+    assert leaf is not None, result["leaves"]
+    assert leaf["buffer"] == "cmd"
+
+
+def test_backward_unresolved_origin_without_a_leaf_withholds_completeness_915(models):
+    # The same gate end to end on the one shape that still ends with
+    # `origin.kind == "unresolved"` and NO leaf: a definition that reads no
+    # SSA variable and is neither a constant nor an address-of (a global load
+    # the memory walk cannot key). Before, this was "complete".
+    x = FVar("x", ident=78); x1 = FSSA(x, 1)
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1],
+                  src=FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
+                            src=FExpr("MLIL_CONST_PTR", "0x601040", constant=0x601040),
+                            src_memory=0))
+    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "popen(x#1, \"r\")", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xa10", constant=0xa10),
+                  params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1]),
+                          FExpr("MLIL_CONST_PTR", "0x710", constant=0x710)])
+    func = FFunc("run_global", 0x10, FSSAFunc([load, sink]), params=[])
+    result = te.TaintEngine(FBV({0xa10: "popen"}), models).backward(
+        func, [te.parse_locator("arg:popen:0")])
+    sl = result["slices"][0]
+    assert sl["origin"]["kind"] == "unresolved", sl["origin"]
+    assert sl["metrics"]["traverses_unresolved"] is True
+    assert result["leaves"] == [], result["leaves"]
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_complete_slice"] is False, diag
+    assert diag["frontier"]["unresolved"] == 1, diag
+    assert "origin.kind == 'unresolved'" in diag["complete_slice_reason"], diag
+
+
+def test_backward_gate_counts_unresolved_origins_even_without_a_leaf_915():
+    # The gate itself, isolated from the walk: an `unresolved` slice origin is
+    # the walk's own admission that it stopped short, and it lives on the
+    # slice, not in `leaves`. A leaf-only gate answered "complete" over it.
+    from bn_agent_bridge import taint_result as tr
+    diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, unresolved_origins=1)
+    assert diag["safe_to_report_complete_slice"] is False, diag
+    assert diag["frontier"]["unresolved"] == 1, diag
+    assert "origin.kind == 'unresolved'" in diag["complete_slice_reason"], diag
+    assert "reached its origins" not in diag["next_action"], diag
+    clean = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1, unresolved_origins=0)
+    assert clean["safe_to_report_complete_slice"] is True, clean
+
+
+def test_backward_follows_modeled_fill_of_address_of_local_915(models):
+    # The slice continues THROUGH the modeled out-param write: snprintf fills
+    # `cmd` from its varargs, so popen's argument originates at ctx#0 --
+    # parameter 0 -- and the step list says which call wrote the buffer.
+    func, bv = _popen_of_local_program(fill="snprintf")
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    assert result["slices"], result
+    sl = result["slices"][0]
+    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
+    reasons = [st.get("reason", "") for st in sl["slice"]]
+    assert any("local buffer cmd written by snprintf" in r for r in reasons), reasons
+    assert not [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["diagnostics"]
+
+
+def test_backward_unmodeled_writer_of_address_of_local_is_a_frontier_915(models):
+    # An in-binary helper with no model was handed &cmd before the sink read it:
+    # it may have written the bytes and the engine cannot tell, so the slice
+    # names the buffer and the call and the gate withholds.
+    func, bv = _popen_of_local_program(fill="compose")
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    leaf = next((l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"), None)
+    assert leaf is not None, result["leaves"]
+    assert leaf["buffer"] == "cmd" and leaf["callee"] == "compose", leaf
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_complete_slice"] is False, diag
+    assert diag["frontier"]["unresolved"] >= 1, diag
+
+
+def _strtok_program(*, first_arg_tainted=True):
+    """tokenize(line#0): t1#1 = strtok(&line | &other, " "); t2#1 = strtok(NULL, " "); system(t2#1)."""
+    line = FVar("line", typ="char[0x40]"); other = FVar("other", typ="char[0x40]")
+    t1 = FVar("t1"); t2 = FVar("t2")
+    t1_1 = FSSA(t1, 1); t2_1 = FSSA(t2, 1)
+    STRTOK, SYS = 0x900, 0x901
+    first = line if first_arg_tainted else other
+    instrs = [
+        _ext_call(0, 0x10, "t1#1 = strtok(&line, \" \")", STRTOK,
+                  [FExpr("MLIL_ADDRESS_OF", "&line", src=first),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)], writes=[t1_1]),
+        _ext_call(1, 0x14, "t2#1 = strtok(nullptr, \" \")", STRTOK,
+                  [FExpr("MLIL_CONST", "0", constant=0),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700)], writes=[t2_1]),
+        _ext_call(2, 0x18, "system(t2#1)", SYS,
+                  [FExpr("MLIL_VAR_SSA", "t2#1", reads=[t2_1])], reads=[t2_1]),
+    ]
+    func = FFunc("tokenize", 0x10, FSSAFunc(instrs), params=[line])
+    return func, FBV({STRTOK: "strtok", SYS: "system"})
+
+
+def test_strtok_null_continuation_carries_taint_and_is_disclosed_915(models):
+    # M-15: `strtok(NULL, d)` reads no argument -- it continues the static state
+    # the tainted `strtok(line, d)` set -- so the second token used to come back
+    # clean with no leaf and no assumption. Now the return is tainted through
+    # the continuation and the flow-insensitive modeling is disclosed.
+    func, bv = _strtok_program()
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert any("continues the tokenizer state" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_strtok_null_without_a_tainted_predecessor_stays_clean_915(models):
+    # Guard: the continuation only carries taint a strtok in THIS function set.
+    # Tokenizing an untainted buffer keeps every token clean and says nothing.
+    func, bv = _strtok_program(first_arg_tainted=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result
+    assert not any("tokenizer state" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
+    # #915: a symbol entry with no recognised role merged to nothing yet was
+    # counted as an active model and, being a truthy dict, took every
+    # `model is not None` branch of the walk. The flat sink shape names the
+    # misplaced fields and the nesting; an arbitrary roleless object names the
+    # vocabulary; an empty `{}` stays the documented benign marker.
+    import pytest
+    flat = {"app_recv": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2}}
+    with pytest.raises(te.TaintError) as ei:
+        te.load_models(extra=flat)
+    msg = str(ei.value)
+    assert "app_recv" in msg and "`class`" in msg and "nested under `sink`" in msg, msg
+
+    with pytest.raises(te.TaintError) as ei2:
+        te.load_models(extra={"app_recv": {"note": "todo"}})
+    msg2 = str(ei2.value)
+    assert "no recognised model role" in msg2 and "sink/sources/propagates" in msg2, msg2
+
+    # A misplaced sink field beside a real role is still the flat mistake.
+    with pytest.raises(te.TaintError):
+        te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
+
+    benign = te.load_models(extra={"app_recv": {}})
+    assert benign["app_recv"] == {}
+
+    # The engine never sees a roleless entry: the same walk as builtin.
+    func, bv = _popen_of_local_program(fill="snprintf")
+    base = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    with pytest.raises(te.TaintError):
+        te.TaintEngine(bv, te.load_models(extra=flat))
+    again = te.TaintEngine(bv, te.load_models(extra={"compose": {}})).backward(
+        func, [te.parse_locator("arg:popen:0")])
+    assert again["slices"] == base["slices"]
+
+
+def test_model_overlay_count_excludes_benign_markers_915():
+    # `models: ... (1 model(s))` must mean one entry that ARMED something. A
+    # benign `{}` is disclosed as what it is, under its own key.
+    src = te.model_overlay_sources({"app_recv": {}, "app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}})
+    user = [s for s in src if s["kind"] == "user"][0]
+    assert user["count"] == 1 and user["benign"] == 1, user
+    only_benign = [s for s in te.model_overlay_sources({"app_recv": {}}) if s["kind"] == "user"][0]
+    assert only_benign["count"] == 0 and only_benign["benign"] == 1, only_benign
+    no_benign = [s for s in te.model_overlay_sources({"app_copy": {"sources": [{"to": "ret"}]}}) if s["kind"] == "user"][0]
+    assert no_benign["count"] == 1 and "benign" not in no_benign, no_benign

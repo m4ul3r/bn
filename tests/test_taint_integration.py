@@ -161,6 +161,17 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         for want_leaf in case.get("leaves", []):
             assert any(l["kind"] == want_leaf["kind"] for l in result["leaves"]), \
                 f"{stem}: expected backward leaf {want_leaf} not in {result['leaves']}"
+        for forbid in case.get("forbid_leaves", []):
+            assert not any(l["kind"] == forbid["kind"] for l in result["leaves"]), \
+                f"{stem}: forbidden backward leaf {forbid} in {result['leaves']}"
+        for sub in case.get("step_reasons_contain", []):
+            reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
+            assert any(sub in r for r in reasons), \
+                f"{stem}: no slice step reason containing {sub!r} in {reasons}"
+        if "complete_slice" in case:
+            gate = result["diagnostics"]["safe_to_report_complete_slice"]
+            assert gate is case["complete_slice"], \
+                f"{stem}: safe_to_report_complete_slice={gate}, expected {case['complete_slice']}: {result['diagnostics']}"
         if case.get("expect_crossed"):
             crossed = [c for sl in result["slices"] for c in (sl.get("crossed_functions") or [])]
             assert case["expect_crossed"] in crossed, \

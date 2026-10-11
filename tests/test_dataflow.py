@@ -792,3 +792,35 @@ def test_dataflow_defuse_renders_the_dropped_call_arg_disclosure_797(monkeypatch
     assert bn.cli.main(["dataflow", "defuse", "parse_hdr", "--var", "len#2",
                         "--target", "active"]) == 0
     assert "hint:" not in capsys.readouterr().out
+
+
+def test_render_taint_discloses_benign_markers_apart_from_models_915():
+    # #915: an overlay whose only entry is a benign `{}` armed nothing, so the
+    # header must not confirm it as "1 model(s)"; the marker is named as such.
+    value = {
+        "direction": "forward",
+        "function": {"name": "process", "address": "0x401189"},
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "model_sources": [
+            {"kind": "builtin", "path": "/builtin/models.json"},
+            {"kind": "user", "via": "--models", "count": 0, "benign": 1, "path": "proj.json"},
+        ],
+        "soundness": "may-analysis (intraprocedural, MVP)",
+    }
+    text = _render_taint_text(value)
+    assert "models: builtin + --models proj.json (0 model(s), 1 benign)" in text
+
+
+def test_render_taint_forward_header_names_the_call_locator_callee():
+    # The `sources:` header printed a bare `call` for `--source call:recv`
+    # while every flow line said `call:recv` -- the one locator kind whose
+    # callee was dropped from the header.
+    value = {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x401189"},
+        "sources": [{"kind": "call", "callee": "recv"}],
+        "reached_sinks": [],
+        "soundness": "may-analysis (intraprocedural, MVP)",
+    }
+    assert "sources: call:recv" in _render_taint_text(value)
