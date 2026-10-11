@@ -6633,11 +6633,15 @@ def _render_class_list_text(value: Any) -> str:
             _SKEWED_FIELDS.reset(token)
         for key in row_unreadable:
             _record_skew(key)
+        # #922 (d): the other demangled spellings this row absorbed, so a reader
+        # who knows the class by the expanded template spelling finds the row.
+        aliases = ", ".join(str(a) for a in _field_list(rec, "aliases") if a)
+        aka_s = f"  (aka {aliases})" if aliases else ""
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
             f"methods={methods}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
-            f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
+            f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )
     footer = _paging_footer(value, rows, page_unreadable)
     if footer is not None:
@@ -6732,6 +6736,9 @@ def _render_one_class(rec: Any) -> str:
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
+    # #922 (d): one class, several demangled spellings -- the card is the merge.
+    for alias in _field_list(rec, "aliases"):
+        lines.append(f"  aka: {alias}")
     methods = _field_list(rec, "methods")
     for m in methods:
         if not isinstance(m, dict):
@@ -6789,7 +6796,11 @@ def _render_one_class(rec: Any) -> str:
             continue
         ott = sec.get("offset_to_top")
         ott_s = f" (offset-to-top {ott})" if ott is not None else ""
-        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
+        # #922 (c): a backwalk-recovered secondary is a lead, not a recovered
+        # fact; say so on the line an analyst would quote.
+        conf = _text_value(sec, "confidence")
+        conf_s = f" [{conf}]" if conf else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}{conf_s}:")
         for s in _field_list(sec, "slots"):
             if not isinstance(s, dict):
                 lines.append(f"    {s!r}")

@@ -134,11 +134,6 @@ def _rtti_kind_and_class(sym) -> tuple[str | None, str | None]:
     return kind, m.group(2).strip()
 
 
-def _class_of_rtti_symbol(sym) -> str | None:
-    """Class name for an RTTI symbol (demangled marker stripped), else None."""
-    return _rtti_kind_and_class(sym)[1]
-
-
 # BN classifies a GOT/import/external alias with one of these symbol types; a real
 # local definition is a DataSymbol/FunctionSymbol/etc. (#529). An alias carries the
 # same demangled RTTI name as the local definition, so if get_symbols() yields the
@@ -287,15 +282,17 @@ def _classify_function(fn) -> tuple[str, str | None, str | None]:
     return _classify_names(str(short) if short else "", str(getattr(fn, "name", "") or ""))
 
 
-def _scan_class_registry(bv) -> dict[str, dict[str, Any]]:
+def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
     """ONE pass over the view -> {class_name: ClassRecord}. Methods, RTTI symbols,
     confidence. Per-class drill-downs (vtable layout, size, bases, instances) are
     added by ``_class_show`` only for the requested class (too costly for every
     class).
 
-    This is the memoised half: it reads only ``bv``, so it is cached per view on
-    the view's generation counter by :func:`_build_class_registry`. Callers must
-    never mutate what it returns -- they get their own copy."""
+    This is the memoised half: it reads only ``bv`` (``ctx`` is used for the
+    stateless word read that links a vtable to its typeinfo, see
+    :func:`_merge_spelling_variants`), so it is cached per view on the view's
+    generation counter by :func:`_build_class_registry`. Callers must never
+    mutate what it returns -- they get their own copy."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
 
@@ -315,6 +312,7 @@ def _scan_class_registry(bv) -> dict[str, dict[str, Any]]:
                 "bases": [],
                 "instances": [],
                 "confidence": "name-only",
+                "aliases": [],
             }
         rec["methods"].append({
             "address": hex(int(getattr(fn, "start", 0))),
@@ -328,7 +326,7 @@ def _scan_class_registry(bv) -> dict[str, dict[str, Any]]:
         registry.setdefault(cls, {
             "name": cls, "methods": [], "vtable": None, "typeinfo": None,
             "typeinfo_name": None, "size": None, "bases": [], "instances": [],
-            "confidence": "name-only",
+            "confidence": "name-only", "aliases": [],
         })
 
     for cls, rec in registry.items():
@@ -343,7 +341,112 @@ def _scan_class_registry(bv) -> dict[str, dict[str, Any]]:
         else:
             rec["confidence"] = "name-only"
 
+    _merge_spelling_variants(ctx, bv, registry, rtti)
     return registry
+
+
+def _record_confidence(rec: dict[str, Any]) -> str:
+    if rec["vtable"] or rec["typeinfo"] or rec["typeinfo_name"]:
+        return "rtti"
+    if any(m["kind"] in ("ctor", "dtor") for m in rec["methods"]):
+        return "ctor"
+    return "name-only"
+
+
+def _merge_spelling_variants(ctx, bv, registry: dict[str, dict[str, Any]],
+                             rtti: dict[str, dict[str, Any]]) -> None:
+    """#922 (d): fold the spellings of ONE class into one record, in place.
+
+    BN demangles each symbol on its own, and the spellings disagree: method
+    symbols come back as ``app::Holder<std::string>`` while the ``_ZTV`` symbol
+    keeps the expanded ``app::Holder<std::__cxx11::basic_string<...>>``. Keyed
+    on the spelling, the registry listed TWO classes -- one with the methods and
+    a typeinfo (so a base) but "no-vtable", one with the vtable and no methods --
+    and the two `class show` cards disagreed about the same object.
+
+    Two spellings are the same class when their RTTI symbols share an address,
+    or when one spelling's local vtable names the other's typeinfo in its
+    Itanium header word[1] (the ABI's own statement of which class a vtable
+    belongs to). A GOT/import alias vtable is never followed: its word[1] is
+    the unrelated next GOT entry. Construction-vtable and thunk artifacts are
+    left alone -- they are not classes.
+
+    The surviving record is the spelling with the most clustered methods (the
+    one the decompiler shows), then the one owning the vtable symbol, then the
+    shorter name; the others are recorded under ``aliases`` so a query by either
+    spelling resolves (see :func:`_resolve_class_names`)."""
+    parent: dict[str, str] = {name: name for name in registry}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def mergeable(name: str) -> bool:
+        return not (_is_construction_vtable_artifact(name) or _is_thunk_artifact(name))
+
+    by_address: dict[tuple[str, int], str] = {}
+    typeinfo_owner: dict[int, str] = {}
+    for name, syms in rtti.items():
+        if name not in registry or not mergeable(name):
+            continue
+        for kind in ("vtable", "typeinfo", "typeinfo_name"):
+            sym = syms.get(kind)
+            if sym is None:
+                continue
+            address = int(getattr(sym, "address", 0))
+            if kind == "typeinfo" and not _is_alias_symbol(sym):
+                typeinfo_owner.setdefault(address, name)
+            owner = by_address.setdefault((kind, address), name)
+            if owner != name:
+                union(owner, name)
+    # The ABI link is only needed for a spelling that owns a vtable but no
+    # typeinfo of its own -- the split shape -- so a view whose RTTI names agree
+    # costs no reads at all.
+    linkable = [
+        (name, syms["vtable"]) for name, syms in rtti.items()
+        if syms.get("vtable") is not None and syms.get("typeinfo") is None
+        and name in registry and mergeable(name) and not _is_alias_symbol(syms["vtable"])
+    ]
+    if ctx is not None and linkable and typeinfo_owner:
+        ptr = ctx._pointer_size(bv)
+        for name, vt in linkable:
+            ti_ptr = ctx._read_pointer_value(bv, int(getattr(vt, "address", 0)) + ptr, size=ptr)
+            owner = typeinfo_owner.get(ti_ptr) if ti_ptr else None
+            if owner is not None and owner != name:
+                union(owner, name)
+
+    groups: dict[str, list[str]] = {}
+    for name in registry:
+        groups.setdefault(find(name), []).append(name)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        canonical = max(members, key=lambda n: (len(registry[n]["methods"]),
+                                                registry[n]["vtable"] is not None,
+                                                -len(n)))
+        rec = registry[canonical]
+        seen = {m["address"] for m in rec["methods"]}
+        for other in members:
+            if other == canonical:
+                continue
+            src = registry.pop(other)
+            for method in src["methods"]:
+                if method["address"] not in seen:
+                    seen.add(method["address"])
+                    rec["methods"].append(method)
+            for key in ("vtable", "typeinfo", "typeinfo_name"):
+                if rec[key] is None and src[key] is not None:
+                    rec[key] = src[key]
+            rec["aliases"].append(other)
+        rec["aliases"].sort()
+        rec["confidence"] = _record_confidence(rec)
 
 
 def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dict[str, Any]]:
@@ -353,8 +456,8 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     generation counter and invalidated by BN's own symbol/function notifications
     -- a rename changes which classes exist, so the registry is rebuilt after any
     such change, and a view with no notification surface is never cached (every
-    call rescans, exactly as before). ``ctx`` is unused today (the scan reads only
-    ``bv``), kept for the callers' uniform ``(ctx, bv)`` seam shape.
+    call rescans, exactly as before). ``ctx`` reaches the scan only for the
+    stateless vtable-header read that merges a class's spelling variants (#922).
 
     Records are copied on the way out because the callers WRITE to them:
     ``_class_list`` sets ``rec["bases"]`` for its page rows and ``_class_show``
@@ -368,13 +471,14 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     poisoned record to every later call on that view, which no in-repo caller does
     today and none should have to know not to do. Measured at ~1 ms for a
     ~6k-method registry, against the ~130 ms rebuild it protects."""
-    registry = _view_memo(bv, "class_registry", lambda: _scan_class_registry(bv))
+    registry = _view_memo(bv, "class_registry", lambda: _scan_class_registry(ctx, bv))
     needle = query.lower() if query else None
     return {
         name: {
             **rec,
             "methods": [dict(method) for method in rec["methods"]],
             "bases": list(rec["bases"]),
+            "aliases": list(rec["aliases"]),
             "instances": list(rec["instances"]),
             "vtable": dict(rec["vtable"]) if isinstance(rec["vtable"], dict) else rec["vtable"],
             "typeinfo": dict(rec["typeinfo"]) if isinstance(rec["typeinfo"], dict) else rec["typeinfo"],
@@ -382,7 +486,10 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
                               if isinstance(rec["typeinfo_name"], dict) else rec["typeinfo_name"]),
         }
         for name, rec in registry.items()
-        if needle is None or needle in name.lower()
+        # #922 (d) review: the absorbed spellings are part of the record, so
+        # `--query basic_string` finds the `Holder<std::string>` card whose alias
+        # carries the expansion -- once, under its canonical name.
+        if needle is None or any(needle in s.lower() for s in (name, *rec["aliases"]))
     }
 
 
@@ -712,6 +819,7 @@ def _declared_type_records(declared: dict[str, Any]) -> dict[str, dict[str, Any]
             "typeinfo_name": None,
             "size": None,
             "bases": [],
+            "aliases": [],
             "instances": _no_instances(),
             "confidence": _DECLARED_CONFIDENCE,
             "notes": [_DECLARED_TYPE_NOTE],
@@ -847,6 +955,8 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
         "size": rec["size"],
         "bases": [b.get("name") for b in rec.get("bases", [])],
         "confidence": rec["confidence"],
+        # #922 (d): the other demangled spellings this record absorbed.
+        "aliases": list(rec.get("aliases") or []),
         # #481: typeinfo emitted for a NON-object TYPE (function/pointer/fundamental),
         # not a domain class -- tagged so it doesn't inflate the class inventory and
         # agents can filter it. Keyed on the name SHAPE (not just missing-vtable), so a
@@ -1088,34 +1198,71 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
     return (target.get("context") or {}).get("kind") == "code"
 
 
-def _lookahead_row_confirms_continuation(row: dict[str, Any] | None) -> bool:
-    """#706 follow-up: row `max_slots` -- read but never scanned as a slot --
-    resolves the one ambiguity the raw cap can't: a trailing run of null rows
-    inside the window reads identically whether the vtable ended there (the
-    next object's zeroed padding) or is an unresolved-relocation run inside a
-    table that keeps going past the cap (#441). A readable code/null/extern
-    row one past the cap is the same kind of entry the window itself accepts
-    as a slot, so the table demonstrably continues. Missing (the reader
-    couldn't produce it), unreadable, or a mapped-data pointer is never
-    treated as evidence of continuation -- absence of proof is not proof the
-    table goes on."""
-    if row is None or not row.get("readable"):
+#: BN `TypeClass` member names of a data variable that is an OBJECT of its own
+#: (an RTTI record, the next vtable's struct) rather than a pointer slot.
+_OBJECT_TYPE_CLASSES = frozenset({"StructureTypeClass", "NamedTypeReferenceClass"})
+
+
+def _row_starts_next_object(bv, row_addr: int | None, index: int) -> bool:
+    """#922 (b): a row that BN itself says is the first word of ANOTHER object
+    ends the vtable, whatever its value decodes to. In a PIE `.data.rel.ro` the
+    next class's `__si_class_type_info` record follows the vtable directly, and
+    its vptr -- an EXTERNAL pointer to `__cxxabiv1::__si_class_type_info`'s
+    vtable -- read as a valid `<external>` slot past BN's own 2-slot `VTable`.
+    Two BN facts name the boundary: an RTTI data symbol (``typeinfo for`` /
+    ``typeinfo name for`` / ``vtable for``) on the row's own address, or a data
+    variable of a structure type starting there. Row 0 is exempt: the slot
+    array's first word carries BN's own ``<Class>::VTable`` struct and, in a
+    stripped build, the ``vtable for X{for `Y'}`` symbol BN synthesises."""
+    if index == 0 or row_addr is None:
         return False
-    target = row.get("target") if isinstance(row.get("target"), dict) else {}
-    status = target.get("status")
-    kind = (target.get("context") or {}).get("kind")
-    return _slot_is_code(target) or status == "null" or kind == "extern"
+    sym = bv.get_symbol_at(row_addr) if hasattr(bv, "get_symbol_at") else None
+    if sym is not None and _rtti_kind_and_class(sym)[0] is not None:
+        return True
+    getter = getattr(bv, "get_data_var_at", None)
+    try:
+        var = getter(row_addr) if callable(getter) else None
+    except Exception:
+        var = None
+    if var is None or int(getattr(var, "address", row_addr)) != row_addr:
+        return False
+    type_class = getattr(getattr(var, "type", None), "type_class", None)
+    return (getattr(type_class, "name", None) or str(type_class)) in _OBJECT_TYPE_CLASSES
 
 
-def _vtable_row_slot(bv, index: int, row: dict[str, Any]) -> dict[str, Any] | None:
+def _is_cxxabi_typeinfo_vptr(bv, value: Any, ptr: int) -> bool:
+    """#922 (b): an external word that is a type_info object's vptr -- it points
+    ``2 * ptr`` past the `vtable for __cxxabiv1::__*_class_type_info` symbol
+    (the vptr addresses the slot array, not the vtable head) -- so the word is
+    the first field of the NEXT typeinfo record, never a virtual method."""
+    try:
+        addr = int(value, 16) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return False
+    getter = getattr(bv, "get_symbol_at", None)
+    if not callable(getter):
+        return False
+    for candidate in (addr, addr - 2 * ptr):
+        sym = getter(candidate)
+        name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "") if sym else ""
+        if "__cxxabiv1" in name and "type_info" in name:
+            return True
+    return False
+
+
+def _vtable_row_slot(bv, index: int, row: dict[str, Any], *,
+                     row_addr: int | None = None, ptr: int = 8) -> dict[str, Any] | None:
     """The slot a raw pointer-table ROW contributes to a vtable, or ``None``
-    when the row is a genuine table BOUNDARY (unreadable, or a mapped
-    data/unmapped pointer -- the next object). Shared by the capped window scan
-    in ``_vtable_layout`` and the one-slot probe ``_vtable_slot_probe`` (#822)
-    so both classify a row identically: a probe that accepted a row the window
-    scan would have stopped at could name a method from the object AFTER the
-    table."""
+    when the row is a genuine table BOUNDARY (unreadable, a mapped
+    data/unmapped pointer, or the first word of the next object -- #922 (b),
+    see :func:`_row_starts_next_object` / :func:`_is_cxxabi_typeinfo_vptr`).
+    Shared by the capped window scan in ``_vtable_layout`` and the one-slot
+    probe ``_vtable_slot_probe`` (#822) so both classify a row identically: a
+    probe that accepted a row the window scan would have stopped at could name
+    a method from the object AFTER the table."""
     if not row.get("readable"):
+        return None
+    if _row_starts_next_object(bv, row_addr, index):
         return None
     target = row.get("target") if isinstance(row.get("target"), dict) else {}
     value = row.get("value")
@@ -1147,7 +1294,10 @@ def _vtable_row_slot(bv, index: int, row: dict[str, Any]) -> dict[str, Any] | No
         }
     if kind == "extern":
         # External slot: `__cxa_pure_virtual` (a pure-virtual marker) or a
-        # cross-module virtual method. A valid vtable entry -- don't stop.
+        # cross-module virtual method. A valid vtable entry -- don't stop...
+        # unless it is the next typeinfo record's vptr (#922 (b)).
+        if _is_cxxabi_typeinfo_vptr(bv, value, ptr):
+            return None
         ext_name = _slot_external_name(bv, value)
         return {
             "index": index, "address": value, "method": None,
@@ -1215,7 +1365,8 @@ def _vtable_slot_probe(
     slot: dict[str, Any] | None = None
     for offset, row in enumerate(rows):
         row_d = row if isinstance(row, dict) else {}
-        slot = _vtable_row_slot(bv, first_row + offset, row_d)
+        slot = _vtable_row_slot(bv, first_row + offset, row_d,
+                                row_addr=start + offset * ptr, ptr=ptr)
         if slot is None:
             if _vtable_row_stop_reason(row_d) == "unreadable":
                 # A read FAILURE, not an observed boundary: whether the table
@@ -1292,8 +1443,18 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "slots_truncated": False,
             "scan_truncated": False,
             "truncated_reason": "no_local_vtable_body",
+            "bn_vtable_slots": None,
         }
     start = vtable_addr + 2 * ptr
+    # #922 (b) review: BN's own `<Class>::VTable` struct at the slot array is
+    # reported (`bn_vtable_slots`) but never bounds the scan. BN sizes that
+    # struct at the first null word, and GCC emits an abstract class's two
+    # destructor entries as zero words, so `struct Early { virtual int first();
+    # virtual ~Early(); virtual int pure() = 0; virtual int late(); }` gets a
+    # one-slot struct for a five-slot table; bounding the walk there hid
+    # `pure()`/`late()` and called the table complete. The end of a table is
+    # the next OBJECT -- the rules in `_vtable_row_slot` -- not BN's width.
+    bn_slots = _bn_vtable_slot_count(bv, start, ptr)
     # #706 follow-up: read one entry PAST the cap. Row `max_slots` is a
     # lookahead ONLY -- never a slot in its own right (the window below
     # excludes it from both scanning and `slots`) -- consulted after the loop
@@ -1339,7 +1500,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # "unreadable", the end NOT observed) or a mapped data pointer / the next
         # object's typeinfo (a genuine boundary), which end the scan either way.
         row_d = row if isinstance(row, dict) else {}
-        slot = _vtable_row_slot(bv, i, row_d)
+        slot = _vtable_row_slot(bv, i, row_d, row_addr=start + i * ptr, ptr=ptr)
         if slot is None:
             if _vtable_row_stop_reason(row_d) == "unreadable":
                 stop_reason = "unreadable"
@@ -1354,12 +1515,21 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # resolves it directly instead of inferring from what the trim below
         # removes: it proves the table continues (or doesn't) independent of
         # `slots`'s final shape.
+        #
+        # #922 (b) review: the lookahead is classified by the SAME rule as a
+        # window row, address included, so the next object's first word at
+        # row `max_slots` (an RTTI record's vptr on a `typeinfo for` address)
+        # is a boundary here too -- a value-only classifier read it as proof
+        # of a 65th slot and turned an exact 64-slot table into `total: null`.
         if scanned >= max_slots > 0:
             lookahead = raw_entries[max_slots] if len(raw_entries) > max_slots else None
-            if _lookahead_row_confirms_continuation(lookahead):
+            lookahead_d = lookahead if isinstance(lookahead, dict) else {}
+            if lookahead_d and _vtable_row_slot(
+                    bv, max_slots, lookahead_d,
+                    row_addr=start + max_slots * ptr, ptr=ptr) is not None:
                 truncated = True
                 stop_reason = "capped"
-            elif isinstance(lookahead, dict) and not lookahead.get("readable"):
+            elif lookahead_d and not lookahead_d.get("readable"):
                 # The lookahead row itself could not be read: the window is full,
                 # so 64 entries are proven, but nothing proves the table stops
                 # there (#822 review round 1).
@@ -1394,7 +1564,36 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         "scan_truncated": stop_reason is not None,
         "truncated_reason": {"capped": "scan_capped",
                              "unreadable": "unreadable_row"}.get(stop_reason),
+        # #922 (b): the slot count BN's own `<Class>::VTable` struct states
+        # (None when BN defined none) -- informational, never a bound (see the
+        # note at `start`).
+        "bn_vtable_slots": bn_slots,
     }
+
+
+def _bn_vtable_slot_count(bv, slot_start: int, ptr: int) -> int | None:
+    """#922 (b): the slot count of BN's own ``<Class>::VTable`` struct when one
+    starts exactly at *slot_start* (the word the constructor stores as the
+    vptr), else None. Reported for the reader; it is NOT where the table ends
+    (BN stops the struct at the first null word, which an abstract class's
+    zeroed destructor entries put in the middle of a real table). Only a
+    structure whose name carries BN's ``VTable`` convention counts -- a user's
+    own pointer slot type says nothing about the table."""
+    getter = getattr(bv, "get_data_var_at", None)
+    try:
+        var = getter(slot_start) if callable(getter) else None
+    except Exception:
+        var = None
+    if var is None or int(getattr(var, "address", slot_start)) != slot_start:
+        return None
+    type_obj = getattr(var, "type", None)
+    if type_obj is None or "VTable" not in str(getattr(type_obj, "registered_name", None) or type_obj):
+        return None
+    try:
+        width = int(getattr(type_obj, "width", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return width // ptr if width > 0 and width % ptr == 0 else None
 
 
 def _slot_external_name(bv, value: Any) -> str | None:
@@ -1428,6 +1627,51 @@ def _demangled_slot_name(bv, fn: dict[str, Any]) -> str | None:
             if disp:
                 return disp
     return mangled
+
+
+#: #922 (a): the note a card carries when its typeinfo is an import/GOT slot.
+_TYPEINFO_IMPORT_NOTE = ("typeinfo is an import slot; bases unknown (the class "
+                         "is defined in another module, so its RTTI is not in this image)")
+
+
+def _typeinfo_is_import_slot(ctx, bv, typeinfo_addr: int) -> bool:
+    """#922 (a): True when *typeinfo_addr* is not a typeinfo OBJECT but a pointer
+    slot for one defined elsewhere -- a ``.got`` entry, an ``ImportAddressSymbol``
+    / ``ImportedDataSymbol`` / ``ExternalSymbol`` alias. The class is imported, so
+    there is no RTTI record to decode here: reading ``+2*ptr`` from a GOT slot
+    reported the NEXT GOT ENTRY (some other class's ``_ZTV``) as a public base
+    with `confidence: rtti`. Same two tests `evidence table` refuses a GOT slot
+    with (:func:`read_evidence._got_alias_target`): the symbol's alias type,
+    else a ``.got``/``.got.plt`` section at the address. Only the section names
+    are consulted (``ctx._sections_at``): this runs per `class list` row, and a
+    full ``_address_context`` would also do the function lookup, code check and
+    string resolution for every row's typeinfo (#922 review)."""
+    sym = bv.get_symbol_at(typeinfo_addr) if hasattr(bv, "get_symbol_at") else None
+    if sym is not None and _is_alias_symbol(sym):
+        return True
+    return any(str(sec.get("name", "")).lower().startswith(".got")
+               for sec in ctx._sections_at(bv, typeinfo_addr))
+
+
+def _note_typeinfo_import(rec: dict[str, Any]) -> None:
+    notes = rec.setdefault("notes", [])
+    if _TYPEINFO_IMPORT_NOTE not in notes:
+        notes.append(_TYPEINFO_IMPORT_NOTE)
+    if isinstance(rec.get("typeinfo"), dict):
+        rec["typeinfo"]["import_slot"] = True
+
+
+def _bases_for_record(ctx, bv, rec: dict[str, Any]) -> list[dict[str, Any]]:
+    """The record's RTTI bases, or ``[]`` with the import note when its typeinfo
+    is an import slot (#922 (a)). The seam's ``_bases_for`` binds here."""
+    ti = rec.get("typeinfo")
+    if not ti:
+        return []
+    typeinfo_addr = int(ti["address"], 16)
+    if _typeinfo_is_import_slot(ctx, bv, typeinfo_addr):
+        _note_typeinfo_import(rec)
+        return []
+    return _rtti_bases(ctx, bv, typeinfo_addr)
 
 
 def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) -> list[dict[str, Any]]:
@@ -1565,11 +1809,24 @@ def _query_leaf(name: str) -> str:
 def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
     """Exact match, else all classes whose top-level leaf equals *name*'s leaf
     (template args preserved), so an unqualified query matches the same class
-    across namespaces without conflating template specializations."""
+    across namespaces without conflating template specializations. A record's
+    ``aliases`` -- the other demangled spellings of the same class (#922 (d)) --
+    resolve exactly like its name, so a query by either spelling finds the one
+    merged card."""
     if name in registry:
         return [name]
+
+    def spellings(key: str) -> list[str]:
+        rec = registry.get(key)
+        aliases = rec.get("aliases") if isinstance(rec, dict) else None
+        return [key, *(aliases or [])]
+
+    exact = sorted(k for k in registry if name in spellings(k)[1:])
+    if exact:
+        return exact
     leaf = _query_leaf(name)
-    return sorted(k for k in registry if _query_leaf(k) == leaf)
+    return sorted(k for k in registry
+                  if any(_query_leaf(s) == leaf for s in spellings(k)))
 
 
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
@@ -1581,6 +1838,14 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
         func = ctx._find_function(bv, method["address"])
         method["thunk"] = _function_thunk_summary(ctx, bv, func)
 
+    # #922 (a): an imported class's typeinfo is a pointer slot, not an RTTI
+    # object; there is nothing behind it to backwalk or decode. Decide once here
+    # so neither vtable path below reads through it (the `_bases_for` seam makes
+    # the same test for the bases and attaches the same note).
+    typeinfo_addr = int(rec["typeinfo"]["address"], 16) if rec.get("typeinfo") else None
+    if typeinfo_addr is not None and _typeinfo_is_import_slot(ctx, bv, typeinfo_addr):
+        _note_typeinfo_import(rec)
+        typeinfo_addr = None
     if rec.get("vtable"):
         rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
         # #412 (codex Finding 1): a multiple-inheritance class commonly keeps its
@@ -1589,28 +1854,33 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
         # walk the typeinfo for the secondaries too. Keep the symbolized primary as
         # `rec["vtable"]`; attach only the recovered tables that are a DIFFERENT
         # address (the backwalk re-finds the primary via its own typeinfo ref).
-        if rec.get("typeinfo"):
-            recovered = _recover_vtables_from_typeinfo(
-                ctx, bv, int(rec["typeinfo"]["address"], 16))
+        if typeinfo_addr is not None:
+            recovered = _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr)
             if recovered:
                 primary_addr = (rec["vtable"] or {}).get("address")
                 secondaries = [s for s in recovered["secondary"]
                                if s.get("address") != primary_addr]
                 if secondaries:
                     rec["secondary_vtables"] = secondaries
-                    rec.setdefault("notes", []).append(
-                        "secondary (multiple-inheritance) vtables recovered via "
-                        "typeinfo backwalk (no _ZTV symbol for the secondary bases)")
-    elif rec.get("typeinfo"):
+                    _note_secondaries(rec, secondaries)
+                _note_rejected_secondaries(rec, recovered["rejected"])
+    elif typeinfo_addr is not None:
         # #354: STRIPPED binary -- the `_ZTV` DataSymbol is gone so the registry has
         # no vtable address, but typeinfo survived. Backwalk typeinfo->vtable.
-        recovered = _recover_vtables_from_typeinfo(ctx, bv, int(rec["typeinfo"]["address"], 16))
+        recovered = _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr)
         if recovered:
-            rec["vtable"] = recovered["primary"]
             if recovered["secondary"]:
                 rec["secondary_vtables"] = recovered["secondary"]   # #412
-            rec.setdefault("notes", []).append(
-                "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
+                _note_secondaries(rec, recovered["secondary"])
+            if recovered["primary"] is not None:
+                rec["vtable"] = recovered["primary"]
+                rec.setdefault("notes", []).append(
+                    "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
+            else:
+                # #922 review: a sole non-zero candidate is a secondary guess,
+                # not the primary; the card keeps `vtable: null` and says why.
+                rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
+            _note_rejected_secondaries(rec, recovered["rejected"])
     size = ctx._object_size_for(bv, rec)
     rec["size"] = size
     # #817: where the size came from is a JSON-surface fact of its own, so it
@@ -1653,6 +1923,134 @@ def _as_signed(value: int | None, ptr: int) -> int:
     return value - (1 << bits) if value >= (1 << (bits - 1)) else value
 
 
+#: #922 (c): the widest object a secondary base subobject is assumed to sit
+#: inside when nothing else vouches for the candidate. An Itanium offset-to-top
+#: is the (non-positive) displacement from a subobject's vptr to the top of the
+#: object -- a small negative number for every ordinary multiple-inheritance
+#: layout. It is a BOUND, not a record detector: a base behind a 17 MiB member
+#: is legal C++, so a candidate outside it is disclosed as out-of-bound (never
+#: "an RTTI record"), and one whose slots are this class's `_ZThn<N>_` thunks
+#: with `N == -offset_to_top` is accepted whatever the width (#922 review).
+_MAX_OFFSET_TO_TOP = 1 << 24
+
+_SECONDARY_HEURISTIC_NOTE = (
+    "secondary (multiple-inheritance) vtables recovered via typeinfo backwalk "
+    "(no _ZTV symbol for the secondary bases); confidence: heuristic -- confirm "
+    "each with `evidence table <address>` before reporting an inheritance edge")
+
+_SECONDARY_RTTI_NOTE = (
+    "secondary (multiple-inheritance) vtables recovered via typeinfo backwalk; "
+    "confidence: rtti (BN's own vtable-group symbol or `_ZThn<N>_` thunk slots "
+    "name this class at that offset-to-top)")
+
+_NO_PRIMARY_NOTE = (
+    "no primary vtable (offset-to-top 0) found by the typeinfo backwalk; the "
+    "secondary candidates are not promoted to a primary")
+
+#: An Itanium non-virtual thunk: `_ZThn<N>_<target>` adjusts `this` by -N
+#: before jumping to the target, so a slot naming one sits in a vtable whose
+#: offset-to-top is exactly -N.
+_THUNK_OFFSET_RE = re.compile(r"^_ZThn(\d+)_")
+
+
+def _thunk_slots_prove_offset(layout: dict[str, Any], ott: int, class_name: str | None) -> bool:
+    """True when a slot of *layout* is a `_ZThn<N>_` thunk with ``N == -ott`` --
+    the ABI's own statement that this slot array is a vtable at that
+    offset-to-top -- into a method of *class_name* when the name is known."""
+    if ott >= 0:
+        return False
+    for slot in layout.get("slots") or []:
+        method = slot.get("method") if isinstance(slot, dict) else None
+        if not isinstance(method, dict):
+            continue
+        m = _THUNK_OFFSET_RE.match(str(method.get("name") or ""))
+        if m is None or int(m.group(1)) != -ott:
+            continue
+        display = method.get("display_name")
+        if class_name and isinstance(display, str) and display and f"{class_name}::" not in display:
+            continue
+        return True
+    return False
+
+
+def _bn_names_vtable_group(bv, vt_addr: int, ptr: int, class_name: str | None) -> bool:
+    """True when BN's own RTTI analysis put a ``vtable for <Class>{for `Base'}``
+    symbol on the candidate's slot array -- its attribution of the group to
+    *class_name* (the shape it synthesises for a secondary group inside the
+    `_ZTV` object, stripped or not)."""
+    if not class_name or not hasattr(bv, "get_symbol_at"):
+        return False
+    kind, owner = _rtti_kind_and_class(bv.get_symbol_at(vt_addr + 2 * ptr))
+    return kind == "vtable" and owner is not None and owner.startswith(f"{class_name}{{for ")
+
+
+def _mapped_region_name(ctx, bv, word: int) -> str | None:
+    """The section (else segment) a non-zero *word* falls in, or None when it
+    is not a mapped address."""
+    if not word:
+        return None
+    sections = ctx._sections_at(bv, word)
+    if sections:
+        return str(sections[0].get("name") or "") or "unnamed section"
+    segment = ctx._segment_at(bv, word)
+    if segment is not None:
+        return f"segment {segment.get('start', '?')}-{segment.get('end', '?')}"
+    return None
+
+
+def _classify_backwalk_candidate(
+    ctx, bv, vt_addr: int, raw: int | None, ptr: int, layout: dict[str, Any],
+    class_name: str | None,
+) -> tuple[int, str | None, str | None]:
+    """``(offset_to_top, rejection, proof)`` for a backwalk candidate's word[0].
+
+    The UNSIGNED word is tested first: a value that is a mapped address (a
+    record's name pointer, `__dso_handle`'s self-pointer, a 32-bit `.rodata`
+    pointer such as ``0xffff0000`` that signs to a plausible ``-65536``) is a
+    pointer, not a displacement. Then the signed value: positive is never an
+    offset-to-top. A displacement the ABI vouches for (thunk slots, BN's own
+    group symbol) is proof at any width; otherwise one past the bound is
+    disclosed as out-of-bound and one inside it is a heuristic (proof None)."""
+    region = _mapped_region_name(ctx, bv, raw or 0)
+    if region is not None:
+        return _as_signed(raw, ptr), (
+            f"word[0] {raw:#x} is a mapped pointer (into {region}), not an offset-to-top"), None
+    ott = _as_signed(raw, ptr)
+    if ott > 0:
+        return ott, f"word[0] {ott:#x} is positive; an offset-to-top is never positive", None
+    if ott == 0:
+        return ott, None, None
+    if _thunk_slots_prove_offset(layout, ott, class_name):
+        return ott, None, "thunk_slots"
+    if _bn_names_vtable_group(bv, vt_addr, ptr, class_name):
+        return ott, None, "bn_vtable_group"
+    if ott < -_MAX_OFFSET_TO_TOP:
+        return ott, (
+            f"offset-to-top {ott} is outside the bound -{_MAX_OFFSET_TO_TOP:#x} and no "
+            f"slot is a `_ZThn{-ott}_` thunk of this class"), None
+    return ott, None, None
+
+
+def _note_rejected_secondaries(rec: dict[str, Any], rejected: list[dict[str, Any]]) -> None:
+    """#922 (c): a rejected candidate is disclosed, never silently dropped. The
+    note states what was observed at the word -- the backwalk also lands on
+    `__dso_handle` + a `DW.ref._ZTI*` catch-table ref, which is no record."""
+    if not rejected:
+        return
+    rec["rejected_secondary_candidates"] = rejected
+    rec.setdefault("notes", []).append(
+        f"{len(rejected)} typeinfo backwalk candidate(s) rejected as vtables: "
+        + "; ".join(f"{r['address']} ({r['reason']})" for r in rejected))
+
+
+def _note_secondaries(rec: dict[str, Any], secondaries: list[dict[str, Any]]) -> None:
+    notes = rec.setdefault("notes", [])
+    if any(s.get("confidence") == "heuristic" for s in secondaries):
+        notes.append(_SECONDARY_HEURISTIC_NOTE)
+    if any(s.get("confidence") == "rtti" for s in secondaries):
+        notes.append(_SECONDARY_RTTI_NOTE)
+
+
 def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any] | None:
     """#354/#412: in a STRIPPED binary the ``_ZTV`` DataSymbol is gone, so the class
     registry carries no vtable address -- but the typeinfo symbol usually survives.
@@ -1661,13 +2059,36 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     validate the candidate as a real vtable via ``_vtable_layout_for`` (word[1] ==
     typeinfo, slots are CODE -- which filters typeinfo base-pointer refs from other
     classes' RTTI), and classify primary (offset-to-top 0) vs secondary (#412,
-    non-zero word[0]). Returns ``{"primary": layout, "secondary": [layout, ...]}``
-    or None when nothing resolves."""
+    non-zero word[0]).
+
+    #922 (c): a derived class's ``__si_class_type_info`` record ALSO has this
+    class's typeinfo at its word[1] (as the base), so the backwalk lands on it
+    too, with its type-name pointer at word[0]; so does `__dso_handle` when a
+    `DW.ref._ZTI*` catch-table ref follows it. A candidate whose word[0] cannot
+    be an offset-to-top (:func:`_classify_backwalk_candidate`) is returned
+    under ``rejected`` with the observed reason, never as a primary or a
+    secondary. A secondary the ABI vouches for -- `_ZThn<N>_` thunk slots with
+    ``N == -offset_to_top``, or BN's own ``vtable for X{for `Y'}`` symbol on
+    its slot array -- carries ``confidence: "rtti"``; any other carries
+    ``confidence: "heuristic"``: a non-zero word[0] followed by this typeinfo
+    is consistent with a secondary base subobject, not proof of one.
+
+    The primary is the candidate at offset-to-top 0 (the first, when several
+    resolve). With none, ``primary`` is None: a non-zero candidate is a
+    secondary guess and stays one, with its provenance -- promoting the
+    nearest-to-zero guess (the former fallback) reported it as an unqualified
+    primary and hid it from the symbolized-primary path's secondaries.
+
+    Returns ``{"primary": layout | None, "secondary": [layout, ...], "rejected":
+    [{"address", "offset_to_top", "reason"}, ...]}`` or None when nothing
+    resolves as a vtable."""
     getter = getattr(bv, "get_data_refs", None)
     if not callable(getter):
         return None
     ptr = ctx._pointer_size(bv)
+    class_name = ctx._typeinfo_name_at(bv, int(typeinfo_addr))
     groups: list[tuple[int, dict[str, Any]]] = []
+    rejected: list[dict[str, Any]] = []
     seen: set[int] = set()
     for ref in getter(int(typeinfo_addr)):
         vt_addr = int(ref) - ptr
@@ -1677,9 +2098,18 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
         layout = ctx._vtable_layout_for(bv, vt_addr)
         if not layout or not layout.get("slots"):
             continue
-        ott = _as_signed(ctx._read_pointer_value(bv, vt_addr, size=ptr), ptr)
+        raw = ctx._read_pointer_value(bv, vt_addr, size=ptr)
+        ott, reason, proof = _classify_backwalk_candidate(
+            ctx, bv, vt_addr, raw, ptr, layout, class_name)
+        if reason is not None:
+            rejected.append({"address": hex(vt_addr), "offset_to_top": ott, "reason": reason})
+            continue
         layout["offset_to_top"] = ott
         layout["typeinfo_backwalk"] = True   # provenance: recovered without a _ZTV symbol
+        if ott != 0:
+            layout["confidence"] = "rtti" if proof else "heuristic"
+            if proof:
+                layout["confidence_reason"] = proof
         groups.append((ott, layout))
     if not groups:
         return None
@@ -1689,12 +2119,9 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     # whose offset-to-top is ALSO 0 is a construction-vtable / RTTI artifact, not
     # a secondary -- dropping it avoids emitting a bogus secondary (#412 review).
     zeros = [layout for ott, layout in groups if ott == 0]
-    if zeros:
-        primary = zeros[0]                            # several ==0 -> take the first
-    else:
-        primary = min(groups, key=lambda g: abs(g[0]))[1]   # none ==0 -> nearest 0
+    primary = zeros[0] if zeros else None
     secondary = [layout for ott, layout in groups if ott != 0]
-    return {"primary": primary, "secondary": secondary}
+    return {"primary": primary, "secondary": secondary, "rejected": rejected}
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:

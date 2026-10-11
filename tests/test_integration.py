@@ -25,6 +25,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
+CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -2395,3 +2396,126 @@ class TestTypesDeclarePartialDrop760:
         parsed = json.loads(res.stdout)
         assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
         assert parsed["committed"] is False, parsed
+
+
+class TestClassLensRttiGuards922:
+    """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
+    adjacency of vtables and `__si_class_type_info` records, the extern vptr of
+    those records, an imported base class whose typeinfo is a `.got`/`.extern`
+    slot, and BN demangling one template class under two spellings -- are what
+    a g++ layout produces, so the mocked fakes are checked against it here."""
+
+    def _show(self, shared_bn, name):
+        res = shared_bn.run("class", "show", name, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_single_inheritance_chain_has_no_phantom_secondaries_or_slots(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # Handler: ~Handler x2, handle (pure), name -> exactly four slots. The
+        # word after them is the next RTTI record's vptr.
+        handler = self._show(shared_bn, "svc::Handler")
+        assert handler["vtable"]["total"] == 4, handler["vtable"]
+        assert "secondary_vtables" not in handler, handler.get("secondary_vtables")
+        assert handler["bases"] == []
+        echo = self._show(shared_bn, "svc::EchoHandler")
+        assert echo["vtable"]["total"] == 4, echo["vtable"]
+        assert "secondary_vtables" not in echo
+        assert [b["name"] for b in echo["bases"]] == ["svc::Handler"]
+        # AuditHandler adds `flush()` as a fifth slot; the count is pinned so a
+        # hidden slot cannot pass the text greps below (#922 review).
+        audit = self._show(shared_bn, "svc::AuditHandler")
+        assert audit["vtable"]["total"] == 5, audit["vtable"]
+        assert audit["vtable"]["slots"][4]["method"]["name"] == "_ZN3svc12AuditHandler5flushEv"
+        text = shared_bn.run("class", "show", "svc::AuditHandler").stdout
+        assert "secondary vtable" not in text
+        assert "<external>" not in text
+
+    def test_bn_vtable_width_never_hides_slots(self, shared_bn):
+        # #922 review (P1): GCC emits the abstract `Codec`'s two destructor
+        # entries as zero words, so BN's `svc::Codec::VTable` struct is ONE slot
+        # wide (it stops at the first null) while the table has five:
+        # probe, null, null, __cxa_pure_virtual, version. Bounding the walk at
+        # BN's width reported `total: 1, scan_truncated: false`.
+        shared_bn.load(CLASSES_BINARY)
+        codec = self._show(shared_bn, "svc::Codec")
+        vt = codec["vtable"]
+        assert vt["bn_vtable_slots"] == 1, vt
+        assert vt["total"] == 5 and vt["scan_truncated"] is False, vt
+        assert [s.get("null", False) for s in vt["slots"]] == [False, True, True, False, False]
+        assert vt["slots"][3]["pure_virtual"] is True
+        assert vt["slots"][4]["method"]["name"] == "_ZN3svc5Codec7versionEv"
+        hexcodec = self._show(shared_bn, "svc::HexCodec")
+        assert hexcodec["vtable"]["total"] == 5, hexcodec["vtable"]
+        assert [b["name"] for b in hexcodec["bases"]] == ["svc::Codec"]
+
+    def test_secondary_vtable_inside_the_vtable_group_is_rtti(self, shared_bn):
+        # #922 review (P3): `Pipe : Sink, Source` keeps its Source subobject's
+        # vtable inside the `_ZTV` object at offset-to-top -8, with `_ZThn8_`
+        # thunks for slots -- the ABI's own layout, so `rtti`, not a heuristic.
+        shared_bn.load(CLASSES_BINARY)
+        pipe = self._show(shared_bn, "svc::Pipe")
+        assert [b["name"] for b in pipe["bases"]] == ["svc::Sink", "svc::Source"]
+        assert pipe["vtable"]["total"] == 4, pipe["vtable"]
+        (secondary,) = pipe["secondary_vtables"]
+        assert secondary["offset_to_top"] == -8
+        assert secondary["confidence"] == "rtti"
+        assert secondary["confidence_reason"] == "thunk_slots"
+        assert all(s["method"]["name"].startswith("_ZThn8_N3svc4Pipe") for s in secondary["slots"])
+        assert "rejected_secondary_candidates" not in pipe
+        text = shared_bn.run("class", "show", "svc::Pipe").stdout
+        assert "secondary vtable @ " in text and "[rtti]:" in text
+        assert "[heuristic]" not in text
+
+    def test_catch_table_ref_is_rejected_with_the_observed_reason(self, shared_bn):
+        # #922 review (P3): `svc::ParseError` is named in a `catch`, so the
+        # PIE carries a `DW.ref._ZTI` word right after `__dso_handle`, and the
+        # typeinfo backwalk lands on `__dso_handle` (a self-pointer). It is
+        # disclosed as what it is -- a mapped pointer -- not as an RTTI record.
+        shared_bn.load(CLASSES_BINARY)
+        parse_error = self._show(shared_bn, "svc::ParseError")
+        assert parse_error["vtable"]["total"] == 3, parse_error["vtable"]
+        (rejected,) = parse_error["rejected_secondary_candidates"]
+        assert rejected["reason"].startswith(f"word[0] {rejected['address']} is a mapped pointer (into .data)")
+        assert "RTTI" not in rejected["reason"]
+        assert not any("RTTI record" in n for n in parse_error["notes"])
+
+    def test_imported_base_class_reports_no_fabricated_facts(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # std::runtime_error is defined in libstdc++: its typeinfo here is an
+        # import slot, so there is no vtable to backwalk and no base to read.
+        card = self._show(shared_bn, "std::runtime_error")
+        assert card["typeinfo"]["import_slot"] is True
+        assert card["bases"] == []
+        assert card["vtable"] is None, card["vtable"]
+        assert "secondary_vtables" not in card
+        assert any("typeinfo is an import slot" in n for n in card["notes"])
+        # ...while the LOCAL subclass still names it as a base through its own
+        # (local) `__si_class_type_info` record.
+        parse_error = self._show(shared_bn, "svc::ParseError")
+        assert [b["name"] for b in parse_error["bases"]] == ["std::runtime_error"]
+        assert "secondary_vtables" not in parse_error
+
+    def test_template_class_spellings_are_one_card(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        listing = json.loads(
+            shared_bn.run("class", "list", "--no-stl", "--format", "json").stdout)
+        boxes = [row for row in listing["items"] if "svc::Box<" in row["name"]]
+        assert len(boxes) == 1, [row["name"] for row in boxes]
+        assert boxes[0]["name"] == "svc::Box<std::string>"
+        assert boxes[0]["has_vtable"] is True and boxes[0]["method_count"] > 0
+        assert boxes[0]["aliases"] and "basic_string" in boxes[0]["aliases"][0]
+        card = self._show(shared_bn, "svc::Box<std::string>")
+        assert card["vtable"]["total"] == 4, card["vtable"]
+        assert [b["name"] for b in card["bases"]] == ["svc::Handler"]
+        by_alias = self._show(shared_bn, card["aliases"][0])
+        assert by_alias["name"] == "svc::Box<std::string>"
+        # #922 review (P2): `--query` by the absorbed spelling finds the one
+        # canonical card, once, through the listing and the count.
+        by_query = json.loads(shared_bn.run(
+            "class", "list", "--no-stl", "--query", "basic_string", "--format", "json").stdout)
+        assert [row["name"] for row in by_query["items"]] == ["svc::Box<std::string>"], by_query
+        assert by_query["total"] == 1
+        counted = json.loads(shared_bn.run(
+            "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
+        assert counted["count"] == 1, counted

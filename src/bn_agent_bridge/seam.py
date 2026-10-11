@@ -1515,12 +1515,19 @@ class BridgeContext:
     def _typeinfo_name_at(self, bv, address):
         """Class name for a _ZTI object address from its data symbol's demangled
         RTTI marker; None if unresolved. Reuses read_class's marker matcher so
-        the space/underscore spelling variants are handled in one place."""
+        the space/underscore spelling variants are handled in one place.
+
+        Only a ``typeinfo for X`` symbol answers (#922): a ``vtable for X`` or
+        ``typeinfo name for X`` symbol names the class too, but the word that
+        reaches here is being tested for "is this a typeinfo OBJECT" -- an
+        imported class's ``.got`` neighbour is commonly another class's
+        ``_ZTV`` slot, and accepting it reported that vtable as an RTTI base."""
         sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
         if sym is None:
             return None
         from . import read_class
-        return read_class._class_of_rtti_symbol(sym)
+        kind, cls = read_class._rtti_kind_and_class(sym)
+        return cls if kind == "typeinfo" else None
 
     def _global_vtable_stores(self, bv, record):
         """Global data symbols whose stored value is this class's vtable addr."""
@@ -1590,10 +1597,7 @@ class BridgeContext:
 
     def _bases_for(self, bv, record):
         from . import read_class
-        ti = record.get("typeinfo")
-        if not ti:
-            return []
-        return read_class._rtti_bases(self, bv, int(ti["address"], 16))
+        return read_class._bases_for_record(self, bv, record)
 
     def _instances_for(self, bv, record):
         from . import read_class

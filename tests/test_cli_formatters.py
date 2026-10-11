@@ -4622,9 +4622,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # M-12 adds the strings `noise_sections` list read (6 malformed list shapes,
     # +6); its round 2 adds the `data_sections` list read and the narrowed
     # `strings` face (`_render_strings_narrowed_text`, which reaches the same
-    # `items` / `noise_sections` lists), three list reads x 6 (+18). Measured:
-    # 1320.
-    assert checked == 1320, f"the differential ran {checked} cases, not 1320"
+    # `items` / `noise_sections` lists), three list reads x 6 (+18).
+    # #922 adds the class `aliases` lists (list row + show card) and the
+    # secondary-vtable `confidence` text (+12). Measured: 1332.
+    assert checked == 1332, f"the differential ran {checked} cases, not 1332"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4707,8 +4708,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # `noise_strings`/`noise_sections` reads (+16); its round 2 adds the
     # `data_sections` read plus the narrowed `strings` face's nine reads (the
     # same envelope through `_render_strings_narrowed_text`): 10 x 8 (+80).
-    # Total 5408.
-    assert swept == 5408, f"the raise sweep ran {swept} renders, not 5408"
+    # #922 adds the class `aliases` lists and the secondary `confidence`
+    # text (+16). Total 5424.
+    assert swept == 5424, f"the raise sweep ran {swept} renders, not 5424"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4892,8 +4894,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # the session-start and session-stop renderers: two pairs x three benign
     # probes (+6). M-12's strings noise reads add five (+5); its round 2 adds
     # the `data_sections` list read (3) and the narrowed `strings` face's nine
-    # reads (two lists x 3 + seven scalars x 2 = 20) (+23). Total 1572.
-    assert checked == 1572, f"the mirror ran {checked} renders, not 1572"
+    # reads (two lists x 3 + seven scalars x 2 = 20) (+23). #922's `aliases`
+    # lists and secondary `confidence` text add six (+6). Total 1578.
+    assert checked == 1578, f"the mirror ran {checked} renders, not 1578"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7753,9 +7756,10 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     # session-stop renderers: two x nine x four (+72). M-12 adds the strings
     # `noise_sections` list position (+36); its round 2 adds `data_sections` and
     # the narrowed `strings` face's `items` / `noise_sections` positions, three x
-    # 36 (+108). Measured: 5004.
-    assert swept == 5004, (
-        f"the element sweep ran {swept} renders, not 5004 -- the size of the "
+    # 36 (+108). #922 adds the two class `aliases` list positions (list row +
+    # show card) at the same nine-by-four (+72). Measured: 5076.
+    assert swept == 5076, (
+        f"the element sweep ran {swept} renders, not 5076 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
