@@ -30,7 +30,7 @@ bn batch apply -t <selector> /tmp/changes.json --preview
 bn save
 ```
 
-Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only**. It is idempotent and safe to re-run.
+Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only** as recognized by the name-shape check: exactly `sub_<address>` or any `nullsub_` prefix. A user-chosen name of that shape is also replaced; other names are skipped. After Go names land, it is idempotent and safe to re-run.
 
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
@@ -46,11 +46,11 @@ Per-op statuses:
 - `rollback_failed` — restore failed; the view may contain some changes.
 - `internal_error` — unexpected apply failure; rollback is attempted.
 
-A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2; a local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
+A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2, as can a semantic bridge refusal without one of those failure statuses. A local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
 
 ## Output and compact status
 
-Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation result never swaps its status for a spill envelope; with `--out`, stdout is an artifact envelope rather than the mutation status.
+Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation never swaps its status for a spill envelope: when detail spills, stdout keeps the compact status and points to `detail_artifact_path` for `results[]`. With `--out`, stdout is an artifact envelope whose `ok` describes the file write, not the mutation; read the artifact or exit code for the verdict. A refusal can emit an error envelope without writing an artifact.
 
 ### Compact status keys
 
@@ -60,17 +60,17 @@ This table describes the stable object from `--format json --summary`; the defau
 |---|---|
 | `kind` | `mutation_summary` |
 | `ok` / `success` | classified operation outcome |
-| `committed` | whether live apply reached commit, including all-noop |
+| `committed` | whether live apply reached commit, including all-noop; `go rename` with no candidates reports false |
 | `preview` | whether preview was requested |
 | `measured` | false when result rows or required counters cannot establish counts |
 | `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
 | `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
-| `rolled_back` | true/false when restore was attempted, null when none was needed |
+| `rolled_back` | meaningful when `committed` is false; false/null on a committed run does not mean restore ran |
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 
-`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. A cleanly completed revert establishes `changed_count: 0`; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
+`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a live clean revert it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
 ## Batch apply
 
