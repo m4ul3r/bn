@@ -5457,6 +5457,11 @@ class _SharedTailCreateBV(_OverlappingCreateBV):
         the hosts give them their tail back; the auto name comes back only
         when the thunk symbol is undefined and the recorded one redefined.
 
+    The symbols live in the view's LISTING (`get_symbols`), as on real BN,
+    where a loader or `j_*` auto symbol is registered -- an implicit
+    `sub_*` is not, and `_auto_symbols_at` reads the listing only (#927
+    round 4).
+
     Every step above was observed, not designed; the stub exists so the
     revert's verification and repair have something to fail against."""
 
@@ -5471,6 +5476,7 @@ class _SharedTailCreateBV(_OverlappingCreateBV):
                       for a in range(0x1000, 0x1019)},
             memory={a: b"\x90" for a in range(0x1000, 0x1019)},
         )
+        self._symbols = [self.a.symbol, self.b.symbol]
         self._repairable = repairable
         self._split = False
 
@@ -5482,9 +5488,11 @@ class _SharedTailCreateBV(_OverlappingCreateBV):
 
     def undefine_auto_symbol(self, symbol):
         self.events.append(("undefine_auto_symbol", symbol.name))
+        self._symbols.remove(symbol)
 
     def define_auto_symbol(self, symbol):
         self.events.append(("define_auto_symbol", symbol.name))
+        self._symbols.append(symbol)
         fn = self.get_function_at(symbol.address)
         if fn is not None:
             fn.name = symbol.name
@@ -5502,6 +5510,7 @@ class _SharedTailCreateBV(_OverlappingCreateBV):
             self.a.name = f"j_sub_{self.TAIL:x}"
             self.a.symbol = types.SimpleNamespace(auto=True, name=self.a.name,
                                                   address=0x1000, type="FunctionSymbol")
+            self._symbols = [s for s in self._symbols if s.address != 0x1000] + [self.a.symbol]
             self.b.set_ranges([(0x1004, self.TAIL)])
             self._spawn_extra().set_ranges([(self.TAIL, self.CUT)])
             return
@@ -5725,6 +5734,131 @@ def test_a_host_left_renamed_after_the_rollback_is_a_failed_rollback_927(monkeyp
     assert marked == [bv]
     # The repair did not paper over it either: no name was written.
     assert bv.get_function_at(start).name == "preview_only_name"
+
+
+class _ImplicitNameHost(_HostFunction):
+    """A host named by analysis alone: `fn.symbol` is SYNTHESIZED from the
+    current name -- auto for the implicit `sub_*`, user once renamed -- and
+    nothing is registered in the view's listing, the shape of every
+    function on a stripped target."""
+
+    @property
+    def symbol(self):
+        return types.SimpleNamespace(auto=self.name.startswith("sub_"), name=self.name,
+                                     address=self.start, type="FunctionSymbol")
+
+    @symbol.setter
+    def symbol(self, value):
+        pass
+
+
+def test_a_preview_rename_before_create_on_an_implicit_named_host_rolls_back_clean_927(monkeypatch):
+    """#927 round 4: on a host named only `sub_<addr>` (no registered
+    symbol), `[rename host, create inside it] --preview` reported
+    `rollback_failed` over a perfectly restored view. Under the rename the
+    listing held only the user symbol (auto set: none); after the undo it
+    was empty and the fallback read `fn.symbol`'s synthesized `sub_*` as an
+    auto symbol analysis ADDED -- one `undefine_auto_symbol` cannot remove.
+    The auto set is the REGISTERED listing on both reads, and the implicit
+    name is the baseline name check's business."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    start = addr - 8
+    host = _ImplicitNameHost(start, f"sub_{start:x}", [(start, start + 0x40)])
+    bv = _overlap_bv(addr, hosts=[host])
+    bv.undefine_auto_symbol = lambda symbol: bv.events.append(("undefine_auto_symbol", symbol.name))
+    bv.define_auto_symbol = lambda symbol: bv.events.append(("define_auto_symbol", symbol.name))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._mutation("active", True, _renamed_host_batch(addr))
+
+    assert result["success"] is True and result["rolled_back"] is True, result["message"]
+    assert host.name == f"sub_{start:x}"
+    assert host.ranges == [(start, start + 0x40)]
+    assert bv.get_function_at(addr) is None
+    assert not any(e[0].endswith("auto_symbol") for e in bv.events if isinstance(e, tuple))
+    assert marked == []
+
+
+def test_an_exception_path_rollback_that_leaves_a_host_renamed_is_a_structured_failure_927(monkeypatch):
+    """#927 round 4: when the post-analysis snapshot raises and the undo
+    leaves the host renamed, the baseline check saw it but the engine raised
+    a bare RuntimeError -- no status, so the CLI exited 2 as a generic
+    error, and the bridge shim (keyed on the prototype residue attribute
+    alone) never marked the view dirty. It is the same failed rollback the
+    other revert paths report: status `rollback_failed`, `observed` saying
+    the view is dirty, and the view marked so `close` warns."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    start = addr - 8
+    bv = _NameStickingBV(
+        hosts=[_HostFunction(start, "main", [(start, start + 0x40)])],
+        segments={addr: _FakeSegment(readable=True, executable=True)},
+        memory={addr: b"\x55\x48\x89\xe5"},
+    )
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+    real_capture = me._capture_function_snapshots
+    calls = []
+
+    def _capture_then_fault(ctx, view, affected):
+        calls.append(affected)
+        if len(calls) == 2:   # the post-analysis snapshot, after every op applied
+            raise RuntimeError("snapshot fault injected after apply")
+        return real_capture(ctx, view, affected)
+
+    monkeypatch.setattr(me, "_capture_function_snapshots", _capture_then_fault)
+
+    with pytest.raises(bridge.OperationFailure) as exc_info:
+        instance._mutation("active", True, _renamed_host_batch(addr))
+
+    exc = exc_info.value
+    assert exc.status == "rollback_failed"
+    assert "snapshot fault injected" in exc.message and "rollback failed" in exc.message
+    assert exc.observed == {"rolled_back": False, "dirty_after": True}
+    assert marked == [bv]
+    assert bv.get_function_at(start).name == "preview_only_name"
+
+
+def test_an_exception_path_rollback_that_restores_the_hosts_is_not_a_failed_rollback_927(monkeypatch):
+    """The twin that must NOT fire: the same fault with a working undo
+    leaves the view as it was, so the original error escapes untouched --
+    no `rollback_failed` status, no dirty mark."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+    real_capture = me._capture_function_snapshots
+    calls = []
+
+    def _capture_then_fault(ctx, view, affected):
+        calls.append(affected)
+        if len(calls) == 2:
+            raise RuntimeError("snapshot fault injected after apply")
+        return real_capture(ctx, view, affected)
+
+    monkeypatch.setattr(me, "_capture_function_snapshots", _capture_then_fault)
+
+    with pytest.raises(RuntimeError, match="snapshot fault injected") as exc_info:
+        instance._mutation("active", True, _renamed_host_batch(addr))
+
+    assert not isinstance(exc_info.value, bridge.OperationFailure)
+    assert marked == []
+    assert bv.get_function_at(addr - 8).name == "main"
+    assert bv.get_function_at(addr) is None
 
 
 def test_the_repair_never_writes_a_user_name_927(monkeypatch):

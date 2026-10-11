@@ -4265,6 +4265,57 @@ def test_batch_apply_stdin_forwards_preview_flag(monkeypatch, fake_transport):
     assert calls[-1]["params"]["preview"] is True
 
 
+def test_a_batch_create_with_a_malformed_address_is_a_structured_exit_3_927(monkeypatch, capsys):
+    """#927 round 4: `{"ops":[{"op":"function_create","address":"not_an_address"}]}`
+    exited 2 with a bare `ok:false` error -- the split-host baseline parsed
+    the address before the transaction opened, outside the apply handler
+    that turns an op's rejection into a row. Driven through the REAL
+    mocked engine with the dispatch envelope the bridge would send: the
+    baseline records nothing for the operand, the handler rejects it, and
+    the batch is the rolled-back exit-3 result with a failure row."""
+    import io
+    from _bridge_fakes import _FakeFunctionCreateBV, _FakeSegment, _load_bridge
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: None)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False):
+        assert op == "batch_apply"
+        try:
+            result = instance._mutation(target, bool(params.get("preview")), params["ops"])
+        except Exception as exc:  # the dispatch() envelope for an escaped failure
+            return {"ok": False, "error": str(exc), "status": getattr(exc, "status", None)}
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    manifest = '{"ops": [{"op": "function_create", "address": "not_an_address"}]}'
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
+    rc = bn.cli.main(["batch", "apply", "--target", "active", "--format", "json", "-"])
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False and payload["rolled_back"] is True
+    assert [r["status"] for r in payload["results"]] == ["unsupported"]
+    assert "not_an_address" in payload["results"][0]["message"]
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
+    rc = bn.cli.main(["batch", "apply", "--target", "active", "--format", "json", "--summary", "-"])
+    assert rc == 3
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["ok"] is False and summary["success"] is False
+    assert summary["failed_count"] == 1 and summary["dirty_after"] is False
+    assert "not_an_address" in summary["first_error"]
+    assert bv.get_function_at(0x1000) is None
+
+
 def test_rename_alias_maps_to_symbol_rename(fake_transport):
     calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True, "results": [{"status": "verified"}]}}})
 

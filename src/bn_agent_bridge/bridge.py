@@ -4304,7 +4304,14 @@ class BinaryNinjaBridge:
                 # though _mutation raised (returns no result), so mark the view dirty
                 # here -- otherwise `close` reads bv.file.modified == false and reports
                 # no unsaved state. The original exception still propagates intact.
-                if getattr(exc, "prototype_user_type_residue", False):
+                # #927 round 4: the same path raises a structured `rollback_failed`
+                # when its revert left the view off its baseline (a split host still
+                # renamed); that view is modified too, and the residue attribute
+                # alone missed it.
+                rollback_failed = (
+                    isinstance(exc, OperationFailure) and exc.status == "rollback_failed"
+                )
+                if rollback_failed or getattr(exc, "prototype_user_type_residue", False):
                     try:
                         selector = a[0] if a else k.get("selector")
                         self.targets.mark_dirty(self.targets.resolve(selector))

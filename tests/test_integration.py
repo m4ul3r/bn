@@ -2188,6 +2188,59 @@ class TestFunctionCreateAnnotatedHost:
         after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
         assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
 
+    def test_batch_preview_rolls_back_clean_on_an_implicit_named_host(self, shared_bn, tmp_path):
+        """#927 round 4: the common stripped-target shape. A host named only
+        `sub_<addr>` has NO registered symbol -- `fn.symbol` synthesizes it
+        -- so under the sibling's rename the listing held one user symbol,
+        after the undo none, and reading `fn.symbol` as a stand-in for the
+        empty listing made the implicit name an "added" auto symbol
+        `undefine_auto_symbol` cannot remove: `success:false,
+        rolled_back:false, dirty_after:true` over a view that was exactly
+        as before. The auto set is the registered listing on both reads."""
+        shared_bn.load(HELLO_BINARY)
+        host = int(_py_line(shared_bn, _IMPLICIT_HOST_SETUP, "HOST"), 16)
+        before = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert f"'sub_{host:x}', []" in before, before
+        mf = tmp_path / "rename_then_split_implicit.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(host), "new_name": "temporary_name"},
+            {"op": "function_create", "address": hex(host + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False, summary
+        after = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+
+
+_IMPLICIT_HOST_SETUP = (
+    # One function with no symbol of its own -- fifteen NOPs and a RET laid
+    # over the fixture's `main` on the test's private copy, started four
+    # bytes past the ELF symbol so BN names it `sub_<addr>` and registers
+    # nothing in the symbol table.
+    "base = [f for f in bv.functions if f.name == 'main'][0].start\n"
+    "for f in list(bv.functions):\n"
+    "    if base <= f.start < base + 0x14:\n"
+    "        bv.remove_user_function(f)\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.write(base + 4, b'\\x90' * 15 + b'\\xc3')\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base + 4); bv.update_analysis_and_wait()\n"
+    "print('HOST=' + hex(base + 4))\n"
+)
+
+
+def _implicit_host_snapshot_code(host: int) -> str:
+    return (
+        f"f = bv.get_function_at({host:#x})\n"
+        f"syms = [(s.name, s.auto) for s in bv.get_symbols({host:#x}, 1)]\n"
+        "ranges = [(hex(r.start), hex(r.end)) for r in f.address_ranges] if f else None\n"
+        f"inside = bv.get_function_at({host + 4:#x}) is not None\n"
+        "print('SNAP=' + repr((f.name if f else None, syms, ranges, inside)))\n"
+    )
+
 
 _SHARED_TAIL_SETUP = (
     # Two user functions sharing a tail, one of them discontiguous -- the

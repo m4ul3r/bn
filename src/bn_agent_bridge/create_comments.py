@@ -364,7 +364,7 @@ def _snapshot_split_hosts(bv, overlapped: list[dict[str, Any]]) -> dict[str, Any
             continue
         hosts[start] = {
             "name": str(fn.name),
-            "auto_symbols": _auto_symbols_at(bv, fn, start),
+            "auto_symbols": _auto_symbols_at(bv, start),
             "ranges": _range_pairs(fn),
         }
     span = sorted({r for host in hosts.values() for r in host["ranges"]})
@@ -375,18 +375,26 @@ def _is_auto_symbol(symbol) -> bool:
     return symbol is not None and bool(getattr(symbol, "auto", False))
 
 
-def _auto_symbols_at(bv, fn, start: int) -> dict[str, Any]:
-    """The AUTO symbols at *start*, by name -- ALL of them, not the one
-    `fn.symbol` prefers. A user rename sits on top of the auto symbols
-    without removing them, so the preferred symbol hides what analysis did
-    underneath: a host cut down to a jump thunk gains an auto `j_*` symbol
-    that outranks its loader name, and after the batch's undo drops the user
-    name the thunk name is what shows. The analysis-owned set is the thing
-    to put back; the view's own listing is the only place it is visible."""
-    symbols = list(bv.get_symbols(start, 1))
-    if not symbols:
-        symbols = [getattr(fn, "symbol", None)]
-    return {str(s.name): s for s in symbols if _is_auto_symbol(s)}
+def _auto_symbols_at(bv, start: int) -> dict[str, Any]:
+    """The REGISTERED auto symbols at *start*, by name -- ALL of them, not
+    the one `fn.symbol` prefers. A user rename sits on top of the auto
+    symbols without removing them, so the preferred symbol hides what
+    analysis did underneath: a host cut down to a jump thunk gains an auto
+    `j_*` symbol that outranks its loader name, and after the batch's undo
+    drops the user name the thunk name is what shows. The analysis-owned
+    set is the thing to put back; the view's own listing is the only place
+    it is visible.
+
+    Only the listing, never `fn.symbol` as a stand-in for an empty one: an
+    implicit `sub_<addr>` name is synthesized, not registered, so it is in
+    `fn.symbol` and absent from the listing -- and a user rename on top
+    makes the listing non-empty without it. Falling back mixed the two:
+    recorded under the rename as no auto symbols, the host read after the
+    undo as having "added" `sub_<addr>`, which `undefine_auto_symbol`
+    cannot remove, and a perfectly restored preview reported a failed
+    rollback (#927 round 4). The implicit name is verified by the
+    transaction baseline's name check instead."""
+    return {str(s.name): s for s in bv.get_symbols(start, 1) if _is_auto_symbol(s)}
 
 
 def _split_host_baseline(ctx, bv, operations: list) -> dict[int, dict[str, Any]]:
@@ -397,12 +405,21 @@ def _split_host_baseline(ctx, bv, operations: list) -> dict[int, dict[str, Any]]
     return to, which no per-op snapshot taken mid-batch can know (#927
     round 3). A create at a gap address records nothing; one inside an
     EARLIER sibling's function finds no function here yet, and that
-    sibling's own restore removes it."""
+    sibling's own restore removes it. A malformed address records nothing
+    either: this runs before the transaction opens, outside the apply
+    handler that turns an op's failure into a `results` row, so raising
+    here demoted the batch's structured, rolled-back exit-3 result to a
+    bare error (#927 round 4). `_op_function_create` rejects the operand
+    itself, exactly as the affected-function pass defers to it."""
     baseline: dict[int, dict[str, Any]] = {}
     for op in operations:
         if not (isinstance(op, dict) and op.get("op") == "function_create" and op.get("address")):
             continue
-        for fn in ctx._functions_containing(bv, _parse_address(op["address"])):
+        try:
+            addr = _parse_address(op["address"])
+        except ValueError:
+            continue
+        for fn in ctx._functions_containing(bv, addr):
             start = int(fn.start)
             if start not in baseline:
                 baseline[start] = {"name": str(fn.name), "ranges": _range_pairs(fn)}
@@ -431,10 +448,9 @@ def _host_auto_symbols_off(bv, hosts: dict[int, dict[str, Any]]) -> list[tuple[i
     auto symbols analysis ADDED, the recorded ones now MISSING)."""
     off: list[tuple[int, list, list]] = []
     for start, before in hosts.items():
-        fn = bv.get_function_at(start)
-        if fn is None:
+        if bv.get_function_at(start) is None:
             continue
-        now = _auto_symbols_at(bv, fn, start)
+        now = _auto_symbols_at(bv, start)
         recorded = before["auto_symbols"]
         added = [now[name] for name in now if name not in recorded]
         missing = [recorded[name] for name in recorded if name not in now]

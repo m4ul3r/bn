@@ -2659,8 +2659,18 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # bv.file.modified == false and wrongly report no unsaved state.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
             if not (undo_ok and restore_ok and drift_ok and hosts_ok):
-                err = RuntimeError(
-                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
+                # #927 round 4: a failed revert on THIS path used to escape as a
+                # bare RuntimeError -- no status, so the CLI exited 2 as if the
+                # bridge had merely erred, and the bridge shim (which keys off the
+                # residue attribute alone) never marked the view dirty, so `close`
+                # read bv.file.modified == false over a host left renamed. Raise
+                # the structured failure the other two revert paths report:
+                # status `rollback_failed` (exit 3, `observed.dirty_after`), and
+                # the shim marks the view dirty off the status.
+                err = OperationFailure(
+                    "rollback_failed",
+                    f"{exc} (additionally, rollback failed; the view may be left partially modified)",
+                    observed={"rolled_back": False, "dirty_after": True},
                 )
                 if proto_residue:
                     err.prototype_user_type_residue = True
