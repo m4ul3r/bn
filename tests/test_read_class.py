@@ -443,8 +443,12 @@ class _RecoverCtx:
     def _vtable_layout_for(self, bv, addr):
         layout = self._layouts.get(addr)
         return dict(layout) if layout is not None else layout
-    def _address_context(self, bv, addr, **kw):
-        return {}   # #922 (a): no section names -> the typeinfo is not a GOT slot
+    def _sections_at(self, bv, addr):
+        return []   # #922 (a): no section names -> the typeinfo is not a GOT slot
+    def _segment_at(self, bv, addr):
+        return None   # ...and no backwalk word[0] is a mapped pointer
+    def _typeinfo_name_at(self, bv, addr):
+        return None
 
 
 class _RecoverBV:
@@ -979,8 +983,8 @@ class _EnrichCtx(_SizeCtx):
     def _instances_for(self, bv, record):
         return {}
 
-    def _address_context(self, bv, address, **kw):
-        return {}
+    def _sections_at(self, bv, address):
+        return []
 
 
 def test_size_none_when_nothing_resolves():
@@ -1144,9 +1148,6 @@ def test_class_show_assembles_full_record():
     class _ShowCtx:
         _find_function = seam.BridgeContext._find_function
         _sections_at = seam.BridgeContext._sections_at
-
-        def _address_context(self, b, addr, **kw):
-            return {}
 
         def _resolve_view(self, sel):
             return bv
@@ -3817,8 +3818,8 @@ def test_enrich_skips_the_backwalk_for_an_import_slot_typeinfo_922():
             return {"construction_sites": [], "stored_globals": []}
         def _find_function(self, bv, addr):
             return None
-        def _address_context(self, bv, addr, **kw):
-            return {"sections": [{"name": ".got"}]}
+        def _sections_at(self, bv, addr):
+            return [{"name": ".got", "start": "0x9400", "end": "0x9500"}]
 
     class _BV(_RecoverBV):
         def get_symbol_at(self, addr):

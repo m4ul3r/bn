@@ -1642,14 +1642,15 @@ def _typeinfo_is_import_slot(ctx, bv, typeinfo_addr: int) -> bool:
     reported the NEXT GOT ENTRY (some other class's ``_ZTV``) as a public base
     with `confidence: rtti`. Same two tests `evidence table` refuses a GOT slot
     with (:func:`read_evidence._got_alias_target`): the symbol's alias type,
-    else the ``.got``/``.got.plt`` section the address context names."""
-    from .read_evidence import _section_names_at
-
+    else a ``.got``/``.got.plt`` section at the address. Only the section names
+    are consulted (``ctx._sections_at``): this runs per `class list` row, and a
+    full ``_address_context`` would also do the function lookup, code check and
+    string resolution for every row's typeinfo (#922 review)."""
     sym = bv.get_symbol_at(typeinfo_addr) if hasattr(bv, "get_symbol_at") else None
     if sym is not None and _is_alias_symbol(sym):
         return True
-    names = _section_names_at(ctx._address_context(bv, typeinfo_addr))
-    return any(name.startswith(".got") for name in names)
+    return any(str(sec.get("name", "")).lower().startswith(".got")
+               for sec in ctx._sections_at(bv, typeinfo_addr))
 
 
 def _note_typeinfo_import(rec: dict[str, Any]) -> None:
