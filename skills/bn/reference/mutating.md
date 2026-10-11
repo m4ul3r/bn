@@ -32,6 +32,8 @@ bn save
 
 Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only** as recognized by the name-shape check: exactly `sub_<address>` or any `nullsub_` prefix. A user-chosen name of that shape is also replaced; other names are skipped. After Go names land, it is idempotent and safe to re-run.
 
+`function create` is for an address auto-analysis missed. An address **inside** an existing function is refused (`invalid_request`, exit 3) naming the containing function, its start, and the offset, because Binary Ninja splits that function at the new start rather than adding a second one beside it. Pass `--allow-overlap` (batch op field `"allow_overlap": true`) only for a deliberate split of an over-extended function; the compact status line then carries `overlaps=N` and an `overlapping_functions:` line, and `--format json --summary` carries `overlapping_functions`. `--preview` obeys the same rule. An unmapped or non-executable address is refused the same way on both surfaces.
+
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
 Per-op statuses:
@@ -54,7 +56,7 @@ Mutations print a compact **text status line** by default. Use `--format json --
 
 ### Compact status keys
 
-This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true:
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true, and `overlapping_functions`, emitted only when a create split an existing function:
 
 | key | meaning |
 |---|---|
@@ -69,6 +71,7 @@ This table describes the stable object from `--format json --summary`; the defau
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
+| `overlapping_functions` | the `{name, address, offset}` of each function a `function create --allow-overlap` split; absent for an ordinary create |
 
 `go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a live clean revert it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
@@ -108,4 +111,4 @@ The manifest must be an object with an `ops` array. Validation runs before apply
 | `tag_type_create` | `name`, `icon` | — | `bn tag type create` |
 | `tag_type_remove` | `name` | — | `bn tag type remove` |
 
-Optional fields include `kind` for symbol rename, `overwrite_existing` or `type_name` for struct fields, and `source_path` for declarations. The table names the operation's real field names; they differ across commands. The same preview, verification, readback, and save rules apply to the batch.
+Optional fields include `kind` for symbol rename, `overwrite_existing` or `type_name` for struct fields, `allow_overlap` for `function_create`, and `source_path` for declarations. The table names the operation's real field names; they differ across commands. The same preview, verification, readback, and save rules apply to the batch.

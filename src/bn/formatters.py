@@ -5159,6 +5159,10 @@ def _operation_row_text(item: dict[str, Any]) -> str:
     if op == "function_create":
         name = item.get("function")
         suffix = f" ({name})" if name else ""
+        overlaps = _row_list(item, "overlaps")
+        if overlaps:
+            # M-03: the verbose row names the host this create split, too.
+            suffix += f" -- splits {_overlap_listing(overlaps)}"
         return f"function_create {_get('address')}{suffix}"
     if op == "rename_symbol":
         return f"rename_symbol {_get('kind', 'auto')} {_get('address')} -> {_get('new_name')}"
@@ -5556,6 +5560,7 @@ def _build_mutation_summary(
     default_error: str = "mutation failed",
     unmeasured_cause: str = "this op reported no results[] rows",
     unusable: bool = False,
+    overlapping_functions: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -5680,6 +5685,15 @@ def _build_mutation_summary(
     }
     if proto_residue:
         summary["prototype_user_type_residue"] = True
+    if overlapping_functions:
+        # M-03: a `function create --allow-overlap` split an existing function
+        # at the new start. That is the one fact the caller asked to be told
+        # about by passing the flag, and it was reported only in the verbose
+        # `results[].note` -- the compact status every loop reads said
+        # `committed changed=1 verified=1` and nothing else. Conditional like
+        # the residue key: an ordinary create must not grow an empty list for
+        # every consumer to learn to ignore.
+        summary["overlapping_functions"] = list(overlapping_functions)
     return summary
 
 
@@ -5792,6 +5806,15 @@ def _mutation_summary(value: Any) -> Any:
                           if rows_unreadable
                           else "an op row's status could not be read" if unreadable
                           else "this op reported no results[] rows"),
+        # M-03: the per-row `overlaps` a `function_create` carries after a
+        # deliberate `--allow-overlap` split, collected across the batch so a
+        # loop reading only the compact status still learns WHICH function
+        # was cut. A reverted/failed row's overlap is not a live split, so
+        # only the rows that verified contribute.
+        overlapping_functions=[
+            o for r in results if r.get("status") == "verified"
+            for o in _row_list(r, "overlaps")
+        ],
     )
 
 
@@ -6074,7 +6097,15 @@ def _render_mutation_summary_text(value: Any) -> str:
         f"failed={value.get('failed_count', 0)}",
         f"dirty_after={value.get('dirty_after')}",
     ]
+    # M-03: the split a `function create --allow-overlap` made is reported HERE,
+    # on the line every loop reads, not only in the verbose row note. Count on
+    # the line, hosts on the next, so the line stays grep-stable.
+    overlaps = _overlap_rows(value)
+    if overlaps:
+        parts.append(f"overlaps={len(overlaps)}")
     line = "  ".join(parts)
+    if overlaps:
+        line += "\noverlapping_functions: " + _overlap_listing(overlaps)
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
@@ -6109,6 +6140,24 @@ def _render_mutation_summary_text(value: Any) -> str:
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
     return line
+
+
+def _overlap_rows(source: Any) -> list[dict[str, Any]]:
+    """The `overlapping_functions` a compact summary carries after a deliberate
+    `function create --allow-overlap` split (M-03) -- the rows of it that can
+    be read, through the row choke point so a malformed one is disclosed."""
+    return _row_list(source, "overlapping_functions")
+
+
+def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
+    """`name @ start (+offset)` per split host; a missing field prints as
+    `<unknown>` rather than dropping the row that says a function was cut."""
+    return ", ".join(
+        f"{_text_value(o, 'name') or '<unknown>'} @ "
+        f"{_text_value(o, 'address') or '<unknown>'}"
+        + (f" (+{offset})" if (offset := _text_value(o, "offset")) else "")
+        for o in overlaps
+    )
 
 
 @_discloses

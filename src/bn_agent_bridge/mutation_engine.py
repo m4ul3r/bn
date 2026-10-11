@@ -4263,14 +4263,16 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # and `get_functions_containing` reports the new one. A create at a
     # mid-function address succeeded with `verified` and said nothing, so a
     # caller who mistyped an address, or who did not realise BN had already
-    # attributed those bytes, was left with two overlapping functions and no
-    # trace of it in the result.
+    # attributed those bytes, was left with a truncated host and no trace of
+    # it in the result.
     #
-    # DISCLOSED, not refused -- the opposite call from the reserved-tag guard
-    # beside it, and for the opposite reason: creating a function BN missed
-    # inside a neighbour it over-extended is ordinary RE work, so refusing
-    # would break a legitimate flow. The harm here is that the overlap is
-    # INVISIBLE, not that it happened.
+    # M-03: REFUSED unless the op says `allow_overlap: true`, then disclosed
+    # -- the same rule, in the same words, as the standalone command
+    # (`create_comments._overlap_refusal`), so an agent that learned one
+    # surface is not surprised by the other. The deliberate split (BN
+    # over-extended the host) stays reachable through the flag.
+    allow_overlap = _validate_bool(op.get("allow_overlap"), label="allow_overlap",
+                                   default=False)
     overlapped = create_comments._containing_function_rows(bv, addr)
     if len(bytes(bv.read(addr, 1))) == 0:
         raise OperationFailure(
@@ -4284,6 +4286,9 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             f"Cannot create function: address {hex(addr)} is not inside an executable segment",
             requested=requested,
         )
+    if overlapped and not allow_overlap:
+        raise create_comments._overlap_refusal(
+            addr, overlapped, requested, flag='"allow_overlap": true on the op')
     # create_user_function (FORCED), not add_function (an advisory auto hint that
     # declines exactly the auto-skipped data-table / missed-handler addresses this
     # op exists to recover -- #360). Mirrors the standalone create_comments path.

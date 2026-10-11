@@ -4991,7 +4991,12 @@ def _bind_read(bridge, params, target):
 # (py_exec, close_binary, save_database) stay lock="write".
 @op("function_create", lock="none")
 def _bind_function_create(bridge, params, target):
-    return bridge._function_create(target, params["address"], _validate_bool(params.get("preview"), label="preview", default=False))
+    return bridge._function_create(
+        target, params["address"],
+        _validate_bool(params.get("preview"), label="preview", default=False),
+        allow_overlap=_validate_bool(params.get("allow_overlap"), label="allow_overlap",
+                                     default=False),
+    )
 
 
 @op("bundle_function", lock="read")

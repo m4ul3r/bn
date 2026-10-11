@@ -103,16 +103,56 @@ def _containing_function_rows(bv, addr: int) -> list[dict[str, str]]:
     Read before a create, because afterwards the address is itself a
     function start and `get_functions_containing` reports the new one. A
     view that cannot answer discloses nothing rather than guessing (#675
-    item 14).
+    item 14). Each row names the host, its start and how far into it the
+    address lies -- the three facts a caller needs to tell a mistyped
+    address from a deliberate split.
     """
     try:
-        return [
-            {"name": str(fn.name), "address": hex(int(fn.start))}
-            for fn in (bv.get_functions_containing(addr) or [])
-            if int(getattr(fn, "start", addr)) != addr
-        ]
+        rows = []
+        for fn in (bv.get_functions_containing(addr) or []):
+            start = int(getattr(fn, "start", addr))
+            if start == addr:
+                continue
+            rows.append({
+                "name": str(fn.name),
+                "address": hex(start),
+                "offset": hex(addr - start),
+            })
+        return rows
     except Exception:  # noqa: BLE001 - no evidence is not a claim
         return []
+
+
+def _overlap_refusal(addr: int, overlapped: list[dict[str, str]], requested: dict,
+                     *, flag: str) -> OperationFailure:
+    """The refusal for a create INSIDE an existing function (M-03).
+
+    A forced ``create_user_function`` at an interior address does not add a
+    second, overlapping function the way the #675 disclosure assumed: BN
+    truncates the host at the new start and the new ``sub_*`` owns the rest,
+    so a mistyped or over-trusted address silently cut a user-named,
+    user-prototyped function down to a few bytes behind a clean
+    ``committed changed=1 verified=1``. The split is legitimate when BN
+    over-extended the host, so it stays reachable -- but only on request,
+    and the refusal names the host, its start and the offset so the caller
+    can tell which case this is. ONE builder for both create paths, so the
+    standalone command and a batch op refuse in the same words; *flag* is
+    the spelling the caller's surface accepts.
+    """
+    listed = ", ".join(
+        f"{o['name']} (starts at {o['address']}, offset +{int(o['offset'], 16):#x})"
+        for o in overlapped
+    )
+    return OperationFailure(
+        "invalid_request",
+        f"Refused to create a function at {hex(addr)}: the address lies inside "
+        f"{listed}. Creating one here splits the host at {hex(addr)} -- it keeps "
+        f"only the bytes before the new start and the new function owns the rest. "
+        f"If the host was over-extended by auto-analysis and the split is "
+        f"intended, pass {flag}; the result then reports the overlap.",
+        requested=requested,
+        observed={"address": hex(addr), "overlaps": overlapped},
+    )
 
 
 def _with_overlap_note(row: dict, overlapped: list[dict[str, str]]) -> dict:
@@ -120,7 +160,8 @@ def _with_overlap_note(row: dict, overlapped: list[dict[str, str]]) -> dict:
 
     ONE builder for both create paths, so the two cannot state the same
     fact differently -- the same reason the duplicate-start note is shared
-    across its three surfaces.
+    across its three surfaces. Only an ``allow_overlap`` create reaches
+    this with a non-empty list; the default refuses first.
     """
     if not overlapped:
         return row
@@ -128,14 +169,17 @@ def _with_overlap_note(row: dict, overlapped: list[dict[str, str]]) -> dict:
     row = dict(row)
     row["overlaps"] = overlapped
     row["note"] = (
-        f"this address is inside {listed}, so the view now has two "
-        f"overlapping functions; that is legitimate when BN over-extended "
-        f"the neighbour, and a mistake if the address was wrong"
+        f"this address is inside {listed}, so the host function is now split "
+        f"at {row.get('address', '<unknown>')}: it keeps only the bytes before "
+        f"the new start and the new function owns the rest; that is legitimate "
+        f"when BN over-extended the neighbour, and a mistake if the address was "
+        f"wrong"
     )
     return row
 
 
-def _function_create(ctx, selector: str | None, address, preview: bool, *, exclusive=None):
+def _function_create(ctx, selector: str | None, address, preview: bool, *,
+                     allow_overlap: bool = False, exclusive=None):
     """Create a function at *address*, verify it, and revert if asked or failed.
 
     #628 lock split: ``exclusive`` is the caller's EXCLUSIVE target-lock scope -- a
@@ -150,6 +194,13 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
     (``_remove_created_function``) stays exclusive on purpose: a reader must never
     observe a half-reverted view. ``exclusive=None`` means "no exclusive scope" (a
     no-op), so direct engine calls and tests keep working.
+
+    ``allow_overlap`` is the deliberate-split switch (M-03): a create at an
+    address INSIDE an existing function is refused by default -- see
+    ``_overlap_refusal`` -- and goes ahead, disclosing the overlap in its
+    row, only when it is True. The preview obeys the same rule: a preview
+    that previews a refused create would report `verified` for a change
+    the live command then refuses.
     """
     exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     with exclusive_scope():
@@ -165,13 +216,15 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
         require_analysis(bv, "Creating a function")
         addr = _parse_address(address)
         requested = {"op": "function_create", "address": hex(addr)}
+        if allow_overlap:
+            requested["allow_overlap"] = True
 
         # #675 item 14: capture the CONTAINING functions before the create --
         # afterwards this address IS a function start and the answer changes.
         # A create at a mid-function address reported `verified` and said
-        # nothing, leaving two overlapping functions with no trace in the
-        # result. Disclosed, not refused: creating a function BN missed
-        # inside a neighbour it over-extended is ordinary RE work.
+        # nothing; M-03 then showed the "overlap" is a truncation of the host,
+        # so it is refused unless `allow_overlap` asks for the split, and
+        # disclosed in the row when it does.
         #
         # BOTH create paths need this. `bn function create` runs here;
         # `batch apply` runs `mutation_engine._op_function_create`. Patching
@@ -203,14 +256,23 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
         # inside an executable region. Auto-analysis skips exactly these handler
         # entry points (reachable only via data/function-pointer tables), so we
         # still create them on request -- but only where code can actually run.
+        # M-24: OperationFailure, not a bare RuntimeError -- the batch path
+        # already refuses the same address as `invalid_request`, and a bridge
+        # mutation refusal is exit 3 on both surfaces, not 2 on one of them.
         if len(bytes(bv.read(addr, 1))) == 0:
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not mapped"
+            raise OperationFailure(
+                "invalid_request",
+                f"Cannot create function: address {hex(addr)} is not mapped",
+                requested=requested,
             )
         if not read_misc._is_executable_address(ctx, bv, addr):
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
+            raise OperationFailure(
+                "invalid_request",
+                f"Cannot create function: address {hex(addr)} is not inside an executable segment",
+                requested=requested,
             )
+        if overlapped and not allow_overlap:
+            raise _overlap_refusal(addr, overlapped, requested, flag="--allow-overlap")
 
         state = bv.begin_undo_actions()
     try:

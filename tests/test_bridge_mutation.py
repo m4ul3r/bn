@@ -4980,25 +4980,25 @@ def test_every_status_a_doomed_batch_emits_is_in_the_reference_status_list_675(
         f"{sorted(emitted - documented)}")
 
 
-# --- #675 item 14: a create inside an existing function says so -----------
+# --- #675 item 14 / M-03: a create inside an existing function ------------
+
+
+_HOST = {"name": "main", "address": "0x401339", "offset": "0x8"}
 
 
 def test_a_create_inside_an_existing_function_discloses_the_overlap_675():
     """#675 item 14: `function create` at a mid-function address returned
     `verified` with a row carrying only address/function/op/requested/status
-    -- two overlapping functions and no trace of it in the result.
-
-    Disclosed rather than refused, the opposite call from the reserved-tag
-    guard and for the opposite reason: creating a function BN missed inside
-    a neighbour it over-extended is ordinary RE work, so a refusal would
-    break a legitimate flow. The harm is that the overlap is INVISIBLE.
+    -- a split host and no trace of it in the result. The row builder is
+    reached only by a deliberate `allow_overlap` create (M-03 refuses the
+    rest), and must still name the host.
     """
     from bn_agent_bridge import create_comments as cc
     row = cc._with_overlap_note(
         {"op": "function_create", "status": "verified", "address": "0x401341"},
-        [{"name": "main", "address": "0x401339"}])
+        [_HOST])
 
-    assert row["overlaps"] == [{"name": "main", "address": "0x401339"}]
+    assert row["overlaps"] == [_HOST]
     assert "main @ 0x401339" in row["note"]
     # It must say which reading is which, or the note is just an alarm.
     assert "legitimate" in row["note"] and "mistake" in row["note"]
@@ -5016,7 +5016,7 @@ def test_a_create_at_a_free_address_grows_no_overlap_keys_675():
 class _OverlappingCreateBV(_FakeFunctionCreateBV):
     """A create view whose containment answers, which the stock fake's does
     not -- so every existing create drive takes the EMPTY path and cannot
-    observe the #675-item-14 note at all."""
+    observe the interior guard at all."""
 
     def __init__(self, *, container_start, container_name="main", **kw):
         super().__init__(**kw)
@@ -5035,34 +5035,76 @@ def _overlap_bv(addr):
     )
 
 
-def test_the_single_command_create_path_returns_the_overlap_675(monkeypatch):
-    """The drive that actually failed in real life, through the entry point
-    `bn function create` uses.
+def _assert_interior_refusal(exc, addr):
+    """The refusal names the host, its start and the offset -- the three
+    facts that tell a mistyped address from a deliberate split -- and says
+    how to ask for the split. Status `invalid_request` is what puts the run
+    at exit 3 on both surfaces."""
+    assert exc.status == "invalid_request"
+    assert "main" in exc.message
+    assert hex(addr - 8) in exc.message
+    assert "+0x8" in exc.message
+    assert "allow" in exc.message and "overlap" in exc.message
+    assert exc.observed["overlaps"] == [
+        {"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
 
-    This replaces an `inspect.getsource` assertion that both paths MENTION
-    the helper. That asserted the call site EXISTS, not that its result
-    REACHES the row -- it would pass a call site whose note is dropped
-    before the row is built, and it asserts source text, which this repo's
-    conventions forbid where a behavioural check is available.
-    """
+
+def test_the_single_command_create_inside_a_function_is_refused_m03(monkeypatch):
+    """M-03: `bn function create <host+8>` committed `changed=1 verified=1`
+    and cut the host down to 8 bytes; the only trace was the verbose row
+    note. Refused by default, before anything is created or analysed."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     addr = 0x401341
     bv = _overlap_bv(addr)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    result = instance._function_create(None, hex(addr), False)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._function_create(None, hex(addr), False)
 
+    _assert_interior_refusal(exc.value, addr)
+    assert "--allow-overlap" in exc.value.message
+    assert bv.added == [] and "refresh" not in bv.events
+
+
+def test_the_single_command_preview_obeys_the_interior_guard_m03(monkeypatch):
+    """A preview that said `verified` for a create the live command refuses
+    would be a plan the loop cannot execute."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._function_create(None, hex(addr), True)
+
+    assert exc.value.status == "invalid_request"
+    assert bv.added == []
+
+
+def test_the_single_command_create_path_returns_the_overlap_with_the_flag_675(monkeypatch):
+    """The deliberate split: `allow_overlap` goes ahead and the row discloses
+    the host, asserted on the OBSERVED row rather than on the call site."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, hex(addr), False, allow_overlap=True)
+
+    assert result["committed"] is True
     row = result["results"][0]
-    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert row["status"] == "verified"
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
     assert "legitimate" in row["note"] and "mistake" in row["note"]
+    assert row["requested"]["allow_overlap"] is True
 
 
-def test_the_batch_create_path_returns_the_same_overlap_675(monkeypatch):
-    """The other entry point, asserted on the OBSERVED row rather than on
-    the two call sites agreeing in source. A divergence introduced after
-    the helper call -- the failure the source assertion could not see --
-    fails here."""
+def test_the_batch_create_inside_a_function_is_refused_m03(monkeypatch):
+    """The other entry point refuses in the same words, and the batch is
+    reverted like any other `invalid_request`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     addr = 0x401341
@@ -5072,14 +5114,55 @@ def test_the_batch_create_path_returns_the_same_overlap_675(monkeypatch):
     result = instance._mutation(
         "active", False, [{"op": "function_create", "address": hex(addr)}])
 
+    assert result["success"] is False and result["committed"] is False
     row = result["results"][0]
-    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8)}]
+    assert row["status"] == "invalid_request"
+    assert "main" in row["message"] and hex(addr - 8) in row["message"]
+    assert "+0x8" in row["message"]
+    assert "allow_overlap" in row["message"]
+    assert bv.get_function_at(addr) is None
+
+
+def test_the_batch_create_path_returns_the_same_overlap_with_the_flag_675(monkeypatch):
+    """With `allow_overlap: true` the batch op proceeds and its row carries
+    the same disclosure the standalone row does."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", False,
+        [{"op": "function_create", "address": hex(addr), "allow_overlap": True}])
+
+    row = result["results"][0]
+    assert row["status"] == "verified"
+    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
     assert "legitimate" in row["note"] and "mistake" in row["note"]
+
+
+def test_the_batch_allow_overlap_field_must_be_a_json_boolean_m03(monkeypatch):
+    """`"allow_overlap": "false"` must not read as permission (#91's rule)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", False,
+        [{"op": "function_create", "address": hex(addr), "allow_overlap": "false"}])
+
+    row = result["results"][0]
+    assert row["status"] == "invalid_request"
+    assert "allow_overlap must be a JSON boolean" in row["message"]
+    assert bv.get_function_at(addr) is None
 
 
 def test_a_view_that_cannot_answer_containment_discloses_nothing_675():
     """Degrade-safely, as everywhere else: a probe that raises has no
-    evidence of an overlap and must not invent one, nor fail the create."""
+    evidence of an overlap and must not invent one, nor refuse the create."""
     from bn_agent_bridge import create_comments as cc
 
     class _Hostile:
@@ -5103,7 +5186,7 @@ def test_a_function_starting_at_the_address_is_not_an_overlap_675():
             return [_Fn(0x401341, "sub_401341"), _Fn(0x401339, "main")]
 
     rows = cc._containing_function_rows(_BV(), 0x401341)
-    assert rows == [{"name": "main", "address": "0x401339"}]
+    assert rows == [_HOST]
 
 def _commit_mutation(monkeypatch, instance, bv, ops):
     """Drive the real commit and dirty-mark path against the same fake view."""

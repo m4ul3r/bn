@@ -148,6 +148,9 @@ def test_function_create_existing_function_is_noop(monkeypatch):
 
 
 def test_function_create_unmapped_address_is_rejected(monkeypatch):
+    """M-24: the standalone refusal raised a bare RuntimeError (exit 2) where
+    the batch op raised `invalid_request` (exit 3) for the same address. A
+    bridge mutation refusal is 3 on both surfaces."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeFunctionCreateBV(
@@ -156,10 +159,34 @@ def test_function_create_unmapped_address_is_rejected(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
+    with pytest.raises(bridge.OperationFailure, match="0xdead.*not mapped") as exc:
         instance._function_create(None, "0xdead", False)
 
+    assert exc.value.status == "invalid_request"
+    assert exc.value.requested == {"op": "function_create", "address": "0xdead"}
     assert bv.added == []
+
+
+def test_function_create_unmapped_address_refuses_alike_standalone_and_batch(monkeypatch):
+    """The two surfaces must classify the refusal identically, or the exit
+    code depends on which one the agent happened to use (M-24)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as standalone:
+        instance._function_create(None, "0xdead", False)
+    with pytest.raises(bridge.OperationFailure) as batch:
+        me._op_function_create(instance.ctx, bv,
+                               {"op": "function_create", "address": "0xdead"}, [])
+
+    assert standalone.value.status == batch.value.status == "invalid_request"
+    assert standalone.value.message == batch.value.message
 
 
 def test_function_create_non_executable_address_is_rejected(monkeypatch):
@@ -171,9 +198,11 @@ def test_function_create_non_executable_address_is_rejected(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    with pytest.raises(RuntimeError, match="0x5000.*not inside an executable segment"):
+    with pytest.raises(bridge.OperationFailure,
+                       match="0x5000.*not inside an executable segment") as exc:
         instance._function_create(None, "0x5000", False)
 
+    assert exc.value.status == "invalid_request"
     assert bv.added == []
 
 
