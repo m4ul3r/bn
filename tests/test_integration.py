@@ -1589,6 +1589,60 @@ class TestLoadCacheBndbRestore:
                 cache_file.unlink()
 
 
+class TestSidecarContentValidation:
+    """A sidecar `.bndb` is preferred by path; whether it describes the bytes
+    now at that path is decided from the sha256 `bn save` stamps into the
+    database. Only real BN can prove the stamp survives `create_database` and
+    comes back through `binaryninja.load` + the analyzed-view restore -- the
+    mocked lane fakes both ends of that round trip."""
+
+    @staticmethod
+    def _function_names(shared_bn) -> set[str]:
+        listing = shared_bn.json("function", "list", "--limit", "500")
+        return {f["name"] for f in (listing.get("items") if isinstance(listing, dict) else listing)}
+
+    def test_replaced_bytes_load_raw_and_restored_bytes_reload_the_database(
+            self, shared_bn, tmp_path):
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+
+        # Save the database for the hello bytes, then prove a plain reload
+        # prefers it with its provenance VERIFIED (no unverified note).
+        shared_bn.load(prog, copy=False)
+        saved = shared_bn.json("save")
+        assert saved["path"] == str(sidecar), saved
+        assert "note" not in saved, saved  # the stamp landed silently
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        reloaded = shared_bn.json("load", str(prog))
+        assert reloaded["path"] == str(sidecar), reloaded
+        notes = " ".join(reloaded["notes"])
+        assert "unverified" not in notes and "NOT restoring" not in notes, notes
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # Different bytes at the same path: the database must NOT be restored.
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+        replaced = shared_bn.json("load", str(prog))
+        assert replaced["path"] == str(prog), replaced
+        assert any(
+            n.startswith("NOT restoring ") and str(sidecar) in n and "--no-bndb" in n
+            for n in replaced["notes"]), replaced["notes"]
+        names = self._function_names(shared_bn)
+        assert {"add", "mul"} <= names and "greet" not in names, names
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+        # The original bytes back: the database describes them again.
+        prog.write_bytes(hello)
+        restored = shared_bn.json("load", str(prog))
+        assert restored["path"] == str(sidecar), restored
+        assert not any(n.startswith("NOT restoring ") for n in restored["notes"])
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+
 class TestBatchFunctionCreate:
     """Regression for #308: function_create works as a batch op -- N missed
     slots can be recovered atomically alongside other mutations, --preview

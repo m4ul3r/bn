@@ -1352,6 +1352,100 @@ def test_own_database_gate_answers_for_a_destination_that_does_not_exist_869(
         str(tmp_path / "fresh.bndb"), str(binary)) is True
 
 
+# --------------------------------------------------------------------------
+# Save stamps the raw file's identity so a later load can validate the .bndb
+# --------------------------------------------------------------------------
+
+
+def test_save_records_the_raw_files_sha256_in_the_database(monkeypatch, tmp_path):
+    # The load-side check (`_database_provenance`) can only refuse a database
+    # saved for different bytes if the save wrote down which bytes those were.
+    # The stamp has to land BEFORE create_database, which is what serialises
+    # the view's metadata into the file.
+    import hashlib
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+
+    class _StampOrderBV(_SaveBV):
+        def create_database(self, out: str):
+            self.stamped_before_write = dict(self.query_metadata("bn_agent_bridge"))
+            return super().create_database(out)
+
+    bv = _StampOrderBV(str(binary), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True and "note" not in result
+    expected = {"source_sha256": hashlib.sha256(b"\x7fELF v1").hexdigest(), "source_size": 7}
+    assert bv.query_metadata("bn_agent_bridge") == expected
+    assert bv.stamped_before_write == expected
+
+
+def test_save_merges_the_stamp_with_other_bridge_metadata(monkeypatch, tmp_path):
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+    bv = _SaveBV(str(binary), result=True, write=True)
+    bv.store_metadata("bn_agent_bridge", {"other": "kept"})
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    instance._save_database(None)
+
+    record = bv.query_metadata("bn_agent_bridge")
+    assert record["other"] == "kept" and record["source_size"] == 7
+
+
+def test_save_does_not_stamp_a_view_homed_at_a_database(monkeypatch, tmp_path):
+    # A view restored from a .bndb already carries the record it was validated
+    # against at load -- or none, if it predates validation. Stamping the bytes
+    # that happen to sit beside it now would launder exactly the mismatch the
+    # load-side check exists to catch, so the record is left alone.
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    (tmp_path / "parse_record").write_bytes(b"\x7fELF v2")
+    db = tmp_path / "parse_record.bndb"
+    db.write_bytes(b"BNDB")
+    bv = _SaveBV(str(db), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True
+    with pytest.raises(KeyError):
+        bv.query_metadata("bn_agent_bridge")
+
+
+def test_save_still_lands_when_the_stamp_fails_and_says_so(monkeypatch, tmp_path):
+    # The stamp must never cost the user their annotations; a save whose
+    # metadata write failed is a save whose later loads will be unverified,
+    # and the result says that rather than hiding it.
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+    bv = _SaveBV(str(binary), result=True, write=True)
+
+    def _refuse(key, value, isAuto=False):
+        raise RuntimeError("metadata store unavailable")
+
+    bv.store_metadata = _refuse
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True
+    assert (tmp_path / "parse_record.bndb").exists()
+    assert "unverified" in result["note"] and "metadata store unavailable" in result["note"]
+
+
 def test_same_file_degrades_to_false_without_identity_evidence_869(monkeypatch):
     # Degrade-safely, the rule `socket_evidence` applies: two paths that
     # neither match as strings nor exist to be stat'd yield no evidence of
@@ -1473,7 +1567,7 @@ def test_the_read_only_cache_fallback_destination_is_disclosed_867(
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     module = _load_bridge(monkeypatch)
     instance = module.BinaryNinjaBridge()
-    cache_dest = str(module._cache_bndb_path(str(raw)))
+    cache_dest = str(module._cache_bndb_path(str(raw), module._hash_file(raw).sha256))
 
     class _ROSaveBV(_SaveBV):
         def create_database(self, out: str):
