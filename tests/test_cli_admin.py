@@ -872,8 +872,8 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {"ok": True, "result": [
-            {"filename": "/fw/svc_a", "analysis_state": "full"},
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": [
+            {"filename": "/fw/svc_a", "analysis_state": "full", "unsaved": False},
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
@@ -944,9 +944,9 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
     # The reported shape: a raw target AND its own sidecar, both open.
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {"ok": True, "result": [
-            {"filename": "/fw/svc_a", "analysis_state": "full"},
-            {"filename": "/fw/svc_a.bndb", "analysis_state": "full"},
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": [
+            {"filename": "/fw/svc_a", "analysis_state": "full", "unsaved": False},
+            {"filename": "/fw/svc_a.bndb", "analysis_state": "full", "unsaved": False},
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
@@ -977,7 +977,9 @@ def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch,
     # failure is now reported honestly: a stderr warning AND structured
     # reload_capture_failed/reload_capture_error result fields AND a nonzero
     # exit code, matching the project_association_error pattern.
-    from bn.transport import BridgeInstance
+    # #925: only a bridge that could not be REACHED takes this path; a live
+    # bridge that does not answer refuses instead (see the M-01 tests below).
+    from bn.transport import BridgeInstance, BridgeUnreachableError
     old = type("FakeInstance", (), {
         "instance_id": "keep-me", "pid": 500,
         "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
@@ -997,8 +999,11 @@ def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch,
     monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
     monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
 
-    def failing_send_to_instance(instance, op, params=None, target=None):
-        raise OSError("connection refused")
+    def failing_send_to_instance(instance, op, params=None, target=None, **kw):
+        raise BridgeUnreachableError(
+            "bridge_unreachable: Binary Ninja bridge instance 'keep-me' (pid 500) "
+            "resolved for lifecycle commands only"
+        )
 
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", failing_send_to_instance)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
@@ -1018,7 +1023,10 @@ def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch,
     assert payload["restarted"] is True
     assert payload["loaded"] == []      # nothing captured to reload
     assert payload["reload_capture_failed"] is True
-    assert payload["reload_capture_error"] == "OSError: connection refused"
+    assert payload["reload_capture_error"] == (
+        "bridge_unreachable: Binary Ninja bridge instance 'keep-me' (pid 500) "
+        "resolved for lifecycle commands only"
+    )
     assert "could not list open targets before restarting keep-me" in captured.err
 
 
@@ -1046,7 +1054,7 @@ def test_session_restart_with_zero_open_targets_still_restarts(monkeypatch, caps
     monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
-        lambda instance, op, params=None, target=None: {"ok": True, "result": []},
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": []},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
@@ -3220,7 +3228,7 @@ def _restart_bridge_stubs(
         "_send_request_to_instance",
         lambda inst, op, **kwargs: {
             "ok": True,
-            "result": [{"filename": "/tmp/app.bin", "analysis_state": "full"}],
+            "result": [{"filename": "/tmp/app.bin", "analysis_state": "full", "unsaved": False}],
         },
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
@@ -3392,7 +3400,7 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
         lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": [
             # Saved: filename is the raw file, the analysis is in the sibling DB.
             {"filename": "/fw/svc_a", "analysis_state": "full",
-             "database_path": "/fw/svc_a.bndb"},
+             "database_path": "/fw/svc_a.bndb", "unsaved": False},
             # Saved on a read-only mount: the DB is the global cache copy. This
             # row was a FICTION in round 1 -- the bridge's cache branch did not
             # record the database, so no real payload ever looked like this and
@@ -3400,11 +3408,12 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
             # `test_save_records_the_CACHE_database_for_restart_857` in
             # test_bridge_dispatch.py is what proves the bridge emits it.
             {"filename": "/ro/svc_b", "analysis_state": "full",
-             "database_path": "/home/u/.cache/bn/bndb/svc_b.deadbeefdeadbeef.bndb"},
+             "database_path": "/home/u/.cache/bn/bndb/svc_b.deadbeefdeadbeef.bndb",
+             "unsaved": False},
             # Deliberately raw and never saved: no database backs it, so it must
             # come back raw -- the #753 fix this must not undo.
             {"filename": "/fw/svc_c", "analysis_state": "quick",
-             "database_path": None},
+             "database_path": None, "unsaved": False},
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
@@ -4268,8 +4277,15 @@ def test_the_runtime_reference_denies_no_environment_default_the_cli_honours(
 # --- M-01: session stop/restart must not silently discard unsaved mutations ---
 
 
-def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1"):
-    """Wire a live instance whose `list_targets` answers *rows*; record ops."""
+def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1", listing=None):
+    """Wire a live instance whose `list_targets` answers *rows*; record ops.
+
+    *listing*, when given, REPLACES the answer: a callable the probe runs
+    instead (raise a `BridgeError` for a bridge that was reached but did not
+    answer, a `BridgeUnreachableError` for one that was not reached, or return
+    an envelope). `calls` records `(op, params)`; the probe's keyword
+    arguments are kept in `calls.probe_kwargs`.
+    """
     import pathlib
 
     from bn.transport import BridgeInstance
@@ -4281,7 +4297,11 @@ def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1"):
         plugin_name="bn_agent_bridge", plugin_version="0.1.0",
         started_at="2026-01-01T00:00:00Z", meta={}, instance_id=instance_id,
     )
-    calls: list[tuple[str, object]] = []
+
+    class _Calls(list):
+        probe_kwargs: dict = {}
+
+    calls = _Calls()
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kw):
         calls.append((op, params))
@@ -4289,6 +4309,9 @@ def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1"):
 
     def fake_to_instance(instance, op, *, params=None, target=None, **kw):
         calls.append((op, params))
+        calls.probe_kwargs = dict(kw)
+        if listing is not None:
+            return listing()
         return {"ok": True, "result": rows}
 
     monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
@@ -4392,17 +4415,179 @@ def test_session_lifecycle_without_unsaved_targets_is_unchanged(monkeypatch, cap
     assert "shutdown" in [op for op, _ in calls]
 
 
-def test_session_stop_dead_bridge_skips_the_unsaved_guard(monkeypatch, capsys):
-    # The guard is best-effort: a bridge that cannot answer `list_targets` is
-    # exactly the one `session stop` must still be able to stop (#694).
-    import signal as signal_mod
+# --- #925 review P1/P2: "could not reach" vs "reached but could not answer" ---
 
+
+_PROBE_TIMEOUT_ERROR = (
+    "Timed out waiting for Binary Ninja bridge pid 500 at /tmp/fix-1.sock after 5s "
+    "(op 'list_targets'). The bridge may be busy with analysis; inspect progress "
+    "with `bn -i fix-1 target info`, then raise or disable the limit with "
+    "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
+)
+
+
+def _raising(exc):
+    def listing():
+        raise exc
+    return listing
+
+
+def _unanswered_listings():
+    """Every way a LIVE bridge fails to answer the unsaved probe."""
     from bn.transport import BridgeError
 
-    def fail(*a, **kw):
-        raise BridgeError("bridge_not_running: gone")
+    return [
+        pytest.param(_raising(BridgeError(_PROBE_TIMEOUT_ERROR)), id="probe-timeout"),
+        pytest.param(
+            _raising(BridgeError(
+                "Unable to enumerate every open BinaryView tab: a UI query raised mid-walk"
+            )),
+            id="strict-walk-refused",
+        ),
+        pytest.param(
+            lambda: {"ok": False, "error": "Unable to enumerate every open BinaryView tab"},
+            id="ok-false-envelope",
+        ),
+        pytest.param(
+            lambda: {"ok": True, "result": [{"filename": "/work/parser", "selector": "parser"}]},
+            id="rows-without-unsaved-ledger",
+        ),
+        pytest.param(lambda: {"ok": True, "result": "parser"}, id="malformed-listing"),
+    ]
 
-    monkeypatch.setattr(bn.cli, "send_request", fail)
+
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+@pytest.mark.parametrize("listing", _unanswered_listings())
+def test_session_lifecycle_refuses_when_a_live_bridge_does_not_answer(
+    monkeypatch, capsys, verb, listing
+):
+    # #925 review P1 (both reviewers): `list_targets` takes the bridge's read
+    # lock, which a `py exec` under the write lock holds, while `shutdown`
+    # takes none -- so the probe timed out, was read as "no targets", and the
+    # stop went through with the unsaved rename lost. "Reached but did not
+    # answer" is "cannot verify", never "nothing to lose": refuse, send nothing.
+    calls = _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS, listing=listing)
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance",
+        lambda instance_id=None: pytest.fail("must not respawn after refusing"),
+    )
+
+    rc = bn.cli.main(["session", verb, "fix-1", "--format", "json"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"session {verb}: cannot verify whether instance fix-1 has unsaved changes" in err
+    assert "no shutdown was sent" in err
+    assert "--discard-unsaved" in err
+    assert [op for op, _ in calls] == ["list_targets"]
+    assert not _FakeSignaller.instances or not _FakeSignaller.instances[0].sent
+
+
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+def test_session_lifecycle_refuses_a_legacy_gui_strict_enumeration_failure(
+    monkeypatch, capsys, verb
+):
+    # The legacy GUI pair registers no instance id (its selector is `default`);
+    # a modal main thread makes its strict tab walk raise, which arrives as the
+    # bridge's `ok: false`. P2: restart's strict capture only buys something if
+    # that refusal is honoured -- before, it reloaded nothing AND discarded.
+    from bn.transport import BridgeError
+
+    calls = _unsaved_guard_fixture(
+        monkeypatch, _UNSAVED_ROWS, instance_id=None,
+        listing=_raising(BridgeError(
+            "Unable to enumerate every open BinaryView tab: a UI query raised mid-walk"
+        )),
+    )
+
+    rc = bn.cli.main(["session", verb, "default", "--format", "json"])
+
+    assert rc == 2
+    assert "cannot verify whether instance default has unsaved changes" in capsys.readouterr().err
+    assert [op for op, _ in calls] == ["list_targets"]
+
+
+def test_session_stop_discard_unsaved_proceeds_past_an_unanswered_probe(monkeypatch, capsys):
+    # `--discard-unsaved` is the consent: the stop proceeds, says on stderr
+    # that it could not verify, and claims no discard it cannot name.
+    from bn.transport import BridgeError
+
+    calls = _unsaved_guard_fixture(
+        monkeypatch, _UNSAVED_ROWS, listing=_raising(BridgeError(_PROBE_TIMEOUT_ERROR))
+    )
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--discard-unsaved", "--format", "json"])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["stopped"] is True
+    assert "discarded_unsaved" not in payload
+    assert "could not verify whether instance fix-1 has unsaved changes" in captured.err
+    assert "stopping anyway" in captured.err
+    assert [op for op, _ in calls] == ["list_targets", "shutdown"]
+
+
+def test_session_restart_discard_unsaved_proceeds_past_an_unanswered_probe(monkeypatch, capsys):
+    # With the flag, a refused strict walk is what it was before #925: the
+    # restart happens, reloads nothing, and says so (#620 fields, rc 1).
+    from bn.transport import BridgeError
+
+    calls = _unsaved_guard_fixture(
+        monkeypatch, _UNSAVED_ROWS, listing=_raising(BridgeError(
+            "Unable to enumerate every open BinaryView tab: a UI query raised mid-walk"
+        )),
+    )
+
+    rc = bn.cli.main(["session", "restart", "fix-1", "--discard-unsaved", "--format", "json"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["restarted"] is True
+    assert payload["loaded"] == []
+    assert payload["reload_capture_failed"] is True
+    assert payload["reload_capture_error"].startswith("Unable to enumerate every open BinaryView tab")
+    assert "discarded_unsaved" not in payload
+    assert "could not list open targets before restarting fix-1" in captured.err
+    assert "shutdown" in [op for op, _ in calls]
+
+
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+def test_session_lifecycle_probe_has_its_own_short_budget(monkeypatch, verb):
+    # The probe waits behind the bridge's read lock, so inheriting
+    # BN_REQUEST_TIMEOUT (600s by default, unbounded under `off`) made a stop
+    # that used to answer in two seconds wait out whatever the bridge was
+    # doing. Applied `resolved=True`, exactly like `session list`'s sweep, so
+    # the environment cannot widen it.
+    from bn.commands.admin import _UNSAVED_PROBE_TIMEOUT
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "off")
+    calls = _unsaved_guard_fixture(monkeypatch, [dict(row, unsaved=False) for row in _UNSAVED_ROWS])
+
+    assert bn.cli.main(["session", verb, "fix-1", "--format", "json"]) == 0
+    assert calls.probe_kwargs["timeout"] == _UNSAVED_PROBE_TIMEOUT
+    assert calls.probe_kwargs["resolved"] is True
+    assert calls.probe_kwargs["idle_probe"] is True
+    assert calls[0] == ("list_targets", {"strict": True})
+
+
+def test_session_stop_dead_bridge_skips_the_unsaved_guard(monkeypatch, capsys):
+    # A bridge that cannot be REACHED holds nothing the guard could ask about,
+    # and is exactly the one `session stop` must still be able to stop (#694).
+    # `BridgeUnreachableError` is what the transport raises for that case and
+    # nothing else (tests/test_transport.py pins which failures are which).
+    import signal as signal_mod
+
+    from bn.transport import BridgeError, BridgeUnreachableError
+
+    def fail(*a, **kw):
+        raise BridgeUnreachableError("bridge_not_running: gone")
+
+    def no_shutdown(*a, **kw):
+        raise BridgeError("Failed to contact Binary Ninja bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", no_shutdown)
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", fail)
     monkeypatch.setattr(
         bn.cli, "find_lifecycle_instance", lambda target: _unreachable_fake_instance("fix-1")

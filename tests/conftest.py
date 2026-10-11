@@ -489,8 +489,11 @@ def _shared_bridge(_hermetic_session_env, tmp_path_factory) -> Iterator[SharedBr
     try:
         yield bridge
     finally:
+        # `--discard-unsaved`: `end()` closes every target after each test, but
+        # a close that failed would leave an unsaved one behind, and a teardown
+        # stop that then REFUSED (#925) would report the shared bridge as leaked.
         subprocess.run(
-            [*_BN_CLI, "session", "stop", bridge.instance_id],
+            [*_BN_CLI, "session", "stop", bridge.instance_id, "--discard-unsaved"],
             capture_output=True, text=True, timeout=_SHARED_BRIDGE_STOP_TIMEOUT, env=env,
         )
 

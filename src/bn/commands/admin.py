@@ -37,7 +37,7 @@ from ..formatters import (
     _render_target_list_text,
     _render_target_use_text,
 )
-from ..transport import BridgeError, _resolve_timeout, unwrap_result
+from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
 
 @command("capabilities",
@@ -748,7 +748,8 @@ def _session_status(args: argparse.Namespace) -> int:
         arg(
             "--discard-unsaved",
             action="store_true",
-            help="Stop even when a target has committed-but-unsaved mutations, discarding them",
+            help="Stop even when a target has committed-but-unsaved mutations (or the "
+                 "bridge cannot say whether one has), discarding them",
         ),
     ],
 )
@@ -794,11 +795,25 @@ def _session_stop(args: argparse.Namespace) -> int:
     inst = cli.find_lifecycle_instance(target_id)
     # Refuse to discard committed-but-unsaved work (M-01): `bn close` discloses
     # a discard, so a stop that silently threw the same edits away was the one
-    # path that lost them without a word. Best-effort: an unreachable bridge
-    # cannot be asked, and stopping THAT one is exactly what #694 is for.
-    discarded = _guard_unsaved_targets(
-        "stop", target_id, inst, discard=bool(getattr(args, "discard_unsaved", False))
-    )
+    # path that lost them without a word. A bridge that cannot be REACHED is
+    # stopped as before -- that process is exactly what #694 is for -- but a
+    # live bridge that does not ANSWER refuses without --discard-unsaved: the
+    # probe takes the read lock a write op holds while `shutdown` takes none,
+    # so "no answer" is the busy bridge, not the dead one.
+    discard = bool(getattr(args, "discard_unsaved", False))
+    discarded: list[dict[str, Any]] = []
+    if inst is not None:
+        rows, listing_failure = _lifecycle_target_listing(
+            "stop", target_id, inst, discard=discard
+        )
+        if listing_failure is not None and discard:
+            print(
+                f"warning: could not verify whether instance {target_id} has "
+                f"unsaved changes ({listing_failure}); stopping anyway "
+                "(--discard-unsaved)",
+                file=sys.stderr,
+            )
+        discarded = _unsaved_targets_or_refuse("stop", target_id, rows, discard=discard)
     # One verified pin for the whole escalation, opened BEFORE the graceful
     # shutdown so the process this command may later signal is pinned throughout
     # (#694): the pid cannot be recycled while pinned, and both SIGTERM and
@@ -863,8 +878,9 @@ def _session_stop(args: argparse.Namespace) -> int:
              arg(
                  "--discard-unsaved",
                  action="store_true",
-                 help="Restart even when a target has committed-but-unsaved mutations, "
-                      "discarding them (the reload starts from the file on disk)",
+                 help="Restart even when a target has committed-but-unsaved mutations (or "
+                      "the bridge cannot say whether one has), discarding them (the "
+                      "reload starts from the file on disk)",
              ),
          ])
 def _session_restart(args: argparse.Namespace) -> int:
@@ -885,61 +901,49 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Capture loaded targets (+ their analysis state) BEFORE tearing down. One
     # listing serves two readers: the reload below and the unsaved guard. The
     # guard is a SAFETY count, so like `session list`'s probe it asks for a
-    # strict walk rather than trusting a snapshot the bridge knows is lossy.
-    reload_targets: list[dict[str, Any]] = []
-    listed_rows: list[Any] = []
-    reload_capture_failed = False
-    reload_capture_error: str | None = None
-    try:
-        resp = cli._send_request_to_instance(
-            inst, "list_targets", params={"strict": True}, target=None
-        )
-        rows = list(unwrap_result(resp, "list_targets") or [])
-        captured: list[dict[str, Any]] = []
-        for t in rows:
-            path = t.get("filename")
-            if path:
-                captured.append({
-                    "path": path,
-                    "quick": t.get("analysis_state") == "quick",
-                    # #753 review: the database that actually backs this target's
-                    # analysis, when it is not the file `filename` names. The
-                    # bridge restores `bv.file.filename` to the original path
-                    # after every save, so for a target loaded raw and then saved
-                    # the filename is the RAW file while the annotations live in
-                    # the sibling/cache database.
-                    "database_path": t.get("database_path"),
-                })
-        # Commit only after the whole capture succeeds -- a mid-iteration
-        # exception (a malformed row) must never leave a partially populated
-        # reload_targets that gets reloaded and reported as a complete `loaded`.
-        reload_targets = captured
-        listed_rows = rows
-    except Exception as exc:
+    # strict walk rather than trusting a snapshot the bridge knows is lossy --
+    # and a strict walk the bridge REFUSES is honoured as a refusal here: a
+    # live bridge that cannot enumerate its tabs may hold unsaved work in the
+    # tab it could not walk, so without --discard-unsaved the restart does not
+    # proceed (#925 review). An unreachable bridge still restarts, with nothing
+    # to reload -- recovering it is what #694 is for, not a loss.
+    discard = bool(getattr(args, "discard_unsaved", False))
+    rows, reload_capture_error = _lifecycle_target_listing(
+        "restart", target_id, inst, discard=discard
+    )
+    reload_capture_failed = reload_capture_error is not None
+    if reload_capture_failed:
         # #620(a): don't silently drop the target-enumeration failure -- the
         # restart still proceeds (with no targets to reload), but the caller
         # needs to know why nothing came back. Recorded in the structured
         # result (not just stderr) so `loaded == []` at rc 0 means only "list
         # succeeded with zero rows", matching _associate_project_roots's
         # project_association_error pattern below.
-        reload_capture_failed = True
-        reload_capture_error = f"{type(exc).__name__}: {exc}"
         print(
             f"warning: could not list open targets before restarting {target_id}: "
             f"{reload_capture_error}",
             file=sys.stderr,
         )
+    reload_targets: list[dict[str, Any]] = [
+        {
+            "path": t["filename"],
+            "quick": t.get("analysis_state") == "quick",
+            # #753 review: the database that actually backs this target's
+            # analysis, when it is not the file `filename` names. The bridge
+            # restores `bv.file.filename` to the original path after every
+            # save, so for a target loaded raw and then saved the filename is
+            # the RAW file while the annotations live in the sibling/cache
+            # database.
+            "database_path": t.get("database_path"),
+        }
+        for t in rows
+        if t.get("filename")
+    ]
 
     # Refuse to discard committed-but-unsaved work (M-01) BEFORE the old
     # process is stopped: the reload below reopens each target from disk, so
-    # anything not saved is gone. An unreachable bridge yields no rows and
-    # proceeds -- restarting it is a recovery path (#694), not a loss.
-    discarded = _unsaved_targets_or_refuse(
-        "restart",
-        target_id,
-        listed_rows,
-        discard=bool(getattr(args, "discard_unsaved", False)),
-    )
+    # anything not saved is gone.
+    discarded = _unsaved_targets_or_refuse("restart", target_id, rows, discard=discard)
 
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
@@ -1052,26 +1056,77 @@ def _require_signal_delivered(reason: str | None, target_id: str) -> None:
         )
 
 
-def _guard_unsaved_targets(
+def _lifecycle_target_listing(
     verb: str, instance_id: str, inst: Any, *, discard: bool
-) -> list[dict[str, Any]]:
-    """Ask *inst* for its targets and apply `_unsaved_targets_or_refuse`.
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Strict `list_targets` of *inst* for `session stop`/`restart`.
 
-    Best-effort by design: a registry entry without a reachable bridge (no
-    `inst`, or a listing that fails) yields no rows and the stop proceeds --
-    the guard protects work a live bridge still holds, it must never make a
-    dead bridge impossible to stop (#694).
+    Returns `(rows, failure)`: the bridge's rows and `None` when it answered,
+    else `[]` and why there is no listing. "Could not reach" and "reached but
+    could not answer" are kept apart, because a safety check must treat them
+    oppositely (#925 review):
+
+    - A `BridgeUnreachableError` -- stopped, gone, resolved for lifecycle
+      commands only, nothing accepting at its socket -- holds nothing this
+      guard could ask about, and stopping THAT process is exactly what #694
+      is for. The caller proceeds, with the reason.
+    - Anything else from a LIVE process -- the probe timing out behind the
+      bridge's write lock (`list_targets` takes the read lock; `shutdown`
+      takes none, so the stop itself would still have gone through), a GUI
+      walk the bridge refused as lossy, a malformed or ledger-less listing --
+      is "cannot verify", never "nothing to lose". Without `--discard-unsaved`
+      the command refuses and sends no shutdown; with it the caller proceeds,
+      with the reason, which is the consent the flag spells out.
+
+    The probe has its own budget (`_UNSAVED_PROBE_TIMEOUT`, applied
+    `resolved=True` exactly like `session list`'s sweep): inheriting
+    `BN_REQUEST_TIMEOUT` made `session stop` wait out a ten-minute default --
+    or forever under `off` -- behind whatever the bridge was doing before it
+    could refuse, where the pre-guard stop answered in two seconds.
     """
-    rows: list[Any] = []
-    if inst is not None:
-        try:
-            resp = cli._send_request_to_instance(
-                inst, "list_targets", params={"strict": True}, target=None
-            )
-            rows = list(unwrap_result(resp, "list_targets") or [])
-        except (BridgeError, OSError):
-            rows = []
-    return _unsaved_targets_or_refuse(verb, instance_id, rows, discard=discard)
+    try:
+        rows = unwrap_result(
+            cli._send_request_to_instance(
+                inst,
+                "list_targets",
+                params={"strict": True},
+                target=None,
+                timeout=_UNSAVED_PROBE_TIMEOUT,
+                resolved=True,
+                idle_probe=True,
+            ),
+            "list_targets",
+        )
+    except BridgeUnreachableError as exc:
+        return [], (str(exc).splitlines() or [type(exc).__name__])[0]
+    except (BridgeError, OSError) as exc:
+        failure = (str(exc).splitlines() or [""])[0] or type(exc).__name__
+        _refuse_unverified_unsaved_state(verb, instance_id, failure, discard=discard)
+        return [], failure
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        failure = "the bridge returned a malformed target listing"
+        _refuse_unverified_unsaved_state(verb, instance_id, failure, discard=discard)
+        return [], failure
+    if any("unsaved" not in row for row in rows):
+        failure = "this bridge does not report per-target unsaved state"
+        _refuse_unverified_unsaved_state(verb, instance_id, failure, discard=discard)
+        return [], failure
+    return rows, None
+
+
+def _refuse_unverified_unsaved_state(
+    verb: str, instance_id: str, failure: str, *, discard: bool
+) -> None:
+    """Refuse a lifecycle verb whose unsaved probe a live bridge did not answer,
+    unless `--discard-unsaved` consented to the loss that may follow."""
+    if discard:
+        return
+    raise BridgeError(
+        f"session {verb}: cannot verify whether instance {instance_id} has "
+        f"unsaved changes ({failure}); no shutdown was sent.\n"
+        f"Retry once `bn -i {shlex.quote(str(instance_id))} target list` answers, "
+        f"or pass --discard-unsaved to {verb} anyway and discard any unsaved changes."
+    )
 
 
 def _unsaved_targets_or_refuse(

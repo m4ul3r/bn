@@ -160,8 +160,11 @@ def _session_start(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> d
 
 
 def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
+    # Teardown, so the discard is deliberate: a test that mutated its private
+    # copy and never saved would otherwise be REFUSED here (#925) and leak the
+    # bridge until the idle reaper caught it.
     subprocess.run(
-        [*_BN_CLI, "session", "stop", instance_id],
+        [*_BN_CLI, "session", "stop", instance_id, "--discard-unsaved"],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -302,6 +305,86 @@ class TestMultiInstance:
                 _session_stop(id_b)
         finally:
             _session_stop(id_a)
+
+
+class TestSessionStopUnsavedGuard:
+    """`session stop` must not discard unsaved work -- least of all because the
+    bridge was busy (#925). A private session, because the stop IS the subject.
+    """
+
+    def test_a_busy_bridge_refuses_promptly_and_keeps_the_unsaved_rename(self, tmp_path):
+        """Both reviewers reproduced the hole on a real bridge: `list_targets`
+        waits on the read lock a `py exec` holds, the probe timed out, the
+        timeout read as "no targets", and the stop went through with the
+        rename lost. Now a bridge that is reached but does not answer refuses
+        within the probe's own budget -- not `BN_REQUEST_TIMEOUT` -- and sends
+        no shutdown, so the rename is still there once the bridge is free.
+        """
+        from bn.commands.admin import _UNSAVED_PROBE_TIMEOUT
+
+        copy = tmp_path / "parser"
+        shutil.copyfile(HELLO_BINARY, copy)
+        copy.chmod(0o755)
+        info = _session_start(str(copy))
+        inst = info["instance_id"]
+        try:
+            listing = json.loads(
+                _bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            items = listing.get("items") if isinstance(listing, dict) else listing
+            symbol = items[0]["name"]
+            renamed = _bn("--instance", inst, "rename", symbol, "UNSAVED_GUARD_MARKER",
+                          "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+            targets = json.loads(
+                _bn("--instance", inst, "target", "list", "--format", "json").stdout)["items"]
+            assert [t["unsaved"] for t in targets] == [True]
+            selector = targets[0]["selector"]
+
+            # An idle bridge answers: the refusal names the dirty target.
+            refused = _bn("session", "stop", inst)
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+            assert f"-t {selector}" in refused.stderr
+            assert f"bn -i {inst} -t {selector} save" in refused.stderr
+
+            # A busy bridge does not: `py exec` holds the write lock for longer
+            # than the probe budget, so the stop must refuse on "cannot verify"
+            # -- promptly, with the bridge's own 600s request default in force.
+            hold = 3 * _UNSAVED_PROBE_TIMEOUT
+            busy = subprocess.Popen(
+                [*_BN_CLI, "--instance", inst, "py", "exec",
+                 f"import time; time.sleep({hold})"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env(),
+            )
+            try:
+                time.sleep(1.0)
+                started = time.monotonic()
+                stop = _bn("session", "stop", inst, "--format", "json", timeout=hold)
+                elapsed = time.monotonic() - started
+                assert stop.returncode == 2, f"{stop.stdout}\n{stop.stderr}"
+                assert "cannot verify whether instance" in stop.stderr
+                assert "no shutdown was sent" in stop.stderr
+                assert "--discard-unsaved" in stop.stderr
+                assert elapsed < 2 * _UNSAVED_PROBE_TIMEOUT, (
+                    f"the probe waited {elapsed:.1f}s behind the write lock")
+            finally:
+                busy.wait(timeout=hold + 30)
+
+            # The bridge survived the refusal with the rename it was protecting.
+            found = _bn("--instance", inst, "function", "search", "UNSAVED_GUARD_MARKER",
+                        "--format", "json")
+            assert found.returncode == 0, f"{found.stdout}\n{found.stderr}"
+            payload = json.loads(found.stdout)
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            assert [row["name"] for row in rows] == ["UNSAVED_GUARD_MARKER"]
+
+            # Explicit consent stops it and discloses exactly the dirty target.
+            stopped = _bn("session", "stop", inst, "--discard-unsaved", "--format", "json")
+            assert stopped.returncode == 0, f"{stopped.stdout}\n{stopped.stderr}"
+            result = json.loads(stopped.stdout)
+            assert result["stopped"] is True
+            assert result["discarded_unsaved"] == [{"selector": selector, "path": str(copy)}]
+        finally:
+            _session_stop(inst)
 
 
 class TestSavePathIdentity:
