@@ -1574,20 +1574,46 @@ def test_read_bytes_malformed_response_clean_error(fake_transport, capsys):
     assert "Traceback" not in err
 
 
-def test_strings_unfiltered_emits_section_hint(fake_transport, capsys):
-    fake_transport({"strings": {"ok": True, "result": []}})
+def test_strings_tip_names_the_sections_that_contributed_noise(fake_transport, capsys):
+    """M-12: the tip names the sections the bridge saw noise in -- it used to
+    blame `.dynsym/.hash/.symtab` on every unfiltered dump, including a static
+    file that has none of them."""
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [], "total": 0, "offset": 0, "limit": 100,
+        "returned": 0, "has_more": False, "filtered": 0,
+        "noise_strings": 1205, "noise_sections": [".text", "(no section)"]}}})
     assert bn.cli.main(["strings", "--target", "active"]) == 0
 
-    _, stderr = capsys.readouterr()
-    assert "--section .rodata" in stderr
+    out, stderr = capsys.readouterr()
+    assert "tip: 1205 string(s) from .text, (no section)" in out
+    assert "--section .rodata" in out
+    assert ".dynsym" not in out and "tip:" not in stderr
+
+
+def test_strings_tip_absent_when_nothing_was_noise(fake_transport, capsys):
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [{"address": "0x401a40", "length": 5, "chars": 5,
+                                      "type": "ascii", "value": "hello"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "filtered": 0, "noise_strings": 0, "noise_sections": []}}})
+    assert bn.cli.main(["strings", "--target", "active"]) == 0
+
+    out, stderr = capsys.readouterr()
+    assert "hello" in out
+    assert "tip:" not in out and "tip:" not in stderr
 
 
 def test_strings_with_filter_suppresses_section_hint(fake_transport, capsys):
-    fake_transport({"strings": {"ok": True, "result": []}})
+    # A pinned section reports no noise (the bridge leaves the counters empty), so
+    # there is no tip to render.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [], "total": 0, "offset": 0, "limit": 100,
+        "returned": 0, "has_more": False, "filtered": 0,
+        "noise_strings": 0, "noise_sections": []}}})
     assert bn.cli.main(["strings", "--section", ".rodata", "--target", "active"]) == 0
 
-    _, stderr = capsys.readouterr()
-    assert "tip:" not in stderr
+    out, stderr = capsys.readouterr()
+    assert "tip:" not in out and "tip:" not in stderr
 
 
 def test_strings_section_hint_suppressed_when_request_fails(monkeypatch, capsys):

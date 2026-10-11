@@ -189,35 +189,73 @@ def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
 
 
 # Sections that hold loader/linker METADATA strings rather than domain literals
-# (#646). Name-based on purpose: BN classifies `.dynstr` as ReadOnlyData exactly
-# like `.rodata` (verified against a live view), so a semantics-only test cannot
-# tell them apart -- and `.dynstr`/`.interp` sit at the LOWEST string addresses on
-# every ELF, so they own the head of any address-ordered sample.
+# (#646), matched as name PREFIXES on top of the semantics test below: BN
+# classifies `.dynstr` as ReadOnlyData exactly like `.rodata` (verified against
+# a live view), so semantics alone cannot tell them apart -- and `.dynstr` /
+# `.interp` sit at the LOWEST string addresses on every ELF, so they own the
+# head of any address-ordered sample. Prefixes, not substrings: `.data.rel.ro`
+# is data, not `.rel.dyn`. `.text`/`.init`/`.fini` are here for a view whose
+# code sections carry no semantics (ReadOnlyCode is the normal signal).
 _METADATA_STRING_SECTIONS = (
     ".interp", ".dynstr", ".dynsym", ".gnu.", ".hash", ".eh_frame", ".rela",
     ".rel.", ".dynamic", ".strtab", ".symtab", ".shstrtab", ".comment", ".note",
-    ".plt", ".got", ".debug",
+    ".plt", ".got", ".debug", ".text", ".init", ".fini",
 )
 
+# String ranking tiers (M-12). A string's tier is the tier of the section that
+# holds it: `.rodata`-like (ReadOnlyData) sections carry the domain literals,
+# `.data`-like sections sometimes do, and everything else -- executable code
+# (whose "strings" are instruction bytes that happen to decode as printable
+# ASCII), linker metadata, and an address no section claims at all (the ELF
+# header) -- is noise. A view with NO sections (a raw/monolithic firmware
+# image) has nothing to rank by, so every string stays in the data tier.
+_STRING_TIER_RODATA = 0
+_STRING_TIER_DATA = 1
+_STRING_TIER_NOISE = 2
+_STRING_NO_SECTION = "(no section)"
 
-def _is_domain_string_section(bv, address: int) -> bool:
-    """Can the section at *address* hold domain literals, or is it ELF metadata?
 
-    True when there is no section knowledge at all (a raw/monolithic firmware
-    image), so the filter degrades to the old behaviour instead of blinding the
-    scan on its primary target class.
-    """
+def _string_section_tier(sec) -> int:
+    """Which ranking tier a section's strings belong to, by BN semantics first
+    (`ReadOnlyCode` is noise regardless of name, `ReadOnlyData` is preferred)
+    and the metadata name list second."""
+    name = str(getattr(sec, "name", "") or "").lower()
+    raw_semantics = getattr(sec, "semantics", 0)
     try:
-        secs = list(bv.get_sections_at(int(address)) or [])
+        semantics = _SECTION_SEMANTICS_NAMES.get(int(raw_semantics), str(raw_semantics))
+    except (TypeError, ValueError):
+        semantics = str(raw_semantics)
+    if semantics == "ReadOnlyCode" or name.startswith(_METADATA_STRING_SECTIONS):
+        return _STRING_TIER_NOISE
+    if semantics == "ReadOnlyData":
+        return _STRING_TIER_RODATA
+    return _STRING_TIER_DATA
+
+
+def _string_section_ranges(bv) -> list[tuple[int, int, int, str]]:
+    """``(start, end, tier, name)`` for every section of the view, computed once
+    per read so a 50k-string scan does not pay a section lookup per string."""
+    try:
+        sections = getattr(bv, "sections", None) or {}
+        return [
+            (int(getattr(sec, "start", 0)), int(getattr(sec, "end", 0)),
+             _string_section_tier(sec), str(name))
+            for name, sec in sections.items()
+        ]
     except Exception:
-        return True
-    if not secs:
-        return True
-    return not any(
-        marker in str(getattr(sec, "name", "") or "").lower()
-        for sec in secs
-        for marker in _METADATA_STRING_SECTIONS
-    )
+        return []
+
+
+def _string_tier_at(ranges: list[tuple[int, int, int, str]], address: int) -> tuple[int, str]:
+    """The tier and section name of *address*. Outside every section on a view
+    that HAS sections is noise (the ELF header decodes as a string on every
+    AArch64 ELF); on a sectionless view nothing can be ranked, so it is data."""
+    for start, end, tier, name in ranges:
+        if start <= address < end:
+            return tier, name
+    if ranges:
+        return _STRING_TIER_NOISE, _STRING_NO_SECTION
+    return _STRING_TIER_DATA, _STRING_NO_SECTION
 
 
 def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None,
@@ -256,7 +294,13 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # --probable-format-strings mode -- the per-survivor code-xref count deferred
     # to `_string_entry`, which runs for the returned page only. Before #814 a
     # `strings --limit 20` paid both for every survivor of a 50k-string scan.
-    survivors: list[tuple[int, str, int, Any, list[str] | None]] = []
+    survivors: list[tuple[int, int, str, int, Any, list[str] | None]] = []
+    # M-12: every survivor is ranked by the tier of its section, computed once
+    # per read. The default dump orders `.rodata`-like strings first and the
+    # instruction-byte / linker-metadata "strings" last; `--section` pins one
+    # tier so its order is still plain address order.
+    ranges = _string_section_ranges(bv)
+    noise_by_section: dict[str, int] = {}
     # #795: the candidate list is materialized so the read can disclose HOW MUCH
     # the active filters dropped. Without it the only way to the denominator was a
     # second, unfiltered invocation (`strings --count` said 1359 where
@@ -283,10 +327,11 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
             if not any(getattr(s, "name", "") == section for s in secs):
                 continue
-        # #646: drop loader/linker metadata strings (`.interp`, `.dynstr` import
-        # names, `__gmon_start__`) so an address-ordered head sample carries domain
-        # literals instead of the ELF preamble it deterministically starts with.
-        if domain_sections_only and not _is_domain_string_section(bv, address):
+        tier, section_name = _string_tier_at(ranges, address)
+        # #646: drop code / loader / linker metadata strings (`.interp`, `.dynstr`
+        # import names, `__gmon_start__`, `.text` bytes that decode as ASCII) so a
+        # head sample carries domain literals instead of the ELF preamble.
+        if domain_sections_only and tier == _STRING_TIER_NOISE:
             continue
         if no_crt:
             if _NO_CRT_PATTERNS.match(value):
@@ -303,7 +348,9 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             if directives is None:
                 continue
 
-        survivors.append((address, value, length, item, directives))
+        if tier == _STRING_TIER_NOISE and not section:
+            noise_by_section[section_name] = noise_by_section.get(section_name, 0) + 1
+        survivors.append((tier, address, value, length, item, directives))
     # #795: how many candidates the ACTIVE filters dropped. An int on EVERY
     # result (0 when nothing filtered), so `jq '.filtered'` is a stable read
     # rather than a key that appears only sometimes -- the same reason `total`
@@ -313,9 +360,9 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
         # `total` mirrors the list envelope key for the same number (#165).
         return {"kind": "strings", "count": len(survivors), "total": len(survivors),
                 "filtered": filtered}
-    # Same order as the pre-#814 full build: (address, value), stable against the
-    # scan order for ties -- only now over the lightweight survivors.
-    survivors.sort(key=lambda row: (row[0], row[1]))
+    # Preferred tier first, then the pre-#814 (address, value) order within a
+    # tier, stable against the scan order for ties.
+    survivors.sort(key=lambda row: (row[0], row[1], row[2]))
     start, stop = _page_window(len(survivors), offset=offset, limit=limit)
     page = _paged_envelope(
         kind="strings",
@@ -325,10 +372,16 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
         limit=limit,
     )
     page["filtered"] = filtered
+    # M-12: which sections contributed code / metadata noise to this listing, so
+    # the CLI tip can name them (and stay silent when there are none) instead of
+    # blaming `.dynsym/.hash/.symtab` on a static file that has none. Empty when
+    # `--section` pinned the population: that noise is what the caller asked for.
+    page["noise_strings"] = sum(noise_by_section.values())
+    page["noise_sections"] = sorted(noise_by_section, key=lambda n: (-noise_by_section[n], n))
     return page
 
 
-def _string_entry(row: tuple[int, str, int, Any, list[str] | None], bv) -> dict[str, Any]:
+def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv) -> dict[str, Any]:
     """Build ONE `strings` row from a retained survivor tuple (#814).
 
     Split out so a row's per-row work -- the string-`type` decode and, in
@@ -337,7 +390,7 @@ def _string_entry(row: tuple[int, str, int, Any, list[str] | None], bv) -> dict[
     filtered population. (The directives themselves were already computed as the
     mode's FILTER and are handed through, so this cannot disagree with the
     filter that admitted the string.)"""
-    address, value, length, item, directives = row
+    _tier, address, value, length, item, directives = row
     raw_type = getattr(item, "type", "")
     try:
         string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))

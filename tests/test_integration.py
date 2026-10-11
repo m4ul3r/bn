@@ -1061,6 +1061,48 @@ class TestDisasmLinearAArch64:
         assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
 
 
+class TestOrientStringsSampleAArch64:
+    """M-12 real-path guard. On a static AArch64 ELF, BN's string scan accepts
+    runs of instruction bytes that happen to decode as printable ASCII, and
+    `.text` sits below `.rodata` in the address space -- so the orient sample,
+    the head of an address-ordered scan, was twenty rows of `@8\\t@`-shaped junk
+    (plus the ELF header, which no section claims) on every such file, while
+    `strings --section .rodata` had the real literals. The mocked tests prove
+    the ranking; this proves BN's real section semantics drive it: no sampled
+    section is `ReadOnlyCode`, the sample names its sections, and the default
+    `strings` dump leads with the same sections."""
+
+    def test_orient_sample_comes_from_data_sections(self, shared_bn, aarch64_probe):
+        shared_bn.load(aarch64_probe, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        semantics = {s["name"]: s["semantics"] for s in sections["items"]}
+        assert "ReadOnlyCode" in semantics.values(), semantics  # premise: BN marks code
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert sample["items"], orient
+        assert "sample_fallback" not in sample, sample
+        drawn = sample["sample_sections"]
+        assert drawn, sample
+        assert all(semantics[name] != "ReadOnlyCode" for name in drawn), (drawn, semantics)
+        # every sampled row is claimed by one of the named sections -- no header row
+        starts = {name: (int(s["start"], 16), int(s["end"], 16))
+                  for name, s in ((s["name"], s) for s in sections["items"])}
+        for row in sample["items"]:
+            addr = int(row["address"], 16)
+            assert any(lo <= addr < hi for lo, hi in (starts[n] for n in drawn)), (row, drawn)
+
+        # The default dump (at orient's min-length) leads with the same
+        # data-section strings and names the code / metadata sections it ranked
+        # last -- never `.rodata`.
+        dump = json.loads(shared_bn.run(
+            "strings", "--limit", "5", "--min-length", str(orient["strings_min_length"]),
+            "--format", "json").stdout)
+        assert [r["value"] for r in dump["items"]] == [r["value"] for r in sample["items"][:5]]
+        assert dump["noise_strings"] > 0, dump
+        assert ".rodata" not in dump["noise_sections"], dump["noise_sections"]
+
+
 class TestSessionStartTimeoutDiagnostics:
     """#718: `session start` must not race its own measurement, and a timeout
     must carry the evidence of how far the start got.

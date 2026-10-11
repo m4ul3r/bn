@@ -3792,12 +3792,14 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
     # #275: the canonical envelope now carries a `kind` discriminator too.
     envelope_keys = {"kind", "items", "total", "offset", "limit", "returned", "has_more"}
-    # #795: `strings` carries ONE key beyond the shared envelope -- `filtered`,
+    # #795: `strings` carries keys beyond the shared envelope -- `filtered`,
     # the count of candidates the active filter chain dropped, so the denominator
-    # is readable without a second unfiltered invocation. It rides the strings
-    # envelope alone (imports reports its exclusions under its own key), so it is
-    # added to the expected set HERE rather than to the shared one above.
-    strings_envelope_keys = envelope_keys | {"filtered"}
+    # is readable without a second unfiltered invocation, and (M-12) the
+    # `noise_strings` / `noise_sections` disclosure of the code / linker-metadata
+    # tier the ranking lists last. They ride the strings envelope alone (imports
+    # reports its exclusions under its own key), so they are added to the
+    # expected set HERE rather than to the shared one above.
+    strings_envelope_keys = envelope_keys | {"filtered", "noise_strings", "noise_sections"}
 
     # A limit that truncates: 2 of 5 come back, but the total stays honest.
     strings_page = instance._strings(None, query=None, offset=0, limit=2)

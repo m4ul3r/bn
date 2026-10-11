@@ -3621,9 +3621,14 @@ def _render_orient_text(value: Any) -> str:
         mn = value.get("strings_min_length")
         filt = f"min-length {mn}; " if mn is not None else ""
         # #646: name the sections the sample came from, so a low-signal sample is
-        # attributable instead of looking like the whole binary's flavour.
+        # attributable instead of looking like the whole binary's flavour -- and
+        # when the bridge had to fall back past the data sections (M-12), say so,
+        # so instruction bytes are not read as literals.
         drawn = _field_list(ss, "sample_sections")
         from_where = f"; from {', '.join(str(d) for d in drawn)}" if drawn else ""
+        fallback = ss.get("sample_fallback")
+        if fallback:
+            from_where += f"; {fallback}"
         lines.append(
             f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
         for s in items[:15]:
@@ -4767,6 +4772,18 @@ def _render_strings_text(value: Any) -> str:
         elif _field_skewed("filtered"):
             note = ("// the payload's filtered-string count is not a number that "
                     "can be read (use --format json)")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        # M-12: the "narrow your noisy dump" tip names the sections that actually
+        # contributed code / linker-metadata noise to THIS listing (the bridge
+        # ranks them last), and is absent when there are none -- it used to blame
+        # `.dynsym/.hash/.symtab` unconditionally, on static files that have none.
+        noisy = _nonnegative_count(value, "noise_strings")
+        if noisy:
+            named = ", ".join(str(n) for n in _field_list(value, "noise_sections"))
+            where = f" from {named}" if named else ""
+            note = (f"// tip: {noisy} string(s){where} are code bytes or linker metadata "
+                    f"(ranked last); narrow with --section .rodata (or --query / "
+                    f"--min-length) for signal.")
             body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
 

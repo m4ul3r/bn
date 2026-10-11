@@ -4065,9 +4065,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # they are named in the skipped set below rather than silently dropped.
     # #795 adds eleven further CLI count reads to this combined population.
     # #889 adds the data-symbol total read; its offset read was already covered.
-    assert len(sites) == 54, (
+    # M-12 adds the strings `noise_strings` count read.
+    assert len(sites) == 55, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 54. A "
+        "count helper, not 55. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4227,9 +4228,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "stated in this context]",
         "_render_target_info_annotations_text(user_symbols) [count not stated "
         "in this context]",
-        # The inner paging disclosure obscures this count in the probe body;
-        # dedicated string-count tests cover both output contexts.
+        # The inner paging disclosure obscures these counts in the probe body;
+        # dedicated string-count / noise-tip tests cover both output contexts.
         "_render_strings_text(filtered) [count not stated in this context]",
+        "_render_strings_text(noise_strings) [count not stated in this context]",
     ]), sorted(not_stated)
 
 
@@ -4614,8 +4616,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # anti-vacuity count it also changes.
     # Combined #873 and #879 renderer population; remeasured below.
     # M-01 adds the `discarded_unsaved` list read to the session-start and
-    # session-stop renderers: two pairs x six malformed values. Measured: 1296.
-    assert checked == 1296, f"the differential ran {checked} cases, not 1296"
+    # session-stop renderers: two pairs x six malformed values (+12).
+    # M-12 adds the strings `noise_strings`/`noise_sections` reads (+6).
+    # Measured: 1302.
+    assert checked == 1302, f"the differential ran {checked} cases, not 1302"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4694,8 +4698,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # Combined #873/#879/#889 population is 5280. #693 adds two go-rename
     # reads, each probed with eight malformed values, for 5296 total.
     # M-01 adds the `discarded_unsaved` read on the session-start and
-    # session-stop renderers: two pairs x eight, for 5312.
-    assert swept == 5312, f"the raise sweep ran {swept} renders, not 5312"
+    # session-stop renderers: two pairs x eight (+16). M-12 adds the strings
+    # `noise_strings`/`noise_sections` reads (+16), for 5328.
+    assert swept == 5328, f"the raise sweep ran {swept} renders, not 5328"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4877,8 +4882,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # Combined #873/#879/#889 mirror is 1534. #693's two reads add four
     # benign probes, for 1538 total.
     # M-01 adds the `discarded_unsaved` read on the session-start and
-    # session-stop renderers: two pairs x three benign probes, for 1544.
-    assert checked == 1544, f"the mirror ran {checked} renders, not 1544"
+    # session-stop renderers: two pairs x three benign probes (+6). M-12's
+    # strings noise reads add five (+5), for 1549.
+    assert checked == 1549, f"the mirror ran {checked} renders, not 1549"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7735,9 +7741,10 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     # #907 adds two class-note list positions, each tested with nine junk
     # elements at four shapes, to the PR-integrated 4716. Measured: 4788.
     # M-01 adds the `discarded_unsaved` list position on the session-start and
-    # session-stop renderers: two x nine x four. Measured: 4860.
-    assert swept == 4860, (
-        f"the element sweep ran {swept} renders, not 4860 -- the size of the "
+    # session-stop renderers: two x nine x four (+72). M-12 adds the strings
+    # `noise_sections` list position (+36). Measured: 4896.
+    assert swept == 4896, (
+        f"the element sweep ran {swept} renders, not 4896 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

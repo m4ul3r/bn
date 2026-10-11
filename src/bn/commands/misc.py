@@ -117,7 +117,11 @@ def _strings(args: argparse.Namespace) -> int:
     # bridge returns the page WITH the true total in a {items, total, ...}
     # envelope, matching function list/search. paged_spill keeps the
     # "--limit/--offset to page" spill hint without the client-side limit+1 probe.
-    rc = _call(
+    # The "narrow your noisy dump" tip is part of the rendered result (M-12):
+    # `_render_strings_text` names the sections that actually contributed noise
+    # from the bridge's `noise_sections`, so it cannot blame `.dynsym/.symtab`
+    # on a static file that has none, and it never precedes a failure.
+    return _call(
         args,
         "strings",
         {
@@ -132,17 +136,6 @@ def _strings(args: argparse.Namespace) -> int:
         stem="strings",
         regex_hint_query=args.query,
     )
-    # The "narrow your noisy dump" tip only makes sense after a successful,
-    # unfiltered dump. Emitting it BEFORE the request put it ahead of (and buried)
-    # a --quick refusal / error; print it after a clean result instead.
-    if (rc == 0 and args.section is None and args.query is None and args.min_length is None
-            and args.max_length is None and not args.no_crt and not args.probable_format_strings):
-        print(
-            "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
-            "narrow with --section .rodata (or --query / --min-length) for signal.",
-            file=sys.stderr,
-        )
-    return rc
 
 
 @_discloses

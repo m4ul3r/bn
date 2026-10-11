@@ -3876,12 +3876,13 @@ class BinaryNinjaBridge:
 
     def _disclose_sample_sections(self, selector: str | None, sample) -> None:
         """Tag an orient strings sample with the sections it was drawn from (#646),
-        so a useless sample is at least attributable. Best-effort."""
+        in the order the sample lists them (preferred tier first, M-12), so a
+        useless sample is at least attributable. Best-effort."""
         if not isinstance(sample, dict):
             return
         try:
             bv = self._resolve_view(selector)
-            names: set[str] = set()
+            names: dict[str, None] = {}
             for item in sample.get("items") or []:
                 addr = item.get("address")
                 if not isinstance(addr, str):
@@ -3889,8 +3890,8 @@ class BinaryNinjaBridge:
                 for sec in bv.get_sections_at(int(addr, 16)) or []:
                     name = str(getattr(sec, "name", "") or "")
                     if name:
-                        names.add(name)
-            sample["sample_sections"] = sorted(names)
+                        names.setdefault(name, None)
+            sample["sample_sections"] = list(names)
         except Exception:
             return
 
@@ -3911,15 +3912,16 @@ class BinaryNinjaBridge:
         strings_min_length = 6
         if analyzed:
             try:
-                # #646: an unfiltered `offset=0, limit=N` over an address-ordered scan
-                # is the HEAD of the address space, and on an ELF the lowest string
-                # addresses are always `.interp` / `.gnu.hash` / `.dynsym` / `.dynstr`
-                # -- so the digest's highest-signal field deterministically carried the
-                # loader path, `__gmon_start__`, and imported symbol names, on 4 of 4
-                # ELF targets. min_length=6 cannot help (`_ITM_deregisterTMCloneTable`
-                # is 27 chars). Restrict the sample to sections that can hold DOMAIN
-                # literals -- the `bn strings --section .rodata` follow-up every agent
-                # paid for by hand.
+                # #646/M-12: an unfiltered `offset=0, limit=N` over an address-ordered
+                # scan is the HEAD of the address space, and on an ELF the lowest
+                # string addresses are the ELF header, `.interp` / `.dynsym` /
+                # `.dynstr` and then `.text` -- so the digest's highest-signal field
+                # deterministically carried the loader path, `__gmon_start__`, and on
+                # every AArch64 ELF twenty rows of instruction bytes that decode as
+                # printable ASCII. min_length=6 cannot help. Restrict the sample to
+                # sections that can hold DOMAIN literals, ranked `.rodata`-like first
+                # -- the `bn strings --section .rodata` follow-up every agent paid
+                # for by hand.
                 strings_sample = read_misc._strings(
                     self.ctx, selector, query=None, offset=0,
                     limit=strings_limit, min_length=strings_min_length,
@@ -3927,11 +3929,15 @@ class BinaryNinjaBridge:
                 )
                 if not (strings_sample.get("items") if isinstance(strings_sample, dict) else None):
                     # Degrade, don't error: a view whose only strings ARE metadata
-                    # still gets a sample rather than a misleading empty one.
+                    # still gets a sample rather than a misleading empty one -- and
+                    # says so, so the reader does not take code bytes for literals.
                     strings_sample = read_misc._strings(
                         self.ctx, selector, query=None, offset=0,
                         limit=strings_limit, min_length=strings_min_length,
                     )
+                    if isinstance(strings_sample, dict):
+                        strings_sample["sample_fallback"] = (
+                            "no strings in data sections; sampled every section")
                 self._disclose_sample_sections(selector, strings_sample)
             except RuntimeError as exc:
                 strings_sample = {"unavailable": str(exc)}
