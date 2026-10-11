@@ -119,6 +119,12 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
                     "writes", "return_bound", "arity_capped", "destinations_unmodeled")
+# The roles that move or fill bytes. The other three are ANNOTATIONS of a flow
+# model (a return bound, an arity cap, a destination disclosure): an overlay
+# entry made of annotations alone is merged INTO the existing model of the same
+# name, never a replacement for it -- `{"read": {"return_bound": ..}}` used to
+# replace the builtin `read` and drop it from every slice (round 4 P3).
+_FLOW_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation", "writes")
 # The fields that ARM a sink. At the root with no `sink` beside them they are
 # the #915 flat shape -- the author wrote a sink that can never fire. Prose
 # fields (`detail`, `optional`, `gate`) are not flagged: they arm nothing, and
@@ -266,8 +272,35 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
     for flag in ("arity_capped", "destinations_unmodeled"):
         if flag in model and model[flag] is not True:
             _fail(f"`{flag}` must be `true` -- `{model[flag]!r}` declares nothing yet "
-                  f"counted as an active model and replaced any builtin `{name}` model; "
-                  f"drop the key or use {{}} to mark {name} benign")
+                  f"would count as an active model; drop the key or use {{}} to mark "
+                  f"{name} benign")
+
+
+def _is_annotation_only(model: Any) -> bool:
+    """True for an entry carrying annotation roles but no flow role."""
+    return model_has_role(model) and not any(k in model for k in _FLOW_ROLE_KEYS)
+
+
+def _overlay(models: dict[str, Any], layer: dict[str, Any], *, source: str) -> None:
+    """Apply one validated overlay *layer* onto *models*: an entry with a flow
+    role (or a ``{}`` marker) replaces the model of its name; an
+    annotation-only entry is merged into the existing flow model, keeping its
+    roles. An annotation with no flow model of that name to annotate is
+    refused -- it would arm nothing, yet a non-None model skips the
+    unmodeled-call frontier for the name."""
+    for name, model in layer.items():
+        if _is_annotation_only(model):
+            base = models.get(name)
+            if not (isinstance(base, dict) and any(k in base for k in _FLOW_ROLE_KEYS)):
+                raise TaintError(
+                    f"{source}: model {name!r} declares only annotation key(s) "
+                    f"({', '.join(k for k in _effective_keys(model))}) and there is no "
+                    f"model of {name} with a flow role "
+                    f"({'/'.join(_FLOW_ROLE_KEYS)}) for them to annotate; declare its "
+                    f"flow role beside them, or use {{}} to mark {name} benign")
+            models[name] = {**base, **model}
+        else:
+            models[name] = model
 
 
 def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -287,7 +320,8 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
             f"builtin taint model DB at {_BUILTIN_MODELS} could not be loaded: {exc}. "
             "This is a packaging bug -- reinstall the bridge."
         ) from exc
-    models.update(_coerce_model_map(raw, source=f"builtin taint model DB ({_BUILTIN_MODELS})"))
+    src = f"builtin taint model DB ({_BUILTIN_MODELS})"
+    _overlay(models, _coerce_model_map(raw, source=src), source=src)
     if taint_models_path is not None:
         override_path = taint_models_path()
         if override_path.exists():
@@ -298,14 +332,17 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
                     f"BN_TAINT_MODELS override at {override_path} could not be loaded: {exc}. "
                     "Fix or remove the file (it overrides the builtin models)."
                 ) from exc
-            models.update(_coerce_model_map(raw, source=f"BN_TAINT_MODELS override ({override_path})"))
+            src = f"BN_TAINT_MODELS override ({override_path})"
+            _overlay(models, _coerce_model_map(raw, source=src), source=src)
     if extra:
         # User-supplied models (e.g. `taint --models project.json` for
         # project-internal copy/format wrappers, #317) are validated through the
         # same coercion as the builtin/override DBs, so a malformed user file is
         # a loud error, not a silent merge-to-nothing (#97). User entries win on
-        # a name clash -- they're the most specific to the target.
-        models.update(_coerce_model_map(extra, source="user-provided models (--models / extra)"))
+        # a name clash -- they're the most specific to the target -- except an
+        # annotation-only entry, which annotates the model it names.
+        src = "user-provided models (--models / extra)"
+        _overlay(models, _coerce_model_map(extra, source=src), source=src)
     return models
 
 

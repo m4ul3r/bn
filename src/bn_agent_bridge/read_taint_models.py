@@ -83,8 +83,8 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
         # spellings and ``__builtin_bswap{16,32,64}``, which the engine resolves on
         # a real binary, so the catalog (and the ``--present`` audit built on it)
         # under-reported the models actually applied. The eighth such key,
-        # ``__builtin_memset``, is an empty ``{}`` marker that declares nothing and
-        # so contributes no catalog row either way.
+        # ``__builtin_memset``, is modeled like ``memset``: a propagator
+        # (``arg:1->*arg:0``) and an ``overflow_len`` sink.
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
         if model.get("sources") and want in (None, "source"):
@@ -106,10 +106,15 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
                 if sink.get("buf_arg") is not None:
                     entry["buf_arg"] = sink.get("buf_arg")
                 sinks_by_class.setdefault(cls, []).append(entry)
-        if model.get("propagates") and want in (None, "propagator"):
-            fts = ", ".join(f"{p.get('from')}->{p.get('to')}" for p in model["propagates"])
+        # A `writes` role (`bzero`: a pointee filled from no argument) is a
+        # flow role too, listed beside the propagates rules as
+        # `literal->*arg:N` -- a writes-only overlay counted as a model yet
+        # rendered no row (round 4 P3).
+        flows = [f"{p.get('from')}->{p.get('to')}" for p in (model.get("propagates") or [])]
+        flows += [f"literal->{t}" for t in (model.get("writes") or [])]
+        if flows and want in (None, "propagator"):
             propagators.append({"symbol": name, "model_name": name, "is_finding": False,
-                                "from_to": fts})
+                                "from_to": ", ".join(flows)})
     return {
         # #555: loud, machine- and human-visible "this is a catalog, not findings".
         "presence_catalog": True,

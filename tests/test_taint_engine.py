@@ -10779,6 +10779,41 @@ def test_strtok_priming_reset_before_a_loop_does_not_kill_the_back_edge_928r4():
     assert any(a.startswith("tokenizer_state_escapes") for a in result2["assumptions"]), result2["assumptions"]
 
 
+def test_annotation_only_overlay_annotates_the_builtin_928r4():
+    # P3: `{"read": {"return_bound": {"max_from_arg": 2}}}` was counted as a
+    # model and REPLACED the builtin read -- `read` vanished from slices.
+    import pytest
+    base = te.load_models()
+    merged = te.load_models(extra={"read": {"return_bound": {"max_from_arg": 2}}})
+    assert merged["read"]["sources"] == base["read"]["sources"], merged["read"]
+    assert merged["read"]["return_bound"] == {"max_from_arg": 2}
+    capped = te.load_models(extra={"read": {"arity_capped": True}})
+    assert capped["read"]["sources"] == base["read"]["sources"] and capped["read"]["arity_capped"] is True
+    # Nothing to annotate: refused, naming the flow roles.
+    with pytest.raises(te.TaintError) as ei:
+        te.load_models(extra={"app_wrapper": {"arity_capped": True}})
+    assert "app_wrapper" in str(ei.value) and "annotate" in str(ei.value), str(ei.value)
+    # The slice is the builtin's: read is still a fill of the buffer.
+    fd, fd0 = _var("fd", 0, ident=12)
+    buf = FVar("buf", typ="char[0x40]")
+    pg = _BufProgram(params=[fd])
+    pg.call(_B_READ, [FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]), _addr_of(buf),
+                      FExpr("MLIL_CONST", "0x3f", constant=0x3f)], reads=[fd0])
+    pg.sink(buf)
+    result = te.TaintEngine(FBV(_B_NAMES), merged).backward(pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+
+
+def test_writes_role_renders_a_catalog_row_928r4():
+    # P3: a writes-only overlay counted 1 model and rendered no row.
+    from bn_agent_bridge.read_taint_models import build_catalog
+    cat = build_catalog(te.load_models(extra={"my_clear": {"writes": ["*arg:0"]}}))
+    rows = {p["symbol"]: p["from_to"] for p in cat["propagators"]}
+    assert rows.get("my_clear") == "literal->*arg:0", rows.get("my_clear")
+    assert rows.get("bzero") == "literal->*arg:0", rows.get("bzero")
+    assert rows.get("__builtin_memset", "").startswith("arg:1->*arg:0"), rows.get("__builtin_memset")
+
+
 def test_benign_model_handed_the_buffer_is_disclosed_928r4():
     # P3: overlay `{"my_fill": {}}` where my_fill really copies: the slice
     # rested on that declaration with nothing saying so, and the only-writer
