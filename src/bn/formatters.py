@@ -5161,8 +5161,11 @@ def _operation_row_text(item: dict[str, Any]) -> str:
         suffix = f" ({name})" if name else ""
         overlaps = _row_list(item, "overlaps")
         if overlaps:
-            # M-03: the verbose row names the host this create split, too.
-            suffix += f" -- splits {_overlap_listing(overlaps)}"
+            # M-03: the verbose row names the host this create landed inside,
+            # too. "inside", not "splits": BN truncates the host only at an
+            # instruction boundary; elsewhere it leaves the host intact beside
+            # the new function (#927 review), and the listing says which.
+            suffix += f" -- inside {_overlap_listing(overlaps)}"
         return f"function_create {_get('address')}{suffix}"
     if op == "rename_symbol":
         return f"rename_symbol {_get('kind', 'auto')} {_get('address')} -> {_get('new_name')}"
@@ -5686,8 +5689,9 @@ def _build_mutation_summary(
     if proto_residue:
         summary["prototype_user_type_residue"] = True
     if overlapping_functions:
-        # M-03: a `function create --allow-overlap` split an existing function
-        # at the new start. That is the one fact the caller asked to be told
+        # M-03: a `function create --allow-overlap` landed inside an existing
+        # function (truncating it, or overlapping it -- the row says which).
+        # That is the one fact the caller asked to be told
         # about by passing the flag, and it was reported only in the verbose
         # `results[].note` -- the compact status every loop reads said
         # `committed changed=1 verified=1` and nothing else. Conditional like
@@ -5809,10 +5813,11 @@ def _mutation_summary(value: Any) -> Any:
         # M-03: the per-row `overlaps` a `function_create` carries after a
         # deliberate `--allow-overlap` split, collected across the batch so a
         # loop reading only the compact status still learns WHICH function
-        # was cut. A reverted/failed row's overlap is not a live split, so
-        # only the rows that verified contribute.
+        # was cut. A reverted row's overlap is not a live split -- but a
+        # `rollback_failed` one's is (#927 review): the created function, and
+        # the cut it made, are still in the view when its revert failed.
         overlapping_functions=[
-            o for r in results if r.get("status") == "verified"
+            o for r in results if r.get("status") in ("verified", "rollback_failed")
             for o in _row_list(r, "overlaps")
         ],
     )
@@ -6150,14 +6155,25 @@ def _overlap_rows(source: Any) -> list[dict[str, Any]]:
 
 
 def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
-    """`name @ start (+offset)` per split host; a missing field prints as
-    `<unknown>` rather than dropping the row that says a function was cut."""
-    return ", ".join(
-        f"{_text_value(o, 'name') or '<unknown>'} @ "
-        f"{_text_value(o, 'address') or '<unknown>'}"
-        + (f" (+{offset})" if (offset := _text_value(o, "offset")) else "")
-        for o in overlaps
-    )
+    """`name @ start (+offset, fate)` per host; a missing field prints as
+    `<unknown>` rather than dropping the row that says a function was cut.
+    The fate is what the create DID to the host -- `truncated` at the new
+    start, or `intact` beside an overlapping function -- when the bridge
+    observed it (#927 review); a row without the observation shows none."""
+    def _one(o: dict[str, Any]) -> str:
+        text = (f"{_text_value(o, 'name') or '<unknown>'} @ "
+                f"{_text_value(o, 'address') or '<unknown>'}")
+        qualifiers = []
+        if offset := _text_value(o, "offset"):
+            qualifiers.append(f"+{offset}")
+        truncated = o.get("truncated")
+        if truncated is True:
+            qualifiers.append("truncated")
+        elif truncated is False:
+            qualifiers.append("intact")
+        return text + (f" ({', '.join(qualifiers)})" if qualifiers else "")
+
+    return ", ".join(_one(o) for o in overlaps)
 
 
 @_discloses

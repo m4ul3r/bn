@@ -7633,8 +7633,9 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
     # #825's include_root and #890's unapplied_prototypes both join the row;
-    # M-03's split disclosure reads each overlap row's name/address/offset.
-    assert len(keys) == 15, f"the op row reads {sorted(keys)}, not 15 keys"
+    # M-03's split disclosure reads each overlap row's name/address/offset,
+    # and #927's observed fate adds `truncated`.
+    assert len(keys) == 16, f"the op row reads {sorted(keys)}, not 16 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7661,12 +7662,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # Measured with both keys: 2970 renders, 1738 examined after the readable
+    # Measured with both keys: 3168 renders, 1848 examined after the readable
     # container carve-out. The two sizes are separate coverage claims.
-    assert (rendered, checked) == (2970, 1738), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 2970, and "
-        f"CHECKED {checked} of them, not 1738. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 1232 "
+    assert (rendered, checked) == (3168, 1848), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 3168, and "
+        f"CHECKED {checked} of them, not 1848. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips 1320 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a

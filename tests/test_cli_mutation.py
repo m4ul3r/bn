@@ -1443,11 +1443,12 @@ def test_function_create_interior_refusal_exits_three_naming_the_host(monkeypatc
 
     message = (
         "Refused to create a function at 0x401a44: the address lies inside "
-        "parse_record (starts at 0x401a40, offset +0x4). Creating one here splits "
-        "the host at 0x401a44 -- it keeps only the bytes before the new start and "
-        "the new function owns the rest. If the host was over-extended by "
-        "auto-analysis and the split is intended, pass --allow-overlap; the "
-        "result then reports the overlap."
+        "parse_record (starts at 0x401a40, offset +0x4, instruction boundary). "
+        "Binary Ninja truncates the host at the new start: it keeps only the "
+        "bytes before it and the new function owns the rest. If the host was "
+        "over-extended by auto-analysis and that is intended, pass "
+        "--allow-overlap; the result then reports the overlap and what became "
+        "of the host."
     )
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0,
@@ -1464,9 +1465,14 @@ def test_function_create_interior_refusal_exits_three_naming_the_host(monkeypatc
     assert "--allow-overlap" in err
 
 
-def _split_create_result(preview=False):
+_SPLIT_HOST_ROW = {"name": "parse_record", "address": "0x401a40", "offset": "0x4",
+                   "instruction_boundary": True, "truncated": True}
+
+
+def _split_create_result(preview=False, status="verified"):
     """What the bridge returns for `function create 0x401a44 --allow-overlap`
-    when 0x401a44 lies 4 bytes into `parse_record` @ 0x401a40."""
+    when 0x401a44 lies 4 bytes into `parse_record` @ 0x401a40, at an
+    instruction boundary (so the host was truncated)."""
     return {
         "preview": preview,
         "success": True,
@@ -1476,19 +1482,22 @@ def _split_create_result(preview=False):
         "results": [
             {
                 "op": "function_create",
-                "status": "verified",
+                "status": status,
                 "address": "0x401a44",
                 "function": "sub_401a44",
                 "requested": {"op": "function_create", "address": "0x401a44",
                               "allow_overlap": True},
-                "overlaps": [{"name": "parse_record", "address": "0x401a40", "offset": "0x4"}],
-                "note": "this address is inside parse_record @ 0x401a40, so the host "
-                        "function is now split at 0x401a44",
+                "overlaps": [dict(_SPLIT_HOST_ROW)],
+                "note": "this address is inside an existing function: parse_record @ "
+                        "0x401a40 was truncated at 0x401a44 (it keeps only the bytes "
+                        "before the new start)",
             }
         ],
         "affected_functions": [
             {"address": "0x401a44", "before_name": None, "after_name": "sub_401a44",
-             "changed": True}
+             "changed": True},
+            {"address": "0x401a40", "before_name": "parse_record",
+             "after_name": "parse_record", "changed": True},
         ],
         "affected_types": [],
     }
@@ -1507,7 +1516,7 @@ def test_function_create_allow_overlap_compact_text_line_discloses_the_split(fak
     first, second = out.splitlines()[:2]
     assert first.startswith("mutation: committed  changed=1  verified=1")
     assert "overlaps=1" in first
-    assert second == "overlapping_functions: parse_record @ 0x401a40 (+0x4)"
+    assert second == "overlapping_functions: parse_record @ 0x401a40 (+0x4, truncated)"
 
 
 def test_function_create_allow_overlap_json_summary_carries_overlapping_functions(fake_transport, capsys):
@@ -1519,8 +1528,7 @@ def test_function_create_allow_overlap_json_summary_carries_overlapping_function
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["kind"] == "mutation_summary"
-    assert payload["overlapping_functions"] == [
-        {"name": "parse_record", "address": "0x401a40", "offset": "0x4"}]
+    assert payload["overlapping_functions"] == [_SPLIT_HOST_ROW]
 
 
 def test_function_create_allow_overlap_preview_summary_still_discloses_the_split(fake_transport, capsys):
@@ -1535,10 +1543,13 @@ def test_function_create_allow_overlap_preview_summary_still_discloses_the_split
     out = capsys.readouterr().out
     assert out.splitlines()[0].startswith("mutation: preview")
     assert "overlaps=1" in out.splitlines()[0]
-    assert "overlapping_functions: parse_record @ 0x401a40 (+0x4)" in out
+    assert "overlapping_functions: parse_record @ 0x401a40 (+0x4, truncated)" in out
 
 
-def test_function_create_allow_overlap_verbose_row_names_the_split_host(fake_transport, capsys):
+def test_function_create_allow_overlap_verbose_row_names_the_host_it_is_inside(fake_transport, capsys):
+    """`-- inside`, not `-- splits` (#927 review): BN truncates the host only
+    at an instruction boundary, so the row names the host and lets the
+    listing's `truncated` / `intact` say what happened to it."""
     fake_transport({"function_create": {"ok": True, "result": _split_create_result()}})
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--allow-overlap",
@@ -1546,7 +1557,70 @@ def test_function_create_allow_overlap_verbose_row_names_the_split_host(fake_tra
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "function_create 0x401a44 (sub_401a44) -- splits parse_record @ 0x401a40 (+0x4)" in out
+    assert ("function_create 0x401a44 (sub_401a44) -- inside parse_record @ 0x401a40 "
+            "(+0x4, truncated)") in out
+    assert "splits" not in out
+    # The truncated host is in the audit's affected list too.
+    assert "affected functions (2):" in out and "- 0x401a40 parse_record" in out
+
+
+def test_function_create_mid_instruction_overlap_renders_the_host_intact(fake_transport, capsys):
+    """The other outcome BN has: the host kept every byte and the listing
+    must say `intact`, never imply a cut."""
+    result = _split_create_result()
+    result["results"][0]["overlaps"] = [{"name": "parse_record", "address": "0x401a40",
+                                         "offset": "0x6", "instruction_boundary": False,
+                                         "truncated": False}]
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--allow-overlap", "0x401a46"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "overlapping_functions: parse_record @ 0x401a40 (+0x6, intact)" in out
+
+
+def test_function_create_rollback_failed_preview_still_reports_the_overlap(fake_transport, capsys):
+    """#927 review P3: `_mutation_summary` kept `overlaps` from `verified`
+    rows only, so a preview whose revert FAILED -- the created function and
+    its cut still live in the view -- showed no `overlaps=` at all. That is
+    exactly the row whose overlap is still real."""
+    result = _split_create_result(preview=True, status="rollback_failed")
+    result["success"] = False
+    result["rolled_back"] = False
+    result["message"] = ("Preview verified, but reverting it failed: the created function, "
+                         "or a function it split, may be left modified in the view.")
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--allow-overlap",
+                      "--preview", "0x401a44"])
+
+    assert rc == 3
+    out = capsys.readouterr().out
+    first = out.splitlines()[0]
+    assert "failed=1" in first and "dirty_after=True" in first and "overlaps=1" in first
+    assert "overlapping_functions: parse_record @ 0x401a40 (+0x4, truncated)" in out
+
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--allow-overlap",
+                      "--preview", "--format", "json", "--summary", "0x401a44"])
+    assert rc == 3
+    assert json.loads(capsys.readouterr().out)["overlapping_functions"] == [_SPLIT_HOST_ROW]
+
+
+def test_a_reverted_sibling_create_does_not_report_its_overlap(fake_transport, capsys):
+    """Must-not-fire twin: a create a failed batch cleanly rolled back is
+    stamped `reverted`; its host was put back, so no overlap is reported."""
+    result = _split_create_result(status="reverted")
+    result["success"] = False
+    result["rolled_back"] = True
+    result["results"].append({"op": "set_comment", "status": "verification_failed",
+                              "address": "0x401a44", "message": "nope"})
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--allow-overlap",
+                      "--format", "json", "--summary", "0x401a44"])
+    assert rc == 3
+    assert "overlapping_functions" not in json.loads(capsys.readouterr().out)
 
 
 def test_function_create_without_overlap_grows_no_overlap_disclosure(fake_transport, capsys):
