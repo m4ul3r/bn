@@ -836,8 +836,6 @@ def _session_stop(args: argparse.Namespace) -> int:
         result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
         if method == "sigterm":
             result["method"] = method
-        if discarded:
-            result["discarded_unsaved"] = discarded
 
         # Block until the socket/registry are gone and the process has exited, so a
         # follow-on `bn session start --instance-id <same>` can't race the dying
@@ -865,6 +863,12 @@ def _session_stop(args: argparse.Namespace) -> int:
                     return 1
                 result["method"] = "sigkill"
 
+        # Attached here, not with the `stopped: true` default above: the
+        # non-converged branch reports a process that is still alive, and a
+        # `[unsaved changes discarded]` row under it would claim a discard the
+        # stop did not complete (#925 review).
+        if discarded:
+            result["discarded_unsaved"] = discarded
         cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
         return 0
     finally:

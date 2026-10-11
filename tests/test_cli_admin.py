@@ -4402,6 +4402,27 @@ def test_session_stop_discard_unsaved_text_discloses_like_close(monkeypatch, cap
     assert "warning: unsaved mutations were discarded" in out
 
 
+def test_session_stop_that_does_not_converge_claims_no_discard(monkeypatch, capsys):
+    # #925 review P3: `discarded_unsaved` is a statement about a stop that
+    # COMPLETED. The non-converged branch reports a process still alive (rc 1,
+    # `stopped: false`), so a `[unsaved changes discarded]` row under it would
+    # claim a discard the command did not perform.
+    _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: False)
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--discard-unsaved", "--format", "json"])
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] is False
+    assert "discarded_unsaved" not in payload
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--discard-unsaved"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[unsaved changes discarded]" not in out
+    assert "warning: unsaved mutations were discarded" not in out
+
+
 @pytest.mark.parametrize("verb", ["restart", "stop"])
 def test_session_lifecycle_without_unsaved_targets_is_unchanged(monkeypatch, capsys, verb):
     clean = [dict(row, unsaved=False) for row in _UNSAVED_ROWS]
