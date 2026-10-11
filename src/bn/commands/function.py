@@ -256,12 +256,26 @@ def _function_info(args: argparse.Namespace) -> int:
          args=[
              preview_arg("Create, verify, then revert without committing"), *mutation_output_args(),
              arg("address", help="Address of the function entry point (hex or decimal)"),
+             # M-03: an address INSIDE an existing function does not simply add
+             # a second function beside it -- at an instruction boundary BN
+             # truncates the host there (which cut a user-named, user-prototyped
+             # function behind a clean `committed changed=1 verified=1`), and at
+             # a mid-instruction address it leaves the host intact beside a
+             # function decoding a bogus stream. Refused by default; the flag is
+             # the deliberate case (BN over-extended the host), and the compact
+             # status then reports which function was hit and how.
+             arg("--allow-overlap", dest="allow_overlap", action="store_true", default=False,
+                 help="Allow an address inside an existing function (refused by default). "
+                      "At an instruction boundary BN truncates that function at the new "
+                      "start; elsewhere it leaves it intact beside an overlapping function "
+                      "decoding a different instruction stream. The status reports the "
+                      "host and which of the two happened"),
          ])
 def _function_create(args: argparse.Namespace) -> int:
     return _mutate(
         args,
         "function_create",
-        {"address": args.address},
+        {"address": args.address, "allow_overlap": bool(args.allow_overlap)},
         preview=bool(args.preview),
         stem="function-create",
     )

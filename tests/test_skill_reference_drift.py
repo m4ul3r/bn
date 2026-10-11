@@ -1116,16 +1116,23 @@ def test_mutating_reference_documents_every_compact_status_key():
                                  "rolled_back": True, "message": "override stuck",
                                  "prototype_user_type_residue": True,
                                  "results": [{"status": "rollback_failed"}]})
+    split = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
+                               "results": [{"op": "function_create", "status": "verified",
+                                            "overlaps": [{"name": "parse_record",
+                                                          "address": "0x401a40",
+                                                          "offset": "0x4"}]}]})
     go = _go_rename_summary({"kind": "go_rename", "success": True, "committed": True,
                              "rolled_back": False, "go_renamed_candidates": 2,
                              "go_committed_count": 2, "go_verified_count": 2,
                              "go_failed_count": 0, "skipped_user_named": 1})
-    emitted = set(measured) | set(unmeasured) | set(residue) | set(go)
+    emitted = set(measured) | set(unmeasured) | set(residue) | set(split) | set(go)
     assert emitted == _documented_compact_status_keys()
-    # ...and the table's "always present except prototype_user_type_residue"
-    # caveat is itself true.
+    # ...and the table's "always present except prototype_user_type_residue /
+    # overlapping_functions" caveat is itself true.
     assert "prototype_user_type_residue" in residue
     assert "prototype_user_type_residue" not in measured
+    assert "overlapping_functions" in split
+    assert "overlapping_functions" not in measured
     # #685: the two summary builders must keep emitting the SAME key set -- the
     # nulled unmeasured counts must not widen one side only.
     assert set(measured) == set(unmeasured) == set(go)

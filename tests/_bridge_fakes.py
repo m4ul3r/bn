@@ -393,16 +393,22 @@ class _FakeFunction:
             set(self._pending_auto_restore),
             set(self._pending_user_restore),
             list(vars_.values()),
+            # A rename is a user symbol write, which BN's undo DOES journal
+            # (verified live on BN 6.1: the batch undo put a host's original
+            # name back before a split-host repair wrote the renamed one over
+            # it again -- #927 round 3).
+            (self.name, self.raw_name),
         )
 
     def provenance_restore(self, snapshot):
         """Undo-restore this function, modelling BN 5.4's journal exactly.
 
-        Values and variable provenance come back; `has_user_type` does NOT --
-        BN's undo leaves BNFunctionHasUserType set (#582, verified live).
+        Values, variable provenance and the name come back; `has_user_type`
+        does NOT -- BN's undo leaves BNFunctionHasUserType set (#582,
+        verified live).
         """
         (type_text, user_vars, user_values, defaults, pending_auto,
-         pending_user, var_state) = snapshot
+         pending_user, var_state, naming) = snapshot
         self._type = type_text
         self._user_vars = set(user_vars)
         self._user_values = dict(user_values)
@@ -412,6 +418,13 @@ class _FakeFunction:
         for var, name, var_type in var_state:
             var.name = name
             var.type = var_type
+        name, raw_name = naming
+        symbol = getattr(self, "symbol", None)
+        if not (getattr(symbol, "auto", False) and str(symbol.name) == str(self.name)):
+            # The name showing is a user write, so the journal puts the old
+            # one back; an AUTO symbol analysis defined (a `j_*` thunk name)
+            # is not journaled and stays (verified live, #927 round 3).
+            self.name, self.raw_name = name, raw_name
 
     def tag_comment_snapshot(self):
         """The tag/comment half of the undo journal: this function's doc comment
@@ -839,8 +852,14 @@ class _FakeBV:
                 return symbol
         return None
 
-    def get_symbols(self):
-        return list(self._symbols)
+    def get_symbols(self, start=None, length=None):
+        # BN's signature: no arguments lists every symbol; (start, length)
+        # lists the ones at addresses in [start, start + length).
+        if start is None:
+            return list(self._symbols)
+        lo, hi = int(start), int(start) + int(length or 1)
+        return [symbol for symbol in self._symbols
+                if lo <= int(getattr(symbol, "address", -1)) < hi]
 
     def get_symbol_at(self, address: int):
         for symbol in self._symbols:

@@ -295,6 +295,11 @@ def _functions_for_op(ctx, bv, op: dict[str, Any], *, type_limit: int | None):
                 functions = [ctx._find_function(bv, op["function"])]
             elif op.get("address"):
                 functions = ctx._functions_containing(bv, _parse_address(op["address"]))
+        elif kind == "function_create" and op.get("address"):
+            # The function(s) a deliberate split cuts are affected too (#927
+            # review): a gap address has none, an interior one without
+            # `allow_overlap` is refused before the snapshot matters.
+            functions = ctx._functions_containing(bv, _parse_address(op["address"]))
         elif kind == "data_retype":
             # A global's type reflows every function that reads it, so the blast
             # radius is the code xrefs to the address, not a single function (#649).
@@ -2217,6 +2222,22 @@ def _reject_duplicate_write_keys(ctx, operations: list[dict[str, Any]]) -> None:
         )
 
 
+def _later_create_needs_ranges(operations: list, index: int) -> bool:
+    """Whether op *index* is a `function_create` with another one after it.
+
+    The later create's interior guard (`_op_function_create`) must see the
+    earlier one's analyzed ranges (#927 P2), and only a create's guard reads
+    them -- so a batch with a single create, or with creates followed only
+    by other ops, keeps the one post-apply analysis #780 left it with.
+    """
+    op = operations[index]
+    if not (isinstance(op, dict) and op.get("op") == "function_create"):
+        return False
+    return any(isinstance(later, dict) and later.get("op") == "function_create"
+               for later in operations[index + 1:])
+
+
+
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
               exclusive=None):
     """Apply, verify, and (on failure or --preview) revert a batch of mutations.
@@ -2232,13 +2253,18 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     multi-minute reanalysis -- parity with load_binary (#99), refresh (#321) and
     go_rename (#365). #780 extends that to the per-op reanalysis a function_create
     op used to run inside the apply loop: it is deferred to this post-apply pass, so
-    an N-create batch reanalyzes once, never inside the exclusive lock. The
+    an N-create batch reanalyzes once, never inside the exclusive lock -- except
+    that a create FOLLOWED BY another create is analyzed before the next one
+    applies (gate-only, between two exclusive apply windows), because the next
+    create's interior guard needs its ranges (#927 P2). The
     revert/settle paths stay exclusive on purpose: a reader
     must never observe a half-reverted view. The #479 quick-load refusal is
     unchanged. ``exclusive=None`` means "no exclusive scope" (a no-op), so direct
     engine calls and tests keep working. Every return path produces exactly the
     same result dict as before -- no schema, status, message or ordering change.
     """
+    from . import create_comments  # one-way import direction, see _op_function_create
+
     exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     if not operations:
         raise ValueError("Batch operation list is empty")
@@ -2368,22 +2394,41 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             )
             else {}
         )
+        # #927 round 3: the functions a create may cut, as they are BEFORE op 0
+        # -- the state every revert path below must return them to. A create
+        # op's own restore repairs their ranges from a snapshot taken just
+        # before IT ran, which inside a batch is an intermediate state; their
+        # names are the journal's, and a rollback is not clean until both agree
+        # with this baseline (`_split_hosts_at_baseline`).
+        host_baseline = create_comments._split_host_baseline(ctx, bv, operations)
         state = bv.begin_undo_actions()
-        results = []
-        # Explicit restores for local var ops, which BN's undo buffer can't
-        # revert (see _run_local_restores). Replayed on every revert path.
-        restores: list = []
-        try:
-            for op in operations:
-                # #780: function_create is the one op that reanalyzes while it
-                # applies. The batch's own post-apply reanalysis (below, gate-only)
-                # already covers every create, so the per-op one only added N full
-                # analyses under the exclusive lock to an N-create batch, starving
-                # every concurrent read. Defer it -- the same #628 deferral -- and
-                # _verify_function_create does the post-analysis readback + #386
-                # code guard afterwards.
+    results = []
+    # Explicit restores for local var ops, which BN's undo buffer can't
+    # revert (see _run_local_restores). Replayed on every revert path.
+    restores: list = []
+    try:
+        for index, op in enumerate(operations):
+            # #780: function_create is the one op that reanalyzes while it
+            # applies. The batch's own post-apply reanalysis (below, gate-only)
+            # already covers every create, so the per-op one only added N full
+            # analyses under the exclusive lock to an N-create batch, starving
+            # every concurrent read. Defer it -- the same #628 deferral -- and
+            # _verify_function_create does the post-analysis readback + #386
+            # code guard afterwards.
+            with exclusive_scope():
                 results.append(_apply_operation(ctx, bv, op, restores, defer_reanalysis=True))
-        except OperationFailure as exc:
+            if _later_create_needs_ranges(operations, index):
+                # #927 P2: a create's interior guard reads the ranges of the
+                # functions already there, and an EARLIER create in this batch
+                # has none until something analyzes it -- so a second create
+                # inside the first sailed past the guard and truncated it
+                # behind `verified`. Analyze between two creates, under the
+                # gate alone like the post-apply pass (the #780 discipline is
+                # "never inside the exclusive lock", which this keeps), so the
+                # next create's probe sees what the live view will.
+                bv.update_analysis_and_wait()
+    except OperationFailure as exc:
+        with exclusive_scope():
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -2391,13 +2436,18 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             restore_ok = _run_local_restores(ctx, bv, restores)
             _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+            # #927 round 3: the hosts of any create are back ONLY if they match
+            # the pre-transaction baseline -- name included -- after the undo
+            # AND the restores; a split host left renamed is a failed rollback.
+            hosts_ok = create_comments._split_hosts_at_baseline(
+                bv, host_baseline, what="the batch's creates")
             # #630: an already-applied set_prototype on an AUTO function leaves an
             # unclearable has_user_type override after revert. That is real residue,
             # not a clean revert, so it must fail and be disclosed here too -- the
             # apply-failure path previously reported status "reverted"/rolled_back
             # True with no disclosure at all.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            values_reverted = undo_ok and restore_ok and drift_ok
+            values_reverted = undo_ok and restore_ok and drift_ok and hosts_ok
             reverted = values_reverted and not proto_residue
             if values_reverted and not proto_residue:
                 message = "Rolled back before post-state verification because an operation failed to apply."
@@ -2485,6 +2535,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 restore_ok = _run_local_restores(ctx, bv, restores)
                 _settle_before_drift_restore(bv, var_before)
                 drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+                # #927 round 3: a create's hosts must match the pre-transaction
+                # baseline (name AND ranges) after the undo and every restore.
+                hosts_ok = create_comments._split_hosts_at_baseline(
+                    bv, host_baseline, what="the batch's creates")
                 # #630: a proto set on a function that had NO prior user type pins
                 # has_user_type, and neither BN's undo nor set_auto_type clears the
                 # flag (verified live on BN 5.4) -- there is no BN API to clear it.
@@ -2501,10 +2555,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 # per-op restamp still reports a rename/local that DID revert as
                 # "reverted", not "rollback_failed".
                 proto_residue = _prototype_user_type_residue(ctx, bv, results)
-                values_reverted = undo_ok and restore_ok and drift_ok
+                values_reverted = undo_ok and restore_ok and drift_ok and hosts_ok
                 restored = values_reverted and not proto_residue
             else:
-                values_reverted = True
+                values_reverted = hosts_ok = True
                 bv.commit_undo_actions(state)
 
             # Build the per-op output only once the revert outcome is known. On
@@ -2521,7 +2575,12 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
             message = None
             if preview:
-                if not values_reverted:
+                if not hosts_ok:
+                    message = (
+                        "Preview verified, but a function a create split is not back as "
+                        "it was before the batch; the view may be left modified."
+                    )
+                elif not values_reverted:
                     message = (
                         "Preview verified, but reverting a non-journaled change "
                         "(local variable or prototype) failed; the view may be left modified."
@@ -2538,7 +2597,12 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 else:
                     message = "Preview verified and reverted."
             elif failed:
-                if not values_reverted:
+                if not hosts_ok:
+                    message = (
+                        "Live-session verification failed AND a function a create split "
+                        "is not back as it was before the batch; the view may be left modified."
+                    )
+                elif not values_reverted:
                     message = (
                         "Live-session verification failed AND reverting a non-journaled change "
                         "(local variable or prototype) failed; the view may be left modified."
@@ -2584,6 +2648,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             restore_ok = _run_local_restores(ctx, bv, restores)
             _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+            hosts_ok = create_comments._split_hosts_at_baseline(
+                bv, host_baseline, what="the batch's creates")
             # #630 round 2: even when the value revert succeeds, an already-applied
             # set_prototype on an AUTO function leaves an unclearable has_user_type
             # override -- BN's undo and set_auto_type both restore the value but leave
@@ -2592,9 +2658,19 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # off the attribute to mark the view dirty, or `close` would read
             # bv.file.modified == false and wrongly report no unsaved state.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            if not (undo_ok and restore_ok and drift_ok):
-                err = RuntimeError(
-                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
+            if not (undo_ok and restore_ok and drift_ok and hosts_ok):
+                # #927 round 4: a failed revert on THIS path used to escape as a
+                # bare RuntimeError -- no status, so the CLI exited 2 as if the
+                # bridge had merely erred, and the bridge shim (which keys off the
+                # residue attribute alone) never marked the view dirty, so `close`
+                # read bv.file.modified == false over a host left renamed. Raise
+                # the structured failure the other two revert paths report:
+                # status `rollback_failed` (exit 3, `observed.dirty_after`), and
+                # the shim marks the view dirty off the status.
+                err = OperationFailure(
+                    "rollback_failed",
+                    f"{exc} (additionally, rollback failed; the view may be left partially modified)",
+                    observed={"rolled_back": False, "dirty_after": True},
                 )
                 if proto_residue:
                     err.prototype_user_type_residue = True
@@ -4248,6 +4324,16 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             "write lock and wedge the instance. Run `bn refresh` first.",
             requested=requested,
         )
+    # M-03: REFUSED unless the op says `allow_overlap: true`, then disclosed
+    # -- the same rule, in the same words, as the standalone command
+    # (`create_comments._overlap_refusal`), so an agent that learned one
+    # surface is not surprised by the other. The deliberate split (BN
+    # over-extended the host) stays reachable through the flag. Validated
+    # BEFORE the existing-start noop below (#927 review): a malformed field
+    # is malformed whether or not a function already starts here, and the
+    # standalone binder validates before its handler runs.
+    allow_overlap = _validate_bool(op.get("allow_overlap"), label="allow_overlap",
+                                   default=False)
     existing = bv.get_function_at(addr)
     if existing is not None:
         return {
@@ -4263,15 +4349,11 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # and `get_functions_containing` reports the new one. A create at a
     # mid-function address succeeded with `verified` and said nothing, so a
     # caller who mistyped an address, or who did not realise BN had already
-    # attributed those bytes, was left with two overlapping functions and no
-    # trace of it in the result.
-    #
-    # DISCLOSED, not refused -- the opposite call from the reserved-tag guard
-    # beside it, and for the opposite reason: creating a function BN missed
-    # inside a neighbour it over-extended is ordinary RE work, so refusing
-    # would break a legitimate flow. The harm here is that the overlap is
-    # INVISIBLE, not that it happened.
-    overlapped = create_comments._containing_function_rows(bv, addr)
+    # attributed those bytes, was left with a truncated host and no trace of
+    # it in the result. Inside a batch an EARLIER create's function is a
+    # possible host too: `_mutation` analyzes between two creates (gate-only)
+    # so that function has its ranges by the time this probe runs (#927 P2).
+    overlapped = create_comments._containing_function_rows(bv, addr, requested=requested)
     if len(bytes(bv.read(addr, 1))) == 0:
         raise OperationFailure(
             "invalid_request",
@@ -4284,6 +4366,13 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             f"Cannot create function: address {hex(addr)} is not inside an executable segment",
             requested=requested,
         )
+    if overlapped and not allow_overlap:
+        raise create_comments._overlap_refusal(
+            addr, overlapped, requested, flag='"allow_overlap": true on the op')
+    # #927 P1: record the hosts a deliberate split will cut, so the restore
+    # below can verify -- and repair -- them rather than assume removing the
+    # created function put them back.
+    hosts = create_comments._snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
     # create_user_function (FORCED), not add_function (an advisory auto hint that
     # declines exactly the auto-skipped data-table / missed-handler addresses this
     # op exists to recover -- #360). Mirrors the standalone create_comments path.
@@ -4319,11 +4408,22 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # remove_function, #304) is the only real revert. The restore RAISES when
     # removal fails so _run_local_restores marks restore_ok=False and the batch
     # reports rolled_back=false instead of claiming a clean rollback while the
-    # fabricated function still persists in the view.
+    # fabricated function still persists in the view. The same raise covers a
+    # host of a deliberate split whose ranges are not back as recorded (#927
+    # P1): restores run newest-first, so a later create inside THIS one is
+    # already gone when this verifies its hosts. The hosts' NAMES are not this
+    # restore's to write -- `hosts` was snapshotted after the earlier siblings
+    # applied, and the batch's undo has already put the journaled state back
+    # by the time restores run -- so `_mutation` checks them against the
+    # pre-transaction baseline instead (#927 round 3).
     def _remove_created_restore():
         if not create_comments._remove_created_function(ctx, bv, addr):
             raise RuntimeError(
                 f"failed to remove fabricated function at {hex(addr)} on revert"
+            )
+        if not create_comments._restore_split_hosts(ctx, bv, addr, hosts):
+            raise RuntimeError(
+                f"the function(s) a create at {hex(addr)} split were not restored on revert"
             )
 
     if restores is not None:
@@ -4353,6 +4453,10 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
         "function": str(created.name) if created is not None else None,
         "requested": requested,
     }
+    if not defer_reanalysis:
+        # Analyzed here, so the hosts' fate is observable here; a deferred op
+        # is stamped by `_verify_function_create` after the batch's analysis.
+        overlapped = create_comments._observe_split(bv, addr, overlapped)
     # ONE builder for both create paths (the other is
     # `create_comments._function_create`), so the two cannot state the same
     # fact differently.
@@ -4395,4 +4499,12 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     # analyzes itself; a deferred op only saw the pre-analysis name).
     item["function"] = str(fn.name)
     item["status"] = "verified"
+    overlaps = item.get("overlaps")
+    if isinstance(overlaps, list) and overlaps:
+        # A deliberate split's hosts are observable now that the batch has
+        # analyzed: say which were truncated and which are intact, in the
+        # same words the self-analyzing op and the standalone command use.
+        from . import create_comments
+        item = create_comments._with_overlap_note(
+            item, create_comments._observe_split(bv, addr, overlaps))
     return item

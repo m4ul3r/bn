@@ -1970,6 +1970,416 @@ class TestFunctionCreateSkippedAddress:
             assert json.loads(live.stdout)["committed"] is True
 
 
+def _function_rows(shared_bn) -> list[dict]:
+    listing = shared_bn.json("function", "list")
+    return listing.get("items", listing) if isinstance(listing, dict) else listing
+
+
+def _function_sizes(shared_bn) -> dict:
+    """`function list` sizes, keyed by name AND by `0x`-address so a test can
+    ask about a function whose name BN may re-derive after a cut."""
+    sizes: dict = {}
+    for f in _function_rows(shared_bn):
+        sizes[f["name"]] = int(f.get("size") or 0)
+        sizes[f["address"]] = int(f.get("size") or 0)
+    return sizes
+
+
+def _function_start_and_size(shared_bn, name: str) -> tuple[int, int]:
+    row = next(f for f in _function_rows(shared_bn) if f["name"] == name)
+    return int(row["address"], 16), int(row.get("size") or 0)
+
+
+def _py_line(shared_bn, code: str, key: str) -> str:
+    probe = shared_bn.run("py", "exec", code)
+    assert probe.returncode == 0, f"{probe.stdout}\n{probe.stderr}"
+    line = next((l for l in probe.stdout.splitlines() if l.startswith(key + "=")), None)
+    assert line is not None, f"{key!r} missing from py exec output:\n{probe.stdout}"
+    return line.split("=", 1)[1].strip()
+
+
+class TestFunctionCreateInteriorGuard:
+    """#927 (M-03) on real BN: a create INSIDE an existing function. Every
+    mocked assumption about this path has been wrong so far -- #675 assumed
+    two overlapping functions, M-03 found truncation, the #927 review found
+    BOTH, depending on whether the address is an instruction boundary -- so
+    the guard, its disclosure and the preview's revert are pinned against
+    BN itself on `parse_record` of the synthetic parser fixture."""
+
+    @staticmethod
+    def _host(shared_bn):
+        return _function_start_and_size(shared_bn, "parse_record")
+
+    def test_boundary_create_is_refused_previewed_and_truncates_on_request(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        start, size = self._host(shared_bn)
+        inside = hex(start + 4)      # past `endbr64`: an instruction boundary
+
+        refused = shared_bn.run("function", "create", inside)
+        assert refused.returncode == 3, f"{refused.stdout}\n{refused.stderr}"
+        assert "parse_record" in refused.stderr and hex(start) in refused.stderr
+        assert "+0x4" in refused.stderr and "instruction boundary" in refused.stderr
+        assert "truncates the host" in refused.stderr
+        assert _function_sizes(shared_bn)["parse_record"] == size
+
+        preview = shared_bn.run("function", "create", inside, "--allow-overlap", "--preview")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        first, second = preview.stdout.splitlines()[:2]
+        assert first.startswith("mutation: preview") and "overlaps=1" in first
+        assert second == f"overlapping_functions: parse_record @ {hex(start)} (+0x4, truncated)"
+        assert "dirty_after=False" in first
+        assert _function_sizes(shared_bn)["parse_record"] == size, "the preview did not restore the host"
+
+        live = shared_bn.run("function", "create", inside, "--allow-overlap", "--format", "json")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        payload = json.loads(live.stdout)
+        row = payload["results"][0]
+        assert row["status"] == "verified"
+        assert row["overlaps"] == [{"name": "parse_record", "address": hex(start), "offset": "0x4",
+                                    "instruction_boundary": True, "truncated": True}]
+        assert "was truncated at" in row["note"]
+        # The truncated host is in the audit, not only the created function.
+        assert {"address": hex(start), "before_name": "parse_record",
+                "after_name": "parse_record", "changed": True} in payload["affected_functions"]
+        sizes = _function_sizes(shared_bn)
+        assert sizes["parse_record"] == 4, sizes
+        assert sizes[hex(start + 4)] == size - 4, sizes
+
+    def test_mid_instruction_create_reports_the_host_intact(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        start, size = self._host(shared_bn)
+        inside = hex(start + 6)      # inside `mov rbp, rsp`
+
+        refused = shared_bn.run("function", "create", inside)
+        assert refused.returncode == 3
+        assert "mid-instruction" in refused.stderr and "leaves the host intact" in refused.stderr
+
+        live = shared_bn.run("function", "create", inside, "--allow-overlap")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        assert f"overlapping_functions: parse_record @ {hex(start)} (+0x6, intact)" in live.stdout
+        sizes = _function_sizes(shared_bn)
+        assert sizes["parse_record"] == size, "BN left the host intact; the status must not claim a cut"
+        assert hex(start + 6) in sizes
+
+
+def _annotate_host(shared_bn, start: int) -> str:
+    """Give the function at *start* every kind of user annotation a split
+    could lose -- name, prototype, doc comment, address comment, function
+    and address tags, a renamed+retyped local -- and return the state
+    snapshot `_host_state` reads, so a test can assert it came back."""
+    inside = hex(start + 8)
+    # The fixtures are this machine's compiler output, so the local to
+    # annotate is picked from the listing, not named in advance: a 32-bit
+    # stack local (a C `int`), retyped to its unsigned twin.
+    locals_ = json.loads(shared_bn.run("local", "list", hex(start), "--format", "json").stdout)
+    local = next(v for v in locals_["items"]
+                 if not v["is_parameter"] and v["type"] == "int32_t" and v["name"].startswith("var_"))
+    for args in (
+        ("rename", hex(start), "review_host"),
+        ("proto", "set", "review_host", "int review_host(int argc, char** argv)"),
+        ("comment", "set", "--function", "review_host", "host doc"),
+        ("comment", "set", inside, "addr note"),
+        ("tag", "add", "--function", "review_host", "--type", "Bookmarks", "--data", "fn tag"),
+        ("tag", "add", inside, "--type", "Bookmarks", "--data", "addr tag"),
+        ("local", "rename", "review_host", local["name"], "review_local"),
+        ("local", "retype", "review_host", "review_local", "uint32_t"),
+    ):
+        res = shared_bn.run(*args)
+        assert res.returncode == 0, f"{args}\n{res.stdout}\n{res.stderr}"
+    return _host_state(shared_bn, start)
+
+
+def _host_state(shared_bn, start: int) -> str:
+    return _py_line(shared_bn, (
+        f"f = bv.get_function_at({start:#x})\n"
+        f"inside = {start + 8:#x}\n"
+        "state = (f.name, f.symbol.auto, str(f.type), f.has_user_type, f.comment,\n"
+        "         bv.get_comment_at(inside),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_function_tags()),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_tags_at(inside)),\n"
+        "         sorted((v.name, str(v.type), f.is_var_user_defined(v)) for v in f.vars),\n"
+        "         [(hex(r.start), hex(r.end)) for r in f.address_ranges])\n"
+        "print('STATE=' + repr(state))\n"), "STATE")
+
+
+class TestFunctionCreateAnnotatedHost:
+    """#927 round 3 on real BN: what a split host's revert must put back, and
+    WHO puts it back. The repair owns only what analysis destroys and the
+    undo journal cannot restore (ranges, existence, auto symbols); every
+    user annotation is the journal's. The standalone preview proves the
+    journal alone preserves them; the batch orderings prove the repair
+    never writes a sibling's since-reverted rename back over the undo."""
+
+    def test_standalone_preview_keeps_every_user_annotation(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        assert "'review_host', False" in before and "'review_local', 'uint32_t', True" in before
+
+        preview = shared_bn.run("function", "create", hex(start + 4), "--allow-overlap", "--preview")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        assert "dirty_after=False" in preview.stdout
+        assert f"overlapping_functions: review_host @ {hex(start)} (+0x4, truncated)" in preview.stdout
+        assert _host_state(shared_bn, start) == before
+
+    def test_batch_preview_keeps_the_hosts_original_name_after_a_sibling_rename(self, shared_bn, tmp_path):
+        """The reviewer's exact repro: `[rename host, create inside it]
+        --preview` exited 0 with `rolled_back: true` and the host still
+        carrying the preview-only name."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_then_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False
+        assert summary["overlapping_functions"][0]["name"] == "preview_only_name"
+        after = _host_state(shared_bn, start)
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+        assert _function_sizes(shared_bn)["review_host"] == size
+
+    def test_failed_live_batch_really_reverts_the_rename_before_the_split(self, shared_bn, tmp_path):
+        """A later op fails, the batch rolls back: the rename row says
+        `reverted` and the view agrees -- original name, full ranges, and
+        no function at the split address."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_split_fail.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True},
+            {"op": "function_create", "address": "0x10"}]}))
+
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 3, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert payload["rolled_back"] is True and payload["success"] is False, payload
+        assert [r["status"] for r in payload["results"]] == [
+            "reverted", "reverted", "invalid_request"], payload["results"]
+        assert _host_state(shared_bn, start) == before
+        sizes = _function_sizes(shared_bn)
+        assert sizes["review_host"] == size and hex(start + 4) not in sizes, sizes
+
+    def test_batch_preview_restores_an_auto_name_a_thunk_cut_replaced_under_a_rename(self, shared_bn, tmp_path):
+        """The analysis-owned half, in the ordering that hides it: host A of
+        the shared-tail geometry is cut down to a jump thunk, which gives it
+        an auto `j_*` symbol UNDER the sibling's user rename. The undo drops
+        the user name and the thunk name would show; the repair restores the
+        auto symbol set from its snapshot, so the baseline name is back."""
+        shared_bn.load(PARSER_BINARY)
+        base = int(_py_line(shared_bn, _SHARED_TAIL_SETUP, "BASE"), 16)
+        before = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        mf = tmp_path / "rename_then_tail_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(base), "new_name": "user_renamed_a"},
+            {"op": "function_create", "address": hex(base + 0x12), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload["message"]
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+
+    def test_batch_preview_rolls_back_clean_on_an_implicit_named_host(self, shared_bn, tmp_path):
+        """#927 round 4: the common stripped-target shape. A host named only
+        `sub_<addr>` has NO registered symbol -- `fn.symbol` synthesizes it
+        -- so under the sibling's rename the listing held one user symbol,
+        after the undo none, and reading `fn.symbol` as a stand-in for the
+        empty listing made the implicit name an "added" auto symbol
+        `undefine_auto_symbol` cannot remove: `success:false,
+        rolled_back:false, dirty_after:true` over a view that was exactly
+        as before. The auto set is the registered listing on both reads."""
+        shared_bn.load(HELLO_BINARY)
+        host = int(_py_line(shared_bn, _IMPLICIT_HOST_SETUP, "HOST"), 16)
+        before = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert f"'sub_{host:x}', []" in before, before
+        mf = tmp_path / "rename_then_split_implicit.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(host), "new_name": "temporary_name"},
+            {"op": "function_create", "address": hex(host + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False, summary
+        after = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+
+
+_IMPLICIT_HOST_SETUP = (
+    # One function with no symbol of its own -- fifteen NOPs and a RET laid
+    # over the fixture's `main` on the test's private copy, started four
+    # bytes past the ELF symbol so BN names it `sub_<addr>` and registers
+    # nothing in the symbol table.
+    "base = [f for f in bv.functions if f.name == 'main'][0].start\n"
+    "for f in list(bv.functions):\n"
+    "    if base <= f.start < base + 0x14:\n"
+    "        bv.remove_user_function(f)\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.write(base + 4, b'\\x90' * 15 + b'\\xc3')\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base + 4); bv.update_analysis_and_wait()\n"
+    "print('HOST=' + hex(base + 4))\n"
+)
+
+
+def _implicit_host_snapshot_code(host: int) -> str:
+    return (
+        f"f = bv.get_function_at({host:#x})\n"
+        f"syms = [(s.name, s.auto) for s in bv.get_symbols({host:#x}, 1)]\n"
+        "ranges = [(hex(r.start), hex(r.end)) for r in f.address_ranges] if f else None\n"
+        f"inside = bv.get_function_at({host + 4:#x}) is not None\n"
+        "print('SNAP=' + repr((f.name if f else None, syms, ranges, inside)))\n"
+    )
+
+
+_SHARED_TAIL_SETUP = (
+    # Two user functions sharing a tail, one of them discontiguous -- the
+    # geometry the #927 review reproduced on a Mapped view, rebuilt over the
+    # bytes of the fixture's `main` on the test's private copy:
+    #   A @ base   = [base, base+2) + [base+0x10, base+0x19)   jmp +0x0e ... ret
+    #   B @ base+4 = [base+4, base+0x19)                        nops ... ret
+    "base = [f for f in bv.functions if f.name == 'main'][0].start\n"
+    "for f in list(bv.functions):\n"
+    "    if base <= f.start < base + 0x19:\n"
+    "        bv.remove_user_function(f)\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.write(base, b'\\xeb\\x0e' + b'\\x90' * 22 + b'\\xc3')\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base); bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base + 4); bv.update_analysis_and_wait()\n"
+    "print('BASE=' + hex(base))\n"
+)
+
+
+def _shared_tail_snapshot_code(base: int) -> str:
+    return (
+        "rows = sorted((hex(f.start), f.name, [(hex(r.start), hex(r.end)) for r in f.address_ranges])\n"
+        f"              for f in bv.functions if {base:#x} <= f.start < {base + 0x19:#x})\n"
+        "print('SNAP=' + repr(rows))\n"
+    )
+
+
+class TestFunctionCreateSplitRestore:
+    """#927 P1 on real BN: `--allow-overlap --preview` inside two hosts that
+    share a tail reported `rolled_back: true` while both hosts stayed
+    shortened and an analysis-created function owned the tail -- removing
+    the created function is not restoring the hosts. The revert now
+    verifies the hosts against a snapshot and repairs them (dropping the
+    analysis-created function, reanalyzing the hosts, putting the auto name
+    BN replaced back), on both the standalone and the batch path."""
+
+    def _build(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        base = int(_py_line(shared_bn, _SHARED_TAIL_SETUP, "BASE"), 16)
+        before = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        rows = eval(before)  # noqa: S307 - our own repr of hex strings and tuples
+        # The premise: two hosts share the tail and one is discontiguous.
+        assert [r[0] for r in rows] == [hex(base), hex(base + 4)], rows
+        assert rows[0][2] == [(hex(base), hex(base + 2)), (hex(base + 0x10), hex(base + 0x19))], rows
+        assert rows[1][2] == [(hex(base + 4), hex(base + 0x19))], rows
+        return base, before
+
+    def test_standalone_preview_restores_both_hosts(self, shared_bn):
+        base, before = self._build(shared_bn)
+
+        preview = shared_bn.run("function", "create", hex(base + 0x12), "--allow-overlap",
+                                "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload
+        # THE claim under test: `rolled_back: true` means the hosts are back.
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+        assert payload["results"][0]["status"] == "verified"
+        assert sorted((o["address"], o["truncated"]) for o in payload["results"][0]["overlaps"]) == [
+            (hex(base), True), (hex(base + 4), True)]
+
+    def test_batch_preview_restores_both_hosts(self, shared_bn, tmp_path):
+        base, before = self._build(shared_bn)
+        mf = tmp_path / "split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(base + 0x12), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+        assert payload["results"][0]["status"] == "verified"
+        assert {o["truncated"] for o in payload["results"][0]["overlaps"]} == {True}
+        # The hosts are affected functions of the batch too, with the diff the
+        # cut would make -- not only entries under the overlap list.
+        cut_hosts = {a["address"] for a in payload["affected_functions"] if a["changed"]}
+        assert {hex(base), hex(base + 4)} <= cut_hosts, payload["affected_functions"]
+
+        # And the live run does what the preview said: both hosts cut.
+        live = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--summary")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        summary = json.loads(live.stdout)
+        assert sorted(o["address"] for o in summary["overlapping_functions"]) == [
+            hex(base), hex(base + 4)]
+        assert _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP") != before
+
+
+class TestBatchSiblingCreateGuard:
+    """#927 P2 on real BN: `[create X, create X+4]` without `allow_overlap`
+    exited 0 with both verified and no overlap, because the second op's
+    guard ran before the first create had analyzed ranges. The batch now
+    analyzes between two creates, so the second is refused and the whole
+    batch -- the first create included -- is rolled back."""
+
+    def test_second_create_inside_the_first_is_refused(self, shared_bn, tmp_path):
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        gone = _py_line(shared_bn, (
+            f"f = bv.get_function_at({start:#x})\n"
+            "bv.remove_user_function(f); bv.update_analysis_and_wait()\n"
+            f"print('GONE=' + str(bv.get_function_at({start:#x}) is None))\n"), "GONE")
+        assert gone == "True"
+
+        mf = tmp_path / "siblings.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(start)},
+            {"op": "function_create", "address": hex(start + 4)}]}))
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 3, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert [r["status"] for r in payload["results"]] == ["reverted", "invalid_request"], payload
+        assert hex(start) in payload["results"][1]["message"] and "+0x4" in payload["results"][1]["message"]
+        assert payload["rolled_back"] is True
+        # Rolled back: the second create never persisted, and whatever sits at
+        # the first address (BN may re-derive `main` from its symbol once the
+        # user suppression is lifted) is not the 4-byte stub a live cut leaves.
+        sizes = _function_sizes(shared_bn)
+        assert hex(start + 4) not in sizes, sizes
+        assert sizes.get(hex(start), size) == size, sizes
+
+        # With the flag on the second op the batch commits, and the second
+        # row names the first create as the host it truncated.
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(start)},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True}]}))
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert [r["status"] for r in payload["results"]] == ["verified", "verified"]
+        assert payload["results"][1]["overlaps"][0]["address"] == hex(start)
+        assert payload["results"][1]["overlaps"][0]["truncated"] is True
+        sizes = _function_sizes(shared_bn)
+        assert sizes[hex(start)] == 4 and sizes[hex(start + 4)] == size - 4, sizes
+
+
 class TestTaintEmptyVerdictHonesty:
     """Regression for #310.1: a genuinely empty forward-taint result (no sink, no
     frontier) must carry the same loud 'NOT an all-clear' caveat the

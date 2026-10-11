@@ -3923,6 +3923,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "results", "prototype_user_type_residue",
     "changed_count", "verified_count", "noop_count", "failed_count",
     "measured", "dirty_after", "first_error",
+    # M-03: the paired renderer reads the split-host listing back off the
+    # summary; a listing, not a count, and absent on every `go rename`.
+    "overlapping_functions",
 }
 
 
@@ -4625,7 +4628,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # `items` / `noise_sections` lists), three list reads x 6 (+18).
     # #922 adds the class `aliases` lists (list row + show card) and the
     # secondary-vtable `confidence` text (+12). Measured: 1332.
-    assert checked == 1332, f"the differential ran {checked} cases, not 1332"
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads of
+    # the compact status line, the op row and the split-host listing (+24).
+    # Measured: 1356.
+    assert checked == 1356, f"the differential ran {checked} cases, not 1356"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4710,7 +4716,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # same envelope through `_render_strings_narrowed_text`): 10 x 8 (+80).
     # #922 adds the class `aliases` lists and the secondary `confidence`
     # text (+16). Total 5424.
-    assert swept == 5424, f"the raise sweep ran {swept} renders, not 5424"
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads
+    # (compact status line, op row and its builders, split-host listing),
+    # eight malformed values each (+32). Total 5456.
+    assert swept == 5456, f"the raise sweep ran {swept} renders, not 5456"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4896,7 +4905,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # the `data_sections` list read (3) and the narrowed `strings` face's nine
     # reads (two lists x 3 + seven scalars x 2 = 20) (+23). #922's `aliases`
     # lists and secondary `confidence` text add six (+6). Total 1578.
-    assert checked == 1578, f"the mirror ran {checked} renders, not 1578"
+    # #927 (M-03)'s overlap list reads add twelve benign probes (+12).
+    # Total 1590.
+    assert checked == 1590, f"the mirror ran {checked} renders, not 1590"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7620,8 +7631,10 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)):
                 keys.add(node.slice.value)
-    # #825's include_root and #890's unapplied_prototypes both join the row.
-    assert len(keys) == 12, f"the op row reads {sorted(keys)}, not 12 keys"
+    # #825's include_root and #890's unapplied_prototypes both join the row;
+    # M-03's split disclosure reads each overlap row's name/address/offset,
+    # and #927's observed fate adds `truncated`.
+    assert len(keys) == 16, f"the op row reads {sorted(keys)}, not 16 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -7648,12 +7661,12 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # Measured with both keys: 2376 renders, 1408 examined after the readable
+    # Measured with both keys: 3168 renders, 1848 examined after the readable
     # container carve-out. The two sizes are separate coverage claims.
-    assert (rendered, checked) == (2376, 1408), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 2376, and "
-        f"CHECKED {checked} of them, not 1408. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 968 "
+    assert (rendered, checked) == (3168, 1848), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 3168, and "
+        f"CHECKED {checked} of them, not 1848. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips 1320 "
         "renders before any assertion, and pinning only the larger number "
         "overstated the covered set by 40%.")
     # The other half, and the reason this is not a blanket "never print a
@@ -7758,8 +7771,11 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     # the narrowed `strings` face's `items` / `noise_sections` positions, three x
     # 36 (+108). #922 adds the two class `aliases` list positions (list row +
     # show card) at the same nine-by-four (+72). Measured: 5076.
-    assert swept == 5076, (
-        f"the element sweep ran {swept} renders, not 5076 -- the size of the "
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list positions
+    # (compact status line, op row and its builders, split-host listing) at
+    # the same nine-by-four (+144). Measured: 5220.
+    assert swept == 5220, (
+        f"the element sweep ran {swept} renders, not 5220 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
