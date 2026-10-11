@@ -31,6 +31,7 @@ brittle across compilers/optimisation.
 | `heap_field.c`         | backward slice through a heap struct-field length: reaching-store recovery, and a `field_load_unresolved` leaf when the store is out of scope (no silent dead-end at malloc) |
 | `bw_local_fill.c`      | backward slice from a `popen` command buffer continues through the modeled `snprintf` that filled the local buffer (origin: parameter → caller); an unmodeled in-binary writer handed `&buf` ends in an `address_of_local_unresolved` leaf and `safe_to_report_complete_slice: false` |
 | `strtok_loop.c`        | `strtok(NULL, ...)` continuation: the second token carries the tainted first call's state into `system()`, disclosed as an assumption |
+| `strtok_escape.c`      | strtok state left tainted at return is disclosed (`tokenizer_state_escapes`) and withholds `safe_to_report_all_clear`; a clean non-NULL `strtok` in between resets the continuation (negative) |
 
 ## `EXPECTED.json` schema
 
@@ -38,7 +39,7 @@ brittle across compilers/optimisation.
 {
   "lang": "c" | "cpp",
   "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],   // optional: extra compiler flags (e.g. to emit __*_chk)
-  "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}]}],
+  "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}],"all_clear": false}],
   // "resolve_map": {"in_function": <fn>, "target": <callee>},  // optional: pin the lone indirect call in <fn> to <callee> via --resolve-map (addresses resolved at test time). <fn> must contain EXACTLY ONE indirect call so the harness can resolve it unambiguously.
   // "assumptions_contain": ["substr", ...],                    // optional: each substring must appear in an assumptions entry
   "backward": [{"function","sink","origin_kinds":[...],"leaves":[{"kind"}],"forbid_leaves":[{"kind"}],"step_reasons_contain":["substr"],"complete_slice": false,"expect_crossed": "<fn>"}],

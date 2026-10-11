@@ -1,0 +1,13 @@
+{
+  "description": "strtok state left tainted at return is disclosed (tokenizer_state_escapes) and withholds the all-clear; a clean non-NULL strtok in between resets the continuation so the later strtok(NULL) -> system is not a flow",
+  "lang": "c",
+  "forward": [
+    {"function": "tok_escape", "source": "arg:read:1",
+     "assumptions_contain": ["tokenizer_state_escapes"],
+     "all_clear": false}
+  ],
+  "negative": [
+    {"function": "tok_reset", "source": "arg:read:1",
+     "forbid_sink_classes": ["command_injection"]}
+  ]
+}

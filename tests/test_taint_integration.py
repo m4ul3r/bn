@@ -144,6 +144,10 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         for want_leaf in case.get("leaves", []):
             assert any(l["kind"] == want_leaf["kind"] for l in result["leaves"]), \
                 f"{stem}: expected leaf {want_leaf} not in {result['leaves']}"
+        if "all_clear" in case:
+            gate = result["diagnostics"]["safe_to_report_all_clear"]
+            assert gate is case["all_clear"], \
+                f"{stem}: safe_to_report_all_clear={gate}, expected {case['all_clear']}: {result['diagnostics']}"
         assert result["soundness"]
 
     for case in spec.get("backward", []):

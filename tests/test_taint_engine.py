@@ -9629,3 +9629,60 @@ def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
     src = te.model_overlay_sources({"app_recv": {"_comment": "benign on purpose"}})
     user = [s for s in src if s["kind"] == "user"][0]
     assert user["count"] == 0 and user["benign"] == 1, user
+
+
+def _addr_of(v):
+    return FExpr("MLIL_ADDRESS_OF", f"&{v.name}", src=v)
+
+
+def _cstr(addr):
+    return FExpr("MLIL_CONST_PTR", hex(addr), constant=addr)
+
+
+def test_strtok_state_left_tainted_at_return_withholds_all_clear_928():
+    # Mythos P2: `read(fd, line); strtok(line, " "); helper_next();` where the
+    # helper does `strtok(NULL) -> system`: the walk armed the continuation
+    # state and returned with it set, and said nothing -- `safe_to_report_all_clear:
+    # true`. The escape is now disclosed and withholds the all-clear.
+    line = FVar("line", typ="char[0x40]"); t1 = FVar("t1"); t1_1 = FSSA(t1, 1)
+    STRTOK, HELPER = 0x900, 0x902
+    instrs = [
+        _ext_call(0, 0x10, 't1#1 = strtok(&line, " ")', STRTOK,
+                  [_addr_of(line), _cstr(0x700)], writes=[t1_1]),
+        _ext_call(1, 0x14, "helper_next()", HELPER, []),
+    ]
+    func = FFunc("tokenize", 0x10, FSSAFunc(instrs), params=[line])
+    result = te.TaintEngine(FBV({STRTOK: "strtok", HELPER: "helper_next"}), te.load_models()).forward(
+        func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == []
+    esc = [a for a in result["assumptions"] if a.startswith("tokenizer_state_escapes @ 0x10")]
+    assert esc and "ANOTHER function" in esc[0], result["assumptions"]
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False, diag
+    assert "tokenizer_state_escapes" in diag["all_clear_reason"], diag
+
+
+def test_strtok_clean_non_null_call_resets_the_continuation_928():
+    # Mythos P3: `strtok(line_tainted); strtok(other_clean); x = strtok(NULL);
+    # system(x)` -- a non-NULL call ALWAYS resets libc's state, so the clean
+    # call is a precise kill: no flow, no escape at return, all-clear stands.
+    line = FVar("line", typ="char[0x40]"); other = FVar("other", typ="char[0x40]")
+    t1 = FVar("t1"); t2 = FVar("t2"); t3 = FVar("t3")
+    t1_1, t2_1, t3_1 = FSSA(t1, 1), FSSA(t2, 1), FSSA(t3, 1)
+    STRTOK, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, 't1#1 = strtok(&line, " ")', STRTOK,
+                  [_addr_of(line), _cstr(0x700)], writes=[t1_1]),
+        _ext_call(1, 0x14, 't2#1 = strtok(&other, " ")', STRTOK,
+                  [_addr_of(other), _cstr(0x700)], writes=[t2_1]),
+        _ext_call(2, 0x18, 't3#1 = strtok(nullptr, " ")', STRTOK,
+                  [FExpr("MLIL_CONST", "0", constant=0), _cstr(0x700)], writes=[t3_1]),
+        _ext_call(3, 0x1c, "system(t3#1)", SYS,
+                  [FExpr("MLIL_VAR_SSA", "t3#1", reads=[t3_1])], reads=[t3_1]),
+    ]
+    func = FFunc("tokenize", 0x10, FSSAFunc(instrs), params=[line])
+    result = te.TaintEngine(FBV({STRTOK: "strtok", SYS: "system"}), te.load_models()).forward(
+        func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    assert not any("tokenizer" in a for a in result["assumptions"]), result["assumptions"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]

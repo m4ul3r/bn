@@ -4072,6 +4072,12 @@ class TaintEngine:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
                         if hit is not None:
                             continuation_state[mkey or name or "?"] = (hit, addr)
+                        else:
+                            # A non-NULL call ALWAYS resets libc's state: a
+                            # clean `strtok(other, ..)` between the tainted
+                            # call and the `strtok(NULL, ..)` is a precise
+                            # kill, not a flow to disclose (PR-928 review P3).
+                            continuation_state.pop(mkey or name or "?", None)
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -4820,6 +4826,21 @@ class TaintEngine:
             # "no sinks reached" indistinguishable from a converged run.
             self._truncated = True
             self._truncation_causes.add("fixpoint_exhausted")
+
+        # A tokenizer's static state still tainted when this function returns:
+        # a `strtok(NULL, ..)` in a CALLER or a CALLEE continues it, and the
+        # continuation model is per function, so that flow is not followed. The
+        # walk KNOWS it armed the state and returned with it set -- silence here
+        # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
+        # a marker the zero-sink gate withholds the all-clear on.
+        for ckey, (_, st_addr) in continuation_state.items():
+            add_assumption(
+                f"tokenizer_state_escapes @ {hex(st_addr)}: the static tokenizer "
+                f"state of {ckey} is tainted by the {ckey} call @ {hex(st_addr)} when "
+                f"{func.name} returns; a {ckey}(NULL, ...) continuation in ANOTHER "
+                f"function (a caller or a callee) is not followed, so a 'no sinks "
+                f"reached' result is NOT an all-clear -- seed `bn taint forward` "
+                f"inside the function that continues the tokenizer")
 
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --

@@ -195,6 +195,15 @@ def _derive_all_clear(
         return False, (
             f"no modeled sink reached, but {len(leaves)} frontier leaf(s) "
             f"remain -- NOT an all-clear")
+    if any("tokenizer_state_escapes" in str(a) for a in assumptions):
+        # A `continuation` model (strtok) left its static state tainted when
+        # the function returned; a `strtok(NULL, ..)` in another function
+        # continues it and is not followed, so the empty result speaks only
+        # for this function's own tokens (PR-928 review P2).
+        return False, (
+            "no modeled sink reached, but a tokenizer's static state is left "
+            "tainted at return (see the tokenizer_state_escapes caveat) -- a "
+            "continuation in another function is not followed, NOT an all-clear")
     if weak_seed:
         return False, (
             "no sinks/leaves, but the source seed was incomplete or mis-anchored "
