@@ -670,7 +670,10 @@ class _ShapeProbeBridge:
 #: strict mode must turn each of them red. The module's OTHER skips are
 #: toolchain prerequisites (a missing cross-compiler, a failed compile) that a
 #: machine can un-skip by installing the toolchain -- the convention this
-#: module already uses for `_cc_available` -- so they stay plain skips.
+#: module already uses for `_cc_available` -- so they stay plain skips, except
+#: the AArch64 probe builder, whose own strict-gate tests live beside it
+#: (`TestAArch64ProbeStrictGate`): it is the lane's only real-architecture
+#: guard, so under strict mode a lost toolchain is a failure there too.
 _FIXTURE_SHAPE_SKIP_CELLS = (
     ("TestFunctionCreatePreviewHonesty", "test_preview_then_live_agree", False,
      "preview/live"),
