@@ -115,17 +115,33 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # author meant (#915). The one roleless shape that IS meaningful is the EMPTY
 # object: the builtin DB marks functions that neither source, propagate nor
 # sink taint with `{}` so a tainted argument does not trigger the conservative
-# "unmodeled external" fallback (`_comment_benign` in taint_models.json).
+# "unmodeled external" fallback (`_comment_benign` in taint_models.json). An
+# entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
                     "return_bound", "arity_capped", "destinations_unmodeled")
-# Fields that belong INSIDE `sink`; at the root they are the #915 flat shape.
-_SINK_INTERIOR_KEYS = ("class", "tainted_args", "len_arg", "buf_arg", "detail",
-                       "optional", "gate")
+# The fields that ARM a sink. At the root with no `sink` beside them they are
+# the #915 flat shape -- the author wrote a sink that can never fire. Prose
+# fields (`detail`, `optional`, `gate`) are not flagged: they arm nothing, and
+# the docstring's promise that unknown keys beside a role are left alone
+# covers an annotation such as `{"propagates": [...], "detail": "wrapper"}`.
+_SINK_ARMING_KEYS = ("class", "tainted_args", "len_arg", "buf_arg")
+
+
+def _effective_keys(model: Any) -> list[str]:
+    """The keys of *model* that are not ``_comment*`` annotations."""
+    if not isinstance(model, dict):
+        return []
+    return [k for k in model if not str(k).startswith("_comment")]
+
+
+def model_is_benign_marker(model: Any) -> bool:
+    """True for the documented no-op entry: ``{}`` or ``_comment*`` keys only."""
+    return isinstance(model, dict) and not _effective_keys(model)
 
 
 def model_has_role(model: Any) -> bool:
     """True when *model* carries at least one recognised role key -- the entries
-    the overlay disclosure counts as models (a benign `{}` is disclosed
+    the overlay disclosure counts as models (a benign marker is disclosed
     separately, #915)."""
     return isinstance(model, dict) and any(k in model for k in _MODEL_ROLE_KEYS)
 
@@ -140,28 +156,32 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
     all is rejected (#915): it merges to nothing, yet it was counted as an active
     model and, being a truthy dict, took every `model is not None` branch of the
     walk (skipping the unrecovered-arg frontier a genuinely unmodeled call would
-    have raised) -- a no-op that still changed the result."""
+    have raised) -- a no-op that still changed the result. The same holds for a
+    role declared EMPTY (`"sources": []`, `"propagates": []`, `"varargs": {}`):
+    it counted as one model, rendered no catalog row, and silently replaced the
+    builtin entry of the same name with nothing (PR-928 review P2)."""
     def _fail(msg: str) -> None:
         raise TaintError(f"{source}: model {name!r} {msg}")
 
     def _is_int(v: Any) -> bool:
         return isinstance(v, int) and not isinstance(v, bool)
 
-    misplaced = [k for k in _SINK_INTERIOR_KEYS if k in model]
-    if misplaced:
-        # The #915 flat shape, whether or not a role sits beside it: these
-        # fields do nothing at the root, so the sink the author wrote is never
-        # armed. Name the key and the nesting that would arm it.
+    if model_is_benign_marker(model):
+        return
+    misplaced = [k for k in _SINK_ARMING_KEYS if k in model]
+    if misplaced and "sink" not in model:
+        # The #915 flat shape: the fields that would arm a sink sit at the root,
+        # where they do nothing. Name the key and the nesting that would arm it.
         shown = ", ".join(f"`{k}`" for k in misplaced)
         _fail(f"has sink field(s) {shown} at the top level; they must be nested "
               f"under `sink` -- {{\"{name}\": {{\"sink\": {{\"class\": ..., "
               f"\"tainted_args\": [...]}}}}}}")
-    if model and not model_has_role(model):
+    if not model_has_role(model):
         _fail(f"declares no recognised model role (keys: "
-              f"{', '.join(repr(k) for k in model)}); a model needs at least one of "
-              f"{'/'.join(_MODEL_ROLE_KEYS)}, each nested under the symbol name "
-              f"({{\"{name}\": {{\"sink\": {{...}}}}}}); an empty {{}} marks a benign "
-              f"function that neither sources, propagates nor sinks taint")
+              f"{', '.join(repr(k) for k in _effective_keys(model))}); a model needs "
+              f"at least one of {'/'.join(_MODEL_ROLE_KEYS)}, each nested under the "
+              f"symbol name ({{\"{name}\": {{\"sink\": {{...}}}}}}); an empty {{}} marks "
+              f"a benign function that neither sources, propagates nor sinks taint")
 
     if "sink" in model:
         sink = model["sink"]
@@ -189,10 +209,23 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
             seq = model[key]
             if not isinstance(seq, list) or not all(isinstance(e, dict) for e in seq):
                 _fail(f"`{key}` must be a list of objects")
+            if not seq:
+                _fail(f"declares `{key}` with no rules -- an empty role arms nothing "
+                      f"yet counted as an active model and replaced any builtin "
+                      f"`{name}` model with it; give it rules or use {{}} to mark "
+                      f"{name} benign")
+            for e in seq:
+                if not isinstance(e.get("to"), str):
+                    _fail(f"`{key}` rule {e!r} needs a string `to` (`ret` / `*arg:N`)")
+                if key == "propagates" and not isinstance(e.get("from"), str):
+                    _fail(f"`propagates` rule {e!r} needs a string `from` (`arg:N` / `*arg:N`)")
     if "varargs" in model:
         va = model["varargs"]
         if not isinstance(va, dict):
             _fail(f"`varargs` must be an object, got {type(va).__name__}")
+        if not isinstance(va.get("to"), str):
+            _fail("`varargs` needs a string `to` (the `*arg:N` the varargs run is "
+                  "formatted into) -- an empty `varargs` declaration arms nothing")
         fi = va.get("first_index")
         if fi is not None and not _is_int(fi):
             _fail("`varargs.first_index` must be an integer")
@@ -292,7 +325,7 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
         entries = ([m for k, m in inner.items() if not str(k).startswith("_comment")]
                    if isinstance(inner, dict) else [])
         count = sum(1 for m in entries if model_has_role(m))
-        benign = sum(1 for m in entries if isinstance(m, dict) and not m)
+        benign = sum(1 for m in entries if model_is_benign_marker(m))
         # #615 review F8: when the bridge was ALSO spawned with BN_TAINT_MODELS
         # pointed at this SAME file, the override above already discloses it --
         # skip the duplicate `user` entry so the same file isn't listed twice

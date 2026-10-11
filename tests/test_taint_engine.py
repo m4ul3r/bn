@@ -6408,11 +6408,12 @@ def test_load_models_validates_user_model_interiors():
             te.load_models(extra=bad)
         assert "app" in str(ei.value)   # the offending model is named
 
-    # a fully-valid model still loads (sink + tainted_args + propagates + varargs)
+    # a fully-valid model still loads (sink + tainted_args + propagates + varargs;
+    # a varargs run must name the `to` it is formatted into -- PR-928 review P2)
     good = {"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1, 2]},
                          "propagates": [{"from": "*arg:1", "to": "*arg:0"}],
                          "sources": [{"to": "*arg:0"}],
-                         "varargs": {"first_index": 3}}}
+                         "varargs": {"first_index": 3, "to": "*arg:0"}}}
     merged = te.load_models(extra=good)
     assert merged["app_copy"]["sink"]["class"] == "overflow_len"
     # bool is not an int for tainted_args (bool is an int subclass in Python)
@@ -9557,12 +9558,22 @@ def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
     msg2 = str(ei2.value)
     assert "no recognised model role" in msg2 and "sink/sources/propagates" in msg2, msg2
 
-    # A misplaced sink field beside a real role is still the flat mistake.
-    with pytest.raises(te.TaintError):
-        te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
+    # Only the fields that ARM a sink are "misplaced", and only with no `sink`
+    # beside them: a prose annotation beside a real role is left alone (the
+    # docstring's forward-compat promise), as is a root-level `len_arg` next
+    # to a nested sink that already arms the entry (PR-928 review P3).
+    with_sink = te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
+    assert with_sink["app_recv"]["sink"]["class"] == "x"
+    annotated = te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                                                   "detail": "project copy wrapper",
+                                                   "optional": True, "gate": "x"}})
+    assert annotated["app_copy"]["propagates"][0]["to"] == "*arg:0"
 
     benign = te.load_models(extra={"app_recv": {}})
     assert benign["app_recv"] == {}
+    # An entry whose only keys are `_comment*` annotations is the same marker.
+    commented = te.load_models(extra={"app_recv": {"_comment": "benign on purpose"}})
+    assert commented["app_recv"] == {"_comment": "benign on purpose"}
 
     # The engine never sees a roleless entry: the same walk as builtin.
     func, bv = _popen_of_local_program(fill="snprintf")
@@ -9572,6 +9583,34 @@ def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
     again = te.TaintEngine(bv, te.load_models(extra={"compose": {}})).backward(
         func, [te.parse_locator("arg:popen:0")])
     assert again["slices"] == base["slices"]
+
+
+def test_empty_recognised_roles_are_rejected_915(models):
+    # PR-928 review P2: `{"strtok": {"sources": []}}` was accepted, printed
+    # `1 model(s)`, rendered no catalog row, and REPLACED the builtin strtok
+    # model with nothing -- a real continuation's `system` flow went to zero
+    # with `safe_to_report_all_clear: true`. Key presence is not a role; the
+    # role's CONTENTS must arm something.
+    import pytest
+    for empty in ({"strtok": {"sources": []}},
+                  {"strtok": {"propagates": []}},
+                  {"app_fmt": {"varargs": {}}},
+                  {"app_fmt": {"varargs": {"first_index": 2}}},
+                  {"app_copy": {"propagates": [{"to": "*arg:0"}]}},
+                  {"app_recv": {"sources": [{"from": "*arg:0"}]}}):
+        with pytest.raises(te.TaintError) as ei:
+            te.load_models(extra=empty)
+        msg = str(ei.value)
+        assert next(iter(empty)) in msg, msg
+    assert "arms nothing" in str(pytest.raises(
+        te.TaintError, te.load_models, extra={"strtok": {"sources": []}}).value)
+
+    # The builtin strtok continuation survives: the overlay never reaches the walk.
+    func, bv = _strtok_program()
+    with pytest.raises(te.TaintError):
+        te.load_models(extra={"strtok": {"sources": []}})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
 
 
 def test_model_overlay_count_excludes_benign_markers_915():
@@ -9584,3 +9623,9 @@ def test_model_overlay_count_excludes_benign_markers_915():
     assert only_benign["count"] == 0 and only_benign["benign"] == 1, only_benign
     no_benign = [s for s in te.model_overlay_sources({"app_copy": {"sources": [{"to": "ret"}]}}) if s["kind"] == "user"][0]
     assert no_benign["count"] == 1 and "benign" not in no_benign, no_benign
+
+
+def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
+    src = te.model_overlay_sources({"app_recv": {"_comment": "benign on purpose"}})
+    user = [s for s in src if s["kind"] == "user"][0]
+    assert user["count"] == 0 and user["benign"] == 1, user
