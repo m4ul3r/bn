@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -744,6 +745,11 @@ def _session_status(args: argparse.Namespace) -> int:
             default=None,
             help="Instance ID to stop (alias for the positional or -i/--instance)",
         ),
+        arg(
+            "--discard-unsaved",
+            action="store_true",
+            help="Stop even when a target has committed-but-unsaved mutations, discarding them",
+        ),
     ],
 )
 def _session_stop(args: argparse.Namespace) -> int:
@@ -786,6 +792,13 @@ def _session_stop(args: argparse.Namespace) -> int:
     # that unreachable process is exactly the one this command must be able to
     # stop (#694).
     inst = cli.find_lifecycle_instance(target_id)
+    # Refuse to discard committed-but-unsaved work (M-01): `bn close` discloses
+    # a discard, so a stop that silently threw the same edits away was the one
+    # path that lost them without a word. Best-effort: an unreachable bridge
+    # cannot be asked, and stopping THAT one is exactly what #694 is for.
+    discarded = _guard_unsaved_targets(
+        "stop", target_id, inst, discard=bool(getattr(args, "discard_unsaved", False))
+    )
     # One verified pin for the whole escalation, opened BEFORE the graceful
     # shutdown so the process this command may later signal is pinned throughout
     # (#694): the pid cannot be recycled while pinned, and both SIGTERM and
@@ -808,6 +821,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
         if method == "sigterm":
             result["method"] = method
+        if discarded:
+            result["discarded_unsaved"] = discarded
 
         # Block until the socket/registry are gone and the process has exited, so a
         # follow-on `bn session start --instance-id <same>` can't race the dying
@@ -843,7 +858,15 @@ def _session_stop(args: argparse.Namespace) -> int:
 
 
 @command("session", "restart", help="Stop a bridge session and respawn it (same id), reloading its targets",
-         args=[arg("instance", help="Instance ID to restart")])
+         args=[
+             arg("instance", help="Instance ID to restart"),
+             arg(
+                 "--discard-unsaved",
+                 action="store_true",
+                 help="Restart even when a target has committed-but-unsaved mutations, "
+                      "discarding them (the reload starts from the file on disk)",
+             ),
+         ])
 def _session_restart(args: argparse.Namespace) -> int:
     """Cleanly reload a live session running stale code (#161): capture its open
     targets, stop the process, respawn under the same instance id, and reload the
@@ -859,14 +882,21 @@ def _session_restart(args: argparse.Namespace) -> int:
         )
     resolved_id = inst.instance_id
 
-    # Capture loaded targets (+ their analysis state) BEFORE tearing down.
+    # Capture loaded targets (+ their analysis state) BEFORE tearing down. One
+    # listing serves two readers: the reload below and the unsaved guard. The
+    # guard is a SAFETY count, so like `session list`'s probe it asks for a
+    # strict walk rather than trusting a snapshot the bridge knows is lossy.
     reload_targets: list[dict[str, Any]] = []
+    listed_rows: list[Any] = []
     reload_capture_failed = False
     reload_capture_error: str | None = None
     try:
-        resp = cli._send_request_to_instance(inst, "list_targets", params={}, target=None)
+        resp = cli._send_request_to_instance(
+            inst, "list_targets", params={"strict": True}, target=None
+        )
+        rows = list(unwrap_result(resp, "list_targets") or [])
         captured: list[dict[str, Any]] = []
-        for t in (unwrap_result(resp, "list_targets") or []):
+        for t in rows:
             path = t.get("filename")
             if path:
                 captured.append({
@@ -884,6 +914,7 @@ def _session_restart(args: argparse.Namespace) -> int:
         # exception (a malformed row) must never leave a partially populated
         # reload_targets that gets reloaded and reported as a complete `loaded`.
         reload_targets = captured
+        listed_rows = rows
     except Exception as exc:
         # #620(a): don't silently drop the target-enumeration failure -- the
         # restart still proceeds (with no targets to reload), but the caller
@@ -898,6 +929,17 @@ def _session_restart(args: argparse.Namespace) -> int:
             f"{reload_capture_error}",
             file=sys.stderr,
         )
+
+    # Refuse to discard committed-but-unsaved work (M-01) BEFORE the old
+    # process is stopped: the reload below reopens each target from disk, so
+    # anything not saved is gone. An unreachable bridge yields no rows and
+    # proceeds -- restarting it is a recovery path (#694), not a loss.
+    discarded = _unsaved_targets_or_refuse(
+        "restart",
+        target_id,
+        listed_rows,
+        discard=bool(getattr(args, "discard_unsaved", False)),
+    )
 
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
@@ -988,6 +1030,8 @@ def _session_restart(args: argparse.Namespace) -> int:
     if reload_capture_failed:
         result["reload_capture_failed"] = True
         result["reload_capture_error"] = reload_capture_error
+    if discarded:
+        result["discarded_unsaved"] = discarded
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures or association_error or reload_capture_failed else 0
 
@@ -1006,6 +1050,70 @@ def _require_signal_delivered(reason: str | None, target_id: str) -> None:
             f"{reason}. Bridge instance {target_id} was left as it is; stop it "
             "manually, then run `bn session start`."
         )
+
+
+def _guard_unsaved_targets(
+    verb: str, instance_id: str, inst: Any, *, discard: bool
+) -> list[dict[str, Any]]:
+    """Ask *inst* for its targets and apply `_unsaved_targets_or_refuse`.
+
+    Best-effort by design: a registry entry without a reachable bridge (no
+    `inst`, or a listing that fails) yields no rows and the stop proceeds --
+    the guard protects work a live bridge still holds, it must never make a
+    dead bridge impossible to stop (#694).
+    """
+    rows: list[Any] = []
+    if inst is not None:
+        try:
+            resp = cli._send_request_to_instance(
+                inst, "list_targets", params={"strict": True}, target=None
+            )
+            rows = list(unwrap_result(resp, "list_targets") or [])
+        except (BridgeError, OSError):
+            rows = []
+    return _unsaved_targets_or_refuse(verb, instance_id, rows, discard=discard)
+
+
+def _unsaved_targets_or_refuse(
+    verb: str, instance_id: str, rows: list[Any], *, discard: bool
+) -> list[dict[str, Any]]:
+    """The `discarded_unsaved` entries for *rows*, or a refusal (M-01).
+
+    `list_targets` rows carry the bridge's committed-but-unsaved ledger as
+    `unsaved`. A `session stop`/`restart` that proceeded past it threw those
+    edits away without a word, while `bn close` of the same target prints
+    `[unsaved changes discarded]`. Without `--discard-unsaved` the command now
+    refuses and names each target by its copy-paste `-t` selector plus the
+    exact `save` that persists it; with the flag it proceeds and the caller
+    gets the same disclosure `close` prints.
+    """
+    unsaved = [
+        {
+            "selector": row.get("selector"),
+            "target_id": row.get("target_id"),
+            "path": row.get("filename"),
+        }
+        for row in rows
+        if isinstance(row, dict) and row.get("unsaved") is True
+    ]
+    if not unsaved or discard:
+        return unsaved
+    noun = "target" if len(unsaved) == 1 else "targets"
+    lines = [
+        f"session {verb}: instance {instance_id} has {len(unsaved)} {noun} with "
+        f"unsaved changes; a {verb} would discard them."
+    ]
+    lines.extend(
+        f"  -t {shlex.quote(str(entry['selector'] or ''))}  {entry['path'] or ''}"
+        for entry in unsaved
+    )
+    lines.append("Save first:")
+    lines.extend(
+        f"  bn -i {shlex.quote(str(instance_id))} -t {shlex.quote(str(entry['selector'] or ''))} save"
+        for entry in unsaved
+    )
+    lines.append(f"Or pass --discard-unsaved to {verb} anyway and discard them.")
+    raise BridgeError("\n".join(lines))
 
 
 def _associate_project_roots(

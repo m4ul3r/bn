@@ -1368,6 +1368,7 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
 
@@ -1413,7 +1414,26 @@ def _render_session_stop_text(value: Any) -> str:
     method = value.get("method")
     if method:
         line += f" ({method})"
-    return line
+    return "\n".join([line, *_discarded_unsaved_lines(value)])
+
+
+def _discarded_unsaved_lines(value: dict[str, Any]) -> list[str]:
+    """The `[unsaved changes discarded]` disclosure for a `session stop` /
+    `session restart --discard-unsaved` result -- the same marker and warning
+    `bn close` prints, so a reader learns one shape for a discard."""
+    discarded = _field_list(value, "discarded_unsaved")
+    if not discarded:
+        return []
+    lines = ["", "discarded:"]
+    for entry in discarded:
+        path = entry.get("path") if isinstance(entry, dict) else entry
+        lines.append(f"- {path or '<unknown>'}  [unsaved changes discarded]")
+    lines.append("")
+    lines.append(
+        "warning: unsaved mutations were discarded. "
+        "use `bn save` before stopping or restarting a session to persist them."
+    )
+    return lines
 
 
 @_discloses

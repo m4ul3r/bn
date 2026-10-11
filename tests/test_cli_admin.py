@@ -4263,3 +4263,155 @@ def test_the_runtime_reference_denies_no_environment_default_the_cli_honours(
 
     assert "BN_TARGET" not in denied, (
         "runtime.md denies BN_TARGET while the root `-t` default reads it")
+
+
+# --- M-01: session stop/restart must not silently discard unsaved mutations ---
+
+
+def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1"):
+    """Wire a live instance whose `list_targets` answers *rows*; record ops."""
+    import pathlib
+
+    from bn.transport import BridgeInstance
+
+    old = _fake_bridge_instance(instance_id, pid=500)  # noqa: F405
+    new = BridgeInstance(
+        pid=999, socket_path=pathlib.Path("/tmp/new.sock"),
+        registry_path=pathlib.Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id=instance_id,
+    )
+    calls: list[tuple[str, object]] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kw):
+        calls.append((op, params))
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    def fake_to_instance(instance, op, *, params=None, target=None, **kw):
+        calls.append((op, params))
+        return {"ok": True, "result": rows}
+
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", fake_to_instance)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    _fake_signaller(monkeypatch)
+    return calls
+
+
+_UNSAVED_ROWS = [
+    {"filename": "/work/parser", "selector": "parser", "target_id": "t1",
+     "analysis_state": "full", "unsaved": True},
+    {"filename": "/work/helper", "selector": "helper", "target_id": "t2",
+     "analysis_state": "full", "unsaved": False},
+]
+
+
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+def test_session_lifecycle_refuses_to_discard_unsaved_targets(monkeypatch, capsys, verb):
+    calls = _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+
+    rc = bn.cli.main(["session", verb, "fix-1"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unsaved changes" in err
+    assert "-t parser" in err and "-t helper" not in err
+    assert "bn -i fix-1 -t parser save" in err
+    assert "--discard-unsaved" in err
+    # Nothing was torn down: the listing is the only request made.
+    assert [op for op, _ in calls] == ["list_targets"]
+    assert not _FakeSignaller.instances or not _FakeSignaller.instances[0].sent
+
+
+def test_session_restart_discard_unsaved_proceeds_and_discloses(monkeypatch, capsys):
+    calls = _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+
+    rc = bn.cli.main(["session", "restart", "fix-1", "--discard-unsaved", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["restarted"] is True
+    assert payload["discarded_unsaved"] == [
+        {"selector": "parser", "target_id": "t1", "path": "/work/parser"}
+    ]
+    ops = [op for op, _ in calls]
+    assert "shutdown" in ops
+    assert sorted(p["path"] for op, p in calls if op == "load_binary") == ["/work/helper", "/work/parser"]
+
+
+def test_session_restart_discard_unsaved_text_discloses_like_close(monkeypatch, capsys):
+    _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+
+    rc = bn.cli.main(["session", "restart", "fix-1", "--discard-unsaved"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "- /work/parser  [unsaved changes discarded]" in out
+    assert "/work/helper  [unsaved" not in out
+    assert "warning: unsaved mutations were discarded" in out
+
+
+def test_session_stop_discard_unsaved_proceeds_and_discloses(monkeypatch, capsys):
+    calls = _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--discard-unsaved", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] is True
+    assert payload["discarded_unsaved"] == [
+        {"selector": "parser", "target_id": "t1", "path": "/work/parser"}
+    ]
+    assert [op for op, _ in calls] == ["list_targets", "shutdown"]
+
+
+def test_session_stop_discard_unsaved_text_discloses_like_close(monkeypatch, capsys):
+    _unsaved_guard_fixture(monkeypatch, _UNSAVED_ROWS)
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--discard-unsaved"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("stopped: fix-1\n")
+    assert "- /work/parser  [unsaved changes discarded]" in out
+    assert "warning: unsaved mutations were discarded" in out
+
+
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+def test_session_lifecycle_without_unsaved_targets_is_unchanged(monkeypatch, capsys, verb):
+    clean = [dict(row, unsaved=False) for row in _UNSAVED_ROWS]
+    calls = _unsaved_guard_fixture(monkeypatch, clean)
+
+    rc = bn.cli.main(["session", verb, "fix-1", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "discarded_unsaved" not in payload
+    assert "shutdown" in [op for op, _ in calls]
+
+
+def test_session_stop_dead_bridge_skips_the_unsaved_guard(monkeypatch, capsys):
+    # The guard is best-effort: a bridge that cannot answer `list_targets` is
+    # exactly the one `session stop` must still be able to stop (#694).
+    import signal as signal_mod
+
+    from bn.transport import BridgeError
+
+    def fail(*a, **kw):
+        raise BridgeError("bridge_not_running: gone")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", fail)
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _unreachable_fake_instance("fix-1")
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    signallers = _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "stop", "fix-1", "--format", "json"])
+
+    assert rc == 0
+    assert signallers[0].sent == [signal_mod.SIGTERM]
+    assert json.loads(capsys.readouterr().out)["method"] == "sigterm"
