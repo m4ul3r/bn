@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-from _bridge_fakes import _FakeBV, _FakeConstPtr, _FakeLLILInstruction, _FakeSection
+from _bridge_fakes import _FakeArch, _FakeBV, _FakeConstPtr, _FakeLLILInstruction, _FakeSection
 
 read_class = importlib.import_module("bn_agent_bridge.read_class")
 seam = importlib.import_module("bn_agent_bridge.seam")
@@ -443,6 +443,8 @@ class _RecoverCtx:
     def _vtable_layout_for(self, bv, addr):
         layout = self._layouts.get(addr)
         return dict(layout) if layout is not None else layout
+    def _address_context(self, bv, addr, **kw):
+        return {}   # #922 (a): no section names -> the typeinfo is not a GOT slot
 
 
 class _RecoverBV:
@@ -977,6 +979,9 @@ class _EnrichCtx(_SizeCtx):
     def _instances_for(self, bv, record):
         return {}
 
+    def _address_context(self, bv, address, **kw):
+        return {}
+
 
 def test_size_none_when_nothing_resolves():
     """A miss stays a bare `None`, NOT a value-less envelope: `_render_one_class`
@@ -1139,6 +1144,9 @@ def test_class_show_assembles_full_record():
     class _ShowCtx:
         _find_function = seam.BridgeContext._find_function
         _sections_at = seam.BridgeContext._sections_at
+
+        def _address_context(self, b, addr, **kw):
+            return {}
 
         def _resolve_view(self, sel):
             return bv
@@ -1797,6 +1805,7 @@ def test_vtable_layout_early_return_carries_truncation_keys():
         "slots_truncated": False,
         "scan_truncated": False,
         "truncated_reason": "no_local_vtable_body",
+        "bn_vtable_slots": None,
     }
 
 
@@ -3740,3 +3749,306 @@ def test_both_spellings_of_the_structure_kind_are_admitted_675(monkeypatch):
     assert sorted(row["name"] for row in
                   read_class._class_list(ctx, None, include_all=True)["items"]
                   if row["confidence"] == "declared-only") == ["ByInt", "ByName"]
+
+
+# --- #922: RTTI records, GOT slots and spelling variants mistaken for class facts ---
+
+
+def _le64(*words):
+    return b"".join(int(w).to_bytes(8, "little") for w in words)
+
+
+def _import_class_bv():
+    """An IMPORTED class (`net::Timeout`): its `typeinfo for` symbol is a `.got`
+    slot (an ImportAddressSymbol), not an RTTI object. The word `+2*ptr` past the
+    slot -- where an `__si_class_type_info` keeps its base pointer -- is the
+    UNRELATED next GOT entry, a pointer to another class's vtable."""
+    syms = [
+        _Sym("_ZTIN3net7TimeoutE", "typeinfo for net::Timeout", 0x9400,
+             "SymbolType.ImportAddressSymbol"),
+        _Sym("_ZTVN3app7StorageE", "vtable for app::Storage", 0x9000),
+        _Sym("_ZTIN3app7StorageE", "typeinfo for app::Storage", 0x9100),
+    ]
+    sections = {".got": _FakeSection(".got", 0x9400, 0x9500)}
+    memory = {0x9400: _le64(0x9800, 0x9808, 0x9000, 0x9100)}
+    return _FakeBV(symbols=syms, sections=sections, memory=memory,
+                   arch=_FakeArch(name="aarch64", address_size=8))
+
+
+def test_bases_refuse_an_import_slot_typeinfo_922():
+    # #922 (a): `class show` on an imported class read its `.got` typeinfo slot as
+    # an `__si_class_type_info` record and reported the next GOT entry -- another
+    # class's `_ZTV` -- as a public base with `confidence: rtti`
+    # (`net::Timeout : app::Storage`). `evidence table` refuses that very address
+    # as a GOT slot; the class lens must apply the same classification: no
+    # bases, and a note saying why.
+    ctx = seam.BridgeContext(None)
+    bv = _import_class_bv()
+    rec = {"name": "net::Timeout", "typeinfo": {"address": "0x9400", "symbol": "_ZTIN3net7TimeoutE"},
+           "vtable": None, "methods": [], "bases": []}
+    assert ctx._bases_for(bv, rec) == []
+    assert rec["typeinfo"]["import_slot"] is True
+    assert any("typeinfo is an import slot; bases unknown" in n for n in rec["notes"])
+    # The `.got` SECTION alone decides it too (some PIE layouts leave the symbol
+    # type untagged), exactly as `evidence table`'s guard does.
+    bv._symbols[0].type = "SymbolType.DataSymbol"
+    assert ctx._bases_for(bv, {**rec, "notes": []}) == []
+
+
+def test_typeinfo_name_at_accepts_only_a_typeinfo_symbol_922():
+    # The second half of (a): a `vtable for X` symbol names a class but is not a
+    # typeinfo OBJECT, so a word pointing at it must not read as an RTTI base.
+    ctx = seam.BridgeContext(None)
+    bv = _import_class_bv()
+    assert ctx._typeinfo_name_at(bv, 0x9100) == "app::Storage"
+    assert ctx._typeinfo_name_at(bv, 0x9000) is None
+
+
+def test_enrich_skips_the_backwalk_for_an_import_slot_typeinfo_922():
+    # The import slot has no RTTI record behind it, so the typeinfo backwalk must
+    # not run either: on the field target it "recovered" a derived class's RTTI
+    # record as this class's vtable (and listed it as a secondary of itself).
+    class _Ctx(_RecoverCtx):
+        def _object_size_for(self, bv, rec):
+            return None
+        def _bases_for(self, bv, rec):
+            return read_class._bases_for_record(self, bv, rec)
+        def _instances_for(self, bv, rec):
+            return {"construction_sites": [], "stored_globals": []}
+        def _find_function(self, bv, addr):
+            return None
+        def _address_context(self, bv, addr, **kw):
+            return {"sections": [{"name": ".got"}]}
+
+    class _BV(_RecoverBV):
+        def get_symbol_at(self, addr):
+            return None
+
+    bv = _BV(0x9400, [0x9028])
+    layouts = {0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]}}
+    ctx = _Ctx(layouts, {0x9020: 0x402260})
+    out = read_class._enrich(ctx, bv, {
+        "name": "net::Timeout", "vtable": None, "typeinfo": {"address": "0x9400"},
+        "methods": [], "bases": []})
+    assert out["vtable"] is None
+    assert "secondary_vtables" not in out
+    assert out["bases"] == []
+    assert out["notes"].count(read_class._TYPEINFO_IMPORT_NOTE) == 1
+
+
+class _BoundaryBV:
+    """A bv for the slot walk's next-object rules: symbols by address, BN data
+    variables by address."""
+    def __init__(self, symbols=None, data_vars=None):
+        self._symbols = dict(symbols or {})
+        self._data_vars = dict(data_vars or {})
+
+    def get_symbol_at(self, addr):
+        return self._symbols.get(int(addr))
+
+    def get_data_var_at(self, addr):
+        return self._data_vars.get(int(addr))
+
+
+def _extern_row(index, value):
+    return {"index": index, "value": hex(value), "readable": True,
+            "target": {"status": "mapped", "context": {"kind": "extern"}}}
+
+
+def test_vtable_layout_stops_at_the_next_typeinfo_record_922():
+    # #922 (b): in a PIE `.data.rel.ro` the next class's `__si_class_type_info`
+    # record follows the vtable directly. Its first word is a vptr into the
+    # EXTERNAL `__cxxabiv1::__si_class_type_info` vtable, which the scan accepted
+    # as an `<external>` slot: BN's own `net::Klass::VTable` had 2 slots, the
+    # card printed 3. The row's address carries `typeinfo for net::Derived`, so
+    # BN itself says a new object starts there.
+    rows = [_code_row(0), _code_row(1), _extern_row(2, 0x9810)]
+    bv = _BoundaryBV(symbols={
+        0x9020: _Sym("_ZTIN3net7DerivedE", "typeinfo for net::Derived", 0x9020),
+        0x9800: _Sym("_ZTVN10__cxxabiv120__si_class_type_infoE",
+                     "vtable for __cxxabiv1::__si_class_type_info", 0x9800,
+                     "SymbolType.ExternalSymbol"),
+    })
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]
+    assert layout["total"] == 2 and layout["scan_truncated"] is False
+
+
+def test_vtable_layout_stops_at_a_cxxabi_typeinfo_vptr_922():
+    # The same phantom slot with NO symbol on the row (a stripped record BN made
+    # no data symbol for): the external word points `2*ptr` past the
+    # `vtable for __cxxabiv1::__si_class_type_info` symbol -- a type_info vptr,
+    # never a virtual method.
+    rows = [_code_row(0), _code_row(1), _extern_row(2, 0x9810)]
+    bv = _BoundaryBV(symbols={
+        0x9800: _Sym("_ZTVN10__cxxabiv120__si_class_type_infoE",
+                     "vtable for __cxxabiv1::__si_class_type_info", 0x9800,
+                     "SymbolType.ExternalSymbol"),
+    })
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]
+    # A genuine external slot (`__cxa_pure_virtual`) is still a slot.
+    rows = [_code_row(0), _extern_row(1, 0x9900)]
+    bv = _BoundaryBV(symbols={0x9900: _Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0x9900,
+                                           "SymbolType.ExternalSymbol")})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]
+    assert layout["slots"][1]["pure_virtual"] is True
+
+
+def test_vtable_layout_is_bounded_by_bn_vtable_struct_922():
+    # BN's `<Class>::VTable` struct at the slot array states the slot count; the
+    # scan never reads past it, whatever the following words decode to.
+    rows = [_code_row(0), _code_row(1), _code_row(2), _code_row(3)]
+    vtable_type = types.SimpleNamespace(width=16, registered_name="net::Klass::VTable")
+    bv = _BoundaryBV(data_vars={0x9010: types.SimpleNamespace(address=0x9010, type=vtable_type)})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]
+    assert layout["bn_vtable_slots"] == 2
+    assert layout["total"] == 2
+    # A struct data variable starting on a LATER row is the next object.
+    record_type = types.SimpleNamespace(
+        width=24, type_class=types.SimpleNamespace(name="StructureTypeClass"))
+    bv = _BoundaryBV(data_vars={0x9020: types.SimpleNamespace(address=0x9020, type=record_type)})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]
+    assert layout["bn_vtable_slots"] is None
+
+
+def test_recover_rejects_an_rtti_record_as_a_secondary_vtable_922():
+    # #922 (c): a derived class's `__si_class_type_info` ALSO points at this
+    # typeinfo from its word[1] (as the base), so the backwalk lands on it. Its
+    # word[0] is the mangled-name POINTER -- positive, in the millions -- which
+    # the backwalk reported as `secondary vtable @ X (offset-to-top 4203104)` on
+    # a class with no multiple inheritance at all. A real secondary keeps a small
+    # non-positive offset-to-top and is labelled a heuristic.
+    ti = 0x9100
+    bv = _RecoverBV(ti, [0x9008, 0x9028, 0x9048])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+        0x9040: {"address": "0x9040", "slots": [{"index": 0, "address": "0xb000"}]},
+    }
+    otts = {0x9000: 0, 0x9020: 0x402260, 0x9040: (1 << 64) - 16}
+    out = read_class._recover_vtables_from_typeinfo(_RecoverCtx(layouts, otts), bv, ti)
+    assert out["primary"]["address"] == "0x9000"
+    assert [s["address"] for s in out["secondary"]] == ["0x9040"]
+    assert out["secondary"][0]["confidence"] == "heuristic"
+    assert [r["address"] for r in out["rejected"]] == ["0x9020"]
+    assert out["rejected"][0]["offset_to_top"] == 0x402260
+    assert "positive" in out["rejected"][0]["reason"]
+    # Nothing but RTTI records -> nothing recovered (never a record as primary).
+    out = read_class._recover_vtables_from_typeinfo(
+        _RecoverCtx(layouts, {0x9000: 0x402260, 0x9020: 0x4022a8, 0x9040: 0x402300}), bv, ti)
+    assert out is None
+
+
+def test_enrich_discloses_rejected_secondary_candidates_922():
+    class _Ctx(_RecoverCtx):
+        def _object_size_for(self, bv, rec):
+            return None
+        def _bases_for(self, bv, rec):
+            return []
+        def _instances_for(self, bv, rec):
+            return {"construction_sites": [], "stored_globals": []}
+        def _find_function(self, bv, addr):
+            return None
+
+    bv = _RecoverBV(0x9100, [0x9008, 0x9028, 0x9048])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+        0x9040: {"address": "0x9040", "slots": [{"index": 0, "address": "0xb000"}]},
+    }
+    ctx = _Ctx(layouts, {0x9000: 0, 0x9020: 0x402260, 0x9040: (1 << 64) - 16})
+    out = read_class._enrich(ctx, bv, {
+        "name": "svc::Handler", "vtable": None, "typeinfo": {"address": "0x9100"},
+        "methods": [], "bases": []})
+    assert out["vtable"]["address"] == "0x9000"
+    assert [s["address"] for s in out["secondary_vtables"]] == ["0x9040"]
+    assert out["rejected_secondary_candidates"][0]["address"] == "0x9020"
+    assert any("confidence: heuristic" in n for n in out["notes"])
+    assert any("rejected as secondary vtables: 0x9020" in n for n in out["notes"])
+
+
+def test_render_class_show_text_marks_heuristic_secondary_922():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "svc::Handler", "confidence": "rtti", "size": None, "bases": [],
+        "aliases": ["svc::Handler<std::__cxx11::basic_string<char> >"],
+        "methods": [], "instances": {"construction_sites": [], "stored_globals": []},
+        "vtable": {"address": "0x9000", "slots": []},
+        "secondary_vtables": [{"address": "0x9040", "offset_to_top": -16, "confidence": "heuristic",
+                               "slots": [{"index": 0, "address": "0xb000", "method": {"name": "name"}}]}],
+    }
+    text = _render_class_show_text(rec)
+    assert "secondary vtable @ 0x9040 (offset-to-top -16) [heuristic]:" in text
+    assert "aka: svc::Handler<std::__cxx11::basic_string<char> >" in text
+
+
+class _SpellingBV(_RegistryBV):
+    """A view whose method symbols demangle `app::Holder<std::string>` while the
+    `_ZTV` symbol keeps the expanded `basic_string` spelling; word[1] of that
+    vtable (the Itanium typeinfo pointer) names the short spelling's typeinfo."""
+    address_size = 8
+
+    def __init__(self):
+        self.long = ("app::Holder<std::__cxx11::basic_string<char, std::char_traits<char>, "
+                     "std::allocator<char> > >")
+        super().__init__(
+            [
+                _Fn(0x1000, "_ZN3app6HolderINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEE5cloneEv",
+                    "app::Holder<std::string>::clone()"),
+                _Fn(0x1100, "_ZN3app6HolderINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEED1Ev",
+                    "app::Holder<std::string>::~Holder()"),
+                _Fn(0x1200, "_ZN3app4BaseD1Ev", "app::Base::~Base()"),
+            ],
+            [
+                _Sym("_ZTVN3app6HolderINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEEE",
+                     f"vtable for {self.long}", 0x9000),
+                _Sym("_ZTIN3app6HolderINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEEE",
+                     "typeinfo for app::Holder<std::string>", 0x9100),
+                _Sym("_ZTVN3app4BaseE", "vtable for app::Base", 0x9200),
+                _Sym("_ZTIN3app4BaseE", "typeinfo for app::Base", 0x9300),
+            ],
+        )
+        self._memory = {0x9000: _le64(0, 0x9100), 0x9200: _le64(0, 0x9300)}
+
+    def read(self, address, length):
+        for base, blob in self._memory.items():
+            if base <= address < base + len(blob):
+                return blob[address - base:address - base + length]
+        return b""
+
+
+def test_registry_merges_the_spellings_of_one_class_922():
+    # #922 (d): keyed on the demangled spelling, the registry listed the class
+    # TWICE -- `app::Holder<std::string>` with the methods and a typeinfo but
+    # "no-vtable", and the `basic_string` spelling with the vtable and no
+    # methods -- and the two `class show` cards disagreed about one vtable. The
+    # vtable's own header names the typeinfo, so the two are one record,
+    # reachable by either spelling.
+    bv = _SpellingBV()
+    reg = read_class._build_class_registry(seam.BridgeContext(None), bv)
+    assert set(reg) == {"app::Holder<std::string>", "app::Base"}
+    rec = reg["app::Holder<std::string>"]
+    assert rec["vtable"]["address"] == "0x9000"
+    assert rec["typeinfo"]["address"] == "0x9100"
+    assert rec["aliases"] == [bv.long]
+    assert rec["confidence"] == "rtti"
+    assert len(rec["methods"]) == 2
+    assert reg["app::Base"]["aliases"] == []
+    assert read_class._resolve_class_names(reg, bv.long) == ["app::Holder<std::string>"]
+    assert read_class._resolve_class_names(reg, "Holder<std::string>") == ["app::Holder<std::string>"]
+    row = read_class._list_row({**rec, "bases": []})
+    assert row["aliases"] == [bv.long] and row["has_vtable"] is True
+
+
+def test_render_class_list_text_shows_aliases_922():
+    from bn.formatters import _render_class_list_text
+    long = "app::Holder<std::__cxx11::basic_string<char> >"
+    text = _render_class_list_text({"items": [
+        {"name": "app::Holder<std::string>", "method_count": 2, "has_vtable": True,
+         "size": None, "bases": [], "confidence": "rtti", "aliases": [long]}],
+        "total": 1, "returned": 1, "offset": 0, "has_more": False})
+    assert f"(aka {long})" in text

@@ -25,6 +25,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
+CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -2395,3 +2396,63 @@ class TestTypesDeclarePartialDrop760:
         parsed = json.loads(res.stdout)
         assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
         assert parsed["committed"] is False, parsed
+
+
+class TestClassLensRttiGuards922:
+    """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
+    adjacency of vtables and `__si_class_type_info` records, the extern vptr of
+    those records, an imported base class whose typeinfo is a `.got`/`.extern`
+    slot, and BN demangling one template class under two spellings -- are what
+    a g++ layout produces, so the mocked fakes are checked against it here."""
+
+    def _show(self, shared_bn, name):
+        res = shared_bn.run("class", "show", name, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_single_inheritance_chain_has_no_phantom_secondaries_or_slots(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # Handler: ~Handler x2, handle (pure), name -> exactly four slots. The
+        # word after them is `typeinfo for svc::Box<...>`'s vptr.
+        handler = self._show(shared_bn, "svc::Handler")
+        assert handler["vtable"]["total"] == 4, handler["vtable"]
+        assert "secondary_vtables" not in handler, handler.get("secondary_vtables")
+        assert handler["bases"] == []
+        echo = self._show(shared_bn, "svc::EchoHandler")
+        assert echo["vtable"]["total"] == 4, echo["vtable"]
+        assert "secondary_vtables" not in echo
+        assert [b["name"] for b in echo["bases"]] == ["svc::Handler"]
+        text = shared_bn.run("class", "show", "svc::AuditHandler").stdout
+        assert "secondary vtable" not in text
+        assert "<external>" not in text
+
+    def test_imported_base_class_reports_no_fabricated_facts(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # std::runtime_error is defined in libstdc++: its typeinfo here is an
+        # import slot, so there is no vtable to backwalk and no base to read.
+        card = self._show(shared_bn, "std::runtime_error")
+        assert card["typeinfo"]["import_slot"] is True
+        assert card["bases"] == []
+        assert card["vtable"] is None, card["vtable"]
+        assert "secondary_vtables" not in card
+        assert any("typeinfo is an import slot" in n for n in card["notes"])
+        # ...while the LOCAL subclass still names it as a base through its own
+        # (local) `__si_class_type_info` record.
+        parse_error = self._show(shared_bn, "svc::ParseError")
+        assert [b["name"] for b in parse_error["bases"]] == ["std::runtime_error"]
+        assert "secondary_vtables" not in parse_error
+
+    def test_template_class_spellings_are_one_card(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        listing = json.loads(
+            shared_bn.run("class", "list", "--no-stl", "--format", "json").stdout)
+        boxes = [row for row in listing["items"] if "svc::Box<" in row["name"]]
+        assert len(boxes) == 1, [row["name"] for row in boxes]
+        assert boxes[0]["name"] == "svc::Box<std::string>"
+        assert boxes[0]["has_vtable"] is True and boxes[0]["method_count"] > 0
+        assert boxes[0]["aliases"] and "basic_string" in boxes[0]["aliases"][0]
+        card = self._show(shared_bn, "svc::Box<std::string>")
+        assert card["vtable"]["total"] == 4, card["vtable"]
+        assert [b["name"] for b in card["bases"]] == ["svc::Handler"]
+        by_alias = self._show(shared_bn, card["aliases"][0])
+        assert by_alias["name"] == "svc::Box<std::string>"

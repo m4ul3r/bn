@@ -64,6 +64,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "statemachine_x86_64",
     "parser_x86_64",
     "dispatch_table_x86_64",
+    "classes_x86_64",   # C++ (src/classes.cpp): the class lens's RTTI shapes (#922)
 )
 
 _BUILD_LOCK_NAME = ".build.lock"
@@ -237,11 +238,11 @@ def build_integration_fixtures(
     """
     out_dir = Path(out_dir) if out_dir is not None else FIXTURES_DIR
     env = {**os.environ, **(make_env or {})}
-    for tool in ("make", env.get("CC", "cc")):
+    for tool in ("make", env.get("CC", "cc"), env.get("CXX", "c++")):
         if shutil.which(tool) is None and not Path(tool).is_file():
             raise FixtureBuildError(
                 f"{tool!r} not found; the real-BN integration fixtures need a C "
-                f"toolchain. Run: make -C tests/fixtures"
+                f"and C++ toolchain. Run: make -C tests/fixtures"
             )
 
     out_dir.mkdir(parents=True, exist_ok=True)
