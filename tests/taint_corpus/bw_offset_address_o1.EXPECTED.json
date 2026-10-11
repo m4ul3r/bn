@@ -1,0 +1,23 @@
+{
+  "description": "`bw_offset_address.c` rebuilt at -O1: an address built on a buffer at a variable offset walks that buffer's writers beside the offset: `popen(line + off)` and `strcpy(buf, &other[i])` name the `read` that filled the buffer (never a slice of the offset alone), and an element `g_hosts[i]` of a writable .bss array is a frontier leaf naming the global",
+  "lang": "c",
+  "cflags": ["-O1"],
+  "backward": [
+    {"function": "sink_offset", "sink": "arg:popen:0",
+     "origin_kinds": ["parameter", "source"],
+     "step_reasons_contain": ["local buffer line written by read"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true},
+    {"function": "input_offset", "sink": "arg:popen:0",
+     "origin_kinds": ["parameter", "source"],
+     "step_reasons_contain": ["local buffer buf written by strcpy", "local buffer other written by read"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true},
+    {"function": "global_element", "sink": "arg:popen:0",
+     "origin_kinds": ["parameter", "global"],
+     "step_reasons_contain": ["local buffer buf written by sprintf"],
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "leaf_details_contain": ["writable storage"],
+     "complete_slice": false}
+  ]
+}
