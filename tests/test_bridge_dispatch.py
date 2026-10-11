@@ -1846,7 +1846,7 @@ def test_load_binary_flags_sidecar_saved_before_content_validation(monkeypatch, 
         n.startswith("database provenance unverified (saved before content validation)")
         and str(bndb) in n and "stored bytes could not be read" in n and "--no-bndb" in n
         for n in result["notes"]), result["notes"]
-    assert bridge._source_verified[views[0]] is False
+    assert bridge._source_verdict(views[0]) is False
     bridge._headless_views.clear()
 
 
@@ -1873,7 +1873,7 @@ def test_load_binary_verifies_a_legacy_database_from_the_bytes_it_stores(monkeyp
         n.startswith("database provenance verified from the bytes stored in")
         and "next save" in n for n in result["notes"]), result["notes"]
     assert views[0].metadata == _provenance(data)       # stamped; create_database will carry it
-    assert bridge._source_verified[views[0]] is True
+    assert bridge._source_verdict(views[0]) is True
     bridge._headless_views.clear()
 
 
@@ -1896,7 +1896,7 @@ def test_load_binary_keeps_a_legacy_database_unverified_when_its_stored_bytes_di
         and "the bytes it stores differ from the file" in n
         for n in result["notes"]), result["notes"]
     assert views[0].metadata == {}
-    assert bridge._source_verified[views[0]] is False
+    assert bridge._source_verdict(views[0]) is False
     bridge._headless_views.clear()
 
 
@@ -2050,7 +2050,7 @@ def test_load_binary_returns_an_already_open_database_whose_record_matches(
     assert loaded_paths == [str(bndb)]
     notes = " ".join(result["notes"])
     assert "NOT restoring" not in notes and "unverified" not in notes
-    assert bridge._source_verified[views[0]] is True
+    assert bridge._source_verdict(views[0]) is True
     bridge._headless_views.clear()
 
 
@@ -2058,10 +2058,12 @@ def test_load_binary_repeated_loads_of_a_legacy_database_keep_the_unverified_not
         monkeypatch, tmp_path):
     # A legacy database that cannot vouch for itself stays unverified on every
     # load that prefers it -- the already-open path included -- never silently.
+    # Same length as the file: a different size is a refusal (another file),
+    # not an unverified note.
     bridge, instance, loaded_paths, views = _setup_provenance_load_test(
-        monkeypatch, db_metadata=None, db_raw_bytes=b"\x7fELF patched")
+        monkeypatch, db_metadata=None, db_raw_bytes=b"\x7fELF v1-patched")
     raw = tmp_path / "parse_record"
-    raw.write_bytes(b"\x7fELF v1")
+    raw.write_bytes(b"\x7fELF v1-release")
     bndb = tmp_path / "parse_record.bndb"
     bndb.write_bytes(b"BNDB")
     instance._load_binary(str(bndb))
@@ -2072,7 +2074,7 @@ def test_load_binary_repeated_loads_of_a_legacy_database_keep_the_unverified_not
         assert any(n.startswith("database provenance unverified") for n in result["notes"]), (
             result["notes"])
     assert loaded_paths == [str(bndb)]
-    assert bridge._source_verified[views[0]] is False
+    assert bridge._source_verdict(views[0]) is False
     bridge._headless_views.clear()
 
 
@@ -2105,6 +2107,136 @@ def test_load_binary_stamps_the_raw_view_and_survives_a_stamp_failure(monkeypatc
     assert any("could not record the source file's sha256" in n
                and "metadata store unavailable" in n for n in result["notes"]), result["notes"]
     bridge._headless_views.clear()
+
+
+def test_load_binary_stamps_the_bytes_the_view_holds_not_the_disk_hash(monkeypatch, tmp_path):
+    # Review round 3 P3: the file can be replaced between the pre-open hash and
+    # BN's open (a ms window). The stamp is taken from the bytes the view
+    # actually HOLDS (`bv.file.raw`); the pre-open hash is the fallback only
+    # when the raw view cannot be read.
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "parse_record"
+    raw.write_bytes(b"\x7fELF on disk at hash time")
+    held = b"\x7fELF what BN opened"
+
+    sys.modules["binaryninja"].load = lambda path, update_analysis=True: _LoadBV(
+        filename=path, raw_bytes=held)
+    instance._load_binary(str(raw))
+
+    assert bridge._headless_views[0].metadata == _provenance(held)
+    bridge._headless_views.clear()
+
+
+def test_load_binary_refuses_a_legacy_database_whose_stored_bytes_differ_in_size(
+        monkeypatch, tmp_path):
+    # Review round 3 P3: a `bv.write` patch cannot change the length, so a
+    # record-less database whose stored bytes are a different SIZE than the
+    # file was saved for another file -- a mismatch, not "patched".
+    bridge, instance, loaded_paths, views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=None, db_raw_bytes=b"\x7fELF firmware 1.0 (longer)")
+    raw = tmp_path / "parse_record"
+    raw.write_bytes(b"\x7fELF firmware 1.1")
+    bndb = tmp_path / "parse_record.bndb"
+    bndb.write_bytes(b"BNDB")
+
+    result = instance._load_binary(str(raw))
+
+    assert loaded_paths == [str(bndb), str(raw)] and result["path"] == str(raw)
+    assert views[0].closed is True and views[0].metadata == {}
+    assert result["notes"][0].startswith("NOT restoring ") and "different size" in result["notes"][0], (
+        result["notes"])
+    assert "patched" not in " ".join(result["notes"])
+    bridge._headless_views.clear()
+
+
+def test_load_binary_reports_an_explicit_database_saved_for_other_bytes_but_keeps_it(
+        monkeypatch, tmp_path):
+    """Review round 3 P2: an explicitly named `.bndb` -- `bn load <db>`, or the
+    path `session restart` reloads through a row's `database_path` -- was the
+    one load that never judged its database: a stale one came back with
+    `notes: []` and `source_verified: null`. It is still never refused (the
+    caller asked for THIS database), but a record naming other bytes than the
+    sibling raw file now holds is said, and the row carries the verdict."""
+    stale = b"\x7fELF firmware 1.0"
+    bridge, instance, loaded_paths, views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(stale))
+    raw = tmp_path / "parse_record"
+    raw.write_bytes(b"\x7fELF firmware 1.1")
+    bndb = tmp_path / "parse_record.bndb"
+    bndb.write_bytes(b"BNDB")
+
+    result = instance._load_binary(str(bndb), prefer_bndb=False)
+
+    assert loaded_paths == [str(bndb)] and result["path"] == str(bndb)
+    assert views[0].closed is False and result.get("already_open") is None
+    assert not any(n.startswith("NOT restoring") for n in result["notes"])
+    note = next(n for n in result["notes"] if "requested explicitly" in n)
+    assert note.startswith(f"{bndb} was saved for different bytes than {raw} now holds")
+    assert f"`bn load {raw} --no-bndb`" in note
+    assert bridge._source_verdict(views[0]) is False
+
+    # The already-open door for an explicit database is judged the same way.
+    again = instance._load_binary(str(bndb), prefer_bndb=False)
+    assert again["already_open"] is True and loaded_paths == [str(bndb)]
+    assert any("requested explicitly" in n for n in again["notes"]), again["notes"]
+    assert bridge._source_verdict(views[0]) is False
+    bridge._headless_views.clear()
+
+
+def test_load_binary_verifies_an_explicit_database_against_its_sibling(monkeypatch, tmp_path):
+    data = b"\x7fELF firmware 1.0"
+    bridge, instance, loaded_paths, views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    raw = tmp_path / "parse_record"
+    raw.write_bytes(data)
+    bndb = tmp_path / "parse_record.bndb"
+    bndb.write_bytes(b"BNDB")
+
+    result = instance._load_binary(str(bndb), prefer_bndb=False)
+
+    assert result["path"] == str(bndb) and result["notes"] == []
+    assert bridge._source_verdict(views[0]) is True
+    bridge._headless_views.clear()
+
+    # Nothing to judge against -- no sibling, or no record -- stays null.
+    raw.unlink()
+    orphan = instance._load_binary(str(bndb), prefer_bndb=False)
+    assert orphan["notes"] == [] and bridge._source_verdict(views[1]) is None
+    bridge._headless_views.clear()
+
+
+def test_source_verdict_is_keyed_on_the_file_session_not_the_wrapper(monkeypatch, tmp_path):
+    """Review round 3 P3 (GUI): a tab reaches the already-open judge as a
+    fresh, handle-equal wrapper that dies when `_load_binary` returns, so a
+    verdict keyed on that wrapper was gone by the next `target list`. The
+    verdict is keyed on `bv.file.session_id` -- any wrapper of the open file
+    answers -- and `refresh()` prunes it once the file is closed."""
+    data = b"\x7fELF v1"
+    bridge, instance, loaded_paths, views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    monkeypatch.delattr(instance.targets, "refresh")          # the real row builder
+    raw = tmp_path / "parse_record"
+    raw.write_bytes(data)
+    (tmp_path / "parse_record.bndb").write_bytes(b"BNDB")
+    original_load = sys.modules["binaryninja"].load
+
+    def load_with_session(path, update_analysis=True):
+        view = original_load(path, update_analysis)
+        view.file.session_id = 42
+        return view
+
+    sys.modules["binaryninja"].load = load_with_session
+    instance._load_binary(str(raw))
+
+    transient = types.SimpleNamespace(file=types.SimpleNamespace(session_id=42))
+    assert bridge._source_verdict(transient) is True
+    assert bridge._source_verdict(views[0]) is True
+    assert bridge._headless_views == [views[0]]
+    bridge._headless_views.clear()
+    instance.targets.refresh()
+    assert bridge._source_verdict(views[0]) is None
+    assert bridge._source_verified == {}
+
 
 
 def test_save_certifies_the_bytes_the_view_loaded_not_the_file_on_disk(monkeypatch, tmp_path):

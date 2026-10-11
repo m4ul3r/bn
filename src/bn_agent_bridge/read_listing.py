@@ -935,9 +935,10 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     ``_annotations_unavailable`` in the caller. ``analysis_cache_restored`` is
     derived from *filename*: a ``.bndb`` carries the analysis cache, which is
     where inherited comments/names come from. *source_verified* is the load's
-    verdict on a database preferred over the raw path -- checked against the
-    file's content (True), restored unverified (False), or no database was
-    preferred (None) -- published beside the flag and spelled out in the hint,
+    verdict on the database (preferred over the raw path, or named explicitly
+    and judged against its sibling raw file) -- checked against the file's
+    content (True), restored unverified or naming other bytes (False), or no
+    database was judged (None) -- published beside the flag and spelled out in the hint,
     so a later reader is not left with the one-shot load note. ``provenance_hint``
     is keyed on ANALYST work, not the raw non-auto count -- the loader's own
     placeholders made a pristine view hint that its entirely-current-run

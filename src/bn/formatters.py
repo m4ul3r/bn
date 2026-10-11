@@ -1664,6 +1664,21 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+def _source_verified_fragment(annotations: Any) -> str:
+    """The ``, source-verified=<true|false|unknown>`` tail of the existing-
+    annotations line, shared by `target info` and `evidence orient` so the
+    load-time provenance verdict is readable in text as well as JSON. ``unknown``
+    is the bridge's explicit null (no database was judged); an older bridge
+    that never sent the key prints nothing, so its line is unchanged.
+    """
+    if not _field_declared(annotations, "source_verified"):
+        return ""
+    verdict = _flag_field(annotations, "source_verified")
+    if verdict is None:
+        return ", source-verified=unknown"
+    return f", source-verified={'true' if verdict else 'false'}"
+
+
 @_discloses
 def _render_target_info_annotations_text(value: Any) -> str:
     """Render the #793 annotation counts / provenance block for `target info`.
@@ -1706,6 +1721,7 @@ def _render_target_info_annotations_text(value: Any) -> str:
     # truthiness test gets exactly backwards ("false" is True to Python).
     restored = _flag_field(annotations, "analysis_cache_restored")
     row += f", cache-restored={bool(restored)}"
+    row += _source_verified_fragment(annotations)
     lines = [row]
     hint = annotations.get("provenance_hint")
     if hint:
@@ -3608,6 +3624,7 @@ def _render_orient_text(value: Any) -> str:
                         f", placeholders={_stated_count(ea, 'placeholder_symbols')}"
                     )
             row += f", cache-restored={ea.get('analysis_cache_restored', False)}"
+            row += _source_verified_fragment(ea)
             lines.append(row)
             if ea.get("provenance_hint"):
                 lines.append(f"  ! {ea['provenance_hint']}")

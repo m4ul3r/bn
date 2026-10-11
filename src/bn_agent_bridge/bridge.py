@@ -821,10 +821,7 @@ class TargetManager:
                     self._next_id += 1
                     self._ids_by_object[bv] = view_id
 
-                try:
-                    session_id = str(bv.file.session_id)
-                except Exception:
-                    session_id = str(id(bv))
+                session_id = view_session_key(bv)
                 try:
                     filename = str(getattr(bv.file, "filename", "")) if bv.file else ""
                 except Exception:
@@ -867,6 +864,13 @@ class TargetManager:
                     vid: path for vid, path in self._database_paths.items()
                     if vid in alive
                 }
+                # The provenance verdicts, keyed on the file session id so a
+                # GUI tab's transient wrapper cannot lose one; pruned here
+                # (same complete-snapshot rule) since nothing else drops a
+                # closed view's entry.
+                open_sessions = {record.session_id for record in alive.values()}
+                for key in [k for k in _source_verified if k not in open_sessions]:
+                    del _source_verified[key]
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -915,12 +919,13 @@ class TargetManager:
                         # "database unknown" without inspecting paths.
                         "database_path": self._database_paths.get(view_id),
                         # Whether the database this view was restored from (a
-                        # sidecar/cache preferred over the raw path) was
-                        # verified against the raw file's content at load:
-                        # true/false, or null for a view no database was
-                        # preferred for (a raw load, an explicitly named
-                        # .bndb). The load note is one-shot; this is not.
-                        "source_verified": _source_verdict(view),
+                        # sidecar/cache preferred over the raw path, or an
+                        # explicitly named .bndb judged against its sibling raw
+                        # file) was verified against the raw file's content at
+                        # load: true/false, or null for a view no database was
+                        # judged for (a raw load, a database with no record or
+                        # no sibling). The load note is one-shot; this is not.
+                        "source_verified": _source_verified.get(record.session_id),
                     }
                 )
             return result
@@ -2281,8 +2286,9 @@ class BinaryNinjaBridge:
         # sentence, awaiting the tail that says what happened instead.
         refused: str | None = None
         refused_path: Path | None = None
-        # The verdict on a preferred database this load returns, for the
-        # target row (`source_verified`); None when no database is preferred.
+        # The verdict on the database this load returns, for the target row
+        # (`source_verified`): a preferred database's, or an explicitly named
+        # database's against its sibling raw file. None when nothing was judged.
         verified: bool | None = None
 
         # #355/#400: if a view for this (post-substitution) path is already
@@ -2316,9 +2322,19 @@ class BinaryNinjaBridge:
                         load_path, substitute = resolved, None
                         continue
                     verified = verdict == "verified"
-                    _source_verified[existing] = verified
+                    _source_verified[view_session_key(existing)] = verified
                     if provenance_note:
                         notes.append(provenance_note)
+                elif load_path.suffix == ".bndb":
+                    # An explicitly named database that is already open: judged
+                    # like a fresh explicit open, informationally.
+                    with self._target_lock.write():
+                        verified, explicit_note = _explicit_database_verdict(
+                            existing, load_path)
+                    if verified is not None:
+                        _source_verified[view_session_key(existing)] = verified
+                    if explicit_note:
+                        notes.append(explicit_note)
                 elif refused is not None:
                     notes = [f"{refused} {_refusal_tail(refused_path, resolved, loaded=False)}"]
                 return self._load_existing_result(
@@ -2402,6 +2418,16 @@ class BinaryNinjaBridge:
             if refused is not None:
                 # Every note so far described the database being discarded.
                 notes = [f"{refused} {_refusal_tail(refused_path, resolved, loaded=True)}"]
+            elif substitute is None and load_path.suffix == ".bndb":
+                # Requested by name (`bn load <db>`, or `session restart`
+                # reopening a target through its `database_path`): kept whatever
+                # its record says, but a record that names other bytes than
+                # the sibling raw file now holds is reported, not swallowed
+                # (review round 3 P2) -- this was the one door a stale database
+                # still walked through silently.
+                verified, explicit_note = _explicit_database_verdict(bv, load_path)
+                if explicit_note:
+                    notes.append(explicit_note)
             if load_path.suffix != ".bndb":
                 stamp_note = _stamp_opened_view(bv, identity)
                 if stamp_note:
@@ -2460,16 +2486,19 @@ class BinaryNinjaBridge:
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
-            if verified is not None:
-                _source_verified[bv] = verified
-
+            #
             # Publish under the exclusive lock so a concurrent target read sees a
             # consistent set. Append under _headless_views_lock, then refresh
-            # (which re-acquires that non-reentrant lock itself).
+            # (which re-acquires that non-reentrant lock itself). The verdict
+            # lands inside the same lock, after the append: `refresh()` prunes
+            # verdicts to the open set, so one recorded before the view is
+            # published would be swept by a concurrent `target list`.
             with self._target_lock.write():
                 with _headless_views_lock:
                     _headless_views.append(bv)
                     published = True  # latched: view now owned by _headless_views
+                if verified is not None:
+                    _source_verified[view_session_key(bv)] = verified
                 targets = self.targets.refresh()
 
             self._record_project_root(workdir)
@@ -2502,7 +2531,7 @@ class BinaryNinjaBridge:
                     _run_on_main_thread(lambda: bv.file.close())
                 _quick_loaded_views.discard(bv)
                 _unanalyzed_views.discard(bv)
-                _source_verified.pop(bv, None)
+                _source_verified.pop(view_session_key(bv), None)
             raise
         finally:
             with _load_in_progress_lock:
@@ -4402,6 +4431,7 @@ from .bridge_state import (  # noqa: E402
     _quick_loaded_views,
     _source_verified,
     _unanalyzed_views,
+    view_session_key,
 )
 
 
@@ -5309,11 +5339,13 @@ def _load_identity(resolved: Path) -> _SourceIdentity | None:
     analysis that takes minutes). None for a database request, or when the
     file cannot be read (the raw open reports that itself).
 
-    Taken BEFORE the open and never again: it is what `_record_source_identity`
-    stamps on the view, so a save certifies the bytes the view LOADED. Hashing
-    the file at save time certified whatever sat at the path by then -- a
-    re-extracted firmware replaced between load and save was stamped as this
-    database's source, and the stale database then matched forever (review P1).
+    Taken BEFORE the open: it chooses the content-keyed cache database and
+    judges a preferred one. The stamp on the opened view (`_stamp_opened_view`)
+    prefers the bytes the view holds and falls back to this, so a save
+    certifies the bytes the view LOADED. Hashing the file at save time
+    certified whatever sat at the path by then -- a re-extracted firmware
+    replaced between load and save was stamped as this database's source, and
+    the stale database then matched forever (review P1).
     """
     if resolved.suffix == ".bndb":
         return None
@@ -5346,14 +5378,19 @@ def _record_source_identity(bv, identity: _SourceIdentity) -> None:
 
 def _stamp_opened_view(bv, identity: _SourceIdentity | None) -> str | None:
     """Record the identity of the raw file *bv* was just opened from, so every
-    later save and export certifies THOSE bytes. Returns a note when the stamp
-    could not be written (the load still succeeds; a database saved from this
-    view will be verified from its stored bytes instead, see
+    later save and export certifies THOSE bytes. The bytes the view actually
+    HOLDS (`bv.file.raw`) are preferred over *identity*, the disk hash taken
+    before the open: a file replaced in the window between the two would
+    otherwise be certified by a view that loaded its predecessor. *identity*
+    is the fallback when the raw view cannot be read. Returns a note when the
+    stamp could not be written (the load still succeeds; a database saved from
+    this view will be verified from its stored bytes instead, see
     `_database_provenance`)."""
-    if identity is None:
+    loaded = _stored_bytes_identity(bv) or identity
+    if loaded is None:
         return None
     try:
-        _record_source_identity(bv, identity)
+        _record_source_identity(bv, loaded)
     except Exception as exc:  # noqa: BLE001 - never lose a load over the stamp
         return (
             f"could not record the source file's sha256 on the view ({exc}); a "
@@ -5400,6 +5437,42 @@ def _stored_bytes_identity(bv) -> _SourceIdentity | None:
         return None
 
 
+def _explicit_database_verdict(bv, database: Path) -> tuple[bool | None, str | None]:
+    """Does the explicitly requested database *bv* still describe its sibling
+    raw file? Informational only -- the caller asked for THIS database, so it
+    is kept whatever the answer (`session restart` reopens a target through
+    this door too, via the row's `database_path`).
+
+    ``(verdict, note)``: ``(None, None)`` when there is nothing to judge (no
+    record, no sibling at ``<database minus .bndb>``, or one that cannot be
+    read); ``(True, None)`` when the record matches the sibling's bytes;
+    ``(False, note)`` when it names other bytes -- the note says the database
+    was kept because it was requested explicitly and how to get the current
+    bytes analyzed instead.
+    """
+    recorded = _recorded_source_identity(bv)
+    if recorded is None:
+        return None, None
+    sibling = database.with_suffix("")
+    if not sibling.is_file():
+        return None, None
+    try:
+        current = _hash_file(sibling)
+    except OSError:
+        return None, None
+    if recorded.sha256 == current.sha256:
+        return True, None
+    return False, (
+        f"{database} was saved for different bytes than {sibling} now holds "
+        f"(database: sha256 {recorded.sha256[:12]}, {recorded.size} bytes; file: "
+        f"sha256 {current.sha256[:12]}, {current.size} bytes); it was kept because "
+        "the database was requested explicitly, so its analysis may describe "
+        f"bytes no longer on disk. To analyze the current file: `bn load {sibling} "
+        "--no-bndb` (`bn load` of the raw path prefers this database only when "
+        "it matches)."
+    )
+
+
 def _database_provenance(bv, database: Path, resolved: Path,
                          current: _SourceIdentity) -> tuple[str, str | None]:
     """Does the opened database *bv* describe the bytes now at *resolved*?
@@ -5411,11 +5484,13 @@ def _database_provenance(bv, database: Path, resolved: Path,
       so: the record is stamped in memory and lands on the next save, which
       is how a database saved before content validation acquires one);
     * ``"unverified"`` -- no record, and the stored bytes could not vouch for
-      it: unreadable, or different from the file (a patched database
-      legitimately differs, so this is a note, not a refusal);
-    * ``"mismatch"`` -- the record names other bytes. The note is the refusal's
-      first sentence; the caller appends what it did instead
-      (`_refusal_tail`).
+      it: unreadable, or different from the file at the same size (a patched
+      database legitimately differs, so this is a note, not a refusal);
+    * ``"mismatch"`` -- the record names other bytes, or there is no record
+      and the stored bytes differ in SIZE from the file: a patch (`bv.write`)
+      cannot change the length, so that database was saved for another file.
+      The note is the refusal's first sentence; the caller appends what it
+      did instead (`_refusal_tail`).
 
     A sidecar or cache database used to be preferred by PATH alone: re-extract
     the firmware, or copy a different binary over the same name, and the OLD
@@ -5434,6 +5509,14 @@ def _database_provenance(bv, database: Path, resolved: Path,
             return "verified", (
                 f"database provenance verified from the bytes stored in {database} "
                 f"(saved before content validation); {landing}"
+            )
+        if stored is not None and stored.size != current.size:
+            return "mismatch", (
+                f"NOT restoring {database}: it records no source hash and the "
+                f"bytes it stores are a different size than {resolved} now holds "
+                f"(database: sha256 {stored.sha256[:12]}, {stored.size} bytes; "
+                f"file: sha256 {current.sha256[:12]}, {current.size} bytes), so it "
+                "was saved for another file."
             )
         detail = (
             f"and the bytes it stores differ from the file (database: sha256 "
@@ -5581,12 +5664,8 @@ def _view_engine_modified(bv) -> bool:
 
 def _source_verdict(bv) -> bool | None:
     """The load-time provenance verdict on *bv* (`_source_verified`), or None
-    for a view no database was preferred for -- or one that cannot be weakly
-    referenced, which was never recorded."""
-    try:
-        return _source_verified.get(bv)
-    except TypeError:
-        return None
+    for a view no database was judged for."""
+    return _source_verified.get(view_session_key(bv))
 
 
 def _analysis_progress(bv):
@@ -5740,6 +5819,10 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
                 verified = verdict == "verified"
                 if provenance_note:
                     bn.log_info(provenance_note)
+        elif load_path.suffix == ".bndb":
+            verified, explicit_note = _explicit_database_verdict(bv, load_path)
+            if explicit_note:
+                bn.log_warn(explicit_note)
         if load_path.suffix != ".bndb":
             stamp_note = _stamp_opened_view(bv, identity)
             if stamp_note:
@@ -5753,7 +5836,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
         if verified is not None:
-            _source_verified[bv] = verified
+            _source_verified[view_session_key(bv)] = verified
         with _headless_views_lock:
             _headless_views.append(bv)
             published = True  # latched: view now owned by _headless_views
@@ -5769,7 +5852,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
                 _run_on_main_thread(lambda: bv.file.close())
             _quick_loaded_views.discard(bv)
             _unanalyzed_views.discard(bv)
-            _source_verified.pop(bv, None)
+            _source_verified.pop(view_session_key(bv), None)
         raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
