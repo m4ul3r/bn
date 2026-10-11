@@ -4356,9 +4356,9 @@ def test_session_restart_discard_unsaved_proceeds_and_discloses(monkeypatch, cap
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["restarted"] is True
-    assert payload["discarded_unsaved"] == [
-        {"selector": "parser", "target_id": "t1", "path": "/work/parser"}
-    ]
+    # `selector` + `path` only: the pre-restart target id names a target the
+    # restart tore down, and its reloaded successor has a new one.
+    assert payload["discarded_unsaved"] == [{"selector": "parser", "path": "/work/parser"}]
     ops = [op for op, _ in calls]
     assert "shutdown" in ops
     assert sorted(p["path"] for op, p in calls if op == "load_binary") == ["/work/helper", "/work/parser"]
@@ -4384,9 +4384,7 @@ def test_session_stop_discard_unsaved_proceeds_and_discloses(monkeypatch, capsys
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["stopped"] is True
-    assert payload["discarded_unsaved"] == [
-        {"selector": "parser", "target_id": "t1", "path": "/work/parser"}
-    ]
+    assert payload["discarded_unsaved"] == [{"selector": "parser", "path": "/work/parser"}]
     assert [op for op, _ in calls] == ["list_targets", "shutdown"]
 
 

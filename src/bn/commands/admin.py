@@ -1145,13 +1145,14 @@ def _unsaved_targets_or_refuse(
     refuses and names each target by its copy-paste `-t` selector plus the
     exact `save` that persists it; with the flag it proceeds and the caller
     gets the same disclosure `close` prints.
+
+    Each entry carries `selector` and `path`, not `target_id`: the entries
+    describe targets the command then tears down, so the `pid:view:session` id
+    would name a dead target -- after a restart, one whose reloaded successor
+    has a new id -- and a reader pasting it gets "no such target".
     """
     unsaved = [
-        {
-            "selector": row.get("selector"),
-            "target_id": row.get("target_id"),
-            "path": row.get("filename"),
-        }
+        {"selector": row.get("selector"), "path": row.get("filename")}
         for row in rows
         if isinstance(row, dict) and row.get("unsaved") is True
     ]
