@@ -334,6 +334,23 @@ def test_render_taint_backward_truncated_is_not_a_complete_result():
     assert "16 of 20 caller(s) followed; 4 dropped" in text
 
 
+def test_render_taint_backward_memory_chain_cut_names_its_cause_928r3():
+    # PR-928 round 3 P3: a `memory_chain` truncation (the local-buffer writer
+    # walk ran out of memory-SSA versions) printed `truncated @depth None` --
+    # the exact `@depth` misreport #579/#576 fixed for the other causes.
+    value = {**_BACKWARD_CAPPED,
+             "leaves": [{"kind": "address_of_local_unresolved", "address": "0x804",
+                         "buffer": "cmd", "il_text": "p#1 = &cmd",
+                         "detail": "the memory-SSA chain ... exceeded the walk budget"}],
+             "assumptions": [],
+             "stats": {"leaves": 1, "slices": 1, "truncated": True,
+                       "truncation_cause": ["memory_chain"]}}
+    text = _render_taint_text(value)
+    assert "verdict: INCOMPLETE" in text
+    assert "memory-chain budget exhausted" in text
+    assert "@depth None" not in text
+
+
 def test_render_taint_backward_complete_run_keeps_old_text():
     # #810: the verdict line is added ONLY for a truncated run, so a complete
     # backward result renders exactly as it did before (no false INCOMPLETE).

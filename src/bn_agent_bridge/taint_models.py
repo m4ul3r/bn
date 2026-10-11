@@ -118,7 +118,7 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # "unmodeled external" fallback (`_comment_benign` in taint_models.json). An
 # entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
-                    "return_bound", "arity_capped", "destinations_unmodeled")
+                    "writes", "return_bound", "arity_capped", "destinations_unmodeled")
 # The fields that ARM a sink. At the root with no `sink` beside them they are
 # the #915 flat shape -- the author wrote a sink that can never fire. Prose
 # fields (`detail`, `optional`, `gate`) are not flagged: they arm nothing, and
@@ -238,6 +238,36 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         na = co.get("null_arg")
         if not _is_int(na) or na < 0:
             _fail("`continuation.null_arg` must be a non-negative integer argument index")
+    if "writes" in model:
+        # A literal fill (`bzero`): the callee writes the pointee of `*arg:N`
+        # from no argument. The backward local-buffer walk counts it as a
+        # covering writer whose bytes come from the call itself.
+        ws = model["writes"]
+        if not isinstance(ws, list) or not ws:
+            _fail("`writes` must be a non-empty list of `*arg:N` tokens (the pointees "
+                  "the callee fills from no argument); an empty `writes` arms nothing "
+                  f"-- give it tokens or use {{}} to mark {name} benign")
+        for t in ws:
+            if not (isinstance(t, str) and t.startswith("*arg:") and _try_arg_index(t) is not None):
+                _fail(f"`writes` entry {t!r} must be a `*arg:N` token (a pointee the callee "
+                      f"fills); a scalar `arg:N` is not written through -- fix the token or "
+                      f"use {{}} to mark {name} benign")
+    # The three annotation roles: a falsy value (`{}`, `0`, `false`) declares
+    # nothing, yet passed as a role, counted as a model and replaced the
+    # builtin of the same name with nothing (round 3 P3) -- the residue of
+    # the empty-role rule above.
+    if "return_bound" in model:
+        rb = model["return_bound"]
+        if not isinstance(rb, dict) or not _is_int(rb.get("max_from_arg")) or rb["max_from_arg"] < 0:
+            _fail("`return_bound` must be an object with a non-negative integer "
+                  "`max_from_arg` (the argument that bounds the return); an empty "
+                  "`return_bound` declares nothing -- give it `max_from_arg` or use {} "
+                  f"to mark {name} benign")
+    for flag in ("arity_capped", "destinations_unmodeled"):
+        if flag in model and model[flag] is not True:
+            _fail(f"`{flag}` must be `true` -- `{model[flag]!r}` declares nothing yet "
+                  f"counted as an active model and replaced any builtin `{name}` model; "
+                  f"drop the key or use {{}} to mark {name} benign")
 
 
 def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
