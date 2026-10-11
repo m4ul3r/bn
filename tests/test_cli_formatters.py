@@ -4628,9 +4628,10 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # `items` / `noise_sections` lists), three list reads x 6 (+18).
     # #922 adds the class `aliases` lists (list row + show card) and the
     # secondary-vtable `confidence` text (+12). Measured: 1332.
-    # M-03 adds the `overlapping_functions` / `overlaps` list reads of the
-    # compact status line and the op row, for 1308. Measured by diffing.
-    assert checked == 1332, f"the differential ran {checked} cases, not 1332"
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads of
+    # the compact status line, the op row and the split-host listing (+24).
+    # Measured: 1356.
+    assert checked == 1356, f"the differential ran {checked} cases, not 1356"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4715,11 +4716,10 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # same envelope through `_render_strings_narrowed_text`): 10 x 8 (+80).
     # #922 adds the class `aliases` lists and the secondary `confidence`
     # text (+16). Total 5424.
-    # reads, each probed with eight malformed values, for 5296 total.
-    # M-03 adds four list reads (`overlapping_functions` on the compact status
-    # line, `overlaps` on the op row and its two builders), eight malformed
-    # values each, for 5328. Measured by diffing the population.
-    assert swept == 5424, f"the raise sweep ran {swept} renders, not 5424"
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads
+    # (compact status line, op row and its builders, split-host listing),
+    # eight malformed values each (+32). Total 5456.
+    assert swept == 5456, f"the raise sweep ran {swept} renders, not 5456"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4905,10 +4905,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # the `data_sections` list read (3) and the narrowed `strings` face's nine
     # reads (two lists x 3 + seven scalars x 2 = 20) (+23). #922's `aliases`
     # lists and secondary `confidence` text add six (+6). Total 1578.
-    # benign probes, for 1538 total.
-    # M-03's four list reads add twelve benign probes, for 1550. Measured by
-    # diffing the population.
-    assert checked == 1578, f"the mirror ran {checked} renders, not 1578"
+    # #927 (M-03)'s overlap list reads add twelve benign probes (+12).
+    # Total 1590.
+    assert checked == 1590, f"the mirror ran {checked} renders, not 1590"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7772,12 +7771,11 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     # the narrowed `strings` face's `items` / `noise_sections` positions, three x
     # 36 (+108). #922 adds the two class `aliases` list positions (list row +
     # show card) at the same nine-by-four (+72). Measured: 5076.
-    # elements at four shapes, to the PR-integrated 4716. Measured: 4788.
-    # M-03 adds four more list positions (`overlapping_functions` on the
-    # compact status line, `overlaps` on the op row and its builders), for
-    # 4932. Measured by diffing the population.
-    assert swept == 5076, (
-        f"the element sweep ran {swept} renders, not 5076 -- the size of the "
+    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list positions
+    # (compact status line, op row and its builders, split-host listing) at
+    # the same nine-by-four (+144). Measured: 5220.
+    assert swept == 5220, (
+        f"the element sweep ran {swept} renders, not 5220 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")
