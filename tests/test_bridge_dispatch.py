@@ -3796,10 +3796,12 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
     # the count of candidates the active filter chain dropped, so the denominator
     # is readable without a second unfiltered invocation, and (M-12) the
     # `noise_strings` / `noise_sections` disclosure of the code / linker-metadata
-    # tier the ranking lists last. They ride the strings envelope alone (imports
-    # reports its exclusions under its own key), so they are added to the
-    # expected set HERE rather than to the shared one above.
-    strings_envelope_keys = envelope_keys | {"filtered", "noise_strings", "noise_sections"}
+    # tier the ranking lists last plus the `data_sections` it drew on. They ride
+    # the strings envelope alone (imports reports its exclusions under its own
+    # key), so they are added to the expected set HERE rather than to the shared
+    # one above.
+    strings_envelope_keys = envelope_keys | {"filtered", "noise_strings", "noise_sections",
+                                             "data_sections"}
 
     # A limit that truncates: 2 of 5 come back, but the total stays honest.
     strings_page = instance._strings(None, query=None, offset=0, limit=2)

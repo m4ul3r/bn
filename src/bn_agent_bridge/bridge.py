@@ -3877,20 +3877,23 @@ class BinaryNinjaBridge:
     def _disclose_sample_sections(self, selector: str | None, sample) -> None:
         """Tag an orient strings sample with the sections it was drawn from (#646),
         in the order the sample lists them (preferred tier first, M-12), so a
-        useless sample is at least attributable. Best-effort."""
+        useless sample is at least attributable. Names come from the SAME
+        section table the ranking used (`read_misc._string_tier_at`), so where
+        sections overlap this cannot name one the ranking did not; a row no
+        section claims (every row of a raw image) is left unnamed. Best-effort."""
         if not isinstance(sample, dict):
             return
         try:
             bv = self._resolve_view(selector)
+            ranges = read_misc._string_section_ranges(bv)
             names: dict[str, None] = {}
             for item in sample.get("items") or []:
                 addr = item.get("address")
                 if not isinstance(addr, str):
                     continue
-                for sec in bv.get_sections_at(int(addr, 16)) or []:
-                    name = str(getattr(sec, "name", "") or "")
-                    if name:
-                        names.setdefault(name, None)
+                _tier, name = read_misc._string_tier_at(ranges, int(addr, 16))
+                if name != read_misc._STRING_NO_SECTION:
+                    names.setdefault(name, None)
             sample["sample_sections"] = list(names)
         except Exception:
             return

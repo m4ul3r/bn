@@ -25,6 +25,7 @@ Import direction is one-way: this module imports ``read_xrefs``,
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from typing import Any
 
 try:
@@ -194,37 +195,55 @@ def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
 # a live view), so semantics alone cannot tell them apart -- and `.dynstr` /
 # `.interp` sit at the LOWEST string addresses on every ELF, so they own the
 # head of any address-ordered sample. Prefixes, not substrings: `.data.rel.ro`
-# is data, not `.rel.dyn`. `.text`/`.init`/`.fini` are here for a view whose
-# code sections carry no semantics (ReadOnlyCode is the normal signal).
+# is data, not `.rel.dyn`. `.relr.` is the packed-relative form (`-z
+# pack-relative-relocs`) that neither `.rel.` nor `.rela` covers.
+# `.text`/`.init`/`.fini` are here for a view whose code sections carry no
+# semantics (ReadOnlyCode is the normal signal).
 _METADATA_STRING_SECTIONS = (
     ".interp", ".dynstr", ".dynsym", ".gnu.", ".hash", ".eh_frame", ".rela",
-    ".rel.", ".dynamic", ".strtab", ".symtab", ".shstrtab", ".comment", ".note",
-    ".plt", ".got", ".debug", ".text", ".init", ".fini",
+    ".rel.", ".relr.", ".dynamic", ".strtab", ".symtab", ".shstrtab", ".comment",
+    ".note", ".plt", ".got", ".debug", ".text", ".init", ".fini",
 )
 
 # String ranking tiers (M-12). A string's tier is the tier of the section that
 # holds it: `.rodata`-like (ReadOnlyData) sections carry the domain literals,
-# `.data`-like sections sometimes do, and everything else -- executable code
-# (whose "strings" are instruction bytes that happen to decode as printable
-# ASCII), linker metadata, and an address no section claims at all (the ELF
-# header) -- is noise. A view with NO sections (a raw/monolithic firmware
-# image) has nothing to rank by, so every string stays in the data tier.
+# `.data`-like sections sometimes do, and executable code (whose "strings" are
+# instruction bytes that happen to decode as printable ASCII) and linker
+# metadata are noise. An address no section claims is judged by its SEGMENT,
+# and only on a view where BN has marked code at all: BN 6.1 never produces a
+# sectionless view (every loader adds `.synthetic_builtins`, an
+# ExternalSection), so "no section" is the ordinary state of every string on a
+# raw / monolithic firmware image or a section-header-stripped ELF -- there it
+# is the literals, not noise.
 _STRING_TIER_RODATA = 0
 _STRING_TIER_DATA = 1
 _STRING_TIER_NOISE = 2
 _STRING_NO_SECTION = "(no section)"
 
 
-def _string_section_tier(sec) -> int:
-    """Which ranking tier a section's strings belong to, by BN semantics first
-    (`ReadOnlyCode` is noise regardless of name, `ReadOnlyData` is preferred)
-    and the metadata name list second."""
-    name = str(getattr(sec, "name", "") or "").lower()
+def _section_semantics_name(sec) -> str:
     raw_semantics = getattr(sec, "semantics", 0)
     try:
-        semantics = _SECTION_SEMANTICS_NAMES.get(int(raw_semantics), str(raw_semantics))
+        return _SECTION_SEMANTICS_NAMES.get(int(raw_semantics), str(raw_semantics))
     except (TypeError, ValueError):
-        semantics = str(raw_semantics)
+        return str(raw_semantics)
+
+
+def _string_section_tier(sec) -> int | None:
+    """Which ranking tier a section's strings belong to, by BN semantics first
+    (`ReadOnlyCode` is noise regardless of name, `ReadOnlyData` is preferred)
+    and the metadata name list second -- or ``None`` for a section that cannot
+    claim a string at all: an `ExternalSection` (BN's synthetic import /
+    builtin table, present on EVERY view) and a NOBITS section (`.bss`,
+    `.tbss`), which has no file bytes, so its address range -- `.tbss` overlaps
+    the head of `.data.rel.ro` on static AArch64 -- belongs to whatever real
+    section shares it."""
+    semantics = _section_semantics_name(sec)
+    if semantics == "ExternalSection":
+        return None
+    if str(getattr(sec, "type", "") or "").upper() == "NOBITS":
+        return None
+    name = str(getattr(sec, "name", "") or "").lower()
     if semantics == "ReadOnlyCode" or name.startswith(_METADATA_STRING_SECTIONS):
         return _STRING_TIER_NOISE
     if semantics == "ReadOnlyData":
@@ -232,29 +251,99 @@ def _string_section_tier(sec) -> int:
     return _STRING_TIER_DATA
 
 
-def _string_section_ranges(bv) -> list[tuple[int, int, int, str]]:
-    """``(start, end, tier, name)`` for every section of the view, computed once
-    per read so a 50k-string scan does not pay a section lookup per string."""
+class _StringSectionMap:
+    """The section -> tier table one `strings` read classifies against (M-12),
+    built once per read so a 50k-string scan pays one bisect per string rather
+    than a walk over every section.
+
+    ``starts`` / ``ends`` / ``tiers`` / ``names`` are parallel, address-sorted
+    and NON-overlapping: where sections overlap (a ReadOnlyData container with a
+    ReadOnlyCode `.text` inside it; a user section laid over a loader one) the
+    overlap is resolved HERE, once, by an explicit precedence rather than by
+    whichever section `bv.sections` happened to list first -- the narrowest
+    claiming section wins, so a broad data section can never hide the code or
+    metadata nested inside it, and between equal claims the noisier tier wins.
+    ``has_code`` records whether BN marked any ReadOnlyCode section at all,
+    which is the precondition for calling an unclaimed address noise."""
+
+    __slots__ = ("bv", "starts", "ends", "tiers", "names", "has_code")
+
+    def __init__(self, bv, claims: list[tuple[int, int, int, str]], *, has_code: bool):
+        self.bv = bv
+        self.has_code = has_code
+        self.starts: list[int] = []
+        self.ends: list[int] = []
+        self.tiers: list[int] = []
+        self.names: list[str] = []
+        # Sweep the section boundaries in address order, keeping the set of
+        # sections open at each point; every elementary interval between two
+        # consecutive boundaries has one owner, chosen by the precedence above.
+        events: list[tuple[int, int, int]] = []  # (position, +1 open / -1 close, claim index)
+        for index, (start, end, _tier, _name) in enumerate(claims):
+            events.append((start, 1, index))
+            events.append((end, -1, index))
+        events.sort(key=lambda e: (e[0], e[1]))  # closes before opens at a shared boundary
+        open_claims: set[int] = set()
+        position = 0
+        for at, kind, index in events:
+            if open_claims and at > position:
+                start, end, tier, name = min(
+                    (claims[i] for i in open_claims),
+                    key=lambda c: (c[1] - c[0], -c[2], c[3]))
+                if self.names and self.names[-1] == name and self.ends[-1] == position:
+                    self.ends[-1] = at
+                else:
+                    self.starts.append(position)
+                    self.ends.append(at)
+                    self.tiers.append(tier)
+                    self.names.append(name)
+            position = at
+            if kind > 0:
+                open_claims.add(index)
+            else:
+                open_claims.discard(index)
+
+
+def _string_section_ranges(bv) -> _StringSectionMap:
+    """The per-view classification table for `_strings` (see `_StringSectionMap`)."""
+    claims: list[tuple[int, int, int, str]] = []
+    has_code = False
     try:
-        sections = getattr(bv, "sections", None) or {}
-        return [
-            (int(getattr(sec, "start", 0)), int(getattr(sec, "end", 0)),
-             _string_section_tier(sec), str(name))
-            for name, sec in sections.items()
-        ]
+        for name, sec in (getattr(bv, "sections", None) or {}).items():
+            tier = _string_section_tier(sec)
+            if tier is None:
+                continue
+            start, end = int(getattr(sec, "start", 0)), int(getattr(sec, "end", 0))
+            if end <= start:
+                continue
+            claims.append((start, end, tier, str(name)))
+            has_code = has_code or _section_semantics_name(sec) == "ReadOnlyCode"
     except Exception:
-        return []
+        claims, has_code = [], False
+    return _StringSectionMap(bv, claims, has_code=has_code)
 
 
-def _string_tier_at(ranges: list[tuple[int, int, int, str]], address: int) -> tuple[int, str]:
-    """The tier and section name of *address*. Outside every section on a view
-    that HAS sections is noise (the ELF header decodes as a string on every
-    AArch64 ELF); on a sectionless view nothing can be ranked, so it is data."""
-    for start, end, tier, name in ranges:
-        if start <= address < end:
-            return tier, name
-    if ranges:
-        return _STRING_TIER_NOISE, _STRING_NO_SECTION
+def _string_tier_at(ranges: _StringSectionMap, address: int) -> tuple[int, str]:
+    """The tier and section name of *address*.
+
+    An address no section claims is noise only when BN marked code somewhere
+    (``has_code``) AND the segment holding the address is executable -- the ELF
+    header, which decodes as a string on every AArch64 ELF, sits unclaimed in
+    the r-x load segment of a view that has a `.text`. Without a ReadOnlyCode
+    section the view is a raw image or a section-header-stripped ELF, where the
+    unclaimed addresses ARE the literals (and on a static ELF `.rodata` shares
+    the r-x segment with `.text`, so segment permissions alone cannot rank them):
+    everything stays in the data tier, which is plain address order."""
+    i = bisect_right(ranges.starts, address) - 1
+    if i >= 0 and address < ranges.ends[i]:
+        return ranges.tiers[i], ranges.names[i]
+    if ranges.has_code and hasattr(ranges.bv, "get_segment_at"):
+        try:
+            segment = ranges.bv.get_segment_at(address)
+        except Exception:
+            segment = None
+        if segment is not None and bool(getattr(segment, "executable", False)):
+            return _STRING_TIER_NOISE, _STRING_NO_SECTION
     return _STRING_TIER_DATA, _STRING_NO_SECTION
 
 
@@ -297,10 +386,13 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     survivors: list[tuple[int, int, str, int, Any, list[str] | None]] = []
     # M-12: every survivor is ranked by the tier of its section, computed once
     # per read. The default dump orders `.rodata`-like strings first and the
-    # instruction-byte / linker-metadata "strings" last; `--section` pins one
-    # tier so its order is still plain address order.
+    # instruction-byte / linker-metadata "strings" last. `--section` pins the
+    # population to one section, and THAT population stays in plain address
+    # order whatever tier each address resolves to (another section may overlap
+    # the pinned one), so the rank every survivor sorts by is a constant there.
     ranges = _string_section_ranges(bv)
     noise_by_section: dict[str, int] = {}
+    data_by_section: dict[str, tuple[int, int]] = {}  # name -> (tier, strings)
     # #795: the candidate list is materialized so the read can disclose HOW MUCH
     # the active filters dropped. Without it the only way to the denominator was a
     # second, unfiltered invocation (`strings --count` said 1359 where
@@ -348,9 +440,13 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             if directives is None:
                 continue
 
-        if tier == _STRING_TIER_NOISE and not section:
-            noise_by_section[section_name] = noise_by_section.get(section_name, 0) + 1
-        survivors.append((tier, address, value, length, item, directives))
+        if not section:
+            if tier == _STRING_TIER_NOISE:
+                noise_by_section[section_name] = noise_by_section.get(section_name, 0) + 1
+            elif section_name != _STRING_NO_SECTION:
+                seen = data_by_section.get(section_name, (tier, 0))
+                data_by_section[section_name] = (tier, seen[1] + 1)
+        survivors.append((0 if section else tier, address, value, length, item, directives))
     # #795: how many candidates the ACTIVE filters dropped. An int on EVERY
     # result (0 when nothing filtered), so `jq '.filtered'` is a stable read
     # rather than a key that appears only sometimes -- the same reason `total`
@@ -374,10 +470,15 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     page["filtered"] = filtered
     # M-12: which sections contributed code / metadata noise to this listing, so
     # the CLI tip can name them (and stay silent when there are none) instead of
-    # blaming `.dynsym/.hash/.symtab` on a static file that has none. Empty when
+    # blaming `.dynsym/.hash/.symtab` on a static file that has none -- and which
+    # DATA sections the listing drew on, preferred tier first and most strings
+    # first within it, so the tip can name a `--section` that exists on THIS
+    # view (`.rdata` on a PE) rather than assume `.rodata`. Both are empty when
     # `--section` pinned the population: that noise is what the caller asked for.
     page["noise_strings"] = sum(noise_by_section.values())
     page["noise_sections"] = sorted(noise_by_section, key=lambda n: (-noise_by_section[n], n))
+    page["data_sections"] = sorted(
+        data_by_section, key=lambda n: (data_by_section[n][0], -data_by_section[n][1], n))
     return page
 
 
