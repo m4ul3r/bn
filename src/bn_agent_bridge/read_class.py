@@ -1862,19 +1862,24 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                                if s.get("address") != primary_addr]
                 if secondaries:
                     rec["secondary_vtables"] = secondaries
-                    rec.setdefault("notes", []).append(_SECONDARY_HEURISTIC_NOTE)
+                    _note_secondaries(rec, secondaries)
                 _note_rejected_secondaries(rec, recovered["rejected"])
     elif typeinfo_addr is not None:
         # #354: STRIPPED binary -- the `_ZTV` DataSymbol is gone so the registry has
         # no vtable address, but typeinfo survived. Backwalk typeinfo->vtable.
         recovered = _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr)
         if recovered:
-            rec["vtable"] = recovered["primary"]
             if recovered["secondary"]:
                 rec["secondary_vtables"] = recovered["secondary"]   # #412
-                rec.setdefault("notes", []).append(_SECONDARY_HEURISTIC_NOTE)
-            rec.setdefault("notes", []).append(
-                "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
+                _note_secondaries(rec, recovered["secondary"])
+            if recovered["primary"] is not None:
+                rec["vtable"] = recovered["primary"]
+                rec.setdefault("notes", []).append(
+                    "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
+            else:
+                # #922 review: a sole non-zero candidate is a secondary guess,
+                # not the primary; the card keeps `vtable: null` and says why.
+                rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
             _note_rejected_secondaries(rec, recovered["rejected"])
     size = ctx._object_size_for(bv, rec)
     rec["size"] = size
@@ -1918,13 +1923,14 @@ def _as_signed(value: int | None, ptr: int) -> int:
     return value - (1 << bits) if value >= (1 << (bits - 1)) else value
 
 
-#: #922 (c): the widest object a secondary base subobject may sit inside. An
-#: Itanium offset-to-top is the (non-positive) displacement from a subobject's
-#: vptr to the top of the object -- a small negative number for every real
-#: multiple-inheritance layout. A word outside this range is not a vtable
-#: header: an `__si_class_type_info` record stores its mangled-name POINTER at
-#: word 0 (a positive value in the millions on every PIE observed), and its base
-#: typeinfo at word 1 -- the exact shape the backwalk mistook for a secondary.
+#: #922 (c): the widest object a secondary base subobject is assumed to sit
+#: inside when nothing else vouches for the candidate. An Itanium offset-to-top
+#: is the (non-positive) displacement from a subobject's vptr to the top of the
+#: object -- a small negative number for every ordinary multiple-inheritance
+#: layout. It is a BOUND, not a record detector: a base behind a 17 MiB member
+#: is legal C++, so a candidate outside it is disclosed as out-of-bound (never
+#: "an RTTI record"), and one whose slots are this class's `_ZThn<N>_` thunks
+#: with `N == -offset_to_top` is accepted whatever the width (#922 review).
 _MAX_OFFSET_TO_TOP = 1 << 24
 
 _SECONDARY_HEURISTIC_NOTE = (
@@ -1932,25 +1938,117 @@ _SECONDARY_HEURISTIC_NOTE = (
     "(no _ZTV symbol for the secondary bases); confidence: heuristic -- confirm "
     "each with `evidence table <address>` before reporting an inheritance edge")
 
+_SECONDARY_RTTI_NOTE = (
+    "secondary (multiple-inheritance) vtables recovered via typeinfo backwalk; "
+    "confidence: rtti (BN's own vtable-group symbol or `_ZThn<N>_` thunk slots "
+    "name this class at that offset-to-top)")
 
-def _offset_to_top_rejection(ott: int) -> str | None:
-    """Why a backwalk candidate's word[0] cannot be an offset-to-top, or None."""
-    if ott > 0:
-        return (f"offset-to-top {ott:#x} is positive: a pointer-sized word (such as an "
-                "RTTI record's type-name pointer), not a vtable header")
-    if ott < -_MAX_OFFSET_TO_TOP:
-        return f"offset-to-top {ott} is below the plausible bound -{_MAX_OFFSET_TO_TOP:#x}"
+_NO_PRIMARY_NOTE = (
+    "no primary vtable (offset-to-top 0) found by the typeinfo backwalk; the "
+    "secondary candidates are not promoted to a primary")
+
+#: An Itanium non-virtual thunk: `_ZThn<N>_<target>` adjusts `this` by -N
+#: before jumping to the target, so a slot naming one sits in a vtable whose
+#: offset-to-top is exactly -N.
+_THUNK_OFFSET_RE = re.compile(r"^_ZThn(\d+)_")
+
+
+def _thunk_slots_prove_offset(layout: dict[str, Any], ott: int, class_name: str | None) -> bool:
+    """True when a slot of *layout* is a `_ZThn<N>_` thunk with ``N == -ott`` --
+    the ABI's own statement that this slot array is a vtable at that
+    offset-to-top -- into a method of *class_name* when the name is known."""
+    if ott >= 0:
+        return False
+    for slot in layout.get("slots") or []:
+        method = slot.get("method") if isinstance(slot, dict) else None
+        if not isinstance(method, dict):
+            continue
+        m = _THUNK_OFFSET_RE.match(str(method.get("name") or ""))
+        if m is None or int(m.group(1)) != -ott:
+            continue
+        display = method.get("display_name")
+        if class_name and isinstance(display, str) and display and f"{class_name}::" not in display:
+            continue
+        return True
+    return False
+
+
+def _bn_names_vtable_group(bv, vt_addr: int, ptr: int, class_name: str | None) -> bool:
+    """True when BN's own RTTI analysis put a ``vtable for <Class>{for `Base'}``
+    symbol on the candidate's slot array -- its attribution of the group to
+    *class_name* (the shape it synthesises for a secondary group inside the
+    `_ZTV` object, stripped or not)."""
+    if not class_name or not hasattr(bv, "get_symbol_at"):
+        return False
+    kind, owner = _rtti_kind_and_class(bv.get_symbol_at(vt_addr + 2 * ptr))
+    return kind == "vtable" and owner is not None and owner.startswith(f"{class_name}{{for ")
+
+
+def _mapped_region_name(ctx, bv, word: int) -> str | None:
+    """The section (else segment) a non-zero *word* falls in, or None when it
+    is not a mapped address."""
+    if not word:
+        return None
+    sections = ctx._sections_at(bv, word)
+    if sections:
+        return str(sections[0].get("name") or "") or "unnamed section"
+    segment = ctx._segment_at(bv, word)
+    if segment is not None:
+        return f"segment {segment.get('start', '?')}-{segment.get('end', '?')}"
     return None
 
 
+def _classify_backwalk_candidate(
+    ctx, bv, vt_addr: int, raw: int | None, ptr: int, layout: dict[str, Any],
+    class_name: str | None,
+) -> tuple[int, str | None, str | None]:
+    """``(offset_to_top, rejection, proof)`` for a backwalk candidate's word[0].
+
+    The UNSIGNED word is tested first: a value that is a mapped address (a
+    record's name pointer, `__dso_handle`'s self-pointer, a 32-bit `.rodata`
+    pointer such as ``0xffff0000`` that signs to a plausible ``-65536``) is a
+    pointer, not a displacement. Then the signed value: positive is never an
+    offset-to-top. A displacement the ABI vouches for (thunk slots, BN's own
+    group symbol) is proof at any width; otherwise one past the bound is
+    disclosed as out-of-bound and one inside it is a heuristic (proof None)."""
+    region = _mapped_region_name(ctx, bv, raw or 0)
+    if region is not None:
+        return _as_signed(raw, ptr), (
+            f"word[0] {raw:#x} is a mapped pointer (into {region}), not an offset-to-top"), None
+    ott = _as_signed(raw, ptr)
+    if ott > 0:
+        return ott, f"word[0] {ott:#x} is positive; an offset-to-top is never positive", None
+    if ott == 0:
+        return ott, None, None
+    if _thunk_slots_prove_offset(layout, ott, class_name):
+        return ott, None, "thunk_slots"
+    if _bn_names_vtable_group(bv, vt_addr, ptr, class_name):
+        return ott, None, "bn_vtable_group"
+    if ott < -_MAX_OFFSET_TO_TOP:
+        return ott, (
+            f"offset-to-top {ott} is outside the bound -{_MAX_OFFSET_TO_TOP:#x} and no "
+            f"slot is a `_ZThn{-ott}_` thunk of this class"), None
+    return ott, None, None
+
+
 def _note_rejected_secondaries(rec: dict[str, Any], rejected: list[dict[str, Any]]) -> None:
-    """#922 (c): a rejected candidate is disclosed, never silently dropped."""
+    """#922 (c): a rejected candidate is disclosed, never silently dropped. The
+    note states what was observed at the word -- the backwalk also lands on
+    `__dso_handle` + a `DW.ref._ZTI*` catch-table ref, which is no record."""
     if not rejected:
         return
     rec["rejected_secondary_candidates"] = rejected
     rec.setdefault("notes", []).append(
-        f"{len(rejected)} typeinfo-adjacent record(s) rejected as secondary vtables: "
+        f"{len(rejected)} typeinfo backwalk candidate(s) rejected as vtables: "
         + "; ".join(f"{r['address']} ({r['reason']})" for r in rejected))
+
+
+def _note_secondaries(rec: dict[str, Any], secondaries: list[dict[str, Any]]) -> None:
+    notes = rec.setdefault("notes", [])
+    if any(s.get("confidence") == "heuristic" for s in secondaries):
+        notes.append(_SECONDARY_HEURISTIC_NOTE)
+    if any(s.get("confidence") == "rtti" for s in secondaries):
+        notes.append(_SECONDARY_RTTI_NOTE)
 
 
 def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any] | None:
@@ -1965,20 +2063,30 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
 
     #922 (c): a derived class's ``__si_class_type_info`` record ALSO has this
     class's typeinfo at its word[1] (as the base), so the backwalk lands on it
-    too; its word[0] is the type-name pointer. A candidate whose word[0] is not
-    a plausible offset-to-top (:func:`_offset_to_top_rejection`) is an RTTI
-    record, not a vtable -- it is returned under ``rejected`` with the reason,
-    never as a primary or a secondary. The secondaries that remain are a
-    heuristic (``confidence: "heuristic"``): a non-zero word[0] followed by this
-    typeinfo is consistent with a secondary base subobject, not proof of one.
+    too, with its type-name pointer at word[0]; so does `__dso_handle` when a
+    `DW.ref._ZTI*` catch-table ref follows it. A candidate whose word[0] cannot
+    be an offset-to-top (:func:`_classify_backwalk_candidate`) is returned
+    under ``rejected`` with the observed reason, never as a primary or a
+    secondary. A secondary the ABI vouches for -- `_ZThn<N>_` thunk slots with
+    ``N == -offset_to_top``, or BN's own ``vtable for X{for `Y'}`` symbol on
+    its slot array -- carries ``confidence: "rtti"``; any other carries
+    ``confidence: "heuristic"``: a non-zero word[0] followed by this typeinfo
+    is consistent with a secondary base subobject, not proof of one.
 
-    Returns ``{"primary": layout, "secondary": [layout, ...], "rejected":
+    The primary is the candidate at offset-to-top 0 (the first, when several
+    resolve). With none, ``primary`` is None: a non-zero candidate is a
+    secondary guess and stays one, with its provenance -- promoting the
+    nearest-to-zero guess (the former fallback) reported it as an unqualified
+    primary and hid it from the symbolized-primary path's secondaries.
+
+    Returns ``{"primary": layout | None, "secondary": [layout, ...], "rejected":
     [{"address", "offset_to_top", "reason"}, ...]}`` or None when nothing
     resolves as a vtable."""
     getter = getattr(bv, "get_data_refs", None)
     if not callable(getter):
         return None
     ptr = ctx._pointer_size(bv)
+    class_name = ctx._typeinfo_name_at(bv, int(typeinfo_addr))
     groups: list[tuple[int, dict[str, Any]]] = []
     rejected: list[dict[str, Any]] = []
     seen: set[int] = set()
@@ -1990,13 +2098,18 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
         layout = ctx._vtable_layout_for(bv, vt_addr)
         if not layout or not layout.get("slots"):
             continue
-        ott = _as_signed(ctx._read_pointer_value(bv, vt_addr, size=ptr), ptr)
-        reason = _offset_to_top_rejection(ott)
+        raw = ctx._read_pointer_value(bv, vt_addr, size=ptr)
+        ott, reason, proof = _classify_backwalk_candidate(
+            ctx, bv, vt_addr, raw, ptr, layout, class_name)
         if reason is not None:
             rejected.append({"address": hex(vt_addr), "offset_to_top": ott, "reason": reason})
             continue
         layout["offset_to_top"] = ott
         layout["typeinfo_backwalk"] = True   # provenance: recovered without a _ZTV symbol
+        if ott != 0:
+            layout["confidence"] = "rtti" if proof else "heuristic"
+            if proof:
+                layout["confidence_reason"] = proof
         groups.append((ott, layout))
     if not groups:
         return None
@@ -2006,13 +2119,8 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     # whose offset-to-top is ALSO 0 is a construction-vtable / RTTI artifact, not
     # a secondary -- dropping it avoids emitting a bogus secondary (#412 review).
     zeros = [layout for ott, layout in groups if ott == 0]
-    if zeros:
-        primary = zeros[0]                            # several ==0 -> take the first
-    else:
-        primary = min(groups, key=lambda g: abs(g[0]))[1]   # none ==0 -> nearest 0
-    secondary = [layout for ott, layout in groups if ott != 0 and layout is not primary]
-    for layout in secondary:
-        layout["confidence"] = "heuristic"
+    primary = zeros[0] if zeros else None
+    secondary = [layout for ott, layout in groups if ott != 0]
     return {"primary": primary, "secondary": secondary, "rejected": rejected}
 
 
