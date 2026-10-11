@@ -1450,9 +1450,37 @@ def _local_retype_result(**overrides):
     return result
 
 
-class _LoadBV:
+class _MetadataMixin:
+    """BN's per-view metadata store (`store_metadata` / `query_metadata`): the
+    bridge stamps the raw file's sha256 here when it OPENS a raw view, and
+    asks a restored database for it at load."""
+
+    def store_metadata(self, key: str, value, isAuto: bool = False):
+        self.__dict__.setdefault("metadata", {})[key] = value
+
+    def query_metadata(self, key: str):
+        try:
+            return self.__dict__.setdefault("metadata", {})[key]
+        except KeyError:
+            raise KeyError(key) from None
+
+
+class _RawView:
+    """`bv.file.raw`: the ORIGINAL bytes a database stores (BN keeps the source
+    file's contents in the .bndb), read in windows like the real one."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self.length = len(data)
+
+    def read(self, offset: int, length: int) -> bytes:
+        return self._data[offset:offset + length]
+
+
+class _LoadBV(_MetadataMixin):
     def __init__(self, filename: str | None = None, view_type: str = "ELF",
-                 functions=None, existing_views=None, db_views=None):
+                 functions=None, existing_views=None, db_views=None, metadata=None,
+                 raw_bytes: bytes | None = None):
         self.analysis_updated = False
         # A real loaded view carries functions; default to one so the #458 .bndb
         # analyzed-view check treats a plain loaded view as analyzed. Tests that
@@ -1461,12 +1489,17 @@ class _LoadBV:
         # _load_binary's #355 idempotency scan reads bv.file.filename, the #369
         # raw-mapped warning reads bv.view_type, and the #458 recovery path reads
         # bv.file.existing_views / bv.file.get_view_of_type(name).
-        self.file = types.SimpleNamespace(filename=filename)
+        self.closed = False
+        self.file = types.SimpleNamespace(
+            filename=filename, close=lambda: setattr(self, "closed", True))
         if existing_views is not None:
             self.file.existing_views = list(existing_views)
             _db = dict(db_views or {})
             self.file.get_view_of_type = lambda name, _m=_db: _m.get(name)
+        if raw_bytes is not None:
+            self.file.raw = _RawView(raw_bytes)
         self.view_type = view_type
+        self.metadata = dict(metadata or {})
 
     def update_analysis_and_wait(self):
         self.analysis_updated = True
@@ -1667,7 +1700,7 @@ class _RecordingWriter:
 # --- save_database: never report success when nothing was written -------------
 
 
-class _SaveBV:
+class _SaveBV(_MetadataMixin):
     """Minimal view for _save_database: records the path create_database got and
     optionally writes a file / returns a chosen bool, mimicking Binary Ninja."""
 
@@ -1684,7 +1717,7 @@ class _SaveBV:
         return self._result
 
 
-class _RehomingSaveBV:
+class _RehomingSaveBV(_MetadataMixin):
     """Like _SaveBV, but mimics BN's create_database RE-HOMING the view's filename
     to the new .bndb -- the behavior _SaveBV omits and the cause of #256."""
 
@@ -1699,7 +1732,7 @@ class _RehomingSaveBV:
         return True
 
 
-class _RehomingFailSaveBV:
+class _RehomingFailSaveBV(_MetadataMixin):
     """create_database re-homes the live view's filename BEFORE failing (no file
     lands) -- BN can rebind bv.file.filename even on a save that doesn't
     complete, so the explicit-failure path must still restore identity (#256)."""
@@ -1733,7 +1766,7 @@ class _RestoreFailFile:
         self._name = value
 
 
-class _RestoreFailSaveBV:
+class _RestoreFailSaveBV(_MetadataMixin):
     """create_database succeeds and re-homes the view, but restoring the original
     filename afterward raises -- the live view stays re-homed to the copy."""
 

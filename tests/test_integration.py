@@ -5,6 +5,7 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -1587,6 +1588,275 @@ class TestLoadCacheBndbRestore:
             ro.chmod(0o700)
             if cache_file is not None and cache_file.exists():
                 cache_file.unlink()
+
+
+class TestSidecarContentValidation:
+    """A sidecar `.bndb` is preferred by path; whether it describes the bytes
+    now at that path is decided from the sha256 the bridge stamps on a raw view
+    when it OPENS it (and `bn save` carries into the database). Only real BN
+    can prove the stamp survives `create_database` and comes back through
+    `binaryninja.load` + the analyzed-view restore, that the view's bytes stay
+    what it loaded when the file is replaced underneath it, and that a legacy
+    database's stored bytes (`bv.file.raw`) hash equal to its source -- the
+    mocked lane fakes every one of those ends."""
+
+    @staticmethod
+    def _function_names(shared_bn) -> set[str]:
+        listing = shared_bn.json("function", "list", "--limit", "500")
+        return {f["name"] for f in (listing.get("items") if isinstance(listing, dict) else listing)}
+
+    def test_replaced_bytes_load_raw_and_restored_bytes_reload_the_database(
+            self, shared_bn, tmp_path):
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+
+        # Save the database for the hello bytes, then prove a plain reload
+        # prefers it with its provenance VERIFIED (no unverified note).
+        shared_bn.load(prog, copy=False)
+        saved = shared_bn.json("save")
+        assert saved["path"] == str(sidecar), saved
+        assert "note" not in saved, saved  # the stamp landed silently
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        reloaded = shared_bn.json("load", str(prog))
+        assert reloaded["path"] == str(sidecar), reloaded
+        notes = " ".join(reloaded["notes"])
+        assert "unverified" not in notes and "NOT restoring" not in notes, notes
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # Different bytes at the same path: the database must NOT be restored.
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+        replaced = shared_bn.json("load", str(prog))
+        assert replaced["path"] == str(prog), replaced
+        assert any(
+            n.startswith("NOT restoring ") and str(sidecar) in n and "--no-bndb" in n
+            for n in replaced["notes"]), replaced["notes"]
+        names = self._function_names(shared_bn)
+        assert {"add", "mul"} <= names and "greet" not in names, names
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+        # The original bytes back: the database describes them again.
+        prog.write_bytes(hello)
+        restored = shared_bn.json("load", str(prog))
+        assert restored["path"] == str(sidecar), restored
+        assert not any(n.startswith("NOT restoring ") for n in restored["notes"])
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_a_file_replaced_under_the_open_view_is_not_certified_by_save(
+            self, shared_bn, tmp_path):
+        """Review P1 (both reviewers): `bn save` hashed the file ON DISK, so a
+        file replaced between load and save was stamped as the database's
+        source and the stale database then matched forever. The identity is
+        taken at open; a save -- and a second save after an earlier successful
+        one -- certifies the bytes the view LOADED."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+
+        shared_bn.load(prog, copy=False)
+        first = shared_bn.json("save")
+        assert first["path"] == str(sidecar) and "note" not in first, first
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())       # replaced while open
+        second = shared_bn.json("save")
+        assert second["path"] == str(sidecar) and "note" not in second, second
+        stamp = shared_bn.json(
+            "py", "exec", "result = dict(bv.query_metadata('bn_agent_bridge'))")["result"]
+        assert stamp == {"source_sha256": hashlib.sha256(hello).hexdigest(),
+                         "source_size": len(hello)}, stamp
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+        # The database describes the hello bytes and says so; the file holds
+        # the add bytes: the raw file loads, loudly.
+        reloaded = shared_bn.json("load", str(prog))
+        assert reloaded["path"] == str(prog) and reloaded.get("already_open") is None, reloaded
+        assert any(
+            n.startswith("NOT restoring ") and str(sidecar) in n
+            for n in reloaded["notes"]), reloaded["notes"]
+        names = self._function_names(shared_bn)
+        assert {"add", "mul"} <= names and "greet" not in names, names
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+    def test_an_already_open_stale_database_is_judged_before_being_returned(
+            self, shared_bn, tmp_path):
+        """Review P1 (Astra): with the stale database explicitly open, a load
+        of the raw path found it by path and returned it `already_open` with
+        only dedupe notes. The open candidate is judged like a fresh one: the
+        explicit database stays open, the raw bytes load beside it."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+        explicit = shared_bn.json("load", str(sidecar))
+        assert explicit["path"] == str(sidecar), explicit
+        assert not any("NOT restoring" in n for n in explicit["notes"]), explicit["notes"]
+        # Round 3 P2: kept (requested explicitly), but no longer silent.
+        assert any("requested explicitly" in n for n in explicit["notes"]), explicit["notes"]
+
+        raw = shared_bn.json("load", str(prog))
+        assert raw["path"] == str(prog) and raw.get("already_open") is None, raw
+        assert any(
+            n.startswith("NOT restoring ") and "Loaded the raw file instead" in n
+            for n in raw["notes"]), raw["notes"]
+        rows = {row["filename"]: row for row in shared_bn.json("target", "list")["items"]}
+        assert set(rows) == {str(sidecar), str(prog)}, rows
+        assert rows[str(prog)]["source_verified"] is None
+        # A raw view beside its own .bndb makes the path selector ambiguous
+        # (both match `prog`); the row's target_id is the unambiguous handle.
+        listing = shared_bn.json("function", "list", "--limit", "500",
+                                 "-t", rows[str(prog)]["target_id"])
+        names = {f["name"] for f in listing["items"]}
+        assert {"add", "mul"} <= names and "greet" not in names, names
+
+        # A third load of the raw path dedupes against the raw view, and the
+        # note says the existing target was returned -- not "loaded".
+        again = shared_bn.json("load", str(prog))
+        assert again["already_open"] is True and again["path"] == str(prog), again
+        refusal = [n for n in again["notes"] if n.startswith("NOT restoring ")]
+        assert refusal and f"{prog} is already open" in refusal[0], again["notes"]
+        assert "Loaded the raw file instead" not in refusal[0]
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_a_legacy_database_is_verified_from_the_bytes_it_stores_and_stamped_on_save(
+            self, shared_bn, tmp_path):
+        """Review P2: a database saved before content validation carries no
+        record, but BN stores the original bytes in it. Real BN proves those
+        hash equal to the source file: the database is VERIFIED from them, the
+        verdict is on the target row, the next save persists the record, and
+        the reload after that is silent."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        # Make it a pre-validation database: strip the record and persist that.
+        shared_bn.load(sidecar, copy=False)
+        shared_bn.json("py", "exec",
+                       "bv.remove_metadata('bn_agent_bridge')\n"
+                       "result = bv.save_auto_snapshot()")
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        legacy = shared_bn.json("load", str(prog))
+        assert legacy["path"] == str(sidecar), legacy
+        notes = " ".join(legacy["notes"])
+        assert "unverified" not in notes and "NOT restoring" not in notes, notes
+        assert any(n.startswith("database provenance verified from the bytes stored in")
+                   for n in legacy["notes"]), legacy["notes"]
+        assert legacy["targets"][0]["source_verified"] is True, legacy["targets"]
+        info = shared_bn.json("target", "info")
+        assert info["source_verified"] is True, info
+        assert info["existing_annotations"]["source_verified"] is True, info
+        assert "verified against the raw file's content" in info["existing_annotations"]["provenance_hint"]
+        assert "greet" in self._function_names(shared_bn)
+        saved = shared_bn.json("save")                      # persists the in-memory stamp
+        assert saved["path"] == str(sidecar), saved
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        silent = shared_bn.json("load", str(prog))
+        assert silent["path"] == str(sidecar), silent
+        assert not any("provenance" in n for n in silent["notes"]), silent["notes"]
+        assert silent["targets"][0]["source_verified"] is True
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # ...and once stamped, other bytes at the path are refused like any
+        # other mismatch -- the hazard a record-less database left as a note.
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+        refused = shared_bn.json("load", str(prog))
+        assert refused["path"] == str(prog), refused
+        assert any(n.startswith("NOT restoring ") for n in refused["notes"]), refused["notes"]
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+    def test_an_explicitly_named_stale_database_is_kept_but_reported(
+            self, shared_bn, tmp_path):
+        """Review round 3 P2: `bn load <db>` never judged its database, so a
+        stale one came back silently (`notes: []`, `source_verified: null`).
+        It is kept -- the caller asked for it -- but the record naming other
+        bytes than the sibling raw file now holds is reported, on the load
+        notes, the row and both text faces."""
+        prog = tmp_path / "prog"
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+        explicit = shared_bn.json("load", str(sidecar))
+        assert explicit["path"] == str(sidecar) and explicit.get("already_open") is None, explicit
+        assert not any("NOT restoring" in n for n in explicit["notes"]), explicit["notes"]
+        note = next((n for n in explicit["notes"] if "requested explicitly" in n), None)
+        assert note and note.startswith(f"{sidecar} was saved for different bytes than {prog}"), (
+            explicit["notes"])
+        assert f"`bn load {prog} --no-bndb`" in note
+        assert explicit["targets"][0]["source_verified"] is False, explicit["targets"]
+        assert "greet" in self._function_names(shared_bn)      # the database's analysis, kept
+        info = shared_bn.json("target", "info")
+        assert info["existing_annotations"]["source_verified"] is False, info
+        text = shared_bn.run("target", "info")
+        assert text.returncode == 0 and "source-verified=false" in text.stdout, text.stdout
+        orient = shared_bn.run("evidence", "orient")
+        assert orient.returncode == 0 and "source-verified=false" in orient.stdout, orient.stdout
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # The original bytes back: the same explicit load verifies, silently.
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        back = shared_bn.json("load", str(sidecar))
+        assert not any("requested explicitly" in n for n in back["notes"]), back["notes"]
+        assert back["targets"][0]["source_verified"] is True, back["targets"]
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+
+class TestRestartReopensAStaleDatabaseLoudly:
+    """Review round 3 P2: `session restart` reloads a saved target through its
+    row's `database_path` with `prefer_bndb` off (#753) -- an explicit database
+    open, and the one load path that still reopened a database whose raw file
+    had changed with `notes: []`. A private session: the restart IS the subject."""
+
+    def test_restart_reports_the_database_whose_raw_file_changed(self, tmp_path):
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        inst = None
+        try:
+            inst = _session_start(str(prog))["instance_id"]
+            saved = json.loads(_bn("--instance", inst, "save", "--format", "json").stdout)
+            assert saved["path"] == str(sidecar), saved
+            prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+            restarted = _bn("session", "restart", inst, "--format", "json",
+                            timeout=_SESSION_START_TIMEOUT)
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            result = json.loads(restarted.stdout)
+            reloaded = result["loaded"][0]
+            assert reloaded["path"] == str(sidecar), reloaded
+            note = next((n for n in reloaded["notes"] if "requested explicitly" in n), None)
+            assert note and note.startswith(f"{sidecar} was saved for different bytes than {prog}"), (
+                reloaded["notes"])
+            assert reloaded["targets"][0]["source_verified"] is False, reloaded["targets"]
+            rows = json.loads(_bn("--instance", inst, "target", "list", "--format", "json").stdout)
+            assert rows["items"][0]["source_verified"] is False, rows
+        finally:
+            if inst:
+                _session_stop(inst)
+
 
 
 class TestBatchFunctionCreate:

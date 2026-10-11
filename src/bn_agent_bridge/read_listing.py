@@ -917,7 +917,8 @@ def _annotations_unavailable(exc: BaseException, *, filename: str = "") -> dict[
     }
 
 
-def _existing_annotations(ctx, bv, *, filename: str = "") -> dict[str, Any]:
+def _existing_annotations(ctx, bv, *, filename: str = "",
+                          source_verified: bool | None = None) -> dict[str, Any]:
     """Counts + provenance hint for annotations ALREADY present in *bv* (#561).
 
     ONE builder for the two surfaces that answer "can I trust this view as
@@ -933,10 +934,15 @@ def _existing_annotations(ctx, bv, *, filename: str = "") -> dict[str, Any]:
     view it already holds); a resolution failure degrades to
     ``_annotations_unavailable`` in the caller. ``analysis_cache_restored`` is
     derived from *filename*: a ``.bndb`` carries the analysis cache, which is
-    where inherited comments/names come from. ``provenance_hint`` is keyed on
-    ANALYST work, not the raw non-auto count -- the loader's own placeholders
-    made a pristine view hint that its entirely-current-run analysis may predate
-    the run (#733 F2).
+    where inherited comments/names come from. *source_verified* is the load's
+    verdict on the database (preferred over the raw path, or named explicitly
+    and judged against its sibling raw file) -- checked against the file's
+    content (True), restored unverified or naming other bytes (False), or no
+    database was judged (None) -- published beside the flag and spelled out in the hint,
+    so a later reader is not left with the one-shot load note. ``provenance_hint``
+    is keyed on ANALYST work, not the raw non-auto count -- the loader's own
+    placeholders made a pristine view hint that its entirely-current-run
+    analysis may predate the run (#733 F2).
     """
     analysis_cache_restored = str(filename or "").endswith(".bndb")
     try:
@@ -949,18 +955,28 @@ def _existing_annotations(ctx, bv, *, filename: str = "") -> dict[str, Any]:
     )
     hint = None
     if analysis_cache_restored or total_annotations:
+        if source_verified is True:
+            restored = " (analysis cache restored from a .bndb verified against the raw file's content)"
+        elif source_verified is False:
+            restored = (
+                " (analysis cache restored from a .bndb whose provenance is UNVERIFIED: "
+                "it may describe other bytes than the raw file)"
+            )
+        else:
+            restored = " (analysis cache restored from a .bndb)"
         hint = (
             f"existing BNDB annotations may predate this run: "
             f"{annotations['comments']} comment(s), "
             f"{annotations['function_comments']} function doc(s), "
             f"{annotations['analyst_symbols']} analyst symbol(s) already present "
             f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
-            + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
+            + (restored if analysis_cache_restored else "")
             + " -- do not over-credit current-run analysis"
         )
     return {
         **annotations,
         "analysis_cache_restored": analysis_cache_restored,
+        "source_verified": source_verified,
         "provenance_hint": hint,
     }
 
