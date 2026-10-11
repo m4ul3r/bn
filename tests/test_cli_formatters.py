@@ -4613,7 +4613,9 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     # Last, so a real absorption reports itself rather than being masked by the
     # anti-vacuity count it also changes.
     # Combined #873 and #879 renderer population; remeasured below.
-    assert checked == 1284, f"the differential ran {checked} cases, not 1284"
+    # M-01 adds the `discarded_unsaved` list read to the session-start and
+    # session-stop renderers: two pairs x six malformed values. Measured: 1296.
+    assert checked == 1296, f"the differential ran {checked} cases, not 1296"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4691,7 +4693,9 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     # #693 adds 16 more for two go-rename reads.
     # Combined #873/#879/#889 population is 5280. #693 adds two go-rename
     # reads, each probed with eight malformed values, for 5296 total.
-    assert swept == 5296, f"the raise sweep ran {swept} renders, not 5296"
+    # M-01 adds the `discarded_unsaved` read on the session-start and
+    # session-stop renderers: two pairs x eight, for 5312.
+    assert swept == 5312, f"the raise sweep ran {swept} renders, not 5312"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4872,7 +4876,9 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     # #693 adds four more for the same go-rename pairs.
     # Combined #873/#879/#889 mirror is 1534. #693's two reads add four
     # benign probes, for 1538 total.
-    assert checked == 1538, f"the mirror ran {checked} renders, not 1538"
+    # M-01 adds the `discarded_unsaved` read on the session-start and
+    # session-stop renderers: two pairs x three benign probes, for 1544.
+    assert checked == 1544, f"the mirror ran {checked} renders, not 1544"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -7728,8 +7734,10 @@ def test_no_list_ELEMENT_costs_the_whole_render():
         f"payload with the list absent rendered cleanly: {raised[:6]}")
     # #907 adds two class-note list positions, each tested with nine junk
     # elements at four shapes, to the PR-integrated 4716. Measured: 4788.
-    assert swept == 4788, (
-        f"the element sweep ran {swept} renders, not 4788 -- the size of the "
+    # M-01 adds the `discarded_unsaved` list position on the session-start and
+    # session-stop renderers: two x nine x four. Measured: 4860.
+    assert swept == 4860, (
+        f"the element sweep ran {swept} renders, not 4860 -- the size of the "
         "covered set (every list position the population discovered x every "
         "junk element kind x all four element shapes), so move it only with a "
         "position you deliberately added or removed")

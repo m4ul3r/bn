@@ -57,7 +57,7 @@ A workflow that starts a headless bridge should name a unique instance, arm a po
 ```bash
 BN_IDLE_TIMEOUT=3600 bn session start /path/to/sample.bin --instance-id analysis-1
 bn -i analysis-1 target close <selector-returned-by-bridge>  # if a target opened
-bn session stop analysis-1                               # attempt even if close failed
+bn session stop analysis-1                               # attempt even if close failed; add --discard-unsaved if the failed close left a target unsaved and the stop refuses
 ```
 
 The exact duplicate-ID error means you did not acquire ownership; leave that existing bridge alone. A timed-out or otherwise failed start has uncertain ownership because its child may have registered later, so attempt `bn session stop <your-unique-id>`. Never use `bn close --all` for cleanup of an owned target; it can close unrelated GUI tabs. Cleanup-only work begins with the exact close/stop commands, not with a new start. `BN_IDLE_TIMEOUT` is optional for an existing user-owned bridge and does not replace normal cleanup for one you own.

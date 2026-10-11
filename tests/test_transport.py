@@ -1388,6 +1388,91 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         send_request("ping", timeout=12.5)
 
 
+def test_only_a_failure_before_connect_is_unreachable(tmp_path, monkeypatch):
+    """`BridgeUnreachableError` is "never reached", nothing broader (#925).
+
+    `session stop`'s unsaved guard skips the probe for a bridge it could not
+    reach and REFUSES for one that was reached but did not answer, so the
+    class must cover exactly the pre-connect failures: the process-state
+    refusals, the lifecycle-only handle, and a connect() nobody accepted. A
+    deadline, a reset after connect, an empty reply are the live bridge's own.
+    """
+    import bn.transport as transport
+    from bn.transport import BridgeError, BridgeUnreachableError
+
+    instance = _make_instance(tmp_path)
+
+    class _FakeSocket:
+        fail_connect: BaseException | None = None
+        fail_after_connect: BaseException | None = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            if self.fail_connect is not None:
+                raise self.fail_connect
+
+        def sendall(self, payload):
+            if self.fail_after_connect is not None:
+                raise self.fail_after_connect
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda sock, inst: None)
+
+    def raised(**shape):
+        _FakeSocket.fail_connect = shape.get("fail_connect")
+        _FakeSocket.fail_after_connect = shape.get("fail_after_connect")
+        # Wide enough for the four ECONNREFUSED retries (0.3s of backoff): a
+        # budget they exhaust is reported as a deadline, which is NOT this class.
+        with pytest.raises(BridgeError) as info:
+            transport._send_request_to_instance(instance, "list_targets", timeout=5.0)
+        return info.value
+
+    # Never reached: nothing accepted the connection (ENOENT/ECONNREFUSED are
+    # retried, then reported as "Failed to contact").
+    refused = raised(fail_connect=ConnectionRefusedError(111, "Connection refused"))
+    assert isinstance(refused, BridgeUnreachableError)
+    assert "Failed to contact Binary Ninja bridge pid 999" in str(refused)
+
+    # Reached: the deadline expired while waiting for the reply.
+    timed_out = raised(fail_after_connect=socket.timeout("timed out"))
+    assert not isinstance(timed_out, BridgeUnreachableError)
+    assert "Timed out waiting for Binary Ninja bridge pid 999" in str(timed_out)
+
+    # Reached: the peer accepted and then reset the connection.
+    reset = raised(fail_after_connect=ConnectionResetError(104, "Connection reset by peer"))
+    assert not isinstance(reset, BridgeUnreachableError)
+    assert "Failed to contact Binary Ninja bridge pid 999" in str(reset)
+
+    # Reached: an empty reply from a process that accepted the request.
+    monkeypatch.setattr(transport, "_process_running", lambda pid: True)
+    empty = raised()
+    assert not isinstance(empty, BridgeUnreachableError)
+    assert "returned an empty response" in str(empty)
+
+    # Never reached: the process-state refusals and the lifecycle-only handle.
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "T")
+    assert isinstance(raised(), BridgeUnreachableError)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "Z")
+    assert isinstance(raised(), BridgeUnreachableError)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "S")
+    instance.unreachable = True
+    assert isinstance(raised(), BridgeUnreachableError)
+
+
 def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
     from bn.transport import BridgeError, BridgeInstance
 
