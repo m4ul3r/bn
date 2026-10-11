@@ -152,9 +152,14 @@ def test_batch_function_create_reanalysis_runs_under_gate_not_exclusive_lock(mon
     across N full analyses while every concurrent read (which takes
     _target_lock.read() and waits on _writer) blocked for all of them. The op's
     reanalysis is deferred to the batch's own post-apply reanalysis, which #628
-    already runs under the write gate alone: exactly ONE reanalysis happens, with
-    the exclusive lock NOT held, and the end state is unchanged (both functions
-    created, verified and visible; a 1-op batch still reanalyzes)."""
+    already runs under the write gate alone: NO reanalysis happens with the
+    exclusive lock held, and the end state is unchanged (both functions
+    created, verified and visible; a 1-op batch still reanalyzes).
+
+    #927 P2 adds one gate-only analysis BETWEEN two creates, so the second
+    create's interior guard sees the first one's ranges -- the lock
+    discipline is the invariant, the count of gate-only analyses is not: a
+    1-create batch analyzes once, an N-create batch N times, never exclusively."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     lock = instance._target_lock
@@ -179,8 +184,9 @@ def test_batch_function_create_reanalysis_runs_under_gate_not_exclusive_lock(mon
     )
 
     # The core assertion: no reanalysis at all ran while the exclusive writer lock
-    # was held, and the batch still reanalyzed exactly once (gate-only, #628).
-    assert waits == [(False, True)]
+    # was held; every analysis the batch ran was gate-only (#628), one per create
+    # (#927 P2: the inter-create one plus the post-apply one).
+    assert waits == [(False, True)] * len(addrs)
     assert lock._writer is False
     assert "refresh" in bv.events
     # End state unchanged: every op verified and every function live.
@@ -5013,40 +5019,149 @@ def test_a_create_at_a_free_address_grows_no_overlap_keys_675():
     assert cc._with_overlap_note(dict(row), []) == row
 
 
-class _OverlappingCreateBV(_FakeFunctionCreateBV):
-    """A create view whose containment answers, which the stock fake's does
-    not -- so every existing create drive takes the EMPTY path and cannot
-    observe the interior guard at all."""
+class _Range:
+    def __init__(self, start, end):
+        self.start, self.end = start, end
 
-    def __init__(self, *, container_start, container_name="main", **kw):
+
+class _HostFunction(_FakeFunction):
+    """A function with the shape the interior guard and its revert read:
+    `address_ranges`, blocks (`get_basic_block_at`) and a `symbol` with
+    provenance. Ranges are the one source of truth; blocks mirror them so
+    `_function_span` (the stock containment rule) agrees."""
+
+    def __init__(self, start, name, ranges, *, auto_symbol=True):
+        super().__init__(start, name)
+        self.set_ranges(ranges)
+        self.symbol = types.SimpleNamespace(auto=auto_symbol, name=name, address=start,
+                                            type="FunctionSymbol")
+
+    def set_ranges(self, ranges):
+        self.ranges = [tuple(r) for r in ranges]
+        self.basic_blocks = [types.SimpleNamespace(start=a, end=b, arch=None)
+                             for a, b in self.ranges]
+
+    @property
+    def address_ranges(self):
+        return [_Range(a, b) for a, b in self.ranges]
+
+    def get_basic_block_at(self, addr):
+        for block in self.basic_blocks:
+            if block.start <= addr < block.end:
+                return block
+        return None
+
+    def covers(self, addr):
+        return any(a <= addr < b for a, b in self.ranges)
+
+
+class _OverlappingCreateBV(_FakeFunctionCreateBV):
+    """A create view that replays what real BN 6.1 does to a function a
+    create lands inside (#927 review, verified on `parser_x86_64`):
+
+      * at an INSTRUCTION BOUNDARY the host is truncated at the new start
+        and the new function owns the rest;
+      * at a MID-INSTRUCTION address the host is left intact and the new
+        function overlaps it, decoding a different stream;
+      * removing the created function lets a truncated host re-extend.
+
+    Instructions are a fixed 4 bytes here, so "boundary" is a multiple of
+    four from the block start. The stock fake's containment never answers,
+    so every other create drive takes the EMPTY path and cannot observe the
+    guard at all; the first cut of this stub answered `main` for every
+    address and modelled no truncation, which is how a revert that did not
+    restore the host passed its tests."""
+
+    def __init__(self, *, hosts, instruction_length=4, **kw):
         super().__init__(**kw)
-        self._container = (container_start, container_name)
+        self.functions = list(hosts)
+        self._insn = instruction_length
+        self._pending: list = []
+
+    def get_instruction_length(self, addr, arch=None):
+        return self._insn
 
     def get_functions_containing(self, addr):
-        start, name = self._container
-        return [types.SimpleNamespace(start=start, name=name)]
+        return [fn for fn in self.functions
+                if isinstance(fn, _HostFunction) and fn.covers(int(addr))]
+
+    def get_next_function_start_after(self, addr):
+        later = [int(fn.start) for fn in self.functions if int(fn.start) > int(addr)]
+        return min(later) if later else 0xFFFFFFFF
+
+    def create_user_function(self, addr):
+        self.events.append(("create_user_function", addr))
+        self.added.append(int(addr))
+        self._suppressed.discard(int(addr))
+        fn = _HostFunction(int(addr), f"sub_{addr:x}", [], auto_symbol=True)
+        fn.arch = self.arch
+        fn.total_bytes = self._created_total_bytes
+        self.functions.append(fn)
+        self._pending.append(fn)
+        return fn
+
+    def _analyze_created(self, fn):
+        """What analysis does for a function created at an interior address."""
+        hosts = [h for h in self.get_functions_containing(fn.start) if h is not fn]
+        end = max([b for h in hosts for a, b in h.ranges if a <= fn.start < b]
+                  or [fn.start + self._created_total_bytes])
+        fn.set_ranges([(fn.start, end)])
+        for host in hosts:
+            block = host.get_basic_block_at(fn.start)
+            if (fn.start - block.start) % self._insn == 0:
+                host.set_ranges([(a, fn.start if a <= fn.start < b else b)
+                                 for a, b in host.ranges])
+
+    def _settle_hosts(self):
+        """A truncated host re-extends once nothing starts where it was cut."""
+        for host in self.functions:
+            if not isinstance(host, _HostFunction) or not hasattr(host, "_cut_from"):
+                continue
+            cut_at, old_end = host._cut_from
+            if self.get_function_at(cut_at) is None:
+                host.set_ranges([(a, old_end if b == cut_at else b) for a, b in host.ranges])
+                del host._cut_from
+
+    def update_analysis_and_wait(self):
+        super().update_analysis_and_wait()
+        for fn in self._pending:
+            before = {h: list(h.ranges) for h in self.functions
+                      if isinstance(h, _HostFunction) and h.ranges}
+            self._analyze_created(fn)
+            for host, ranges in before.items():
+                if host.ranges != ranges:
+                    host._cut_from = (fn.start, max(b for a, b in ranges))
+        self._pending = []
+        self._settle_hosts()
 
 
-def _overlap_bv(addr):
+def _overlap_bv(addr, *, offset=8, hosts=None, **kw):
+    """`main` covering [addr-offset, addr-offset+0x40) with the create at
+    +offset -- a boundary when offset is a multiple of 4."""
+    start = addr - offset
+    if hosts is None:
+        hosts = [_HostFunction(start, "main", [(start, start + 0x40)])]
     return _OverlappingCreateBV(
-        container_start=addr - 8,
+        hosts=hosts,
         segments={addr: _FakeSegment(readable=True, executable=True)},
         memory={addr: b"\x55\x48\x89\xe5"},
+        **kw,
     )
 
 
 def _assert_interior_refusal(exc, addr):
-    """The refusal names the host, its start and the offset -- the three
-    facts that tell a mistyped address from a deliberate split -- and says
-    how to ask for the split. Status `invalid_request` is what puts the run
-    at exit 3 on both surfaces."""
+    """The refusal names the host, its start, the offset and which of BN's
+    two outcomes the address gets -- the facts that tell a mistyped address
+    from a deliberate split -- and says how to ask for it. Status
+    `invalid_request` is what puts the run at exit 3 on both surfaces."""
     assert exc.status == "invalid_request"
     assert "main" in exc.message
     assert hex(addr - 8) in exc.message
     assert "+0x8" in exc.message
     assert "allow" in exc.message and "overlap" in exc.message
     assert exc.observed["overlaps"] == [
-        {"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
+        {"name": "main", "address": hex(addr - 8), "offset": "0x8",
+         "instruction_boundary": True}]
 
 
 def test_the_single_command_create_inside_a_function_is_refused_m03(monkeypatch):
@@ -5067,6 +5182,53 @@ def test_the_single_command_create_inside_a_function_is_refused_m03(monkeypatch)
     assert bv.added == [] and "refresh" not in bv.events
 
 
+def test_the_refusal_says_a_boundary_address_truncates_the_host_927():
+    """The refusal must not promise ONE outcome (#927 review): at an
+    instruction boundary BN truncates the host, and the text says so."""
+    from bn_agent_bridge import create_comments as cc
+    exc = cc._overlap_refusal(
+        0x401341, [{**_HOST, "instruction_boundary": True}], {}, flag="--allow-overlap")
+    assert "truncates the host" in exc.message
+    assert "instruction boundary" in exc.message
+    assert "intact" not in exc.message
+
+
+def test_the_refusal_says_a_mid_instruction_address_overlaps_the_host_927():
+    """...and at a mid-instruction address -- the typo-shaped case -- BN
+    leaves the host intact beside a function decoding a bogus stream, which
+    the old "splits the host at the new start" wording got exactly wrong."""
+    from bn_agent_bridge import create_comments as cc
+    exc = cc._overlap_refusal(
+        0x401343, [{**_HOST, "offset": "0xa", "instruction_boundary": False}], {},
+        flag="--allow-overlap")
+    assert "not an instruction boundary" in exc.message
+    assert "leaves the host intact" in exc.message
+    assert "mid-instruction" in exc.message
+    assert "truncates the host" not in exc.message
+
+
+def test_the_refusal_covers_both_outcomes_when_the_boundary_is_unknown_927():
+    """A host whose blocks cannot be walked gets no verdict, and the refusal
+    then states both outcomes rather than guessing one."""
+    from bn_agent_bridge import create_comments as cc
+    exc = cc._overlap_refusal(0x401341, [_HOST], {}, flag="--allow-overlap")
+    assert "either truncates the host" in exc.message
+    assert "leaves the host intact" in exc.message
+    assert "boundary unknown" in exc.message
+
+
+def test_the_boundary_probe_walks_the_hosts_block_with_bn_instruction_lengths_927():
+    from bn_agent_bridge import create_comments as cc
+    host = _HostFunction(0x401339, "main", [(0x401339, 0x401379)])
+    bv = _overlap_bv(0x401341, hosts=[host])
+    assert cc._instruction_boundary(bv, host, 0x401341) is True     # +8
+    assert cc._instruction_boundary(bv, host, 0x401343) is False    # +10
+    assert cc._instruction_boundary(bv, host, 0x401339) is True     # the start
+    assert cc._instruction_boundary(bv, host, 0x401400) is None     # outside
+    # A function with no blocks to walk -- the stock fake -- is "unknown".
+    assert cc._instruction_boundary(bv, _FakeFunction(0x401339, "main"), 0x401341) is None
+
+
 def test_the_single_command_preview_obeys_the_interior_guard_m03(monkeypatch):
     """A preview that said `verified` for a create the live command refuses
     would be a plan the loop cannot execute."""
@@ -5083,9 +5245,14 @@ def test_the_single_command_preview_obeys_the_interior_guard_m03(monkeypatch):
     assert bv.added == []
 
 
+_SPLIT_HOST = {**_HOST, "instruction_boundary": True, "truncated": True}
+
+
 def test_the_single_command_create_path_returns_the_overlap_with_the_flag_675(monkeypatch):
     """The deliberate split: `allow_overlap` goes ahead and the row discloses
-    the host, asserted on the OBSERVED row rather than on the call site."""
+    the host and what became of it, asserted on the OBSERVED row rather than
+    on the call site -- and the truncated host is an affected function too
+    (#927 review), not only an entry under the overlap list."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     addr = 0x401341
@@ -5097,9 +5264,41 @@ def test_the_single_command_create_path_returns_the_overlap_with_the_flag_675(mo
     assert result["committed"] is True
     row = result["results"][0]
     assert row["status"] == "verified"
-    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
+    assert row["overlaps"] == [_SPLIT_HOST]
+    assert "main @ 0x401339 was truncated at 0x401341" in row["note"]
     assert "legitimate" in row["note"] and "mistake" in row["note"]
     assert row["requested"]["allow_overlap"] is True
+    # The fake did what BN does: the host now ends at the new start.
+    assert bv.get_function_at(0x401339).ranges == [(0x401339, 0x401341)]
+    assert result["affected_functions"] == [
+        {"address": hex(addr), "before_name": None, "after_name": f"sub_{addr:x}",
+         "changed": True},
+        {"address": "0x401339", "before_name": "main", "after_name": "main",
+         "changed": True},
+    ]
+
+
+def test_a_mid_instruction_create_reports_the_host_intact_927(monkeypatch):
+    """BN's other outcome: the host keeps every byte and the new function
+    overlaps it. The row must say `intact`, and the host audit row reports
+    no change -- a status that claimed a split here would be the inverse
+    of the M-03 lie."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401343
+    bv = _overlap_bv(addr, offset=10)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, hex(addr), False, allow_overlap=True)
+
+    row = result["results"][0]
+    assert row["status"] == "verified"
+    assert row["overlaps"] == [{"name": "main", "address": "0x401339", "offset": "0xa",
+                                "instruction_boundary": False, "truncated": False}]
+    assert "main @ 0x401339 is intact and now overlaps the new function" in row["note"]
+    assert bv.get_function_at(0x401339).ranges == [(0x401339, 0x401379)]
+    assert result["affected_functions"][1] == {
+        "address": "0x401339", "before_name": "main", "after_name": "main", "changed": False}
 
 
 def test_the_batch_create_inside_a_function_is_refused_m03(monkeypatch):
@@ -5120,12 +5319,14 @@ def test_the_batch_create_inside_a_function_is_refused_m03(monkeypatch):
     assert "main" in row["message"] and hex(addr - 8) in row["message"]
     assert "+0x8" in row["message"]
     assert "allow_overlap" in row["message"]
+    assert "truncates the host" in row["message"]
     assert bv.get_function_at(addr) is None
 
 
 def test_the_batch_create_path_returns_the_same_overlap_with_the_flag_675(monkeypatch):
     """With `allow_overlap: true` the batch op proceeds and its row carries
-    the same disclosure the standalone row does."""
+    the same disclosure the standalone row does -- including the observed
+    fate of the host, stamped after the batch's deferred analysis."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     addr = 0x401341
@@ -5138,7 +5339,8 @@ def test_the_batch_create_path_returns_the_same_overlap_with_the_flag_675(monkey
 
     row = result["results"][0]
     assert row["status"] == "verified"
-    assert row["overlaps"] == [{"name": "main", "address": hex(addr - 8), "offset": "0x8"}]
+    assert row["overlaps"] == [_SPLIT_HOST]
+    assert "was truncated at 0x401341" in row["note"]
     assert "legitimate" in row["note"] and "mistake" in row["note"]
 
 
@@ -5160,16 +5362,64 @@ def test_the_batch_allow_overlap_field_must_be_a_json_boolean_m03(monkeypatch):
     assert bv.get_function_at(addr) is None
 
 
-def test_a_view_that_cannot_answer_containment_discloses_nothing_675():
-    """Degrade-safely, as everywhere else: a probe that raises has no
-    evidence of an overlap and must not invent one, nor refuse the create."""
+def test_a_malformed_allow_overlap_is_refused_even_at_an_existing_start_927(monkeypatch):
+    """#927 review P3: the type check sat below the existing-start noop, so
+    `"allow_overlap": "false"` was a noop at a function start and a refusal
+    one byte in. A malformed field is malformed wherever it points."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _overlap_bv(0x401341)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "function_create", "address": "0x401339", "allow_overlap": "false"}])
+
+    row = result["results"][0]
+    assert row["status"] == "invalid_request", row
+    assert "allow_overlap must be a JSON boolean" in row["message"]
+
+
+def test_a_view_that_cannot_answer_containment_refuses_the_create_927():
+    """#927 review P3: the probe swallowed every exception and returned `[]`,
+    so a view that could not say whether the address was inside a function
+    let the create proceed -- and truncate -- silently: the M-03 harm, on
+    the one view nobody could see it coming. A guard fails CLOSED."""
     from bn_agent_bridge import create_comments as cc
 
     class _Hostile:
         def get_functions_containing(self, addr):
             raise RuntimeError("analysis unavailable")
 
-    assert cc._containing_function_rows(_Hostile(), 0x401341) == []
+    with pytest.raises(cc.OperationFailure) as exc:
+        cc._containing_function_rows(_Hostile(), 0x401341, requested={"op": "function_create"})
+    assert exc.value.status == "internal_error"
+    assert "Could not determine whether 0x401341 lies inside" in exc.value.message
+    assert exc.value.requested == {"op": "function_create"}
+
+
+def test_an_unreadable_containment_creates_nothing_on_either_path_927(monkeypatch):
+    """Driven through both entry points: nothing is created or analysed when
+    the guard cannot read its evidence."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+
+    def _unreadable(a):
+        raise RuntimeError("analysis unavailable")
+    bv.get_functions_containing = _unreadable
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._function_create(None, hex(addr), False, allow_overlap=True)
+    assert exc.value.status == "internal_error"
+    assert bv.added == [] and "refresh" not in bv.events
+
+    result = instance._mutation(
+        "active", False, [{"op": "function_create", "address": hex(addr)}])
+    assert result["results"][0]["status"] == "internal_error"
+    assert bv.added == []
 
 
 def test_a_function_starting_at_the_address_is_not_an_overlap_675():
@@ -5185,8 +5435,280 @@ def test_a_function_starting_at_the_address_is_not_an_overlap_675():
         def get_functions_containing(self, addr):
             return [_Fn(0x401341, "sub_401341"), _Fn(0x401339, "main")]
 
-    rows = cc._containing_function_rows(_BV(), 0x401341)
+    rows = cc._containing_function_rows(_BV(), 0x401341, requested={})
     assert rows == [_HOST]
+
+
+# --- #927 P1: a revert must put the hosts back, not just drop the create ---
+
+
+class _SharedTailCreateBV(_OverlappingCreateBV):
+    """Replays the real-BN 6.1 geometry the #927 review reproduced: a
+    discontiguous host A = [0x1000,0x1002)+[0x1010,0x1019) and a host
+    B = [0x1004,0x1019) sharing the tail. A create at 0x1012:
+
+      * cuts A to [0x1000,0x1002) (and analysis renames it `j_sub_1010`,
+        a jump thunk), cuts B to [0x1004,0x1010), and spawns an
+        ANALYSIS-CREATED function at 0x1010;
+      * removing the created function leaves all of that in place -- the
+        extra function simply grows over the tail;
+      * `remove_function` on the extra does not stick (analysis re-creates
+        it), `remove_user_function` does, and only then does reanalyzing
+        the hosts give them their tail back; the auto name comes back only
+        when the thunk symbol is undefined and the recorded one redefined.
+
+    Every step above was observed, not designed; the stub exists so the
+    revert's verification and repair have something to fail against."""
+
+    TAIL, CUT, END = 0x1010, 0x1012, 0x1019
+
+    def __init__(self, *, repairable=True):
+        self.a = _HostFunction(0x1000, "entry_a", [(0x1000, 0x1002), (0x1010, 0x1019)])
+        self.b = _HostFunction(0x1004, "entry_b", [(0x1004, 0x1019)])
+        super().__init__(
+            hosts=[self.a, self.b], instruction_length=1,
+            segments={a: _FakeSegment(readable=True, executable=True)
+                      for a in range(0x1000, 0x1019)},
+            memory={a: b"\x90" for a in range(0x1000, 0x1019)},
+        )
+        self._repairable = repairable
+        self._split = False
+
+    def _spawn_extra(self):
+        extra = _HostFunction(self.TAIL, f"sub_{self.TAIL:x}", [(self.TAIL, self.END)])
+        extra.auto = True
+        self.functions.append(extra)
+        return extra
+
+    def undefine_auto_symbol(self, symbol):
+        self.events.append(("undefine_auto_symbol", symbol.name))
+
+    def define_auto_symbol(self, symbol):
+        self.events.append(("define_auto_symbol", symbol.name))
+        fn = self.get_function_at(symbol.address)
+        if fn is not None:
+            fn.name = symbol.name
+            fn.symbol = symbol
+
+    def update_analysis_and_wait(self):
+        _FakeMutationBV.update_analysis_and_wait(self)
+        created = self.get_function_at(self.CUT)
+        extra = self.get_function_at(self.TAIL)
+        if created is not None and not self._split:
+            self._split = True
+            self._pending = []
+            created.set_ranges([(self.CUT, self.END)])
+            self.a.set_ranges([(0x1000, 0x1002)])
+            self.a.name = f"j_sub_{self.TAIL:x}"
+            self.a.symbol = types.SimpleNamespace(auto=True, name=self.a.name,
+                                                  address=0x1000, type="FunctionSymbol")
+            self.b.set_ranges([(0x1004, self.TAIL)])
+            self._spawn_extra().set_ranges([(self.TAIL, self.CUT)])
+            return
+        if not self._split:
+            return
+        if created is None and extra is not None:
+            extra.set_ranges([(self.TAIL, self.END)])
+        if created is None and extra is None:
+            if self.TAIL not in self._suppressed or not self._repairable:
+                self._spawn_extra()   # analysis brings it straight back
+            elif self.a.reanalyzed and self.b.reanalyzed:
+                self.a.set_ranges([(0x1000, 0x1002), (0x1010, 0x1019)])
+                self.b.set_ranges([(0x1004, 0x1019)])
+                self._split = False
+
+
+def _shared_tail_snapshot(bv):
+    return sorted((fn.start, fn.name, list(fn.ranges)) for fn in bv.functions)
+
+
+def test_a_preview_inside_shared_tail_hosts_restores_them_or_says_so_927(monkeypatch):
+    """#927 P1 (standalone): the preview reported `rolled_back: true` while
+    both hosts stayed shortened and an analysis-created function kept the
+    tail. The revert now verifies the hosts against their snapshot, repairs
+    them the way BN allows, and only then claims a clean revert."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SharedTailCreateBV()
+    before = _shared_tail_snapshot(bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, hex(bv.CUT), True, allow_overlap=True)
+
+    assert result["success"] is True and result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"
+    # BOTH hosts were disclosed, as truncated, with the fate observed before
+    # the revert put them back.
+    assert [(o["name"], o["truncated"]) for o in result["results"][0]["overlaps"]] == [
+        ("entry_a", True), ("entry_b", True)]
+    assert _shared_tail_snapshot(bv) == before, "the hosts are not back as they were"
+    # The repair escalated exactly as documented: non-poisoning first, then
+    # the suppressing removal of the ANALYSIS-created function, never of a
+    # host or of a function that was there before.
+    assert ("remove_function", bv.TAIL) in bv.events
+    assert ("remove_user_function", bv.TAIL) in bv.events
+    assert ("remove_user_function", 0x1000) not in bv.events
+    assert ("remove_user_function", 0x1004) not in bv.events
+    assert ("define_auto_symbol", "entry_a") in bv.events
+    assert bv.a.name == "entry_a"
+
+
+def test_a_preview_whose_hosts_cannot_be_restored_reports_rollback_failed_927(monkeypatch):
+    """When BN will not give the hosts back, the preview must say so: a
+    failed rollback, not a success, and the view marked dirty so `close`
+    warns -- `rolled_back: true` over shortened hosts is the P1 lie."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SharedTailCreateBV(repairable=False)
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._function_create(None, hex(bv.CUT), True, allow_overlap=True)
+
+    assert result["success"] is False and result["rolled_back"] is False
+    row = result["results"][0]
+    assert row["status"] == "rollback_failed"
+    assert row["overlaps"], "the overlap is still live and must stay disclosed"
+    assert "a function it split" in result["message"]
+    assert marked == [bv]
+    assert bv.a.ranges == [(0x1000, 0x1002)]
+
+
+def test_a_batch_preview_inside_shared_tail_hosts_restores_them_927(monkeypatch):
+    """#927 P1 (batch): the same geometry through `batch apply --preview`,
+    whose restore is the op's registered closure."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SharedTailCreateBV()
+    before = _shared_tail_snapshot(bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "function_create", "address": hex(bv.CUT), "allow_overlap": True}])
+
+    assert result["success"] is True and result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert [(o["name"], o["truncated"]) for o in result["results"][0]["overlaps"]] == [
+        ("entry_a", True), ("entry_b", True)]
+    assert _shared_tail_snapshot(bv) == before
+
+
+def test_a_batch_whose_hosts_cannot_be_restored_reports_rollback_failed_927(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SharedTailCreateBV(repairable=False)
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "function_create", "address": hex(bv.CUT), "allow_overlap": True}])
+
+    assert result["success"] is False and result["rolled_back"] is False
+    assert "may be left modified" in result["message"]
+    assert marked == [bv]
+
+
+def test_the_restore_never_removes_a_function_that_predated_the_create_927(monkeypatch):
+    """The repair removes only starts the snapshot did not record: a
+    function that already sat inside a host's range is not analysis
+    residue, and a repair that dropped it would trade one loss for another."""
+    cc = _load_bridge(monkeypatch).create_comments
+    host = _HostFunction(0x2000, "outer", [(0x2000, 0x2040)])
+    inner = _HostFunction(0x2020, "inner", [(0x2020, 0x2040)])
+    bv = _overlap_bv(0x2008, hosts=[host, inner])
+    snapshot = cc._snapshot_split_hosts(bv, [{"name": "outer", "address": "0x2000", "offset": "0x8"}])
+    assert snapshot["starts"] == {0x2000, 0x2020}
+    # Shorten the host by hand and let the restore try: the only candidate
+    # start inside the span is `inner`, which predates the create.
+    host.set_ranges([(0x2000, 0x2008)])
+    assert cc._restore_split_hosts(None, bv, 0x2008, snapshot) is False
+    assert bv.get_function_at(0x2020) is inner
+    assert not any(e[0].startswith("remove") for e in bv.events if isinstance(e, tuple))
+
+
+# --- #927 P2: a batch create inside an EARLIER batch create ---------------
+
+
+def test_a_batch_create_inside_an_earlier_create_is_refused_927(monkeypatch):
+    """#927 P2: `[create X, create X+4]` without `allow_overlap` exited 0 with
+    both rows verified and no overlap -- the second op's guard ran before
+    the first create had analyzed ranges, and the post-analysis verifier
+    checks existence and code only. The batch now analyzes between two
+    creates (gate-only), so the second sees the first and is refused."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    first, second = 0x4011d8, 0x4011dc
+    bv = _OverlappingCreateBV(
+        hosts=[],
+        segments={a: _FakeSegment(readable=True, executable=True) for a in (first, second)},
+        memory={a: b"\x55\x48\x89\xe5" for a in (first, second)},
+        created_total_bytes=0x60,
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "function_create", "address": hex(first)},
+        {"op": "function_create", "address": hex(second)},
+    ])
+
+    assert result["success"] is False and result["committed"] is False
+    assert [r["status"] for r in result["results"]] == ["reverted", "invalid_request"]
+    refusal = result["results"][1]["message"]
+    assert f"sub_{first:x}" in refusal and hex(first) in refusal and "+0x4" in refusal
+    assert "allow_overlap" in refusal
+    # The whole batch is undone: neither function is live.
+    assert bv.get_function_at(first) is None and bv.get_function_at(second) is None
+
+
+def test_a_batch_create_inside_an_earlier_create_proceeds_with_the_flag_927(monkeypatch):
+    """The must-fire twin's permission path: with `allow_overlap` on the
+    second op the batch commits and the second row names the FIRST create
+    as the host it truncated."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    first, second = 0x4011d8, 0x4011dc
+    bv = _OverlappingCreateBV(
+        hosts=[],
+        segments={a: _FakeSegment(readable=True, executable=True) for a in (first, second)},
+        memory={a: b"\x55\x48\x89\xe5" for a in (first, second)},
+        created_total_bytes=0x60,
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "function_create", "address": hex(first)},
+        {"op": "function_create", "address": hex(second), "allow_overlap": True},
+    ])
+
+    assert result["success"] is True and result["committed"] is True
+    assert [r["status"] for r in result["results"]] == ["verified", "verified"]
+    assert result["results"][1]["overlaps"] == [
+        {"name": f"sub_{first:x}", "address": hex(first), "offset": "0x4",
+         "instruction_boundary": True, "truncated": True}]
+    assert "overlaps" not in result["results"][0]
+
+
+def test_a_batch_with_creates_followed_only_by_other_ops_analyzes_once_927(monkeypatch):
+    """Must-not-fire twin of the inter-create analysis: only a LATER create
+    needs an earlier one's ranges, so a create followed by a comment keeps
+    #780's single post-apply analysis."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ops = [{"op": "function_create", "address": "0x1000"},
+           {"op": "set_comment", "address": "0x1000", "comment": "x"}]
+    assert me._later_create_needs_ranges(ops, 0) is False
+    assert me._later_create_needs_ranges(ops, 1) is False
+    two = [{"op": "function_create", "address": "0x1000"},
+           {"op": "set_comment", "address": "0x1000", "comment": "x"},
+           {"op": "function_create", "address": "0x2000"}]
+    assert [me._later_create_needs_ranges(two, i) for i in range(3)] == [True, False, False]
+    assert me._later_create_needs_ranges(["not-a-dict", {"op": "function_create"}], 0) is False
+
 
 def _commit_mutation(monkeypatch, instance, bv, ops):
     """Drive the real commit and dirty-mark path against the same fake view."""

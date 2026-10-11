@@ -320,7 +320,9 @@ def test_function_create_refused_on_quick_view_without_analysis(monkeypatch):
     """#479: on a --quick-loaded view, function create must fail fast (pointing at
     `bn refresh`) instead of triggering full analysis under the write lock -- which
     wedged the instance so even later `target info` reads hung. It must NOT start
-    analysis or create anything."""
+    analysis or create anything. #927 review: the refusal is the batch op's
+    `OperationFailure("invalid_request")` (exit 3 on both surfaces), not a bare
+    RuntimeError that put the standalone command at exit 2 -- M-24's twin."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeFunctionCreateBV(
@@ -330,8 +332,10 @@ def test_function_create_refused_on_quick_view_without_analysis(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     bridge._quick_loaded_views.add(bv)
 
-    with pytest.raises(RuntimeError, match="--quick"):
+    with pytest.raises(bridge.OperationFailure, match="--quick") as exc:
         instance._function_create(None, "0x1000", False)
+    assert exc.value.status == "invalid_request"
+    assert exc.value.requested == {"op": "function_create", "address": "0x1000"}
 
     # No analysis kicked off, nothing created -> no wedge, no side effects.
     assert "refresh" not in bv.events
@@ -351,8 +355,9 @@ def test_function_create_preview_refused_on_quick_view(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     bridge._quick_loaded_views.add(bv)
 
-    with pytest.raises(RuntimeError, match="bn refresh"):
+    with pytest.raises(bridge.OperationFailure, match="bn refresh") as exc:
         instance._function_create(None, "0x1000", True)
+    assert exc.value.status == "invalid_request"
 
     assert "refresh" not in bv.events
     assert bv.added == []
