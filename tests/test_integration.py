@@ -2062,6 +2062,133 @@ class TestFunctionCreateInteriorGuard:
         assert hex(start + 6) in sizes
 
 
+def _annotate_host(shared_bn, start: int) -> str:
+    """Give the function at *start* every kind of user annotation a split
+    could lose -- name, prototype, doc comment, address comment, function
+    and address tags, a renamed+retyped local -- and return the state
+    snapshot `_host_state` reads, so a test can assert it came back."""
+    inside = hex(start + 8)
+    # The fixtures are this machine's compiler output, so the local to
+    # annotate is picked from the listing, not named in advance: a 32-bit
+    # stack local (a C `int`), retyped to its unsigned twin.
+    locals_ = json.loads(shared_bn.run("local", "list", hex(start), "--format", "json").stdout)
+    local = next(v for v in locals_["items"]
+                 if not v["is_parameter"] and v["type"] == "int32_t" and v["name"].startswith("var_"))
+    for args in (
+        ("rename", hex(start), "review_host"),
+        ("proto", "set", "review_host", "int review_host(int argc, char** argv)"),
+        ("comment", "set", "--function", "review_host", "host doc"),
+        ("comment", "set", inside, "addr note"),
+        ("tag", "add", "--function", "review_host", "--type", "Bookmarks", "--data", "fn tag"),
+        ("tag", "add", inside, "--type", "Bookmarks", "--data", "addr tag"),
+        ("local", "rename", "review_host", local["name"], "review_local"),
+        ("local", "retype", "review_host", "review_local", "uint32_t"),
+    ):
+        res = shared_bn.run(*args)
+        assert res.returncode == 0, f"{args}\n{res.stdout}\n{res.stderr}"
+    return _host_state(shared_bn, start)
+
+
+def _host_state(shared_bn, start: int) -> str:
+    return _py_line(shared_bn, (
+        f"f = bv.get_function_at({start:#x})\n"
+        f"inside = {start + 8:#x}\n"
+        "state = (f.name, f.symbol.auto, str(f.type), f.has_user_type, f.comment,\n"
+        "         bv.get_comment_at(inside),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_function_tags()),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_tags_at(inside)),\n"
+        "         sorted((v.name, str(v.type), f.is_var_user_defined(v)) for v in f.vars),\n"
+        "         [(hex(r.start), hex(r.end)) for r in f.address_ranges])\n"
+        "print('STATE=' + repr(state))\n"), "STATE")
+
+
+class TestFunctionCreateAnnotatedHost:
+    """#927 round 3 on real BN: what a split host's revert must put back, and
+    WHO puts it back. The repair owns only what analysis destroys and the
+    undo journal cannot restore (ranges, existence, auto symbols); every
+    user annotation is the journal's. The standalone preview proves the
+    journal alone preserves them; the batch orderings prove the repair
+    never writes a sibling's since-reverted rename back over the undo."""
+
+    def test_standalone_preview_keeps_every_user_annotation(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        assert "'review_host', False" in before and "'review_local', 'uint32_t', True" in before
+
+        preview = shared_bn.run("function", "create", hex(start + 4), "--allow-overlap", "--preview")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        assert "dirty_after=False" in preview.stdout
+        assert f"overlapping_functions: review_host @ {hex(start)} (+0x4, truncated)" in preview.stdout
+        assert _host_state(shared_bn, start) == before
+
+    def test_batch_preview_keeps_the_hosts_original_name_after_a_sibling_rename(self, shared_bn, tmp_path):
+        """The reviewer's exact repro: `[rename host, create inside it]
+        --preview` exited 0 with `rolled_back: true` and the host still
+        carrying the preview-only name."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_then_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False
+        assert summary["overlapping_functions"][0]["name"] == "preview_only_name"
+        after = _host_state(shared_bn, start)
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+        assert _function_sizes(shared_bn)["review_host"] == size
+
+    def test_failed_live_batch_really_reverts_the_rename_before_the_split(self, shared_bn, tmp_path):
+        """A later op fails, the batch rolls back: the rename row says
+        `reverted` and the view agrees -- original name, full ranges, and
+        no function at the split address."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_split_fail.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True},
+            {"op": "function_create", "address": "0x10"}]}))
+
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 3, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert payload["rolled_back"] is True and payload["success"] is False, payload
+        assert [r["status"] for r in payload["results"]] == [
+            "reverted", "reverted", "invalid_request"], payload["results"]
+        assert _host_state(shared_bn, start) == before
+        sizes = _function_sizes(shared_bn)
+        assert sizes["review_host"] == size and hex(start + 4) not in sizes, sizes
+
+    def test_batch_preview_restores_an_auto_name_a_thunk_cut_replaced_under_a_rename(self, shared_bn, tmp_path):
+        """The analysis-owned half, in the ordering that hides it: host A of
+        the shared-tail geometry is cut down to a jump thunk, which gives it
+        an auto `j_*` symbol UNDER the sibling's user rename. The undo drops
+        the user name and the thunk name would show; the repair restores the
+        auto symbol set from its snapshot, so the baseline name is back."""
+        shared_bn.load(PARSER_BINARY)
+        base = int(_py_line(shared_bn, _SHARED_TAIL_SETUP, "BASE"), 16)
+        before = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        mf = tmp_path / "rename_then_tail_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(base), "new_name": "user_renamed_a"},
+            {"op": "function_create", "address": hex(base + 0x12), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload["message"]
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+
+
 _SHARED_TAIL_SETUP = (
     # Two user functions sharing a tail, one of them discontiguous -- the
     # geometry the #927 review reproduced on a Mapped view, rebuilt over the

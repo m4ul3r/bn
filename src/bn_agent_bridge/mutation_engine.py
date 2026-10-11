@@ -2263,6 +2263,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     engine calls and tests keep working. Every return path produces exactly the
     same result dict as before -- no schema, status, message or ordering change.
     """
+    from . import create_comments  # one-way import direction, see _op_function_create
+
     exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     if not operations:
         raise ValueError("Batch operation list is empty")
@@ -2392,6 +2394,13 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             )
             else {}
         )
+        # #927 round 3: the functions a create may cut, as they are BEFORE op 0
+        # -- the state every revert path below must return them to. A create
+        # op's own restore repairs their ranges from a snapshot taken just
+        # before IT ran, which inside a batch is an intermediate state; their
+        # names are the journal's, and a rollback is not clean until both agree
+        # with this baseline (`_split_hosts_at_baseline`).
+        host_baseline = create_comments._split_host_baseline(ctx, bv, operations)
         state = bv.begin_undo_actions()
     results = []
     # Explicit restores for local var ops, which BN's undo buffer can't
@@ -2427,13 +2436,18 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             restore_ok = _run_local_restores(ctx, bv, restores)
             _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+            # #927 round 3: the hosts of any create are back ONLY if they match
+            # the pre-transaction baseline -- name included -- after the undo
+            # AND the restores; a split host left renamed is a failed rollback.
+            hosts_ok = create_comments._split_hosts_at_baseline(
+                bv, host_baseline, what="the batch's creates")
             # #630: an already-applied set_prototype on an AUTO function leaves an
             # unclearable has_user_type override after revert. That is real residue,
             # not a clean revert, so it must fail and be disclosed here too -- the
             # apply-failure path previously reported status "reverted"/rolled_back
             # True with no disclosure at all.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            values_reverted = undo_ok and restore_ok and drift_ok
+            values_reverted = undo_ok and restore_ok and drift_ok and hosts_ok
             reverted = values_reverted and not proto_residue
             if values_reverted and not proto_residue:
                 message = "Rolled back before post-state verification because an operation failed to apply."
@@ -2521,6 +2535,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 restore_ok = _run_local_restores(ctx, bv, restores)
                 _settle_before_drift_restore(bv, var_before)
                 drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+                # #927 round 3: a create's hosts must match the pre-transaction
+                # baseline (name AND ranges) after the undo and every restore.
+                hosts_ok = create_comments._split_hosts_at_baseline(
+                    bv, host_baseline, what="the batch's creates")
                 # #630: a proto set on a function that had NO prior user type pins
                 # has_user_type, and neither BN's undo nor set_auto_type clears the
                 # flag (verified live on BN 5.4) -- there is no BN API to clear it.
@@ -2537,10 +2555,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 # per-op restamp still reports a rename/local that DID revert as
                 # "reverted", not "rollback_failed".
                 proto_residue = _prototype_user_type_residue(ctx, bv, results)
-                values_reverted = undo_ok and restore_ok and drift_ok
+                values_reverted = undo_ok and restore_ok and drift_ok and hosts_ok
                 restored = values_reverted and not proto_residue
             else:
-                values_reverted = True
+                values_reverted = hosts_ok = True
                 bv.commit_undo_actions(state)
 
             # Build the per-op output only once the revert outcome is known. On
@@ -2557,7 +2575,12 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
             message = None
             if preview:
-                if not values_reverted:
+                if not hosts_ok:
+                    message = (
+                        "Preview verified, but a function a create split is not back as "
+                        "it was before the batch; the view may be left modified."
+                    )
+                elif not values_reverted:
                     message = (
                         "Preview verified, but reverting a non-journaled change "
                         "(local variable or prototype) failed; the view may be left modified."
@@ -2574,7 +2597,12 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 else:
                     message = "Preview verified and reverted."
             elif failed:
-                if not values_reverted:
+                if not hosts_ok:
+                    message = (
+                        "Live-session verification failed AND a function a create split "
+                        "is not back as it was before the batch; the view may be left modified."
+                    )
+                elif not values_reverted:
                     message = (
                         "Live-session verification failed AND reverting a non-journaled change "
                         "(local variable or prototype) failed; the view may be left modified."
@@ -2620,6 +2648,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             restore_ok = _run_local_restores(ctx, bv, restores)
             _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+            hosts_ok = create_comments._split_hosts_at_baseline(
+                bv, host_baseline, what="the batch's creates")
             # #630 round 2: even when the value revert succeeds, an already-applied
             # set_prototype on an AUTO function leaves an unclearable has_user_type
             # override -- BN's undo and set_auto_type both restore the value but leave
@@ -2628,7 +2658,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # off the attribute to mark the view dirty, or `close` would read
             # bv.file.modified == false and wrongly report no unsaved state.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            if not (undo_ok and restore_ok and drift_ok):
+            if not (undo_ok and restore_ok and drift_ok and hosts_ok):
                 err = RuntimeError(
                     f"{exc} (additionally, rollback failed; the view may be left partially modified)"
                 )
@@ -4369,9 +4399,13 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # removal fails so _run_local_restores marks restore_ok=False and the batch
     # reports rolled_back=false instead of claiming a clean rollback while the
     # fabricated function still persists in the view. The same raise covers a
-    # host of a deliberate split that is not back as recorded (#927 P1):
-    # restores run newest-first, so a later create inside THIS one is already
-    # gone when this verifies its hosts.
+    # host of a deliberate split whose ranges are not back as recorded (#927
+    # P1): restores run newest-first, so a later create inside THIS one is
+    # already gone when this verifies its hosts. The hosts' NAMES are not this
+    # restore's to write -- `hosts` was snapshotted after the earlier siblings
+    # applied, and the batch's undo has already put the journaled state back
+    # by the time restores run -- so `_mutation` checks them against the
+    # pre-transaction baseline instead (#927 round 3).
     def _remove_created_restore():
         if not create_comments._remove_created_function(ctx, bv, addr):
             raise RuntimeError(

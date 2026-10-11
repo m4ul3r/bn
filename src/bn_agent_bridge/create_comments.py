@@ -343,6 +343,18 @@ def _snapshot_split_hosts(bv, overlapped: list[dict[str, Any]]) -> dict[str, Any
     before the create, plus every function start their ranges already held,
     so the repair can tell a function analysis added from one that was
     there.
+
+    Taken immediately before the create, so inside a batch it is the host's
+    INTERMEDIATE state (an earlier sibling may have renamed it). That is the
+    right reference for what the repair owns -- ranges, existence and the
+    AUTO symbols, none of which the undo journal restores, none of which a
+    sibling op writes, and each of which the restores undo in reverse apply
+    order -- and the wrong one for anything the journal owns (a user name,
+    prototype, comments, tags, locals): the batch undoes those
+    transaction-wide BEFORE the restores run, so re-applying them from here
+    resurrects a sibling's reverted change (#927 round 3). The repair never
+    writes them; the transaction baseline (`_split_host_baseline`) verifies
+    them. `name` is kept for the audit rows and the log lines only.
     """
     hosts: dict[int, dict[str, Any]] = {}
     for row in overlapped:
@@ -352,32 +364,83 @@ def _snapshot_split_hosts(bv, overlapped: list[dict[str, Any]]) -> dict[str, Any
             continue
         hosts[start] = {
             "name": str(fn.name),
-            "symbol": getattr(fn, "symbol", None),
+            "auto_symbols": _auto_symbols_at(bv, fn, start),
             "ranges": _range_pairs(fn),
         }
     span = sorted({r for host in hosts.values() for r in host["ranges"]})
     return {"hosts": hosts, "span": span, "starts": _function_starts_within(bv, span)}
 
 
-def _hosts_off(bv, snapshot: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """(range mismatches, name mismatches) against the snapshot; both empty
-    means the hosts are back exactly as recorded."""
-    ranges_off: list[str] = []
-    names_off: list[str] = []
-    for start, before in snapshot["hosts"].items():
+def _is_auto_symbol(symbol) -> bool:
+    return symbol is not None and bool(getattr(symbol, "auto", False))
+
+
+def _auto_symbols_at(bv, fn, start: int) -> dict[str, Any]:
+    """The AUTO symbols at *start*, by name -- ALL of them, not the one
+    `fn.symbol` prefers. A user rename sits on top of the auto symbols
+    without removing them, so the preferred symbol hides what analysis did
+    underneath: a host cut down to a jump thunk gains an auto `j_*` symbol
+    that outranks its loader name, and after the batch's undo drops the user
+    name the thunk name is what shows. The analysis-owned set is the thing
+    to put back; the view's own listing is the only place it is visible."""
+    symbols = list(bv.get_symbols(start, 1))
+    if not symbols:
+        symbols = [getattr(fn, "symbol", None)]
+    return {str(s.name): s for s in symbols if _is_auto_symbol(s)}
+
+
+def _split_host_baseline(ctx, bv, operations: list) -> dict[int, dict[str, Any]]:
+    """The TRANSACTION baseline of every function a batch's creates could
+    cut: name and ranges of each function containing a `function_create`
+    address, read before op 0 applies. `_split_hosts_at_baseline` verifies
+    the rollback against this -- the state the whole transaction must
+    return to, which no per-op snapshot taken mid-batch can know (#927
+    round 3). A create at a gap address records nothing; one inside an
+    EARLIER sibling's function finds no function here yet, and that
+    sibling's own restore removes it."""
+    baseline: dict[int, dict[str, Any]] = {}
+    for op in operations:
+        if not (isinstance(op, dict) and op.get("op") == "function_create" and op.get("address")):
+            continue
+        for fn in ctx._functions_containing(bv, _parse_address(op["address"])):
+            start = int(fn.start)
+            if start not in baseline:
+                baseline[start] = {"name": str(fn.name), "ranges": _range_pairs(fn)}
+    return baseline
+
+
+def _host_ranges_off(bv, hosts: dict[int, dict[str, Any]]) -> list[str]:
+    """Which of *hosts* are gone or cover other bytes than recorded."""
+    off: list[str] = []
+    for start, before in hosts.items():
         fn = bv.get_function_at(start)
         if fn is None:
-            ranges_off.append(f"{before['name']} @ {hex(start)} is gone")
+            off.append(f"{before['name']} @ {hex(start)} is gone")
             continue
         now = _range_pairs(fn)
         if now != before["ranges"]:
-            ranges_off.append(
+            off.append(
                 f"{before['name']} @ {hex(start)} covers "
                 f"{[(hex(a), hex(b)) for a, b in now]} instead of "
                 f"{[(hex(a), hex(b)) for a, b in before['ranges']]}")
-        if str(fn.name) != before["name"]:
-            names_off.append(f"{hex(start)} is named {fn.name!r} instead of {before['name']!r}")
-    return ranges_off, names_off
+    return off
+
+
+def _host_auto_symbols_off(bv, hosts: dict[int, dict[str, Any]]) -> list[tuple[int, list, list]]:
+    """Per host whose auto symbols differ from the snapshot: (start, the
+    auto symbols analysis ADDED, the recorded ones now MISSING)."""
+    off: list[tuple[int, list, list]] = []
+    for start, before in hosts.items():
+        fn = bv.get_function_at(start)
+        if fn is None:
+            continue
+        now = _auto_symbols_at(bv, fn, start)
+        recorded = before["auto_symbols"]
+        added = [now[name] for name in now if name not in recorded]
+        missing = [recorded[name] for name in recorded if name not in now]
+        if added or missing:
+            off.append((start, added, missing))
+    return off
 
 
 def _reanalyze_hosts(bv, snapshot: dict[str, Any]) -> None:
@@ -398,15 +461,24 @@ def _restore_split_hosts(ctx, bv, addr: int, snapshot: dict[str, Any]) -> bool:
     analysis re-creates it, with ``remove_user_function`` (the same escalation
     ``_remove_created_function`` makes: a shortened host is worse than a "no
     function here" mark at an address that had no function before either).
-    Only starts the snapshot did not record are ever removed. A host whose
-    auto name analysis replaced gets its recorded symbol back. Verified
-    after every step; False means the view is NOT as it was, and the caller
-    must report `rollback_failed` rather than a clean revert.
+    Only starts the snapshot did not record are ever removed.
+
+    This repairs ONLY what analysis destroyed and the undo journal cannot
+    restore: ranges, existence, and the AUTO symbol set (a host cut down to
+    a jump thunk gains an auto `j_*` symbol that outranks its old name, and
+    reanalysis does not take it back): auto symbols analysis added are
+    undefined, recorded ones it dropped are redefined. A user name is the
+    journal's -- inside a batch the snapshot may hold a sibling's
+    since-reverted rename, so writing it here would undo the undo (#927
+    round 3); the caller verifies it against the transaction baseline
+    instead. Verified after every step; False means the view is NOT as it
+    was, and the caller must report `rollback_failed` rather than a clean
+    revert.
     """
     if not snapshot.get("hosts"):
         return True
     try:
-        ranges_off, names_off = _hosts_off(bv, snapshot)
+        ranges_off = _host_ranges_off(bv, snapshot["hosts"])
         if ranges_off:
             keep = set(snapshot["starts"]) | set(snapshot["hosts"]) | {addr}
             for remover_name in ("remove_function", "remove_user_function"):
@@ -418,37 +490,72 @@ def _restore_split_hosts(ctx, bv, addr: int, snapshot: dict[str, Any]) -> bool:
                     if extra is not None:
                         remover(extra)
                 _reanalyze_hosts(bv, snapshot)
-                ranges_off, names_off = _hosts_off(bv, snapshot)
+                ranges_off = _host_ranges_off(bv, snapshot["hosts"])
                 if not ranges_off:
                     break
-        if names_off:
-            for start, before in snapshot["hosts"].items():
-                fn = bv.get_function_at(start)
-                if fn is None or str(fn.name) == before["name"]:
-                    continue
-                old = before["symbol"]
-                current = getattr(fn, "symbol", None)
-                if old is not None and getattr(old, "auto", False):
-                    if current is not None and getattr(current, "auto", False):
-                        bv.undefine_auto_symbol(current)
-                    bv.define_auto_symbol(old)
-                else:
-                    fn.name = before["name"]
+        symbols_off = _host_auto_symbols_off(bv, snapshot["hosts"])
+        if symbols_off:
+            for _start, added, missing in symbols_off:
+                for symbol in added:
+                    bv.undefine_auto_symbol(symbol)
+                for symbol in missing:
+                    bv.define_auto_symbol(symbol)
             bv.update_analysis_and_wait()
-            ranges_off, names_off = _hosts_off(bv, snapshot)
+            symbols_off = _host_auto_symbols_off(bv, snapshot["hosts"])
     except Exception as exc:  # noqa: BLE001 - report the restore as failed, don't raise
         bn.log_error(
             f"BN Agent Bridge: restoring the functions a create at 0x{addr:x} "
             f"split failed on revert: {exc!r}"
         )
         return False
-    if ranges_off or names_off:
+    if ranges_off or symbols_off:
+        names_off = [
+            f"{hex(start)} has auto symbols analysis added {[str(s.name) for s in added]} "
+            f"and lost {[str(s.name) for s in missing]}"
+            for start, added, missing in symbols_off
+        ]
         bn.log_error(
             f"BN Agent Bridge: the functions a create at 0x{addr:x} split were not "
             f"restored on revert: {'; '.join(ranges_off + names_off)}"
         )
         return False
     return True
+
+
+def _split_hosts_at_baseline(bv, baseline: dict[int, dict[str, Any]], *, what: str) -> bool:
+    """Whether every host in *baseline* exists with its baseline ranges AND
+    name -- the final check before a rollback is reported clean. Run after
+    the undo and every restore, so a name the journal should have put back
+    and did not, or one a repair wrote over it, is a failed rollback and not
+    a `rolled_back: true` over a renamed function (#927 round 3). Any name
+    difference counts here: nothing but a failed revert can legitimately
+    leave the view there. Logs what is off; *what* names the caller."""
+    if not baseline:
+        return True
+    try:
+        off = _host_ranges_off(bv, baseline)
+        for start, before in baseline.items():
+            fn = bv.get_function_at(start)
+            if fn is not None and str(fn.name) != before["name"]:
+                off.append(f"{hex(start)} is named {fn.name!r} instead of {before['name']!r}")
+    except Exception as exc:  # noqa: BLE001 - an unreadable host is not a verified one
+        bn.log_error(f"BN Agent Bridge: could not verify the hosts {what} split: {exc!r}")
+        return False
+    if off:
+        bn.log_error(
+            f"BN Agent Bridge: the hosts {what} split are not as they were before "
+            f"the transaction: {'; '.join(off)}"
+        )
+        return False
+    return True
+
+
+def _revert_split_hosts(ctx, bv, addr: int, snapshot: dict[str, Any]) -> bool:
+    """The standalone command's whole host revert: repair, then verify against
+    the baseline -- which, with no sibling op in the transaction, is the
+    snapshot itself (every name included)."""
+    return (_restore_split_hosts(ctx, bv, addr, snapshot)
+            and _split_hosts_at_baseline(bv, snapshot["hosts"], what=f"a create at 0x{addr:x}"))
 
 
 def _split_host_rows(bv, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -599,7 +706,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
             created = bv.get_function_at(addr)
             if created is None:
                 reverted = mutation_engine._revert_undo_safely(ctx, bv, state)
-                reverted = _restore_split_hosts(ctx, bv, addr, hosts) and reverted
+                reverted = _revert_split_hosts(ctx, bv, addr, hosts) and reverted
                 return {
                     "preview": preview,
                     "success": False,
@@ -633,7 +740,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
                 # fabricated function verified (#386).
                 mutation_engine._revert_undo_safely(ctx, bv, state)
                 removed = _remove_created_function(ctx, bv, addr)
-                removed = _restore_split_hosts(ctx, bv, addr, hosts) and removed
+                removed = _revert_split_hosts(ctx, bv, addr, hosts) and removed
                 return {
                     "preview": preview,
                     "success": False,
@@ -674,7 +781,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
                 # being back. Verified, repaired where BN allows, and reported
                 # as a failed rollback otherwise -- never a clean revert on
                 # trust.
-                reverted = _restore_split_hosts(ctx, bv, addr, hosts) and reverted
+                reverted = _revert_split_hosts(ctx, bv, addr, hosts) and reverted
                 committed = False
                 success = reverted
                 if reverted:
@@ -756,7 +863,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
             # also explicitly drop any function left at the address (#117).
             undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
             removed = _remove_created_function(ctx, bv, addr)
-            removed = _restore_split_hosts(ctx, bv, addr, hosts) and removed
+            removed = _revert_split_hosts(ctx, bv, addr, hosts) and removed
         if not (undo_ok and removed):
             raise RuntimeError(
                 f"{exc} (additionally, rollback failed; the view may be left partially modified)"

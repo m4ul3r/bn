@@ -5630,6 +5630,151 @@ def test_the_restore_never_removes_a_function_that_predated_the_create_927(monke
     assert bv.get_function_at(0x2020) is inner
     assert not any(e[0].startswith("remove") for e in bv.events if isinstance(e, tuple))
 
+# --- #927 round 3: a sibling rename before an allowed create --------------
+
+
+def _renamed_host_batch(addr, *extra_ops):
+    """`[rename host, create inside it]`, the ordering whose rollback
+    resurrected the preview-only name (#927 round 3)."""
+    return [
+        {"op": "rename_symbol", "identifier": hex(addr - 8), "new_name": "preview_only_name"},
+        {"op": "function_create", "address": hex(addr), "allow_overlap": True},
+        *extra_ops,
+    ]
+
+
+def test_a_batch_preview_does_not_resurrect_a_siblings_rename_of_the_host_927(monkeypatch):
+    """#927 round 3: `[rename host, create inside host] --preview` reported
+    `rolled_back: true` with the host still carrying the preview-only name.
+    The create's host snapshot was taken AFTER the rename applied; the
+    batch undo put the original name back, and the repair then wrote the
+    snapshot's (renamed) name over it. The repair owns ranges and auto
+    symbols only; the name is the journal's, and the batch verifies it
+    against the pre-transaction baseline."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    host = bv.get_function_at(addr - 8)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", True, _renamed_host_batch(addr))
+
+    assert result["success"] is True and result["rolled_back"] is True, result["message"]
+    assert [r["status"] for r in result["results"]] == ["verified", "verified"]
+    assert host.name == "main", "the preview-only name survived the rollback"
+    assert host.ranges == [(addr - 8, addr - 8 + 0x40)]
+    assert bv.get_function_at(addr) is None
+
+
+def test_a_failed_live_batch_really_reverts_a_rename_before_an_allowed_create_927(monkeypatch):
+    """The live twin: a later op fails, every applied op is rolled back, and
+    the rename row's `reverted` must be true of the view -- not a stamp over
+    a host the create's repair renamed again."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    bv = _overlap_bv(addr)
+    host = bv.get_function_at(addr - 8)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, _renamed_host_batch(
+        addr, {"op": "function_create", "address": "0x10"}))
+
+    assert result["success"] is False and result["rolled_back"] is True, result["message"]
+    assert [r["status"] for r in result["results"]] == [
+        "reverted", "reverted", "invalid_request"]
+    assert host.name == "main"
+    assert host.ranges == [(addr - 8, addr - 8 + 0x40)]
+
+
+class _NameStickingBV(_OverlappingCreateBV):
+    """A view whose undo does NOT give a renamed host its name back -- the
+    shape of a journal that silently failed, which the baseline check must
+    catch rather than trust `undo_ok`."""
+
+    def revert_undo_actions(self, state):
+        names = {fn: fn.name for fn in self.functions}
+        super().revert_undo_actions(state)
+        for fn, name in names.items():
+            fn.name = name
+
+
+def test_a_host_left_renamed_after_the_rollback_is_a_failed_rollback_927(monkeypatch):
+    """The final check is against the PRE-BATCH baseline: a host whose name
+    is not back -- whatever put it there -- is `rollback_failed` with the
+    view marked dirty, never `rolled_back: true`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401341
+    start = addr - 8
+    bv = _NameStickingBV(
+        hosts=[_HostFunction(start, "main", [(start, start + 0x40)])],
+        segments={addr: _FakeSegment(readable=True, executable=True)},
+        memory={addr: b"\x55\x48\x89\xe5"},
+    )
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._mutation("active", True, _renamed_host_batch(addr))
+
+    assert result["success"] is False and result["rolled_back"] is False
+    assert "a function a create split is not back" in result["message"]
+    assert marked == [bv]
+    # The repair did not paper over it either: no name was written.
+    assert bv.get_function_at(start).name == "preview_only_name"
+
+
+def test_the_repair_never_writes_a_user_name_927(monkeypatch):
+    """Driven directly: a host whose user name differs from the snapshot
+    after the revert is the journal's business. The repair restores ranges
+    and reports the ranges as back; it neither assigns the name nor defines
+    a symbol, and the standalone baseline check is what fails."""
+    cc = _load_bridge(monkeypatch).create_comments
+    host = _HostFunction(0x2000, "renamed_by_sibling", [(0x2000, 0x2040)], auto_symbol=False)
+    bv = _overlap_bv(0x2008, hosts=[host])
+    snapshot = cc._snapshot_split_hosts(bv, [{"name": "renamed_by_sibling", "address": "0x2000",
+                                             "offset": "0x8"}])
+    assert snapshot["hosts"][0x2000]["auto_symbols"] == {}
+    host.name = "original"   # what the undo put back
+    assert cc._restore_split_hosts(None, bv, 0x2008, snapshot) is True
+    assert host.name == "original"
+    assert not any(e[0].endswith("auto_symbol") for e in bv.events if isinstance(e, tuple))
+    assert cc._split_hosts_at_baseline(bv, snapshot["hosts"], what="a create") is False
+    assert cc._split_hosts_at_baseline(
+        bv, {0x2000: {"name": "original", "ranges": ((0x2000, 0x2040),)}}, what="a create") is True
+
+
+def test_the_repair_restores_the_auto_symbol_set_under_a_user_name_927(monkeypatch):
+    """The analysis-owned half: the auto symbols a thunk cut added are
+    undefined and the recorded ones redefined -- read from the view's
+    listing, not `fn.symbol`, because a user name on top hides them."""
+    cc = _load_bridge(monkeypatch).create_comments
+    host = _HostFunction(0x2000, "sub_2000", [(0x2000, 0x2040)])
+    bv = _overlap_bv(0x2008, hosts=[host])
+    loader = types.SimpleNamespace(auto=True, name="sub_2000", address=0x2000, type="FunctionSymbol")
+    bv._symbols = [loader]
+    events = []
+    bv.undefine_auto_symbol = lambda symbol: (events.append(("undefine", symbol.name)),
+                                              bv._symbols.remove(symbol))
+    bv.define_auto_symbol = lambda symbol: (events.append(("define", symbol.name)),
+                                            bv._symbols.append(symbol))
+    snapshot = cc._snapshot_split_hosts(bv, [{"name": "sub_2000", "address": "0x2000",
+                                             "offset": "0x8"}])
+    assert list(snapshot["hosts"][0x2000]["auto_symbols"]) == ["sub_2000"]
+    # What the cut did underneath a sibling's user rename: a `j_*` auto
+    # symbol replaced the loader one.
+    thunk = types.SimpleNamespace(auto=True, name="j_sub_2010", address=0x2000, type="FunctionSymbol")
+    bv._symbols = [types.SimpleNamespace(auto=False, name="user_x", address=0x2000,
+                                         type="FunctionSymbol"), thunk]
+
+    assert cc._restore_split_hosts(None, bv, 0x2008, snapshot) is True
+
+    assert events == [("undefine", "j_sub_2010"), ("define", "sub_2000")]
+    assert [s.name for s in bv._symbols] == ["user_x", "sub_2000"]
+
 
 # --- #927 P2: a batch create inside an EARLIER batch create ---------------
 
