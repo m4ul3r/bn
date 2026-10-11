@@ -23,7 +23,7 @@ make -C tests/fixtures clean
 | `statemachine_x86_64`  | a branchy switch state machine                  |
 | `parser_x86_64`        | a length-prefixed record parser (source→sink)   |
 | `dispatch_table_x86_64`| a const function-pointer dispatch table (indirect source→sink) |
-| `classes_x86_64`       | a C++ PIE: single-inheritance vtables, an exception subclass of an imported class, a template class (class lens, #922) |
+| `classes_x86_64`       | a C++ PIE: single-inheritance vtables, an exception subclass of an imported class, a template class, an abstract class with zeroed destructor slots, one multiple-inheritance class (class lens, #922) |
 
 ## Multi-instance stress test
 

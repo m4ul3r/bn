@@ -1195,25 +1195,6 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
     return (target.get("context") or {}).get("kind") == "code"
 
 
-def _lookahead_row_confirms_continuation(row: dict[str, Any] | None) -> bool:
-    """#706 follow-up: row `max_slots` -- read but never scanned as a slot --
-    resolves the one ambiguity the raw cap can't: a trailing run of null rows
-    inside the window reads identically whether the vtable ended there (the
-    next object's zeroed padding) or is an unresolved-relocation run inside a
-    table that keeps going past the cap (#441). A readable code/null/extern
-    row one past the cap is the same kind of entry the window itself accepts
-    as a slot, so the table demonstrably continues. Missing (the reader
-    couldn't produce it), unreadable, or a mapped-data pointer is never
-    treated as evidence of continuation -- absence of proof is not proof the
-    table goes on."""
-    if row is None or not row.get("readable"):
-        return False
-    target = row.get("target") if isinstance(row.get("target"), dict) else {}
-    status = target.get("status")
-    kind = (target.get("context") or {}).get("kind")
-    return _slot_is_code(target) or status == "null" or kind == "extern"
-
-
 #: BN `TypeClass` member names of a data variable that is an OBJECT of its own
 #: (an RTTI record, the next vtable's struct) rather than a pointer slot.
 _OBJECT_TYPE_CLASSES = frozenset({"StructureTypeClass", "NamedTypeReferenceClass"})
@@ -1462,12 +1443,15 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "bn_vtable_slots": None,
         }
     start = vtable_addr + 2 * ptr
-    # #922 (b): BN's own `<Class>::VTable` struct at the slot array, when its
-    # analysis committed to one, is the slot count. The scan never reads past
-    # it -- the words after it are the next object (observed in the field as a
-    # typeinfo record's vptr rendered as a phantom `<external>` slot).
+    # #922 (b) review: BN's own `<Class>::VTable` struct at the slot array is
+    # reported (`bn_vtable_slots`) but never bounds the scan. BN sizes that
+    # struct at the first null word, and GCC emits an abstract class's two
+    # destructor entries as zero words, so `struct Early { virtual int first();
+    # virtual ~Early(); virtual int pure() = 0; virtual int late(); }` gets a
+    # one-slot struct for a five-slot table; bounding the walk there hid
+    # `pure()`/`late()` and called the table complete. The end of a table is
+    # the next OBJECT -- the rules in `_vtable_row_slot` -- not BN's width.
     bn_slots = _bn_vtable_slot_count(bv, start, ptr)
-    window_len = max_slots if bn_slots is None or bn_slots >= max_slots else bn_slots
     # #706 follow-up: read one entry PAST the cap. Row `max_slots` is a
     # lookahead ONLY -- never a slot in its own right (the window below
     # excludes it from both scanning and `slots`) -- consulted after the loop
@@ -1490,7 +1474,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
     # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
     raw_entries = table.get("items") or table.get("entries") or []
-    window = raw_entries[:window_len]
+    window = raw_entries[:max_slots]
     scanned = 0
     truncated = False
     # #822 review (round 1): WHY the scan stopped, which is what decides whether
@@ -1528,12 +1512,21 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # resolves it directly instead of inferring from what the trim below
         # removes: it proves the table continues (or doesn't) independent of
         # `slots`'s final shape.
+        #
+        # #922 (b) review: the lookahead is classified by the SAME rule as a
+        # window row, address included, so the next object's first word at
+        # row `max_slots` (an RTTI record's vptr on a `typeinfo for` address)
+        # is a boundary here too -- a value-only classifier read it as proof
+        # of a 65th slot and turned an exact 64-slot table into `total: null`.
         if scanned >= max_slots > 0:
             lookahead = raw_entries[max_slots] if len(raw_entries) > max_slots else None
-            if _lookahead_row_confirms_continuation(lookahead):
+            lookahead_d = lookahead if isinstance(lookahead, dict) else {}
+            if lookahead_d and _vtable_row_slot(
+                    bv, max_slots, lookahead_d,
+                    row_addr=start + max_slots * ptr, ptr=ptr) is not None:
                 truncated = True
                 stop_reason = "capped"
-            elif isinstance(lookahead, dict) and not lookahead.get("readable"):
+            elif lookahead_d and not lookahead_d.get("readable"):
                 # The lookahead row itself could not be read: the window is full,
                 # so 64 entries are proven, but nothing proves the table stops
                 # there (#822 review round 1).
@@ -1569,7 +1562,8 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         "truncated_reason": {"capped": "scan_capped",
                              "unreadable": "unreadable_row"}.get(stop_reason),
         # #922 (b): the slot count BN's own `<Class>::VTable` struct states
-        # (None when BN defined none); the scan is bounded by it.
+        # (None when BN defined none) -- informational, never a bound (see the
+        # note at `start`).
         "bn_vtable_slots": bn_slots,
     }
 
@@ -1577,10 +1571,11 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
 def _bn_vtable_slot_count(bv, slot_start: int, ptr: int) -> int | None:
     """#922 (b): the slot count of BN's own ``<Class>::VTable`` struct when one
     starts exactly at *slot_start* (the word the constructor stores as the
-    vptr), else None. BN's width is a bound the scan must not walk past: the
-    words after it belong to the next object. Only a structure whose name
-    carries BN's ``VTable`` convention counts -- a user's own pointer slot type
-    says nothing about where the table ends."""
+    vptr), else None. Reported for the reader; it is NOT where the table ends
+    (BN stops the struct at the first null word, which an abstract class's
+    zeroed destructor entries put in the middle of a real table). Only a
+    structure whose name carries BN's ``VTable`` convention counts -- a user's
+    own pointer slot type says nothing about the table."""
     getter = getattr(bv, "get_data_var_at", None)
     try:
         var = getter(slot_start) if callable(getter) else None

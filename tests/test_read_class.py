@@ -3896,23 +3896,77 @@ def test_vtable_layout_stops_at_a_cxxabi_typeinfo_vptr_922():
     assert layout["slots"][1]["pure_virtual"] is True
 
 
-def test_vtable_layout_is_bounded_by_bn_vtable_struct_922():
-    # BN's `<Class>::VTable` struct at the slot array states the slot count; the
-    # scan never reads past it, whatever the following words decode to.
-    rows = [_code_row(0), _code_row(1), _code_row(2), _code_row(3)]
-    vtable_type = types.SimpleNamespace(width=16, registered_name="net::Klass::VTable")
+def _null_row(index):
+    return {"index": index, "value": "0x0", "readable": True,
+            "target": {"status": "null", "context": {"kind": "null"}}}
+
+
+def test_vtable_layout_reports_but_never_bounds_at_bn_vtable_struct_922():
+    # #922 (b) review (P1): BN sizes its `<Class>::VTable` struct at the first
+    # null word, and GCC emits an abstract class's two destructor entries as
+    # zero words -- `struct Early { virtual int first(); virtual ~Early();
+    # virtual int pure() = 0; virtual int late(); }` gets a ONE-slot struct for
+    # a five-slot table. Bounding the walk at that width reported `total: 1,
+    # scan_truncated: false`, hiding `pure()` and `late()` and letting
+    # `evidence virtual-call` call a provider absent. The width is reported;
+    # the table ends at the next OBJECT.
+    rows = [_code_row(0), _null_row(1), _null_row(2), _extern_row(3, 0x9900), _code_row(4),
+            _data_row(5)]
+    vtable_type = types.SimpleNamespace(width=8, registered_name="net::Early::VTable")
+    bv = _BoundaryBV(
+        symbols={0x9900: _Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0x9900,
+                              "SymbolType.ExternalSymbol")},
+        data_vars={0x9010: types.SimpleNamespace(address=0x9010, type=vtable_type)})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1, 2, 3, 4]
+    assert layout["slots"][3]["pure_virtual"] is True
+    assert layout["bn_vtable_slots"] == 1
+    assert layout["total"] == 5 and layout["scan_truncated"] is False
+    # A wider-than-the-table struct does not pad the table either: the walk's
+    # own boundary (the next object's typeinfo) ends it.
+    rows = [_code_row(0), _code_row(1), _data_row(2)]
+    vtable_type = types.SimpleNamespace(width=32, registered_name="net::Klass::VTable")
     bv = _BoundaryBV(data_vars={0x9010: types.SimpleNamespace(address=0x9010, type=vtable_type)})
     layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
     assert [s["index"] for s in layout["slots"]] == [0, 1]
-    assert layout["bn_vtable_slots"] == 2
-    assert layout["total"] == 2
+    assert layout["bn_vtable_slots"] == 4 and layout["total"] == 2
     # A struct data variable starting on a LATER row is the next object.
+    rows = [_code_row(0), _code_row(1), _code_row(2), _code_row(3)]
     record_type = types.SimpleNamespace(
         width=24, type_class=types.SimpleNamespace(name="StructureTypeClass"))
     bv = _BoundaryBV(data_vars={0x9020: types.SimpleNamespace(address=0x9020, type=record_type)})
     layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
     assert [s["index"] for s in layout["slots"]] == [0, 1]
     assert layout["bn_vtable_slots"] is None
+
+
+def test_vtable_layout_lookahead_honours_the_next_object_at_the_cap_922():
+    # #922 (b) review (Astra P2): a 64-slot table whose row AFTER the cap is
+    # the next typeinfo record's vptr (an external word on a `typeinfo for`
+    # address). The value-only lookahead read it as a 65th slot --
+    # `total: null, total_lower_bound: 65` -- while the window rows apply the
+    # object-boundary rules. The lookahead is classified by the same rule.
+    rows = [_code_row(i) for i in range(64)] + [_extern_row(64, 0x9810)]
+    bv = _BoundaryBV(
+        symbols={
+            0x9010 + 64 * 8: _Sym("_ZTI4Next", "typeinfo for Next", 0x9010 + 64 * 8),
+            0x9800: _Sym("_ZTVN10__cxxabiv120__si_class_type_infoE",
+                         "vtable for __cxxabiv1::__si_class_type_info", 0x9800,
+                         "SymbolType.ExternalSymbol"),
+        },
+        data_vars={0x9010: types.SimpleNamespace(
+            address=0x9010, type=types.SimpleNamespace(width=512, registered_name="demo::Node::VTable"))})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    assert len(layout["slots"]) == 64
+    assert layout["total"] == 64 and layout["bn_vtable_slots"] == 64
+    assert layout["truncated"] is False and layout["scan_truncated"] is False
+    assert layout["total_lower_bound"] is None
+    # Control: a code row past the cap, on an address BN attributes to no other
+    # object, still proves continuation.
+    rows = [_code_row(i) for i in range(65)]
+    layout = read_class._vtable_layout(_SlotCtx(rows), _BoundaryBV(), 0x9000)
+    assert layout["truncated"] is True and layout["total"] is None
+    assert layout["total_lower_bound"] == 65
 
 
 def test_recover_rejects_an_rtti_record_as_a_secondary_vtable_922():
