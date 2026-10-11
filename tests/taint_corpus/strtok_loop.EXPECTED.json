@@ -1,0 +1,9 @@
+{
+  "description": "strtok(NULL, ...) continuation carries the taint of the tainted strtok(line, ...) before it, so the SECOND token reaches system(); the flow-insensitive continuation is disclosed as an assumption",
+  "lang": "c",
+  "forward": [
+    {"function": "run_second_word", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}],
+     "assumptions_contain": ["continues the tokenizer state"]}
+  ]
+}

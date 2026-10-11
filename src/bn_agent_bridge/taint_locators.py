@@ -214,7 +214,8 @@ def derive_flow_facts(*, direction: str,
     o = origin or {}
     source = o.get("callee") or o.get("kind") or "?"
     sink_callee = (sink or {}).get("callee") or (sink or {}).get("kind")
-    traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved"}
+    traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved",
+                                  "address_of_local_unresolved", "global"}
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}
     return metrics, _make_signature(source, chain, None, sink_callee)

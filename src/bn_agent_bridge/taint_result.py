@@ -74,6 +74,14 @@ BLOCKING_LEAF_KINDS = frozenset({
     # absent from the result. Same class as the other frontier leaves: the walk
     # stopped with data unexamined, so the slice is NOT a complete answer.
     "caller_sites_truncated",
+    # A backward slice reached `p = &local_buf` (or a folded `sink(&buf)`) and
+    # the walk could not account for the buffer's CONTENTS: no memory version
+    # to walk, an unmodeled call took the buffer's address or ran after it
+    # escaped to memory, a path to the sink with no writer at all (a
+    # conditional fill), a writer's input the walk could not interpret, or a
+    # memory chain longer than the walk budget. The sink consumes the bytes,
+    # not the pointer, so a slice that stops at the address-of is NOT complete.
+    "address_of_local_unresolved",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -143,6 +151,14 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
         return ("the backward caller ascent hit its per-site cap -- some calling "
                 "sites were never followed; narrow the sink or inspect the "
                 "capped sites named in the caller_sites_truncated leaf")
+    if "memory_chain" in causes:
+        # Backward-only cause: the local-buffer writer walk ran out of
+        # memory-SSA versions before reaching the function entry, so writers
+        # older than the cut are absent from the slice.
+        return ("the backward walk through a local buffer's writers exhausted "
+                "its memory-chain budget -- older writers were never examined; "
+                "seed closer to the sink or inspect the earlier writes named in "
+                "the address_of_local_unresolved leaf")
     return "depth/recursion cutoff"
 
 
@@ -189,6 +205,15 @@ def _derive_all_clear(
         return False, (
             f"no modeled sink reached, but {len(leaves)} frontier leaf(s) "
             f"remain -- NOT an all-clear")
+    if any("tokenizer_state_escapes" in str(a) for a in assumptions):
+        # A `continuation` model (strtok) left its static state tainted when
+        # the function returned; a `strtok(NULL, ..)` in another function
+        # continues it and is not followed, so the empty result speaks only
+        # for this function's own tokens (PR-928 review P2).
+        return False, (
+            "no modeled sink reached, but a tokenizer's static state is left "
+            "tainted at return (see the tokenizer_state_escapes caveat) -- a "
+            "continuation in another function is not followed, NOT an all-clear")
     if weak_seed:
         return False, (
             "no sinks/leaves, but the source seed was incomplete or mis-anchored "
@@ -326,6 +351,7 @@ def backward_diagnostics(
     *,
     sinks_seeded: int,
     slices: int,
+    unresolved_origins: int = 0,
     truncated: bool = False,
     truncation_cause: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -350,6 +376,15 @@ def backward_diagnostics(
     backward run has no "found something, so the findings are the signal" case:
     its slices ARE the result, and their completeness is a live question whether
     there are none, one, or many.
+
+    ``unresolved_origins`` is the number of slices whose ``origin.kind`` is
+    ``unresolved`` -- the walk's own admission that the def-chain bottomed out
+    at a definition it could not classify (an ``&local`` it did not follow, a
+    load it could not key). That admission lives on the SLICE, not in
+    ``leaves``, so a leaf-only gate answered ``safe_to_report_complete_slice:
+    true`` beside ``traverses_unresolved: true`` and ``frontier.unresolved: 0``
+    on the same result. It is counted in ``frontier.unresolved`` and withholds
+    the claim like any blocking leaf.
     """
     by_kind: dict[str, int] = {}
     for lf in leaves or []:
@@ -361,9 +396,10 @@ def backward_diagnostics(
     # but a deliberately abandoned ascent, and conflating it would hide the one
     # frontier a user can act on by re-running with a narrower sink.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
-                  "indirect_call_unresolved", "field_load_unresolved")
+                  "indirect_call_unresolved", "field_load_unresolved",
+                  "address_of_local_unresolved")
     COARSE = ("coarse_memory_store", "pointer_escape")
-    unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     dropped_callers_n = by_kind.get("caller_sites_truncated", 0)
 
@@ -381,6 +417,12 @@ def backward_diagnostics(
             f"{len(blocking)} frontier leaf(s) ({', '.join(seen)}) remain -- the "
             "def-chain was not followed to every origin, so this slice is NOT a "
             "complete account of what reaches the sink")
+    elif unresolved_origins:
+        complete, reason = False, (
+            f"{int(unresolved_origins)} slice(s) bottomed out at an unresolved "
+            "definition (origin.kind == 'unresolved') -- the def-chain was not "
+            "followed to its origin, so this slice is NOT a complete account of "
+            "what reaches the sink")
     elif truncated:
         complete, reason = False, (
             f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
@@ -414,11 +456,18 @@ def backward_diagnostics(
             "the caller ascent was capped, so some calling sites were never "
             "followed; re-run against a specific caller or narrow the sink to "
             "see the origins behind the dropped sites")
+    elif truncated and truncation_cause:
+        # A named cut (the memory-chain budget, a depth bound) has its own
+        # remediation; the generic unresolved text below would send the reader
+        # to `bn proto set` for a walk that simply ran out of budget (round 3).
+        next_action = _truncation_hint(truncation_cause)
     elif unresolved_n:
         next_action = (
-            "the walk bottomed out at an unresolved def (an indirect call or a "
-            "field load the engine could not key); recover the callee prototype "
-            "with `bn proto set` or seed inside the producing function")
+            "the walk bottomed out at an unresolved def (an indirect call, a "
+            "field load the engine could not key, or a local buffer whose "
+            "contents it could not account for); recover the callee prototype "
+            "with `bn proto set`, seed inside the producing function, or "
+            "re-run `bn taint forward --source var:<buf>` on the buffer")
     elif coarse_n:
         next_action = (
             "the walk crossed a coarse-memory frontier (a pointer/store not "
