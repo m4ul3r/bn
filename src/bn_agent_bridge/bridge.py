@@ -914,6 +914,13 @@ class TargetManager:
                         # database, so a consumer can tell "no database" from
                         # "database unknown" without inspecting paths.
                         "database_path": self._database_paths.get(view_id),
+                        # Whether the database this view was restored from (a
+                        # sidecar/cache preferred over the raw path) was
+                        # verified against the raw file's content at load:
+                        # true/false, or null for a view no database was
+                        # preferred for (a raw load, an explicitly named
+                        # .bndb). The load note is one-shot; this is not.
+                        "source_verified": _source_verdict(view),
                     }
                 )
             return result
@@ -2262,10 +2269,21 @@ class BinaryNinjaBridge:
 
         load_path = resolved
         notes: list[str] = []
-        substitute = _resolve_bndb_sidecar(resolved, prefer_bndb)
+        # Hashed once, BEFORE the open, and stamped on the raw view it opens:
+        # a save then certifies the bytes the view loaded, whatever sits at
+        # the path by then. The same identity judges a preferred database.
+        identity = _load_identity(resolved)
+        substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
         if substitute is not None:
             load_path = substitute.path
             notes.append(_sidecar_note(substitute, resolved))
+        # A preferred database `_database_provenance` refused: its note's first
+        # sentence, awaiting the tail that says what happened instead.
+        refused: str | None = None
+        refused_path: Path | None = None
+        # The verdict on a preferred database this load returns, for the
+        # target row (`source_verified`); None when no database is preferred.
+        verified: bool | None = None
 
         # #355/#400: if a view for this (post-substitution) path is already
         # open, return its target instead of opening a duplicate. Concurrent
@@ -2280,6 +2298,29 @@ class BinaryNinjaBridge:
         while True:
             existing = self._find_open_view_for_path(load_path)
             if existing is not None:
+                if substitute is not None:
+                    # The open view IS the database this load would prefer by
+                    # path -- an earlier explicit `bn load <db>`, or a restore
+                    # from before the file changed. Returning it unjudged let a
+                    # stale database through the one door the fresh-open check
+                    # does not cover (review P1), so it is judged exactly like
+                    # a database this load opens itself; under the write lock,
+                    # since a legacy record may be stamped onto a live view.
+                    with self._target_lock.write():
+                        verdict, provenance_note = _database_provenance(
+                            existing, load_path, resolved, identity)
+                    if verdict == "mismatch":
+                        # Keep the explicitly opened database open; this load
+                        # wants the raw bytes, deduped like any other load.
+                        refused, refused_path = provenance_note, load_path
+                        load_path, substitute = resolved, None
+                        continue
+                    verified = verdict == "verified"
+                    _source_verified[existing] = verified
+                    if provenance_note:
+                        notes.append(provenance_note)
+                elif refused is not None:
+                    notes = [f"{refused} {_refusal_tail(refused_path, resolved, loaded=False)}"]
                 return self._load_existing_result(
                     load_path, resolved, notes, existing, workdir
                 )
@@ -2336,14 +2377,10 @@ class BinaryNinjaBridge:
                 # replaced since the save (re-extracted firmware, a different
                 # binary copied over the same name): drop the database and open
                 # the bytes that are actually on disk, loudly.
-                use_database, provenance_note = _database_provenance(
-                    bv, load_path, resolved, substitute.identity)
-                if use_database:
-                    if provenance_note:
-                        notes.append(provenance_note)
-                else:
-                    # Every note so far described the database being discarded.
-                    notes = [provenance_note]
+                verdict, provenance_note = _database_provenance(
+                    bv, load_path, resolved, identity)
+                if verdict == "mismatch":
+                    refused, refused_path = provenance_note, load_path
                     stale = bv
                     bv = None
                     with self._target_lock.write():
@@ -2353,10 +2390,22 @@ class BinaryNinjaBridge:
                     bndb_unanalyzed = False
                     existing = self._find_open_view_for_path(resolved)
                     if existing is not None:
+                        notes = [f"{refused} {_refusal_tail(refused_path, resolved, loaded=False)}"]
                         return self._load_existing_result(
                             load_path, resolved, notes, existing, workdir
                         )
                     bv = self._open_view(load_path)
+                else:
+                    verified = verdict == "verified"
+                    if provenance_note:
+                        notes.append(provenance_note)
+            if refused is not None:
+                # Every note so far described the database being discarded.
+                notes = [f"{refused} {_refusal_tail(refused_path, resolved, loaded=True)}"]
+            if load_path.suffix != ".bndb":
+                stamp_note = _stamp_opened_view(bv, identity)
+                if stamp_note:
+                    notes.append(stamp_note)
 
             # #369 (part 1): BN's format detection failed and fell back to a raw
             # 'Raw'/'Mapped' view -- an empty/garbage/text file opened this way has
@@ -2408,6 +2457,11 @@ class BinaryNinjaBridge:
             # analysis_state="unanalyzed" (not "full"), matching the WARNING note.
             if bndb_unanalyzed:
                 _unanalyzed_views.add(bv)
+            # The load note is one-shot; the target row keeps the verdict so a
+            # later `target info` can still answer whether the restored
+            # database was verified against the raw file.
+            if verified is not None:
+                _source_verified[bv] = verified
 
             # Publish under the exclusive lock so a concurrent target read sees a
             # consistent set. Append under _headless_views_lock, then refresh
@@ -2448,6 +2502,7 @@ class BinaryNinjaBridge:
                     _run_on_main_thread(lambda: bv.file.close())
                 _quick_loaded_views.discard(bv)
                 _unanalyzed_views.discard(bv)
+                _source_verified.pop(bv, None)
             raise
         finally:
             with _load_in_progress_lock:
@@ -2815,18 +2870,17 @@ class BinaryNinjaBridge:
         # answerable, so the answer is captured here and consumed after. Both
         # candidate destinations are decided now: the primary, and the cache
         # path the read-only fallback may write instead.
-        # The raw bytes this view describes, hashed once. Only a view homed at
-        # the raw file is stamped: a view restored from a database already
-        # carries the record it was validated against at load -- or none, if
-        # the database predates the record, and stamping the CURRENT bytes
-        # then would launder exactly the mismatch the load-side check exists
-        # to catch. The cache fallback is keyed on the same hash.
-        identity: _SourceIdentity | None = None
-        if filename and not filename.endswith(".bndb"):
-            try:
-                identity = _hash_file(filename)
-            except OSError:
-                identity = None
+        # The bytes this view describes are whatever it RECORDED when the bridge
+        # opened it (`_stamp_opened_view`), or whatever the database it was
+        # restored from recorded. Never the file on disk now: hashing at save
+        # time certified a file replaced between load and save as this
+        # database's source, and the stale database then matched forever
+        # (review P1). `create_database` serialises the record as it stands,
+        # so a save and an export both carry it. The cache fallback is keyed
+        # on the same hash. A raw-homed view with no record (a GUI tab the
+        # bridge did not open, a stamp that failed at load) saves unstamped;
+        # a later load verifies that database from the bytes it stores.
+        identity = _recorded_source_identity(bv)
         try:
             cache_path = str(_cache_bndb_path(
                 filename or out, identity.sha256 if identity else None))
@@ -2837,15 +2891,6 @@ class BinaryNinjaBridge:
             cache_path is not None
             and _is_own_database_destination(cache_path, filename, cache_path)
         )
-        provenance_note: str | None = None
-        if identity is not None:
-            try:
-                _record_source_identity(bv, identity)
-            except Exception as exc:  # noqa: BLE001 - never lose a save over the stamp
-                provenance_note = (
-                    f"could not record the source file's sha256 in the database "
-                    f"({exc}); a later load will report its provenance as unverified"
-                )
 
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
@@ -2944,7 +2989,6 @@ class BinaryNinjaBridge:
             if own_cache:
                 self.targets.note_database(bv, saved)
             _disclose_open_target_collision(self.targets, bv, saved, result)
-            _append_note(result, provenance_note)
             return result
 
         # `bv.create_database` re-homes the live view to whatever .bndb it wrote,
@@ -2981,7 +3025,6 @@ class BinaryNinjaBridge:
             # be unconditional here too -- this degraded path wrote a real file
             # and can land on another open target exactly like the clean one.
             _disclose_open_target_collision(self.targets, bv, saved, degraded)
-            _append_note(degraded, provenance_note)
             return degraded
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         # #753: the live filename was just restored to the ORIGINAL path, so from
@@ -3000,7 +3043,6 @@ class BinaryNinjaBridge:
             self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
         _disclose_open_target_collision(self.targets, bv, saved, result)
-        _append_note(result, provenance_note)
         return result
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
@@ -3097,7 +3139,8 @@ class BinaryNinjaBridge:
             # had no annotation key at all, so a cached .bndb read as a pristine
             # view until a separate `bn comment list` pass contradicted it.
             "existing_annotations": read_listing._existing_annotations(
-                self.ctx, bv, filename=filename
+                self.ctx, bv, filename=filename,
+                source_verified=_source_verdict(bv),
             ),
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
@@ -4039,7 +4082,8 @@ class BinaryNinjaBridge:
             try:
                 bv = self._resolve_view(selector)
                 existing_annotations = read_listing._existing_annotations(
-                    self.ctx, bv, filename=filename
+                    self.ctx, bv, filename=filename,
+                    source_verified=_source_verdict(bv),
                 )
             except Exception as exc:
                 existing_annotations = read_listing._annotations_unavailable(
@@ -4356,6 +4400,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views,
     _headless_views_lock,
     _quick_loaded_views,
+    _source_verified,
     _unanalyzed_views,
 )
 
@@ -5258,15 +5303,36 @@ def _hash_file(path: str | Path) -> _SourceIdentity:
     return _SourceIdentity(digest.hexdigest(), size)
 
 
-# The metadata key under which a saved database records the raw bytes it
-# describes. `bv.store_metadata` persists it into the .bndb snapshot, so the
-# load side can ask the database itself what it was saved for.
+def _load_identity(resolved: Path) -> _SourceIdentity | None:
+    """The identity of the raw file a load is about to OPEN, hashed once per
+    load (a 27 MB firmware blob is ~50 ms; 512 MiB about a second, against an
+    analysis that takes minutes). None for a database request, or when the
+    file cannot be read (the raw open reports that itself).
+
+    Taken BEFORE the open and never again: it is what `_record_source_identity`
+    stamps on the view, so a save certifies the bytes the view LOADED. Hashing
+    the file at save time certified whatever sat at the path by then -- a
+    re-extracted firmware replaced between load and save was stamped as this
+    database's source, and the stale database then matched forever (review P1).
+    """
+    if resolved.suffix == ".bndb":
+        return None
+    try:
+        return _hash_file(resolved)
+    except OSError:
+        return None
+
+
+# The metadata key under which a view records the raw bytes it describes.
+# Stamped when the bridge OPENS a raw file; `bv.store_metadata` is in-memory
+# until `create_database` serialises it into the .bndb, so the load side can
+# ask the database itself what it was saved for.
 _PROVENANCE_METADATA_KEY = "bn_agent_bridge"
 
 
 def _record_source_identity(bv, identity: _SourceIdentity) -> None:
     """Stamp *identity* into *bv*'s persistent metadata (merged with anything
-    else already stored under the bridge's key). Must run BEFORE
+    else already stored under the bridge's key). In memory until the next
     `create_database`, which is what serialises the metadata into the file."""
     try:
         existing = bv.query_metadata(_PROVENANCE_METADATA_KEY)
@@ -5278,9 +5344,28 @@ def _record_source_identity(bv, identity: _SourceIdentity) -> None:
     bv.store_metadata(_PROVENANCE_METADATA_KEY, record)
 
 
+def _stamp_opened_view(bv, identity: _SourceIdentity | None) -> str | None:
+    """Record the identity of the raw file *bv* was just opened from, so every
+    later save and export certifies THOSE bytes. Returns a note when the stamp
+    could not be written (the load still succeeds; a database saved from this
+    view will be verified from its stored bytes instead, see
+    `_database_provenance`)."""
+    if identity is None:
+        return None
+    try:
+        _record_source_identity(bv, identity)
+    except Exception as exc:  # noqa: BLE001 - never lose a load over the stamp
+        return (
+            f"could not record the source file's sha256 on the view ({exc}); a "
+            "database saved from it will carry no source record"
+        )
+    return None
+
+
 def _recorded_source_identity(bv) -> _SourceIdentity | None:
-    """The identity a database recorded at save, or None if it predates
-    content validation (or the record is unreadable)."""
+    """The identity a view recorded (at open, or in the database it was
+    restored from), or None if it predates content validation (or the record
+    is unreadable)."""
     try:
         record = bv.query_metadata(_PROVENANCE_METADATA_KEY)
     except Exception:  # noqa: BLE001 - KeyError when absent; unreadable == absent
@@ -5294,34 +5379,101 @@ def _recorded_source_identity(bv) -> _SourceIdentity | None:
     return _SourceIdentity(sha, int(size) if isinstance(size, int) else -1)
 
 
+def _stored_bytes_identity(bv) -> _SourceIdentity | None:
+    """The identity of the ORIGINAL bytes a database stores (`bv.file.raw`):
+    BN keeps the source file's contents in the .bndb, and for an unpatched
+    database they hash equal to the file it was saved from. None when the
+    raw view is unavailable."""
+    try:
+        raw = bv.file.raw
+        length = int(raw.length)
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < length:
+            chunk = raw.read(offset, min(1 << 20, length - offset))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            offset += len(chunk)
+        return _SourceIdentity(digest.hexdigest(), length)
+    except Exception:  # noqa: BLE001 - no raw view, or one that cannot be read
+        return None
+
+
 def _database_provenance(bv, database: Path, resolved: Path,
-                         current: _SourceIdentity) -> tuple[bool, str | None]:
+                         current: _SourceIdentity) -> tuple[str, str | None]:
     """Does the opened database *bv* describe the bytes now at *resolved*?
 
-    Returns ``(use_database, note)``. A sidecar or cache database used to be
-    preferred by PATH alone: re-extract the firmware, or copy a different
-    binary over the same name, and the OLD database loaded with every read --
-    `bn read` included -- describing bytes that were no longer on disk, with no
-    staleness hint. The database records its source's sha256 at save, so a
-    mismatch refuses the database (the caller loads the raw bytes) and a
-    database saved before the record existed is used but flagged.
+    Returns ``(verdict, note)`` with verdict one of:
+
+    * ``"verified"`` -- the database's record matches the file's content (no
+      note), or it has no record and the bytes it STORES match (a note says
+      so: the record is stamped in memory and lands on the next save, which
+      is how a database saved before content validation acquires one);
+    * ``"unverified"`` -- no record, and the stored bytes could not vouch for
+      it: unreadable, or different from the file (a patched database
+      legitimately differs, so this is a note, not a refusal);
+    * ``"mismatch"`` -- the record names other bytes. The note is the refusal's
+      first sentence; the caller appends what it did instead
+      (`_refusal_tail`).
+
+    A sidecar or cache database used to be preferred by PATH alone: re-extract
+    the firmware, or copy a different binary over the same name, and the OLD
+    database loaded with every read -- `bn read` included -- describing bytes
+    that were no longer on disk, with no staleness hint.
     """
     recorded = _recorded_source_identity(bv)
     if recorded is None:
-        return True, (
+        stored = _stored_bytes_identity(bv)
+        if stored is not None and stored.sha256 == current.sha256:
+            try:
+                _record_source_identity(bv, current)
+                landing = "the record is written on the next save"
+            except Exception as exc:  # noqa: BLE001 - verified regardless; say the stamp failed
+                landing = f"could not record it on the view ({exc})"
+            return "verified", (
+                f"database provenance verified from the bytes stored in {database} "
+                f"(saved before content validation); {landing}"
+            )
+        detail = (
+            f"and the bytes it stores differ from the file (database: sha256 "
+            f"{stored.sha256[:12]}, {stored.size} bytes; file: sha256 "
+            f"{current.sha256[:12]}, {current.size} bytes) -- patched, or saved "
+            "for other bytes"
+            if stored is not None else
+            "and its stored bytes could not be read"
+        )
+        return "unverified", (
             "database provenance unverified (saved before content validation): "
-            f"{database} records no source hash, so it may describe different "
-            f"bytes than {resolved} now holds; pass --no-bndb to analyze the raw file"
+            f"{database} records no source hash {detail}, so it may describe "
+            f"different bytes than {resolved} now holds; pass --no-bndb to "
+            "analyze the raw file"
         )
     if recorded.sha256 == current.sha256:
-        return True, None
-    return False, (
+        return "verified", None
+    return "mismatch", (
         f"NOT restoring {database}: it was saved for different bytes than "
         f"{resolved} now holds (database: sha256 {recorded.sha256[:12]}, "
         f"{recorded.size} bytes; file: sha256 {current.sha256[:12]}, "
-        f"{current.size} bytes). Loaded the raw file instead, so the saved "
-        "annotations are NOT present. To use the stale database anyway, load it "
-        f"explicitly: `bn load {database}`; --no-bndb always loads the raw bytes."
+        f"{current.size} bytes)."
+    )
+
+
+def _refusal_tail(database: Path, resolved: Path, *, loaded: bool) -> str:
+    """What a load did after refusing *database* (`_database_provenance`
+    mismatch): opened the raw bytes, or returned the raw view that was
+    already open -- which may itself predate the bytes now on disk."""
+    if loaded:
+        return (
+            "Loaded the raw file instead, so the saved annotations are NOT "
+            "present. To use the stale database anyway, load it explicitly: "
+            f"`bn load {database}`; --no-bndb always loads the raw bytes."
+        )
+    return (
+        f"{resolved} is already open, so that existing target was returned "
+        "without reloading; it may itself predate the bytes now on disk "
+        "(`bn close` it and load again to analyze the current file). To use "
+        f"the stale database anyway: `bn load {database}`."
     )
 
 
@@ -5333,17 +5485,20 @@ def _cache_bndb_path(binary_path: str, content_sha256: str | None = None) -> Pat
     `_resolve_bndb_sidecar` reads here so a later load of the same binary restores
     those annotations instead of re-analyzing blank (#214 save / #318 load).
 
-    The digest keys on the binary's CONTENT (*content_sha256*) so two binaries
-    with the same basename don't collide, two firmware versions at the same
-    path get separate databases, and different bytes at the same path never
-    inherit a stale analysis. Without a content hash (the raw file could not
-    be read) it falls back to the pre-validation PATH digest -- which is also
-    the legacy name `_resolve_bndb_sidecar` still reads so caches saved before
-    content keying keep restoring.
+    Named ``<basename>.<first 16 hex of the content sha256>.bndb``, so two
+    binaries with the same basename don't collide, two firmware versions at
+    the same path get separate databases, different bytes at the same path
+    never inherit a stale analysis -- and ``sha256sum <file> | cut -c1-16``
+    finds the entry. Without a content hash (a view the bridge did not open
+    itself, so it carries no record) it falls back to the pre-validation PATH
+    digest -- which is also the legacy name `_resolve_bndb_sidecar` still
+    reads so caches saved before content keying keep restoring.
     """
     stem = Path(binary_path).name or "target"
-    keyed_on = content_sha256 if content_sha256 else binary_path
-    digest = hashlib.sha256(keyed_on.encode("utf-8")).hexdigest()[:16]
+    digest = (
+        content_sha256[:16] if content_sha256
+        else hashlib.sha256(binary_path.encode("utf-8")).hexdigest()[:16]
+    )
     return cache_home() / "bndb" / f"{stem}.{digest}.bndb"
 
 
@@ -5353,10 +5508,10 @@ class _SidecarChoice:
 
     path: Path
     source: str  # "adjacent" | "cache"
-    identity: _SourceIdentity  # of the raw file, hashed once per load
 
 
-def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> _SidecarChoice | None:
+def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
+                          identity: _SourceIdentity | None) -> _SidecarChoice | None:
     """The saved database to load instead of ``resolved``, or None to load the
     path as given.
 
@@ -5367,25 +5522,22 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> _SidecarChoice |
     ``<path>.bndb``; if none (e.g. the binary is on a read-only mount), falls back
     to the writable-cache copy `_save_database` wrote there (#318): the
     content-keyed name first, then the legacy path-keyed name. A request that
-    already points at a ``.bndb`` (or prefer_bndb=False) resolves to None.
+    already points at a ``.bndb`` (or prefer_bndb=False, or a raw file whose
+    *identity* could not be taken) resolves to None.
 
     The choice is by path; whether the database actually describes the bytes
     now at ``resolved`` is decided AFTER it is opened (`_database_provenance`),
-    which is why the raw file's identity travels with the choice.
+    against the same *identity* `_load_identity` took for the open.
     """
-    if not prefer_bndb or resolved.suffix == ".bndb":
+    if not prefer_bndb or resolved.suffix == ".bndb" or identity is None:
         return None
-    try:
-        identity = _hash_file(resolved)  # once per load; a 27 MB firmware blob is ~50 ms
-    except OSError:
-        return None  # unreadable raw file: let the raw open report it
     sibling = Path(str(resolved) + ".bndb")
     if sibling.exists():
-        return _SidecarChoice(sibling, "adjacent", identity)
+        return _SidecarChoice(sibling, "adjacent")
     for cached in (_cache_bndb_path(str(resolved), identity.sha256),
                    _cache_bndb_path(str(resolved))):
         if cached.exists():
-            return _SidecarChoice(cached, "cache", identity)
+            return _SidecarChoice(cached, "cache")
     return None
 
 
@@ -5425,6 +5577,16 @@ def _view_engine_modified(bv) -> bool:
         return bool(getattr(getattr(bv, "file", None), "modified", False))
     except Exception:  # noqa: BLE001 - a stale view's `.file` access may raise
         return False
+
+
+def _source_verdict(bv) -> bool | None:
+    """The load-time provenance verdict on *bv* (`_source_verified`), or None
+    for a view no database was preferred for -- or one that cannot be weakly
+    referenced, which was never recorded."""
+    try:
+        return _source_verified.get(bv)
+    except TypeError:
+        return None
 
 
 def _analysis_progress(bv):
@@ -5538,7 +5700,8 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     import binaryninja
 
     resolved = Path(path).expanduser().resolve()
-    substitute = _resolve_bndb_sidecar(resolved, prefer_bndb)
+    identity = _load_identity(resolved)
+    substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
     load_path = substitute.path if substitute is not None else resolved
     if substitute is not None:
         bn.log_info(_sidecar_note(substitute, resolved))
@@ -5546,6 +5709,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
         return None
+    verified: bool | None = None
     published = False
     try:
         # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
@@ -5560,11 +5724,10 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
         if substitute is not None:
             # Parity with _load_binary: a database chosen by path must describe
             # the bytes now on disk, or the raw file is preloaded instead.
-            use_database, provenance_note = _database_provenance(
-                bv, load_path, resolved, substitute.identity)
-            if provenance_note:
-                (bn.log_info if use_database else bn.log_warn)(provenance_note)
-            if not use_database:
+            verdict, provenance_note = _database_provenance(
+                bv, load_path, resolved, identity)
+            if verdict == "mismatch":
+                bn.log_warn(f"{provenance_note} {_refusal_tail(load_path, resolved, loaded=True)}")
                 stale = bv
                 _run_on_main_thread(lambda: stale.file.close())
                 load_path = resolved
@@ -5573,6 +5736,14 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
                 if bv is None:
                     bn.log_warn(f"Failed to open binary: {load_path}")
                     return None
+            else:
+                verified = verdict == "verified"
+                if provenance_note:
+                    bn.log_info(provenance_note)
+        if load_path.suffix != ".bndb":
+            stamp_note = _stamp_opened_view(bv, identity)
+            if stamp_note:
+                bn.log_warn(stamp_note)
         quick_effective = quick and load_path.suffix != ".bndb"
         if quick_effective:
             _quick_loaded_views.add(bv)
@@ -5581,6 +5752,8 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
             _quick_loaded_views.discard(bv)
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
+        if verified is not None:
+            _source_verified[bv] = verified
         with _headless_views_lock:
             _headless_views.append(bv)
             published = True  # latched: view now owned by _headless_views
@@ -5596,6 +5769,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
                 _run_on_main_thread(lambda: bv.file.close())
             _quick_loaded_views.discard(bv)
             _unanalyzed_views.discard(bv)
+            _source_verified.pop(bv, None)
         raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv

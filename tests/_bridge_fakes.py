@@ -1452,7 +1452,8 @@ def _local_retype_result(**overrides):
 
 class _MetadataMixin:
     """BN's per-view metadata store (`store_metadata` / `query_metadata`): the
-    bridge stamps the raw file's sha256 here at save and asks for it at load."""
+    bridge stamps the raw file's sha256 here when it OPENS a raw view, and
+    asks a restored database for it at load."""
 
     def store_metadata(self, key: str, value, isAuto: bool = False):
         self.__dict__.setdefault("metadata", {})[key] = value
@@ -1464,9 +1465,22 @@ class _MetadataMixin:
             raise KeyError(key) from None
 
 
+class _RawView:
+    """`bv.file.raw`: the ORIGINAL bytes a database stores (BN keeps the source
+    file's contents in the .bndb), read in windows like the real one."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self.length = len(data)
+
+    def read(self, offset: int, length: int) -> bytes:
+        return self._data[offset:offset + length]
+
+
 class _LoadBV(_MetadataMixin):
     def __init__(self, filename: str | None = None, view_type: str = "ELF",
-                 functions=None, existing_views=None, db_views=None, metadata=None):
+                 functions=None, existing_views=None, db_views=None, metadata=None,
+                 raw_bytes: bytes | None = None):
         self.analysis_updated = False
         # A real loaded view carries functions; default to one so the #458 .bndb
         # analyzed-view check treats a plain loaded view as analyzed. Tests that
@@ -1482,6 +1496,8 @@ class _LoadBV(_MetadataMixin):
             self.file.existing_views = list(existing_views)
             _db = dict(db_views or {})
             self.file.get_view_of_type = lambda name, _m=_db: _m.get(name)
+        if raw_bytes is not None:
+            self.file.raw = _RawView(raw_bytes)
         self.view_type = view_type
         self.metadata = dict(metadata or {})
 

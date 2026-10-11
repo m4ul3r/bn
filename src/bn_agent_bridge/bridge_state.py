@@ -1,8 +1,9 @@
 """Mutable view-tracking module globals shared across the bridge.
 
-These three globals track headless-loaded BinaryViews and the subset loaded
-with ``--quick`` (analysis not yet run). They were hoisted out of ``bridge.py``
-into this neutral module so that read-op domain modules (e.g. ``read_misc``,
+These globals track headless-loaded BinaryViews, the subset loaded with
+``--quick`` (analysis not yet run), and per-view load-time verdicts. They were
+hoisted out of ``bridge.py`` into this neutral module so that read-op domain
+modules (e.g. ``read_misc``,
 which reads ``_quick_loaded_views``) can consult them WITHOUT importing
 ``bridge.py`` (which would create an import cycle).
 
@@ -30,6 +31,13 @@ _quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 # on a raw-only image will not recover a format view, so these are reported as
 # `analysis_state="unanalyzed"` rather than "quick". Weak so closed views drop out.
 _unanalyzed_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
+# View -> whether the database it was restored from was VERIFIED against the raw
+# file's content at load (True), or restored UNVERIFIED (False: no record and
+# its stored bytes could not vouch for it). Absent for a view that was not a
+# path-preferred database restore (a raw load, an explicitly named .bndb), so
+# `target list`/`target info` publish null there. The load note is one-shot;
+# this is what a later `target info` answers from. Weak so closed views drop out.
+_source_verified: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
 
 
 def require_analysis(bv: Any, what: str = "This operation") -> None:
