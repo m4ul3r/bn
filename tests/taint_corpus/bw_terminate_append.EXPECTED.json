@@ -1,0 +1,22 @@
+{
+  "description": "fill; buf[n] = 0; append; popen -- the aliased-field terminator must not break the memory chain: the parameter / read source copied in by the OLDER writer is the origin, not the literal append; a nested `strcpy(cmd, tmp)` source buffer is walked to its read",
+  "lang": "c",
+  "cflags": ["-O1"],
+  "backward": [
+    {"function": "fill_terminate_append", "sink": "arg:popen:0",
+     "origin_kinds": ["parameter"],
+     "step_reasons_contain": ["store into local buffer", "written by strcpy", "written by strcat"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true},
+    {"function": "read_terminate_append", "sink": "arg:popen:0",
+     "origin_kinds": ["source"],
+     "step_reasons_contain": ["written by read"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true},
+    {"function": "copy_from_tmp", "sink": "arg:popen:0",
+     "origin_kinds": ["source"],
+     "step_reasons_contain": ["local buffer tmp written by read"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true}
+  ]
+}

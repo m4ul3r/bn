@@ -1,0 +1,21 @@
+{
+  "description": "backward memory-path honesty: a conditional fill (memory phi with a writer-less arm) is a frontier; a source buffer overwritten after it was copied is read at the copy's memory version, not the sink's; an escaped &buf makes a later unmodeled call an opaque writer",
+  "lang": "c",
+  "backward": [
+    {"function": "conditional_fill", "sink": "arg:popen:0",
+     "origin_kinds": ["address_of_local_unresolved"],
+     "step_reasons_contain": ["written by snprintf"],
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": false},
+    {"function": "chained_fill", "sink": "arg:popen:0",
+     "origin_kinds": ["call"],
+     "step_reasons_contain": ["local buffer src written by snprintf", "local buffer dst written by strcpy"],
+     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": true},
+    {"function": "escape_then_call", "sink": "arg:popen:0",
+     "origin_kinds": ["address_of_local_unresolved"],
+     "step_reasons_contain": ["stored to memory", "may be written by fill_global"],
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": false}
+  ]
+}

@@ -9625,10 +9625,19 @@ def test_model_overlay_count_excludes_benign_markers_915():
     assert no_benign["count"] == 1 and "benign" not in no_benign, no_benign
 
 
-def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
-    src = te.model_overlay_sources({"app_recv": {"_comment": "benign on purpose"}})
-    user = [s for s in src if s["kind"] == "user"][0]
-    assert user["count"] == 0 and user["benign"] == 1, user
+# --- PR-928 round 2: the local-buffer walk's honesty gates --------------------
+#
+# Each shape here was compiled and run against a real BN by a reviewer; the
+# fakes reproduce the MLIL-SSA facts that mattered (an aliased terminator store
+# with only `ssa_memory_version`, a memory phi with a bare entry arm, an
+# address-of operand with no SSA reads, a source buffer overwritten after it
+# was copied, `&buf` escaping to a global, a folded `popen(&cmd)`).
+
+_B_STRCPY, _B_STRCAT, _B_SNPRINTF, _B_READ, _B_POPEN, _B_COMPOSE, _B_RUN, _B_FILL_GLOBAL = (
+    0x900, 0x901, 0x902, 0x903, 0x904, 0x905, 0x906, 0x907)
+_B_NAMES = {_B_STRCPY: "strcpy", _B_STRCAT: "strcat", _B_SNPRINTF: "snprintf",
+            _B_READ: "read", _B_POPEN: "popen", _B_COMPOSE: "compose", _B_RUN: "run",
+            _B_FILL_GLOBAL: "fill_global"}
 
 
 def _addr_of(v):
@@ -9637,6 +9646,345 @@ def _addr_of(v):
 
 def _cstr(addr):
     return FExpr("MLIL_CONST_PTR", hex(addr), constant=addr)
+
+
+class _BufProgram:
+    """Builds `f(<params>)` one memory-defining instruction at a time, numbering
+    memory versions the way BN does: each call/store reads the current version
+    and defines the next. ``sink()`` seeds the popen that reads the buffer."""
+
+    def __init__(self, name="build_cmd", params=()):
+        self.name, self.params = name, list(params)
+        self.instrs, self.mem_defs, self.mem = [], {}, 0
+        self._i, self._addr = 0, 0x10
+
+    def _next(self):
+        i, a = self._i, self._addr
+        self._i += 1
+        self._addr += 4
+        return i, a
+
+    def call(self, target, params, *, reads=(), writes=()):
+        i, a = self._next()
+        ins = _ext_call(i, a, f"{_B_NAMES[target]}(...)", target, params,
+                        reads=reads, writes=writes)
+        ins.src_memory = self.mem
+        self.mem += 1
+        ins.dest_memory = self.mem
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def aliased_store(self, buf, offset, value):
+        """`buf[offset] @ mem#k -> mem#k+1 = value`: MLIL_SET_VAR_ALIASED_FIELD,
+        which carries NO src_memory/dest_memory -- only ssa_memory_version."""
+        i, a = self._next()
+        dst = FSSA(buf, self.mem + 1)
+        ins = FInstr(i, a, "MLIL_SET_VAR_ALIASED_FIELD",
+                     f"{buf.name}[{offset:#x}] @ mem#{self.mem} -> mem#{self.mem + 1} = {value}",
+                     writes=[dst], dest=dst, src=FExpr("MLIL_CONST", str(value), constant=value),
+                     offset=offset)
+        ins.ssa_memory_version = self.mem
+        self.mem += 1
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def store(self, dest_expr, src_expr, reads=()):
+        i, a = self._next()
+        ins = FInstr(i, a, "MLIL_STORE_SSA", f"[{dest_expr}].q = {src_expr}",
+                     reads=list(reads), dest=dest_expr, src=src_expr)
+        ins.src_memory = self.mem
+        self.mem += 1
+        ins.dest_memory = self.mem
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def phi(self, *versions):
+        i, a = self._next()
+        ins = FInstr(i, a, "MLIL_MEM_PHI",
+                     f"mem#{self.mem + 1} = phi({', '.join(f'mem#{v}' for v in versions)})")
+        ins.src_memory = list(versions)
+        self.mem += 1
+        ins.dest_memory = self.mem
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def sink(self, buf, *, folded=False):
+        """`popen(p#1, "r")` after `p#1 = &buf` -- or, folded, `popen(&buf, "r")`."""
+        if folded:
+            arg = _addr_of(buf)
+            reads = []
+        else:
+            p = FVar("p"); p1 = FSSA(p, 1)
+            i, a = self._next()
+            self.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", f"p#1 = &{buf.name}",
+                                      writes=[p1], src=_addr_of(buf)))
+            arg = FExpr("MLIL_VAR_SSA", "p#1", reads=[p1])
+            reads = [p1]
+        return self.call(_B_POPEN, [arg, _cstr(0x710)], reads=reads)
+
+    def func(self, **kw):
+        return FFunc(self.name, 0x10, FSSAFunc(self.instrs, mem_defs=self.mem_defs),
+                     params=self.params, **kw)
+
+
+def _bw(func, extra_names=None, sink="arg:popen:0"):
+    names = dict(_B_NAMES)
+    names.update(extra_names or {})
+    result = te.TaintEngine(FBV(names), te.load_models()).backward(
+        func, [te.parse_locator(sink)])
+    reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
+    aol = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
+    return result, reasons, aol
+
+
+def test_backward_aliased_terminator_store_does_not_break_the_writer_chain_928():
+    # Mythos P1: `strcpy(cmd, host); cmd[100] = 0; strcat(cmd, " -c 1");
+    # popen(cmd)` -- the terminator lifts to MLIL_SET_VAR_ALIASED_FIELD with no
+    # `src_memory`, so the chain dead-ended there, strcpy (and the parameter
+    # it copied in) vanished, and the literal strcat claimed origin `call` with
+    # `safe_to_report_complete_slice: true`. The chain now steps through
+    # `ssa_memory_version`, the aliased store is a writer, and the parameter
+    # origin found through the OLDER writer outranks the literal append.
+    host = FVar("host", ident=11); host0 = FSSA(host, 0)
+    cmd = FVar("cmd", typ="char[0x80]")
+    pg = _BufProgram(params=[host])
+    pg.call(_B_STRCPY, [_addr_of(cmd), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
+    pg.aliased_store(cmd, 0x64, 0)
+    pg.call(_B_STRCAT, [_addr_of(cmd), _cstr(0x700)])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    sl = result["slices"][0]
+    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, sl["origin"]
+    assert any("store into local buffer cmd" in r for r in reasons), reasons
+    assert any("written by strcpy" in r for r in reasons), reasons
+    assert any("written by strcat" in r for r in reasons), reasons
+    assert aol == [], aol
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["diagnostics"]
+
+
+def test_backward_source_fill_outranks_a_later_literal_terminator_928():
+    # The same chain with a receive API: `read(fd, cmd, 100); cmd[100] = 0;
+    # strcat(cmd, " -c 1")` must come back as origin `source: read`, not the
+    # terminator's `constant: 0` nor the append's `call: strcat`.
+    fd = FVar("fd", ident=12); fd0 = FSSA(fd, 0)
+    cmd = FVar("cmd", typ="char[0x80]")
+    pg = _BufProgram(params=[fd])
+    pg.call(_B_READ, [FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]), _addr_of(cmd),
+                      FExpr("MLIL_CONST", "0x64", constant=0x64)], reads=[fd0])
+    pg.aliased_store(cmd, 0x64, 0)
+    pg.call(_B_STRCAT, [_addr_of(cmd), _cstr(0x700)])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+    assert any("written by read" in r for r in reasons), reasons
+    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+
+def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
+    # Astra P1: `if (flag) snprintf(dst, n, "fixed"); popen(dst)` -- the sink
+    # reads phi(mem#0, mem#1); the entry arm has NO writer, so on that path
+    # the sink reads whatever the stack held. The collector returned only the
+    # writers it found and the literal fill claimed a complete slice.
+    dst = FVar("dst", typ="char[0x80]")
+    pg = _BufProgram(params=[FVar("flag", ident=13)])
+    pg.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
+    pg.phi(0, 1)
+    pg.sink(dst)
+    result, reasons, aol = _bw(pg.func())
+    assert any("written by snprintf" in r for r in reasons), reasons
+    assert len(aol) == 1 and "on at least one path" in aol[0]["detail"], result["leaves"]
+    assert aol[0]["buffer"] == "dst"
+    assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved", result["slices"][0]["origin"]
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_complete_slice"] is False and diag["frontier"]["unresolved"] == 1, diag
+
+
+def test_backward_covered_memory_phi_arms_stay_complete_928():
+    # Guard: a fill on EVERY arm (`if (a) snprintf(..."x") else snprintf(..."y")`)
+    # is covered -- no frontier, the slice is complete.
+    dst = FVar("dst", typ="char[0x80]")
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
+    other = pg.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x708)])
+    other.src_memory = 0   # the else arm also starts from the entry state
+    pg.phi(1, 2)
+    pg.sink(dst)
+    result, reasons, aol = _bw(pg.func())
+    assert aol == [], result["leaves"]
+    assert result["slices"][0]["origin"] == {"kind": "call", "callee": "snprintf"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
+    # Astra P1 (budget): an opaque fill, hundreds of unrelated memory
+    # definitions, then a one-byte constant store next to the sink -- the walk
+    # used to give up silently past its depth cap and the store's `constant: 0`
+    # claimed a complete, untruncated slice with the opaque producer dropped.
+    cmd = FVar("cmd", typ="char[0x80]"); other = FVar("other", typ="char[0x80]")
+    pg = _BufProgram()
+    pg.call(_B_COMPOSE, [_addr_of(cmd)])
+    for _ in range(te.MEM_CHAIN_BUDGET + 40):
+        pg.store(_addr_of(other), FExpr("MLIL_CONST", "1", constant=1))
+    pg.aliased_store(cmd, 0, 0)
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is True, result["stats"]
+    assert result["stats"]["truncation_cause"] == ["memory_chain"], result["stats"]
+    assert len(aol) == 1 and "walk budget" in aol[0]["detail"], result["leaves"]
+    assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
+
+
+def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
+    # Astra P1: `read(fd, other, n); strcpy(cmd, &other); popen(cmd)` -- the
+    # strcpy source operand has no SSA reads, so it was taken for a literal and
+    # `other` was never examined (origin `call: strcpy`, complete). The operand
+    # is a local whose contents are walked at strcpy's input memory.
+    fd = FVar("fd", ident=12); fd0 = FSSA(fd, 0)
+    cmd = FVar("cmd", typ="char[0x80]"); other = FVar("other", typ="char[0x40]")
+    pg = _BufProgram(params=[fd])
+    pg.call(_B_READ, [FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]), _addr_of(other),
+                      FExpr("MLIL_CONST", "0x3f", constant=0x3f)], reads=[fd0])
+    pg.call(_B_STRCPY, [_addr_of(cmd), _addr_of(other)])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+    assert any("local buffer other written by read" in r for r in reasons), reasons
+    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+    # With nothing writing `other`, the nested buffer is the frontier.
+    pg2 = _BufProgram(params=[fd])
+    pg2.call(_B_STRCPY, [_addr_of(cmd), _addr_of(other)])
+    pg2.sink(cmd)
+    result2, _, aol2 = _bw(pg2.func())
+    assert [l["buffer"] for l in aol2] == ["other"], result2["leaves"]
+    assert result2["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_backward_uninterpretable_fill_operand_is_a_frontier_928():
+    # A fill input that reads no variable and is neither a literal nor a local
+    # -- a global pointer load -- is not "a literal"; it is unaccounted for.
+    cmd = FVar("cmd", typ="char[0x80]")
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(cmd),
+                        FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
+                              src=FExpr("MLIL_CONST_PTR", "0x601040", constant=0x601040))])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert len(aol) == 1 and "neither a literal nor a local" in aol[0]["detail"], result["leaves"]
+    assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_backward_nested_buffer_is_read_at_the_copy_not_the_sink_928():
+    # Astra P2: `snprintf(src, n, "fixed"); strcpy(dst, src); snprintf(src, n,
+    # "%s", input); popen(dst)` -- the second snprintf runs AFTER strcpy
+    # consumed `src` and cannot reach `dst`, yet it was reported as dst's
+    # origin (`input#0`) because the nested walk reused the sink's memory
+    # version. The fill's own `src_memory` is where its source bytes are read.
+    inp = FVar("input", ident=14); inp0 = FSSA(inp, 0)
+    src = FVar("src", typ="char[0x40]"); dst = FVar("dst", typ="char[0x40]")
+    n = FExpr("MLIL_CONST", "0x40", constant=0x40)
+    pg = _BufProgram(params=[inp])
+    pg.call(_B_SNPRINTF, [_addr_of(src), n, _cstr(0x700)])
+    pg.call(_B_STRCPY, [_addr_of(dst), _addr_of(src)])
+    late = pg.call(_B_SNPRINTF, [_addr_of(src), n, _cstr(0x708),
+                                 FExpr("MLIL_VAR_SSA", "input#0", reads=[inp0])], reads=[inp0])
+    pg.sink(dst)
+    result, reasons, aol = _bw(pg.func())
+    sl = result["slices"][0]
+    assert sl["origin"] == {"kind": "call", "callee": "snprintf"}, sl["origin"]
+    assert hex(late.address) not in [st.get("address") for st in sl["slice"]], sl["slice"]
+    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+
+def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928():
+    # Mythos P2: `cmd[0] = 0; gp = cmd; fill_global(host); popen(cmd)` -- the
+    # store's DEST is the global, so it is not a writer of cmd, and fill_global
+    # takes no pointer to cmd, so it was not opaque either: once the chain no
+    # longer broke at the terminator, the constant store became a complete
+    # origin. A store whose VALUE is &cmd is an escape; every unmodeled call
+    # after it may write through the stashed pointer.
+    host = FVar("host", ident=11); host0 = FSSA(host, 0)
+    cmd = FVar("cmd", typ="char[0x80]")
+    pg = _BufProgram(params=[host])
+    pg.aliased_store(cmd, 0, 0)
+    pg.store(FExpr("MLIL_CONST_PTR", "0x404050", constant=0x404050), _addr_of(cmd))
+    pg.call(_B_FILL_GLOBAL, [FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert any("stored to memory" in r for r in reasons), reasons
+    assert len(aol) == 1 and aol[0]["callee"] == "fill_global", result["leaves"]
+    assert "ran after the address of cmd" in aol[0]["detail"], aol[0]
+    assert result["slices"][0]["origin"] == {
+        "kind": "address_of_local_unresolved", "buffer": "cmd", "callee": "fill_global"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    # Guard: a MODELED call after the escape is trusted to its model.
+    pg2 = _BufProgram(params=[host])
+    pg2.aliased_store(cmd, 0, 0)
+    pg2.store(FExpr("MLIL_CONST_PTR", "0x404050", constant=0x404050), _addr_of(cmd))
+    other = FVar("other", typ="char[0x40]")
+    pg2.call(_B_SNPRINTF, [_addr_of(other), FExpr("MLIL_CONST", "0x40", constant=0x40), _cstr(0x700)])
+    pg2.sink(cmd)
+    result2, _, aol2 = _bw(pg2.func())
+    assert aol2 == [], result2["leaves"]
+    assert result2["slices"][0]["origin"] == {"kind": "constant", "value": 0, "var": "cmd"}
+
+
+def test_backward_folded_address_of_sink_operand_is_seeded_928():
+    # Mythos P2: `popen(&cmd, "r")` with the address-of folded into the call
+    # parameter was a hard "reads no variable" seed error while the same shape
+    # one definition away (`p#1 = &cmd; popen(p#1)`) yielded a full slice.
+    ctx = FVar("ctx", ident=77); ctx0 = FSSA(ctx, 0)
+    cmd = FVar("cmd", typ="char[0x100]")
+    pg = _BufProgram(params=[ctx])
+    pg.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x100", constant=0x100),
+                          _cstr(0x700), FExpr("MLIL_VAR_SSA", "ctx#0", reads=[ctx0])], reads=[ctx0])
+    pg.sink(cmd, folded=True)
+    result, reasons, aol = _bw(pg.func())
+    sl = result["slices"][0]
+    assert sl["sink"]["seed"] == "&cmd", sl["sink"]
+    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
+    assert any("written by snprintf" in r for r in reasons), reasons
+    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+    # An address expression that is NOT a local's address still cannot seed.
+    pg2 = _BufProgram(params=[ctx])
+    pg2.call(_B_POPEN, [FExpr("MLIL_VAR_SSA", "&dst", reads=[]), _cstr(0x710)])
+    with pytest.raises(te.TaintError, match="reads no variable"):
+        _bw(pg2.func())
+
+
+def test_backward_caller_ascent_follows_a_folded_address_of_argument_928():
+    # The ascent's twin of the folded seed: `run(&cmd)` in the caller, where
+    # `run` hands its parameter to popen. The caller's writers of cmd are the
+    # slice's origin, not an "is not a trackable scalar" stop.
+    buf = FVar("buf", ident=21); buf0 = FSSA(buf, 0)
+    callee = FFunc("run", 0x10, FSSAFunc([
+        _ext_call(0, 0x10, 'popen(buf#0, "r")', _B_POPEN,
+                  [FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0]), _cstr(0x710)], reads=[buf0]),
+    ]), params=[buf])
+    host = FVar("host", ident=11); host0 = FSSA(host, 0)
+    cmd = FVar("cmd", typ="char[0x100]")
+    pg = _BufProgram(name="main", params=[host])
+    pg._addr = 0x100
+    pg.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x100", constant=0x100),
+                          _cstr(0x700), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
+    site = pg.call(_B_RUN, [_addr_of(cmd)])
+    caller = pg.func()
+    callee.caller_sites = [FSite(caller, site.address)]
+    result, reasons, aol = _bw(callee)
+    sl = result["slices"][0]
+    assert sl["crossed_functions"] == ["run"], sl
+    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, sl["origin"]
+    assert any("written by snprintf" in r for r in reasons), reasons
+    assert not any("trackable scalar" in a for a in result["assumptions"]), result["assumptions"]
+    assert aol == [], result["leaves"]
 
 
 def test_strtok_state_left_tainted_at_return_withholds_all_clear_928():
@@ -9686,3 +10034,37 @@ def test_strtok_clean_non_null_call_resets_the_continuation_928():
     assert result["reached_sinks"] == [], result["reached_sinks"]
     assert not any("tokenizer" in a for a in result["assumptions"]), result["assumptions"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+def test_backward_diagnostics_name_the_memory_chain_cut_928():
+    from bn_agent_bridge import taint_result as tr
+    diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1,
+                                   truncated=True, truncation_cause=["memory_chain"])
+    assert diag["safe_to_report_complete_slice"] is False
+    assert "memory-chain budget" in diag["complete_slice_reason"], diag
+
+
+def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
+    src = te.model_overlay_sources({"app_recv": {"_comment": "benign on purpose"}})
+    user = [s for s in src if s["kind"] == "user"][0]
+    assert user["count"] == 0 and user["benign"] == 1, user
+
+
+def test_backward_indexed_loop_store_is_a_writer_of_the_buffer_928():
+    # `for (i..n) cmd[i] = host[i]; popen(cmd)`: the store's address `&cmd + i`
+    # has no constant offset, so no slot keys it -- but it is a write to the
+    # buffer and its value must be walked (to the parameter), not reported as
+    # "no writer found". The zero-trip path (phi entry arm) stays a frontier.
+    host = FVar("host", ident=11); host0 = FSSA(host, 0)
+    i = FVar("i", ident=15); i1 = FSSA(i, 1)
+    cmd = FVar("cmd", typ="char[0x80]")
+    pg = _BufProgram(params=[host])
+    pg.store(FExpr("MLIL_ADD", "&cmd + i#1", left=_addr_of(cmd),
+                   right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1])),
+             FExpr("MLIL_LOAD_SSA", "[host#0 + i#1].b", reads=[host0, i1]), reads=[host0, i1])
+    pg.phi(0, 1)
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert any("store into local buffer cmd" in r for r in reasons), reasons
+    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, result["slices"][0]["origin"]
+    assert len(aol) == 1 and "on at least one path" in aol[0]["detail"], result["leaves"]

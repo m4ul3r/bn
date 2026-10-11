@@ -74,11 +74,13 @@ BLOCKING_LEAF_KINDS = frozenset({
     # absent from the result. Same class as the other frontier leaves: the walk
     # stopped with data unexamined, so the slice is NOT a complete answer.
     "caller_sites_truncated",
-    # A backward slice reached `p = &local_buf` and the walk could not account
-    # for the buffer's CONTENTS (no memory version to walk, an unmodeled call
-    # took the buffer's address, or the chain ended with no writer). The sink
-    # consumes the bytes, not the pointer, so a slice that stops at the
-    # address-of is NOT complete.
+    # A backward slice reached `p = &local_buf` (or a folded `sink(&buf)`) and
+    # the walk could not account for the buffer's CONTENTS: no memory version
+    # to walk, an unmodeled call took the buffer's address or ran after it
+    # escaped to memory, a path to the sink with no writer at all (a
+    # conditional fill), a writer's input the walk could not interpret, or a
+    # memory chain longer than the walk budget. The sink consumes the bytes,
+    # not the pointer, so a slice that stops at the address-of is NOT complete.
     "address_of_local_unresolved",
 })
 
@@ -149,6 +151,14 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
         return ("the backward caller ascent hit its per-site cap -- some calling "
                 "sites were never followed; narrow the sink or inspect the "
                 "capped sites named in the caller_sites_truncated leaf")
+    if "memory_chain" in causes:
+        # Backward-only cause: the local-buffer writer walk ran out of
+        # memory-SSA versions before reaching the function entry, so writers
+        # older than the cut are absent from the slice.
+        return ("the backward walk through a local buffer's writers exhausted "
+                "its memory-chain budget -- older writers were never examined; "
+                "seed closer to the sink or inspect the earlier writes named in "
+                "the address_of_local_unresolved leaf")
     return "depth/recursion cutoff"
 
 
