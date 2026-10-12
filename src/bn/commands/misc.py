@@ -761,7 +761,7 @@ def _batch_target_from_cli(args: argparse.Namespace,
                      "local_rename, local_retype, data_retype, struct_field_set, "
                      "struct_field_rename, struct_field_delete, types_declare, function_create, "
                      "tag_add, tag_remove, tag_type_create, tag_type_remove. "
-                     "Required fields: skills/bn/reference/mutating.md, "
+                     "Required fields: the bn skill's reference/mutating.md, "
                      "'Batch op kinds and required fields'. A missing required field is "
                      "reported as status 'invalid_request' naming the field.\n"
                      "Ceilings: a manifest over 5000 ops, or whose serialized request exceeds "
