@@ -311,7 +311,8 @@ def test_go_rename_applies_recovered_names_auto_only(monkeypatch):
     assert out["results"] == []
 
 
-def test_go_rename_noop_when_already_named(monkeypatch):
+@pytest.mark.parametrize("preview", [False, True])
+def test_go_rename_noop_when_already_named(monkeypatch, preview):
     blob = _build_pclntab()
     bv = _GoBV(blob, defined={0x401000})
     _fns, get_function_at = _fake_functions({0x401000: "main.foo"})
@@ -319,8 +320,12 @@ def test_go_rename_noop_when_already_named(monkeypatch):
     bridge, inst = _ctx(monkeypatch, bv)
     monkeypatch.setattr(inst, "_mutation",
                         lambda *a, **k: pytest.fail("mutation must not run on a noop"))
-    out = inst._go_rename(None)
+    out = inst._go_rename(None, preview=preview)
     assert out["go_renamed_candidates"] == 0 and out["success"] is True and out["results"] == []
+    assert out["go_verified_count"] == out["go_committed_count"] == out["go_failed_count"] == 0
+    assert out["committed"] is False
+    assert out["skipped_already_named"] == out["defined_count"] == 1
+    assert _fns[0x401000].name == "main.foo"
 
 
 def test_go_rename_skips_undefined_pcln_addresses(monkeypatch):

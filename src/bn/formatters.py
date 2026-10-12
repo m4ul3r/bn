@@ -1140,10 +1140,9 @@ def _render_comment_list_text(value: Any) -> str:
         # distinguishable in one listing -- same `[doc]` marker `comment get
         # --function` already uses.
         prefix = "[doc] " if item.get("scope") == "function_doc" else ""
-        # Both cells carry settable text -- `comment` via `comment set`, and the
-        # containing function's symbol name via `rename`, which accepts a control
-        # char (`_require_nonempty_name` rejects only empty/whitespace). Either
-        # one raw splits the row (#771).
+        # Comments accept controls, and symbol names from existing databases or
+        # external writers can contain them too. Either raw cell splits the row
+        # (#771), even though bn symbol rename now rejects controls (#923).
         lines.append(f"{address}  {_escape_control_chars(func)}  {prefix}"
                      f"{_escape_control_chars(comment)}")
     return "\n".join(lines)
@@ -5840,7 +5839,7 @@ def _mutation_summary(value: Any) -> Any:
 
 
 # `go rename`'s own counters -- the ONE list, and the read loop below iterates
-# it, so a seventh counter cannot be read outside the capture that decides
+# it, so another counter cannot be read outside the capture that decides
 # whether this summary was measured at all. A tuple maintained BESIDE the reads
 # would be a second declaration to drift; this one IS the reads.
 _GO_RENAME_COUNTERS = (
@@ -5849,6 +5848,8 @@ _GO_RENAME_COUNTERS = (
     "go_verified_count",
     "go_failed_count",
     "skipped_user_named",
+    "skipped_already_named",
+    "skipped_interior_pc",
     "skipped_changed_during_apply",
 )
 
@@ -6042,7 +6043,7 @@ def _go_rename_summary(value: Any) -> Any:
     # `not success`, not on `failed`, is what keeps a revert that failed AFTER
     # every rename verified -- zero failure rows, message only -- from reporting
     # failed=0 with no error while the view sits partially renamed.
-    return _build_mutation_summary(
+    summary = _build_mutation_summary(
         # This op measures through its own counters rather than through
         # `results[]` -- but "measures through" is not "measured": a counter
         # that arrived in a shape no count reads out of leaves the derived
@@ -6066,9 +6067,8 @@ def _go_rename_summary(value: Any) -> Any:
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
-        # inside go_renamed_candidates. Distinct functions considered =
-        # candidates + scan-time-only skips -- keeping verified+noop+failed <=
-        # op_count, the invariant every other mutation summary holds.
+        # inside go_renamed_candidates. Already-named and interior-PC rows
+        # are scan-only skips, not operations; disclose them separately.
         op_count=candidates + skipped
                  - counters["skipped_changed_during_apply"],
         reported_success=reported_success,
@@ -6077,10 +6077,7 @@ def _go_rename_summary(value: Any) -> Any:
         failed=failed,
         changed=changed,
         verified=stated_verified,
-        # Already-user-named functions are deliberately left alone: no change,
-        # which is what `noop` means elsewhere. `op_count` above still uses the
-        # numeric read: it is a literal count of what the op could see, and an
-        # absent counter shrinks it rather than unknowing it.
+        # User-named skips retain the existing operation/noop population.
         noop=stated_noop,
         committed=committed,
         preview=preview,
@@ -6088,6 +6085,23 @@ def _go_rename_summary(value: Any) -> Any:
         message=_text_value(value, "message"),
         default_error="go rename failed",
     )
+    # Preserve operation-count semantics while exposing the scan buckets.
+    # The user-named wire counter includes apply-time skips; its overlap is
+    # explicit here, just as it is in the detailed producer result.
+    summary["go_rename"] = {
+        name: (None if source in unreadable
+               or (source in {"go_renamed_candidates", "skipped_user_named"}
+                   and not _field_present(value, source))
+               else counters[source])
+        for name, source in (
+            ("candidates", "go_renamed_candidates"),
+            ("skipped_user_named", "skipped_user_named"),
+            ("skipped_already_named", "skipped_already_named"),
+            ("skipped_interior_pc", "skipped_interior_pc"),
+            ("skipped_changed_during_apply", "skipped_changed_during_apply"),
+        )
+    }
+    return summary
 
 
 @_discloses
@@ -6127,6 +6141,14 @@ def _render_mutation_summary_text(value: Any) -> str:
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if _field_declared(value, "go_rename"):
+        go = _field_dict(value, "go_rename")
+        line += "\ngo rename: " + "  ".join(
+            f"{key}={_fmt_count(go.get(key))}" for key in (
+                "candidates", "skipped_user_named", "skipped_already_named",
+                "skipped_interior_pc", "skipped_changed_during_apply",
+            )
+        )
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive

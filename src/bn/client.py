@@ -187,6 +187,12 @@ class Client:
         limit: int | None = None,
         resolved: bool = False,
     ) -> dict[str, Any]:
+        """Collect rows while retaining the final cumulative callsite coverage.
+
+        Scan counts include rows before the requested offset and lookahead;
+        has_more describes available rows, not complete caller enumeration.
+        A zero-row collection retains its one-row probe's scan coverage.
+        """
         if page_size < 1:
             raise ValueError("page_size must be at least 1")
         if limit is not None and limit < 0:
@@ -305,6 +311,18 @@ class Client:
         aggregate["offset"] = initial_offset
         aggregate["returned"] = len(items)
         aggregate["total"] = seen_total
+        # Callsites rescans from row zero through offset + limit on every page.
+        # Its final coverage is cumulative, not additive or implied by has_more:
+        # even a terminal page can have incomplete caller enumeration. Replace
+        # the whole coverage group, dropping a lower bound refined to an exact
+        # total (the producer omits total_lower_bound once the scan completes).
+        for field in (
+            "scan_truncated", "caller_scan_truncated", "caller_scan_note",
+            "callers_scanned", "caller_total", "total_lower_bound",
+        ):
+            aggregate.pop(field, None)
+            if field in page:
+                aggregate[field] = page[field]
         aggregate["has_more"] = bool(
             bridge_has_more and limit is not None and len(items) >= limit
         )

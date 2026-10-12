@@ -3742,6 +3742,8 @@ class BinaryNinjaBridge:
                 result = {"kind": "go_rename", "success": True, "committed": False,
                           "preview": preview, "results": [],
                           "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                          "go_verified_count": 0, "go_committed_count": 0,
+                          "go_failed_count": 0,
                           "defined_count": recovered.get("defined_count", 0)}
                 return _disclose_go_rename_skips(
                     result,

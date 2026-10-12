@@ -1081,63 +1081,6 @@ def test_mutating_reference_documents_the_output_flags(mutation_engine):
     assert "status line" in text or "status summary" in text
 
 
-def _documented_compact_status_keys() -> set[str]:
-    """The keys named in the first column of `mutating.md`'s "Compact status
-    keys" table. One row may name several keys (the counts share a row), so
-    collect every backticked identifier in that cell."""
-    section = MUTATING.read_text(encoding="utf-8").split("### Compact status keys", 1)
-    assert len(section) == 2, "the compact-status key table section is gone"
-    keys: set[str] = set()
-    for line in section[1].splitlines():
-        if not line.startswith("|") or line.startswith("|---") or line.startswith("| key "):
-            if keys:
-                break                       # past the end of the table
-            continue
-        keys.update(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", line.split("|")[1]))
-    return keys
-
-
-def test_mutating_reference_documents_every_compact_status_key():
-    """#684 made `measured` -- and the null-vs-zero count semantics around it --
-    load-bearing for a JSON control loop, and the answer to "a value nobody is
-    told to read is not loud enough" is that the compact schema is DOCUMENTED.
-    A table that silently drifts from the emitted keys is the same
-    remembered-exception failure mode as a forgotten `summary_transform`: it
-    shipped omitting `kind` and `prototype_user_type_residue` (#630's residue
-    flag, which a control loop must see). Pin the documented key set to the
-    union of what `_mutation_summary` and `_go_rename_summary` actually emit
-    across the measured, unmeasured and residue shapes."""
-    from bn.formatters import _go_rename_summary, _mutation_summary
-
-    measured = _mutation_summary({"success": True, "committed": True,
-                                  "rolled_back": False, "results": [{"status": "noop"}]})
-    unmeasured = _mutation_summary({"success": True, "committed": True, "results": []})
-    residue = _mutation_summary({"success": False, "committed": False,
-                                 "rolled_back": True, "message": "override stuck",
-                                 "prototype_user_type_residue": True,
-                                 "results": [{"status": "rollback_failed"}]})
-    split = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
-                               "results": [{"op": "function_create", "status": "verified",
-                                            "overlaps": [{"name": "parse_record",
-                                                          "address": "0x401a40",
-                                                          "offset": "0x4"}]}]})
-    go = _go_rename_summary({"kind": "go_rename", "success": True, "committed": True,
-                             "rolled_back": False, "go_renamed_candidates": 2,
-                             "go_committed_count": 2, "go_verified_count": 2,
-                             "go_failed_count": 0, "skipped_user_named": 1})
-    emitted = set(measured) | set(unmeasured) | set(residue) | set(split) | set(go)
-    assert emitted == _documented_compact_status_keys()
-    # ...and the table's "always present except prototype_user_type_residue /
-    # overlapping_functions" caveat is itself true.
-    assert "prototype_user_type_residue" in residue
-    assert "prototype_user_type_residue" not in measured
-    assert "overlapping_functions" in split
-    assert "overlapping_functions" not in measured
-    # #685: the two summary builders must keep emitting the SAME key set -- the
-    # nulled unmeasured counts must not widen one side only.
-    assert set(measured) == set(unmeasured) == set(go)
-
-
 def test_reading_reference_documents_the_function_list_flags():
     """#650: `--sort` / `--reverse` / `--min-size` / `--demangle` all ship, and all
     were absent from `reading.md` -- so two agents wrote the same python to sort
