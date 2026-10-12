@@ -76,12 +76,28 @@ from . import taint_result as _taint_result_mod  # noqa: F401
 # ``caller_sites_truncated`` leaf naming the counts (#810).
 MAX_CALLERS = 16
 
-# Memory-SSA versions the backward local-buffer writer walk follows from the
-# sink back toward the function entry before it gives up. Exceeding it sets
-# ``stats.truncated`` (cause ``memory_chain``) and emits a blocking leaf: a
-# writer behind the cut is absent from the slice, and the PR-928 review showed
-# a silent cut letting a one-byte store past it claim a complete slice.
+# Shared work/storage allowance for one backward local-buffer proof, including
+# its prefix and loop-invariant queries. Charge memory visits, PHI inputs and
+# proof/interval processing BEFORE expansion; a depth cap alone permits an
+# exponential number of path alternatives. Exhaustion sets ``stats.truncated``
+# (cause ``memory_chain``) and emits a blocking leaf, never a complete slice.
 MEM_CHAIN_BUDGET = 256
+
+
+class _MemoryChainExhausted(Exception):
+    """Internal unwind to the owning local-buffer query's truncation result."""
+
+
+class _MemoryChainBudget:
+    __slots__ = ("remaining",)
+
+    def __init__(self) -> None:
+        self.remaining = MEM_CHAIN_BUDGET
+
+    def take(self, units: int = 1) -> None:
+        if units > self.remaining:
+            raise _MemoryChainExhausted
+        self.remaining -= units
 
 # BN's stores to a stack slot BY NAME (no address expression): an address-taken
 # local written as a whole or by field offset. They are memory definitions
@@ -1377,15 +1393,20 @@ class TaintEngine:
             bufs.append(buf)
         return bufs
 
-    def _mem_phi_sources(self, defn: Any) -> list[int]:
+    def _mem_phi_sources(self, defn: Any, *,
+                         _budget: _MemoryChainBudget | None = None) -> list[int]:
         src = getattr(defn, "src_memory", None)
         if isinstance(src, (list, tuple)):
+            if _budget is not None:
+                _budget.take(len(src))
             try:
                 return [int(x) for x in src]
             except Exception:
                 return []
         out = []
         for x in (getattr(defn, "src", None) or []):
+            if _budget is not None:
+                _budget.take()
             try:
                 out.append(int(getattr(x, "version", x)))
             except Exception:
@@ -1991,7 +2012,8 @@ class TaintEngine:
 
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None, *,
-                              region: _BufferRegion = _BufferRegion()) -> dict[str, Any]:
+                              region: _BufferRegion = _BufferRegion(),
+                              _budget: _MemoryChainBudget | None = None) -> dict[str, Any]:
         """Writers that may affect the consumed region of local *base_key* on
         the memory-SSA chain ending at *mv* (the sink's input), newest first,
         plus whether that chain accounts for the region on EVERY path.
@@ -2062,8 +2084,9 @@ class TaintEngine:
         the string-or-bytes alternative per arm, including across later writes.
         Loop backedges are neutral, but cannot invent a terminator location;
         byte initialization can independently establish a loop invariant.
-        ``truncated`` is True when the walk exhausted ``MEM_CHAIN_BUDGET`` --
-        writers behind the cut are missing.
+        ``truncated`` is True when the shared ``MEM_CHAIN_BUDGET`` allowance
+        for visits, proof alternatives and interval work/storage is exhausted.
+        Prefix and loop-invariant queries spend the SAME allowance.
 
         Deliberately does NOT stop at a full-cover writer: ``strcat`` after
         ``strcpy`` both write offset 0 and both feed the sink, and a may-analysis
@@ -2080,10 +2103,18 @@ class TaintEngine:
         # initialization through NUL or the entire bounded byte demand.
         memo: dict[int, tuple[frozenset[_BufferProof], bool] | None] = {}
         truncated = False
+        budget = _budget if _budget is not None else _MemoryChainBudget()
         backedge = False
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
         escape_addrs: set[int] = set()
+
+        def _proof(initialized: bool = False,
+                   term: _StringTermination | None = None) -> _BufferProof:
+            # Include interval slots before constructing/hashing a retained
+            # alternative. Charges are cumulative, never refunded on dedup.
+            budget.take(1 + (len(term.nuls) if term is not None else 0))
+            return _BufferProof(initialized, term)
 
         def _alias(expr: Any, escaped: bool) -> str:
             return self._ptr_aliases_local(ssaf, expr, base_key, escaped=escaped,
@@ -2106,7 +2137,7 @@ class TaintEngine:
 
             Query the writer's INPUT epoch, not the sink epoch. The nested
             demand is bytes, so it cannot recurse into another string-prefix
-            proof; its normal all-path and memory-chain limits still apply.
+            proof; it spends this query's allowance rather than resetting it.
             """
             nonlocal truncated
             if not strings or region.offset is None or off is None:
@@ -2117,7 +2148,8 @@ class TaintEngine:
                 return True
             prefix = self._local_buffer_writers(
                 ssaf, base_key, self._mem_in(defn), base_size=base_size,
-                region=_BufferRegion(region.offset, off - region.offset, "bytes"))
+                region=_BufferRegion(region.offset, off - region.offset, "bytes"),
+                _budget=budget)
             truncated |= prefix["truncated"]
             return prefix["covered"] and not prefix["truncated"]
 
@@ -2131,6 +2163,8 @@ class TaintEngine:
                 return term
             # Subtract the whole POSSIBLE write, not its requested count as
             # initialized bytes. All untouched NULs keep their initialized prefix.
+            # Subtraction can split each input interval into two output slots.
+            budget.take(1 + 2 * len(term.nuls))
             nuls: list[tuple[int, int]] = []
             for lo, hi in term.nuls:
                 if lo < off:
@@ -2148,6 +2182,9 @@ class TaintEngine:
                 return right
             if right is None:
                 return left
+            count = len(left.nuls) + len(right.nuls)
+            # Reserve interval storage and the sort's comparison work first.
+            budget.take(1 + count * (1 + count.bit_length()))
             ends = [e for e in (left.end, right.end) if e is not None]
             intervals: list[tuple[int, int]] = []
             for lo, hi in sorted((*left.nuls, *right.nuls)):
@@ -2181,19 +2218,19 @@ class TaintEngine:
                 else:
                     return proofs
                 writers.append(("opaque", defn, callee, why))
-                return frozenset(_BufferProof(p.initialized) for p in proofs)
+                return frozenset(_proof(p.initialized) for p in proofs)
             if not yes and not maybe:
                 return proofs
             outs = self._model_out_arg_indices(model)
             if model_is_benign_marker(model):
                 # A benign taint model is not a no-write promise.
                 writers.append(("benign", defn, callee))
-                return frozenset(_BufferProof(p.initialized) for p in proofs)
+                return frozenset(_proof(p.initialized) for p in proofs)
             if any(i in maybe and _write_width(model, params, i) != 0 for i in outs):
                 writers.append(("opaque", defn, callee,
                                 "writes through a pointer argument the walk cannot "
                                 "resolve (it may alias the escaped address of)"))
-                return frozenset(_BufferProof(p.initialized) for p in proofs)
+                return frozenset(_proof(p.initialized) for p in proofs)
             hit = [i for i in outs if i in yes and _write_width(model, params, i) != 0]
             if not hit:
                 return proofs
@@ -2203,6 +2240,7 @@ class TaintEngine:
             byte_covers = False
             new_term = None
             for rule in model.get("initializes") or []:
+                budget.take()
                 if rule["arg"] not in hit:
                     continue
                 off = self._must_offset(ssaf, params[rule["arg"]], base_key)
@@ -2238,6 +2276,7 @@ class TaintEngine:
                             off + nul, ((off + nul, off + nul + 1),)))
             updated: set[_BufferProof] = set()
             for proof in proofs:
+                budget.take()
                 term = proof.term
                 if model.get("preserves_cstring") is True:
                     # Appends retain termination, not the old terminator's position.
@@ -2246,7 +2285,7 @@ class TaintEngine:
                     for i in hit:
                         term = _after_write(self._must_offset(ssaf, params[i], base_key),
                                             _write_width(model, params, i), term)
-                updated.add(_BufferProof(proof.initialized or byte_covers, _merge_terms(term, new_term)))
+                updated.add(_proof(proof.initialized or byte_covers, _merge_terms(term, new_term)))
             return frozenset(updated)
 
         def _fill_provenance(defn: Any, mkey: str, params: list[Any],
@@ -2296,15 +2335,17 @@ class TaintEngine:
                     or _cstring_prefix(defn, off)):
                 lo = max(off, region.offset)
                 new_term = _StringTermination(lo, ((lo, off + width),))
-            return frozenset(_BufferProof(
-                p.initialized or byte_covers,
-                _merge_terms(p.term if zero else _after_write(off, width, p.term), new_term))
-                for p in proofs)
+            updated: set[_BufferProof] = set()
+            for p in proofs:
+                budget.take()
+                term = p.term if zero else _after_write(off, width, p.term)
+                updated.add(_proof(p.initialized or byte_covers, _merge_terms(term, new_term)))
+            return frozenset(updated)
 
         def rec(v: Any, depth: int) -> tuple[frozenset[_BufferProof], bool]:
             """Per-path initialization alternatives and escape state at epoch v."""
             nonlocal truncated, backedge
-            unknown = (frozenset({_BufferProof()}), False)
+            budget.take()
             try:
                 v = int(v)
             except (TypeError, ValueError):
@@ -2316,11 +2357,10 @@ class TaintEngine:
                 backedge = True
                 # Neutral for coverage, but not an invented exact terminator
                 # that a loop-body write could use to survive its own clobber.
-                neutral = _BufferProof(not strings, _StringTermination() if strings else None)
+                neutral = _proof(not strings, _StringTermination() if strings else None)
                 return frozenset({neutral}), False
             if depth > MEM_CHAIN_BUDGET:
-                truncated = True
-                return unknown
+                raise _MemoryChainExhausted
             memo[v] = None
             try:
                 defn = ssaf.get_ssa_memory_definition(v)
@@ -2329,9 +2369,17 @@ class TaintEngine:
             if defn is None:
                 res = unknown
             elif "MEM_PHI" in op_name(defn):
-                arms = [rec(sv, depth + 1) for sv in self._mem_phi_sources(defn)]
-                res = (frozenset(p for facts, _ in arms for p in facts),
-                       any(e for _, e in arms)) if arms else unknown
+                joined: set[_BufferProof] = set()
+                escaped = False
+                for sv in self._mem_phi_sources(defn, _budget=budget):
+                    facts, esc = rec(sv, depth + 1)
+                    escaped |= esc
+                    for p in facts:
+                        # Charge even a duplicate: hashing/union still examines
+                        # it, and each memoized PHI retains its own set of refs.
+                        budget.take(1 + (len(p.term.nuls) if p.term is not None else 0))
+                        joined.add(p)
+                res = (frozenset(joined), escaped) if joined else unknown
             else:
                 # Walk to the root first: escaped pointers affect later calls.
                 proofs, esc = rec(self._mem_in(defn), depth + 1)
@@ -2351,7 +2399,7 @@ class TaintEngine:
                             writers.append(("maybe_store", defn,
                                             "stores through a pointer the walk cannot "
                                             "resolve, which may alias"))
-                            proofs = frozenset(_BufferProof(p.initialized) for p in proofs)
+                            proofs = frozenset(_proof(p.initialized) for p in proofs)
                     val = getattr(defn, "src", None)
                     if _store_width(defn) != 0 and _alias(val, esc) != "no":
                         writers.append(("escape", defn))
@@ -2366,15 +2414,24 @@ class TaintEngine:
             memo[v] = res
             return res
 
-        proofs, _ = rec(mv, 0)
-        covered = bool(proofs) and all(p.initialized or p.term is not None for p in proofs)
-        if backedge and region.kind == "bounded_cstring" and not covered:
-            # A clobbering loop cannot assume a stable string terminator. It
-            # can still preserve a definite BYTE invariant through its backedge.
-            byte_proof = self._local_buffer_writers(
-                ssaf, base_key, mv, base_size=base_size, region=byte_region)
-            covered = byte_proof["covered"]
-            truncated |= byte_proof["truncated"]
+        try:
+            unknown = (frozenset({_proof()}), False)
+            proofs, _ = rec(mv, 0)
+            covered = bool(proofs) and all(p.initialized or p.term is not None for p in proofs)
+            if backedge and region.kind == "bounded_cstring" and not covered:
+                # A clobbering loop cannot assume a stable string terminator. It
+                # can still preserve a definite BYTE invariant through its backedge.
+                byte_proof = self._local_buffer_writers(
+                    ssaf, base_key, mv, base_size=base_size, region=byte_region,
+                    _budget=budget)
+                covered = byte_proof["covered"]
+        except _MemoryChainExhausted:
+            if _budget is not None:
+                # Abort the entire proof, not just an expensive prefix/PHI arm.
+                raise
+            proofs = frozenset()
+            covered = False
+            truncated = True
 
         end = None
         if bytes_ and region.offset is not None and region.width is not None:
@@ -6760,9 +6817,11 @@ class TaintEngine:
                     defn, label,
                     f"the memory-SSA chain from the sink back through the writers "
                     f"of local buffer {label} exceeded the walk budget "
-                    f"({MEM_CHAIN_BUDGET} versions); writers before the cut are "
-                    "missing and the slice is NOT complete -- seed closer to the "
-                    "sink or inspect the earlier writes to the buffer")
+                    f"({MEM_CHAIN_BUDGET} shared work units for memory visits, "
+                    "proof alternatives and NUL intervals, including prefix/loop "
+                    "queries); writers or coverage proofs are missing and the "
+                    "slice is NOT complete -- seed closer to the sink or inspect "
+                    "the earlier writes to the buffer")
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
             elif not res["covered"]:
                 benign = [w[2] for w in res["writers"] if w[0] == "benign"]

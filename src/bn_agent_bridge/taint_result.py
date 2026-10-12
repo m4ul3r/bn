@@ -79,7 +79,7 @@ BLOCKING_LEAF_KINDS = frozenset({
     # to walk, an unmodeled call took the buffer's address or ran after it
     # escaped to memory, a path to the sink with no writer at all (a
     # conditional fill), a writer's input the walk could not interpret, or a
-    # memory chain longer than the walk budget. The sink consumes the bytes,
+    # memory/coverage proof exceeding the walk's work allowance. The sink consumes the bytes,
     # not the pointer, so a slice that stops at the address-of is NOT complete.
     "address_of_local_unresolved",
 })
@@ -152,11 +152,10 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "sites were never followed; narrow the sink or inspect the "
                 "capped sites named in the caller_sites_truncated leaf")
     if "memory_chain" in causes:
-        # Backward-only cause: the local-buffer writer walk ran out of
-        # memory-SSA versions before reaching the function entry, so writers
-        # older than the cut are absent from the slice.
+        # Backward-only: memory traversal or path/interval proof work exhausted
+        # the shared allowance, possibly in a prefix or loop-invariant query.
         return ("the backward walk through a local buffer's writers exhausted "
-                "its memory-chain budget -- older writers were never examined; "
+                "its memory-chain budget -- writers or coverage proofs are missing; "
                 "seed closer to the sink or inspect the earlier writes named in "
                 "the address_of_local_unresolved leaf")
     return "depth/recursion cutoff"

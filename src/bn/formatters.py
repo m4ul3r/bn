@@ -4179,13 +4179,12 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
         parts.append("caller-site cap reached (not every caller was followed; "
                      "see the caller_sites_truncated frontier)")
     if "memory_chain" in causes:
-        # Backward-only: the local-buffer writer walk ran out of memory-SSA
-        # versions before the function entry; the cut is named by the
-        # address_of_local_unresolved leaf (PR-928 round 3 P3).
+        # Backward-only: traversal or proof alternatives/intervals exhausted
+        # the shared work allowance; the blocking leaf names the cut.
         parts.append("memory-chain budget exhausted while walking a local "
-                     "buffer's writers (older writers were never examined; seed "
-                     "closer to the sink -- see the address_of_local_unresolved "
-                     "frontier)")
+                     "buffer's writers (writers or coverage proofs are missing; "
+                     "seed closer to the sink -- see the "
+                     "address_of_local_unresolved frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)

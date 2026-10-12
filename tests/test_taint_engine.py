@@ -11442,3 +11442,92 @@ def test_backward_may_alias_writer_is_retained_unless_zero_effect_933(operation,
     assert result["diagnostics"]["safe_to_report_complete_slice"] is (count == 0)
     assert any(step["address"] == hex(writer.address)
                for sl in result["slices"] for step in sl["slice"]) is (count != 0)
+
+
+@pytest.mark.parametrize("kind", ["cstring", "bounded_cstring"])
+@pytest.mark.parametrize("branches,complete", [(2, True), (10, False)])
+def test_backward_shallow_phi_work_is_bounded_931(monkeypatch, kind, branches, complete):
+    # Every branch may remove a different NUL interval; byte zero survives all
+    # paths. Depth is small, but materializing every interval subset is not.
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    for i in range(branches):
+        bypass = pg.mem
+        pg.call(_B_READ, [_region_const(0), _region_addr(buf, 2 * i + 1), _region_const(1)])
+        pg.phi(bypass, pg.mem)
+    assert pg.mem < te.MEM_CHAIN_BUDGET
+    pg.call(_B_POPEN, [_addr_of(buf), _region_const(64)])
+    fn = pg.func()
+    counts = {"proofs": 0, "proof_slots": 0, "term_slots": 0, "definitions": 0}
+    proof_type, term_type = te._BufferProof, te._StringTermination
+    get_definition = fn.mlil.ssa_form.get_ssa_memory_definition
+
+    def proof(*args, **kwargs):
+        result = proof_type(*args, **kwargs)
+        counts["proofs"] += 1
+        counts["proof_slots"] += len(result.term.nuls) if result.term is not None else 0
+        return result
+
+    def term(*args, **kwargs):
+        result = term_type(*args, **kwargs)
+        counts["term_slots"] += len(result.nuls)
+        return result
+
+    def definition(version):
+        counts["definitions"] += 1
+        return get_definition(version)
+
+    monkeypatch.setattr(te, "_BufferProof", proof)
+    monkeypatch.setattr(te, "_StringTermination", term)
+    monkeypatch.setattr(fn.mlil.ssa_form, "get_ssa_memory_definition", definition)
+    rule = {"arg": 0, "kind": kind, **({"len_arg": 1} if kind == "bounded_cstring" else {})}
+    models = te.load_models(extra={"popen": {"consumes": [rule]}})
+    result = te.TaintEngine(FBV(_B_NAMES), models).backward(fn, [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert result["stats"]["truncated"] is (not complete)
+    # Count actual constructed objects/slots, not elapsed time or heap totals.
+    assert counts["proofs"] + counts["proof_slots"] <= te.MEM_CHAIN_BUDGET
+    assert counts["term_slots"] <= 2 * te.MEM_CHAIN_BUDGET
+    assert counts["definitions"] <= te.MEM_CHAIN_BUDGET
+    if complete:
+        assert result["leaves"] == []
+    else:
+        assert result["stats"]["truncation_cause"] == ["memory_chain"]
+        assert any(l["kind"] == "address_of_local_unresolved" for l in result["leaves"])
+
+
+@pytest.mark.parametrize("stores,complete", [(2, True), (18, False)])
+def test_backward_prefix_queries_share_memory_work_allowance_931(stores, complete):
+    # Each suffix NUL asks about the initialized prefix at its INPUT epoch.
+    # Separately bounded queries would repeat quadratic work on this short chain.
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(64)])
+    for i in range(stores):
+        pg.aliased_store(buf, i + 1, 0).size = 1
+    assert pg.mem < te.MEM_CHAIN_BUDGET
+    pg.sink(buf, folded=True)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert result["stats"]["truncated"] is (not complete)
+    if not complete:
+        assert result["stats"]["truncation_cause"] == ["memory_chain"]
+        assert any(l["kind"] == "address_of_local_unresolved" for l in result["leaves"])
+
+
+@pytest.mark.parametrize("budget,complete", [(24, False), (256, True)])
+def test_backward_loop_invariant_shares_memory_work_allowance_931(monkeypatch, budget, complete):
+    # The first pass cannot assume a terminator across the clobbering backedge.
+    # Its byte-invariant retry must use what remains, not a fresh allowance.
+    monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", budget)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(4)])
+    pg.phi(pg.mem, pg.mem + 2)
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(1)])
+    pg.call(_B_POPEN, [_addr_of(buf), _region_const(4)])
+    models = te.load_models(extra={"popen": {
+        "consumes": [{"arg": 0, "kind": "bounded_cstring", "len_arg": 1}]}})
+    result = te.TaintEngine(FBV(_B_NAMES), models).backward(pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert result["stats"]["truncated"] is (not complete)
+    if not complete:
+        assert result["stats"]["truncation_cause"] == ["memory_chain"]
