@@ -123,6 +123,8 @@ def test_symbol_rename_invalid_name_refuses_raw_and_batch_before_writes(
         )
     assert exc.value.status == "invalid_request"
     assert exc.value.requested["new_name"] == bad_name
+    if batch:
+        assert "operation 1 " in exc.value.message
     assert fn.name == "parse_record"
     assert fn.comment == ""
     assert bv.events == []  # No transaction, analysis, commit, or revert.

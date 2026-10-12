@@ -1832,6 +1832,7 @@ def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = 
         # Validate the entire batch before any sibling can write (#923).
         _require_nonempty_name(
             op["new_name"], requested=_operation_requested(ctx, op), reject_controls=True,
+            label=f"{where}{kind!r} new name",
         )
     return kind
 
