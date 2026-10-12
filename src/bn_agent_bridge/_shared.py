@@ -420,15 +420,25 @@ def _validate_bool(value: Any, *, label: str, default: bool) -> bool:
 
 
 def _require_nonempty_name(value: Any, *, label: str = "new name",
-                           requested: dict[str, Any] | None = None) -> str:
+                           requested: dict[str, Any] | None = None,
+                           reject_controls: bool = False) -> str:
     """Reject an empty/whitespace-only/null name before any view mutation.
 
     A JSON ``null`` must not ``str()`` into the literal "None" and slip the
     emptiness check, and an empty name leaves a degenerate unnamed
-    function/local/field that then "verifies" against itself (#363/#605)."""
+    function/local/field that then "verifies" against itself (#363/#605).
+    Symbol renames additionally reject Unicode Cc controls (C0, DEL, C1);
+    local/field callers retain their emptiness-only policy. Printable quotes
+    and other punctuation are not controls or empty input (#923).
+    """
     if value is None or not str(value).strip():
         raise OperationFailure("invalid_request", f"{label} must be non-empty", requested=requested)
-    return str(value)
+    name = str(value)
+    if reject_controls and any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in name):
+        raise OperationFailure(
+            "invalid_request", f"{label} must not contain control characters", requested=requested,
+        )
+    return name
 
 
 def _run_on_main_thread(func):

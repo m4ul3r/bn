@@ -1768,13 +1768,13 @@ def _suggest_field(provided: Any, missing: str) -> str | None:
 
 
 def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = None) -> str:
-    """Validate one manifest op's SHAPE and return its kind.
+    """Validate one manifest op's shape and symbol name, and return its kind.
 
     Split out of ``_apply_operation`` so a batch can check EVERY op before
     applying ANY (#650): the batch is atomic, so a typo in op 13 used to roll back
     12 good ops. Covers a missing/unknown op kind (with a did-you-mean), missing
     required fields (with a did-you-mean drawn from the keys actually provided),
-    the one-of locator groups, and the enum-valued fields.
+    the one-of locator groups, enum-valued fields, and symbol-name validity.
     """
     where = f"operation {index} " if index is not None else "operation "
     # A missing `op` key must be its own invalid_request, NOT silently assumed
@@ -1828,6 +1828,11 @@ def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = 
                 f"{' / '.join(repr(v) for v in allowed)}, got {str(op[field])!r}",
                 requested=_operation_requested(ctx, op),
             )
+    if kind == "rename_symbol":
+        # Validate the entire batch before any sibling can write (#923).
+        _require_nonempty_name(
+            op["new_name"], requested=_operation_requested(ctx, op), reject_controls=True,
+        )
     return kind
 
 
@@ -2693,13 +2698,11 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
 def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     kind = str(op.get("kind", "auto"))
     identifier = op["identifier"]
-    # Reject a degenerate empty/whitespace/null name before touching the view: BN
-    # accepts `fn.name = ""` and leaves the function unnamed, which then "verifies"
-    # against itself (#363). Inspect the RAW value first -- a JSON `null` would
-    # otherwise `str()` to the literal "None" and slip the emptiness check. Done
-    # here (not just CLI-side) so batch/raw callers are covered too; pre-resolution
-    # so no view state is modified on rejection.
-    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
+    # Keep the guard on direct handler calls as well as batch preflight (#923).
+    # Reject before resolution or writes, without stripping or banning quotes.
+    new_name = _require_nonempty_name(
+        op["new_name"], requested=_operation_requested(ctx, op), reject_controls=True,
+    )
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
     if target["kind"] == "function":

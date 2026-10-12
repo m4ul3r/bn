@@ -78,6 +78,70 @@ def test_op_rename_symbol_rejects_empty_new_name(monkeypatch, bad_name):
     assert "non-empty" in excinfo.value.message
 
 
+@pytest.mark.parametrize("control", ["\0", "\t", "\n", "\r", "\x1b", "\x1f", "\x7f", "\x80", "\x85", "\x9f"])
+@pytest.mark.parametrize("kind", ["function", "data"])
+def test_symbol_rename_control_name_refused_before_resolution(monkeypatch, control, kind):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+
+    def unexpected_resolution(*args):
+        pytest.fail("invalid symbol name reached target resolution")
+
+    monkeypatch.setattr(instance.ctx, "_resolve_rename_target", unexpected_resolution)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_rename_symbol(bv, {
+            "op": "rename_symbol", "kind": kind, "identifier": hex(fn.start),
+            "new_name": f"bad{control}name",
+        })
+    assert exc.value.status == "invalid_request"
+    assert fn.name == "parse_record"
+    assert bv.events == []
+
+
+@pytest.mark.parametrize("bad_name", ["", "   ", None, "bad\nname", "bad\0name", "bad\x7fname", "bad\x9fname"])
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("preview", [False, True])
+def test_symbol_rename_invalid_name_refuses_raw_and_batch_before_writes(
+    monkeypatch, bad_name, batch, preview,
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    rename = {"op": "rename_symbol", "identifier": hex(fn.start), "new_name": bad_name}
+    # A valid earlier sibling must not apply even temporarily.
+    params = {"ops": [
+        {"op": "set_comment", "function": hex(fn.start), "comment": "must not land"},
+        rename,
+    ]} if batch else rename
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._dispatch_on_main(
+            "batch_apply" if batch else "rename_symbol", {**params, "preview": preview}, "fixture",
+        )
+    assert exc.value.status == "invalid_request"
+    assert exc.value.requested["new_name"] == bad_name
+    assert fn.name == "parse_record"
+    assert fn.comment == ""
+    assert bv.events == []  # No transaction, analysis, commit, or revert.
+
+
+@pytest.mark.parametrize("name", ["''", '""', "operator[]", "ns::parse_record", "café", "two words"])
+def test_symbol_rename_preserves_printable_quotes_and_punctuation(monkeypatch, name):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_record")
+    bv = _FakeBV(functions=[fn])
+    op = {"op": "rename_symbol", "identifier": hex(fn.start), "new_name": name}
+    result = instance._apply_operation(bv, op)
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["name"] == name
+    assert fn.name == name
+
+
 def test_mutation_refused_on_quick_view_before_any_analysis(monkeypatch):
     """#479 (sibling): every write op except function_create routes through
     _mutation, whose success/revert paths call update_analysis_and_wait(). On a
