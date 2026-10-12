@@ -11,6 +11,7 @@ import time
 import types
 import weakref
 from collections.abc import Mapping
+from enum import IntEnum
 from pathlib import Path
 
 import pytest
@@ -916,6 +917,40 @@ def test_struct_assist_ignores_layout_alias_but_not_distinct_matching_struct():
     assert len(read_decompile._struct_layout_warnings(bv, fn)) == 1
     bv.types["other_cfg"] = _struct_assist_layout("other_cfg")
     assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("other_layout", [False, True], ids=["sole-layout", "ambiguous"])
+def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(other_layout):
+    class TypeClass(IntEnum):
+        IntegerTypeClass = 2
+        NamedTypeReferenceClass = 11
+
+    def reference(name: str, width: int) -> _FakeType:
+        alias = _FakeType(name, width=width, type_class=TypeClass.NamedTypeReferenceClass)
+        alias.target = lambda view: view.types.get(name)
+        return alias
+
+    bv, fn, _, _ = _struct_assist_case()
+    if not other_layout:
+        bv.types.clear()
+    # Model two member typedef hops through the view's registered type table,
+    # with numeric enums rather than permissive string-only type classes.
+    bv.types["word_t"] = _FakeType(
+        "unsigned long long", width=8, type_class=TypeClass.IntegerTypeClass)
+    bv.types["flags_t"] = reference("word_t", 8)
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = reference("flags_t", 8)
+    bv.types["wrapped_cfg"] = wrapped
+    # A whole-struct alias must not create another concrete candidate.
+    bv.types["wrapped_alias"] = reference("wrapped_cfg", wrapped.width)
+
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    if other_layout:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in warnings[0]
 
 
 @pytest.mark.parametrize("case", [

@@ -24,8 +24,8 @@ Outbound calls resolve through:
   * ``_shared`` -- module-free helpers (``_parse_address``, ``OperationFailure``).
 
 Import direction is one-way: this module imports ``il_format``, ``vars``,
-``taint_engine``, and ``_shared`` (plus stdlib + binaryninja). It NEVER imports
-``bridge`` or ``seam`` -- those import THIS module one-way (design spec §3.2).
+``taint_engine``, ``read_types``, and ``_shared`` (plus stdlib + binaryninja).
+It NEVER imports ``bridge`` or ``seam`` -- those import THIS module one-way.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
+from . import read_types
 from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
@@ -361,9 +362,10 @@ def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, 
 def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     """Evidence-qualified known-layout assistance; never writes a type (#903).
 
-    Match complete scalar members of concrete, non-inherited structs. Aliases
-    do not add candidates (their concrete declarations are already in bv.types).
-    Matching two distinct offsets is a minimum witness, not proof of identity.
+    Match complete scalar members of concrete, non-inherited structs, resolving
+    member typedefs first. Whole-struct aliases do not add candidates (their
+    concrete declarations are already in bv.types). Matching two distinct
+    offsets is a minimum witness, not proof of identity.
     """
     accesses = _untyped_pointer_accesses(func)
     if not accesses:
@@ -381,8 +383,10 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
             if offset < end or width <= 0:
                 break  # overlapping/incomplete layouts are not a unique witness
             end = offset + width
-            if (member.name and not getattr(member, "bit_width", 0)
-                    and _enum_name(member.type.type_class) in {
+            _, member_type, follow_error = read_types._follow_typedef(
+                bv, str(member.name), member.type)
+            if (follow_error is None and member.name and not getattr(member, "bit_width", 0)
+                    and _enum_name(member_type.type_class) in {
                         "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
                         "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
                     }):

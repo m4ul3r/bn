@@ -3271,3 +3271,29 @@ class TestStructLayoutAssistance903:
             "struct other_cfg { char pad[40]; uint64_t mode; uint32_t count; };")
         ambiguous = shared_bn.json("decompile", "handle")
         assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+
+        # A typedef on a scalar member must neither hide a compatible layout
+        # nor make a distinct, direct-scalar layout appear uniquely compatible.
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('cfg')\n"
+            "bv.undefine_user_type('other_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        shared_bn.json(
+            "types", "declare",
+            "typedef unsigned long long word_t; "
+            "struct wrapped_cfg { char pad[40]; word_t flags; unsigned int depth; }; "
+            "typedef struct wrapped_cfg wrapped_alias;")
+        wrapped = shared_bn.json("decompile", "handle")
+        hints = [w for w in wrapped["warnings"] if "struct layout candidate" in w]
+        assert len(hints) == 1, wrapped
+        for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in hints[0]
+        assert shared_bn.json("proto", "get", "handle") == before
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+        assert shared_bn.json("proto", "get", "handle") == before
