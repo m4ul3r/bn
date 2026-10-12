@@ -9803,6 +9803,52 @@ def test_backward_covered_memory_phi_arms_stay_complete_928():
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("writer", ["memset", "strcpy"])
+@pytest.mark.parametrize("filled_entry", [False, True])
+def test_backward_loop_exit_preserves_entry_path_950(reverse, writer, filled_entry):
+    # Header = phi(entry, backedge); exit = phi(fill, backedge). The filled
+    # exit visits the header while active, but must not publish its optimistic
+    # backedge descendants for the exit's other arm.
+    buf, other, pg = FVar("buf", typ="char[64]"), FVar("other", typ="char[64]"), _BufProgram()
+    if filled_entry:
+        pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    entry = pg.mem
+    header = pg.phi(entry, entry + 3)
+    if writer == "memset":
+        pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    else:
+        pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    fill = pg.mem
+    backedge = pg.call(_B_STRCPY, [_addr_of(other), _cstr(0x700)])
+    backedge.src_memory = header.dest_memory
+    arms = (fill, pg.mem)
+    pg.phi(*(reversed(arms) if reverse else arms))
+    pg.sink(buf)
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is filled_entry
+    assert bool(aol) is (not filled_entry)
+    assert any(f"written by {writer}" in r for r in reasons)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_backward_cyclic_revisits_share_bounded_work_950(monkeypatch, reverse):
+    monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", 16)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    header = pg.phi(0, 3)
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    backedge = pg.call(_B_STRCPY, [_addr_of(FVar("other")), _cstr(0x700)])
+    backedge.src_memory = header.dest_memory
+    pg.phi(*((3, 2) if reverse else (2, 3)))
+    pg.sink(buf)
+    result, _, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["memory_chain"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol and "walk budget" in aol[0]["detail"]
+
+
 def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
     # Astra P1 (budget): an opaque fill, hundreds of unrelated memory
     # definitions, then a one-byte constant store next to the sink -- the walk

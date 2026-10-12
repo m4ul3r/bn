@@ -40,6 +40,7 @@ brittle across compilers/optimisation.
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
 | `bw_regions.c`        | #931/#933: zero/short/full-request reads, suffix/indexed rows and append-only buffers remain incomplete; initialized struct-member strings and exact byte ranges are covered without requiring unrelated fields. `bw_regions_o1.c` / `bw_regions_o2.c` rebuild at -O1/-O2 |
 | `strtok_fixpoint.c`   | #932: two-entry/two-back-edge tokenizer CFG with two unused-return initializers; the NULL continuation reaches `system` even when IL enumerates it first. O0/O1/O2 variants share the source |
+| `loop_exit.c`        | #950: exact synthetic -O1 loop with filled/unwritten exits in both source orders; cyclic memory-PHI memoization must retain an unresolved entry path |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -71,6 +72,14 @@ those cases retain explicit frontier and completeness assertions without
 pinning one path. Overlapping nonzero reads and copy/member cases still check
 their source/parameter origins. `string_not_full_bytes` must remain incomplete:
 `snprintf`'s capacity is not the number of bytes it initializes.
+
+`loop_exit` is compiled with `-O1 -fno-inline`, using the exact issue #950
+source. It is analyzed only: do not execute its intentionally uninitialized
+`popen` arguments. Compiler-dependent IL coverage is complemented by deterministic
+memory-SSA tests for both exit-arm orders, `memset`/`strcpy` writers, initialized
+entry controls, and shared-budget exhaustion. Cyclic results that consulted a
+neutral backedge are not cached for other exit arms; revisits remain bounded
+by the same proof allowance. This does not claim arbitrary loop induction.
 
 ## `EXPECTED.json` schema
 

@@ -2082,8 +2082,9 @@ class TaintEngine:
         return-dependent writes and unannotated models prove no coverage.
         A memory-phi is covered only when every arm is. Bounded strings retain
         the string-or-bytes alternative per arm, including across later writes.
-        Loop backedges are neutral, but cannot invent a terminator location;
-        byte initialization can independently establish a loop invariant.
+        Loop backedges are neutral only within the active traversal; results
+        depending on them are not cached for another PHI arm. They cannot invent
+        a terminator location; byte initialization can establish a loop invariant.
         ``truncated`` is True when the shared ``MEM_CHAIN_BUDGET`` allowance
         for visits, proof alternatives and interval work/storage is exhausted.
         Prefix and loop-invariant queries spend the SAME allowance.
@@ -2105,6 +2106,7 @@ class TaintEngine:
         truncated = False
         budget = _budget if _budget is not None else _MemoryChainBudget()
         backedge = False
+        cycle_reads = 0
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
         escape_addrs: set[int] = set()
@@ -2344,7 +2346,7 @@ class TaintEngine:
 
         def rec(v: Any, depth: int) -> tuple[frozenset[_BufferProof], bool]:
             """Per-path initialization alternatives and escape state at epoch v."""
-            nonlocal truncated, backedge
+            nonlocal truncated, backedge, cycle_reads
             budget.take()
             try:
                 v = int(v)
@@ -2355,6 +2357,7 @@ class TaintEngine:
                 if m is not None:
                     return m
                 backedge = True
+                cycle_reads += 1
                 # Neutral for coverage, but not an invented exact terminator
                 # that a loop-body write could use to survive its own clobber.
                 neutral = _proof(not strings, _StringTermination() if strings else None)
@@ -2362,6 +2365,7 @@ class TaintEngine:
             if depth > MEM_CHAIN_BUDGET:
                 raise _MemoryChainExhausted
             memo[v] = None
+            cycle_start = cycle_reads
             try:
                 defn = ssaf.get_ssa_memory_definition(v)
             except Exception:
@@ -2411,7 +2415,14 @@ class TaintEngine:
                 elif self._is_call(defn):
                     proofs = _call_writer(defn, esc, proofs)
                 res = (proofs, esc)
-            memo[v] = res
+            # A neutral backedge is an assumption about THIS active traversal,
+            # not a final fact at v. Reusing a descendant computed under it can
+            # omit the loop header's entry arm at a later exit PHI (#950).
+            # Retain only cycle-independent results; retries share the budget.
+            if cycle_reads == cycle_start:
+                memo[v] = res
+            else:
+                del memo[v]
             return res
 
         try:
