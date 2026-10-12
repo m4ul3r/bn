@@ -2476,6 +2476,59 @@ def test_selector_falls_back_to_target_id_for_identical_paths(monkeypatch):
     bridge._headless_views.clear()
 
 
+@pytest.mark.parametrize("paths", [
+    ["/samples/runtime/demo", "/samples/runtime/demo.bndb", "/samples/copy/demo"],
+    ["/samples/left/demo.bndb", "/samples/right/demo.bndb"],
+    ["/samples/demo", "/cache/demo.0123456789abcdef.bndb"],
+    ["/samples/demo.bndb", "/samples/demo.bndb"],
+    ["/samples/active", "/samples/other"],
+    ["active", "   ", ""],
+    ["/samples/other", "/samples/1"],
+    ["/samples/demo ", "/samples/demo"],
+])
+def test_listed_selectors_round_trip_through_resolution(monkeypatch, paths):
+    """#919: every advertised selector must survive the resolver's aliases."""
+    bridge = _load_bridge(monkeypatch)
+    views = [_FakeFileBV(path, session_id=str(i)) for i, path in enumerate(paths)]
+    _register_views(bridge, *views)
+    manager = bridge.TargetManager()
+    try:
+        rows = manager.refresh()
+        for row, view in zip(rows, views, strict=True):
+            assert manager.resolve(row["selector"]) is view
+            assert manager.resolve(row["target_id"]) is view
+    finally:
+        bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("suffix", ["", ".bndb", ".0123456789abcdef.bndb"])
+def test_target_id_fallback_outranks_id_like_filename_aliases(monkeypatch, suffix):
+    bridge = _load_bridge(monkeypatch)
+    alpha = _FakeFileBV("/samples/demo", session_id="1")
+    database = _FakeFileBV("/samples/demo.bndb", session_id="2")
+    _register_views(bridge, alpha, database)
+    manager = bridge.TargetManager()
+    alpha_id = manager.refresh()[0]["target_id"]
+    named_like_id = _FakeFileBV(f"/samples/{alpha_id}{suffix}", session_id="3")
+    _register_views(bridge, alpha, database, named_like_id)
+    try:
+        rows = manager.refresh()
+        assert rows[0]["selector"] == alpha_id  # raw path collides at every depth
+        for row, view in zip(rows, [alpha, database, named_like_id], strict=True):
+            assert manager.resolve(row["selector"]) is view
+            assert manager.resolve(row["target_id"]) is view
+        assert manager.matches_target(alpha_id, alpha_id)
+        assert not manager.matches_target(rows[2]["target_id"], alpha_id)
+        assert manager.resolve(bridge.PinnedTarget(alpha_id)) is alpha
+
+        # An internal pin must not acquire human alias semantics after close.
+        _register_views(bridge, named_like_id)
+        with pytest.raises(RuntimeError, match="Unknown target selector"):
+            manager.resolve(bridge.PinnedTarget(alpha_id))
+    finally:
+        bridge._headless_views.clear()
+
+
 def test_refresh_rows_carry_analysis_state(monkeypatch):
     # target list rows must expose per-target analysis state so an agent can tell
     # a --quick view from a full one without a separate target info per target.
