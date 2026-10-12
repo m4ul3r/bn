@@ -1,8 +1,9 @@
 """Mutable view-tracking module globals shared across the bridge.
 
-These three globals track headless-loaded BinaryViews and the subset loaded
-with ``--quick`` (analysis not yet run). They were hoisted out of ``bridge.py``
-into this neutral module so that read-op domain modules (e.g. ``read_misc``,
+These globals track headless-loaded BinaryViews, the subset loaded with
+``--quick`` (analysis not yet run), and per-view load-time verdicts. They were
+hoisted out of ``bridge.py`` into this neutral module so that read-op domain
+modules (e.g. ``read_misc``,
 which reads ``_quick_loaded_views``) can consult them WITHOUT importing
 ``bridge.py`` (which would create an import cycle).
 
@@ -30,6 +31,31 @@ _quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 # on a raw-only image will not recover a format view, so these are reported as
 # `analysis_state="unanalyzed"` rather than "quick". Weak so closed views drop out.
 _unanalyzed_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
+# File session id (`bv.file.session_id`, see `view_session_key`) -> whether the
+# database the view was restored from was VERIFIED against the raw file's
+# content at load (True), or restored UNVERIFIED (False: no record and its
+# stored bytes could not vouch for it; or an explicitly named .bndb whose record
+# names other bytes than its sibling raw file now holds). Absent for a view no
+# database was judged for (a raw load, a database with nothing to judge it
+# against), so `target list`/`target info` publish null there. The load note is
+# one-shot; this is what a later `target info` answers from.
+#
+# Keyed on the session id, NOT the wrapper: in GUI mode a tab reaches the
+# already-open judge in `_load_binary` as a fresh, handle-equal wrapper that
+# dies when the call returns, so a weak-keyed entry on it was gone by the next
+# `target list`. A plain dict that `TargetManager.refresh()` prunes to the open
+# set (on a complete snapshot) outlives any wrapper and drops closed views.
+_source_verified: dict[str, bool] = {}
+
+
+def view_session_key(bv: Any) -> str:
+    """The key `_source_verified` and the target rows share for *bv*: BN's
+    file session id, which every wrapper of one open file reports alike; the
+    wrapper's own identity when the view has none (a fake, a dead handle)."""
+    try:
+        return str(bv.file.session_id)
+    except Exception:  # noqa: BLE001 - no file / no session id: fall back to identity
+        return str(id(bv))
 
 
 def require_analysis(bv: Any, what: str = "This operation") -> None:

@@ -39,7 +39,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import mutation_engine
 from . import read_misc
-from .bridge_state import require_analysis
+from .bridge_state import _quick_loaded_views
 from ._shared import (
     OperationFailure,
     _parse_address,
@@ -97,45 +97,502 @@ def _remove_created_function(ctx, bv, addr: int) -> bool:
     return bv.get_function_at(addr) is None
 
 
-def _containing_function_rows(bv, addr: int) -> list[dict[str, str]]:
+def _instruction_boundary(bv, fn, addr: int) -> bool | None:
+    """Whether *addr* starts an instruction of *fn*'s block, or None if unknowable.
+
+    Which of BN's two outcomes a create INSIDE a function gets (verified on
+    BN 6.1, #927 review): at an instruction boundary BN truncates the host at
+    the new start; at a mid-instruction address it leaves the host intact and
+    adds an overlapping function that decodes a different instruction stream
+    from the same bytes -- the shape of a mistyped address. Walked from the
+    containing block's start with BN's own instruction lengths, so a
+    fixed-width ISA and a variable-length one are judged the same way.
+    """
+    try:
+        block = fn.get_basic_block_at(addr)
+        if block is None:
+            return None
+        arch = getattr(block, "arch", None)
+        cursor = int(block.start)
+        while cursor < addr:
+            length = int(bv.get_instruction_length(cursor, arch) if arch is not None
+                         else bv.get_instruction_length(cursor))
+            if length <= 0:
+                return None
+            cursor += length
+        return cursor == addr
+    except Exception:  # noqa: BLE001 - an unanswerable probe is "unknown", not a verdict
+        return None
+
+
+def _containing_function_rows(bv, addr: int, *, requested: dict) -> list[dict[str, Any]]:
     """Functions that already CONTAIN *addr*, excluding one starting there.
 
     Read before a create, because afterwards the address is itself a
-    function start and `get_functions_containing` reports the new one. A
-    view that cannot answer discloses nothing rather than guessing (#675
-    item 14).
+    function start and `get_functions_containing` reports the new one. Each
+    row names the host, its start, how far into it the address lies and
+    whether the address is an instruction boundary there -- the facts a
+    caller needs to tell a mistyped address from a deliberate split.
+
+    This is the evidence a GUARD acts on, so a view that cannot answer is
+    refused (`internal_error`), not waved through: the #675 disclosure could
+    afford to say nothing, but a guard that fails open lets the exact harm it
+    exists to stop -- a silent truncation -- through on the one view where
+    nobody can see it coming.
     """
     try:
-        return [
-            {"name": str(fn.name), "address": hex(int(fn.start))}
-            for fn in (bv.get_functions_containing(addr) or [])
-            if int(getattr(fn, "start", addr)) != addr
-        ]
-    except Exception:  # noqa: BLE001 - no evidence is not a claim
-        return []
+        rows = []
+        for fn in (bv.get_functions_containing(addr) or []):
+            start = int(getattr(fn, "start", addr))
+            if start == addr:
+                continue
+            row: dict[str, Any] = {
+                "name": str(fn.name),
+                "address": hex(start),
+                "offset": hex(addr - start),
+            }
+            boundary = _instruction_boundary(bv, fn, addr)
+            if boundary is not None:
+                row["instruction_boundary"] = boundary
+            rows.append(row)
+        return rows
+    except Exception as exc:  # noqa: BLE001 - fail CLOSED: no evidence is not a licence
+        raise OperationFailure(
+            "internal_error",
+            f"Could not determine whether {hex(addr)} lies inside an existing "
+            f"function ({exc!r}); refusing to create one there rather than risk "
+            f"truncating a function this probe cannot see.",
+            requested=requested,
+            observed={"address": hex(addr)},
+        ) from exc
 
 
-def _with_overlap_note(row: dict, overlapped: list[dict[str, str]]) -> dict:
+def _split_outcome(rows: list[dict[str, Any]]) -> str:
+    """What a create inside these hosts does to them, in BN's two outcomes.
+
+    ONE sentence for the refusal (standalone and batch) and the `--help` /
+    reference wording follows it: truncation at an instruction boundary, an
+    overlapping function decoding a different stream otherwise. Says which
+    when every host answers the same way, and covers both when the probe
+    could not tell or the hosts disagree.
+    """
+    verdicts = {row.get("instruction_boundary") for row in rows}
+    if verdicts == {True}:
+        return (
+            "Binary Ninja truncates the host at the new start: it keeps only "
+            "the bytes before it and the new function owns the rest."
+        )
+    if verdicts == {False}:
+        return (
+            "The address is not an instruction boundary there, so Binary Ninja "
+            "leaves the host intact and adds a second, overlapping function "
+            "that decodes a different instruction stream from the same bytes "
+            "-- the shape of a mistyped address."
+        )
+    return (
+        "Binary Ninja either truncates the host at the new start (when the "
+        "address is an instruction boundary in it) or leaves the host intact "
+        "beside a second, overlapping function decoding a different "
+        "instruction stream (when it is not)."
+    )
+
+
+def _boundary_word(row: dict[str, Any]) -> str:
+    boundary = row.get("instruction_boundary")
+    if boundary is True:
+        return "instruction boundary"
+    if boundary is False:
+        return "mid-instruction"
+    return "boundary unknown"
+
+
+def _overlap_refusal(addr: int, overlapped: list[dict[str, Any]], requested: dict,
+                     *, flag: str) -> OperationFailure:
+    """The refusal for a create INSIDE an existing function (M-03).
+
+    A forced ``create_user_function`` at an interior address does not add a
+    second function the way the #675 disclosure assumed -- not reliably: at
+    an instruction boundary BN truncates the host at the new start and the
+    new ``sub_*`` owns the rest, so a mistyped or over-trusted address
+    silently cut a user-named, user-prototyped function down to a few bytes
+    behind a clean ``committed changed=1 verified=1``; at a mid-instruction
+    address it leaves the host intact and lands an overlapping function on
+    a bogus instruction stream. The split is legitimate when BN
+    over-extended the host, so it stays reachable -- but only on request,
+    and the refusal names the host, its start, the offset and which outcome
+    this address gets, so the caller can tell which case this is. ONE
+    builder for both create paths, so the standalone command and a batch op
+    refuse in the same words; *flag* is the spelling the caller's surface
+    accepts.
+    """
+    listed = ", ".join(
+        f"{o['name']} (starts at {o['address']}, offset +{int(o['offset'], 16):#x}, "
+        f"{_boundary_word(o)})"
+        for o in overlapped
+    )
+    return OperationFailure(
+        "invalid_request",
+        f"Refused to create a function at {hex(addr)}: the address lies inside "
+        f"{listed}. {_split_outcome(overlapped)} If the host was over-extended "
+        f"by auto-analysis and that is intended, pass {flag}; the result then "
+        f"reports the overlap and what became of the host.",
+        requested=requested,
+        observed={"address": hex(addr), "overlaps": overlapped},
+    )
+
+
+def _observe_split(bv, addr: int, overlapped: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp each overlap row with what the create DID to its host.
+
+    Read after analysis: a host that no longer covers the new start was
+    truncated there; one that still covers it is intact and now overlaps the
+    new function. Observed, not predicted from the boundary probe, so the
+    row reports what happened rather than what was expected to.
+    """
+    observed = []
+    for row in overlapped:
+        row = dict(row)
+        try:
+            host = bv.get_function_at(int(row["address"], 16))
+            if host is None:
+                row["truncated"] = True
+            else:
+                covers = any(int(r.start) <= addr < int(r.end)
+                             for r in _function_ranges(host))
+                row["truncated"] = not covers
+        except Exception:  # noqa: BLE001 - leave the outcome unstamped rather than guessed
+            pass
+        observed.append(row)
+    return observed
+
+
+def _with_overlap_note(row: dict, overlapped: list[dict[str, Any]]) -> dict:
     """Add the overlap disclosure to a create row, if there is one.
 
     ONE builder for both create paths, so the two cannot state the same
     fact differently -- the same reason the duplicate-start note is shared
-    across its three surfaces.
+    across its three surfaces. Only an ``allow_overlap`` create reaches
+    this with a non-empty list; the default refuses first. A row already
+    stamped by ``_observe_split`` says what happened to the host; an
+    unstamped one (a deferred batch create, before its analysis) says what
+    can happen.
     """
     if not overlapped:
         return row
-    listed = ", ".join(f"{o['name']} @ {o['address']}" for o in overlapped)
+    fates = []
+    for o in overlapped:
+        where = f"{o['name']} @ {o['address']}"
+        truncated = o.get("truncated")
+        if truncated is True:
+            fates.append(f"{where} was truncated at {row.get('address', '<unknown>')} "
+                         f"(it keeps only the bytes before the new start)")
+        elif truncated is False:
+            fates.append(f"{where} is intact and now overlaps the new function, "
+                         f"which decodes a different instruction stream from the "
+                         f"same bytes")
+        else:
+            fates.append(f"{where} is either truncated at the new start or left "
+                         f"intact beside an overlapping function")
     row = dict(row)
     row["overlaps"] = overlapped
     row["note"] = (
-        f"this address is inside {listed}, so the view now has two "
-        f"overlapping functions; that is legitimate when BN over-extended "
-        f"the neighbour, and a mistake if the address was wrong"
+        f"this address is inside an existing function: {'; '.join(fates)}; "
+        f"that is legitimate when BN over-extended the neighbour, and a "
+        f"mistake if the address was wrong"
     )
     return row
 
 
-def _function_create(ctx, selector: str | None, address, preview: bool, *, exclusive=None):
+def _function_ranges(fn) -> list:
+    ranges = getattr(fn, "address_ranges", None)
+    return list(ranges) if ranges is not None else []
+
+
+def _range_pairs(fn) -> tuple[tuple[int, int], ...]:
+    """The half-open ranges *fn* covers, comparable across reads."""
+    return tuple(sorted((int(r.start), int(r.end)) for r in _function_ranges(fn)))
+
+
+def _function_starts_within(bv, ranges) -> set[int]:
+    """Function starts inside *ranges*, walked with BN's own next-start index
+    so the cost is the functions there, not every function in the view."""
+    starts: set[int] = set()
+    walk = getattr(bv, "get_next_function_start_after", None)
+    if walk is None:
+        return starts
+    for lo, hi in ranges:
+        if bv.get_function_at(lo) is not None:
+            starts.add(lo)
+        cursor = lo
+        while True:
+            nxt = walk(cursor)
+            if nxt is None or int(nxt) <= cursor or int(nxt) >= hi:
+                break
+            cursor = int(nxt)
+            starts.add(cursor)
+    return starts
+
+
+def _snapshot_split_hosts(bv, overlapped: list[dict[str, Any]]) -> dict[str, Any]:
+    """What a revert of a deliberate-split create must put back (#927 P1).
+
+    Removing the created function is NOT restoring the hosts: on real BN a
+    create inside two functions that share a tail left both shortened and
+    an analysis-created function owning the tail -- and the preview reported
+    `rolled_back: true`. So the hosts' ranges and symbols are recorded
+    before the create, plus every function start their ranges already held,
+    so the repair can tell a function analysis added from one that was
+    there.
+
+    Taken immediately before the create, so inside a batch it is the host's
+    INTERMEDIATE state (an earlier sibling may have renamed it). That is the
+    right reference for what the repair owns -- ranges, existence and the
+    AUTO symbols, none of which the undo journal restores, none of which a
+    sibling op writes, and each of which the restores undo in reverse apply
+    order -- and the wrong one for anything the journal owns (a user name,
+    prototype, comments, tags, locals): the batch undoes those
+    transaction-wide BEFORE the restores run, so re-applying them from here
+    resurrects a sibling's reverted change (#927 round 3). The repair never
+    writes them; the transaction baseline (`_split_host_baseline`) verifies
+    them. `name` is kept for the audit rows and the log lines only.
+    """
+    hosts: dict[int, dict[str, Any]] = {}
+    for row in overlapped:
+        start = int(row["address"], 16)
+        fn = bv.get_function_at(start)
+        if fn is None:
+            continue
+        hosts[start] = {
+            "name": str(fn.name),
+            "auto_symbols": _auto_symbols_at(bv, start),
+            "ranges": _range_pairs(fn),
+        }
+    span = sorted({r for host in hosts.values() for r in host["ranges"]})
+    return {"hosts": hosts, "span": span, "starts": _function_starts_within(bv, span)}
+
+
+def _is_auto_symbol(symbol) -> bool:
+    return symbol is not None and bool(getattr(symbol, "auto", False))
+
+
+def _auto_symbols_at(bv, start: int) -> dict[str, Any]:
+    """The REGISTERED auto symbols at *start*, by name -- ALL of them, not
+    the one `fn.symbol` prefers. A user rename sits on top of the auto
+    symbols without removing them, so the preferred symbol hides what
+    analysis did underneath: a host cut down to a jump thunk gains an auto
+    `j_*` symbol that outranks its loader name, and after the batch's undo
+    drops the user name the thunk name is what shows. The analysis-owned
+    set is the thing to put back; the view's own listing is the only place
+    it is visible.
+
+    Only the listing, never `fn.symbol` as a stand-in for an empty one: an
+    implicit `sub_<addr>` name is synthesized, not registered, so it is in
+    `fn.symbol` and absent from the listing -- and a user rename on top
+    makes the listing non-empty without it. Falling back mixed the two:
+    recorded under the rename as no auto symbols, the host read after the
+    undo as having "added" `sub_<addr>`, which `undefine_auto_symbol`
+    cannot remove, and a perfectly restored preview reported a failed
+    rollback (#927 round 4). The implicit name is verified by the
+    transaction baseline's name check instead."""
+    return {str(s.name): s for s in bv.get_symbols(start, 1) if _is_auto_symbol(s)}
+
+
+def _split_host_baseline(ctx, bv, operations: list) -> dict[int, dict[str, Any]]:
+    """The TRANSACTION baseline of every function a batch's creates could
+    cut: name and ranges of each function containing a `function_create`
+    address, read before op 0 applies. `_split_hosts_at_baseline` verifies
+    the rollback against this -- the state the whole transaction must
+    return to, which no per-op snapshot taken mid-batch can know (#927
+    round 3). A create at a gap address records nothing; one inside an
+    EARLIER sibling's function finds no function here yet, and that
+    sibling's own restore removes it. A malformed address records nothing
+    either: this runs before the transaction opens, outside the apply
+    handler that turns an op's failure into a `results` row, so raising
+    here demoted the batch's structured, rolled-back exit-3 result to a
+    bare error (#927 round 4). `_op_function_create` rejects the operand
+    itself, exactly as the affected-function pass defers to it."""
+    baseline: dict[int, dict[str, Any]] = {}
+    for op in operations:
+        if not (isinstance(op, dict) and op.get("op") == "function_create" and op.get("address")):
+            continue
+        try:
+            addr = _parse_address(op["address"])
+        except ValueError:
+            continue
+        for fn in ctx._functions_containing(bv, addr):
+            start = int(fn.start)
+            if start not in baseline:
+                baseline[start] = {"name": str(fn.name), "ranges": _range_pairs(fn)}
+    return baseline
+
+
+def _host_ranges_off(bv, hosts: dict[int, dict[str, Any]]) -> list[str]:
+    """Which of *hosts* are gone or cover other bytes than recorded."""
+    off: list[str] = []
+    for start, before in hosts.items():
+        fn = bv.get_function_at(start)
+        if fn is None:
+            off.append(f"{before['name']} @ {hex(start)} is gone")
+            continue
+        now = _range_pairs(fn)
+        if now != before["ranges"]:
+            off.append(
+                f"{before['name']} @ {hex(start)} covers "
+                f"{[(hex(a), hex(b)) for a, b in now]} instead of "
+                f"{[(hex(a), hex(b)) for a, b in before['ranges']]}")
+    return off
+
+
+def _host_auto_symbols_off(bv, hosts: dict[int, dict[str, Any]]) -> list[tuple[int, list, list]]:
+    """Per host whose auto symbols differ from the snapshot: (start, the
+    auto symbols analysis ADDED, the recorded ones now MISSING)."""
+    off: list[tuple[int, list, list]] = []
+    for start, before in hosts.items():
+        if bv.get_function_at(start) is None:
+            continue
+        now = _auto_symbols_at(bv, start)
+        recorded = before["auto_symbols"]
+        added = [now[name] for name in now if name not in recorded]
+        missing = [recorded[name] for name in recorded if name not in now]
+        if added or missing:
+            off.append((start, added, missing))
+    return off
+
+
+def _reanalyze_hosts(bv, snapshot: dict[str, Any]) -> None:
+    for start in snapshot["hosts"]:
+        fn = bv.get_function_at(start)
+        if fn is not None:
+            fn.reanalyze()
+    bv.update_analysis_and_wait()
+
+
+def _restore_split_hosts(ctx, bv, addr: int, snapshot: dict[str, Any]) -> bool:
+    """Put the hosts of a reverted deliberate-split create back, and SAY whether they are.
+
+    Called once the created function is gone. On real BN the hosts usually
+    re-extend on their own; when they do not (the shared-tail case, #927 P1),
+    the bytes they lost belong to a function analysis created, which is
+    dropped -- first with the non-poisoning ``remove_function``, then, if
+    analysis re-creates it, with ``remove_user_function`` (the same escalation
+    ``_remove_created_function`` makes: a shortened host is worse than a "no
+    function here" mark at an address that had no function before either).
+    Only starts the snapshot did not record are ever removed.
+
+    This repairs ONLY what analysis destroyed and the undo journal cannot
+    restore: ranges, existence, and the AUTO symbol set (a host cut down to
+    a jump thunk gains an auto `j_*` symbol that outranks its old name, and
+    reanalysis does not take it back): auto symbols analysis added are
+    undefined, recorded ones it dropped are redefined. A user name is the
+    journal's -- inside a batch the snapshot may hold a sibling's
+    since-reverted rename, so writing it here would undo the undo (#927
+    round 3); the caller verifies it against the transaction baseline
+    instead. Verified after every step; False means the view is NOT as it
+    was, and the caller must report `rollback_failed` rather than a clean
+    revert.
+    """
+    if not snapshot.get("hosts"):
+        return True
+    try:
+        ranges_off = _host_ranges_off(bv, snapshot["hosts"])
+        if ranges_off:
+            keep = set(snapshot["starts"]) | set(snapshot["hosts"]) | {addr}
+            for remover_name in ("remove_function", "remove_user_function"):
+                remover = getattr(bv, remover_name, None)
+                if remover is None:
+                    continue
+                for start in sorted(_function_starts_within(bv, snapshot["span"]) - keep):
+                    extra = bv.get_function_at(start)
+                    if extra is not None:
+                        remover(extra)
+                _reanalyze_hosts(bv, snapshot)
+                ranges_off = _host_ranges_off(bv, snapshot["hosts"])
+                if not ranges_off:
+                    break
+        symbols_off = _host_auto_symbols_off(bv, snapshot["hosts"])
+        if symbols_off:
+            for _start, added, missing in symbols_off:
+                for symbol in added:
+                    bv.undefine_auto_symbol(symbol)
+                for symbol in missing:
+                    bv.define_auto_symbol(symbol)
+            bv.update_analysis_and_wait()
+            symbols_off = _host_auto_symbols_off(bv, snapshot["hosts"])
+    except Exception as exc:  # noqa: BLE001 - report the restore as failed, don't raise
+        bn.log_error(
+            f"BN Agent Bridge: restoring the functions a create at 0x{addr:x} "
+            f"split failed on revert: {exc!r}"
+        )
+        return False
+    if ranges_off or symbols_off:
+        names_off = [
+            f"{hex(start)} has auto symbols analysis added {[str(s.name) for s in added]} "
+            f"and lost {[str(s.name) for s in missing]}"
+            for start, added, missing in symbols_off
+        ]
+        bn.log_error(
+            f"BN Agent Bridge: the functions a create at 0x{addr:x} split were not "
+            f"restored on revert: {'; '.join(ranges_off + names_off)}"
+        )
+        return False
+    return True
+
+
+def _split_hosts_at_baseline(bv, baseline: dict[int, dict[str, Any]], *, what: str) -> bool:
+    """Whether every host in *baseline* exists with its baseline ranges AND
+    name -- the final check before a rollback is reported clean. Run after
+    the undo and every restore, so a name the journal should have put back
+    and did not, or one a repair wrote over it, is a failed rollback and not
+    a `rolled_back: true` over a renamed function (#927 round 3). Any name
+    difference counts here: nothing but a failed revert can legitimately
+    leave the view there. Logs what is off; *what* names the caller."""
+    if not baseline:
+        return True
+    try:
+        off = _host_ranges_off(bv, baseline)
+        for start, before in baseline.items():
+            fn = bv.get_function_at(start)
+            if fn is not None and str(fn.name) != before["name"]:
+                off.append(f"{hex(start)} is named {fn.name!r} instead of {before['name']!r}")
+    except Exception as exc:  # noqa: BLE001 - an unreadable host is not a verified one
+        bn.log_error(f"BN Agent Bridge: could not verify the hosts {what} split: {exc!r}")
+        return False
+    if off:
+        bn.log_error(
+            f"BN Agent Bridge: the hosts {what} split are not as they were before "
+            f"the transaction: {'; '.join(off)}"
+        )
+        return False
+    return True
+
+
+def _revert_split_hosts(ctx, bv, addr: int, snapshot: dict[str, Any]) -> bool:
+    """The standalone command's whole host revert: repair, then verify against
+    the baseline -- which, with no sibling op in the transaction, is the
+    snapshot itself (every name included)."""
+    return (_restore_split_hosts(ctx, bv, addr, snapshot)
+            and _split_hosts_at_baseline(bv, snapshot["hosts"], what=f"a create at 0x{addr:x}"))
+
+
+def _split_host_rows(bv, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """One `affected_functions` row per host of a committed split, so the
+    audit lists the function that was cut, not only the one that was made."""
+    rows = []
+    for start, before in snapshot["hosts"].items():
+        fn = bv.get_function_at(start)
+        after_name = str(fn.name) if fn is not None else None
+        changed = fn is None or _range_pairs(fn) != before["ranges"] or after_name != before["name"]
+        rows.append({
+            "address": hex(start),
+            "before_name": before["name"],
+            "after_name": after_name,
+            "changed": bool(changed),
+        })
+    return rows
+
+
+def _function_create(ctx, selector: str | None, address, preview: bool, *,
+                     allow_overlap: bool = False, exclusive=None):
     """Create a function at *address*, verify it, and revert if asked or failed.
 
     #628 lock split: ``exclusive`` is the caller's EXCLUSIVE target-lock scope -- a
@@ -150,10 +607,21 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
     (``_remove_created_function``) stays exclusive on purpose: a reader must never
     observe a half-reverted view. ``exclusive=None`` means "no exclusive scope" (a
     no-op), so direct engine calls and tests keep working.
+
+    ``allow_overlap`` is the deliberate-split switch (M-03): a create at an
+    address INSIDE an existing function is refused by default -- see
+    ``_overlap_refusal`` -- and goes ahead, disclosing the overlap in its
+    row, only when it is True. The preview obeys the same rule: a preview
+    that previews a refused create would report `verified` for a change
+    the live command then refuses.
     """
     exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     with exclusive_scope():
         bv = ctx._resolve_view(selector)
+        addr = _parse_address(address)
+        requested = {"op": "function_create", "address": hex(addr)}
+        if allow_overlap:
+            requested["allow_overlap"] = True
         # #479: on a --quick-loaded view the initial analysis never ran, so the
         # update_analysis_and_wait() below would run the full (multi-minute) analysis
         # as a side effect of a mutation -- a stall the caller never asked for, and
@@ -161,23 +629,31 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
         # `target info` blocked. Refuse fast and point at `bn refresh` (which is built
         # to run that analysis once) instead. Also protects --preview, whose whole
         # promise is a bounded, revertible probe. #628 only shortens the exclusive
-        # window the reanalysis runs in; this refusal is unchanged.
-        require_analysis(bv, "Creating a function")
-        addr = _parse_address(address)
-        requested = {"op": "function_create", "address": hex(addr)}
+        # window the reanalysis runs in; this refusal is unchanged -- except that
+        # it is the batch op's `OperationFailure("invalid_request")` now (M-24's
+        # twin, #927 review): a bare RuntimeError put the standalone command at
+        # exit 2 for the refusal `batch apply` reports at exit 3.
+        if bv in _quick_loaded_views:
+            raise OperationFailure(
+                "invalid_request",
+                "Cannot create a function: this target was loaded with --quick (no "
+                "analysis). Creating a function would run the full analysis under the "
+                "write lock and wedge the instance. Run `bn refresh` first.",
+                requested=requested,
+            )
 
         # #675 item 14: capture the CONTAINING functions before the create --
         # afterwards this address IS a function start and the answer changes.
         # A create at a mid-function address reported `verified` and said
-        # nothing, leaving two overlapping functions with no trace in the
-        # result. Disclosed, not refused: creating a function BN missed
-        # inside a neighbour it over-extended is ordinary RE work.
+        # nothing; M-03 then showed the "overlap" is a truncation of the host,
+        # so it is refused unless `allow_overlap` asks for the split, and
+        # disclosed in the row when it does.
         #
         # BOTH create paths need this. `bn function create` runs here;
         # `batch apply` runs `mutation_engine._op_function_create`. Patching
         # only the one I found first left the command under test unchanged,
         # which the live run caught.
-        overlapped = _containing_function_rows(bv, addr)
+        overlapped = _containing_function_rows(bv, addr, requested=requested)
         existing = bv.get_function_at(addr)
         if existing is not None:
             return {
@@ -203,15 +679,29 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
         # inside an executable region. Auto-analysis skips exactly these handler
         # entry points (reachable only via data/function-pointer tables), so we
         # still create them on request -- but only where code can actually run.
+        # M-24: OperationFailure, not a bare RuntimeError -- the batch path
+        # already refuses the same address as `invalid_request`, and a bridge
+        # mutation refusal is exit 3 on both surfaces, not 2 on one of them.
         if len(bytes(bv.read(addr, 1))) == 0:
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not mapped"
+            raise OperationFailure(
+                "invalid_request",
+                f"Cannot create function: address {hex(addr)} is not mapped",
+                requested=requested,
             )
         if not read_misc._is_executable_address(ctx, bv, addr):
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
+            raise OperationFailure(
+                "invalid_request",
+                f"Cannot create function: address {hex(addr)} is not inside an executable segment",
+                requested=requested,
             )
+        if overlapped and not allow_overlap:
+            raise _overlap_refusal(addr, overlapped, requested, flag="--allow-overlap")
 
+        # #927 P1: what a revert must put back. Removing the created function
+        # does not restore the hosts on every geometry (two hosts sharing a
+        # tail were left shortened behind `rolled_back: true`), so record
+        # them now and verify them after every revert below.
+        hosts = _snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
         state = bv.begin_undo_actions()
     try:
         with exclusive_scope():
@@ -232,6 +722,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
             created = bv.get_function_at(addr)
             if created is None:
                 reverted = mutation_engine._revert_undo_safely(ctx, bv, state)
+                reverted = _revert_split_hosts(ctx, bv, addr, hosts) and reverted
                 return {
                     "preview": preview,
                     "success": False,
@@ -265,6 +756,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
                 # fabricated function verified (#386).
                 mutation_engine._revert_undo_safely(ctx, bv, state)
                 removed = _remove_created_function(ctx, bv, addr)
+                removed = _revert_split_hosts(ctx, bv, addr, hosts) and removed
                 return {
                     "preview": preview,
                     "success": False,
@@ -287,6 +779,12 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
 
             function_name = str(created.name)
             op_status = "verified"
+            # Observed after analysis: which hosts the create truncated and
+            # which it left intact (the mid-instruction outcome), and the
+            # audit row per host -- read BEFORE a preview's revert so the
+            # preview reports what the live run would do to them.
+            overlapped = _observe_split(bv, addr, overlapped)
+            host_rows = _split_host_rows(bv, hosts)
             if preview:
                 # Function creation isn't reliably undone by revert_undo_actions
                 # (the same non-journaled class as create_user_var / set_user_type),
@@ -295,6 +793,11 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
                 # did not verify (#117).
                 bv.revert_undo_actions(state)
                 reverted = _remove_created_function(ctx, bv, addr)
+                # #927 P1: the created function being gone is not the hosts
+                # being back. Verified, repaired where BN allows, and reported
+                # as a failed rollback otherwise -- never a clean revert on
+                # trust.
+                reverted = _revert_split_hosts(ctx, bv, addr, hosts) and reverted
                 committed = False
                 success = reverted
                 if reverted:
@@ -306,8 +809,9 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
                     # routes it to 'failed:' instead of '[verified]' and the per-op
                     # status stops contradicting success:false (#117).
                     message = (
-                        "Preview verified, but removing the created function on "
-                        "revert failed; the view may be left modified."
+                        "Preview verified, but reverting it failed: the created "
+                        "function, or a function it split, may be left modified "
+                        "in the view."
                     )
                     op_status = "rollback_failed"
                     # The fabricated function is still LIVE in the view, but BN's
@@ -351,13 +855,18 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
                         "requested": requested,
                     }, overlapped)
                 ],
+                # The host(s) a deliberate split cut are affected functions
+                # too (#927 review): the compact face carries them under
+                # `overlapping_functions`; the full audit must not list only
+                # the function that was made.
                 "affected_functions": [
                     {
                         "address": hex(addr),
                         "before_name": None,
                         "after_name": function_name,
                         "changed": True,
-                    }
+                    },
+                    *host_rows,
                 ],
                 "affected_types": [],
             }
@@ -370,6 +879,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *, exclu
             # also explicitly drop any function left at the address (#117).
             undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
             removed = _remove_created_function(ctx, bv, addr)
+            removed = _revert_split_hosts(ctx, bv, addr, hosts) and removed
         if not (undo_ok and removed):
             raise RuntimeError(
                 f"{exc} (additionally, rollback failed; the view may be left partially modified)"

@@ -339,6 +339,35 @@ def test_target_info_text_renders_existing_annotations():
     assert "existing annotations" not in plain
 
 
+def test_text_faces_print_the_source_verified_verdict():
+    """Review round 3 P3: the JSON `source_verified` verdict was absent from
+    both text faces (only the hint sentence carried it). The existing-
+    annotations line of `target info` and `evidence orient` prints
+    `source-verified=true|false|unknown` (unknown = the bridge's explicit null);
+    an older bridge that never sent the key prints the line unchanged."""
+    from bn.commands.binary import _render_target_info_text_with_annotations
+    from bn.formatters import _render_orient_text
+
+    def block(**extra):
+        return {"comments": 1, "function_comments": 0, "user_symbols": 2,
+                "analysis_cache_restored": True, **extra}
+
+    for verdict, printed in ((True, "true"), (False, "false"), (None, "unknown")):
+        info = _render_target_info_text_with_annotations({
+            "selector": "shared.bndb", "existing_annotations": block(source_verified=verdict)})
+        assert f"cache-restored=True, source-verified={printed}" in info, info
+        orient = _render_orient_text({
+            "target": {"selector": "shared.bndb"},
+            "existing_annotations": block(source_verified=verdict)})
+        assert f"cache-restored=True, source-verified={printed}" in orient, orient
+
+    legacy = _render_target_info_text_with_annotations({
+        "selector": "shared.bndb", "existing_annotations": block()})
+    assert "source-verified" not in legacy, legacy
+    assert "source-verified" not in _render_orient_text({
+        "target": {"selector": "shared.bndb"}, "existing_annotations": block()})
+
+
 def test_target_info_verbose_renders_segments():
     """target info --verbose text appends the segment map with r/w/x perms; the
     block is absent when no segments are present (target list rows). (F21)"""

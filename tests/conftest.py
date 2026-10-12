@@ -64,6 +64,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "statemachine_x86_64",
     "parser_x86_64",
     "dispatch_table_x86_64",
+    "classes_x86_64",   # C++ (src/classes.cpp): the class lens's RTTI shapes (#922)
     "canary_x86_64",
 )
 
@@ -238,11 +239,11 @@ def build_integration_fixtures(
     """
     out_dir = Path(out_dir) if out_dir is not None else FIXTURES_DIR
     env = {**os.environ, **(make_env or {})}
-    for tool in ("make", env.get("CC", "cc")):
+    for tool in ("make", env.get("CC", "cc"), env.get("CXX", "c++")):
         if shutil.which(tool) is None and not Path(tool).is_file():
             raise FixtureBuildError(
                 f"{tool!r} not found; the real-BN integration fixtures need a C "
-                f"toolchain. Run: make -C tests/fixtures"
+                f"and C++ toolchain. Run: make -C tests/fixtures"
             )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -490,8 +491,11 @@ def _shared_bridge(_hermetic_session_env, tmp_path_factory) -> Iterator[SharedBr
     try:
         yield bridge
     finally:
+        # `--discard-unsaved`: `end()` closes every target after each test, but
+        # a close that failed would leave an unsaved one behind, and a teardown
+        # stop that then REFUSED (#925) would report the shared bridge as leaked.
         subprocess.run(
-            [*_BN_CLI, "session", "stop", bridge.instance_id],
+            [*_BN_CLI, "session", "stop", bridge.instance_id, "--discard-unsaved"],
             capture_output=True, text=True, timeout=_SHARED_BRIDGE_STOP_TIMEOUT, env=env,
         )
 

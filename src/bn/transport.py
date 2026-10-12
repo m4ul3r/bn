@@ -53,6 +53,20 @@ class BridgeError(RuntimeError):
         self.observed = observed
 
 
+class BridgeUnreachableError(BridgeError):
+    """A request that never REACHED the bridge: the process is stopped, gone,
+    resolved for lifecycle commands only (#694), recorded without an identity
+    token, or nothing accepted the connection at its socket.
+
+    Distinct from every error a live bridge produces -- a timeout, a reset
+    mid-reply, an empty or malformed reply, an `ok: false` envelope -- because
+    the two call for opposite handling by a safety check: a bridge that could
+    not be reached holds nothing a `session stop` could ask about, while a
+    bridge that was reached but did not answer may well hold unsaved work, and
+    "no answer" must never be read as "nothing to lose" (#925 review).
+    """
+
+
 TRANSIENT_SOCKET_ERRNOS = {
     errno.ECONNREFUSED,
     errno.ENOENT,
@@ -1252,7 +1266,10 @@ def choose_instance(
 def _instance_identity(instance: BridgeInstance) -> dict[str, Any]:
     token = instance.instance_token
     if not isinstance(token, str) or not token:
-        raise BridgeError(
+        # Refused before any socket is opened: nothing can be dispatched to a
+        # record without a token, so it is "never reached" to the lifecycle
+        # guard, exactly like the `unreachable` handle.
+        raise BridgeUnreachableError(
             f"Bridge instance {instance_selector(instance)!r} has no identity token; "
             "the bridge is stale -- restart it and retry"
         )
@@ -1330,13 +1347,13 @@ def _send_request_to_instance(
 ) -> dict[str, Any]:
     process_state = _process_state(instance.pid)
     if process_state in {"T", "t"}:
-        raise BridgeError(
+        raise BridgeUnreachableError(
             f"bridge_stopped: Binary Ninja bridge instance "
             f"{instance_selector(instance)!r} (pid {instance.pid}) is stopped; "
             f"resume it with `kill -CONT {instance.pid}` or restart the instance"
         )
     if process_state in {"Z", "X", "x"}:
-        raise BridgeError(
+        raise BridgeUnreachableError(
             f"bridge_not_running: Binary Ninja bridge instance "
             f"{instance_selector(instance)!r} (pid {instance.pid}) is in "
             f"process state {process_state}; restart the instance"
@@ -1350,7 +1367,7 @@ def _send_request_to_instance(
         # discovery refused to trust (#618) -- and `session restart` dispatches
         # `list_targets` to the handle it resolves. The refusal belongs at the
         # one chokepoint every dispatch goes through.
-        raise BridgeError(
+        raise BridgeUnreachableError(
             f"bridge_unreachable: Binary Ninja bridge instance "
             f"{instance_selector(instance)!r} (pid {instance.pid}) resolved for "
             f"lifecycle commands only: its recorded socket is either gone or not "
@@ -1409,6 +1426,10 @@ def _send_request_to_instance(
 
     chunks: list[bytes] = []
     last_error: OSError | None = None
+    # Whether any attempt got past connect(): a failure before that point never
+    # reached the bridge; one after it is the bridge's own (see
+    # BridgeUnreachableError).
+    reached = False
     for attempt in range(connect_retries):
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1422,6 +1443,7 @@ def _send_request_to_instance(
                 if remaining is not None:
                     sock.settimeout(remaining)
                 sock.connect(str(instance.socket_path))
+                reached = True
                 _verify_socket_peer_pid(sock, instance)
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
@@ -1477,7 +1499,11 @@ def _send_request_to_instance(
                 "then raise or disable the limit with "
                 "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
             ) from last_error
-        raise BridgeError(
+        # A failure before connect() ever succeeded (socket gone, nothing
+        # accepting) never reached the bridge; one after it -- a reset while
+        # sending, a peer that accepted and dropped -- is the bridge's own.
+        contact_error = BridgeError if reached else BridgeUnreachableError
+        raise contact_error(
             f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
         ) from last_error
 

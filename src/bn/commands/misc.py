@@ -26,6 +26,7 @@ from ..formatters import (
     _render_py_exec_text,
     _render_read_text,
     _render_sections_text,
+    _render_strings_narrowed_text,
     _render_strings_text,
     _stated_count,
 )
@@ -117,7 +118,17 @@ def _strings(args: argparse.Namespace) -> int:
     # bridge returns the page WITH the true total in a {items, total, ...}
     # envelope, matching function list/search. paged_spill keeps the
     # "--limit/--offset to page" spill hint without the client-side limit+1 probe.
-    rc = _call(
+    # The "narrow your noisy dump" tip is part of the rendered result (M-12):
+    # `_render_strings_text` names the sections that actually contributed noise
+    # from the bridge's `noise_sections`, so it cannot blame `.dynsym/.symtab`
+    # on a static file that has none, and it never precedes a failure. Under a
+    # filter the caller chose, the renderer states where the matches sit rather
+    # than recommending the flag already in use (`--section` leaves the bridge's
+    # noise counters empty, so it needs no flag here).
+    narrowed = (args.query is not None or args.min_length is not None
+                or args.max_length is not None or args.no_crt
+                or args.probable_format_strings)
+    return _call(
         args,
         "strings",
         {
@@ -126,23 +137,12 @@ def _strings(args: argparse.Namespace) -> int:
             "limit": _effective_limit(args),
         },
         require_target=True,
-        text_renderer=_render_strings_text,
+        text_renderer=_render_strings_narrowed_text if narrowed else _render_strings_text,
         page_label="strings",
         paged_spill=True,
         stem="strings",
         regex_hint_query=args.query,
     )
-    # The "narrow your noisy dump" tip only makes sense after a successful,
-    # unfiltered dump. Emitting it BEFORE the request put it ahead of (and buried)
-    # a --quick refusal / error; print it after a clean result instead.
-    if (rc == 0 and args.section is None and args.query is None and args.min_length is None
-            and args.max_length is None and not args.no_crt and not args.probable_format_strings):
-        print(
-            "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
-            "narrow with --section .rodata (or --query / --min-length) for signal.",
-            file=sys.stderr,
-        )
-    return rc
 
 
 @_discloses

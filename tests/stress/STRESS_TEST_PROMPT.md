@@ -8,7 +8,7 @@ You are testing the `bn` CLI tool's multi-instance session support. The code is 
 cd /opt/bn/tests/fixtures && make
 ```
 
-Verify you have 6 binaries: `hello_x86_64`, `add_x86_64`, `crypto_x86_64`, `statemachine_x86_64`, `parser_x86_64`, `dispatch_table_x86_64`.
+Verify you have 7 binaries: `hello_x86_64`, `add_x86_64`, `crypto_x86_64`, `statemachine_x86_64`, `parser_x86_64`, `dispatch_table_x86_64`, `classes_x86_64`.
 
 ## Step 2: Run the automated stress test
 

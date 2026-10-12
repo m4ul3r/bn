@@ -7,11 +7,11 @@ spawn live bridge sessions); run them by hand.
 ## Fixtures
 
 `tests/fixtures/` holds license-clean **synthetic** x86_64 programs built from
-`tests/fixtures/src/*.c` — no target/proprietary data. The built binaries are
+`tests/fixtures/src/*.c` (plus one C++ program, `src/classes.cpp`) — no target/proprietary data. The built binaries are
 git-ignored; both harnesses build them on demand. To (re)build manually:
 
 ```bash
-make -C tests/fixtures        # produces *_x86_64 from src/*.c
+make -C tests/fixtures        # produces *_x86_64 from src/*.c and src/*.cpp
 make -C tests/fixtures clean
 ```
 
@@ -23,6 +23,7 @@ make -C tests/fixtures clean
 | `statemachine_x86_64`  | a branchy switch state machine                  |
 | `parser_x86_64`        | a length-prefixed record parser (source→sink)   |
 | `dispatch_table_x86_64`| a const function-pointer dispatch table (indirect source→sink) |
+| `classes_x86_64`       | a C++ PIE: single-inheritance vtables, an exception subclass of an imported class, a template class, an abstract class with zeroed destructor slots, one multiple-inheritance class (class lens, #922) |
 
 ## Multi-instance stress test
 

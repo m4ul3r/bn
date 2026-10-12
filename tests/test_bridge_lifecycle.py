@@ -1352,6 +1352,126 @@ def test_own_database_gate_answers_for_a_destination_that_does_not_exist_869(
         str(tmp_path / "fresh.bndb"), str(binary)) is True
 
 
+# --------------------------------------------------------------------------
+# The raw file's identity is stamped on the view at OPEN; save persists it
+# --------------------------------------------------------------------------
+
+
+def test_save_persists_the_record_stamped_at_open(monkeypatch, tmp_path):
+    # The load-side check (`_database_provenance`) can only refuse a database
+    # saved for different bytes if the database records which bytes those
+    # were. The record is stamped when the raw view is OPENED
+    # (`_stamp_opened_view`); `create_database` serialises the view's metadata
+    # as it stands, so the record is there BEFORE the write and untouched by it.
+    import hashlib
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+
+    class _StampOrderBV(_SaveBV):
+        def create_database(self, out: str):
+            self.stamped_before_write = dict(self.query_metadata("bn_agent_bridge"))
+            return super().create_database(out)
+
+    bv = _StampOrderBV(str(binary), result=True, write=True)
+    assert module._stamp_opened_view(bv, module._load_identity(binary)) is None
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True and "note" not in result
+    expected = {"source_sha256": hashlib.sha256(b"\x7fELF v1").hexdigest(), "source_size": 7}
+    assert bv.query_metadata("bn_agent_bridge") == expected
+    assert bv.stamped_before_write == expected
+
+
+def test_save_never_hashes_the_file_on_disk(monkeypatch, tmp_path):
+    # Review P1: hashing at save time certified whatever sat at the path by
+    # then. The save consults only the view's own record -- the file can have
+    # changed, or be unreadable, and the record stays the loaded bytes'.
+    import hashlib
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+    bv = _SaveBV(str(binary), result=True, write=True)
+    module._stamp_opened_view(bv, module._load_identity(binary))
+    binary.write_bytes(b"\x7fELF v2 -- replaced under the open view")
+
+    def _no_disk_hash(path):
+        raise AssertionError(f"save must not hash the disk: {path}")
+
+    monkeypatch.setattr(module, "_hash_file", _no_disk_hash)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True and "note" not in result
+    assert bv.query_metadata("bn_agent_bridge") == {
+        "source_sha256": hashlib.sha256(b"\x7fELF v1").hexdigest(), "source_size": 7}
+
+
+def test_the_stamp_merges_with_other_bridge_metadata(monkeypatch, tmp_path):
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+    bv = _SaveBV(str(binary), result=True, write=True)
+    bv.store_metadata("bn_agent_bridge", {"other": "kept"})
+
+    module._stamp_opened_view(bv, module._load_identity(binary))
+
+    record = bv.query_metadata("bn_agent_bridge")
+    assert record["other"] == "kept" and record["source_size"] == 7
+
+
+def test_save_does_not_stamp_a_view_homed_at_a_database(monkeypatch, tmp_path):
+    # A view restored from a .bndb carries the record it was validated against
+    # at load -- or none, if it predates validation and could not vouch for
+    # itself. Stamping the bytes that happen to sit beside it now would launder
+    # exactly the mismatch the load-side check exists to catch, so the save
+    # leaves the record alone (and, homed at a database, says nothing).
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    (tmp_path / "parse_record").write_bytes(b"\x7fELF v2")
+    db = tmp_path / "parse_record.bndb"
+    db.write_bytes(b"BNDB")
+    bv = _SaveBV(str(db), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True and "note" not in result
+    with pytest.raises(KeyError):
+        bv.query_metadata("bn_agent_bridge")
+
+
+def test_save_of_an_unstamped_raw_view_lands_without_inventing_a_record(
+        monkeypatch, tmp_path):
+    # A raw-homed view the bridge did not open (a GUI tab; a stamp that failed
+    # at load) has no record to persist. The save never invents one from the
+    # disk -- it lands unstamped, and the next load that prefers the database
+    # verifies it from the bytes it stores (`_database_provenance`).
+    from _bridge_fakes import _SaveBV
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    binary = tmp_path / "parse_record"
+    binary.write_bytes(b"\x7fELF v1")
+    bv = _SaveBV(str(binary), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True and "note" not in result
+    assert (tmp_path / "parse_record.bndb").exists()
+    with pytest.raises(KeyError):
+        bv.query_metadata("bn_agent_bridge")
+
+
 def test_same_file_degrades_to_false_without_identity_evidence_869(monkeypatch):
     # Degrade-safely, the rule `socket_evidence` applies: two paths that
     # neither match as strings nor exist to be stat'd yield no evidence of
@@ -1473,7 +1593,7 @@ def test_the_read_only_cache_fallback_destination_is_disclosed_867(
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     module = _load_bridge(monkeypatch)
     instance = module.BinaryNinjaBridge()
-    cache_dest = str(module._cache_bndb_path(str(raw)))
+    cache_dest = str(module._cache_bndb_path(str(raw), module._hash_file(raw).sha256))
 
     class _ROSaveBV(_SaveBV):
         def create_database(self, out: str):
@@ -1484,6 +1604,7 @@ def test_the_read_only_cache_fallback_destination_is_disclosed_867(
             return True
 
     bv = _ROSaveBV(str(raw), result=True, write=True)
+    module._stamp_opened_view(bv, module._load_identity(raw))   # as `bn load` does
     other = _SaveBV(cache_dest, result=True, write=True)
     monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
     monkeypatch.setattr(

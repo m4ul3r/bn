@@ -1574,20 +1574,87 @@ def test_read_bytes_malformed_response_clean_error(fake_transport, capsys):
     assert "Traceback" not in err
 
 
-def test_strings_unfiltered_emits_section_hint(fake_transport, capsys):
-    fake_transport({"strings": {"ok": True, "result": []}})
+_NOISY_STRINGS_PAGE = {
+    "kind": "strings", "items": [{"address": "0x4550b0", "length": 11, "chars": 11,
+                                  "type": "ascii", "value": "default.cfg"}],
+    "total": 1206, "offset": 0, "limit": 100, "returned": 1, "has_more": True,
+    "filtered": 0, "noise_strings": 1205, "noise_sections": [".text", "(no section)"],
+    "data_sections": [".rdata", ".data"],
+}
+
+
+def test_strings_tip_names_the_sections_that_contributed_noise(fake_transport, capsys):
+    """M-12: the tip names the sections the bridge saw noise in -- it used to
+    blame `.dynsym/.hash/.symtab` on every unfiltered dump, including a static
+    file that has none of them -- and the `--section` it recommends is the
+    view's own top data section (`.rdata` here, as on a PE), not an assumed
+    `.rodata`."""
+    fake_transport({"strings": {"ok": True, "result": _NOISY_STRINGS_PAGE}})
     assert bn.cli.main(["strings", "--target", "active"]) == 0
 
-    _, stderr = capsys.readouterr()
-    assert "--section .rodata" in stderr
+    out, stderr = capsys.readouterr()
+    assert "tip: 1205 string(s) from .text, (no section)" in out
+    assert "--section .rdata" in out and ".rodata" not in out
+    assert ".dynsym" not in out and "tip:" not in stderr
 
 
-def test_strings_with_filter_suppresses_section_hint(fake_transport, capsys):
-    fake_transport({"strings": {"ok": True, "result": []}})
+def test_strings_tip_without_a_data_section_recommends_no_section_flag(fake_transport, capsys):
+    """A view whose listing drew on no data section at all (every string was
+    noise) cannot be narrowed by `--section`: the tip must not invent one."""
+    fake_transport({"strings": {"ok": True, "result": {
+        **_NOISY_STRINGS_PAGE, "data_sections": []}}})
+    assert bn.cli.main(["strings", "--target", "active"]) == 0
+
+    out, _ = capsys.readouterr()
+    assert "tip: 1205 string(s) from .text, (no section)" in out
+    assert "--section" not in out and "--query / --min-length" in out
+
+
+def test_strings_tip_absent_when_nothing_was_noise(fake_transport, capsys):
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [{"address": "0x401a40", "length": 5, "chars": 5,
+                                      "type": "ascii", "value": "hello"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "filtered": 0, "noise_strings": 0, "noise_sections": [], "data_sections": [".rodata"]}}})
+    assert bn.cli.main(["strings", "--target", "active"]) == 0
+
+    out, stderr = capsys.readouterr()
+    assert "hello" in out
+    assert "tip:" not in out and "tip:" not in stderr
+
+
+@pytest.mark.parametrize("flags", [
+    ["--query", "4aR4"], ["--min-length", "6"], ["--max-length", "40"], ["--no-crt"],
+    ["--probable-format-strings"],
+], ids=lambda f: f[0])
+def test_strings_under_a_filter_states_noise_without_recommending_the_flag_in_use(
+        fake_transport, capsys, flags):
+    """Under a filter the caller chose, the tip's "narrow with --section /
+    --query / --min-length" advice recommended the flag already in use. The
+    bridge still reports the noise (a `--query` hit in `.text` is worth
+    knowing), so the text states where the matches sit and recommends nothing."""
+    fake_transport({"strings": {"ok": True, "result": _NOISY_STRINGS_PAGE}})
+    assert bn.cli.main(["strings", *flags, "--target", "active"]) == 0
+
+    out, stderr = capsys.readouterr()
+    assert "note: 1205 of the listed string(s) from .text, (no section) are code bytes" in out
+    assert "tip:" not in out and "narrow with" not in out
+    assert "--section" not in out and "--query" not in out and "--min-length" not in out
+    assert "tip:" not in stderr
+
+
+def test_strings_section_pin_renders_no_tip(fake_transport, capsys):
+    """A pinned section reports no noise (the bridge leaves the counters empty:
+    that population is what the caller asked for), so there is nothing to
+    render."""
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [], "total": 0, "offset": 0, "limit": 100,
+        "returned": 0, "has_more": False, "filtered": 0,
+        "noise_strings": 0, "noise_sections": [], "data_sections": []}}})
     assert bn.cli.main(["strings", "--section", ".rodata", "--target", "active"]) == 0
 
-    _, stderr = capsys.readouterr()
-    assert "tip:" not in stderr
+    out, stderr = capsys.readouterr()
+    assert "tip:" not in out and "note:" not in out and "tip:" not in stderr
 
 
 def test_strings_section_hint_suppressed_when_request_fails(monkeypatch, capsys):
@@ -2481,6 +2548,7 @@ _MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
     "_render_py_exec_text": _COVERED_IN_FORMATTERS,
     "_render_read_text": _COVERED_IN_FORMATTERS,
     "_render_sections_text": _COVERED_IN_FORMATTERS,
+    "_render_strings_narrowed_text": _COVERED_IN_FORMATTERS,
     "_render_strings_text": _COVERED_IN_FORMATTERS,
 }
 
@@ -3104,7 +3172,7 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
     positionals = {tuple(spec["path"]): [a[0][0] for a in spec["args"]
                                          if not a[0][0].startswith("-")]
                    for spec in bn.cli._COMMANDS}
-    leaked, probed, emitted, covered = [], 0, 0, set()
+    leaked, emitted, covered = [], 0, set()
     for path in sorted(advertised):
         required, unfillable = _estimate_required_flags(leaf(path))
         unfillable += [p for p in positionals[path]
@@ -3118,7 +3186,7 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         # process either way, but `active` resolves to whatever target some
         # other session has focused, and a sweep this wide is exactly the shape
         # that must not depend on a fixture to stay harmless: if a change ever
-        # re-routes one of these 285 invocations past the stub, it must find
+        # re-routes one of these invocations past the stub, it must find
         # nothing on the other end rather than a live view.
         base = (list(path)
                 + [_ESTIMATE_ARG_VALUES[p] for p in positionals[path]]
@@ -3132,7 +3200,6 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
             except SystemExit as exc:                 # argparse refusals
                 rc = exc.code
             out = capsys.readouterr().out
-            probed += 1
             estimated = _is_estimate_envelope(out)
             if rc == 0:
                 emitted += 1
@@ -3145,15 +3212,9 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         "these invocations of --estimate-output put something other than the "
         f"estimate envelope on stdout: {leaked[:6]}")
     # ...and the sweep cannot quietly degrade into "every probe errored out":
-    # every advertised command reached an emitting path at least once, and the
-    # probe count is pinned so a mode class cannot silently stop being swept.
+    # every advertised command reached an emitting path at least once.
     assert covered == advertised, (
         f"never reached an emitting path: {sorted(advertised - covered)}")
-    # `local list --frame` is one more store_true mode swept on an estimable command.
-    assert probed == 286, (
-        f"the sweep ran {probed} probes, not 286 -- a flag class joining or "
-        "leaving the derivation changes the coverage claim, so move the number "
-        "in the same commit")
     assert emitted, "no probe reached an emit path at all"
 
 

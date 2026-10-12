@@ -1436,6 +1436,7 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
 
@@ -1481,7 +1482,26 @@ def _render_session_stop_text(value: Any) -> str:
     method = value.get("method")
     if method:
         line += f" ({method})"
-    return line
+    return "\n".join([line, *_discarded_unsaved_lines(value)])
+
+
+def _discarded_unsaved_lines(value: dict[str, Any]) -> list[str]:
+    """The `[unsaved changes discarded]` disclosure for a `session stop` /
+    `session restart --discard-unsaved` result -- the same marker and warning
+    `bn close` prints, so a reader learns one shape for a discard."""
+    discarded = _field_list(value, "discarded_unsaved")
+    if not discarded:
+        return []
+    lines = ["", "discarded:"]
+    for entry in discarded:
+        path = entry.get("path") if isinstance(entry, dict) else entry
+        lines.append(f"- {path or '<unknown>'}  [unsaved changes discarded]")
+    lines.append("")
+    lines.append(
+        "warning: unsaved mutations were discarded. "
+        "use `bn save` before stopping or restarting a session to persist them."
+    )
+    return lines
 
 
 @_discloses
@@ -1712,6 +1732,21 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+def _source_verified_fragment(annotations: Any) -> str:
+    """The ``, source-verified=<true|false|unknown>`` tail of the existing-
+    annotations line, shared by `target info` and `evidence orient` so the
+    load-time provenance verdict is readable in text as well as JSON. ``unknown``
+    is the bridge's explicit null (no database was judged); an older bridge
+    that never sent the key prints nothing, so its line is unchanged.
+    """
+    if not _field_declared(annotations, "source_verified"):
+        return ""
+    verdict = _flag_field(annotations, "source_verified")
+    if verdict is None:
+        return ", source-verified=unknown"
+    return f", source-verified={'true' if verdict else 'false'}"
+
+
 @_discloses
 def _render_target_info_annotations_text(value: Any) -> str:
     """Render the #793 annotation counts / provenance block for `target info`.
@@ -1754,6 +1789,7 @@ def _render_target_info_annotations_text(value: Any) -> str:
     # truthiness test gets exactly backwards ("false" is True to Python).
     restored = _flag_field(annotations, "analysis_cache_restored")
     row += f", cache-restored={bool(restored)}"
+    row += _source_verified_fragment(annotations)
     lines = [row]
     hint = annotations.get("provenance_hint")
     if hint:
@@ -3656,6 +3692,7 @@ def _render_orient_text(value: Any) -> str:
                         f", placeholders={_stated_count(ea, 'placeholder_symbols')}"
                     )
             row += f", cache-restored={ea.get('analysis_cache_restored', False)}"
+            row += _source_verified_fragment(ea)
             lines.append(row)
             if ea.get("provenance_hint"):
                 lines.append(f"  ! {ea['provenance_hint']}")
@@ -3669,9 +3706,14 @@ def _render_orient_text(value: Any) -> str:
         mn = value.get("strings_min_length")
         filt = f"min-length {mn}; " if mn is not None else ""
         # #646: name the sections the sample came from, so a low-signal sample is
-        # attributable instead of looking like the whole binary's flavour.
+        # attributable instead of looking like the whole binary's flavour -- and
+        # when the bridge had to fall back past the data sections (M-12), say so,
+        # so instruction bytes are not read as literals.
         drawn = _field_list(ss, "sample_sections")
         from_where = f"; from {', '.join(str(d) for d in drawn)}" if drawn else ""
+        fallback = ss.get("sample_fallback")
+        if fallback:
+            from_where += f"; {fallback}"
         lines.append(
             f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
         for s in items[:15]:
@@ -4204,6 +4246,14 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
         # Name the cause and where the dropped count lives -- the frontier leaf.
         parts.append("caller-site cap reached (not every caller was followed; "
                      "see the caller_sites_truncated frontier)")
+    if "memory_chain" in causes:
+        # Backward-only: the local-buffer writer walk ran out of memory-SSA
+        # versions before the function entry; the cut is named by the
+        # address_of_local_unresolved leaf (PR-928 round 3 P3).
+        parts.append("memory-chain budget exhausted while walking a local "
+                     "buffer's writers (older writers were never examined; seed "
+                     "closer to the sink -- see the address_of_local_unresolved "
+                     "frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)
@@ -4458,7 +4508,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
                     _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
                 else:
-                    _extra = origin.get("callee") or origin.get("var") or ""
+                    _extra = origin.get("callee") or origin.get("var") or origin.get("address") or ""
                 _spill = " (via spill)" if origin.get("via_spill") else ""
                 lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
@@ -4661,7 +4711,11 @@ def _render_model_sources(sources: Any) -> str:
             parts.append(f"override ({s.get('path')})")
         elif kind == "user":
             loc = s.get("path") or s.get("via", "--models")
-            parts.append(f"--models {loc} ({s.get('count', 0)} model(s))")
+            # #915: `count` is the role-bearing entries; a benign `{}` marker
+            # armed nothing and is shown as what it is, not as a model.
+            benign = s.get("benign")
+            tail = f", {benign} benign" if benign else ""
+            parts.append(f"--models {loc} ({s.get('count', 0)} model(s){tail})")
     return ("models: " + " + ".join(parts)) if parts else ""
 
 
@@ -4677,6 +4731,10 @@ def _describe_loc(loc: Any) -> str:
         return f"ret:{loc.get('callee')}"
     if kind == "arg":
         return f"arg:{loc.get('callee')}:{loc.get('index')}"
+    if kind in ("call", "model"):
+        # The header used to print a bare `call` while every flow line said
+        # `call:<callee>` -- the one locator kind whose callee was dropped.
+        return f"{kind}:{loc.get('callee')}"
     return str(kind)
 
 
@@ -4790,10 +4848,14 @@ def _render_strings_rows(value: Any) -> str:
     return "\n".join(lines)
 
 
-@_discloses
-def _render_strings_text(value: Any) -> str:
-    """Render strings: the paged {items, total, ...} envelope (with a footer),
-    or a bare list for back-compat / internal callers (#122)."""
+def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
+    """The body of the two `strings` listing faces below: the paged {items,
+    total, ...} envelope (with a footer), or a bare list for back-compat /
+    internal callers (#122). *narrowed* is whether the caller's own filters
+    (--query, --min-length, --no-crt, ...) already shaped the listing: the
+    noise tip then states where the matches sit instead of recommending a
+    flag the caller is already using. The faces are the `@_discloses`
+    boundaries; this records through them."""
     body = _render_paged_list_text(value, "items", _render_strings_rows)
     # #795: state how many strings the ACTIVE filter chain dropped, so the
     # denominator does not need a second unfiltered invocation (`strings --count`
@@ -4816,7 +4878,50 @@ def _render_strings_text(value: Any) -> str:
             note = ("// the payload's filtered-string count is not a number that "
                     "can be read (use --format json)")
             body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        # M-12: the "narrow your noisy dump" tip names the sections that actually
+        # contributed code / linker-metadata noise to THIS listing (the bridge
+        # ranks them last), and is absent when there are none -- it used to blame
+        # `.dynsym/.hash/.symtab` unconditionally, on static files that have none.
+        # The `--section` it recommends is the view's own top data section
+        # (`.rdata` on a PE, never an assumed `.rodata`), and under a filter the
+        # caller chose it only states where the matches sit.
+        noisy = _nonnegative_count(value, "noise_strings")
+        if noisy:
+            named = ", ".join(str(n) for n in _field_list(value, "noise_sections"))
+            where = f" from {named}" if named else ""
+            data_sections = _field_list(value, "data_sections")
+            if narrowed:
+                note = (f"// note: {noisy} of the listed string(s){where} are code "
+                        f"bytes or linker metadata (ranked last).")
+            elif data_sections:
+                note = (f"// tip: {noisy} string(s){where} are code bytes or linker "
+                        f"metadata (ranked last); narrow with --section "
+                        f"{data_sections[0]} (or --query / --min-length) for signal.")
+            else:
+                note = (f"// tip: {noisy} string(s){where} are code bytes or linker "
+                        f"metadata (ranked last); narrow with --query / --min-length "
+                        f"for signal.")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        elif _field_skewed("noise_strings"):
+            note = ("// the payload's noise-string count is not a number that "
+                    "can be read (use --format json)")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
+
+
+@_discloses
+def _render_strings_text(value: Any) -> str:
+    """Render the unfiltered `strings` listing (the tip recommends how to narrow)."""
+    return _strings_listing_text(value, narrowed=False)
+
+
+@_discloses
+def _render_strings_narrowed_text(value: Any) -> str:
+    """Render a `strings` listing the caller's own filters (--query,
+    --min-length/--max-length, --no-crt, --probable-format-strings) already
+    shaped: the noise note states where the matches sit instead of
+    recommending a flag in use (M-12)."""
+    return _strings_listing_text(value, narrowed=True)
 
 
 def _render_sections_rows(value: Any) -> str:
@@ -5138,6 +5243,13 @@ def _operation_row_text(item: dict[str, Any]) -> str:
     if op == "function_create":
         name = item.get("function")
         suffix = f" ({name})" if name else ""
+        overlaps = _row_list(item, "overlaps")
+        if overlaps:
+            # M-03: the verbose row names the host this create landed inside,
+            # too. "inside", not "splits": BN truncates the host only at an
+            # instruction boundary; elsewhere it leaves the host intact beside
+            # the new function (#927 review), and the listing says which.
+            suffix += f" -- inside {_overlap_listing(overlaps)}"
         return f"function_create {_get('address')}{suffix}"
     if op == "rename_symbol":
         return f"rename_symbol {_get('kind', 'auto')} {_get('address')} -> {_get('new_name')}"
@@ -5535,6 +5647,7 @@ def _build_mutation_summary(
     default_error: str = "mutation failed",
     unmeasured_cause: str = "this op reported no results[] rows",
     unusable: bool = False,
+    overlapping_functions: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -5659,6 +5772,16 @@ def _build_mutation_summary(
     }
     if proto_residue:
         summary["prototype_user_type_residue"] = True
+    if overlapping_functions:
+        # M-03: a `function create --allow-overlap` landed inside an existing
+        # function (truncating it, or overlapping it -- the row says which).
+        # That is the one fact the caller asked to be told
+        # about by passing the flag, and it was reported only in the verbose
+        # `results[].note` -- the compact status every loop reads said
+        # `committed changed=1 verified=1` and nothing else. Conditional like
+        # the residue key: an ordinary create must not grow an empty list for
+        # every consumer to learn to ignore.
+        summary["overlapping_functions"] = list(overlapping_functions)
     return summary
 
 
@@ -5771,6 +5894,16 @@ def _mutation_summary(value: Any) -> Any:
                           if rows_unreadable
                           else "an op row's status could not be read" if unreadable
                           else "this op reported no results[] rows"),
+        # M-03: the per-row `overlaps` a `function_create` carries after a
+        # deliberate `--allow-overlap` split, collected across the batch so a
+        # loop reading only the compact status still learns WHICH function
+        # was cut. A reverted row's overlap is not a live split -- but a
+        # `rollback_failed` one's is (#927 review): the created function, and
+        # the cut it made, are still in the view when its revert failed.
+        overlapping_functions=[
+            o for r in results if r.get("status") in ("verified", "rollback_failed")
+            for o in _row_list(r, "overlaps")
+        ],
     )
 
 
@@ -6053,7 +6186,15 @@ def _render_mutation_summary_text(value: Any) -> str:
         f"failed={value.get('failed_count', 0)}",
         f"dirty_after={value.get('dirty_after')}",
     ]
+    # M-03: the split a `function create --allow-overlap` made is reported HERE,
+    # on the line every loop reads, not only in the verbose row note. Count on
+    # the line, hosts on the next, so the line stays grep-stable.
+    overlaps = _overlap_rows(value)
+    if overlaps:
+        parts.append(f"overlaps={len(overlaps)}")
     line = "  ".join(parts)
+    if overlaps:
+        line += "\noverlapping_functions: " + _overlap_listing(overlaps)
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
@@ -6088,6 +6229,35 @@ def _render_mutation_summary_text(value: Any) -> str:
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
     return line
+
+
+def _overlap_rows(source: Any) -> list[dict[str, Any]]:
+    """The `overlapping_functions` a compact summary carries after a deliberate
+    `function create --allow-overlap` split (M-03) -- the rows of it that can
+    be read, through the row choke point so a malformed one is disclosed."""
+    return _row_list(source, "overlapping_functions")
+
+
+def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
+    """`name @ start (+offset, fate)` per host; a missing field prints as
+    `<unknown>` rather than dropping the row that says a function was cut.
+    The fate is what the create DID to the host -- `truncated` at the new
+    start, or `intact` beside an overlapping function -- when the bridge
+    observed it (#927 review); a row without the observation shows none."""
+    def _one(o: dict[str, Any]) -> str:
+        text = (f"{_text_value(o, 'name') or '<unknown>'} @ "
+                f"{_text_value(o, 'address') or '<unknown>'}")
+        qualifiers = []
+        if offset := _text_value(o, "offset"):
+            qualifiers.append(f"+{offset}")
+        truncated = o.get("truncated")
+        if truncated is True:
+            qualifiers.append("truncated")
+        elif truncated is False:
+            qualifiers.append("intact")
+        return text + (f" ({', '.join(qualifiers)})" if qualifiers else "")
+
+    return ", ".join(_one(o) for o in overlaps)
 
 
 @_discloses
@@ -6629,11 +6799,15 @@ def _render_class_list_text(value: Any) -> str:
             _SKEWED_FIELDS.reset(token)
         for key in row_unreadable:
             _record_skew(key)
+        # #922 (d): the other demangled spellings this row absorbed, so a reader
+        # who knows the class by the expanded template spelling finds the row.
+        aliases = ", ".join(str(a) for a in _field_list(rec, "aliases") if a)
+        aka_s = f"  (aka {aliases})" if aliases else ""
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
             f"methods={methods}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
-            f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
+            f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )
     footer = _paging_footer(value, rows, page_unreadable)
     if footer is not None:
@@ -6728,6 +6902,9 @@ def _render_one_class(rec: Any) -> str:
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
+    # #922 (d): one class, several demangled spellings -- the card is the merge.
+    for alias in _field_list(rec, "aliases"):
+        lines.append(f"  aka: {alias}")
     methods = _field_list(rec, "methods")
     for m in methods:
         if not isinstance(m, dict):
@@ -6785,7 +6962,11 @@ def _render_one_class(rec: Any) -> str:
             continue
         ott = sec.get("offset_to_top")
         ott_s = f" (offset-to-top {ott})" if ott is not None else ""
-        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
+        # #922 (c): a backwalk-recovered secondary is a lead, not a recovered
+        # fact; say so on the line an analyst would quote.
+        conf = _text_value(sec, "confidence")
+        conf_s = f" [{conf}]" if conf else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}{conf_s}:")
         for s in _field_list(sec, "slots"):
             if not isinstance(s, dict):
                 lines.append(f"    {s!r}")

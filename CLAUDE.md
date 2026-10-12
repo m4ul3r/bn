@@ -31,7 +31,7 @@ uv run pytest -m "not real_bn"             # skip the lanes that drive a real BN
 
 The suite is xdist-clean, and parallel is where the wall time is: `-n 8` takes the full run from roughly seven and a half minutes to two and a half on a six-core laptop. It is not in `addopts` because a serial run is the one that gives a readable failure and a usable `-x`.
 
-Tests mock the `binaryninja` module — no BN license needed except for the two real-BN lanes, `test_integration.py` and `test_taint_integration.py`, which need a real BN install plus a C toolchain (`cc`/`gcc` + `make`). BN is discovered the same way the CLI discovers it (platform defaults), except that `BN_INSTALL_DIR` is authoritative here: if it points at a non-install, the lane treats BN as absent rather than falling back to another install.
+Tests mock the `binaryninja` module — no BN license needed except for the two real-BN lanes, `test_integration.py` and `test_taint_integration.py`, which need a real BN install plus a C and C++ toolchain (`cc`/`gcc` + `c++`/`g++` + `make`; the C++ compiler builds the one `src/classes.cpp` fixture the class lens is checked against). BN is discovered the same way the CLI discovers it (platform defaults), except that `BN_INSTALL_DIR` is authoritative here: if it points at a non-install, the lane treats BN as absent rather than falling back to another install.
 
 The `tests/fixtures/*_x86_64` binaries those tests run against are compiler output and stay untracked. A session-scoped fixture in `tests/conftest.py` builds them automatically when BN is present; if the build fails — missing compiler, make error, or timeout — the run errors out with `FixtureBuildError` and the diagnostics rather than skipping. Manual fallback: `make -C tests/fixtures`.
 

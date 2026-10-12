@@ -26,6 +26,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # Structural split (#562): the engine re-exports the moved names so existing
@@ -37,7 +38,7 @@ from .taint_models import (  # noqa: F401
     _model_buffer_source_args, TaintError, BoundedSink,
     _coerce_model_map, _validate_model_interior, load_models,
     model_overlay_sources, _canonical_cxx_alloc, lookup_model,
-    _try_arg_index, model_arg_indices,
+    _try_arg_index, model_arg_indices, model_is_benign_marker,
 )
 from .taint_il import (  # noqa: F401
     reaching_reg_def, reaching_arg_seed_vars, op_name, is_ssa_var,
@@ -74,6 +75,40 @@ from . import taint_result as _taint_result_mod  # noqa: F401
 # contract: crossing it sets ``stats.truncated``/``truncation_cause`` and emits a
 # ``caller_sites_truncated`` leaf naming the counts (#810).
 MAX_CALLERS = 16
+
+# Memory-SSA versions the backward local-buffer writer walk follows from the
+# sink back toward the function entry before it gives up. Exceeding it sets
+# ``stats.truncated`` (cause ``memory_chain``) and emits a blocking leaf: a
+# writer behind the cut is absent from the slice, and the PR-928 review showed
+# a silent cut letting a one-byte store past it claim a complete slice.
+MEM_CHAIN_BUDGET = 256
+
+# BN's stores to a stack slot BY NAME (no address expression): an address-taken
+# local written as a whole or by field offset. They are memory definitions
+# without ``src_memory``/``dest_memory`` -- only ``ssa_memory_version``.
+_NAMED_STORE_OPS = frozenset({
+    "MLIL_SET_VAR_ALIASED", "MLIL_SET_VAR_ALIASED_FIELD", "MLIL_SET_VAR_FIELD",
+})
+
+
+class _BufferSeed:
+    """A backward seed that is the CONTENTS of a buffer the sink was handed by
+    address with the address folded into the call parameter itself
+    (``popen(&cmd, "r")``, ``popen(&line + off, "r")``), rather than an SSA
+    variable. The same shape one definition away (``p#1 = &cmd; popen(p#1)``)
+    walks the buffer's writers; this makes the folded form take the same path
+    instead of a hard "reads no variable" seed error -- or, with a variable
+    offset, instead of following only the offset (round 4 P1). ``local`` is
+    the local buffer, or ``addr`` a writable global the operand is built on
+    (``g_hosts + (i << 6)``), which the slice reports as a leaf. ``name``
+    renders as ``&cmd`` / the address through ``var_label`` so the slice's
+    ``sink.seed`` says what was seeded."""
+    __slots__ = ("local", "addr", "name")
+
+    def __init__(self, local: Any = None, *, addr: int | None = None):
+        self.local = local
+        self.addr = addr
+        self.name = f"&{var_label(local)}" if local is not None else hex(int(addr or 0))
 
 
 # --------------------------------------------------------------------------
@@ -1043,6 +1078,46 @@ class TaintEngine:
         except Exception:
             return False
 
+    def _const_ptr_storage(self, addr: int) -> str:
+        """Storage class of the constant address *addr* a writer operand points
+        at: ``"readonly"`` (a string literal in ``.rodata``/code -- the bytes
+        are established by the binary), ``"writable"`` (a ``.data``/``.bss``
+        global any function may have filled -- NOT a literal, round 3 P1) or
+        ``"unknown"`` (a view with neither section semantics nor segment
+        permissions for the address: the unit fakes). Section semantics first
+        (``get_sections_at``), then segment permissions."""
+        secs = []
+        getsecs = getattr(self.bv, "get_sections_at", None)
+        if getsecs is not None:
+            try:
+                secs = list(getsecs(int(addr)) or [])
+            except Exception:
+                secs = []
+        verdicts: set[str] = set()
+        for sec in secs:
+            sem = getattr(sec, "semantics", None)
+            try:
+                sem_i = int(sem)
+            except (TypeError, ValueError):
+                sem_i = {"ReadOnlyCodeSectionSemantics": 1, "ReadOnlyDataSectionSemantics": 2,
+                         "ReadWriteDataSectionSemantics": 3}.get(
+                    str(getattr(sem, "name", sem)), 0)
+            if sem_i in (1, 2):
+                verdicts.add("readonly")
+            elif sem_i == 3:
+                verdicts.add("writable")
+        if "writable" in verdicts:
+            return "writable"
+        if "readonly" in verdicts:
+            return "readonly"
+        fn = getattr(self.bv, "is_offset_writable", None)
+        if fn is None:
+            return "unknown"
+        try:
+            return "writable" if fn(int(addr)) else "readonly"
+        except Exception:
+            return "unknown"
+
     # -- memory-SSA load/store correlation (Phase 3C) ---------------------
     # BN's memory SSA is a single global chain (a load's `src_memory` def is the
     # most-recent store, not necessarily an aliasing one), so we walk the version
@@ -1461,6 +1536,614 @@ class TaintEngine:
             if hit is not None:
                 return ("source", defn, hit)
         return None
+
+    def _model_out_arg_indices(self, model: dict[str, Any]) -> list[int]:
+        """Argument indices a model WRITES through (``*arg:N`` in a ``propagates``
+        ``to``, a ``sources`` ``to``, the ``varargs`` ``to`` or a ``writes``
+        entry -- the literal fill of a ``memset``/``bzero``), in rule order."""
+        out: list[int] = []
+        toks = [r.get("to") for r in (model.get("propagates") or [])]
+        toks += [s.get("to") for s in (model.get("sources") or [])]
+        toks.append((model.get("varargs") or {}).get("to"))
+        toks += list(model.get("writes") or [])
+        for t in toks:
+            if isinstance(t, str) and t.startswith("*arg:"):
+                i = _try_arg_index(t)
+                if i is not None and i not in out:
+                    out.append(i)
+        return out
+
+    def _mem_in(self, ins: Any) -> int | None:
+        """The memory-SSA version *ins* READS (the state before it executes).
+        ``src_memory`` where BN carries one (``MLIL_STORE_SSA``/``CALL_SSA``/
+        ``LOAD_SSA``); otherwise ``ssa_memory_version``, which every MLIL-SSA
+        instruction has and which is the ONLY form on ``MLIL_SET_VAR_ALIASED``
+        / ``SET_VAR_ALIASED_FIELD`` / ``SET_VAR_FIELD`` -- the shape a
+        ``buf[i] = c`` terminator lifts to, where a ``src_memory``-only step
+        dead-ended the chain and dropped every writer before it (PR-928 review
+        P1). ``None`` when neither is available (the unit fakes / a non-SSA
+        instruction)."""
+        for attr in ("src_memory", "ssa_memory_version"):
+            v = getattr(ins, attr, None)
+            if v is None or isinstance(v, (list, tuple)):
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _reaches_avoiding(src: Any, dst: Any, avoid: list[Any]) -> bool | None:
+        """Can control flow run from just after instruction *src* to *dst*
+        without executing any instruction in *avoid*? An instruction-granular
+        search over the IL basic blocks (``start``/``end`` instruction-index
+        ranges, ``outgoing_edges``), so a loop back-edge that re-enters the
+        source block before the reset is a path (round 4 P2: a priming
+        reset before a loop DOMINATES the `strtok(NULL)` yet the tainted
+        call at the bottom of the body reaches it around the back-edge).
+        None when the view exposes no block / edge information -- an answer
+        the caller must treat as "reachable", never as a kill. An *avoid*
+        instruction without block information is ignored (it proves no cut)."""
+        def _idx(i: Any) -> int | None:
+            try:
+                return int(getattr(i, "instr_index"))
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        sb = getattr(src, "il_basic_block", None)
+        si, di = _idx(src), _idx(dst)
+        if sb is None or getattr(dst, "il_basic_block", None) is None or si is None or di is None:
+            return None
+        stop: dict[int, bool] = {}
+        for a in avoid:
+            ai = _idx(a)
+            if ai is not None and getattr(a, "il_basic_block", None) is not None:
+                stop[ai] = False
+        stop[di] = True
+
+        def _scan(block: Any, lo: int) -> bool | None:
+            """True: *dst* is the first stop at or after *lo* in *block*;
+            False: a reset is; None: control falls through to the successors."""
+            hits = [i for i in stop if lo <= i < int(block.end)]
+            return stop[min(hits)] if hits else None
+
+        try:
+            first = _scan(sb, si + 1)
+            if first is not None:
+                return first
+            seen: set[tuple[int, int]] = set()
+            work = [sb]
+            while work:
+                for edge in list(work.pop().outgoing_edges):
+                    t = getattr(edge, "target", None)
+                    if t is None:
+                        return None     # an undetermined successor: unproven
+                    key = (int(t.start), int(t.end))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    r = _scan(t, int(t.start))
+                    if r is True:
+                        return True
+                    if r is None:
+                        work.append(t)
+        except Exception:   # noqa: BLE001 - a view without edges/ranges proves nothing
+            return None
+        return False
+
+    def _address_terms(self, expr: Any) -> tuple[list[Any], list[int]]:
+        """The ``(locals, const_addrs)`` an address expression is BUILT ON: every
+        ``&v`` / ``&v:field`` and every ``CONST_PTR`` that is a term of its
+        pointer-arithmetic tree, at ANY offset -- constant or not. ``&line +
+        rbx`` reads ``rbx``, and a walk that followed only that read dropped the
+        buffer the sink actually consumes (round 4 P1); ``0x4040a0 + (i << 6)``
+        is an element of a ``.bss`` array, not an index. Only ``ADD`` (either
+        side) and the minuend of a ``SUB`` are descended: anything else (a
+        multiply, a mask) is a value, not an address."""
+        locals_: list[Any] = []
+        addrs: list[int] = []
+
+        def visit(e: Any, depth: int) -> None:
+            if e is None or depth > 12:
+                return
+            op = op_name(e)
+            if "ADDRESS_OF" in op:
+                v = getattr(e, "src", None) or getattr(e, "var", None)
+                if v is not None and all(var_key(v) != var_key(x) for x in locals_):
+                    locals_.append(v)
+            elif "CONST_PTR" in op:
+                c = self._int_const(e)
+                if c is not None and c not in addrs:
+                    addrs.append(c)
+            elif op == "MLIL_ADD":
+                visit(getattr(e, "left", None), depth + 1)
+                visit(getattr(e, "right", None), depth + 1)
+            elif op == "MLIL_SUB":
+                visit(getattr(e, "left", None), depth + 1)
+
+        visit(expr, 0)
+        return locals_, addrs
+
+    def _folded_buffer_seeds(self, expr: Any) -> list[_BufferSeed]:
+        """Backward seeds for the buffers a call operand is an address INTO:
+        every local it is built on, at any offset (``popen(&cmd)``,
+        ``popen(&line + off)``), and -- beside a variable offset, the
+        ``g_hosts[i]`` element shape -- every writable global. A bare
+        constant address with no reads stays the "reads no variable" seed
+        error it was (no def-chain at all)."""
+        locals_, addrs = self._address_terms(expr)
+        seeds = [_BufferSeed(loc) for loc in locals_]
+        if expr_reads(expr):
+            seeds += [_BufferSeed(addr=a) for a in addrs
+                      if self._const_ptr_storage(a) == "writable"]
+        return seeds
+
+    def _must_offset(self, ssaf: Any, expr: Any, base_key: Any,
+                     visited: set | None = None, depth: int = 0) -> int | None:
+        """The constant byte offset into local *base_key* that the pointer
+        *expr* holds on EVERY path, else None -- the must-alias question
+        coverage asks. ``&base`` is 0, ``&base:field`` / ``&base + c`` is the
+        constant, an SSA copy is its source, a ``VAR_PHI`` only when every arm
+        agrees (a loop back-edge or an arm pointing at another local does not).
+        ``_ptr_aliases_local`` answers the may-question (is this a writer at
+        all); a may-writer records its step but covers no path (round 4 P2:
+        ``p = flag ? a : b; read(fd, p, 63)`` covered ``a`` on the ``b`` path)."""
+        if expr is None or depth > 12:
+            return None
+        op = op_name(expr)
+        if "ADDRESS_OF" in op:
+            v = getattr(expr, "src", None) or getattr(expr, "var", None)
+            if v is None or var_key(v) != base_key:
+                return None
+            try:
+                return int(getattr(expr, "offset", 0) or 0) if op == "MLIL_ADDRESS_OF_FIELD" else 0
+            except (TypeError, ValueError):
+                return None
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+            rc = self._int_const(right)
+            if rc is not None and "PTR" not in op_name(right):
+                off = self._must_offset(ssaf, left, base_key, visited, depth + 1)
+                return None if off is None else off + (rc if op == "MLIL_ADD" else -rc)
+            lc = self._int_const(left)
+            if op == "MLIL_ADD" and lc is not None and "PTR" not in op_name(left):
+                off = self._must_offset(ssaf, right, base_key, visited, depth + 1)
+                return None if off is None else off + lc
+            return None
+        if "LOAD" in op:
+            # A reload of a slot: a must-alias only when the store reaching
+            # this load on the memory chain wrote a must-alias of &base
+            # (`g_stash = buf; strcpy(g_stash, host)`). A call or an
+            # unresolved store in between leaves it unproven.
+            la = self._addr_base_offset(ssaf, getattr(expr, "src", None))
+            if la is None:
+                return None
+            rw = self._reaching_writer(ssaf, getattr(expr, "src_memory", None), la,
+                                       getattr(expr, "size", None), set(), 0)
+            if rw is None or rw[0] != "store":
+                return None
+            return self._must_offset(ssaf, getattr(rw[1], "src", None), base_key,
+                                     visited, depth + 1)
+        if is_ssa_var(expr):
+            key = (var_key(expr), getattr(expr, "version", None))
+            visited = visited if visited is not None else set()
+            if key in visited:
+                return None      # a loop back-edge: the cursor moves
+            visited = visited | {key}
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is None:
+                return None
+            dop = op_name(d)
+            if dop == "MLIL_SET_VAR_SSA":
+                return self._must_offset(ssaf, getattr(d, "src", None), base_key, visited, depth + 1)
+            if dop == "MLIL_VAR_PHI":
+                offs = {self._must_offset(ssaf, a, base_key, visited, depth + 1)
+                        for a in (getattr(d, "src", None) or [])}
+                return offs.pop() if len(offs) == 1 else None
+            return None
+        reads = expr_reads(expr)
+        if len(reads) == 1 and "LOAD" not in op:
+            return self._must_offset(ssaf, reads[0], base_key, visited, depth + 1)
+        return None
+
+    def _var_byte_size(self, v: Any) -> int | None:
+        """Byte size of local *v* (a Variable / SSAVariable) from its type, or
+        None when the type carries no width (then a constant-offset store can
+        never be shown to write the WHOLE variable)."""
+        t = getattr(getattr(v, "var", v), "type", None)
+        w = getattr(t, "width", None)
+        if w is not None:
+            try:
+                return int(w)
+            except (TypeError, ValueError):
+                return None
+        m = re.fullmatch(r"(?:unsigned\s+)?char\s*\[(0x[0-9a-fA-F]+|\d+)\]", str(t or "").strip())
+        return int(m.group(1), 0) if m else None
+
+    def _ptr_aliases_local(self, ssaf: Any, expr: Any, base_key: Any, *,
+                           escaped: bool, escape_addrs: set, visited: set | None = None,
+                           depth: int = 0) -> str:
+        """Does the pointer *expr* point INTO local buffer *base_key*?
+        ``"yes"`` when it is provably built on ``&base`` (a constant or
+        non-constant offset, through SSA copies, every arm of a ``VAR_PHI``,
+        the return of a modeled call that derives it from ``&base``, or a
+        reload of the slot ``&base`` escaped into); ``"no"`` when it provably
+        is not (another local's address, a constant, a parameter / loaded /
+        callee-returned pointer while ``&base`` has NOT escaped -- a stack
+        address that was never stored can only be reached through ``&base``);
+        ``"maybe"`` otherwise -- a loaded or parameter pointer after the
+        address escaped, the return of an unmodeled call that was handed the
+        buffer, or a chain past the depth cap. ``"maybe"`` is the answer the
+        walk MUST disclose, never drop (PR-928 review round 3)."""
+        if expr is None:
+            return "no"
+        if depth > 12:
+            return "maybe"
+        op = op_name(expr)
+        if "ADDRESS_OF" in op:
+            v = getattr(expr, "src", None) or getattr(expr, "var", None)
+            return "yes" if v is not None and var_key(v) == base_key else "no"
+        if "LOAD" in op:
+            a = getattr(expr, "src", None)
+            if a is not None and "CONST_PTR" in op_name(a):
+                c = self._int_const(a)
+                if c is not None and c in escape_addrs:
+                    return "yes"
+            return "maybe" if escaped else "no"
+        if "CONST" in op or "EXTERN_PTR" in op or "IMPORT" in op:
+            return "no"
+        if is_ssa_var(expr):
+            key = (var_key(expr), getattr(expr, "version", None))
+            visited = visited if visited is not None else set()
+            if key in visited:
+                return "no"     # a loop back-edge arm adds no new base
+            visited.add(key)
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is None:
+                # A parameter / undefined register holds a value fixed before
+                # this frame existed: it cannot be this frame's stack address
+                # (an escape stores &buf AFTER entry; a reload of it is a LOAD).
+                return "no"
+            dop = op_name(d)
+            if dop == "MLIL_SET_VAR_SSA":
+                return self._ptr_aliases_local(
+                    ssaf, getattr(d, "src", None), base_key, escaped=escaped,
+                    escape_addrs=escape_addrs, visited=visited, depth=depth + 1)
+            if dop == "MLIL_VAR_PHI":
+                arms = [self._ptr_aliases_local(
+                            ssaf, a, base_key, escaped=escaped, escape_addrs=escape_addrs,
+                            visited=visited, depth=depth + 1)
+                        for a in (getattr(d, "src", None) or [])]
+                if "yes" in arms:
+                    return "yes"
+                return "maybe" if "maybe" in arms or not arms else "no"
+            if self._is_call(d):
+                # A pointer returned by a call: a modeled callee that derives
+                # its return from an argument (`strchr(buf, c)`, `p = memcpy(buf, ..)`)
+                # points where that argument did; an unmodeled callee handed the
+                # buffer may return a pointer into it.
+                params = self._call_params(d)
+                name = self._callee_name(const_target(getattr(d, "dest", None)))
+                _, model = lookup_model(self.models, name)
+                handed = [self._ptr_aliases_local(
+                              ssaf, p, base_key, escaped=escaped, escape_addrs=escape_addrs,
+                              visited=set(visited), depth=depth + 1)
+                          for p in params]
+                if model is None:
+                    if "yes" in handed or "maybe" in handed or escaped:
+                        return "maybe"
+                    return "no"
+                for rule in model.get("propagates") or []:
+                    if str(rule.get("to") or "") != "ret":
+                        continue
+                    fi = _try_arg_index(str(rule.get("from") or ""))
+                    if fi is not None and fi < len(handed) and handed[fi] != "no":
+                        return handed[fi]
+                return "no"
+            # Any other definition (a partial register write, a field read):
+            # not a pointer the walk can follow.
+            return "maybe" if escaped else "no"
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            # Pointer arithmetic: the pointer is whichever side is built on
+            # &base. Anything else (a xor, a multiply, a narrowing) is a value,
+            # not an address.
+            answers = [self._ptr_aliases_local(
+                           ssaf, getattr(expr, a, None), base_key, escaped=escaped,
+                           escape_addrs=escape_addrs, visited=visited, depth=depth + 1)
+                       for a in ("left", "right")]
+            if "yes" in answers:
+                return "yes"
+            return "maybe" if "maybe" in answers else "no"
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            # A single-variable wrapper (`MLIL_VAR_SSA`, a cast of one var).
+            return self._ptr_aliases_local(
+                ssaf, reads[0], base_key, escaped=escaped,
+                escape_addrs=escape_addrs, visited=visited, depth=depth + 1)
+        return "no"
+
+    def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
+                              base_size: int | None = None) -> dict[str, Any]:
+        """Every writer of the local buffer *base_key* on the memory-SSA chain
+        ending at version *mv* (the version the sink READS), newest first,
+        plus whether that chain accounts for the buffer on EVERY path.
+
+        GOVERNING RULE (PR-928 review rounds 1-3): the walk never EXCLUDES a
+        store, out-argument, pointer base or callee it cannot classify with
+        certainty. Every exclusion in the earlier rounds became a false
+        ``safe_to_report_complete_slice: true`` -- a phi'd loop-store pointer,
+        a modeled call reloading the stashed address, a ``.bss`` operand read
+        as a literal. Precision is applied where it is provable (a keyed slot,
+        a dominating definition, a pointer that cannot hold this frame's stack
+        address); anything else is a ``maybe`` writer the consumer turns into
+        a blocking ``address_of_local_unresolved`` leaf.
+
+        The backward twin of the forward out-param handling: a slice that
+        reaches ``p = &buf`` must continue through the bytes' producers, not
+        stop at the pointer. Returns ``{"writers": [...], "covered": bool,
+        "truncated": bool}`` where each writer is a tuple headed by its kind:
+
+        * ``("store", defn)`` -- a store whose address is built on the buffer,
+          in any of BN's store shapes (``MLIL_STORE_SSA`` through an address
+          expr, ``MLIL_SET_VAR_ALIASED[_FIELD]`` / ``SET_VAR_FIELD`` for a
+          stack slot written by name -- the ``buf[n] = 0`` terminator); any
+          offset, constant or not (a byte-wise loop fill is many stores
+          through a phi'd cursor);
+        * ``("maybe_store", defn, why)`` -- a store through a pointer the walk
+          cannot resolve (a reloaded or parameter pointer after ``&buf``
+          escaped, a pointer an unmodeled call returned after being handed
+          the buffer): it MAY write the bytes, and the slice is not complete
+          until it is accounted for;
+        * ``("fill", defn, mkey, params, from_idxs, is_source, len_idxs)`` --
+          a modeled call writing ``*arg:N`` where ``params[N]`` resolves to
+          the buffer (directly, through a phi'd pointer, or by reloading the
+          slot ``&buf`` escaped into); ``from_idxs`` are the argument indices
+          the model derives those bytes from (``propagates`` ``from`` + the
+          varargs run), ``len_idxs`` the length arguments that decide how
+          many of them (a tainted length cuts the command), ``is_source``
+          when a ``sources`` rule fills it (a receive API);
+        * ``("benign", defn, callee)`` -- a ``{}``-modeled call handed the
+          buffer: its model promises it writes nothing TAINTED, not that it
+          writes nothing, so it is recorded (not dropped) but neither covers
+          a path nor supplies an origin;
+        * ``("escape", defn)`` -- a store whose VALUE is the buffer's address
+          (``[global] = &buf``, a stack descriptor slot): from here on any
+          callee may write the bytes through the stashed pointer;
+        * ``("opaque", defn, callee, why)`` -- a call that may have written
+          the bytes and the engine cannot tell: unmodeled and handed the
+          buffer's address (or a pointer that may alias it), unmodeled and
+          run after that address escaped to memory, or modeled with an
+          out-argument pointer the walk cannot resolve while the address is
+          escaped (the backward mirror of the forward ``pointer_escape`` leaf).
+
+        ``covered`` is False when some path from the sink back to the function
+        entry crosses NO writer that accounts for the buffer -- the
+        ``if (flag) fill(buf); sink(buf)`` shape, whose memory phi has a bare
+        entry-state arm: the sink then reads whatever the stack held, and a
+        slice that names only the fill's origin is not complete. Coverage is
+        decided by the BYTES a writer provably writes, never by its kind
+        (round 4 P2): a writer covers a path only when its pointer is a
+        MUST-alias of ``&base + 0`` (``_must_offset`` -- every phi arm
+        resolves to this base at offset 0) AND it writes the whole variable:
+        a modeled fill / source / ``writes`` call at offset 0 (its model
+        declares the destination as the buffer), an unmodeled call handed
+        ``&base`` itself (its opaque leaf already blocks), a whole-variable
+        ``SET_VAR_ALIASED`` or a store at least the variable's width. An
+        escape writes no byte; an indexed store (``buf[n] = 0``), a
+        constant-offset store or fill (``buf[63] = 0``, ``strcpy(buf + 60,
+        ..)``), a may-alias writer (a phi that may point at another local, a
+        maybe-store) and a ``{}``-modeled call are writers that cover nothing.
+        A memory-phi is covered only when every arm is; a loop back-edge arm
+        is neutral (it adds no path that does not also leave through the
+        entry arm). ``truncated`` is True when the walk exhausted
+        ``MEM_CHAIN_BUDGET`` -- writers behind the cut are missing.
+
+        Deliberately does NOT stop at a full-cover writer: ``strcat`` after
+        ``strcpy`` both write offset 0 and both feed the sink, and a may-analysis
+        that drops the earlier one loses an origin. A partial store never masks
+        anything either (mirrors ``_reaching_writer``)."""
+        writers: list[tuple] = []     # oldest first while walking; reversed on return
+        # version -> (covered, escaped) once walked; None while on the stack
+        memo: dict[int, tuple[bool, bool] | None] = {}
+        truncated = False
+        # Constant addresses `&buf` was stored to: a later reload of one of
+        # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
+        escape_addrs: set[int] = set()
+
+        def _alias(expr: Any, escaped: bool) -> str:
+            return self._ptr_aliases_local(ssaf, expr, base_key, escaped=escaped,
+                                           escape_addrs=escape_addrs)
+
+        def _params_touching(params: list[Any], escaped: bool) -> tuple[list[int], list[int]]:
+            """``(yes, maybe)`` argument indices pointing into the buffer."""
+            yes: list[int] = []
+            maybe: list[int] = []
+            for i, p in enumerate(params):
+                a = _alias(p, escaped)
+                if a == "yes":
+                    yes.append(i)
+                elif a == "maybe":
+                    maybe.append(i)
+            return yes, maybe
+
+        def _at_base(params: list[Any], idxs: list[int]) -> bool:
+            """Is one of *idxs* a must-alias of ``&base + 0``?"""
+            return any(i < len(params) and self._must_offset(ssaf, params[i], base_key) == 0
+                       for i in idxs)
+
+        def _call_writer(defn: Any, escaped: bool) -> bool:
+            """Record *defn* (a call) as a writer when it can be one; True if
+            it was recorded as one that COVERS the path -- only a call whose
+            written pointer is a must-alias of ``&base + 0``."""
+            params = self._call_params(defn)
+            yes, maybe = _params_touching(params, escaped)
+            name = self._callee_name(const_target(getattr(defn, "dest", None)))
+            mkey, model = lookup_model(self.models, name)
+            callee = name or str(getattr(defn, "dest", "indirect"))
+            if model is None:
+                if yes:
+                    why = "has no taint model and received the address of"
+                elif maybe:
+                    why = "has no taint model and received a pointer that may alias"
+                elif escaped:
+                    why = "has no taint model and ran after the address of"
+                else:
+                    return False
+                writers.append(("opaque", defn, callee, why))
+                return _at_base(params, yes)
+            if not yes and not maybe:
+                # Trusted to its model: a libc model declares what the callee
+                # writes, and none of its pointers reaches the buffer -- not
+                # even by reloading the slot the address escaped into.
+                return False
+            outs = self._model_out_arg_indices(model)
+            if model_is_benign_marker(model):
+                # `{}` promises no taint flows through the call, nothing about
+                # whether it writes its pointer arguments (round 3: memset's
+                # kin were `{}` and read as "writes nothing"). Recorded, so the
+                # call is in the slice; it neither covers nor originates.
+                writers.append(("benign", defn, callee))
+                return False
+            if any(i in maybe for i in outs):
+                writers.append(("opaque", defn, callee,
+                                "writes through a pointer argument the walk cannot "
+                                "resolve (it may alias the escaped address of)"))
+                return False
+            hit = [i for i in outs if i in yes]
+            if not hit:
+                return False
+            from_idxs: list[int] = []
+            for rule in model.get("propagates") or []:
+                if _try_arg_index(str(rule.get("to") or "")) in hit:
+                    fi = _try_arg_index(str(rule.get("from") or ""))
+                    if fi is not None and fi < len(params) and fi not in from_idxs:
+                        from_idxs.append(fi)
+            va = model.get("varargs")
+            if va is not None and _try_arg_index(str(va.get("to") or "")) in hit:
+                for fi in range(max(int(va.get("first_index", 0)), 0), len(params)):
+                    if fi not in from_idxs:
+                        from_idxs.append(fi)
+            is_source = any(
+                _try_arg_index(str(s.get("to") or "")) in hit
+                for s in (model.get("sources") or []))
+            # The length operand(s) of a bounded fill decide how many of the
+            # input bytes land in the buffer -- `memcpy(buf, "lit", n)` with a
+            # tainted n cuts the command (round 3 P3).
+            sink = model.get("sink") or {}
+            len_idxs: list[int] = []
+            if sink.get("len_arg") is not None:
+                len_idxs = [int(sink["len_arg"])]
+            elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
+                len_idxs = [int(i) for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
+            len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
+            writers.append(("fill", defn, mkey or name, params, from_idxs, is_source, len_idxs))
+            # A fill at a constant offset (`strcpy(buf + 60, "x")`) or through
+            # a pointer that may point at another local writes bytes of this
+            # buffer on some path, not the buffer (round 4 P2).
+            return _at_base(params, hit)
+
+        def _store_covers(defn: Any, slot: tuple) -> bool:
+            """A keyed store covers the buffer only when it writes ALL of it."""
+            op = op_name(defn)
+            if op == "MLIL_SET_VAR_ALIASED":
+                return True
+            if base_size is None or slot[1] != 0:
+                return False
+            try:
+                width = int(getattr(defn, "size", None))
+            except (TypeError, ValueError):
+                return False
+            return width >= base_size
+
+        def rec(v: Any, depth: int) -> tuple[bool, bool]:
+            """``(covered, escaped)`` for the chain from version *v* back to
+            the entry: *covered* -- every path crosses a writer that accounts
+            for the buffer; *escaped* -- some path stores the buffer's address
+            to memory."""
+            nonlocal truncated
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                return (False, False)
+            if v in memo:
+                m = memo[v]
+                # None: *v* is on the stack -- a loop back-edge. Neutral.
+                return m if m is not None else (True, False)
+            if depth > MEM_CHAIN_BUDGET:
+                truncated = True
+                return (False, False)
+            memo[v] = None
+            try:
+                defn = ssaf.get_ssa_memory_definition(v)
+            except Exception:
+                defn = None
+            if defn is None:
+                # The entry state (mem#0): nothing on this path wrote the buffer.
+                res = (False, False)
+            elif "MEM_PHI" in op_name(defn):
+                arms = [rec(sv, depth + 1) for sv in self._mem_phi_sources(defn)]
+                res = (bool(arms) and all(c for c, _ in arms), any(e for _, e in arms))
+            else:
+                # Walk to the root FIRST so writers come out oldest-first and an
+                # escape is known before the calls that ran after it.
+                cov, esc = rec(self._mem_in(defn), depth + 1)
+                op = op_name(defn)
+                if "STORE" in op or op in _NAMED_STORE_OPS:
+                    slot = self._field_store_slot(ssaf, defn)
+                    if slot is not None and slot[0] == base_key:
+                        writers.append(("store", defn))
+                        cov = _store_covers(defn, slot) or cov
+                    elif "STORE" in op:
+                        # Not keyed to the buffer: the address may still be
+                        # built on it (a phi'd loop cursor, `[p + i]` with
+                        # `p = &buf`), or be a pointer the walk cannot pin.
+                        a = _alias(getattr(defn, "dest", None), esc)
+                        if a == "yes":
+                            writers.append(("store", defn))
+                            # Through a pointer built on &buf: covers only
+                            # at a must-alias offset 0 with the full width --
+                            # an indexed `buf[n] = 0` writes one byte.
+                            if base_size is not None \
+                                    and self._must_offset(ssaf, getattr(defn, "dest", None),
+                                                          base_key) == 0:
+                                try:
+                                    cov = int(getattr(defn, "size", 0)) >= base_size or cov
+                                except (TypeError, ValueError):
+                                    pass
+                        elif a == "maybe":
+                            # Disclosed by its own blocking leaf; it covers
+                            # nothing -- it may write elsewhere.
+                            writers.append(("maybe_store", defn,
+                                            "stores through a pointer the walk cannot "
+                                            "resolve, which may alias"))
+                    val = getattr(defn, "src", None)
+                    if _alias(val, esc) != "no":
+                        # From here every writer through the stashed pointer
+                        # is disclosed (a reload is a fill, an unmodeled call
+                        # is opaque). The escape itself writes no byte of the
+                        # buffer, so it covers no path (round 4 P2).
+                        writers.append(("escape", defn))
+                        esc = True
+                        if "STORE" in op:
+                            c = self._const_ptr_addr(ssaf, getattr(defn, "dest", None))
+                            if c is not None:
+                                escape_addrs.add(int(c))
+                elif self._is_call(defn):
+                    cov = _call_writer(defn, esc) or cov
+                res = (cov, esc)
+            memo[v] = res
+            return res
+
+        covered, _ = rec(mv, 0)
+        writers.reverse()
+        return {"writers": writers, "covered": covered, "truncated": truncated}
 
     def _field_base_is_alloc_or_param(self, ssaf: Any, func: Any, base_var: Any) -> bool:
         """True when *base_var* (the pointer a field load is based on) is itself
@@ -3387,6 +4070,17 @@ class TaintEngine:
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
+        # Static-state tokenizers (`continuation` models, e.g. strtok): the most
+        # recent call in THIS function whose `null_arg` was tainted, keyed by
+        # model key -> (tainted node, call address, call instruction). A later `strtok(NULL, ..)`
+        # reads that state, not an argument, so without it every token after
+        # the first silently dropped taint -- no leaf, no assumption.
+        continuation_state: dict[str, tuple] = {}
+        # model key -> [(addr, call instruction)] of the CLEAN non-NULL calls
+        # seen after the tainted one (address order): together they kill the
+        # continuation only when they lie on every path from the tainted call
+        # to the `strtok(NULL)` (`_reaches_avoiding`).
+        clean_resets: dict[str, list[tuple]] = {}
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -3938,6 +4632,60 @@ class TaintEngine:
                         # false all-clear survive when a tainted value is passed
                         # there through the dropped ABI register).
                         _note_under_recovered_sink_arg(argidx)
+            co = model.get("continuation")
+            if co is not None:
+                cidx = int(co.get("null_arg", 0))
+                ckey = mkey or name or "?"
+                if cidx < len(params):
+                    if self._int_const(params[cidx]) == 0:
+                        st = continuation_state.get(ckey)
+                        if st is not None:
+                            st_node, st_addr, st_ins = st
+                            # A clean non-NULL call resets libc's state -- but
+                            # it kills the continuation only when the clean
+                            # calls lie on EVERY path from the tainted call to
+                            # this one. A clean call under `if (mode)` leaves the
+                            # tainted line on the other path (round 3 P1), and a
+                            # priming reset before a loop DOMINATES the NULL
+                            # call yet the tainted call at the bottom of the
+                            # body reaches it around the back-edge (round 4
+                            # P2) -- so the test is reachability with the
+                            # resets removed, not dominance.
+                            resets = clean_resets.get(ckey) or []
+                            killed = bool(resets) and self._reaches_avoiding(
+                                st_ins, ins, [rins for _, rins in resets]) is False
+                            if not killed:
+                                for rule in model.get("propagates") or []:
+                                    if _try_arg_index(str(rule.get("from") or "")) != cidx:
+                                        continue
+                                    if self._apply_to_token(ssaf, ins, params, rule.get("to"),
+                                                            taint_node, name or "?",
+                                                            parents=[st_node]):
+                                        changed = True
+                                partial = ""
+                                if resets:
+                                    partial = (
+                                        f"; a clean {name or mkey} @ "
+                                        f"{', '.join(hex(ra) for ra, _ in resets)} resets "
+                                        f"the state on SOME path but not on every path "
+                                        f"from the tainted call to this one, so the tainted "
+                                        f"line continues on the others")
+                                add_assumption(
+                                    f"{name or mkey}(NULL, ...) @ {hex(addr)} continues the "
+                                    f"tokenizer state of the tainted {name or mkey} call @ "
+                                    f"{hex(st_addr)}: modeled flow-insensitively (the most "
+                                    f"recent tainted {name or mkey} in this function), not by "
+                                    f"control flow; a continuation of a buffer tokenized in "
+                                    f"ANOTHER function is not followed{partial}")
+                    else:
+                        hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
+                        if hit is not None:
+                            continuation_state[ckey] = (hit, addr, ins)
+                            # Resets recorded before this (address-ordered)
+                            # tainted call cannot kill what it re-arms.
+                            clean_resets.pop(ckey, None)
+                        elif not any(ra == addr for ra, _ in clean_resets.get(ckey) or []):
+                            clean_resets.setdefault(ckey, []).append((addr, ins))
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -4687,6 +5435,37 @@ class TaintEngine:
             self._truncated = True
             self._truncation_causes.add("fixpoint_exhausted")
 
+        # A tokenizer's static state still tainted when this function returns:
+        # a `strtok(NULL, ..)` in a CALLER or a CALLEE continues it, and the
+        # continuation model is per function, so that flow is not followed. The
+        # walk KNOWS it armed the state and returned with it set -- silence here
+        # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
+        # a marker the zero-sink gate withholds the all-clear on.
+        rets = [i for i in instrs if op_name(i) == "MLIL_RET"]
+        for ckey, (_, st_addr, st_ins) in continuation_state.items():
+            resets = clean_resets.get(ckey) or []
+            # The state is clean at return only when the clean resets lie on
+            # EVERY path from the tainted call to every return (the same
+            # reachability test as the in-function continuation, round 4 P2);
+            # a return reachable around them -- or a view without block
+            # information -- leaves it tainted on a path.
+            if rets and resets and all(
+                    self._reaches_avoiding(st_ins, r, [rins for _, rins in resets]) is False
+                    for r in rets):
+                continue
+            partial = ""
+            if resets:
+                partial = (f" (a clean {ckey} @ "
+                           f"{', '.join(hex(ra) for ra, _ in resets)} resets it on some "
+                           f"path but not on every path to a return)")
+            add_assumption(
+                f"tokenizer_state_escapes @ {hex(st_addr)}: the static tokenizer "
+                f"state of {ckey} is tainted by the {ckey} call @ {hex(st_addr)} when "
+                f"{func.name} returns{partial}; a {ckey}(NULL, ...) continuation in "
+                f"ANOTHER function (a caller or a callee) is not followed, so a 'no "
+                f"sinks reached' result is NOT an all-clear -- seed `bn taint forward` "
+                f"inside the function that continues the tokenizer")
+
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --
         # the flow really wasn't followed. Slots that DID correlate already carry their
@@ -5351,7 +6130,8 @@ class TaintEngine:
                 for seed_var, sink_ins in seeds:
                     sink_addr = hex(int(getattr(sink_ins, "address", 0)))
                     seed_label = var_label(seed_var)
-                    for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
+                    for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
+                                                   seed_ins=sink_ins):
                         o = sl["origin"]
                         key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
                                o.get("value"), o.get("callee"), o.get("index"))
@@ -5432,6 +6212,10 @@ class TaintEngine:
                 self._bw_leaves, self._bw_assumptions,
                 sinks_seeded=sum(1 for s in sink_status if s.get("seeded")),
                 slices=len(slices),
+                # A slice whose own origin is `unresolved` is the walk admitting
+                # it stopped short; the gate must see it even with no leaf.
+                unresolved_origins=sum(
+                    1 for sl in slices if (sl.get("origin") or {}).get("kind") == "unresolved"),
                 truncated=self._bw_truncated,
                 truncation_cause=sorted(self._bw_truncation_causes)),
             # #812: configured knobs, echoed as forward does. `max_iters` is
@@ -5451,21 +6235,279 @@ class TaintEngine:
             self._bw_assumptions.append(msg)
 
     def _backward_slice(self, func: Any, seed_var: Any, depth: int, max_depth: int,
-                        visited_funcs: set) -> list[dict[str, Any]]:
+                        visited_funcs: set, seed_ins: Any = None) -> list[dict[str, Any]]:
         """Backward def-chain slice within *func*, continuing into callers when it
         bottoms out at a parameter. Returns one slice per origin path."""
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
         visited_vars: set = set()
         origin = {"kind": "unresolved"}
+        # A LITERAL origin reached through a local buffer's writers (a `strcat`
+        # appending a constant, a `buf[n] = 0` terminator) is "weak": the buffer's
+        # writers are walked newest-first, and the sink's bytes also come from
+        # every OLDER writer, so a parameter/source/frontier origin found later
+        # replaces it instead of being dropped (PR-928 review P1: `strcpy(cmd,
+        # host); cmd[n] = 0; strcat(cmd, " -c 1")` reported origin `call:strcat`,
+        # and the caller ascent, keyed on a parameter origin, never ran). Among
+        # weak origins a literal FILL (`memcpy(buf, "lit", n)`) outranks a
+        # constant store: the bytes the sink reads come from the fill, the
+        # 1-byte terminator only ends them (round 3 P3). A slice names ONE
+        # origin, and only a parameter origin continues into the callers, so
+        # when a buffer has both a source and a parameter input (`read(fd,
+        # buf); buf[i] ^= key[i]`) the parameter wins: the source stays in the
+        # steps, the caller ascent is not lost. Ranks: 0 parameter, 1 any
+        # other strong origin (source, frontier), 2 literal fill, 3 constant.
+        origin_rank = 0
         terminal_params: dict[int, Any] = {}
 
-        def _set_origin(o):
-            nonlocal origin
-            if origin["kind"] == "unresolved":
+        def _set_origin(o, *, weak: int | bool = 0):
+            nonlocal origin, origin_rank
+            if weak is True:
+                rank = 3
+            elif weak:
+                rank = int(weak) + 1
+            else:
+                rank = 0 if o.get("kind") == "parameter" else 1
+            if origin["kind"] == "unresolved" or origin_rank > rank:
                 origin = o
+                origin_rank = rank
 
-        def walk(v, d):
+        # (buffer key, memory version) pairs already walked, so two buffers that
+        # copy into each other inside a loop cannot recurse without end.
+        visited_bufs: set = set()
+
+        def _buffer_leaf(at, label, detail, **extra):
+            leaf = {
+                "kind": "address_of_local_unresolved",
+                "address": hex(int(getattr(at, "address", 0))),
+                "buffer": label,
+                **extra,
+                "il_text": str(at),
+                "detail": detail,
+            }
+            if leaf not in self._bw_leaves:
+                self._bw_leaves.append(leaf)
+
+        def _global_leaf(at, label, addr, subject):
+            """A writable-storage global the bytes are read from: any function
+            may have set them, so they are unaccounted for (round 3 P1; round 4
+            P1 for an element `g_hosts[i]` at a non-constant offset)."""
+            _buffer_leaf(
+                at, label,
+                f"{subject} is built on the address {hex(addr)} of a global in "
+                f"writable storage, whose bytes any function may have set; they are "
+                f"unaccounted for and the slice is NOT complete -- re-run `bn taint "
+                f"forward --source var:<global>` or inspect the writes to it",
+                **{"global": hex(addr)})
+            _set_origin({"kind": "global", "address": hex(addr), "buffer": label})
+
+        def _follow_addresses(at, expr, d, mv, label, subject) -> tuple[bool, bool]:
+            """Walk every buffer *expr* is an address INTO, at any offset:
+            each local it is built on (``&line + rbx``) has its writers walked
+            at *mv*, each writable global (``0x4040a0 + (i << 6)``) is a leaf.
+            Returns ``(walked_local, global_leaf)``. The offset's own reads
+            are the caller's to walk -- both feed the bytes (round 4 P1: the
+            walk followed only the index and claimed a complete slice)."""
+            locals_, addrs = self._address_terms(expr)
+            for loc in locals_:
+                _walk_local_buffer(at, loc, d, mv)
+            glob = False
+            for addr in addrs:
+                if self._const_ptr_storage(addr) == "writable":
+                    _global_leaf(at, label, addr, subject)
+                    glob = True
+            return bool(locals_), glob
+
+        def _follow_input(at, expr, d, mv, label, what) -> str:
+            """Continue the slice through one INPUT operand of a writer of
+            *label* -- the value a store wrote, an argument a modeled fill
+            derived the bytes from. *mv* is the memory version the writer
+            READ, which is where a pointee operand's contents are read.
+            Returns ``"followed"``, ``"literal"`` (an established constant:
+            the bytes come from the writer itself) or ``"unresolved"`` (an
+            operand with no SSA reads that is neither a literal nor a local
+            the walk can follow -- a global load, an indirect address).
+
+            An address operand is a BUFFER, not a literal and not just its
+            offset (`strcpy(&cmd, &other)`, PR-928 review P1; `strcpy(buf,
+            &other[i])`, round 4 P1): its bytes are read at THIS writer's
+            input memory. Both `"ping %s"` and `g_host` reach a fill as
+            CONST_PTR; only an address into READ-ONLY storage is a literal."""
+            reads = expr_reads(expr)
+            walked, glob = _follow_addresses(at, expr, d + 1, mv, label,
+                                             f"{what} local buffer {label}")
+            for r in reads:
+                walk(r, d + 1, mv)
+            if reads or walked:
+                return "followed"
+            if glob:
+                return "unresolved"
+            if "CONST" in op_name(expr) or self._address_terms(expr)[1]:
+                # A scalar constant, or a constant address into read-only
+                # storage (at a constant offset).
+                return "literal"
+            _buffer_leaf(
+                at, label,
+                f"{what} local buffer {label} is `{expr}`, which reads no variable "
+                f"and is neither a literal nor a local the walk can follow; the "
+                f"bytes it supplies are unaccounted for and the slice is NOT "
+                f"complete")
+            _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
+            return "unresolved"
+
+        def _walk_local_buffer(defn, local, d, mv):
+            """Continue the slice through the CONTENTS of *local*, read at
+            memory version *mv* by the instruction that consumed its address
+            (*defn* is the address-of definition, or the consuming call for a
+            folded `popen(&cmd)` seed / a nested `strcpy(&cmd, &other)`)."""
+            label = var_label(local)
+            if mv is None:
+                _buffer_leaf(
+                    defn, label,
+                    f"the sink reads the contents of local buffer {label} but the "
+                    f"walk could not account for them (no memory version at the "
+                    f"sink to walk); the slice stops at the address-of and is NOT "
+                    f"complete -- re-run `bn taint forward --source var:{label}` "
+                    f"or inspect the writes to the buffer")
+                _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
+                return
+            bkey = (var_key(local), int(mv))
+            if bkey in visited_bufs:
+                return
+            visited_bufs.add(bkey)
+            res = self._local_buffer_writers(ssaf, var_key(local), mv,
+                                             base_size=self._var_byte_size(local))
+            opaque: list[str] = []
+            for w in res["writers"]:
+                kind, wdefn = w[0], w[1]
+                # The writer's own input memory: where a store's value or a
+                # fill's source buffer was read. Using the SINK's version here
+                # let a later overwrite of a source buffer (after it had been
+                # copied) pose as the copy's origin (PR-928 review P2).
+                wmv = self._mem_in(wdefn)
+                if kind == "store":
+                    steps.append(_instr_dict(wdefn, reason=f"store into local buffer {label}"))
+                    src = getattr(wdefn, "src", None)
+                    if _follow_input(wdefn, src, d, wmv, label, "the value stored into") == "literal":
+                        cval = self._int_const(src)
+                        _set_origin({"kind": "constant", "var": label,
+                                     **({"value": cval} if cval is not None else {})},
+                                    weak=2)
+                elif kind == "maybe_store":
+                    # A store through a pointer the walk cannot pin: it MAY
+                    # write the bytes. Walked (its value is in the slice) AND
+                    # disclosed -- never dropped.
+                    _, _, why = w
+                    steps.append(_instr_dict(
+                        wdefn, reason=f"store that may write local buffer {label}"))
+                    _follow_input(wdefn, getattr(wdefn, "src", None), d, wmv, label,
+                                  "the value stored through a pointer that may alias")
+                    _buffer_leaf(
+                        wdefn, label,
+                        f"`{wdefn}` {why} {label}; whether it wrote the bytes the sink "
+                        "reads is unknown, so the slice is NOT complete -- inspect "
+                        "the pointer's definition or seed inside the producing loop")
+                    opaque.append(str(wdefn))
+                elif kind == "escape":
+                    steps.append(_instr_dict(
+                        wdefn, reason=f"address of local buffer {label} stored to memory"))
+                elif kind == "benign":
+                    _, _, callee = w
+                    steps.append(_instr_dict(
+                        wdefn, reason=f"local buffer {label} passed to {callee} "
+                                      f"(benign model: writes nothing tainted)"))
+                    # The completeness claim now RESTS on a `{}` declaration
+                    # for a callee that was handed the buffer -- say so where
+                    # a reader of the result looks (round 4 P3).
+                    self._bw_assume(
+                        f"local buffer {label} is passed to {callee} @ "
+                        f"{hex(int(getattr(wdefn, 'address', 0)))}, whose model is {{}} "
+                        f"(benign: writes nothing tainted); the slice trusts that "
+                        f"declaration -- if {callee} copies an input into the buffer, "
+                        f"model it with `propagates` or the slice is incomplete")
+                elif kind == "fill":
+                    _, _, mkey, params, from_idxs, is_source, len_idxs = w
+                    steps.append(_instr_dict(
+                        wdefn, reason=f"local buffer {label} written by {mkey}"))
+                    if is_source:
+                        _set_origin({"kind": "source", "callee": mkey})
+                    states = [_follow_input(wdefn, params[i], d, wmv, label,
+                                            f"input {i} of {mkey} writing")
+                              for i in from_idxs]
+                    for i in len_idxs:
+                        if expr_reads(params[i]):
+                            steps.append(_instr_dict(
+                                wdefn, reason=f"length argument {i} of {mkey} bounds "
+                                              f"how much of the input lands in {label}"))
+                            for r in expr_reads(params[i]):
+                                walk(r, d + 1, wmv)
+                    if not is_source and all(s == "literal" for s in states):
+                        # Every input the model names is an established
+                        # constant (a literal format/string): the bytes come
+                        # from the call itself.
+                        _set_origin({"kind": "call", "callee": mkey}, weak=1)
+                else:  # opaque: a call may have written the bytes
+                    _, _, callee, why = w
+                    steps.append(_instr_dict(
+                        wdefn, reason=f"local buffer {label} may be written by {callee}"))
+                    _buffer_leaf(
+                        wdefn, label,
+                        f"{callee} {why} {label}; whether it wrote the bytes the sink "
+                        "reads is unknown, so the slice is NOT complete -- model the "
+                        "call or seed inside it",
+                        callee=callee)
+                    opaque.append(callee)
+            if opaque:
+                # Deferred past the loop so a real origin reached through another
+                # writer (a modeled fill from a parameter) wins the slice's
+                # origin and the opaque call stays what it is: a frontier leaf.
+                _set_origin({"kind": "address_of_local_unresolved",
+                             "buffer": label, "callee": opaque[0]})
+            if res["truncated"]:
+                # Writers behind the cut are absent: the same contract as the
+                # caller-site cap (#810) -- stats say truncated, a blocking
+                # leaf says where, and the gate withholds.
+                self._bw_truncated = True
+                self._bw_truncation_causes.add("memory_chain")
+                _buffer_leaf(
+                    defn, label,
+                    f"the memory-SSA chain from the sink back through the writers "
+                    f"of local buffer {label} exceeded the walk budget "
+                    f"({MEM_CHAIN_BUDGET} versions); writers before the cut are "
+                    "missing and the slice is NOT complete -- seed closer to the "
+                    "sink or inspect the earlier writes to the buffer")
+                _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
+            elif not res["covered"]:
+                benign = [w[2] for w in res["writers"] if w[0] == "benign"]
+                if benign and len(benign) == len(res["writers"]):
+                    why = (f"the only call that touches it is {', '.join(dict.fromkeys(benign))}, "
+                           "modeled {} -- which promises no TAINTED write, not that "
+                           "the call fills the buffer -- so no path is proven to write it")
+                elif res["writers"]:
+                    why = ("on at least one path from the function entry to the "
+                           "sink nothing is proven to write the whole buffer -- a "
+                           "conditional or loop-only fill, or only partial, indexed, "
+                           "offset or may-alias writes -- so there the sink may read "
+                           "whatever the stack held")
+                else:
+                    why = "no writer of the buffer was found on the sink's memory chain"
+                _buffer_leaf(
+                    defn, label,
+                    f"the sink reads the contents of local buffer {label} but the "
+                    f"walk could not account for them ({why}); the slice is NOT "
+                    f"complete -- re-run `bn taint forward --source var:{label}` "
+                    "or inspect the writes to the buffer")
+                # Classified like `field_load_unresolved`: the origin names the
+                # stop and the leaf is the one frontier entry, so the frontier
+                # count is not inflated by counting one stop twice.
+                _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
+
+        def walk(v, d, mv):
+            """Backward over the def-chain of SSA value *v*. *mv* is the memory
+            version at which the value is CONSUMED as a buffer (the sink call,
+            or the modeled fill / store that read it) -- it rides unchanged
+            through copies and arithmetic, because a pointer's pointee is read
+            where the pointer is dereferenced, not where it was defined."""
             nonlocal origin
             if d > self.max_depth:
                 self._bw_assume(
@@ -5487,16 +6529,15 @@ class TaintEngine:
                     via_spill = pidx is not None
                 if pidx is not None:
                     terminal_params[pidx] = v
-                    if origin["kind"] == "unresolved":
-                        origin = {"kind": "parameter", "index": pidx, "var": var_label(v),
-                                  **({"via_spill": True} if via_spill else {})}
+                    _set_origin({"kind": "parameter", "index": pidx, "var": var_label(v),
+                                 **({"via_spill": True} if via_spill else {})})
                     if via_spill:
                         self._bw_assume(
                             f"stack local {var_label(v)} appears to be a spill of param "
                             f"{pidx} (its slot has a single store of the incoming parameter); "
                             f"canonicalized to param:{pidx} so caller-ascent continues (#434)")
-                elif origin["kind"] == "unresolved":
-                    origin = {"kind": "entry", "var": var_label(v)}
+                else:
+                    _set_origin({"kind": "entry", "var": var_label(v)})
                 return
             if self._is_call(defn):
                 target = const_target(getattr(defn, "dest", None))
@@ -5512,10 +6553,58 @@ class TaintEngine:
                     if leaf not in self._bw_leaves:
                         self._bw_leaves.append(leaf)
                 else:
-                    origin = {"kind": "call", "callee": name}
+                    # A modeled return that DERIVES from an argument (`memcpy`
+                    # returns its destination, `strchr` a pointer into its
+                    # haystack): the value is that argument's, so the slice
+                    # continues through it -- `popen(memcpy(buf, ..))` at -O2
+                    # stopped here as a complete `call: memcpy` (round 3).
+                    ret_from = [_try_arg_index(str(r.get("from") or ""))
+                                for r in (model or {}).get("propagates") or []
+                                if str(r.get("to") or "") == "ret"]
+                    cparams = self._call_params(defn) if ret_from else []
+                    states: list[str] = []
+                    for fi in ret_from:
+                        if fi is None or fi >= len(cparams):
+                            continue
+                        steps.append(_instr_dict(
+                            defn, reason=f"return of {mkey or name} derives from its argument {fi}"))
+                        states.append(_follow_input(
+                            defn, cparams[fi], d, mv, var_label(v),
+                            f"argument {fi} of {mkey or name} returned by"))
+                    if not states:
+                        _set_origin({"kind": "call", "callee": name})
+                    elif all(s == "literal" for s in states):
+                        _set_origin({"kind": "call", "callee": mkey or name}, weak=1)
                 return
             steps.append(_instr_dict(defn, reason="definition"))
             src_expr = getattr(defn, "src", None)
+            # `p = &local` / `p = &line + off` / `p = g_hosts + (i << 6)`: the
+            # sink consumes the CONTENTS of whatever buffer the pointer is
+            # built on, not the pointer, so the slice must continue through
+            # whatever wrote them -- the `snprintf(buf, n, fmt, obj->field);
+            # popen(buf)` shape used to stop here with origin `unresolved` and
+            # no leaf, and a variable offset followed only the index (round 4
+            # P1). The bytes are read at the consumer's memory version *mv*,
+            # so the writers are found on its memory-SSA chain; the offset's
+            # own reads are walked too -- they pick which bytes.
+            walked, glob = _follow_addresses(defn, src_expr, d, mv, var_label(v),
+                                             f"the pointer {var_label(v)}")
+            if walked or glob:
+                for r in expr_reads(src_expr):
+                    walk(r, d + 1, mv)
+                return
+            if src_expr is not None and op_name(src_expr) in ("MLIL_VAR_ALIASED",
+                                                               "MLIL_VAR_ALIASED_FIELD"):
+                # `i = buf[0] @ mem#k`: a read of an address-taken local BY
+                # NAME -- the bytes are the buffer's contents at this
+                # instruction's memory version, so the writers on that chain
+                # are the value's producers (the xor-loop `buf[i] ^= key[i]`
+                # reads the `read` fill through exactly this shape; round 3).
+                aliased = getattr(src_expr, "src", None)
+                aliased = getattr(aliased, "var", aliased)
+                if aliased is not None:
+                    _walk_local_buffer(defn, aliased, d, self._mem_in(defn))
+                    return
             if src_expr is not None and "LOAD" in op_name(src_expr):
                 la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
                 if la is not None:
@@ -5531,7 +6620,7 @@ class TaintEngine:
                         st_reads = expr_reads(getattr(store_defn, "src", None))
                         if st_reads:
                             for r in st_reads:
-                                walk(r, d + 1)
+                                walk(r, d + 1, mv)
                         else:
                             cval = self._int_const(getattr(store_defn, "src", None))
                             if cval is not None:
@@ -5573,15 +6662,27 @@ class TaintEngine:
             # `unresolved` -- for an auditor those are opposite risk conclusions
             # (#43). The narrow case the issue targets: a constant reached through
             # one or more variable copies (var = 0; r2 = var), where the direct
-            # immediate is already handled at seeding time.
-            if not reads and origin["kind"] == "unresolved":
+            # immediate is already handled at seeding time. Weak: reached as one
+            # input of a local buffer's writer (`rsi = " -c 1"; strcat(cmd, rsi)`)
+            # it must not outrank the parameter an older writer copied in.
+            if not reads:
                 cval = self._int_const(getattr(defn, "src", None))
                 if cval is not None:
-                    origin = {"kind": "constant", "value": cval, "var": var_label(v)}
+                    _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
+                                weak=True)
             for r in reads:
-                walk(r, d + 1)
+                walk(r, d + 1, mv)
 
-        walk(seed_var, 0)
+        seed_mv = self._mem_in(seed_ins) if seed_ins is not None else None
+        if isinstance(seed_var, _BufferSeed):
+            # `popen(&cmd, "r")` with the address folded into the parameter:
+            # the seed IS the buffer's contents, read by the sink call itself.
+            if seed_var.local is not None:
+                _walk_local_buffer(seed_ins, seed_var.local, 0, seed_mv)
+            else:
+                _global_leaf(seed_ins, seed_var.name, int(seed_var.addr), "the sink argument")
+        else:
+            walk(seed_var, 0, seed_mv)
         base_steps = list(reversed(steps))
 
         # continue into callers only when the value's origin here is a parameter
@@ -5625,16 +6726,21 @@ class TaintEngine:
                 cparams = self._call_params(call_ins)
                 if pidx >= len(cparams):
                     continue
-                seeds = expr_reads(cparams[pidx])
+                # `run(&buf)` / `run(&buf + i)` with the address folded into
+                # the call parameter: the callee's parameter is the buffer's
+                # contents, so the ascent walks the caller's writers of it --
+                # the same path `p = &buf; run(p)` takes -- beside the offset.
+                seeds: list[Any] = (expr_reads(cparams[pidx])
+                                    + self._folded_buffer_seeds(cparams[pidx]))
                 if not seeds:
-                    # arg has no SSA value reads (e.g. &localbuf); can't follow scalar slice
                     self._bw_assume(
-                        f"arg {pidx} at {hex(addr)} in {caller.name} is not a trackable scalar; "
-                        "caller slice not followed")
+                        f"arg {pidx} at {hex(addr)} in {caller.name} is not a trackable "
+                        "scalar; caller slice not followed")
                     continue
                 boundary = _instr_dict(call_ins, reason=f"passed as arg {pidx} to {func.name}")
                 for sv in seeds:
-                    for sub in self._backward_slice(caller, sv, depth + 1, max_depth, visited_funcs):
+                    for sub in self._backward_slice(caller, sv, depth + 1, max_depth, visited_funcs,
+                                                    seed_ins=call_ins):
                         results.append({
                             "steps": sub["steps"] + [boundary] + base_steps,
                             "origin": sub["origin"],
@@ -5727,8 +6833,17 @@ class TaintEngine:
                 max_params = max(max_params, len(params))
                 if idx < len(params):
                     saw_in_range = True
-                    for r in expr_reads(params[idx]):
+                    reads = expr_reads(params[idx])
+                    for r in reads:
                         out.append((r, c))
+                    # `popen(&cmd, "r")` / `popen(&line + off, "r")`: BN folded
+                    # the address into the parameter. The sink reads the
+                    # buffer's contents, which the slice walks exactly as it
+                    # does for `p = &cmd; popen(p)` -- a seed error (or, with
+                    # a variable offset, a slice of only the offset) was the
+                    # same bug with a second answer.
+                    for bs in self._folded_buffer_seeds(params[idx]):
+                        out.append((bs, c))
             if not out:
                 # The locator was fine; the arg itself can't be sliced. Say so
                 # precisely instead of blaming the --sink locator.

@@ -5,10 +5,12 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import struct
 import sys
 import threading
 import time
@@ -25,6 +27,7 @@ ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
+CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -161,8 +164,11 @@ def _session_start(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> d
 
 
 def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
+    # Teardown, so the discard is deliberate: a test that mutated its private
+    # copy and never saved would otherwise be REFUSED here (#925) and leak the
+    # bridge until the idle reaper caught it.
     subprocess.run(
-        [*_BN_CLI, "session", "stop", instance_id],
+        [*_BN_CLI, "session", "stop", instance_id, "--discard-unsaved"],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -303,6 +309,86 @@ class TestMultiInstance:
                 _session_stop(id_b)
         finally:
             _session_stop(id_a)
+
+
+class TestSessionStopUnsavedGuard:
+    """`session stop` must not discard unsaved work -- least of all because the
+    bridge was busy (#925). A private session, because the stop IS the subject.
+    """
+
+    def test_a_busy_bridge_refuses_promptly_and_keeps_the_unsaved_rename(self, tmp_path):
+        """Both reviewers reproduced the hole on a real bridge: `list_targets`
+        waits on the read lock a `py exec` holds, the probe timed out, the
+        timeout read as "no targets", and the stop went through with the
+        rename lost. Now a bridge that is reached but does not answer refuses
+        within the probe's own budget -- not `BN_REQUEST_TIMEOUT` -- and sends
+        no shutdown, so the rename is still there once the bridge is free.
+        """
+        from bn.commands.admin import _UNSAVED_PROBE_TIMEOUT
+
+        copy = tmp_path / "parser"
+        shutil.copyfile(HELLO_BINARY, copy)
+        copy.chmod(0o755)
+        info = _session_start(str(copy))
+        inst = info["instance_id"]
+        try:
+            listing = json.loads(
+                _bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            items = listing.get("items") if isinstance(listing, dict) else listing
+            symbol = items[0]["name"]
+            renamed = _bn("--instance", inst, "rename", symbol, "UNSAVED_GUARD_MARKER",
+                          "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+            targets = json.loads(
+                _bn("--instance", inst, "target", "list", "--format", "json").stdout)["items"]
+            assert [t["unsaved"] for t in targets] == [True]
+            selector = targets[0]["selector"]
+
+            # An idle bridge answers: the refusal names the dirty target.
+            refused = _bn("session", "stop", inst)
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+            assert f"-t {selector}" in refused.stderr
+            assert f"bn -i {inst} -t {selector} save" in refused.stderr
+
+            # A busy bridge does not: `py exec` holds the write lock for longer
+            # than the probe budget, so the stop must refuse on "cannot verify"
+            # -- promptly, with the bridge's own 600s request default in force.
+            hold = 3 * _UNSAVED_PROBE_TIMEOUT
+            busy = subprocess.Popen(
+                [*_BN_CLI, "--instance", inst, "py", "exec",
+                 f"import time; time.sleep({hold})"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env(),
+            )
+            try:
+                time.sleep(1.0)
+                started = time.monotonic()
+                stop = _bn("session", "stop", inst, "--format", "json", timeout=hold)
+                elapsed = time.monotonic() - started
+                assert stop.returncode == 2, f"{stop.stdout}\n{stop.stderr}"
+                assert "cannot verify whether instance" in stop.stderr
+                assert "no shutdown was sent" in stop.stderr
+                assert "--discard-unsaved" in stop.stderr
+                assert elapsed < 2 * _UNSAVED_PROBE_TIMEOUT, (
+                    f"the probe waited {elapsed:.1f}s behind the write lock")
+            finally:
+                busy.wait(timeout=hold + 30)
+
+            # The bridge survived the refusal with the rename it was protecting.
+            found = _bn("--instance", inst, "function", "search", "UNSAVED_GUARD_MARKER",
+                        "--format", "json")
+            assert found.returncode == 0, f"{found.stdout}\n{found.stderr}"
+            payload = json.loads(found.stdout)
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            assert [row["name"] for row in rows] == ["UNSAVED_GUARD_MARKER"]
+
+            # Explicit consent stops it and discloses exactly the dirty target.
+            stopped = _bn("session", "stop", inst, "--discard-unsaved", "--format", "json")
+            assert stopped.returncode == 0, f"{stopped.stdout}\n{stopped.stderr}"
+            result = json.loads(stopped.stdout)
+            assert result["stopped"] is True
+            assert result["discarded_unsaved"] == [{"selector": selector, "path": str(copy)}]
+        finally:
+            _session_stop(inst)
 
 
 class TestSavePathIdentity:
@@ -898,10 +984,18 @@ def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
 
     A plain function, not the fixture body, so the budget guard below can call
     it with a recording stand-in instead of spending the 20s for real.
+
+    A missing cross-compiler or a failed cross-compile is a visible skip by
+    default and a FAILURE under `BN_REQUIRE_REAL_TESTS=1` (`refuse_silent_skip`):
+    every test on this probe is a real-architecture guard the mocked suite
+    cannot stand in for, so a strict lane that lost the toolchain must say so
+    rather than report green with the guard unexercised.
     """
     cc = shutil.which("aarch64-linux-gnu-gcc")
     if cc is None:
-        pytest.skip("aarch64-linux-gnu-gcc not available")
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc not available, so the AArch64 probe lane did not "
+            "run; install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
     workdir = tmp_path_factory.mktemp("aarch64-probe")
     src = workdir / "probe.c"
     src.write_text("int add(int a, int b){return a + b;}\nint main(){return add(1, 2);}\n")
@@ -911,7 +1005,9 @@ def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
         capture_output=True, text=True, timeout=120,
     )
     if build.returncode != 0:
-        pytest.skip(f"aarch64 cross-compile failed: {build.stderr}")
+        refuse_silent_skip(
+            f"aarch64 cross-compile failed (exit {build.returncode}), so the AArch64 "
+            f"probe lane did not run; fix the cross toolchain: {build.stderr.strip()}")
     selector = bridge.load(probe, copy=False, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
     saved = bridge.run("save", "--target", selector, "--format", "json")
     assert saved.returncode == 0, f"priming save failed: {saved.stderr}\n{saved.stdout}"
@@ -977,6 +1073,193 @@ class TestDisasmLinearAArch64:
                             "--mode", "arm", "--format", "json")
         assert res.returncode != 0, res.stdout
         assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
+
+
+class TestOrientStringsSampleAArch64:
+    """M-12 real-path guard. On a static AArch64 ELF, BN's string scan accepts
+    runs of instruction bytes that happen to decode as printable ASCII, and
+    `.text` sits below `.rodata` in the address space -- so the orient sample,
+    the head of an address-ordered scan, was twenty rows of `@8\\t@`-shaped junk
+    (plus the ELF header, which no section claims) on every such file, while
+    `strings --section .rodata` had the real literals. The mocked tests prove
+    the ranking; this proves BN's real section semantics drive it: no sampled
+    section is `ReadOnlyCode`, the sample names its sections, and the default
+    `strings` dump leads with the same sections."""
+
+    def test_orient_sample_comes_from_data_sections(self, shared_bn, aarch64_probe):
+        shared_bn.load(aarch64_probe, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        semantics = {s["name"]: s["semantics"] for s in sections["items"]}
+        assert "ReadOnlyCode" in semantics.values(), semantics  # premise: BN marks code
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert sample["items"], orient
+        assert "sample_fallback" not in sample, sample
+        drawn = sample["sample_sections"]
+        assert drawn, sample
+        assert all(semantics[name] != "ReadOnlyCode" for name in drawn), (drawn, semantics)
+        # every sampled row is claimed by one of the named sections -- no header row
+        starts = {name: (int(s["start"], 16), int(s["end"], 16))
+                  for name, s in ((s["name"], s) for s in sections["items"])}
+        for row in sample["items"]:
+            addr = int(row["address"], 16)
+            assert any(lo <= addr < hi for lo, hi in (starts[n] for n in drawn)), (row, drawn)
+
+        # The default dump (at orient's min-length) leads with the same
+        # data-section strings, names the code / metadata sections it ranked
+        # last -- never `.rodata` -- and `.rodata` is the data section the tip
+        # recommends narrowing to.
+        dump = json.loads(shared_bn.run(
+            "strings", "--limit", "5", "--min-length", str(orient["strings_min_length"]),
+            "--format", "json").stdout)
+        assert [r["value"] for r in dump["items"]] == [r["value"] for r in sample["items"][:5]]
+        assert dump["noise_strings"] > 0, dump
+        assert ".rodata" not in dump["noise_sections"], dump["noise_sections"]
+        assert dump["data_sections"][0] == ".rodata", dump["data_sections"]
+        text = shared_bn.run("strings", "--limit", "5").stdout
+        assert "// tip:" in text and "--section .rodata" in text, text
+        # Under a filter the caller chose, the text states where the matches
+        # sit instead of recommending the flag already in use.
+        narrowed = shared_bn.run("strings", "--limit", "5", "--min-length",
+                                 str(orient["strings_min_length"])).stdout
+        assert "// note:" in narrowed and "narrow with" not in narrowed, narrowed
+
+
+def _strip_section_headers(binary: Path, out: Path) -> Path:
+    """*binary* with its ELF64 section-header table unlinked (e_shoff / e_shnum /
+    e_shstrndx zeroed) -- what `objcopy --strip-section-headers` produces,
+    without needing a binutils new enough to have that flag. BN then recovers
+    only what the dynamic segment describes (`.interp`, `.dynamic`, `.got_*`)
+    and marks no code section at all."""
+    data = bytearray(binary.read_bytes())
+    assert data[:4] == b"\x7fELF" and data[4] == 2, "an ELF64 fixture"
+    struct.pack_into("<Q", data, 0x28, 0)
+    struct.pack_into("<H", data, 0x3c, 0)
+    struct.pack_into("<H", data, 0x3e, 0)
+    out.write_bytes(data)
+    out.chmod(0o755)
+    return out
+
+
+class TestStringsRankingWithoutCodeSections:
+    """M-12 round 2: BN 6.1 never produces a sectionless view -- every loader
+    adds `.synthetic_builtins` (an ExternalSection) -- so a classifier that
+    treats "has any section" as "sectioned" and "no section claims it" as
+    noise ranks EVERY string of a raw image or a section-header-stripped ELF
+    as `(no section)` noise: the literals printed under a tip calling them
+    code bytes, and orient claiming it fell back past the data sections. The
+    mocked `_RawBV` used to have no `sections` attribute at all, a shape BN
+    never gives, which is why the suite could not see it; these drive the real
+    loader."""
+
+    _LITERALS = ("vxWorks boot loader", "boot: %s", "default.cfg")
+
+    def test_raw_mapped_view_strings_are_literals_not_noise(self, shared_bn, tmp_path):
+        image = bytearray(0x400)
+        for offset, literal in zip((0x100, 0x200, 0x300), self._LITERALS):
+            image[offset:offset + len(literal) + 1] = literal.encode() + b"\0"
+        blob = tmp_path / "firmware.bin"
+        blob.write_bytes(image)
+        shared_bn.load(blob, copy=False)
+
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        # premise: the raw view is NOT sectionless -- only the synthetic one
+        assert {s["semantics"] for s in sections["items"]} == {"ExternalSection"}, sections
+
+        dump = json.loads(shared_bn.run("strings", "--format", "json").stdout)
+        assert [r["value"] for r in dump["items"]] == list(self._LITERALS), dump
+        assert dump["noise_strings"] == 0 and dump["noise_sections"] == [], dump
+        assert dump["data_sections"] == [], dump
+        text = shared_bn.run("strings").stdout
+        assert "tip:" not in text and "code bytes" not in text, text
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert "sample_fallback" not in sample, sample
+        assert [r["value"] for r in sample["items"]] == list(self._LITERALS), sample
+        assert sample["sample_sections"] == [], sample
+
+    def test_section_header_stripped_elf_keeps_literals_as_data(self, shared_bn, tmp_path):
+        stripped = _strip_section_headers(HELLO_BINARY, tmp_path / "hello_stripped")
+        shared_bn.load(stripped, copy=False)
+
+        sections = json.loads(shared_bn.run("sections", "--format", "json").stdout)
+        semantics = {s["name"]: s["semantics"] for s in sections["items"]}
+        # premise: BN recovered loader metadata from the dynamic segment, but
+        # marked no code section -- so it has not said where code is.
+        assert "ReadOnlyCode" not in semantics.values(), semantics
+        assert any(name.startswith(".interp") for name in semantics), semantics
+
+        dump = json.loads(shared_bn.run("strings", "--format", "json").stdout)
+        values = [r["value"] for r in dump["items"]]
+        assert "starting up" in values and "greeting length: %d\n" in values, values
+        # the unclaimed addresses (code AND literals) are data, in address
+        # order; only the recovered metadata sections rank last
+        assert "(no section)" not in dump["noise_sections"], dump["noise_sections"]
+        assert all(name.startswith((".interp", ".dynamic", ".got")) for name in dump["noise_sections"]), dump
+        unclaimed = [int(r["address"], 16) for r in dump["items"]
+                     if r["value"] in ("starting up", "greeting length: %d\n")]
+        data_rows = [int(r["address"], 16) for r in dump["items"]][:len(dump["items"]) - dump["noise_strings"]]
+        assert data_rows == sorted(data_rows) and all(a in data_rows for a in unclaimed), dump
+
+        orient = json.loads(shared_bn.run("evidence", "orient", "--format", "json").stdout)
+        sample = orient["strings_sample"]
+        assert "sample_fallback" not in sample, sample
+        assert "starting up" in [r["value"] for r in sample["items"]], sample
+
+
+class TestAArch64ProbeStrictGate:
+    """The AArch64 probe is the only real-architecture guard the lane has; a
+    missing cross-compiler or a failed cross-compile must be a visible skip by
+    default and a FAILURE -- carrying the build diagnostics -- under
+    `BN_REQUIRE_REAL_TESTS=1`, never a silent pass of an unexercised guard."""
+
+    @staticmethod
+    def _prime(monkeypatch, tmp_path_factory, *, which, build):
+        monkeypatch.setattr(shutil, "which", which)
+        monkeypatch.setattr(subprocess, "run", build)
+        _build_and_prime_aarch64_probe(None, tmp_path_factory)
+
+    def test_missing_cross_compiler_fails_in_strict_mode(self, monkeypatch, tmp_path_factory):
+        from _pytest.outcomes import Failed, Skipped
+
+        def no_build(*a, **k):
+            raise AssertionError("must not try to compile without a compiler")
+
+        monkeypatch.delenv("BN_REQUIRE_REAL_TESTS", raising=False)
+        with pytest.raises(Skipped) as skipped:
+            self._prime(monkeypatch, tmp_path_factory, which=lambda name: None, build=no_build)
+        assert "aarch64-linux-gnu-gcc" in str(skipped.value)
+
+        monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
+        with pytest.raises((Failed, Skipped)) as failed:
+            self._prime(monkeypatch, tmp_path_factory, which=lambda name: None, build=no_build)
+        assert isinstance(failed.value, Failed), failed.value
+        assert "aarch64-linux-gnu-gcc" in str(failed.value)
+        assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
+
+    def test_failed_cross_compile_fails_in_strict_mode_with_diagnostics(self, monkeypatch,
+                                                                        tmp_path_factory):
+        from _pytest.outcomes import Failed, Skipped
+
+        def broken_build(*a, **k):
+            return subprocess.CompletedProcess(a[0] if a else [], 1, stdout="",
+                                               stderr="ld: cannot find crt1.o")
+
+        monkeypatch.delenv("BN_REQUIRE_REAL_TESTS", raising=False)
+        with pytest.raises(Skipped) as skipped:
+            self._prime(monkeypatch, tmp_path_factory,
+                        which=lambda name: "/usr/bin/" + name, build=broken_build)
+        assert "cannot find crt1.o" in str(skipped.value)
+
+        monkeypatch.setenv("BN_REQUIRE_REAL_TESTS", "1")
+        with pytest.raises((Failed, Skipped)) as failed:
+            self._prime(monkeypatch, tmp_path_factory,
+                        which=lambda name: "/usr/bin/" + name, build=broken_build)
+        assert isinstance(failed.value, Failed), failed.value
+        assert "cannot find crt1.o" in str(failed.value) and "exit 1" in str(failed.value)
+        assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
 
 
 class TestSessionStartTimeoutDiagnostics:
@@ -1308,6 +1591,275 @@ class TestLoadCacheBndbRestore:
                 cache_file.unlink()
 
 
+class TestSidecarContentValidation:
+    """A sidecar `.bndb` is preferred by path; whether it describes the bytes
+    now at that path is decided from the sha256 the bridge stamps on a raw view
+    when it OPENS it (and `bn save` carries into the database). Only real BN
+    can prove the stamp survives `create_database` and comes back through
+    `binaryninja.load` + the analyzed-view restore, that the view's bytes stay
+    what it loaded when the file is replaced underneath it, and that a legacy
+    database's stored bytes (`bv.file.raw`) hash equal to its source -- the
+    mocked lane fakes every one of those ends."""
+
+    @staticmethod
+    def _function_names(shared_bn) -> set[str]:
+        listing = shared_bn.json("function", "list", "--limit", "500")
+        return {f["name"] for f in (listing.get("items") if isinstance(listing, dict) else listing)}
+
+    def test_replaced_bytes_load_raw_and_restored_bytes_reload_the_database(
+            self, shared_bn, tmp_path):
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+
+        # Save the database for the hello bytes, then prove a plain reload
+        # prefers it with its provenance VERIFIED (no unverified note).
+        shared_bn.load(prog, copy=False)
+        saved = shared_bn.json("save")
+        assert saved["path"] == str(sidecar), saved
+        assert "note" not in saved, saved  # the stamp landed silently
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        reloaded = shared_bn.json("load", str(prog))
+        assert reloaded["path"] == str(sidecar), reloaded
+        notes = " ".join(reloaded["notes"])
+        assert "unverified" not in notes and "NOT restoring" not in notes, notes
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # Different bytes at the same path: the database must NOT be restored.
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+        replaced = shared_bn.json("load", str(prog))
+        assert replaced["path"] == str(prog), replaced
+        assert any(
+            n.startswith("NOT restoring ") and str(sidecar) in n and "--no-bndb" in n
+            for n in replaced["notes"]), replaced["notes"]
+        names = self._function_names(shared_bn)
+        assert {"add", "mul"} <= names and "greet" not in names, names
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+        # The original bytes back: the database describes them again.
+        prog.write_bytes(hello)
+        restored = shared_bn.json("load", str(prog))
+        assert restored["path"] == str(sidecar), restored
+        assert not any(n.startswith("NOT restoring ") for n in restored["notes"])
+        assert "greet" in self._function_names(shared_bn)
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_a_file_replaced_under_the_open_view_is_not_certified_by_save(
+            self, shared_bn, tmp_path):
+        """Review P1 (both reviewers): `bn save` hashed the file ON DISK, so a
+        file replaced between load and save was stamped as the database's
+        source and the stale database then matched forever. The identity is
+        taken at open; a save -- and a second save after an earlier successful
+        one -- certifies the bytes the view LOADED."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+
+        shared_bn.load(prog, copy=False)
+        first = shared_bn.json("save")
+        assert first["path"] == str(sidecar) and "note" not in first, first
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())       # replaced while open
+        second = shared_bn.json("save")
+        assert second["path"] == str(sidecar) and "note" not in second, second
+        stamp = shared_bn.json(
+            "py", "exec", "result = dict(bv.query_metadata('bn_agent_bridge'))")["result"]
+        assert stamp == {"source_sha256": hashlib.sha256(hello).hexdigest(),
+                         "source_size": len(hello)}, stamp
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+        # The database describes the hello bytes and says so; the file holds
+        # the add bytes: the raw file loads, loudly.
+        reloaded = shared_bn.json("load", str(prog))
+        assert reloaded["path"] == str(prog) and reloaded.get("already_open") is None, reloaded
+        assert any(
+            n.startswith("NOT restoring ") and str(sidecar) in n
+            for n in reloaded["notes"]), reloaded["notes"]
+        names = self._function_names(shared_bn)
+        assert {"add", "mul"} <= names and "greet" not in names, names
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+    def test_an_already_open_stale_database_is_judged_before_being_returned(
+            self, shared_bn, tmp_path):
+        """Review P1 (Astra): with the stale database explicitly open, a load
+        of the raw path found it by path and returned it `already_open` with
+        only dedupe notes. The open candidate is judged like a fresh one: the
+        explicit database stays open, the raw bytes load beside it."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+        explicit = shared_bn.json("load", str(sidecar))
+        assert explicit["path"] == str(sidecar), explicit
+        assert not any("NOT restoring" in n for n in explicit["notes"]), explicit["notes"]
+        # Round 3 P2: kept (requested explicitly), but no longer silent.
+        assert any("requested explicitly" in n for n in explicit["notes"]), explicit["notes"]
+
+        raw = shared_bn.json("load", str(prog))
+        assert raw["path"] == str(prog) and raw.get("already_open") is None, raw
+        assert any(
+            n.startswith("NOT restoring ") and "Loaded the raw file instead" in n
+            for n in raw["notes"]), raw["notes"]
+        rows = {row["filename"]: row for row in shared_bn.json("target", "list")["items"]}
+        assert set(rows) == {str(sidecar), str(prog)}, rows
+        assert rows[str(prog)]["source_verified"] is None
+        # A raw view beside its own .bndb makes the path selector ambiguous
+        # (both match `prog`); the row's target_id is the unambiguous handle.
+        listing = shared_bn.json("function", "list", "--limit", "500",
+                                 "-t", rows[str(prog)]["target_id"])
+        names = {f["name"] for f in listing["items"]}
+        assert {"add", "mul"} <= names and "greet" not in names, names
+
+        # A third load of the raw path dedupes against the raw view, and the
+        # note says the existing target was returned -- not "loaded".
+        again = shared_bn.json("load", str(prog))
+        assert again["already_open"] is True and again["path"] == str(prog), again
+        refusal = [n for n in again["notes"] if n.startswith("NOT restoring ")]
+        assert refusal and f"{prog} is already open" in refusal[0], again["notes"]
+        assert "Loaded the raw file instead" not in refusal[0]
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_a_legacy_database_is_verified_from_the_bytes_it_stores_and_stamped_on_save(
+            self, shared_bn, tmp_path):
+        """Review P2: a database saved before content validation carries no
+        record, but BN stores the original bytes in it. Real BN proves those
+        hash equal to the source file: the database is VERIFIED from them, the
+        verdict is on the target row, the next save persists the record, and
+        the reload after that is silent."""
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        # Make it a pre-validation database: strip the record and persist that.
+        shared_bn.load(sidecar, copy=False)
+        shared_bn.json("py", "exec",
+                       "bv.remove_metadata('bn_agent_bridge')\n"
+                       "result = bv.save_auto_snapshot()")
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        legacy = shared_bn.json("load", str(prog))
+        assert legacy["path"] == str(sidecar), legacy
+        notes = " ".join(legacy["notes"])
+        assert "unverified" not in notes and "NOT restoring" not in notes, notes
+        assert any(n.startswith("database provenance verified from the bytes stored in")
+                   for n in legacy["notes"]), legacy["notes"]
+        assert legacy["targets"][0]["source_verified"] is True, legacy["targets"]
+        info = shared_bn.json("target", "info")
+        assert info["source_verified"] is True, info
+        assert info["existing_annotations"]["source_verified"] is True, info
+        assert "verified against the raw file's content" in info["existing_annotations"]["provenance_hint"]
+        assert "greet" in self._function_names(shared_bn)
+        saved = shared_bn.json("save")                      # persists the in-memory stamp
+        assert saved["path"] == str(sidecar), saved
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        silent = shared_bn.json("load", str(prog))
+        assert silent["path"] == str(sidecar), silent
+        assert not any("provenance" in n for n in silent["notes"]), silent["notes"]
+        assert silent["targets"][0]["source_verified"] is True
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # ...and once stamped, other bytes at the path are refused like any
+        # other mismatch -- the hazard a record-less database left as a note.
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+        refused = shared_bn.json("load", str(prog))
+        assert refused["path"] == str(prog), refused
+        assert any(n.startswith("NOT restoring ") for n in refused["notes"]), refused["notes"]
+        assert shared_bn.run("close", str(prog)).returncode == 0
+
+    def test_an_explicitly_named_stale_database_is_kept_but_reported(
+            self, shared_bn, tmp_path):
+        """Review round 3 P2: `bn load <db>` never judged its database, so a
+        stale one came back silently (`notes: []`, `source_verified: null`).
+        It is kept -- the caller asked for it -- but the record naming other
+        bytes than the sibling raw file now holds is reported, on the load
+        notes, the row and both text faces."""
+        prog = tmp_path / "prog"
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        shared_bn.load(prog, copy=False)
+        assert shared_bn.json("save")["path"] == str(sidecar)
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+        explicit = shared_bn.json("load", str(sidecar))
+        assert explicit["path"] == str(sidecar) and explicit.get("already_open") is None, explicit
+        assert not any("NOT restoring" in n for n in explicit["notes"]), explicit["notes"]
+        note = next((n for n in explicit["notes"] if "requested explicitly" in n), None)
+        assert note and note.startswith(f"{sidecar} was saved for different bytes than {prog}"), (
+            explicit["notes"])
+        assert f"`bn load {prog} --no-bndb`" in note
+        assert explicit["targets"][0]["source_verified"] is False, explicit["targets"]
+        assert "greet" in self._function_names(shared_bn)      # the database's analysis, kept
+        info = shared_bn.json("target", "info")
+        assert info["existing_annotations"]["source_verified"] is False, info
+        text = shared_bn.run("target", "info")
+        assert text.returncode == 0 and "source-verified=false" in text.stdout, text.stdout
+        orient = shared_bn.run("evidence", "orient")
+        assert orient.returncode == 0 and "source-verified=false" in orient.stdout, orient.stdout
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+        # The original bytes back: the same explicit load verifies, silently.
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        back = shared_bn.json("load", str(sidecar))
+        assert not any("requested explicitly" in n for n in back["notes"]), back["notes"]
+        assert back["targets"][0]["source_verified"] is True, back["targets"]
+        assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+
+class TestRestartReopensAStaleDatabaseLoudly:
+    """Review round 3 P2: `session restart` reloads a saved target through its
+    row's `database_path` with `prefer_bndb` off (#753) -- an explicit database
+    open, and the one load path that still reopened a database whose raw file
+    had changed with `notes: []`. A private session: the restart IS the subject."""
+
+    def test_restart_reports_the_database_whose_raw_file_changed(self, tmp_path):
+        prog = tmp_path / "prog"
+        hello = Path(HELLO_BINARY).read_bytes()
+        prog.write_bytes(hello)
+        prog.chmod(0o755)
+        sidecar = prog.with_name("prog.bndb")
+        inst = None
+        try:
+            inst = _session_start(str(prog))["instance_id"]
+            saved = json.loads(_bn("--instance", inst, "save", "--format", "json").stdout)
+            assert saved["path"] == str(sidecar), saved
+            prog.write_bytes(Path(ADD_BINARY).read_bytes())
+
+            restarted = _bn("session", "restart", inst, "--format", "json",
+                            timeout=_SESSION_START_TIMEOUT)
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            result = json.loads(restarted.stdout)
+            reloaded = result["loaded"][0]
+            assert reloaded["path"] == str(sidecar), reloaded
+            note = next((n for n in reloaded["notes"] if "requested explicitly" in n), None)
+            assert note and note.startswith(f"{sidecar} was saved for different bytes than {prog}"), (
+                reloaded["notes"])
+            assert reloaded["targets"][0]["source_verified"] is False, reloaded["targets"]
+            rows = json.loads(_bn("--instance", inst, "target", "list", "--format", "json").stdout)
+            assert rows["items"][0]["source_verified"] is False, rows
+        finally:
+            if inst:
+                _session_stop(inst)
+
+
+
 class TestBatchFunctionCreate:
     """Regression for #308: function_create works as a batch op -- N missed
     slots can be recovered atomically alongside other mutations, --preview
@@ -1417,6 +1969,416 @@ class TestFunctionCreateSkippedAddress:
             live = shared_bn.run("function", "create", addr2, "--format", "json")
             assert json.loads(live.stdout)["results"][0]["status"] == "verified"
             assert json.loads(live.stdout)["committed"] is True
+
+
+def _function_rows(shared_bn) -> list[dict]:
+    listing = shared_bn.json("function", "list")
+    return listing.get("items", listing) if isinstance(listing, dict) else listing
+
+
+def _function_sizes(shared_bn) -> dict:
+    """`function list` sizes, keyed by name AND by `0x`-address so a test can
+    ask about a function whose name BN may re-derive after a cut."""
+    sizes: dict = {}
+    for f in _function_rows(shared_bn):
+        sizes[f["name"]] = int(f.get("size") or 0)
+        sizes[f["address"]] = int(f.get("size") or 0)
+    return sizes
+
+
+def _function_start_and_size(shared_bn, name: str) -> tuple[int, int]:
+    row = next(f for f in _function_rows(shared_bn) if f["name"] == name)
+    return int(row["address"], 16), int(row.get("size") or 0)
+
+
+def _py_line(shared_bn, code: str, key: str) -> str:
+    probe = shared_bn.run("py", "exec", code)
+    assert probe.returncode == 0, f"{probe.stdout}\n{probe.stderr}"
+    line = next((l for l in probe.stdout.splitlines() if l.startswith(key + "=")), None)
+    assert line is not None, f"{key!r} missing from py exec output:\n{probe.stdout}"
+    return line.split("=", 1)[1].strip()
+
+
+class TestFunctionCreateInteriorGuard:
+    """#927 (M-03) on real BN: a create INSIDE an existing function. Every
+    mocked assumption about this path has been wrong so far -- #675 assumed
+    two overlapping functions, M-03 found truncation, the #927 review found
+    BOTH, depending on whether the address is an instruction boundary -- so
+    the guard, its disclosure and the preview's revert are pinned against
+    BN itself on `parse_record` of the synthetic parser fixture."""
+
+    @staticmethod
+    def _host(shared_bn):
+        return _function_start_and_size(shared_bn, "parse_record")
+
+    def test_boundary_create_is_refused_previewed_and_truncates_on_request(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        start, size = self._host(shared_bn)
+        inside = hex(start + 4)      # past `endbr64`: an instruction boundary
+
+        refused = shared_bn.run("function", "create", inside)
+        assert refused.returncode == 3, f"{refused.stdout}\n{refused.stderr}"
+        assert "parse_record" in refused.stderr and hex(start) in refused.stderr
+        assert "+0x4" in refused.stderr and "instruction boundary" in refused.stderr
+        assert "truncates the host" in refused.stderr
+        assert _function_sizes(shared_bn)["parse_record"] == size
+
+        preview = shared_bn.run("function", "create", inside, "--allow-overlap", "--preview")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        first, second = preview.stdout.splitlines()[:2]
+        assert first.startswith("mutation: preview") and "overlaps=1" in first
+        assert second == f"overlapping_functions: parse_record @ {hex(start)} (+0x4, truncated)"
+        assert "dirty_after=False" in first
+        assert _function_sizes(shared_bn)["parse_record"] == size, "the preview did not restore the host"
+
+        live = shared_bn.run("function", "create", inside, "--allow-overlap", "--format", "json")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        payload = json.loads(live.stdout)
+        row = payload["results"][0]
+        assert row["status"] == "verified"
+        assert row["overlaps"] == [{"name": "parse_record", "address": hex(start), "offset": "0x4",
+                                    "instruction_boundary": True, "truncated": True}]
+        assert "was truncated at" in row["note"]
+        # The truncated host is in the audit, not only the created function.
+        assert {"address": hex(start), "before_name": "parse_record",
+                "after_name": "parse_record", "changed": True} in payload["affected_functions"]
+        sizes = _function_sizes(shared_bn)
+        assert sizes["parse_record"] == 4, sizes
+        assert sizes[hex(start + 4)] == size - 4, sizes
+
+    def test_mid_instruction_create_reports_the_host_intact(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        start, size = self._host(shared_bn)
+        inside = hex(start + 6)      # inside `mov rbp, rsp`
+
+        refused = shared_bn.run("function", "create", inside)
+        assert refused.returncode == 3
+        assert "mid-instruction" in refused.stderr and "leaves the host intact" in refused.stderr
+
+        live = shared_bn.run("function", "create", inside, "--allow-overlap")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        assert f"overlapping_functions: parse_record @ {hex(start)} (+0x6, intact)" in live.stdout
+        sizes = _function_sizes(shared_bn)
+        assert sizes["parse_record"] == size, "BN left the host intact; the status must not claim a cut"
+        assert hex(start + 6) in sizes
+
+
+def _annotate_host(shared_bn, start: int) -> str:
+    """Give the function at *start* every kind of user annotation a split
+    could lose -- name, prototype, doc comment, address comment, function
+    and address tags, a renamed+retyped local -- and return the state
+    snapshot `_host_state` reads, so a test can assert it came back."""
+    inside = hex(start + 8)
+    # The fixtures are this machine's compiler output, so the local to
+    # annotate is picked from the listing, not named in advance: a 32-bit
+    # stack local (a C `int`), retyped to its unsigned twin.
+    locals_ = json.loads(shared_bn.run("local", "list", hex(start), "--format", "json").stdout)
+    local = next(v for v in locals_["items"]
+                 if not v["is_parameter"] and v["type"] == "int32_t" and v["name"].startswith("var_"))
+    for args in (
+        ("rename", hex(start), "review_host"),
+        ("proto", "set", "review_host", "int review_host(int argc, char** argv)"),
+        ("comment", "set", "--function", "review_host", "host doc"),
+        ("comment", "set", inside, "addr note"),
+        ("tag", "add", "--function", "review_host", "--type", "Bookmarks", "--data", "fn tag"),
+        ("tag", "add", inside, "--type", "Bookmarks", "--data", "addr tag"),
+        ("local", "rename", "review_host", local["name"], "review_local"),
+        ("local", "retype", "review_host", "review_local", "uint32_t"),
+    ):
+        res = shared_bn.run(*args)
+        assert res.returncode == 0, f"{args}\n{res.stdout}\n{res.stderr}"
+    return _host_state(shared_bn, start)
+
+
+def _host_state(shared_bn, start: int) -> str:
+    return _py_line(shared_bn, (
+        f"f = bv.get_function_at({start:#x})\n"
+        f"inside = {start + 8:#x}\n"
+        "state = (f.name, f.symbol.auto, str(f.type), f.has_user_type, f.comment,\n"
+        "         bv.get_comment_at(inside),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_function_tags()),\n"
+        "         sorted(t.type.name + ':' + t.data for t in f.get_tags_at(inside)),\n"
+        "         sorted((v.name, str(v.type), f.is_var_user_defined(v)) for v in f.vars),\n"
+        "         [(hex(r.start), hex(r.end)) for r in f.address_ranges])\n"
+        "print('STATE=' + repr(state))\n"), "STATE")
+
+
+class TestFunctionCreateAnnotatedHost:
+    """#927 round 3 on real BN: what a split host's revert must put back, and
+    WHO puts it back. The repair owns only what analysis destroys and the
+    undo journal cannot restore (ranges, existence, auto symbols); every
+    user annotation is the journal's. The standalone preview proves the
+    journal alone preserves them; the batch orderings prove the repair
+    never writes a sibling's since-reverted rename back over the undo."""
+
+    def test_standalone_preview_keeps_every_user_annotation(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        assert "'review_host', False" in before and "'review_local', 'uint32_t', True" in before
+
+        preview = shared_bn.run("function", "create", hex(start + 4), "--allow-overlap", "--preview")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        assert "dirty_after=False" in preview.stdout
+        assert f"overlapping_functions: review_host @ {hex(start)} (+0x4, truncated)" in preview.stdout
+        assert _host_state(shared_bn, start) == before
+
+    def test_batch_preview_keeps_the_hosts_original_name_after_a_sibling_rename(self, shared_bn, tmp_path):
+        """The reviewer's exact repro: `[rename host, create inside it]
+        --preview` exited 0 with `rolled_back: true` and the host still
+        carrying the preview-only name."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_then_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False
+        assert summary["overlapping_functions"][0]["name"] == "preview_only_name"
+        after = _host_state(shared_bn, start)
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+        assert _function_sizes(shared_bn)["review_host"] == size
+
+    def test_failed_live_batch_really_reverts_the_rename_before_the_split(self, shared_bn, tmp_path):
+        """A later op fails, the batch rolls back: the rename row says
+        `reverted` and the view agrees -- original name, full ranges, and
+        no function at the split address."""
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        before = _annotate_host(shared_bn, start)
+        mf = tmp_path / "rename_split_fail.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(start), "new_name": "preview_only_name"},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True},
+            {"op": "function_create", "address": "0x10"}]}))
+
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 3, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert payload["rolled_back"] is True and payload["success"] is False, payload
+        assert [r["status"] for r in payload["results"]] == [
+            "reverted", "reverted", "invalid_request"], payload["results"]
+        assert _host_state(shared_bn, start) == before
+        sizes = _function_sizes(shared_bn)
+        assert sizes["review_host"] == size and hex(start + 4) not in sizes, sizes
+
+    def test_batch_preview_restores_an_auto_name_a_thunk_cut_replaced_under_a_rename(self, shared_bn, tmp_path):
+        """The analysis-owned half, in the ordering that hides it: host A of
+        the shared-tail geometry is cut down to a jump thunk, which gives it
+        an auto `j_*` symbol UNDER the sibling's user rename. The undo drops
+        the user name and the thunk name would show; the repair restores the
+        auto symbol set from its snapshot, so the baseline name is back."""
+        shared_bn.load(PARSER_BINARY)
+        base = int(_py_line(shared_bn, _SHARED_TAIL_SETUP, "BASE"), 16)
+        before = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        mf = tmp_path / "rename_then_tail_split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(base), "new_name": "user_renamed_a"},
+            {"op": "function_create", "address": hex(base + 0x12), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload["message"]
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+
+    def test_batch_preview_rolls_back_clean_on_an_implicit_named_host(self, shared_bn, tmp_path):
+        """#927 round 4: the common stripped-target shape. A host named only
+        `sub_<addr>` has NO registered symbol -- `fn.symbol` synthesizes it
+        -- so under the sibling's rename the listing held one user symbol,
+        after the undo none, and reading `fn.symbol` as a stand-in for the
+        empty listing made the implicit name an "added" auto symbol
+        `undefine_auto_symbol` cannot remove: `success:false,
+        rolled_back:false, dirty_after:true` over a view that was exactly
+        as before. The auto set is the registered listing on both reads."""
+        shared_bn.load(HELLO_BINARY)
+        host = int(_py_line(shared_bn, _IMPLICIT_HOST_SETUP, "HOST"), 16)
+        before = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert f"'sub_{host:x}', []" in before, before
+        mf = tmp_path / "rename_then_split_implicit.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": hex(host), "new_name": "temporary_name"},
+            {"op": "function_create", "address": hex(host + 4), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        summary = json.loads(preview.stdout)
+        assert summary["success"] is True and summary["rolled_back"] is True, summary
+        assert summary["dirty_after"] is False, summary
+        after = _py_line(shared_bn, _implicit_host_snapshot_code(host), "SNAP")
+        assert after == before, f"the host is not back as it was:\n{before}\n{after}"
+
+
+_IMPLICIT_HOST_SETUP = (
+    # One function with no symbol of its own -- fifteen NOPs and a RET laid
+    # over the fixture's `main` on the test's private copy, started four
+    # bytes past the ELF symbol so BN names it `sub_<addr>` and registers
+    # nothing in the symbol table.
+    "base = [f for f in bv.functions if f.name == 'main'][0].start\n"
+    "for f in list(bv.functions):\n"
+    "    if base <= f.start < base + 0x14:\n"
+    "        bv.remove_user_function(f)\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.write(base + 4, b'\\x90' * 15 + b'\\xc3')\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base + 4); bv.update_analysis_and_wait()\n"
+    "print('HOST=' + hex(base + 4))\n"
+)
+
+
+def _implicit_host_snapshot_code(host: int) -> str:
+    return (
+        f"f = bv.get_function_at({host:#x})\n"
+        f"syms = [(s.name, s.auto) for s in bv.get_symbols({host:#x}, 1)]\n"
+        "ranges = [(hex(r.start), hex(r.end)) for r in f.address_ranges] if f else None\n"
+        f"inside = bv.get_function_at({host + 4:#x}) is not None\n"
+        "print('SNAP=' + repr((f.name if f else None, syms, ranges, inside)))\n"
+    )
+
+
+_SHARED_TAIL_SETUP = (
+    # Two user functions sharing a tail, one of them discontiguous -- the
+    # geometry the #927 review reproduced on a Mapped view, rebuilt over the
+    # bytes of the fixture's `main` on the test's private copy:
+    #   A @ base   = [base, base+2) + [base+0x10, base+0x19)   jmp +0x0e ... ret
+    #   B @ base+4 = [base+4, base+0x19)                        nops ... ret
+    "base = [f for f in bv.functions if f.name == 'main'][0].start\n"
+    "for f in list(bv.functions):\n"
+    "    if base <= f.start < base + 0x19:\n"
+    "        bv.remove_user_function(f)\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.write(base, b'\\xeb\\x0e' + b'\\x90' * 22 + b'\\xc3')\n"
+    "bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base); bv.update_analysis_and_wait()\n"
+    "bv.create_user_function(base + 4); bv.update_analysis_and_wait()\n"
+    "print('BASE=' + hex(base))\n"
+)
+
+
+def _shared_tail_snapshot_code(base: int) -> str:
+    return (
+        "rows = sorted((hex(f.start), f.name, [(hex(r.start), hex(r.end)) for r in f.address_ranges])\n"
+        f"              for f in bv.functions if {base:#x} <= f.start < {base + 0x19:#x})\n"
+        "print('SNAP=' + repr(rows))\n"
+    )
+
+
+class TestFunctionCreateSplitRestore:
+    """#927 P1 on real BN: `--allow-overlap --preview` inside two hosts that
+    share a tail reported `rolled_back: true` while both hosts stayed
+    shortened and an analysis-created function owned the tail -- removing
+    the created function is not restoring the hosts. The revert now
+    verifies the hosts against a snapshot and repairs them (dropping the
+    analysis-created function, reanalyzing the hosts, putting the auto name
+    BN replaced back), on both the standalone and the batch path."""
+
+    def _build(self, shared_bn):
+        shared_bn.load(PARSER_BINARY)
+        base = int(_py_line(shared_bn, _SHARED_TAIL_SETUP, "BASE"), 16)
+        before = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        rows = eval(before)  # noqa: S307 - our own repr of hex strings and tuples
+        # The premise: two hosts share the tail and one is discontiguous.
+        assert [r[0] for r in rows] == [hex(base), hex(base + 4)], rows
+        assert rows[0][2] == [(hex(base), hex(base + 2)), (hex(base + 0x10), hex(base + 0x19))], rows
+        assert rows[1][2] == [(hex(base + 4), hex(base + 0x19))], rows
+        return base, before
+
+    def test_standalone_preview_restores_both_hosts(self, shared_bn):
+        base, before = self._build(shared_bn)
+
+        preview = shared_bn.run("function", "create", hex(base + 0x12), "--allow-overlap",
+                                "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload
+        # THE claim under test: `rolled_back: true` means the hosts are back.
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+        assert payload["results"][0]["status"] == "verified"
+        assert sorted((o["address"], o["truncated"]) for o in payload["results"][0]["overlaps"]) == [
+            (hex(base), True), (hex(base + 4), True)]
+
+    def test_batch_preview_restores_both_hosts(self, shared_bn, tmp_path):
+        base, before = self._build(shared_bn)
+        mf = tmp_path / "split.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(base + 0x12), "allow_overlap": True}]}))
+
+        preview = shared_bn.run("batch", "apply", str(mf), "--preview", "--format", "json")
+        assert preview.returncode == 0, f"{preview.stdout}\n{preview.stderr}"
+        payload = json.loads(preview.stdout)
+        assert payload["success"] is True and payload["rolled_back"] is True, payload
+        after = _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP")
+        assert after == before, f"the hosts are not back as they were:\n{before}\n{after}"
+        assert payload["results"][0]["status"] == "verified"
+        assert {o["truncated"] for o in payload["results"][0]["overlaps"]} == {True}
+        # The hosts are affected functions of the batch too, with the diff the
+        # cut would make -- not only entries under the overlap list.
+        cut_hosts = {a["address"] for a in payload["affected_functions"] if a["changed"]}
+        assert {hex(base), hex(base + 4)} <= cut_hosts, payload["affected_functions"]
+
+        # And the live run does what the preview said: both hosts cut.
+        live = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--summary")
+        assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+        summary = json.loads(live.stdout)
+        assert sorted(o["address"] for o in summary["overlapping_functions"]) == [
+            hex(base), hex(base + 4)]
+        assert _py_line(shared_bn, _shared_tail_snapshot_code(base), "SNAP") != before
+
+
+class TestBatchSiblingCreateGuard:
+    """#927 P2 on real BN: `[create X, create X+4]` without `allow_overlap`
+    exited 0 with both verified and no overlap, because the second op's
+    guard ran before the first create had analyzed ranges. The batch now
+    analyzes between two creates, so the second is refused and the whole
+    batch -- the first create included -- is rolled back."""
+
+    def test_second_create_inside_the_first_is_refused(self, shared_bn, tmp_path):
+        shared_bn.load(HELLO_BINARY)
+        start, size = _function_start_and_size(shared_bn, "main")
+        gone = _py_line(shared_bn, (
+            f"f = bv.get_function_at({start:#x})\n"
+            "bv.remove_user_function(f); bv.update_analysis_and_wait()\n"
+            f"print('GONE=' + str(bv.get_function_at({start:#x}) is None))\n"), "GONE")
+        assert gone == "True"
+
+        mf = tmp_path / "siblings.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(start)},
+            {"op": "function_create", "address": hex(start + 4)}]}))
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 3, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert [r["status"] for r in payload["results"]] == ["reverted", "invalid_request"], payload
+        assert hex(start) in payload["results"][1]["message"] and "+0x4" in payload["results"][1]["message"]
+        assert payload["rolled_back"] is True
+        # Rolled back: the second create never persisted, and whatever sits at
+        # the first address (BN may re-derive `main` from its symbol once the
+        # user suppression is lifted) is not the 4-byte stub a live cut leaves.
+        sizes = _function_sizes(shared_bn)
+        assert hex(start + 4) not in sizes, sizes
+        assert sizes.get(hex(start), size) == size, sizes
+
+        # With the flag on the second op the batch commits, and the second
+        # row names the first create as the host it truncated.
+        mf.write_text(json.dumps({"ops": [
+            {"op": "function_create", "address": hex(start)},
+            {"op": "function_create", "address": hex(start + 4), "allow_overlap": True}]}))
+        res = shared_bn.run("batch", "apply", str(mf), "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        payload = json.loads(res.stdout)
+        assert [r["status"] for r in payload["results"]] == ["verified", "verified"]
+        assert payload["results"][1]["overlaps"][0]["address"] == hex(start)
+        assert payload["results"][1]["overlaps"][0]["truncated"] is True
+        sizes = _function_sizes(shared_bn)
+        assert sizes[hex(start)] == 4 and sizes[hex(start + 4)] == size - 4, sizes
 
 
 class TestTaintEmptyVerdictHonesty:
@@ -2140,3 +3102,126 @@ class TestStackFrameMap:
         # headroom; `to_canary` is measured from its offset to the canary slot.
         buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
         assert buffer["to_canary"] == canary - buffer["storage"] >= 44
+
+
+class TestClassLensRttiGuards922:
+    """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
+    adjacency of vtables and `__si_class_type_info` records, the extern vptr of
+    those records, an imported base class whose typeinfo is a `.got`/`.extern`
+    slot, and BN demangling one template class under two spellings -- are what
+    a g++ layout produces, so the mocked fakes are checked against it here."""
+
+    def _show(self, shared_bn, name):
+        res = shared_bn.run("class", "show", name, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_single_inheritance_chain_has_no_phantom_secondaries_or_slots(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # Handler: ~Handler x2, handle (pure), name -> exactly four slots. The
+        # word after them is the next RTTI record's vptr.
+        handler = self._show(shared_bn, "svc::Handler")
+        assert handler["vtable"]["total"] == 4, handler["vtable"]
+        assert "secondary_vtables" not in handler, handler.get("secondary_vtables")
+        assert handler["bases"] == []
+        echo = self._show(shared_bn, "svc::EchoHandler")
+        assert echo["vtable"]["total"] == 4, echo["vtable"]
+        assert "secondary_vtables" not in echo
+        assert [b["name"] for b in echo["bases"]] == ["svc::Handler"]
+        # AuditHandler adds `flush()` as a fifth slot; the count is pinned so a
+        # hidden slot cannot pass the text greps below (#922 review).
+        audit = self._show(shared_bn, "svc::AuditHandler")
+        assert audit["vtable"]["total"] == 5, audit["vtable"]
+        assert audit["vtable"]["slots"][4]["method"]["name"] == "_ZN3svc12AuditHandler5flushEv"
+        text = shared_bn.run("class", "show", "svc::AuditHandler").stdout
+        assert "secondary vtable" not in text
+        assert "<external>" not in text
+
+    def test_bn_vtable_width_never_hides_slots(self, shared_bn):
+        # #922 review (P1): GCC emits the abstract `Codec`'s two destructor
+        # entries as zero words, so BN's `svc::Codec::VTable` struct is ONE slot
+        # wide (it stops at the first null) while the table has five:
+        # probe, null, null, __cxa_pure_virtual, version. Bounding the walk at
+        # BN's width reported `total: 1, scan_truncated: false`.
+        shared_bn.load(CLASSES_BINARY)
+        codec = self._show(shared_bn, "svc::Codec")
+        vt = codec["vtable"]
+        assert vt["bn_vtable_slots"] == 1, vt
+        assert vt["total"] == 5 and vt["scan_truncated"] is False, vt
+        assert [s.get("null", False) for s in vt["slots"]] == [False, True, True, False, False]
+        assert vt["slots"][3]["pure_virtual"] is True
+        assert vt["slots"][4]["method"]["name"] == "_ZN3svc5Codec7versionEv"
+        hexcodec = self._show(shared_bn, "svc::HexCodec")
+        assert hexcodec["vtable"]["total"] == 5, hexcodec["vtable"]
+        assert [b["name"] for b in hexcodec["bases"]] == ["svc::Codec"]
+
+    def test_secondary_vtable_inside_the_vtable_group_is_rtti(self, shared_bn):
+        # #922 review (P3): `Pipe : Sink, Source` keeps its Source subobject's
+        # vtable inside the `_ZTV` object at offset-to-top -8, with `_ZThn8_`
+        # thunks for slots -- the ABI's own layout, so `rtti`, not a heuristic.
+        shared_bn.load(CLASSES_BINARY)
+        pipe = self._show(shared_bn, "svc::Pipe")
+        assert [b["name"] for b in pipe["bases"]] == ["svc::Sink", "svc::Source"]
+        assert pipe["vtable"]["total"] == 4, pipe["vtable"]
+        (secondary,) = pipe["secondary_vtables"]
+        assert secondary["offset_to_top"] == -8
+        assert secondary["confidence"] == "rtti"
+        assert secondary["confidence_reason"] == "thunk_slots"
+        assert all(s["method"]["name"].startswith("_ZThn8_N3svc4Pipe") for s in secondary["slots"])
+        assert "rejected_secondary_candidates" not in pipe
+        text = shared_bn.run("class", "show", "svc::Pipe").stdout
+        assert "secondary vtable @ " in text and "[rtti]:" in text
+        assert "[heuristic]" not in text
+
+    def test_catch_table_ref_is_rejected_with_the_observed_reason(self, shared_bn):
+        # #922 review (P3): `svc::ParseError` is named in a `catch`, so the
+        # PIE carries a `DW.ref._ZTI` word right after `__dso_handle`, and the
+        # typeinfo backwalk lands on `__dso_handle` (a self-pointer). It is
+        # disclosed as what it is -- a mapped pointer -- not as an RTTI record.
+        shared_bn.load(CLASSES_BINARY)
+        parse_error = self._show(shared_bn, "svc::ParseError")
+        assert parse_error["vtable"]["total"] == 3, parse_error["vtable"]
+        (rejected,) = parse_error["rejected_secondary_candidates"]
+        assert rejected["reason"].startswith(f"word[0] {rejected['address']} is a mapped pointer (into .data)")
+        assert "RTTI" not in rejected["reason"]
+        assert not any("RTTI record" in n for n in parse_error["notes"])
+
+    def test_imported_base_class_reports_no_fabricated_facts(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        # std::runtime_error is defined in libstdc++: its typeinfo here is an
+        # import slot, so there is no vtable to backwalk and no base to read.
+        card = self._show(shared_bn, "std::runtime_error")
+        assert card["typeinfo"]["import_slot"] is True
+        assert card["bases"] == []
+        assert card["vtable"] is None, card["vtable"]
+        assert "secondary_vtables" not in card
+        assert any("typeinfo is an import slot" in n for n in card["notes"])
+        # ...while the LOCAL subclass still names it as a base through its own
+        # (local) `__si_class_type_info` record.
+        parse_error = self._show(shared_bn, "svc::ParseError")
+        assert [b["name"] for b in parse_error["bases"]] == ["std::runtime_error"]
+        assert "secondary_vtables" not in parse_error
+
+    def test_template_class_spellings_are_one_card(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        listing = json.loads(
+            shared_bn.run("class", "list", "--no-stl", "--format", "json").stdout)
+        boxes = [row for row in listing["items"] if "svc::Box<" in row["name"]]
+        assert len(boxes) == 1, [row["name"] for row in boxes]
+        assert boxes[0]["name"] == "svc::Box<std::string>"
+        assert boxes[0]["has_vtable"] is True and boxes[0]["method_count"] > 0
+        assert boxes[0]["aliases"] and "basic_string" in boxes[0]["aliases"][0]
+        card = self._show(shared_bn, "svc::Box<std::string>")
+        assert card["vtable"]["total"] == 4, card["vtable"]
+        assert [b["name"] for b in card["bases"]] == ["svc::Handler"]
+        by_alias = self._show(shared_bn, card["aliases"][0])
+        assert by_alias["name"] == "svc::Box<std::string>"
+        # #922 review (P2): `--query` by the absorbed spelling finds the one
+        # canonical card, once, through the listing and the count.
+        by_query = json.loads(shared_bn.run(
+            "class", "list", "--no-stl", "--query", "basic_string", "--format", "json").stdout)
+        assert [row["name"] for row in by_query["items"]] == ["svc::Box<std::string>"], by_query
+        assert by_query["total"] == 1
+        counted = json.loads(shared_bn.run(
+            "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
+        assert counted["count"] == 1, counted

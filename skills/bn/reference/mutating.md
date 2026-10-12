@@ -30,7 +30,9 @@ bn batch apply -t <selector> /tmp/changes.json --preview
 bn save
 ```
 
-Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only**. It is idempotent and safe to re-run.
+Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only** as recognized by the name-shape check: exactly `sub_<address>` or any `nullsub_` prefix. A user-chosen name of that shape is also replaced; other names are skipped. After Go names land, it is idempotent and safe to re-run.
+
+`function create` is for an address auto-analysis missed. An address **inside** an existing function is refused (`invalid_request`, exit 3) naming the containing function, its start, the offset and whether the address is an instruction boundary there, because Binary Ninja does not simply add a second function beside it: at an instruction boundary it truncates the host at the new start (the host keeps only the bytes before it), and at a mid-instruction address it leaves the host intact beside an overlapping function that decodes a different instruction stream -- the shape of a mistyped address. Pass `--allow-overlap` (batch op field `"allow_overlap": true`) only for a deliberate cut of an over-extended function; the compact status line then carries `overlaps=N` and an `overlapping_functions:` line naming each host as `truncated` or `intact`, `--format json --summary` carries `overlapping_functions`, and the full result lists the host under `affected_functions` too. `--preview` obeys the same rule, and its revert verifies the host is back as it was before the command -- in a batch, as it was before the batch's first op, so a sibling rename of the host is undone with the rest -- a host that cannot be restored is reported as `rollback_failed` with `dirty_after` true, never as a clean revert (when the batch itself errored after applying, the error envelope carries `status: rollback_failed` and `observed.dirty_after: true` instead of a result). An unmapped, non-executable or `--quick`-loaded target is refused the same way on both surfaces.
 
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
@@ -46,31 +48,32 @@ Per-op statuses:
 - `rollback_failed` — restore failed; the view may contain some changes.
 - `internal_error` — unexpected apply failure; rollback is attempted.
 
-A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2; a local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
+A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2, as can a semantic bridge refusal without one of those failure statuses. A local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
 
 ## Output and compact status
 
-Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation result never swaps its status for a spill envelope; with `--out`, stdout is an artifact envelope rather than the mutation status.
+Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation never swaps its status for a spill envelope: when detail spills, stdout keeps the compact status and points to `detail_artifact_path` for `results[]`. With `--out`, stdout is an artifact envelope whose `ok` describes the file write, not the mutation; read the artifact or exit code for the verdict. A refusal can emit an error envelope without writing an artifact.
 
 ### Compact status keys
 
-This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true:
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true, and `overlapping_functions`, emitted only when a create landed inside an existing function:
 
 | key | meaning |
 |---|---|
 | `kind` | `mutation_summary` |
 | `ok` / `success` | classified operation outcome |
-| `committed` | whether live apply reached commit, including all-noop |
+| `committed` | whether live apply reached commit, including all-noop; `go rename` with no candidates reports false |
 | `preview` | whether preview was requested |
 | `measured` | false when result rows or required counters cannot establish counts |
 | `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
 | `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
-| `rolled_back` | true/false when restore was attempted, null when none was needed |
+| `rolled_back` | meaningful when `committed` is false; false/null on a committed run does not mean restore ran |
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
+| `overlapping_functions` | the `{name, address, offset, instruction_boundary, truncated}` of each function a `function create --allow-overlap` landed inside (`truncated` says whether the host was cut at the new start or left intact); absent for an ordinary create |
 
-`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. A cleanly completed revert establishes `changed_count: 0`; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
+`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a live clean revert it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
 ## Batch apply
 
@@ -108,4 +111,4 @@ The manifest must be an object with an `ops` array. Validation runs before apply
 | `tag_type_create` | `name`, `icon` | — | `bn tag type create` |
 | `tag_type_remove` | `name` | — | `bn tag type remove` |
 
-Optional fields include `kind` for symbol rename, `overwrite_existing` or `type_name` for struct fields, and `source_path` for declarations. The table names the operation's real field names; they differ across commands. The same preview, verification, readback, and save rules apply to the batch.
+Optional fields include `kind` for symbol rename, `overwrite_existing` or `type_name` for struct fields, `allow_overlap` for `function_create`, and `source_path` for declarations. The table names the operation's real field names; they differ across commands. The same preview, verification, readback, and save rules apply to the batch.
