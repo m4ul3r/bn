@@ -3229,6 +3229,19 @@ class TestStructLayoutAssistance903:
         assert build.returncode == 0, f"struct fixture build failed:\n{build.stdout}\n{build.stderr}"
         shared_bn.load(binary)
         shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        # A fresh ELF already has loader-provided layouts: its header can match
+        # these same accesses and later make cfg ambiguous. Establish an empty
+        # inventory explicitly, without blacklisting names or changing offsets.
+        remaining_types = shared_bn.json(
+            "py", "exec",
+            "for name in list(bv.types.keys()):\n"
+            "    if bv.is_type_auto_defined(name):\n"
+            "        bv.undefine_type(bv.get_type_id(name))\n"
+            "    else:\n"
+            "        bv.undefine_user_type(name)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [str(name) for name in bv.types.keys()]\n")["result"]
+        assert remaining_types == [], remaining_types
         before = shared_bn.json("proto", "get", "handle")
         missing = shared_bn.json("decompile", "handle")
         assert not any("struct layout candidate" in w for w in missing["warnings"]), missing
