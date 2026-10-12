@@ -6,7 +6,10 @@ import types
 
 import pytest
 
-from _bridge_fakes import _FakeArch, _FakeBV, _FakeConstPtr, _FakeLLILInstruction, _FakeSection
+from _bridge_fakes import (
+    _FakeArch, _FakeBV, _FakeConstPtr, _FakeFunction, _FakeLLILInstruction,
+    _FakeSection, _FakeSegment,
+)
 
 read_class = importlib.import_module("bn_agent_bridge.read_class")
 seam = importlib.import_module("bn_agent_bridge.seam")
@@ -4370,6 +4373,106 @@ def _slot_array_bv(ptr=8):
                                 for w in (0, 0x9100, 0x400000, 0, 0, 0xdead, 0x400020))},
         arch=_FakeArch(name="x86_64" if ptr == 8 else "x86", address_size=ptr),
     )
+
+
+def _slot_array_global_bv(ptr=8):
+    """Byte-backed table and globals referencing its head, vptr and next slot."""
+    bv = _slot_array_bv(ptr)
+    bv._memory[0x9000] += (0x9100).to_bytes(ptr, "little")  # next-object boundary
+    bv.functions = [_FakeFunction(a, f"sub_{a:x}") for a in (0x400000, 0x400020)]
+    bv._symbols.append(_Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0xdead,
+                            "SymbolType.ExternalSymbol"))
+    bv._data_refs = {0x9100: [0x9000 + ptr]}
+    for address, name, value in (
+        (0xa000, "global_codec", 0x9000 + 2 * ptr),
+        (0xa010, "head_pointer", 0x9000),
+        (0xa020, "later_slot_pointer", 0x9000 + 4 * ptr),
+    ):
+        bv._symbols.append(_Sym(name, name, address))
+        bv._memory[address] = value.to_bytes(ptr, "little")
+        bv._data_refs[value] = [address]
+    bv.sections = {
+        ".text": _FakeSection(".text", 0x400000, 0x401000, "ReadOnlyCodeSectionSemantics"),
+        ".data.rel.ro": _FakeSection(".data.rel.ro", 0x9000, 0xa100),
+        ".extern": _FakeSection(".extern", 0xdead, 0xdeae),
+    }
+    bv._segments = {
+        0x400000: _FakeSegment(start=0x400000, end=0x401000, executable=True),
+        0x9000: _FakeSegment(start=0x9000, end=0xa100),
+        0xdead: _FakeSegment(start=0xdead, end=0xdeae),
+    }
+    bv.user_type_container = types.SimpleNamespace(types={})
+    return bv
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("symbol_position", ["head", "slots", "absent"])
+def test_class_show_stored_global_uses_address_point_935(monkeypatch, ptr, symbol_position):
+    bv = _slot_array_global_bv(ptr)
+    if symbol_position == "head":
+        bv._symbols[0].address = 0x9000
+    elif symbol_position == "absent":
+        bv._symbols.pop(0)  # typeinfo backwalk must use the same address point
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9000"
+    assert [slot["address"] for slot in card["vtable"]["slots"]] == [
+        "0x400000", "0x0", "0x0", "0xdead", "0x400020"]
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
+    assert card["instances"]["stored_globals_truncated"] is False
+
+
+def test_stored_global_keeps_proven_address_point_when_slots_unreadable_935(monkeypatch):
+    bv = _slot_array_global_bv()
+    bv._memory[0x9000] = bv._memory[0x9000][:16]  # only the header is readable
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9000"
+    assert card["vtable"]["truncated_reason"] == "unreadable_row"
+    assert card["vtable"]["slots"] == []
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
+
+
+@pytest.mark.parametrize("refusal", [
+    "unreadable_offset", "nonzero_offset", "unresolved_typeinfo", "import_alias", "got",
+])
+def test_stored_global_does_not_offset_an_unproven_vtable_935(monkeypatch, refusal):
+    bv = _slot_array_global_bv()
+    if refusal == "unreadable_offset":
+        bv._memory[0x9008] = bv._memory.pop(0x9000)[8:]
+    elif refusal == "nonzero_offset":
+        bv._memory[0x9000] = _le64(8) + bv._memory[0x9000][8:]
+    elif refusal == "unresolved_typeinfo":
+        bv._symbols.pop(1)
+    elif refusal == "import_alias":
+        bv._symbols[0].type = "SymbolType.ImportAddressSymbol"
+    else:
+        bv.sections[".got"] = _FakeSection(".got", 0x9010, 0x9018)
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    # A registry entry alone does not authorize the adjustment either.
+    record = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    assert ctx._global_vtable_stores(bv, record) == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9010"
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+    assert card["vtable"]["slots"] == []
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
 
 
 @pytest.mark.parametrize("ptr", [4, 8])
