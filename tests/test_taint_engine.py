@@ -4426,32 +4426,10 @@ def test_backward_field_load_recovers_source_call(models):
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
     origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
     assert ("source", "read") in origins, origins
-    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
-def test_backward_stack_buffer_load_keeps_prior_behavior(models):
-    # A plain stack-buffer byte load (base is neither allocator nor parameter)
-    # with no in-scope store/source must NOT become field_load_unresolved -- the
-    # #158 path must not over-trigger on ordinary stack loads.
-    buf = FVar("buf", typ="char[0x40]"); x = FVar("x", ident=60)
-    x1 = FSSA(x, 1)
-    load_src = FExpr("MLIL_LOAD_SSA", "[&buf]", reads=[], src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
-                     src_memory=1)
-    load_src.size = 1
-    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = buf[0]", reads=[], writes=[x1], src=load_src)
-    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(d, s, x#1)", reads=[x1], writes=[],
-                  dest=FExpr("MLIL_CONST_PTR", "0x90", constant=0x90),
-                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
-                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
-                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
-    ssa = FSSAFunc([load, sink], mem_defs={})
-    func = FFunc("g", 0x10, ssa, params=[FVar("fd")])
-    bv = FBV({0x90: "memcpy"})
-    engine = te.TaintEngine(bv, models)
-    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
-    assert result["slices"]
-    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
-    assert {sl["origin"]["kind"] for sl in result["slices"]} <= {"entry", "unresolved"}
 
 
 # --------------------------------------------------------------------------
@@ -9787,7 +9765,7 @@ def test_backward_source_fill_outranks_a_later_literal_terminator_928():
     result, reasons, aol = _bw(pg.func())
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
     assert any("written by read" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and result["diagnostics"]["safe_to_report_complete_slice"] is False, result
 
 
 def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
@@ -9860,7 +9838,8 @@ def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
     result, reasons, aol = _bw(pg.func())
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
     assert any("local buffer other written by read" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert [l["buffer"] for l in aol] == ["other"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
     # With nothing writing `other`, the nested buffer is the frontier.
     pg2 = _BufProgram(params=[fd])
@@ -9929,7 +9908,7 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     # Round 4 P2: the escape writes no byte of cmd and the call after it is
     # not handed &cmd -- neither covers the path, so the 1-byte `cmd[0] = 0`
     # leaves the buffer unproven there too: a second, distinct frontier.
-    assert any("nothing is proven to write the whole buffer" in l["detail"] for l in aol), aol
+    assert any("region" in l for l in aol), aol
     assert result["slices"][0]["origin"] == {
         "kind": "address_of_local_unresolved", "buffer": "cmd", "callee": "fill_global"}
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -9946,7 +9925,7 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     result2, reasons2, aol2 = _bw(pg2.func())
     assert not any(l.get("callee") for l in aol2), result2["leaves"]
     assert not any("snprintf" in r for r in reasons2), reasons2
-    assert [l["detail"] for l in aol2 if "nothing is proven to write the whole buffer" in l["detail"]], aol2
+    assert any("region" in l for l in aol2), aol2
 
 
 def test_backward_folded_address_of_sink_operand_is_seeded_928():
@@ -10214,7 +10193,7 @@ def test_backward_store_through_phi_pointer_is_a_writer_928r3():
     # The parameter the loop xors in is the origin (it outranks the source so
     # the caller ascent is not lost); the source stays in the steps.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "key#0"}, result["slices"][0]["origin"]
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and result["diagnostics"]["safe_to_report_complete_slice"] is False, result
 
 
 def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
@@ -10298,7 +10277,7 @@ def test_backward_modeled_out_arg_unresolvable_while_escaped_is_opaque_928r3():
     assert len(opq) == 1 and "cannot resolve" in opq[0]["detail"], result["leaves"]
     # A may-alias out-arg covers nothing (round 4 P2): the bare 1-byte
     # terminator leaves the path unproven, a distinct frontier.
-    assert any("nothing is proven to write the whole buffer" in l["detail"] for l in aol), aol
+    assert any("region" in l for l in aol), aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
@@ -10360,7 +10339,8 @@ def test_backward_memset_and_bzero_are_literal_fills_928r3():
         name = _B_NAMES[zeroer]
         assert any(f"local buffer buf written by {name}" in r for r in reasons), reasons
         assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
-        assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+        # The literal arm is covered, but read can return short/error.
+        assert aol and result["diagnostics"]["safe_to_report_complete_slice"] is False, result
 
 
 def test_backward_benign_call_handed_the_buffer_is_recorded_not_covering_928r3():
@@ -10571,7 +10551,7 @@ def test_backward_variable_offset_address_walks_the_buffer_928r4():
     # The offset is walked too; a parameter origin outranks the source so the
     # caller ascent still runs.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "off#0"}
-    assert aol == [], result["leaves"]
+    assert aol and result["diagnostics"]["safe_to_report_complete_slice"] is False, result
 
     # Folded into the sink operand (`popen(&line + off#0)`): the buffer is a
     # seed of its own beside the offset.
@@ -10601,7 +10581,7 @@ def test_backward_variable_offset_fill_operand_walks_the_source_buffer_928r4():
     result, reasons, aol = _bw(pg.func())
     assert any("local buffer other written by read" in r for r in reasons), reasons
     assert any("local buffer buf written by strcpy" in r for r in reasons), reasons
-    assert aol == [], result["leaves"]
+    assert aol and result["diagnostics"]["safe_to_report_complete_slice"] is False, result
 
 
 def test_backward_writable_global_element_is_a_leaf_928r4():
@@ -10655,7 +10635,7 @@ def test_backward_coverage_is_by_bytes_not_by_writer_kind_928r4():
     # step is in the slice) but covers nothing.
     result, reasons, aol = _bw(_two_locals_phi_program().func())
     assert any("local buffer a written by read" in r for r in reasons), reasons
-    assert len(aol) == 1 and "nothing is proven to write the whole buffer" in aol[0]["detail"], aol
+    assert len(aol) == 1 and aol[0]["region"]["kind"] == "cstring", aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
     fd, fd0 = _var("fd", 0, ident=12)
@@ -10827,16 +10807,261 @@ def test_benign_model_handed_the_buffer_is_disclosed_928r4():
     result = te.TaintEngine(FBV(_B_NAMES), models).backward(pg.func(), [te.parse_locator("arg:popen:0")])
     aol = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
     assert len(aol) == 1 and "the only call that touches it is my_fill" in aol[0]["detail"], aol
-    assert "conditional or loop-only" not in aol[0]["detail"], aol[0]["detail"]
     assert any("passed to my_fill" in a and "whose model is {}" in a for a in result["assumptions"]), \
         result["assumptions"]
 
-    # Beside a covering memset the slice is complete -- and says what it trusts.
+    # A benign taint model does not promise to preserve the earlier NUL.
     pg2 = _BufProgram(params=[host])
     pg2.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
                          FExpr("MLIL_CONST", "0x40", constant=0x40)])
     pg2.call(_B_MY_FILL, [_addr_of(buf), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
     pg2.sink(buf)
     result2 = te.TaintEngine(FBV(_B_NAMES), models).backward(pg2.func(), [te.parse_locator("arg:popen:0")])
-    assert result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2["diagnostics"]
+    assert result2["diagnostics"]["safe_to_report_complete_slice"] is False, result2["diagnostics"]
     assert any("passed to my_fill" in a for a in result2["assumptions"]), result2["assumptions"]
+
+
+# --- #931/#933: consumed regions and definite initialization ----------------
+
+def _region_const(n):
+    return FExpr("MLIL_CONST", str(n), constant=n)
+
+
+def _region_addr(local, offset):
+    if offset is None:
+        return _plus(_addr_of(local), FExpr("MLIL_VAR_SSA", "index", reads=[FSSA(FVar("index"), 0)]))
+    return _plus(_addr_of(local), _region_const(offset))
+
+
+@pytest.mark.parametrize("length", [0, 1, 64, None])
+@pytest.mark.parametrize("offset", [0, 32, None])
+def test_backward_requested_read_extent_is_not_initialization_931(length, offset):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    n = _region_const(length) if length is not None else FExpr(
+        "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
+    source = pg.call(_B_READ, [_region_const(0), _addr_of(buf), n])
+    pg.call(_B_POPEN, [_region_addr(buf, offset), _cstr(0x710)])
+    result, _, leaves = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert any(l.get("region", {}).get("offset") == offset for l in leaves)
+    assert any(step["address"] == hex(source.address)
+               for sl in result["slices"] for step in sl["slice"])
+
+
+@pytest.mark.parametrize("filled,consumed,offset,complete", [
+    (0, 1, 0, False), (1, 2, 0, False), (64, 16, 32, True),
+    (32, 1, 32, False), (64, 64, 0, True), (None, 16, 0, False),
+])
+def test_backward_definite_byte_extent_contains_consumed_region_931(filled, consumed, offset, complete):
+    buf, dst = FVar("buf", typ="char[64]"), FVar("dst", typ="char[64]")
+    pg = _BufProgram()
+    n = _region_const(filled) if filled is not None else FExpr(
+        "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), n])
+    pg.call(_B_MEMCPY, [_addr_of(dst), _region_addr(buf, offset), _region_const(consumed)])
+    result, _, _ = _bw(pg.func(), sink="arg:memcpy:1")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("fill,complete", [("append", False), ("bytes", False), ("zero", True)])
+def test_backward_cstring_is_not_a_byte_range_or_an_append_931(fill, complete):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    if fill == "append":
+        pg.call(_B_STRCAT, [_addr_of(buf), _cstr(0x700)])
+    else:
+        pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0 if fill == "zero" else 65),
+                           _region_const(64)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("write_offset,read_offset,length,complete", [
+    (4, 4, 64, True), (4, 5, 64, False), (0, 4, 64, False),
+    (4, 4, 0, False), (4, None, 64, False),
+])
+def test_backward_member_string_coverage_933(alias, write_offset, read_offset, length, complete):
+    obj = FVar("request", typ=types.SimpleNamespace(width=72))
+    host, host0 = _var("host", 0, ident=91)
+    pg = _BufProgram(params=[host])
+    pg.call(_B_SNPRINTF, [_region_addr(obj, write_offset), _region_const(length),
+                          _cstr(0x700), FExpr("MLIL_VAR_SSA", "host", reads=[host0])],
+            reads=[host0])
+    expr = _region_addr(obj, read_offset)
+    if alias:
+        _, p1 = _var("member_ptr", 1)
+        _set(pg, p1, "member_ptr = &request.cmd", expr, reads=expr.vars_read)
+        expr = FExpr("MLIL_VAR_SSA", "member_ptr", reads=[p1])
+    pg.call(_B_POPEN, [expr, _cstr(0x710)], reads=expr.vars_read)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert any(s["origin"].get("var") == "host#0" for s in result["slices"])
+
+
+def test_backward_recursive_member_copy_keeps_source_region_933():
+    obj = FVar("request", typ=types.SimpleNamespace(width=144))
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_region_addr(obj, 8), _region_const(64), _cstr(0x700)])
+    pg.call(_B_STRCPY, [_region_addr(obj, 80), _region_addr(obj, 8)])
+    pg.call(_B_POPEN, [_region_addr(obj, 80), _cstr(0x710)])
+    result, _, leaves = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, leaves
+
+
+def test_backward_repeated_local_at_same_epoch_keeps_distinct_regions_933(monkeypatch):
+    obj, dst = FVar("request", typ=types.SimpleNamespace(width=144)), FVar("dst", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_region_addr(obj, 8), _region_const(64), _cstr(0x700)])
+    # Both operands are consumed at one epoch; the first must not mark the
+    # entire local visited and hide the uninitialized second member.
+    custom = 0x930
+    monkeypatch.setitem(_B_NAMES, custom, "join_regions")
+    pg.call(custom, [_addr_of(dst), _region_addr(obj, 8), _region_addr(obj, 80)])
+    pg.sink(dst)
+    models = te.load_models(extra={"join_regions": {
+        "propagates": [{"from": "*arg:1", "to": "*arg:0"}, {"from": "*arg:2", "to": "*arg:0"}],
+        "initializes": [{"arg": 0, "kind": "cstring"}],
+        "consumes": [{"arg": 1, "kind": "cstring"}, {"arg": 2, "kind": "cstring"}],
+    }})
+    result = te.TaintEngine(FBV(_B_NAMES), models).backward(
+        pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert any(l.get("region", {}).get("offset") == 80 for l in result["leaves"])
+
+
+@pytest.mark.parametrize("rule", [
+    {}, {"arg": 0, "kind": "bytes"}, {"arg": -1, "kind": "cstring"},
+    {"arg": 0, "kind": "bytes", "len_arg": True},
+    {"arg": 0, "kind": "cstring", "zero": True},
+])
+def test_backward_invalid_initialization_contract_is_rejected_931(rule):
+    with pytest.raises(te.TaintError):
+        te.load_models(extra={"memcpy": {"initializes": [rule]}})
+
+
+# --- #932: unused-return tokenizer state participates in convergence --------
+
+def _strtok_irreducible_program(*, reset=False):
+    line = FVar("line", typ="char[64]")
+    other = FVar("other", typ="char[64]")
+    token = FSSA(FVar("token"), 1)
+    strtok, system = 0x940, 0x941
+    # IL traversal visits the continuation before BOTH unused initializers.
+    cont = _ext_call(0, 0x10, "token = strtok(NULL)", strtok,
+                     [_region_const(0), _cstr(0x700)], writes=[token])
+    sink = _ext_call(1, 0x14, "system(token)", system,
+                     [FExpr("MLIL_VAR_SSA", "token", reads=[token])], reads=[token])
+    init_a = _ext_call(2, 0x18, "strtok(line)", strtok, [_addr_of(line), _cstr(0x700)])
+    init_b = _ext_call(3, 0x1c, "strtok(line)", strtok, [_addr_of(line), _cstr(0x700)])
+    clean = _ext_call(4, 0x20, "strtok(other)", strtok, [_addr_of(other), _cstr(0x700)])
+    ret = FInstr(5, 0x24, "MLIL_RET", "return")
+    blocks = [FBlock(0, 2), FBlock(2, 3), FBlock(3, 4), FBlock(4, 5), FBlock(5, 6)]
+    body, a, b, cut, exit_block = blocks
+    body.outgoing_edges = [_FEdge(a), _FEdge(b), _FEdge(exit_block)]
+    a.outgoing_edges = [_FEdge(cut if reset else body)]
+    b.outgoing_edges = [_FEdge(cut if reset else body)]
+    cut.outgoing_edges = [_FEdge(body)]
+    exit_block.outgoing_edges = []
+    for ins, block in [(cont, body), (sink, body), (init_a, a), (init_b, b), (clean, cut), (ret, exit_block)]:
+        ins.il_basic_block = block
+    instrs = [cont, sink, init_a, init_b, *([clean] if reset else []), ret]
+    return FFunc("token_cycle", 0x10, FSSAFunc(instrs), params=[line]), FBV({strtok: "strtok", system: "system"})
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_strtok_discovery_revisits_unused_return_initializers_without_oscillation_932(reset):
+    func, bv = _strtok_irreducible_program(reset=reset)
+    result = te.TaintEngine(bv, te.load_models(), max_iters=8).forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ([] if reset else ["system"])
+    assert result["stats"]["truncated"] is False
+    escapes = [a for a in result["assumptions"] if a.startswith("tokenizer_state_escapes")]
+    assert bool(escapes) is not reset
+    if reset:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_strtok_state_discovery_at_iteration_limit_is_disclosed_932():
+    func, bv = _strtok_irreducible_program()
+    result = te.TaintEngine(bv, te.load_models(), max_iters=1).forward(
+        func, [te.parse_locator("param:0")])
+    assert result["stats"]["truncated"] is True
+    assert "fixpoint_exhausted" in result["stats"]["truncation_cause"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("count,nul_present,complete", [
+    (3, True, False), (4, True, True), (4, False, False),
+])
+def test_backward_literal_copy_requires_a_copied_verified_nul_931(count, nul_present, complete):
+    class LiteralView(FBVStorage):
+        def get_ascii_string_at(self, addr, minimum):
+            return types.SimpleNamespace(length=3)
+
+        def read(self, addr, size):
+            return b"\0" if addr == 0x703 and size == 1 and nul_present else b"x"
+
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), _region_const(count)])
+    pg.sink(buf)
+    result = te.TaintEngine(
+        LiteralView(_B_NAMES, ro=[(0x700, 0x800)]), te.load_models()).backward(
+            pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+def test_backward_later_receive_can_destroy_prior_string_termination_931():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(64)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+
+
+def test_backward_scalar_local_load_does_not_certify_a_may_source_931():
+    buf = FVar("buf", typ="char[64]")
+    value = FSSA(FVar("value"), 1)
+    pg = _BufProgram()
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(1)])
+    load = FExpr("MLIL_LOAD_SSA", "buf[0]", src=_addr_of(buf), src_memory=pg.mem)
+    load.size = 1
+    _set(pg, value, "value = buf[0]", load)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, leaves = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert any(l.get("region") == {"offset": 0, "width": 1, "kind": "bytes"} for l in leaves)
+
+
+@pytest.mark.parametrize("offset,complete", [(0, True), (32, False)])
+def test_backward_exact_return_alias_keeps_member_and_suffix_933(offset, complete):
+    obj = FVar("request", typ=types.SimpleNamespace(width=72))
+    returned = FSSA(FVar("returned"), 1)
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_region_addr(obj, 4), _cstr(0x700)], writes=[returned])
+    ptr = _plus(FExpr("MLIL_VAR_SSA", "returned", reads=[returned]), _region_const(offset))
+    pg.call(_B_POPEN, [ptr, _cstr(0x710)], reads=[returned])
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+def test_backward_return_propagation_is_not_an_exact_alias_933(monkeypatch):
+    obj = FVar("request", typ=types.SimpleNamespace(width=72))
+    returned = FSSA(FVar("returned"), 1)
+    search = 0x950
+    monkeypatch.setitem(_B_NAMES, search, "strchr")
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_region_addr(obj, 4), _cstr(0x700)])
+    pg.call(search, [_region_addr(obj, 4), _region_const(65)], writes=[returned])
+    pg.call(_B_POPEN, [FExpr("MLIL_VAR_SSA", "returned", reads=[returned]), _cstr(0x710)],
+            reads=[returned])
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False

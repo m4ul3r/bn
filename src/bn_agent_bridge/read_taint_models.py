@@ -87,10 +87,12 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
         # (``arg:1->*arg:0``) and an ``overflow_len`` sink.
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
+        regions = {key: model[key] for key in ("initializes", "consumes", "preserves_cstring", "return_alias")
+                   if key in model}
         if model.get("sources") and want in (None, "source"):
             tos = ", ".join(str(s.get("to")) for s in model["sources"])
             sources.append({"symbol": name, "model_name": name, "is_finding": False,
-                            "to": tos})
+                            "to": tos, **regions})
         sink = model.get("sink")
         if sink and want in (None, "sink"):
             cls = sink.get("class") or "?"
@@ -99,7 +101,7 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
                     "symbol": name, "model_name": name, "is_finding": False,
                     "tainted_args": sink.get("tainted_args", []),
                     "class": cls, "detail": sink.get("detail"),
-                    "model_description": _sink_model_description(cls, sink)}
+                    "model_description": _sink_model_description(cls, sink), **regions}
                 # #443: surface a bounded-write sink's length/buffer argument indices.
                 if sink.get("len_arg") is not None:
                     entry["len_arg"] = sink.get("len_arg")
@@ -114,7 +116,7 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
         flows += [f"literal->{t}" for t in (model.get("writes") or [])]
         if flows and want in (None, "propagator"):
             propagators.append({"symbol": name, "model_name": name, "is_finding": False,
-                                "from_to": ", ".join(flows)})
+                                "from_to": ", ".join(flows), **regions})
     return {
         # #555: loud, machine- and human-visible "this is a catalog, not findings".
         "presence_catalog": True,

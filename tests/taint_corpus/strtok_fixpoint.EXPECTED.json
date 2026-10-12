@@ -1,0 +1,20 @@
+{
+  "lang": "c",
+  "cflags": [
+    "-O0",
+    "-fno-builtin"
+  ],
+  "forward": [
+    {
+      "function": "token_cycle",
+      "source": "param:0",
+      "sinks": [
+        {
+          "callee": "system",
+          "class": "command_injection",
+          "arg": 0
+        }
+      ]
+    }
+  ]
+}

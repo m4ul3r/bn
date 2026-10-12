@@ -38,6 +38,14 @@ brittle across compilers/optimisation.
 | `bw_global_operand.c`  | a `CONST_PTR` fill operand is a literal only in read-only storage: `sprintf(cmd, "%s", g_host)` from a `.bss` array is a frontier leaf with origin `global` (`complete_slice: false`); the `.rodata` literal twin is complete |
 | `bw_offset_address.c`  | an address built on a buffer at a VARIABLE offset is that buffer: `popen(line + off)` and `strcpy(buf, &other[i])` walk the `read` that filled it beside the offset; `g_hosts[i]` (a `.bss` array element) is a `global` frontier leaf. `bw_offset_address_o1.c` rebuilds it at -O1 |
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
+| `bw_regions.c`        | #931/#933: zero/short/full-request reads, suffix/indexed rows and append-only buffers remain incomplete; initialized struct-member strings and exact byte ranges are covered without requiring unrelated fields. `bw_regions_o1.c` / `bw_regions_o2.c` rebuild at -O1/-O2 |
+| `strtok_fixpoint.c`   | #932: two-entry/two-back-edge tokenizer CFG with two unused-return initializers; the NULL continuation reaches `system` even when IL enumerates it first. O0/O1/O2 variants share the source |
+
+The region-coverage cases deliberately distinguish a may-source from a proven
+initializer. Existing `read`-based offset/append/loop cases still require their
+source steps, but now require an incomplete slice: the request length does not
+prove the return count or NUL termination. A zero-filled branch cannot certify
+the alternative short/error-read branch.
 
 ## `EXPECTED.json` schema
 

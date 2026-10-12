@@ -1,0 +1,155 @@
+{
+  "lang": "c",
+  "cflags": [
+    "-O0",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "zero_read",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "short_read",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "full_request",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "suffix_read",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "indexed_row",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "append_only",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "member_string",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "member_copy",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "member_bytes",
+      "sink": "arg:write:1",
+      "complete_slice": true,
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "partial_member",
+      "sink": "arg:write:1",
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "unknown_member",
+      "sink": "arg:write:1",
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "string_not_full_bytes",
+      "sink": "arg:write:1",
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "byte_suffix",
+      "sink": "arg:write:1",
+      "complete_slice": true,
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "byte_suffix_gap",
+      "sink": "arg:write:1",
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    }
+  ]
+}

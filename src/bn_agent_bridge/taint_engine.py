@@ -27,7 +27,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 # Structural split (#562): the engine re-exports the moved names so existing
 # importers (`from bn_agent_bridge.taint_engine import X`, `_taint.X`) keep
@@ -91,6 +91,17 @@ _NAMED_STORE_OPS = frozenset({
 })
 
 
+class _BufferRegion(NamedTuple):
+    """Consumed bytes relative to a local, or to an operand before resolution.
+
+    A C string ends at its first NUL, not at the enclosing object's end.
+    None offsets/widths are unknown, never evidence of whole-object coverage.
+    """
+    offset: int | None = 0
+    width: int | None = None
+    kind: str = "unknown"
+
+
 class _BufferSeed:
     """A backward seed that is the CONTENTS of a buffer the sink was handed by
     address with the address folded into the call parameter itself
@@ -103,11 +114,13 @@ class _BufferSeed:
     (``g_hosts + (i << 6)``), which the slice reports as a leaf. ``name``
     renders as ``&cmd`` / the address through ``var_label`` so the slice's
     ``sink.seed`` says what was seeded."""
-    __slots__ = ("local", "addr", "name")
+    __slots__ = ("local", "addr", "name", "region")
 
-    def __init__(self, local: Any = None, *, addr: int | None = None):
+    def __init__(self, local: Any = None, *, addr: int | None = None,
+                 region: _BufferRegion = _BufferRegion()):
         self.local = local
         self.addr = addr
+        self.region = region
         self.name = f"&{var_label(local)}" if local is not None else hex(int(addr or 0))
 
 
@@ -1665,7 +1678,8 @@ class TaintEngine:
         visit(expr, 0)
         return locals_, addrs
 
-    def _folded_buffer_seeds(self, expr: Any) -> list[_BufferSeed]:
+    def _folded_buffer_seeds(self, ssaf: Any, expr: Any,
+                             region: _BufferRegion = _BufferRegion()) -> list[_BufferSeed]:
         """Backward seeds for the buffers a call operand is an address INTO:
         every local it is built on, at any offset (``popen(&cmd)``,
         ``popen(&line + off)``), and -- beside a variable offset, the
@@ -1673,11 +1687,75 @@ class TaintEngine:
         constant address with no reads stays the "reads no variable" seed
         error it was (no def-chain at all)."""
         locals_, addrs = self._address_terms(expr)
-        seeds = [_BufferSeed(loc) for loc in locals_]
+        seeds = [_BufferSeed(loc, region=self._local_region(ssaf, expr, loc, region))
+                 for loc in locals_]
         if expr_reads(expr):
             seeds += [_BufferSeed(addr=a) for a in addrs
                       if self._const_ptr_storage(a) == "writable"]
         return seeds
+
+    def _local_region(self, ssaf: Any, expr: Any, local: Any,
+                      region: _BufferRegion) -> _BufferRegion:
+        off = self._must_offset(ssaf, expr, var_key(local))
+        return region._replace(offset=(off + region.offset
+                                       if off is not None and region.offset is not None else None))
+
+    def _consumed_region(self, ssaf: Any, call: Any, idx: int) -> _BufferRegion:
+        """Only an explicit read contract supplies a byte count/string demand."""
+        name = self._callee_name(const_target(getattr(call, "dest", None)))
+        _, model = lookup_model(self.models, name)
+        params = self._call_params(call)
+        for rule in (model or {}).get("consumes") or []:
+            if rule["arg"] == idx:
+                width = self._extent_length(ssaf, params, rule)
+                return _BufferRegion(0, width, rule["kind"])
+        # printf varargs have format-dependent reads; without parsing the
+        # conversion, a pointer argument's extent remains unknown.
+        return _BufferRegion()
+
+    def _extent_length(self, ssaf: Any, params: list[Any], rule: dict) -> int | None:
+        idx = rule.get("len_arg")
+        if idx is None or idx >= len(params):
+            return None
+        for expr in self._def_chain(ssaf, params[idx]):
+            value = self._int_const(expr)
+            if value is not None:
+                return value if value >= 0 else None
+        return None
+
+    def _literal_terminator(self, ssaf: Any, expr: Any) -> int | None:
+        """A NUL's byte offset in immutable storage, verified from the view.
+
+        The string recognizer supplies a candidate length, never the proof:
+        unlike the format-display helper, a truncated read is not termination.
+        """
+        addr = self._const_ptr_addr(ssaf, expr)
+        if addr is None or self._const_ptr_storage(addr) != "readonly":
+            return None
+        try:
+            if self.bv.read(addr, 1) == b"\x00":
+                return 0
+            string = self.bv.get_ascii_string_at(addr, 1)
+            length = int(string.length)
+            if length >= 0 and self.bv.read(addr + length, 1) == b"\x00":
+                return length
+        except (AttributeError, TypeError, ValueError, OSError):
+            pass
+        return None
+
+    @staticmethod
+    def _extent_covers(region: _BufferRegion, off: int | None, width: int | None,
+                       *, cstring: bool = False, zero: bool = False) -> bool:
+        if region.offset is None or off is None:
+            return False
+        if region.kind == "cstring":
+            # A producer string only establishes the string starting there;
+            # an interior pointer might lie AFTER its terminator.
+            return ((cstring and off == region.offset)
+                    or (zero and width is not None and off <= region.offset < off + width))
+        return (region.kind == "bytes" and region.width is not None
+                and width is not None and off <= region.offset
+                and region.offset + region.width <= off + width)
 
     def _must_offset(self, ssaf: Any, expr: Any, base_key: Any,
                      visited: set | None = None, depth: int = 0) -> int | None:
@@ -1744,6 +1822,13 @@ class TaintEngine:
                 offs = {self._must_offset(ssaf, a, base_key, visited, depth + 1)
                         for a in (getattr(d, "src", None) or [])}
                 return offs.pop() if len(offs) == 1 else None
+            if self._is_call(d):
+                name = self._callee_name(const_target(getattr(d, "dest", None)))
+                _, model = lookup_model(self.models, name)
+                idx = (model or {}).get("return_alias")
+                params = self._call_params(d)
+                if idx is not None and idx < len(params):
+                    return self._must_offset(ssaf, params[idx], base_key, visited, depth + 1)
             return None
         reads = expr_reads(expr)
         if len(reads) == 1 and "LOAD" not in op:
@@ -1870,7 +1955,8 @@ class TaintEngine:
         return "no"
 
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
-                              base_size: int | None = None) -> dict[str, Any]:
+                              base_size: int | None = None, *,
+                              region: _BufferRegion = _BufferRegion()) -> dict[str, Any]:
         """Every writer of the local buffer *base_key* on the memory-SSA chain
         ending at version *mv* (the version the sink READS), newest first,
         plus whether that chain accounts for the buffer on EVERY path.
@@ -1928,18 +2014,12 @@ class TaintEngine:
         ``if (flag) fill(buf); sink(buf)`` shape, whose memory phi has a bare
         entry-state arm: the sink then reads whatever the stack held, and a
         slice that names only the fill's origin is not complete. Coverage is
-        decided by the BYTES a writer provably writes, never by its kind
-        (round 4 P2): a writer covers a path only when its pointer is a
-        MUST-alias of ``&base + 0`` (``_must_offset`` -- every phi arm
-        resolves to this base at offset 0) AND it writes the whole variable:
-        a modeled fill / source / ``writes`` call at offset 0 (its model
-        declares the destination as the buffer), an unmodeled call handed
-        ``&base`` itself (its opaque leaf already blocks), a whole-variable
-        ``SET_VAR_ALIASED`` or a store at least the variable's width. An
-        escape writes no byte; an indexed store (``buf[n] = 0``), a
-        constant-offset store or fill (``buf[63] = 0``, ``strcpy(buf + 60,
-        ..)``), a may-alias writer (a phi that may point at another local, a
-        maybe-store) and a ``{}``-modeled call are writers that cover nothing.
+        decided by the consumed REGION, not by a modeled destination. Byte
+        ranges need a definite extent containing them. C strings need an
+        initializing string producer at the consumed start or a proven NUL
+        there; writing a requested I/O length is never such a guarantee.
+        An append needs prior initialization. Unknown/indexed offsets,
+        return-dependent writes and unannotated models prove no coverage.
         A memory-phi is covered only when every arm is; a loop back-edge arm
         is neutral (it adds no path that does not also leave through the
         entry arm). ``truncated`` is True when the walk exhausted
@@ -1973,15 +2053,12 @@ class TaintEngine:
                     maybe.append(i)
             return yes, maybe
 
-        def _at_base(params: list[Any], idxs: list[int]) -> bool:
-            """Is one of *idxs* a must-alias of ``&base + 0``?"""
-            return any(i < len(params) and self._must_offset(ssaf, params[i], base_key) == 0
-                       for i in idxs)
+        def _call_writer(defn: Any, escaped: bool) -> tuple[bool, bool]:
+            """Record provenance, returning (covers, preserves prior string).
 
-        def _call_writer(defn: Any, escaped: bool) -> bool:
-            """Record *defn* (a call) as a writer when it can be one; True if
-            it was recorded as one that COVERS the path -- only a call whose
-            written pointer is a must-alias of ``&base + 0``."""
+            Byte initialization is monotone; string termination is not: a
+            later read/memcpy may overwrite the NUL a previous fill established.
+            """
             params = self._call_params(defn)
             yes, maybe = _params_touching(params, escaped)
             name = self._callee_name(const_target(getattr(defn, "dest", None)))
@@ -1995,14 +2072,11 @@ class TaintEngine:
                 elif escaped:
                     why = "has no taint model and ran after the address of"
                 else:
-                    return False
+                    return False, True
                 writers.append(("opaque", defn, callee, why))
-                return _at_base(params, yes)
+                return False, False
             if not yes and not maybe:
-                # Trusted to its model: a libc model declares what the callee
-                # writes, and none of its pointers reaches the buffer -- not
-                # even by reloading the slot the address escaped into.
-                return False
+                return False, True
             outs = self._model_out_arg_indices(model)
             if model_is_benign_marker(model):
                 # `{}` promises no taint flows through the call, nothing about
@@ -2010,15 +2084,15 @@ class TaintEngine:
                 # kin were `{}` and read as "writes nothing"). Recorded, so the
                 # call is in the slice; it neither covers nor originates.
                 writers.append(("benign", defn, callee))
-                return False
+                return False, False
             if any(i in maybe for i in outs):
                 writers.append(("opaque", defn, callee,
                                 "writes through a pointer argument the walk cannot "
                                 "resolve (it may alias the escaped address of)"))
-                return False
+                return False, False
             hit = [i for i in outs if i in yes]
             if not hit:
-                return False
+                return False, True
             from_idxs: list[int] = []
             for rule in model.get("propagates") or []:
                 if _try_arg_index(str(rule.get("to") or "")) in hit:
@@ -2042,25 +2116,40 @@ class TaintEngine:
                 len_idxs = [int(sink["len_arg"])]
             elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
                 len_idxs = [int(i) for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
+            len_idxs += [r["len_arg"] for r in model.get("initializes") or []
+                         if r["arg"] in hit and "len_arg" in r and r["len_arg"] not in len_idxs]
             len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
             writers.append(("fill", defn, mkey or name, params, from_idxs, is_source, len_idxs))
-            # A fill at a constant offset (`strcpy(buf + 60, "x")`) or through
-            # a pointer that may point at another local writes bytes of this
-            # buffer on some path, not the buffer (round 4 P2).
-            return _at_base(params, hit)
+            covers = False
+            for rule in model.get("initializes") or []:
+                if rule["arg"] not in hit:
+                    continue
+                off = self._must_offset(ssaf, params[rule["arg"]], base_key)
+                width = self._extent_length(ssaf, params, rule)
+                zero = rule.get("zero") is True
+                vi = rule.get("value_arg")
+                if vi is not None and vi < len(params):
+                    zero = any(self._int_const(e) == 0 for e in self._def_chain(ssaf, params[vi]))
+                string = rule["kind"] == "cstring" and (
+                    "len_arg" not in rule or (width is not None and width > 0))
+                covers |= self._extent_covers(region, off, width, cstring=string, zero=zero)
+                ci = rule.get("copy_arg")
+                if (region.kind == "cstring" and ci is not None and ci < len(params)
+                        and off is not None and region.offset is not None and width is not None):
+                    nul = self._literal_terminator(ssaf, params[ci])
+                    if nul is not None and 0 <= region.offset - off <= nul < width:
+                        covers = True
+            # String appends preserve an already initialized string; they do
+            # not supply its missing prefix. Other may-writes can destroy NUL.
+            return covers, model.get("preserves_cstring") is True
 
         def _store_covers(defn: Any, slot: tuple) -> bool:
-            """A keyed store covers the buffer only when it writes ALL of it."""
-            op = op_name(defn)
-            if op == "MLIL_SET_VAR_ALIASED":
-                return True
-            if base_size is None or slot[1] != 0:
-                return False
-            try:
-                width = int(getattr(defn, "size", None))
-            except (TypeError, ValueError):
-                return False
-            return width >= base_size
+            width = getattr(defn, "size", None)
+            if width is None and op_name(defn) == "MLIL_SET_VAR_ALIASED":
+                width = base_size
+            return self._extent_covers(
+                region, slot[1], width,
+                zero=self._int_const(getattr(defn, "src", None)) == 0)
 
         def rec(v: Any, depth: int) -> tuple[bool, bool]:
             """``(covered, escaped)`` for the chain from version *v* back to
@@ -2099,7 +2188,9 @@ class TaintEngine:
                     slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == base_key:
                         writers.append(("store", defn))
-                        cov = _store_covers(defn, slot) or cov
+                        cov = _store_covers(defn, slot) or (
+                            cov and (region.kind != "cstring"
+                                     or self._int_const(getattr(defn, "src", None)) == 0))
                     elif "STORE" in op:
                         # Not keyed to the buffer: the address may still be
                         # built on it (a phi'd loop cursor, `[p + i]` with
@@ -2107,16 +2198,10 @@ class TaintEngine:
                         a = _alias(getattr(defn, "dest", None), esc)
                         if a == "yes":
                             writers.append(("store", defn))
-                            # Through a pointer built on &buf: covers only
-                            # at a must-alias offset 0 with the full width --
-                            # an indexed `buf[n] = 0` writes one byte.
-                            if base_size is not None \
-                                    and self._must_offset(ssaf, getattr(defn, "dest", None),
-                                                          base_key) == 0:
-                                try:
-                                    cov = int(getattr(defn, "size", 0)) >= base_size or cov
-                                except (TypeError, ValueError):
-                                    pass
+                            off = self._must_offset(ssaf, getattr(defn, "dest", None), base_key)
+                            cov = _store_covers(defn, (base_key, off)) or (
+                                cov and (region.kind != "cstring"
+                                         or self._int_const(getattr(defn, "src", None)) == 0))
                         elif a == "maybe":
                             # Disclosed by its own blocking leaf; it covers
                             # nothing -- it may write elsewhere.
@@ -2136,7 +2221,8 @@ class TaintEngine:
                             if c is not None:
                                 escape_addrs.add(int(c))
                 elif self._is_call(defn):
-                    cov = _call_writer(defn, esc) or cov
+                    covers, preserves = _call_writer(defn, esc)
+                    cov = covers or (cov and (region.kind != "cstring" or preserves))
                 res = (cov, esc)
             memo[v] = res
             return res
@@ -4070,17 +4156,30 @@ class TaintEngine:
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
-        # Static-state tokenizers (`continuation` models, e.g. strtok): the most
-        # recent call in THIS function whose `null_arg` was tainted, keyed by
-        # model key -> (tainted node, call address, call instruction). A later `strtok(NULL, ..)`
-        # reads that state, not an argument, so without it every token after
-        # the first silently dropped taint -- no leaf, no assumption.
-        continuation_state: dict[str, tuple] = {}
-        # model key -> [(addr, call instruction)] of the CLEAN non-NULL calls
-        # seen after the tainted one (address order): together they kill the
-        # continuation only when they lie on every path from the tainted call
-        # to the `strtok(NULL)` (`_reaches_avoiding`).
-        clean_resets: dict[str, list[tuple]] = {}
+        # Discovery is a monotone set of initializer SITES, not one "latest"
+        # call overwritten on every pass. An unused return still adds state
+        # and must revisit an earlier-in-IL continuation (#932).
+        continuation_state: dict[tuple[str, int], tuple] = {}
+        reset_candidates: dict[str, list[tuple]] = {}
+        for candidate in instrs:
+            if not self._is_call(candidate):
+                continue
+            name = self._callee_name(const_target(getattr(candidate, "dest", None)))
+            mkey, model = lookup_model(self.models, name)
+            co = (model or {}).get("continuation")
+            if co is None:
+                continue
+            ci = int(co["null_arg"])
+            cp = self._call_params(candidate)
+            if ci < len(cp) and self._int_const(cp[ci]) != 0:
+                reset_candidates.setdefault(mkey or name or "?", []).append(
+                    (int(candidate.address), candidate, cp, ci))
+
+        def clean_resets(ckey: str) -> list[tuple]:
+            # Re-evaluate cleanliness against monotone taint, independently
+            # of traversal order. A candidate can cease to be clean only once.
+            return [(a, ins) for a, ins, params, ci in reset_candidates.get(ckey, [])
+                    if self._token_hit_node(ssaf, params, f"*arg:{ci}", tainted) is None]
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -4638,9 +4737,9 @@ class TaintEngine:
                 ckey = mkey or name or "?"
                 if cidx < len(params):
                     if self._int_const(params[cidx]) == 0:
-                        st = continuation_state.get(ckey)
-                        if st is not None:
-                            st_node, st_addr, st_ins = st
+                        for (state_key, _), (st_node, st_addr, st_ins) in continuation_state.items():
+                            if state_key != ckey:
+                                continue
                             # A clean non-NULL call resets libc's state -- but
                             # it kills the continuation only when the clean
                             # calls lie on EVERY path from the tainted call to
@@ -4651,8 +4750,8 @@ class TaintEngine:
                             # body reaches it around the back-edge (round 4
                             # P2) -- so the test is reachability with the
                             # resets removed, not dominance.
-                            resets = clean_resets.get(ckey) or []
-                            killed = bool(resets) and self._reaches_avoiding(
+                            resets = clean_resets(ckey)
+                            killed = self._reaches_avoiding(
                                 st_ins, ins, [rins for _, rins in resets]) is False
                             if not killed:
                                 for rule in model.get("propagates") or []:
@@ -4673,19 +4772,16 @@ class TaintEngine:
                                 add_assumption(
                                     f"{name or mkey}(NULL, ...) @ {hex(addr)} continues the "
                                     f"tokenizer state of the tainted {name or mkey} call @ "
-                                    f"{hex(st_addr)}: modeled flow-insensitively (the most "
-                                    f"recent tainted {name or mkey} in this function), not by "
-                                    f"control flow; a continuation of a buffer tokenized in "
+                                    f"{hex(st_addr)}: modeled from a discovered initializer "
+                                    f"with no every-path clean reset; a continuation of a buffer tokenized in "
                                     f"ANOTHER function is not followed{partial}")
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
                         if hit is not None:
-                            continuation_state[ckey] = (hit, addr, ins)
-                            # Resets recorded before this (address-ordered)
-                            # tainted call cannot kill what it re-arms.
-                            clean_resets.pop(ckey, None)
-                        elif not any(ra == addr for ra, _ in clean_resets.get(ckey) or []):
-                            clean_resets.setdefault(ckey, []).append((addr, ins))
+                            state_key = (ckey, int(ins.instr_index))
+                            if state_key not in continuation_state:
+                                continuation_state[state_key] = (hit, addr, ins)
+                                changed = True
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -5442,8 +5538,8 @@ class TaintEngine:
         # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
         # a marker the zero-sink gate withholds the all-clear on.
         rets = [i for i in instrs if op_name(i) == "MLIL_RET"]
-        for ckey, (_, st_addr, st_ins) in continuation_state.items():
-            resets = clean_resets.get(ckey) or []
+        for (ckey, _), (_, st_addr, st_ins) in continuation_state.items():
+            resets = clean_resets(ckey)
             # The state is clean at return only when the clean resets lie on
             # EVERY path from the tainted call to every return (the same
             # reachability test as the in-function continuation, round 4 P2);
@@ -6130,8 +6226,17 @@ class TaintEngine:
                 for seed_var, sink_ins in seeds:
                     sink_addr = hex(int(getattr(sink_ins, "address", 0)))
                     seed_label = var_label(seed_var)
+                    seed_region = _BufferRegion()
+                    seed_expr = None
+                    if sink.get("kind") == "arg":
+                        idx = int(sink["index"])
+                        seed_region = self._consumed_region(ssaf, sink_ins, idx)
+                        params = self._call_params(sink_ins)
+                        if idx < len(params):
+                            seed_expr = params[idx]
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
-                                                   seed_ins=sink_ins):
+                                                   seed_ins=sink_ins, seed_region=seed_region,
+                                                   seed_expr=seed_expr):
                         o = sl["origin"]
                         key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
                                o.get("value"), o.get("callee"), o.get("index"))
@@ -6235,7 +6340,9 @@ class TaintEngine:
             self._bw_assumptions.append(msg)
 
     def _backward_slice(self, func: Any, seed_var: Any, depth: int, max_depth: int,
-                        visited_funcs: set, seed_ins: Any = None) -> list[dict[str, Any]]:
+                        visited_funcs: set, seed_ins: Any = None, *,
+                        seed_region: _BufferRegion = _BufferRegion(),
+                        seed_expr: Any = None) -> list[dict[str, Any]]:
         """Backward def-chain slice within *func*, continuing into callers when it
         bottoms out at a parameter. Returns one slice per origin path."""
         ssaf = self._ssa_func(func)
@@ -6258,7 +6365,7 @@ class TaintEngine:
         # steps, the caller ascent is not lost. Ranks: 0 parameter, 1 any
         # other strong origin (source, frontier), 2 literal fill, 3 constant.
         origin_rank = 0
-        terminal_params: dict[int, Any] = {}
+        terminal_params: dict[tuple[int, _BufferRegion], Any] = {}
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
@@ -6272,8 +6379,8 @@ class TaintEngine:
                 origin = o
                 origin_rank = rank
 
-        # (buffer key, memory version) pairs already walked, so two buffers that
-        # copy into each other inside a loop cannot recurse without end.
+        # Local/epoch/consumed-region triples already walked: recursive copies
+        # terminate without conflating two members consumed at the same epoch.
         visited_bufs: set = set()
 
         def _buffer_leaf(at, label, detail, **extra):
@@ -6301,7 +6408,8 @@ class TaintEngine:
                 **{"global": hex(addr)})
             _set_origin({"kind": "global", "address": hex(addr), "buffer": label})
 
-        def _follow_addresses(at, expr, d, mv, label, subject) -> tuple[bool, bool]:
+        def _follow_addresses(at, expr, d, mv, label, subject,
+                              region=_BufferRegion(), pointer_expr=None) -> tuple[bool, bool]:
             """Walk every buffer *expr* is an address INTO, at any offset:
             each local it is built on (``&line + rbx``) has its writers walked
             at *mv*, each writable global (``0x4040a0 + (i << 6)``) is a leaf.
@@ -6310,7 +6418,9 @@ class TaintEngine:
             walk followed only the index and claimed a complete slice)."""
             locals_, addrs = self._address_terms(expr)
             for loc in locals_:
-                _walk_local_buffer(at, loc, d, mv)
+                resolved = self._local_region(
+                    ssaf, pointer_expr if pointer_expr is not None else expr, loc, region)
+                _walk_local_buffer(at, loc, d, mv, resolved)
             glob = False
             for addr in addrs:
                 if self._const_ptr_storage(addr) == "writable":
@@ -6318,7 +6428,7 @@ class TaintEngine:
                     glob = True
             return bool(locals_), glob
 
-        def _follow_input(at, expr, d, mv, label, what) -> str:
+        def _follow_input(at, expr, d, mv, label, what, region=_BufferRegion()) -> str:
             """Continue the slice through one INPUT operand of a writer of
             *label* -- the value a store wrote, an argument a modeled fill
             derived the bytes from. *mv* is the memory version the writer
@@ -6335,9 +6445,9 @@ class TaintEngine:
             CONST_PTR; only an address into READ-ONLY storage is a literal."""
             reads = expr_reads(expr)
             walked, glob = _follow_addresses(at, expr, d + 1, mv, label,
-                                             f"{what} local buffer {label}")
+                                             f"{what} local buffer {label}", region)
             for r in reads:
-                walk(r, d + 1, mv)
+                walk(r, d + 1, mv, region, expr)
             if reads or walked:
                 return "followed"
             if glob:
@@ -6355,7 +6465,7 @@ class TaintEngine:
             _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
             return "unresolved"
 
-        def _walk_local_buffer(defn, local, d, mv):
+        def _walk_local_buffer(defn, local, d, mv, region):
             """Continue the slice through the CONTENTS of *local*, read at
             memory version *mv* by the instruction that consumed its address
             (*defn* is the address-of definition, or the consuming call for a
@@ -6371,12 +6481,12 @@ class TaintEngine:
                     f"or inspect the writes to the buffer")
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
                 return
-            bkey = (var_key(local), int(mv))
+            bkey = (var_key(local), int(mv), region)
             if bkey in visited_bufs:
                 return
             visited_bufs.add(bkey)
             res = self._local_buffer_writers(ssaf, var_key(local), mv,
-                                             base_size=self._var_byte_size(local))
+                                             base_size=self._var_byte_size(local), region=region)
             opaque: list[str] = []
             for w in res["writers"]:
                 kind, wdefn = w[0], w[1]
@@ -6432,7 +6542,8 @@ class TaintEngine:
                     if is_source:
                         _set_origin({"kind": "source", "callee": mkey})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
-                                            f"input {i} of {mkey} writing")
+                                            f"input {i} of {mkey} writing",
+                                            self._consumed_region(ssaf, wdefn, i))
                               for i in from_idxs]
                     for i in len_idxs:
                         if expr_reads(params[i]):
@@ -6485,10 +6596,9 @@ class TaintEngine:
                            "the call fills the buffer -- so no path is proven to write it")
                 elif res["writers"]:
                     why = ("on at least one path from the function entry to the "
-                           "sink nothing is proven to write the whole buffer -- a "
-                           "conditional or loop-only fill, or only partial, indexed, "
-                           "offset or may-alias writes -- so there the sink may read "
-                           "whatever the stack held")
+                           "sink nothing is proven to initialize the consumed region -- "
+                           "a conditional, partial, unknown-length, return-dependent, "
+                           "indexed or may-alias write, or an unproven C-string terminator")
                 else:
                     why = "no writer of the buffer was found on the sink's memory chain"
                 _buffer_leaf(
@@ -6496,13 +6606,14 @@ class TaintEngine:
                     f"the sink reads the contents of local buffer {label} but the "
                     f"walk could not account for them ({why}); the slice is NOT "
                     f"complete -- re-run `bn taint forward --source var:{label}` "
-                    "or inspect the writes to the buffer")
+                    "or inspect the writes to the buffer",
+                    region={"offset": region.offset, "width": region.width, "kind": region.kind})
                 # Classified like `field_load_unresolved`: the origin names the
                 # stop and the leaf is the one frontier entry, so the frontier
                 # count is not inflated by counting one stop twice.
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
 
-        def walk(v, d, mv):
+        def walk(v, d, mv, region=_BufferRegion(), pointer_expr=None):
             """Backward over the def-chain of SSA value *v*. *mv* is the memory
             version at which the value is CONSUMED as a buffer (the sink call,
             or the modeled fill / store that read it) -- it rides unchanged
@@ -6513,7 +6624,7 @@ class TaintEngine:
                 self._bw_assume(
                     f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
                 return
-            key = (var_key(v), getattr(v, "version", None))
+            key = (var_key(v), getattr(v, "version", None), mv, region, id(pointer_expr))
             if key in visited_vars:
                 return
             visited_vars.add(key)
@@ -6528,7 +6639,12 @@ class TaintEngine:
                     pidx = self._param_spill_index(func, ssaf, v)
                     via_spill = pidx is not None
                 if pidx is not None:
-                    terminal_params[pidx] = v
+                    relative = self._addr_base_offset(ssaf, pointer_expr)
+                    param_region = region._replace(offset=(
+                        relative[1] + region.offset
+                        if relative is not None and relative[0] == var_key(v)
+                        and region.offset is not None else None))
+                    terminal_params[(pidx, param_region)] = v
                     _set_origin({"kind": "parameter", "index": pidx, "var": var_label(v),
                                  **({"via_spill": True} if via_spill else {})})
                     if via_spill:
@@ -6568,9 +6684,18 @@ class TaintEngine:
                             continue
                         steps.append(_instr_dict(
                             defn, reason=f"return of {mkey or name} derives from its argument {fi}"))
+                        # Propagation alone is not an exact pointer alias:
+                        # strchr/stpcpy can return an interior/end pointer.
+                        relative = self._addr_base_offset(ssaf, pointer_expr if pointer_expr is not None else v)
+                        return_region = region._replace(offset=(
+                            region.offset + relative[1]
+                            if (model or {}).get("return_alias") == fi
+                            and relative is not None and relative[0] == var_key(v)
+                            and region.offset is not None else None))
                         states.append(_follow_input(
                             defn, cparams[fi], d, mv, var_label(v),
-                            f"argument {fi} of {mkey or name} returned by"))
+                            f"argument {fi} of {mkey or name} returned by",
+                            return_region))
                     if not states:
                         _set_origin({"kind": "call", "callee": name})
                     elif all(s == "literal" for s in states):
@@ -6588,7 +6713,7 @@ class TaintEngine:
             # so the writers are found on its memory-SSA chain; the offset's
             # own reads are walked too -- they pick which bytes.
             walked, glob = _follow_addresses(defn, src_expr, d, mv, var_label(v),
-                                             f"the pointer {var_label(v)}")
+                                             f"the pointer {var_label(v)}", region, pointer_expr)
             if walked or glob:
                 for r in expr_reads(src_expr):
                     walk(r, d + 1, mv)
@@ -6603,9 +6728,23 @@ class TaintEngine:
                 aliased = getattr(src_expr, "src", None)
                 aliased = getattr(aliased, "var", aliased)
                 if aliased is not None:
-                    _walk_local_buffer(defn, aliased, d, self._mem_in(defn))
+                    _walk_local_buffer(
+                        defn, aliased, d, self._mem_in(defn),
+                        _BufferRegion(getattr(src_expr, "offset", 0),
+                                      getattr(src_expr, "size", None), "bytes"))
                     return
             if src_expr is not None and "LOAD" in op_name(src_expr):
+                pointer = getattr(src_expr, "src", None)
+                local = self._pointee_var(ssaf, pointer)
+                locals_, _ = self._address_terms(pointer)
+                if local is None and len(locals_) == 1:
+                    local = locals_[0]
+                if local is not None:
+                    demand = _BufferRegion(0, getattr(src_expr, "size", None), "bytes")
+                    _walk_local_buffer(
+                        defn, local, d, getattr(src_expr, "src_memory", None),
+                        self._local_region(ssaf, pointer, local, demand))
+                    return
                 la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
                 if la is not None:
                     rec = self._reaching_writer(
@@ -6633,6 +6772,16 @@ class TaintEngine:
                         steps.append(_instr_dict(
                             call_defn, reason=f"field filled by source {callee}"))
                         _set_origin({"kind": "source", "callee": callee})
+                        # A receive API is an origin, not proof that this
+                        # particular loaded field was initialized (#931).
+                        leaf = {"kind": "field_load_unresolved",
+                                "address": hex(int(getattr(defn, "address", 0))),
+                                "offset": hex(la[1]), "width": getattr(src_expr, "size", None),
+                                "il_text": str(defn),
+                                "detail": f"{callee} may write this field; its requested "
+                                          "length does not prove initialized bytes"}
+                        if leaf not in self._bw_leaves:
+                            self._bw_leaves.append(leaf)
                         return
                     base_var = self._addr_base_var(ssaf, getattr(src_expr, "src", None))
                     if self._field_base_is_alloc_or_param(ssaf, func, base_var):
@@ -6671,18 +6820,19 @@ class TaintEngine:
                     _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
                                 weak=True)
             for r in reads:
-                walk(r, d + 1, mv)
+                walk(r, d + 1, mv, region,
+                     pointer_expr if pointer_expr is not None else src_expr)
 
         seed_mv = self._mem_in(seed_ins) if seed_ins is not None else None
         if isinstance(seed_var, _BufferSeed):
             # `popen(&cmd, "r")` with the address folded into the parameter:
             # the seed IS the buffer's contents, read by the sink call itself.
             if seed_var.local is not None:
-                _walk_local_buffer(seed_ins, seed_var.local, 0, seed_mv)
+                _walk_local_buffer(seed_ins, seed_var.local, 0, seed_mv, seed_var.region)
             else:
                 _global_leaf(seed_ins, seed_var.name, int(seed_var.addr), "the sink argument")
         else:
-            walk(seed_var, 0, seed_mv)
+            walk(seed_var, 0, seed_mv, seed_region, seed_expr)
         base_steps = list(reversed(steps))
 
         # continue into callers only when the value's origin here is a parameter
@@ -6708,7 +6858,7 @@ class TaintEngine:
         # arity (#810). The disclosure reports the measurement, never the constant.
         considered = caller_sites[:MAX_CALLERS]
         ascended: set[int] = set()
-        for pidx, pvar in terminal_params.items():
+        for (pidx, region), pvar in terminal_params.items():
             followed = False
             for idx, site in enumerate(considered):
                 caller = getattr(site, "function", None)
@@ -6731,7 +6881,8 @@ class TaintEngine:
                 # contents, so the ascent walks the caller's writers of it --
                 # the same path `p = &buf; run(p)` takes -- beside the offset.
                 seeds: list[Any] = (expr_reads(cparams[pidx])
-                                    + self._folded_buffer_seeds(cparams[pidx]))
+                                    + self._folded_buffer_seeds(
+                                        self._ssa_func(caller), cparams[pidx], region))
                 if not seeds:
                     self._bw_assume(
                         f"arg {pidx} at {hex(addr)} in {caller.name} is not a trackable "
@@ -6740,7 +6891,8 @@ class TaintEngine:
                 boundary = _instr_dict(call_ins, reason=f"passed as arg {pidx} to {func.name}")
                 for sv in seeds:
                     for sub in self._backward_slice(caller, sv, depth + 1, max_depth, visited_funcs,
-                                                    seed_ins=call_ins):
+                                                    seed_ins=call_ins, seed_region=region,
+                                                    seed_expr=cparams[pidx]):
                         results.append({
                             "steps": sub["steps"] + [boundary] + base_steps,
                             "origin": sub["origin"],
@@ -6842,7 +6994,8 @@ class TaintEngine:
                     # does for `p = &cmd; popen(p)` -- a seed error (or, with
                     # a variable offset, a slice of only the offset) was the
                     # same bug with a second answer.
-                    for bs in self._folded_buffer_seeds(params[idx]):
+                    for bs in self._folded_buffer_seeds(
+                            ssaf, params[idx], self._consumed_region(ssaf, c, idx)):
                         out.append((bs, c))
             if not out:
                 # The locator was fine; the arg itself can't be sliced. Say so
