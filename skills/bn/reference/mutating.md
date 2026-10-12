@@ -78,6 +78,8 @@ This table describes the stable object from `--format json --summary`; the defau
 
 A genuine zero-candidate scan explicitly reports zero verified, committed, and failed renames. Both live and preview runs then report `measured: true`, `changed_count: 0`, `verified_count: 0`, `failed_count: 0`, `dirty_after: false`, and exit 0; `committed` stays false. The additional compact scan disclosure explains an idempotent re-run or containment-only scan without changing the operation population. This describes what this call changed, not whether the view had earlier unsaved edits.
 
+Unknown fields in the compact `go_rename` disclosure remain JSON `null` and render as `?` in text, including spilled status and text output files; a measured zero still renders as `0`.
+
 If a required measurement source is missing, a supplied counter is unreadable, or a failure counter contradicts the failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under a successful `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a failed preview or live run whose revert completed it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
 ## Batch apply

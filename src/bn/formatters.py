@@ -6145,7 +6145,7 @@ def _render_mutation_summary_text(value: Any) -> str:
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(
-            f"{key}={_stated_count(go, key)}" for key in (
+            f"{key}={_fmt_count(go.get(key))}" for key in (
                 "candidates", "skipped_user_named", "skipped_already_named",
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )

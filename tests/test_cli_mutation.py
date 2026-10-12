@@ -579,6 +579,44 @@ def test_go_rename_unreadable_scan_skips_preserve_failure_precedence(
     assert bn.cli._mutation_exit_code(payload, _go_rename_summary) == exit_code
 
 
+@pytest.mark.parametrize("counter,key,missing", [
+    ("go_renamed_candidates", "candidates", False),
+    ("skipped_user_named", "skipped_user_named", False),
+    ("skipped_already_named", "skipped_already_named", False),
+    ("skipped_interior_pc", "skipped_interior_pc", False),
+    ("skipped_changed_during_apply", "skipped_changed_during_apply", False),
+    ("go_renamed_candidates", "candidates", True),
+    ("skipped_user_named", "skipped_user_named", True),
+])
+def test_go_rename_unknown_disclosure_stays_unknown_in_text(
+        monkeypatch, fake_transport, capsys, tmp_path, counter, key, missing):
+    from bn.formatters import _go_rename_summary
+
+    payload, _ = _go_rename_produced(monkeypatch, preview=False)
+    if missing:
+        payload.pop(counter)
+    else:
+        payload[counter] = "unknown"
+    assert _go_rename_summary(payload)["go_rename"][key] is None
+    fake_transport({"go_rename": {"ok": True, "result": payload}})
+    argv = ["go", "rename", "--target", "active"]
+    expected_exit = 0 if missing else 4
+
+    assert bn.cli.main(argv) == expected_exit
+    text = capsys.readouterr().out
+    assert f"{key}=?" in text and f"{key}=0" not in text
+
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    assert bn.cli.main([*argv, "--verbose"]) == expected_exit
+    spilled = capsys.readouterr().out
+    assert f"{key}=?" in spilled and f"{key}=0" not in spilled
+
+    output = tmp_path / "summary.txt"
+    assert bn.cli.main([*argv, "--summary", "--out", str(output)]) == expected_exit
+    written = output.read_text(encoding="utf-8")
+    assert f"{key}=?" in written and f"{key}=0" not in written
+
+
 def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatch):
     """#693 item 1: `changed` is what is LIVE, and a failed revert leaves an
     UNKNOWN nonzero subset of the renames live. Reporting `changed_count: 0`
