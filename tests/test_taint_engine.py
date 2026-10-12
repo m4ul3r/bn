@@ -10887,7 +10887,9 @@ def test_backward_member_string_coverage_933(alias, write_offset, read_offset, l
     pg.call(_B_POPEN, [expr, _cstr(0x710)], reads=expr.vars_read)
     result, _, _ = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
-    assert any(s["origin"].get("var") == "host#0" for s in result["slices"])
+    # A zero-capacity formatter cannot supply the destination's contents.
+    assert any(s["origin"].get("var") == "host#0"
+               for s in result["slices"]) is (length > 0)
 
 
 def test_backward_recursive_member_copy_keeps_source_region_933():
