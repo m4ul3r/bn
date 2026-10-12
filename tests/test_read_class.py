@@ -773,18 +773,18 @@ def test_resolve_class_names_cross_namespace_leaf():
 def test_class_list_envelope_filters_and_pages():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True)
     assert out["kind"] == "classes" and "classes" not in out  # #275: items-only
     assert out["returned"] == len(out["items"])
     assert out["has_more"] is False
     names = [c["name"] for c in out["items"]]
     assert "net::Session" in names and out["total"] == len(names)
     # Default (no --all) drops name-only clusters like the bare "net" namespace.
-    confirmed = read_class._class_list(_Ctx(), None, include_all=False)
+    confirmed = read_class._class_list(_Ctx(None), None, include_all=False)
     assert "net" not in [c["name"] for c in confirmed["items"]]
     assert "net::Session" in [c["name"] for c in confirmed["items"]]
 
@@ -792,11 +792,11 @@ def test_class_list_envelope_filters_and_pages():
 def test_class_list_envelope_has_more_when_paged():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, limit=1)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, limit=1)
     assert out["kind"] == "classes" and "classes" not in out
     assert out["limit"] == 1
     assert out["returned"] == 1
@@ -829,11 +829,11 @@ def test_class_list_no_stl_filters_library_classes():
     syms = [_Sym("_ZTVN3net7SessionE", "_vtable_for_net::Session", 0x9000)]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, no_stl=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, no_stl=True)
     names = [c["name"] for c in out["items"]]
     assert "net::Session" in names
     assert "std::vector<int>" not in names
@@ -841,7 +841,7 @@ def test_class_list_no_stl_filters_library_classes():
     assert out["no_stl"] is True
     assert out["library_suppressed"] >= 2
     # Without --no-stl the library classes are present.
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert "std::vector<int>" in [c["name"] for c in full["items"]]
     assert full["library_suppressed"] == 0
 
@@ -857,7 +857,7 @@ def test_class_list_populates_bases_for_shown_rows():
     ]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
@@ -866,7 +866,7 @@ def test_class_list_populates_bases_for_shown_rows():
                 return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
             return []
 
-    out = read_class._class_list(_Ctx(), None)
+    out = read_class._class_list(_Ctx(None), None)
     row = next(c for c in out["items"] if c["name"] == "net::Session")
     assert row["bases"] == ["net::Endpoint"]
 
@@ -2334,21 +2334,21 @@ def test_class_list_discloses_quick_analysis_state():
     bridge_state = importlib.import_module("bn_agent_bridge.bridge_state")
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert full["analysis_state"] == "full"
     assert full["partial"] is False
-    full_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    full_count = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     assert full_count["analysis_state"] == "full"
     assert full_count["partial"] is False
 
     bridge_state._quick_loaded_views.add(bv)
     try:
-        quick = read_class._class_list(_Ctx(), None, include_all=True)
-        quick_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+        quick = read_class._class_list(_Ctx(None), None, include_all=True)
+        quick_count = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     finally:
         bridge_state._quick_loaded_views.discard(bv)
 

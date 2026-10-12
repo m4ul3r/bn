@@ -3202,8 +3202,9 @@ class TestClassLensRttiGuards922:
         assert counted["count"] == 1, counted
 
     def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
-        # Both builds use the same source/options except -s. Compare the actual
-        # slot words, not demangled method names (which stripping removes).
+        # Both builds use the same source/options except -s. Compare raw slot
+        # words within each view; across views only proven external symbols use
+        # their identity, since BN assigns their synthetic addresses per view.
         expected_totals = {
             "svc::Codec": 5, "svc::HexCodec": 5, "svc::Handler": 4,
             "svc::EchoHandler": 4, "svc::AuditHandler": 5, "svc::Pipe": 4,
@@ -3220,10 +3221,14 @@ class TestClassLensRttiGuards922:
             }
             raw = shared_bn.json(
                 "py", "exec",
+                "import binaryninja as bn\n"
                 "ptr = bv.address_size\n"
                 f"tables = {tables!r}\n"
                 "result = {\n"
                 "    'ptr': ptr,\n"
+                "    'externals': {hex(s.address): {'raw_name': s.raw_name,\n"
+                "        'namespace': str(s.namespace)}\n"
+                "        for s in bv.get_symbols_of_type(bn.SymbolType.ExternalSymbol)},\n"
                 "    'codec_symbols': [hex(s.address) for s in bv.get_symbols()\n"
                 "        if s.short_name in ('vtable for svc::Codec',\n"
                 "                            '_vtable_for_svc::Codec', 'vtable_for_svc::Codec')],\n"
@@ -3270,5 +3275,13 @@ class TestClassLensRttiGuards922:
             assert imported["typeinfo"]["import_slot"] is True
             assert imported["bases"] == [] and imported["vtable"] is None
             assert "secondary_vtables" not in imported
-            snapshots.append(raw["tables"])
+            for name, pure_index in (("svc::Codec", 3), ("svc::Handler", 2)):
+                address = raw["tables"][name][0]["slots"][pure_index]
+                assert raw["externals"][address]["raw_name"] == "__cxa_pure_virtual"
+            snapshots.append({
+                name: [{**words, "slots": [
+                    raw["externals"].get(address, address) for address in words["slots"]
+                ]} for words in entries]
+                for name, entries in raw["tables"].items()
+            })
         assert snapshots[0] == snapshots[1]
