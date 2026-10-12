@@ -1170,10 +1170,6 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         try:
             if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
                 response = _json_response(ok=False, error="request too large")
-            elif not admitted:
-                # Explicit stop or idle expiry won admission. Refuse cleanly
-                # rather than dispatching work into a bridge being torn down.
-                response = _json_response(ok=False, error="bridge is shutting down")
             else:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
@@ -1198,7 +1194,10 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                         idle_probe = payload.get("idle_probe") is True
                         expected_identity = getattr(bridge, "bridge_identity", None)
                         actual_identity = payload.get("_bridge_identity")
-                        if (
+                        if not admitted:
+                            response = _json_response(
+                                ok=False, error="bridge is shutting down")
+                        elif (
                             expected_identity is not None
                             and actual_identity != expected_identity
                         ):

@@ -997,9 +997,10 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     successor.stop()
 
 
-def _send_lifecycle_request(client, instance, op="blocked"):
+def _send_lifecycle_request(client, instance, op="blocked", *, idle_probe=False):
     client.sendall(json.dumps({
         "op": op, "_bridge_identity": instance.bridge_identity,
+        "idle_probe": idle_probe,
     }).encode() + b"\n")
 
 
@@ -1008,7 +1009,9 @@ def _read_lifecycle_response(client):
         return json.loads(stream.read())
 
 
-def test_rebind_does_not_readmit_a_request_on_the_old_listener(monkeypatch, tmp_path):
+@pytest.mark.parametrize("idle_probe", [False, True])
+def test_rebind_does_not_readmit_a_request_on_the_old_listener(
+        monkeypatch, tmp_path, idle_probe):
     import socket
     import threading
 
@@ -1032,10 +1035,19 @@ def test_rebind_does_not_readmit_a_request_on_the_old_listener(monkeypatch, tmp_
             assert accepted.wait(5)
             instance.stop()
             instance.start()
-            _send_lifecycle_request(client, instance, "list_targets")
+            before = module.time.monotonic() - 60
+            instance._last_activity = before
+            _send_lifecycle_request(
+                client, instance, "list_targets", idle_probe=idle_probe)
             response = _read_lifecycle_response(client)
             assert response["ok"] is False
             assert response["error"] == "bridge is shutting down"
+            if idle_probe:
+                assert instance._last_activity == before
+            else:
+                assert instance._last_activity > before
+            assert instance._try_idle_shutdown(
+                now=module.time.monotonic(), timeout=30) is idle_probe
     finally:
         instance.stop()
 
