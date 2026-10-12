@@ -65,7 +65,7 @@ This table describes the stable object from `--format json --summary`; the defau
 | `committed` | whether live apply reached commit, including all-noop; `go rename` with no candidates reports false |
 | `preview` | whether preview was requested |
 | `measured` | false when result rows or required counters cannot establish counts |
-| `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
+| `op_count` | For `go rename`, candidates plus all scan-time skips: user-named, already carrying the recovered name, and interior PCs. This reconciles with `defined_count`; apply-time skips are not counted twice. |
 | `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
 | `rolled_back` | meaningful when `committed` is false; false/null on a committed run does not mean restore ran |
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
@@ -73,7 +73,11 @@ This table describes the stable object from `--format json --summary`; the defau
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 | `overlapping_functions` | the `{name, address, offset, instruction_boundary, truncated}` of each function a `function create --allow-overlap` landed inside (`truncated` says whether the host was cut at the new start or left intact); absent for an ordinary create |
 
-`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a live clean revert it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
+`go rename` counts through its own counters rather than one `results[]` row per rename. Its `noop_count` includes `skipped_user_named`, `skipped_already_named`, and `skipped_interior_pc`. The latter two are optional nonzero buckets in the full result; their absence means zero. Since `skipped_user_named` also includes `skipped_changed_during_apply`, those apply-time skips are subtracted from `candidates + noop_count` to obtain `op_count`.
+
+A genuine zero-candidate scan explicitly reports zero verified, committed, and failed renames. Both live and preview runs then report `measured: true`, `changed_count: 0`, `verified_count: 0`, `failed_count: 0`, `dirty_after: false`, and exit 0; `committed` stays false. The default text's `noop` and the compact JSON's `noop_count` account for every scan-time skip, including an idempotent re-run or a containment-only scan. This describes what this call changed, not whether the view had earlier unsaved edits.
+
+If a required measurement source is missing, a supplied counter is unreadable, or a failure counter contradicts the failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under a successful `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a failed preview or live run whose revert completed it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
 ## Batch apply
 

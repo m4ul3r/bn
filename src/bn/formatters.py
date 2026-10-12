@@ -5840,7 +5840,7 @@ def _mutation_summary(value: Any) -> Any:
 
 
 # `go rename`'s own counters -- the ONE list, and the read loop below iterates
-# it, so a seventh counter cannot be read outside the capture that decides
+# it, so another counter cannot be read outside the capture that decides
 # whether this summary was measured at all. A tuple maintained BESIDE the reads
 # would be a second declaration to drift; this one IS the reads.
 _GO_RENAME_COUNTERS = (
@@ -5849,6 +5849,8 @@ _GO_RENAME_COUNTERS = (
     "go_verified_count",
     "go_failed_count",
     "skipped_user_named",
+    "skipped_already_named",
+    "skipped_interior_pc",
     "skipped_changed_during_apply",
 )
 
@@ -5915,7 +5917,8 @@ def _go_rename_summary(value: Any) -> Any:
     committed_count = counters["go_committed_count"]
     verified = counters["go_verified_count"]
     failed = counters["go_failed_count"]
-    skipped = counters["skipped_user_named"]
+    skipped = (counters["skipped_user_named"] + counters["skipped_already_named"]
+               + counters["skipped_interior_pc"])
     rolled_back = value.get("rolled_back")
     reported_success = bool(value.get("success", True))
     # The rows and the counter answer the SAME question on this op, and the
@@ -6066,9 +6069,9 @@ def _go_rename_summary(value: Any) -> Any:
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
-        # inside go_renamed_candidates. Distinct functions considered =
-        # candidates + scan-time-only skips -- keeping verified+noop+failed <=
-        # op_count, the invariant every other mutation summary holds.
+        # inside go_renamed_candidates. Already-named and interior-PC rows
+        # are disjoint scan-time skips. Distinct functions considered =
+        # candidates + all scan-time skips, reconciling with defined_count.
         op_count=candidates + skipped
                  - counters["skipped_changed_during_apply"],
         reported_success=reported_success,
@@ -6077,10 +6080,10 @@ def _go_rename_summary(value: Any) -> Any:
         failed=failed,
         changed=changed,
         verified=stated_verified,
-        # Already-user-named functions are deliberately left alone: no change,
-        # which is what `noop` means elsewhere. `op_count` above still uses the
-        # numeric read: it is a literal count of what the op could see, and an
-        # absent counter shrinks it rather than unknowing it.
+        # Every skipped row is deliberately left unchanged, including an
+        # already recovered name or an interior PC we must never rename.
+        # `op_count` above still uses the numeric read: it counts the rows
+        # this envelope reports, even when a missing counter shrinks it.
         noop=stated_noop,
         committed=committed,
         preview=preview,

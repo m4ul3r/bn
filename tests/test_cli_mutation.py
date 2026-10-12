@@ -470,6 +470,101 @@ def _go_rename_produced(monkeypatch, *, preview, readback_fails=(),
     return payload, {addr: fn.name for addr, fn in functions.items()}
 
 
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("names,interior,expected_noop", [
+    ({}, False, 0),
+    ({0x401000: "parse_record"}, False, 1),
+    ({0x401000: "main.f0"}, False, 1),
+    ({}, True, 3),
+    ({0x401000: "main.f0", 0x402000: "parse_record"}, True, 3),
+], ids=["undefined", "user-named", "already-named", "interior", "mixed"])
+def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
+        monkeypatch, fake_transport, capsys, preview, names, interior, expected_noop):
+    """#883: scan real synthetic pcln data, then render the producer's no-op."""
+    from test_read_go import (
+        _ContainmentOnlyGoBV, _GoBV, _build_pclntab_many, _ctx, _fake_functions,
+    )
+
+    blob = _build_pclntab_many(3)
+    bv = _ContainmentOnlyGoBV(blob) if interior else _GoBV(blob)
+    functions, get_function_at = _fake_functions(names)
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
+    _bridge, instance = _ctx(monkeypatch, bv)
+    payload = instance._go_rename(None, preview=preview)
+    assert {addr: fn.name for addr, fn in functions.items()} == names
+    assert payload["defined_count"] == expected_noop
+
+    fake_transport({"go_rename": {"ok": True, "result": payload}})
+    argv = ["go", "rename", "--target", "active"] + (["--preview"] if preview else [])
+    assert bn.cli.main(argv) == 0
+    text = capsys.readouterr().out
+    assert "changed=0" in text and "verified=0" in text and "failed=0" in text
+    assert f"noop={expected_noop}" in text and "dirty_after=False" in text
+
+    assert bn.cli.main([*argv, "--format", "json", "--summary"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["ok"] is True and summary["measured"] is True
+    assert summary["committed"] is False and summary["dirty_after"] is False
+    assert summary["changed_count"] == summary["verified_count"] == summary["failed_count"] == 0
+    assert summary["noop_count"] == summary["op_count"] == expected_noop
+    assert summary["first_error"] is None
+
+    assert bn.cli.main([*argv, "--format", "json"]) == 0
+    detail = json.loads(capsys.readouterr().out)
+    assert detail["ok"] is True and detail["committed"] is False
+    assert detail["go_renamed_candidates"] == detail["go_verified_count"] == 0
+    assert detail["go_committed_count"] == detail["go_failed_count"] == 0
+    assert sum(detail.get(key, 0) for key in (
+        "skipped_user_named", "skipped_already_named", "skipped_interior_pc",
+    )) == summary["noop_count"]
+
+
+@pytest.mark.parametrize("preview,readback_fails,lose_on_rollback,changed,dirty", [
+    (False, (), (), 2, True),
+    (True, (), (), 2, False),
+    (False, (0x402000,), (), 0, False),
+    (True, (0x402000,), (), 0, False),
+    (False, (0x402000,), (0x401000,), None, True),
+    (True, (), (0x401000,), None, True),
+])
+def test_go_rename_summary_reconciles_scan_skips_without_changing_rollback(
+        monkeypatch, preview, readback_fails, lose_on_rollback, changed, dirty):
+    from bn.formatters import _go_rename_summary
+
+    payload, _live = _go_rename_produced(
+        monkeypatch, preview=preview, readback_fails=readback_fails,
+        lose_on_rollback=lose_on_rollback, skipped_user_named=3,
+        skipped_already_named=2, skipped_interior_pc=4)
+    summary = _go_rename_summary(payload)
+    assert summary["measured"] is True
+    assert summary["op_count"] == payload["defined_count"] == 11
+    assert summary["noop_count"] == 9
+    assert summary["changed_count"] == changed
+    assert summary["dirty_after"] is dirty
+    assert summary["verified_count"] == payload["go_verified_count"]
+    assert summary["failed_count"] == payload["go_failed_count"]
+
+
+@pytest.mark.parametrize("counter", ["skipped_already_named", "skipped_interior_pc"])
+@pytest.mark.parametrize("bogus", ["unknown", {"count": 2}])
+@pytest.mark.parametrize("readback_fails,exit_code", [((), 4), ((0x402000,), 3)])
+def test_go_rename_unreadable_scan_skips_preserve_failure_precedence(
+        monkeypatch, counter, bogus, readback_fails, exit_code):
+    from bn.formatters import _add_mutation_ok, _go_rename_summary
+
+    payload, _live = _go_rename_produced(
+        monkeypatch, preview=False, readback_fails=readback_fails,
+        skipped_already_named=2, skipped_interior_pc=4)
+    payload[counter] = bogus
+    summary = _go_rename_summary(payload)
+    assert summary["measured"] is False and summary["ok"] is False
+    assert summary["dirty_after"] is True
+    for key in ("changed_count", "verified_count", "noop_count", "failed_count"):
+        assert summary[key] is None
+    assert _add_mutation_ok(payload)["ok"] is False
+    assert bn.cli._mutation_exit_code(payload, _go_rename_summary) == exit_code
+
+
 def test_a_go_rename_whose_revert_failed_does_not_report_changed_zero(monkeypatch):
     """#693 item 1: `changed` is what is LIVE, and a failed revert leaves an
     UNKNOWN nonzero subset of the renames live. Reporting `changed_count: 0`
@@ -4811,7 +4906,8 @@ def test_data_retype_verification_failure_exits_3_649(fake_transport):
     assert rc == 3
 
 
-def test_go_rename_op_count_does_not_double_count_apply_time_skips():
+@pytest.mark.parametrize("already,interior", [(0, 0), (2, 4)])
+def test_go_rename_op_count_does_not_double_count_apply_time_skips(already, interior):
     # The wire `skipped_user_named` FOLDS apply-time "changed underneath us"
     # skips in (bridge: skipped_total = skipped_user_named + skipped_during_apply)
     # while those same rows stay inside go_renamed_candidates -- summing the two
@@ -4823,9 +4919,10 @@ def test_go_rename_op_count_does_not_double_count_apply_time_skips():
         "results": [], "go_renamed_candidates": 10, "go_committed_count": 7,
         "go_verified_count": 7, "go_failed_count": 0,
         "skipped_user_named": 5, "skipped_changed_during_apply": 3,
+        "skipped_already_named": already, "skipped_interior_pc": interior,
     })
-    assert summary["op_count"] == 12
-    assert summary["noop_count"] == 5
+    assert summary["op_count"] == 12 + already + interior
+    assert summary["noop_count"] == 5 + already + interior
     assert summary["changed_count"] == 7
 
 
