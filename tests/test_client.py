@@ -126,6 +126,72 @@ def test_collect_stops_at_total_limit_and_reports_remaining_rows(monkeypatch):
     assert calls == [{"offset": 0, "limit": 2}, {"offset": 2, "limit": 1}]
 
 
+@pytest.mark.parametrize(
+    "limit,offset,incomplete,returned,scanned,total,has_more,scan_truncated",
+    [
+        (None, 0, False, 7, 7, 7, False, False),
+        (3, 0, False, 3, 4, None, True, True),
+        (6, 0, False, 6, 7, 7, True, False),
+        (None, 2, False, 5, 7, 7, False, False),
+        (None, 0, True, 7, 7, None, False, False),
+        (3, 2, True, 3, 6, None, True, True),
+        (0, 0, False, 0, 2, None, True, True),
+        (0, 6, False, 0, 7, 7, True, False),
+        (0, 7, True, 0, 7, None, False, False),
+    ],
+    ids=[
+        "complete", "finite-partial", "finite-complete-scan", "nonzero-offset",
+        "terminal-incomplete", "lower-bound-refines", "zero-probe",
+        "zero-probe-complete-scan", "zero-probe-incomplete-empty",
+    ],
+)
+def test_collect_callsites_cumulative_coverage(
+    monkeypatch, limit, offset, incomplete, returned, scanned, total,
+    has_more, scan_truncated,
+):
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+
+    def reply(op, *, params, **kwargs):
+        # One row per discovered caller. Like read_listing._callsites, each
+        # request scans from zero, including a lookahead row before slicing.
+        start, size = params["offset"], params["limit"]
+        examined = min(start + size + 1, 7)
+        rows = [{"id": index} for index in range(start, min(start + size, 7))]
+        truncated = examined < 7
+        page = {
+            "kind": "callsites", "items": rows, "offset": start, "limit": size,
+            "returned": len(rows), "has_more": start + len(rows) < 7,
+            "total": None if truncated or incomplete else 7,
+            "scan_truncated": truncated, "caller_scan_truncated": incomplete,
+            "caller_scan_note": "unavailable IL" if incomplete else None,
+            "callers_scanned": examined, "caller_total": None if incomplete else 7,
+            "row_fields": ["id"],
+        }
+        if truncated or incomplete:
+            page["total_lower_bound"] = examined
+        return {"result": page}
+
+    monkeypatch.setattr(client_module, "send_request", reply)
+    result = Client(timeout=3).collect(
+        "callsites", {"offset": offset}, page_size=2, limit=limit
+    )
+
+    assert result["items"] == [{"id": i} for i in range(offset, offset + returned)]
+    assert result["offset"] == offset
+    assert result["returned"] == returned
+    assert result["has_more"] is has_more
+    assert result["total"] == total
+    assert result["scan_truncated"] is scan_truncated
+    assert result["caller_scan_truncated"] is incomplete
+    assert result["caller_scan_note"] == ("unavailable IL" if incomplete else None)
+    assert result["callers_scanned"] == scanned
+    assert result["caller_total"] == (None if incomplete else 7)
+    if total is None:
+        assert result["total_lower_bound"] == scanned
+    else:
+        assert "total_lower_bound" not in result
+
+
 def test_collect_exact_limit_does_not_claim_more_when_bridge_is_finished(monkeypatch):
     monkeypatch.setattr(
         client_module,

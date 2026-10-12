@@ -700,21 +700,86 @@ sys.exit(1)
         _run(bn_kernel.Session(backend="cli").run("bad"))
 
 
-def test_cache_dir_reaches_the_env_before_the_client_is_built(monkeypatch, tmp_path):
-    # A retained kernel's environment was fixed when the kernel started, so a
-    # bridge registered under another cache dir is unreachable from here: the
-    # explicit argument is the only knob, and it must land before the native
-    # client resolves its socket at construction time.
+@pytest.mark.parametrize("backend", ["native", "cli"])
+def test_cache_dir_tracks_effective_root_and_reads(monkeypatch, tmp_path, backend):
+    import bn.client as client_module
+    from bn.paths import cache_home
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
     monkeypatch.delenv("BN_CACHE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    default_root = cache_home()
+    roots = [
+        tmp_path / "cache-a", tmp_path / "cache-b", tmp_path / "replacement",
+        default_root, tmp_path / "home" / "expanded", Path("relative-cache"),
+    ]
+    # Different roots expose different target records. Keep transport synthetic,
+    # but use the routing resolver on each native read and inside each CLI child.
+    for root in roots:
+        root.mkdir(parents=True)
+        (root / "target.json").write_text(json.dumps(_canonical_target_info(
+            filename=str(root / "sample.bndb")
+        )))
+    if backend == "native":
+        def reply(op, **kwargs):
+            return {"result": json.loads((cache_home() / "target.json").read_text())}
 
-    bound = bn_kernel.Session(instance="w1", backend="cli", cache_dir=tmp_path)
+        monkeypatch.setattr(client_module, "send_request", reply)
+    else:
+        source = Path(__file__).resolve().parents[1] / "src"
+        script = f"""
+import json, sys
+sys.path.insert(0, {str(source)!r})
+from bn.paths import cache_home
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+with open(out, "w") as stream:
+    stream.write((cache_home() / "target.json").read_text())
+"""
+        monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
 
-    assert os.environ["BN_CACHE_DIR"] == str(tmp_path)
-    assert bound.cache_dir == str(tmp_path)
+    first = bn_kernel.Session(
+        instance="worker", target="sample", backend=backend, cache_dir=roots[0]
+    )
+    inherited = bn_kernel.Session(
+        instance="worker", target="sample", backend=backend, cache_dir=None
+    )
 
-    monkeypatch.delenv("BN_CACHE_DIR", raising=False)
-    assert bn_kernel.Session(instance="w1", backend="cli").cache_dir is None
+    def check(root):
+        assert first.cache_dir == inherited.cache_dir == str(root)
+        assert _run(first.info())["filename"] == str(root / "sample.bndb")
+
+    check(roots[0])
+    second = bn_kernel.Session(
+        instance="worker", target="sample", backend=backend, cache_dir=roots[1]
+    )
+    check(roots[1])
+    assert second.cache_dir == str(roots[1])
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(roots[2]))
+    check(roots[2])
+    assert second.cache_dir == str(roots[2])
+
+    monkeypatch.setenv("BN_CACHE_DIR", "")
+    check(default_root)
+    assert os.environ["BN_CACHE_DIR"] == ""
+
+    monkeypatch.delenv("BN_CACHE_DIR")
+    check(default_root)
+    ambient = bn_kernel.Session(
+        instance="worker", target="sample", backend=backend, cache_dir=None
+    )
+    assert ambient.cache_dir == str(default_root)
     assert "BN_CACHE_DIR" not in os.environ
+
+    monkeypatch.setenv("BN_CACHE_DIR", "~/expanded")
+    check(roots[4])
+    assert os.environ["BN_CACHE_DIR"] == "~/expanded"
+
+    monkeypatch.setenv("BN_CACHE_DIR", "relative-cache")
+    check(roots[5])
 
 
 def test_cache_dir_rejects_a_non_path(monkeypatch):
@@ -2480,6 +2545,109 @@ json.dump({"items": [row], "offset": 0, "has_more": False, "total": 1},
     rows = _run(cli.callsites("sink", limit=2))
     assert "--within" not in rows[0]["argv"]
     assert "--within-file" not in rows[0]["argv"]
+
+
+@pytest.mark.parametrize("backend", ["native", "cli"])
+@pytest.mark.parametrize(
+    "limit,offset,incomplete,returned,scanned,total,has_more,scan_truncated",
+    [
+        (None, 0, False, 1007, 1007, 1007, False, False),
+        (503, 0, False, 503, 504, None, True, True),
+        (1006, 0, False, 1006, 1007, 1007, True, False),
+        (None, 2, False, 1005, 1007, 1007, False, False),
+        (None, 0, True, 1007, 1007, None, False, False),
+        (503, 2, True, 503, 506, None, True, True),
+        (0, 0, False, 0, 2, None, True, True),
+        (0, 1006, False, 0, 1007, 1007, True, False),
+        (0, 1007, True, 0, 1007, None, False, False),
+    ],
+    ids=[
+        "complete", "finite-partial", "finite-complete-scan", "nonzero-offset",
+        "terminal-incomplete", "lower-bound-refines", "zero-probe",
+        "zero-probe-complete-scan", "zero-probe-incomplete-empty",
+    ],
+)
+def test_callsites_cumulative_coverage_on_both_backends(
+    monkeypatch, tmp_path, backend, limit, offset, incomplete, returned,
+    scanned, total, has_more, scan_truncated,
+):
+    import bn.client as client_module
+
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    rows = [
+        {
+            "call_addr": hex(0x1000 + index * 0x20),
+            "caller_static": hex(0x1005 + index * 0x20),
+            "containing_function": {
+                "name": f"caller_{index}", "address": hex(0x1000 + index * 0x20),
+            },
+            "callee": {"name": "sink", "address": "0x20000"},
+        }
+        for index in range(1007)
+    ]
+    pages = {}
+    start = offset
+    while True:
+        size = 1 if limit == 0 else (
+            500 if limit is None else min(500, limit - (start - offset))
+        )
+        examined = min(start + size + 1, len(rows))
+        truncated = examined < len(rows)
+        page_rows = rows[start:start + size]
+        page = {
+            "kind": "callsites", "items": page_rows, "offset": start, "limit": size,
+            "returned": len(page_rows), "has_more": start + len(page_rows) < len(rows),
+            "total": None if truncated or incomplete else len(rows),
+            "scan_truncated": truncated, "caller_scan_truncated": incomplete,
+            "caller_scan_note": "unavailable IL" if incomplete else None,
+            "callers_scanned": examined,
+            "caller_total": None if incomplete else len(rows),
+            "row_fields": list(rows[0]),
+        }
+        if truncated or incomplete:
+            page["total_lower_bound"] = examined
+        pages[start] = page
+        start += len(page_rows)
+        if (
+            limit == 0 or not page["has_more"]
+            or (limit is not None and start - offset >= limit)
+        ):
+            break
+
+    if backend == "native":
+        monkeypatch.setattr(
+            client_module, "send_request",
+            lambda op, *, params, **kwargs: {"result": pages[params["offset"]]},
+        )
+    else:
+        script = _page_script(f"page = {pages!r}[offset]")
+        monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    bound = bn_kernel.Session(instance="worker", target="sample", backend=backend)
+    if offset == 0:
+        collected = _run(bound.callsites("sink", limit=limit))
+    elif backend == "native":
+        collected = _run(bound._native_collect(
+            "callsites", {"callee": "sink", "offset": offset}, limit
+        ))
+    else:
+        collected = _run(bound.all("callsites", "sink", offset=offset, limit=limit))
+
+    assert collected == rows[offset:offset + returned]
+    aggregate = bound.last.payload
+    assert aggregate["items"] == collected
+    assert aggregate["offset"] == offset
+    assert aggregate["returned"] == returned
+    assert aggregate["has_more"] is has_more
+    assert aggregate["total"] == total
+    assert aggregate["scan_truncated"] is scan_truncated
+    assert aggregate["caller_scan_truncated"] is incomplete
+    assert aggregate["caller_scan_note"] == ("unavailable IL" if incomplete else None)
+    assert aggregate["callers_scanned"] == scanned
+    assert aggregate["caller_total"] == (None if incomplete else 1007)
+    if total is None:
+        assert aggregate["total_lower_bound"] == scanned
+    else:
+        assert "total_lower_bound" not in aggregate
 
 
 def test_cli_callsites_uses_within_for_single_scope(monkeypatch, tmp_path):
