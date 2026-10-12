@@ -957,6 +957,7 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     Direction 2 is red on the pre-fix base (#799); direction 1 is red on a
     one-shot that never re-arms.
     """
+    import socket
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
 
@@ -964,7 +965,13 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     reowner = _live_bridge(module, "rearm1")
     reowner.stop()
     reowner.start()  # the same object binds the path again
-    assert _socket_answers(reowner.socket_path), "the rebind is not serving"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect(str(reowner.socket_path))
+        _send_lifecycle_request(client, reowner, "list_targets")
+        response = _read_lifecycle_response(client)
+    assert response["ok"] is True, response
+    assert response["result"] == []
     reowner.stop()
     assert not reowner.socket_path.exists(), (
         "the stop() that ended the rebind left that bind's own socket behind"
@@ -999,6 +1006,38 @@ def _send_lifecycle_request(client, instance, op="blocked"):
 def _read_lifecycle_response(client):
     with client.makefile("rb") as stream:
         return json.loads(stream.read())
+
+
+def test_rebind_does_not_readmit_a_request_on_the_old_listener(monkeypatch, tmp_path):
+    import socket
+    import threading
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    instance = _live_bridge(module, "old-listener")
+    old_server = instance._server
+    accepted = threading.Event()
+    setup = module.BridgeHandler.setup
+
+    def observe_setup(handler):
+        setup(handler)
+        if handler.server is old_server:
+            accepted.set()
+
+    monkeypatch.setattr(module.BridgeHandler, "setup", observe_setup)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(instance.socket_path))
+            assert accepted.wait(5)
+            instance.stop()
+            instance.start()
+            _send_lifecycle_request(client, instance, "list_targets")
+            response = _read_lifecycle_response(client)
+            assert response["ok"] is False
+            assert response["error"] == "bridge is shutting down"
+    finally:
+        instance.stop()
 
 
 @pytest.mark.parametrize("pause_at", ["dispatch", "response"])

@@ -1166,7 +1166,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         enter_request = getattr(bridge, "_enter_request", None)
         leave_request = getattr(bridge, "_leave_request", None)
         counted = enter_request is not None
-        admitted = enter_request() if counted else True
+        admitted = enter_request(self.server) if counted else True
         try:
             if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
                 response = _json_response(ok=False, error="request too large")
@@ -1554,6 +1554,8 @@ class BinaryNinjaBridge:
             # socket file the rollback already removed, and the registry and the log
             # belong to the spawn.
             self._instance_state_released = False
+            with self._request_state_lock:
+                self._shutting_down = False
             # #612: tighten the freshly-bound socket to owner-only. Even with the
             # peercred check this is defense-in-depth (a wrong-uid peer can't even
             # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
@@ -1947,18 +1949,19 @@ class BinaryNinjaBridge:
             self._active_requests.discard(request_id)
             self._cancelled_requests.discard(request_id)
 
-    def _enter_request(self) -> bool:
+    def _enter_request(self, server: ThreadedUnixServer | None = None) -> bool:
         """Count a received request for idle reaping and bounded stop draining.
 
         ALWAYS increments, including malformed/refused requests, until the
-        response write completes. False means shutdown has latched: write the
-        refusal without dispatching, then balance with _leave_request().
+        response write completes. False means shutdown has latched or the request
+        belongs to a retired listener: write the refusal, then balance accounting.
         """
         with self._request_state_lock:
             self._inflight += 1
             thread = threading.current_thread()
             self._request_threads[thread] = self._request_threads.get(thread, 0) + 1
-            return not self._shutting_down
+            return (not self._shutting_down
+                    and (server is None or server is self._server))
 
     def _leave_request(self, *, stamp_activity: bool = True) -> None:
         """Balance a prior _enter_request and stamp the idle clock. Called only after

@@ -4712,6 +4712,7 @@ def test_bridge_handler_invalid_request_is_counted_during_its_write(monkeypatch)
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
     handler.rfile = io.BytesIO(b"not json at all\n")  # never becomes a dict -> no dispatch
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _InflightProbeWriter(inst)
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4747,6 +4748,7 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
         + b"\n"
     )
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4774,6 +4776,7 @@ def test_bridge_response_echoes_the_request_id(monkeypatch):
         + b"\n"
     )
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4798,6 +4801,7 @@ def test_bridge_response_omits_id_when_the_request_had_none(monkeypatch):
         + b"\n"
     )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4828,6 +4832,7 @@ def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
         + b"\n"
     )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4851,6 +4856,7 @@ def test_bridge_handler_refuses_request_when_shutting_down(monkeypatch):
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
     handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
