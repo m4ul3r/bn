@@ -1148,6 +1148,7 @@ def test_class_show_assembles_full_record():
     class _ShowCtx:
         _find_function = seam.BridgeContext._find_function
         _sections_at = seam.BridgeContext._sections_at
+        _read_pointer_value = seam.BridgeContext._read_pointer_value
 
         def _resolve_view(self, sel):
             return bv
@@ -1286,13 +1287,13 @@ def test_class_show_detects_thunks_only_for_requested_class(monkeypatch, class_m
 def test_class_show_unknown_name_errors_with_hint():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
     import pytest
     with pytest.raises(read_class.OperationFailure) as exc:
-        read_class._class_show(_Ctx(), None, "net::Nope")
+        read_class._class_show(_Ctx(None), None, "net::Nope")
     assert "class list" in str(exc.value).lower()
 
 
@@ -1300,13 +1301,13 @@ def test_class_show_unknown_name_suggests_close_matches():
     # #413: a near-miss should point at the real class name, not just "run class list".
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
     import pytest
     with pytest.raises(read_class.OperationFailure) as exc:
-        read_class._class_show(_Ctx(), None, "net::Sesion")  # typo of net::Session
+        read_class._class_show(_Ctx(None), None, "net::Sesion")  # typo of net::Session
     msg = str(exc.value)
     assert "did you mean" in msg.lower()
     assert "net::Session" in msg
@@ -1476,14 +1477,14 @@ def test_class_list_count_only_484():
     # non-class artifact_count, without building/paging rows.
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     assert out["kind"] == "classes"
     assert "items" not in out and "count" in out
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert out["count"] == full["total"]                 # count matches the full listing
     assert out["total"] == full["total"]
     assert "artifact_count" in out and out["artifact_count"] >= 0
@@ -1502,11 +1503,11 @@ def test_class_list_labels_non_class_rtti_artifacts_481():
     ]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    rows = {r["name"]: r for r in read_class._class_list(_Ctx(), None, include_all=True)["items"]}
+    rows = {r["name"]: r for r in read_class._class_list(_Ctx(None), None, include_all=True)["items"]}
     assert rows["net::Session"]["artifact"] is False           # real class (ctor + vtable)
     artifacts = [r for r in rows.values() if r["artifact"]]
     assert artifacts                                            # the function-type typeinfo row
@@ -4354,3 +4355,130 @@ def test_import_slot_test_reads_only_the_sections_922():
     assert read_class._typeinfo_is_import_slot(_Ctx(), bv, 0x9400) is True
     assert read_class._typeinfo_is_import_slot(_Ctx(), bv, 0x9100) is False
     assert _Ctx.calls == [0x9400, 0x9100]
+
+
+# --- #935: stripped primary-vtable symbols name the slot array, not the head ---
+
+
+def _slot_array_bv(ptr=8):
+    return _FakeBV(
+        symbols=[
+            _Sym("_vtable_for_svc::Codec", "vtable for svc::Codec", 0x9000 + 2 * ptr),
+            _Sym("_typeinfo_for_svc::Codec", "typeinfo for svc::Codec", 0x9100),
+        ],
+        memory={0x9000: b"".join(w.to_bytes(ptr, "little")
+                                for w in (0, 0x9100, 0x400000, 0, 0, 0xdead, 0x400020))},
+        arch=_FakeArch(name="x86_64" if ptr == 8 else "x86", address_size=ptr),
+    )
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("marker", ["vtable for ", "_vtable_for_"])
+def test_registry_normalizes_a_proven_slot_array_symbol_935(ptr, marker):
+    bv = _slot_array_bv(ptr)
+    sym = bv._symbols[0]
+    sym.short_name = marker + "svc::Codec"
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9000"
+    assert rec["typeinfo"]["address"] == "0x9100"
+    assert sym.address == 0x9000 + 2 * ptr  # read-only: BN's symbol is untouched
+
+
+@pytest.mark.parametrize("secondary", [False, True])
+def test_slot_array_symbol_preserves_slots_and_secondary_provenance_935(monkeypatch, secondary):
+    rows = {0: _code_row(0), 1: _null_row(1), 2: _null_row(2),
+            3: _extern_row(3, 0xdead), 4: _code_row(4), 5: _data_row(5)}
+    if secondary:
+        rows.update({
+            5: {"readable": True, "value": hex((1 << 64) - 8),
+                "target": {"status": "unmapped"}},
+            6: _data_row(6, 0x9100), 7: _code_row(7), 8: _code_row(8),
+            9: _data_row(9),
+        })
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_pointer_table_layout", _WindowCtx(rows)._pointer_table_layout)
+    cards = []
+    for symbol_address in (0x9000, 0x9010):
+        bv = _slot_array_bv()
+        bv._symbols[0].address = symbol_address
+        bv._symbols.append(_Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0xdead,
+                                "SymbolType.ExternalSymbol"))
+        bv._data_refs = {0x9100: [0x9008]}
+        if secondary:
+            bv._memory[0x9038] = _le64((1 << 64) - 8, 0x9100)
+            bv._data_refs[0x9100].append(0x9040)
+            bv._symbols.append(_Sym("_vtable_for_svc::Codec{for `svc::Source'}",
+                                    "vtable for svc::Codec{for `svc::Source'}", 0x9048))
+        rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+        cards.append(read_class._enrich(ctx, bv, rec))
+    symbolized, stripped = cards
+    assert stripped["vtable"] == symbolized["vtable"]
+    vt = stripped["vtable"]
+    assert vt["address"] == "0x9000"
+    assert vt["total"] == 5 and vt["scan_truncated"] is False
+    assert [s["address"] for s in vt["slots"]] == [
+        "0x400000", "0x0", "0x0", "0xdead", "0x400020"]
+    assert [s.get("null", False) for s in vt["slots"]] == [False, True, True, False, False]
+    assert vt["slots"][3]["pure_virtual"] is True
+    assert "typeinfo_backwalk" not in vt  # normalized symbol, not backwalk recovery
+    if secondary:
+        assert stripped["secondary_vtables"] == symbolized["secondary_vtables"]
+        (table,) = stripped["secondary_vtables"]
+        assert table["address"] == "0x9038" and table["offset_to_top"] == -8
+        assert table["typeinfo_backwalk"] is True
+        assert table["confidence"] == "rtti"
+        assert table["confidence_reason"] == "bn_vtable_group"
+        assert [s["address"] for s in table["slots"]] == ["0x400038", "0x400040"]
+    else:
+        assert "secondary_vtables" not in stripped
+
+
+@pytest.mark.parametrize("offset_to_top", [None, 8, 0xffff0000, (1 << 64) - 8])
+def test_slot_array_symbol_requires_a_readable_primary_offset_935(offset_to_top):
+    bv = _slot_array_bv()
+    if offset_to_top is None:
+        bv._memory = {0x9008: _le64(0x9100, 0x400000, 0)}
+    else:
+        bv._memory[0x9000] = _le64(offset_to_top, 0x9100, 0x400000, 0)
+    ctx = seam.BridgeContext(None)
+    rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+    card = read_class._enrich(ctx, bv, rec)
+    assert card["vtable"]["slots"] == []
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+    assert "secondary_vtables" not in card
+
+
+@pytest.mark.parametrize("typeinfo_marker", [
+    "typeinfo for svc::Other", "vtable for svc::Codec", "typeinfo name for svc::Codec", "",
+])
+def test_slot_array_symbol_requires_typeinfo_for_the_same_class_935(typeinfo_marker):
+    bv = _slot_array_bv()
+    bv._symbols[1].short_name = typeinfo_marker
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("symbol_index", [0, 1])
+@pytest.mark.parametrize("symbol_type", read_class._ALIAS_SYMBOL_TYPES)
+def test_slot_array_symbol_refuses_import_aliases_935(symbol_index, symbol_type):
+    bv = _slot_array_bv()
+    bv._symbols[symbol_index].type = f"SymbolType.{symbol_type}"
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("got_address", [0x9000, 0x9008, 0x9010, 0x9100])
+def test_slot_array_symbol_refuses_got_words_without_alias_symbols_935(got_address):
+    bv = _slot_array_bv()
+    bv.sections = {".got": _FakeSection(".got", got_address, got_address + 8)}
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+def test_slot_array_normalization_preserves_an_existing_object_head_935():
+    bv = _slot_array_bv()
+    # Two adjacent plausible headers: the existing symbol's own header wins.
+    bv._memory[0x9000] = _le64(0, 0x9100, 0, 0x9100, 0x400000)
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"

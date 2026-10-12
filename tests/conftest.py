@@ -65,6 +65,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "parser_x86_64",
     "dispatch_table_x86_64",
     "classes_x86_64",   # C++ (src/classes.cpp): the class lens's RTTI shapes (#922)
+    "classes_stripped_x86_64",  # same PIE with BN-synthesized vtable symbols (#935)
 )
 
 _BUILD_LOCK_NAME = ".build.lock"

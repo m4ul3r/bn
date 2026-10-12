@@ -27,6 +27,7 @@ ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
+CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3199,3 +3200,75 @@ class TestClassLensRttiGuards922:
         counted = json.loads(shared_bn.run(
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
+
+    def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
+        # Both builds use the same source/options except -s. Compare the actual
+        # slot words, not demangled method names (which stripping removes).
+        expected_totals = {
+            "svc::Codec": 5, "svc::HexCodec": 5, "svc::Handler": 4,
+            "svc::EchoHandler": 4, "svc::AuditHandler": 5, "svc::Pipe": 4,
+        }
+        snapshots = []
+        for binary in (CLASSES_BINARY, CLASSES_STRIPPED_BINARY):
+            target = shared_bn.load(binary)
+            cards = {name: shared_bn.json("class", "show", name, "-t", target)
+                     for name in expected_totals}
+            tables = {
+                name: [(int(vt["address"], 16), len(vt["slots"]))
+                       for vt in [card["vtable"], *card.get("secondary_vtables", [])]]
+                for name, card in cards.items()
+            }
+            raw = shared_bn.json(
+                "py", "exec",
+                "ptr = bv.address_size\n"
+                f"tables = {tables!r}\n"
+                "result = {\n"
+                "    'ptr': ptr,\n"
+                "    'codec_symbols': [hex(s.address) for s in bv.get_symbols()\n"
+                "        if s.short_name in ('vtable for svc::Codec',\n"
+                "                            '_vtable_for_svc::Codec', 'vtable_for_svc::Codec')],\n"
+                "    'tables': {name: [{\n"
+                "        'head': hex(head),\n"
+                "        'offset_to_top': bv.read_int(head, ptr),\n"
+                "        'typeinfo': hex(bv.read_int(head + ptr, ptr, False)),\n"
+                "        'slots': [hex(bv.read_int(head + (2 + i) * ptr, ptr, False))\n"
+                "                  for i in range(count)],\n"
+                "    } for head, count in entries] for name, entries in tables.items()},\n"
+                "}\n",
+                "-t", target,
+            )["result"]
+            for name, card in cards.items():
+                vt = card["vtable"]
+                assert vt["total"] == expected_totals[name], card
+                assert vt["scan_truncated"] is False, vt
+                for layout, words in zip(
+                    [vt, *card.get("secondary_vtables", [])], raw["tables"][name], strict=True,
+                ):
+                    assert words["typeinfo"] == card["typeinfo"]["address"]
+                    assert [s["address"] for s in layout["slots"]] == words["slots"]
+                assert raw["tables"][name][0]["offset_to_top"] == 0
+                if name != "svc::Pipe":
+                    assert "secondary_vtables" not in card, card
+            codec = cards["svc::Codec"]["vtable"]
+            assert [s.get("null", False) for s in codec["slots"]] == [
+                False, True, True, False, False]
+            assert codec["slots"][3]["pure_virtual"] is True
+            assert "typeinfo_backwalk" not in codec
+            # The supplied stripped repro puts this symbol on the FIRST SLOT;
+            # the class card must still name the preceding object head.
+            symbol_address = int(codec["address"], 16)
+            if binary == CLASSES_STRIPPED_BINARY:
+                symbol_address += 2 * raw["ptr"]
+            assert hex(symbol_address) in raw["codec_symbols"], raw
+            (secondary,) = cards["svc::Pipe"]["secondary_vtables"]
+            assert secondary["offset_to_top"] == -8
+            assert secondary["typeinfo_backwalk"] is True
+            assert secondary["confidence"] == "rtti"
+            assert secondary["confidence_reason"] in ("thunk_slots", "bn_vtable_group")
+            assert raw["tables"]["svc::Pipe"][1]["offset_to_top"] == -8
+            imported = shared_bn.json("class", "show", "std::runtime_error", "-t", target)
+            assert imported["typeinfo"]["import_slot"] is True
+            assert imported["bases"] == [] and imported["vtable"] is None
+            assert "secondary_vtables" not in imported
+            snapshots.append(raw["tables"])
+        assert snapshots[0] == snapshots[1]

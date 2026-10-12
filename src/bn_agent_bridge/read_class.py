@@ -215,6 +215,38 @@ def _sym_entry(sym) -> dict[str, Any] | None:
     }
 
 
+def _vtable_symbol_entry(ctx, bv, sym, class_name: str) -> dict[str, Any] | None:
+    """Normalize BN's stripped primary-vtable symbol from slot array to head.
+
+    Only a readable (zero offset-to-top, local typeinfo for THIS class) header
+    proves the adjustment. Nonzero offsets belong to the secondary backwalk,
+    not a primary; an import/GOT alias is not a local object at either address.
+    Keep an already decodable object head and never move the BN symbol itself.
+    """
+    entry = _sym_entry(sym)
+    if entry is None or ctx is None or _is_alias_symbol(sym):
+        return entry
+    ptr = ctx._pointer_size(bv)
+    address = int(sym.address)
+    head = address - 2 * ptr
+    if head < 0 or address % ptr:
+        return entry
+    # A symbol at an object head already satisfies the layout reader's gate.
+    ti = ctx._read_pointer_value(bv, address + ptr, size=ptr)
+    if ti and ctx._typeinfo_name_at(bv, ti) is not None:
+        return entry
+    if ctx._read_pointer_value(bv, head, size=ptr) != 0:
+        return entry
+    ti = ctx._read_pointer_value(bv, head + ptr, size=ptr)
+    if not ti or ctx._typeinfo_name_at(bv, ti) != class_name:
+        return entry
+    if any(_typeinfo_is_import_slot(ctx, bv, addr)
+           for addr in (address, head, head + ptr, ti)):
+        return entry
+    entry["address"] = hex(head)
+    return entry
+
+
 # #622 criterion (d) -- "class list / class show reuse a per-view registry (or
 # cheaper show path) rather than demangling every function on every call" -- is
 # DELIVERED by the per-view registry memo below, and the memo that follows it
@@ -288,11 +320,11 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
     added by ``_class_show`` only for the requested class (too costly for every
     class).
 
-    This is the memoised half: it reads only ``bv`` (``ctx`` is used for the
-    stateless word read that links a vtable to its typeinfo, see
-    :func:`_merge_spelling_variants`), so it is cached per view on the view's
-    generation counter by :func:`_build_class_registry`. Callers must never
-    mutate what it returns -- they get their own copy."""
+    This is the memoised half: it reads only ``bv`` (``ctx`` supplies the
+    stateless header reads that normalize a slot-array symbol and link a
+    vtable to its typeinfo), so it is cached per view on the view's generation
+    counter by :func:`_build_class_registry`. Callers must never mutate what
+    it returns -- they get their own copy."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
 
@@ -331,7 +363,7 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
 
     for cls, rec in registry.items():
         syms = rtti.get(cls, {})
-        rec["vtable"] = _sym_entry(syms.get("vtable"))
+        rec["vtable"] = _vtable_symbol_entry(ctx, bv, syms.get("vtable"), cls)
         rec["typeinfo"] = _sym_entry(syms.get("typeinfo"))
         rec["typeinfo_name"] = _sym_entry(syms.get("typeinfo_name"))
         if syms.get("vtable") or syms.get("typeinfo") or syms.get("typeinfo_name"):
@@ -456,8 +488,8 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     generation counter and invalidated by BN's own symbol/function notifications
     -- a rename changes which classes exist, so the registry is rebuilt after any
     such change, and a view with no notification surface is never cached (every
-    call rescans, exactly as before). ``ctx`` reaches the scan only for the
-    stateless vtable-header read that merges a class's spelling variants (#922).
+    call rescans, exactly as before). ``ctx`` supplies stateless vtable-header
+    reads for slot-array normalization and class spelling variants.
 
     Records are copied on the way out because the callers WRITE to them:
     ``_class_list`` sets ``rec["bases"]`` for its page rows and ``_class_show``
