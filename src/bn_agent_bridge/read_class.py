@@ -218,10 +218,10 @@ def _sym_entry(sym) -> dict[str, Any] | None:
 def _vtable_symbol_entry(ctx, bv, sym, class_name: str) -> dict[str, Any] | None:
     """Normalize BN's stripped primary-vtable symbol from slot array to head.
 
-    Only a readable (zero offset-to-top, local typeinfo for THIS class) header
-    proves the adjustment. Nonzero offsets belong to the secondary backwalk,
-    not a primary; an import/GOT alias is not a local object at either address.
-    Keep an already decodable object head and never move the BN symbol itself.
+    A readable zero offset-to-top and same-class typeinfo pair is necessary,
+    but construction tables share that header. Require a fully resolved,
+    nonvirtual RTTI ancestry before adjusting an address point. Keep an already
+    decodable object head and never move the BN symbol itself.
     """
     entry = _sym_entry(sym)
     if entry is None or ctx is None or _is_alias_symbol(sym):
@@ -242,6 +242,8 @@ def _vtable_symbol_entry(ctx, bv, sym, class_name: str) -> dict[str, Any] | None
         return entry
     if any(_typeinfo_is_import_slot(ctx, bv, addr)
            for addr in (address, head, head + ptr, ti)):
+        return entry
+    if not _has_nonvirtual_rtti_ancestry(ctx, bv, ti, ptr):
         return entry
     entry["address"] = hex(head)
     return entry
@@ -1704,6 +1706,57 @@ def _bases_for_record(ctx, bv, rec: dict[str, Any]) -> list[dict[str, Any]]:
         _note_typeinfo_import(rec)
         return []
     return _rtti_bases(ctx, bv, typeinfo_addr)
+
+
+def _has_nonvirtual_rtti_ancestry(ctx, bv, typeinfo_addr: int, ptr: int) -> bool:
+    """Prove construction tables impossible; unknown ancestry is not proof.
+
+    Structural base inference drops unresolved entries, so use the ABI selector
+    and require every declared entry to be readable before reusing _rtti_bases.
+    """
+    pending = [typeinfo_addr]
+    seen: set[int] = set()
+    while pending:
+        addr = pending.pop()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        if (_typeinfo_is_import_slot(ctx, bv, addr)
+                or ctx._typeinfo_name_at(bv, addr) is None):
+            return False
+        vptr = ctx._read_pointer_value(bv, addr, size=ptr)
+        kind = None
+        if vptr:
+            for candidate in (vptr, vptr - 2 * ptr):
+                sym = bv.get_symbol_at(candidate)
+                name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "")
+                for abi, layout in (("__class_type_info", "base"),
+                                    ("__si_class_type_info", "si"),
+                                    ("__vmi_class_type_info", "vmi")):
+                    if "__cxxabiv1" in name and abi in name:
+                        kind = layout
+                        break
+                if kind:
+                    break
+        if kind is None:
+            return False
+        after_name = addr + 2 * ptr
+        if kind == "si":
+            if not ctx._read_pointer_value(bv, after_name, size=ptr):
+                return False
+        elif kind == "vmi":
+            count = ctx._read_u32(bv, after_name + 4)
+            if count is None or not 0 < count <= 64:
+                return False
+            for index in range(count):
+                base = after_name + 8 + index * 2 * ptr
+                flags = ctx._read_pointer_value(bv, base + ptr, size=ptr)
+                if (not ctx._read_pointer_value(bv, base, size=ptr)
+                        or flags is None or flags & 1):
+                    return False
+        bases = _rtti_bases(ctx, bv, addr, kind_hint=kind)
+        pending.extend(int(base["address"], 16) for base in bases)
+    return True
 
 
 def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) -> list[dict[str, Any]]:

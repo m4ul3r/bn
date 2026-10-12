@@ -3285,3 +3285,45 @@ class TestClassLensRttiGuards922:
                 for name, entries in raw["tables"].items()
             })
         assert snapshots[0] == snapshots[1]
+
+    @pytest.mark.parametrize("stripped", [False, True])
+    def test_virtual_base_construction_tables_are_not_promoted_945(self, shared_bn, tmp_path, stripped):
+        source = tmp_path / "construction.cpp"
+        source.write_text("""
+struct V { long v = 1; virtual ~V() {} virtual int vf() { return 1; } };
+struct B : virtual V {
+    long b = 2; virtual int bf() { return 2; } int vf() override { return 3; }
+};
+struct C : virtual V { long c = 3; virtual int cf() { return 4; } };
+struct D : B, C {
+    long d = 4; int bf() override { return 5; } int cf() override { return 6; }
+};
+int main(int argc, char **) {
+    D d; B b; B *p = argc > 1 ? static_cast<B *>(&d) : &b;
+    return p->bf();
+}
+""")
+        binary = tmp_path / "construction"
+        build = subprocess.run(
+            ["c++", "-O0", "-fno-stack-protector", *(["-s"] if stripped else []),
+             "-o", str(binary), str(source)], capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        # Check the actual native shape, not a fake population: B has both
+        # complete and construction address points; C is only constructed in D.
+        candidates = shared_bn.json(
+            "py", "exec",
+            "result = {name: [hex(s.address) for s in bv.get_symbols()\n"
+            "    if s.short_name in ('vtable for ' + name, '_vtable_for_' + name)\n"
+            "    and bv.read_int(s.address - 2 * bv.address_size, bv.address_size) == 0]\n"
+            "    for name in ('B', 'C')}\n",
+            "-t", target,
+        )["result"]
+        assert len(candidates["B"]) >= 2, candidates
+        assert len(candidates["C"]) == 1, candidates
+        for name in ("B", "C"):
+            card = shared_bn.json("class", "show", name, "-t", target)
+            assert card["vtable"]["address"] in candidates[name], card
+            assert card["vtable"]["slots"] == [], card
+            assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card

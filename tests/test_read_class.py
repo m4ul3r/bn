@@ -4368,9 +4368,15 @@ def _slot_array_bv(ptr=8):
         symbols=[
             _Sym("_vtable_for_svc::Codec", "vtable for svc::Codec", 0x9000 + 2 * ptr),
             _Sym("_typeinfo_for_svc::Codec", "typeinfo for svc::Codec", 0x9100),
+            _Sym("_ZTVN10__cxxabiv117__class_type_infoE",
+                 "vtable for __cxxabiv1::__class_type_info", 0x9800,
+                 "SymbolType.ExternalSymbol"),
         ],
-        memory={0x9000: b"".join(w.to_bytes(ptr, "little")
-                                for w in (0, 0x9100, 0x400000, 0, 0, 0xdead, 0x400020))},
+        memory={
+            0x9000: b"".join(w.to_bytes(ptr, "little")
+                             for w in (0, 0x9100, 0x400000, 0, 0, 0xdead, 0x400020)),
+            0x9100: (0x9800 + 2 * ptr).to_bytes(ptr, "little"),
+        },
         arch=_FakeArch(name="x86_64" if ptr == 8 else "x86", address_size=ptr),
     )
 
@@ -4585,3 +4591,61 @@ def test_slot_array_normalization_preserves_an_existing_object_head_935():
     bv._memory[0x9000] = _le64(0, 0x9100, 0, 0x9100, 0x400000)
     rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
     assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("extra_candidate", [False, True])
+def test_construction_address_point_is_not_a_complete_table_945(ptr, extra_candidate):
+    bv = _slot_array_bv(ptr)
+    bv._symbols.append(_Sym("abi_vmi", "vtable for __cxxabiv1::__vmi_class_type_info", 0x9900))
+    bv._symbols.append(_Sym("base_ti", "typeinfo for svc::VirtualBase", 0x9200))
+    bv._memory[0x9100] = (
+        (0x9900 + 2 * ptr).to_bytes(ptr, "little") + bytes(ptr)
+        + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        + (0x9200).to_bytes(ptr, "little") + (3).to_bytes(ptr, "little")
+    )
+    bv._memory[0x9200] = (0x9800 + 2 * ptr).to_bytes(ptr, "little")
+    if extra_candidate:
+        bv._symbols.append(_Sym("complete_slots", "vtable for svc::Codec", 0x9400 + 2 * ptr))
+        bv._memory[0x9400] = b"".join(
+            w.to_bytes(ptr, "little") for w in (0, 0x9100, 0x400020, 0))
+    ctx = seam.BridgeContext(None)
+    rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    card = read_class._enrich(ctx, bv, rec)
+    assert card["vtable"]["address"] == hex(0x9000 + 2 * ptr)
+    assert card["vtable"]["slots"] == []
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+
+
+@pytest.mark.parametrize("ancestry", [
+    "nonvirtual", "virtual", "unresolved", "import", "got",
+    "unknown_selector", "unreadable_base", "unreadable_flags",
+])
+def test_normalization_requires_proven_transitive_nonvirtual_ancestry_945(ancestry):
+    bv = _slot_array_bv()
+    bv._symbols.extend([
+        _Sym("abi_si", "vtable for __cxxabiv1::__si_class_type_info", 0x9900),
+        _Sym("abi_vmi", "vtable for __cxxabiv1::__vmi_class_type_info", 0x9a00),
+        _Sym("middle_ti", "typeinfo for svc::Middle", 0x9200),
+        _Sym("base_ti", "typeinfo for svc::Base", 0x9300),
+    ])
+    bv._memory[0x9100] = _le64(0x9910, 0, 0x9200)
+    bv._memory[0x9200] = (
+        _le64(0x9a10, 0) + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        + _le64(0x9300, 3 if ancestry == "virtual" else 2)
+    )
+    bv._memory[0x9300] = _le64(0x9810, 0)
+    if ancestry == "unresolved":
+        bv._symbols.pop()
+    elif ancestry == "import":
+        bv._symbols[-1].type = "SymbolType.ImportedDataSymbol"
+    elif ancestry == "got":
+        bv.sections = {".got": _FakeSection(".got", 0x9300, 0x9308)}
+    elif ancestry == "unknown_selector":
+        bv._memory[0x9300] = _le64(0xdead, 0)
+    elif ancestry == "unreadable_base":
+        bv._memory[0x9200] = bv._memory[0x9200][:24]
+    elif ancestry == "unreadable_flags":
+        bv._memory[0x9200] = bv._memory[0x9200][:32]
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == ("0x9000" if ancestry == "nonvirtual" else "0x9010")
