@@ -30,6 +30,7 @@ Import direction is one-way: this module imports ``il_format``, ``vars``,
 from __future__ import annotations
 
 import re
+import shlex
 
 from typing import Any
 
@@ -291,6 +292,133 @@ def _flattened_guard_warning(bv, func) -> str | None:
     )
 
 
+def _enum_name(value: Any) -> str:
+    return str(getattr(value, "name", value))
+
+
+def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, int]]]]:
+    """Direct incoming void-pointer accesses only, not alias/type recovery.
+
+    SSA version zero ties the witness to the incoming parameter, not a later
+    value stored in the same variable. Any unsupported memory address using
+    that variable disqualifies it rather than cherry-picking its easy accesses.
+    """
+    parameters = {
+        _taint.var_key(var): (index, var)
+        for index, var in enumerate(getattr(func, "parameter_vars", ()))
+        if _enum_name(getattr(var.type, "type_class", None)) == "PointerTypeClass"
+        and _enum_name(getattr(var.type.target, "type_class", None)) == "VoidTypeClass"
+    }
+    if not parameters:
+        return []
+    ssa = getattr(getattr(func, "mlil", None), "ssa_form", None)
+    if ssa is None:
+        return []
+    accesses: dict[tuple, set[tuple[int, int]]] = {key: set() for key in parameters}
+    unsupported: set[tuple] = set()
+
+    def collect(ins: Any) -> None:
+        op = _taint.op_name(ins)
+        if op not in {
+            "MLIL_LOAD_SSA", "MLIL_LOAD_STRUCT_SSA",
+            "MLIL_STORE_SSA", "MLIL_STORE_STRUCT_SSA",
+        }:
+            return
+        address = ins.src if op.startswith("MLIL_LOAD") else ins.dest
+        touched = {_taint.var_key(v) for v in address.vars_read} & parameters.keys()
+        if not touched:
+            return
+        base = address
+        offset = int(ins.offset) if "_STRUCT_" in op else 0
+        if _taint.op_name(base) == "MLIL_ADD":
+            left, right = base.left, base.right
+            if _taint.op_name(left) == "MLIL_CONST":
+                left, right = right, left
+            if _taint.op_name(right) == "MLIL_CONST":
+                offset += int(right.constant)
+                base = left
+        if _taint.op_name(base) != "MLIL_VAR_SSA" or base.src.version != 0:
+            unsupported.update(touched)
+            return
+        key = _taint.var_key(base.src)
+        width = int(ins.size)
+        if key not in parameters or touched != {key} or offset < 0 or width <= 0:
+            unsupported.update(touched)
+            return
+        accesses[key].add((offset, width))
+
+    # traverse visits nested loads as well as top-level stores. Its callback
+    # returns None, so draining the generator need not retain any IL objects.
+    for _ in ssa.traverse(collect):
+        pass
+    return [
+        (index, var, accesses[key])
+        for key, (index, var) in parameters.items()
+        if key not in unsupported and len({off for off, _ in accesses[key]}) >= 2
+    ]
+
+
+def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
+    """Evidence-qualified known-layout assistance; never writes a type (#903).
+
+    Match complete scalar members of concrete, non-inherited structs. Aliases
+    do not add candidates (their concrete declarations are already in bv.types).
+    Matching two distinct offsets is a minimum witness, not proof of identity.
+    """
+    accesses = _untyped_pointer_accesses(func)
+    if not accesses:
+        return []
+    layouts: list[tuple[str, dict[tuple[int, int], str]]] = []
+    for name, type_obj in bv.types.items():
+        if (_enum_name(type_obj.type_class) != "StructureTypeClass"
+                or _enum_name(type_obj.type) != "StructStructureType"
+                or type_obj.base_structures):
+            continue
+        members: dict[tuple[int, int], str] = {}
+        end = 0
+        for member in sorted(type_obj.members, key=lambda member: member.offset):
+            offset, width = int(member.offset), int(member.type.width)
+            if offset < end or width <= 0:
+                break  # overlapping/incomplete layouts are not a unique witness
+            end = offset + width
+            if (member.name and not getattr(member, "bit_width", 0)
+                    and _enum_name(member.type.type_class) in {
+                        "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
+                        "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
+                    }):
+                members[(offset, width)] = str(member.name)
+        else:
+            if end <= int(type_obj.width):
+                layouts.append((str(name), members))
+
+    warnings = []
+    for index, var, observed in accesses:
+        matches = [(name, members) for name, members in layouts if observed <= members.keys()]
+        if len(matches) != 1:
+            continue  # no witness or ambiguous: never choose a "best" struct
+        name, members = matches[0]
+        evidence = ", ".join(
+            f"+{offset:#x}/{width} bytes -> {members[(offset, width)]}"
+            for offset, width in sorted(observed)
+        )
+        qualifiers = " ".join(
+            q for q in ("const", "volatile") if bool(getattr(var.type.target, q, False))
+        )
+        pointer_type = f"{qualifiers + ' ' if qualifiers else ''}struct {name} *"
+        address = hex(int(func.start))
+        warnings.append(
+            f"struct layout candidate for parameter {index + 1} ({var.name}): "
+            f"observed direct MLIL accesses {evidence} match declared struct {name}. "
+            "Offsets and widths alone do not prove the parameter's type. "
+            f"Review `bn struct show {shlex.quote(name)}` and `bn disasm {address}`; "
+            f"if confirmed, use `bn proto get {address}`, then `bn proto set {address}` "
+            f"with the full prototype, changing only this parameter to "
+            f"`{pointer_type}` (preserve other parameters, qualifiers and calling convention). "
+            "No type was applied."
+        )
+    return warnings
+
+
 def _decompile_batch(
     ctx,
     selector: str | None,
@@ -378,6 +506,7 @@ def _decompile(
     guard_warn = _flattened_guard_warning(bv, func)
     if guard_warn:
         warnings.append(guard_warn)
+    warnings.extend(_struct_layout_warnings(bv, func))
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,

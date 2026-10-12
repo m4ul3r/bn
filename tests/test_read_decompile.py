@@ -829,6 +829,164 @@ def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
         rd._linear_decode_arch(_Ctx(), bv, 0x401000, "thumb")
 
 
+def _struct_assist_layout(name: str = "cfg", *, flags_width: int = 8) -> _FakeType:
+    def integer(width: int) -> _FakeType:
+        return _FakeType(
+            f"uint{width * 8}_t", width=width, type_class="IntegerTypeClass")
+    layout = _FakeType(f"struct {name}", width=0x38, members=[
+        _FakeMember(0x28, "flags", integer(flags_width)),
+        _FakeMember(0x30, "depth", integer(4)),
+    ])
+    layout.type = types.SimpleNamespace(name="StructStructureType")
+    layout.base_structures = []
+    return layout
+
+
+def _struct_assist_access(
+    var: _FakeVariable, offset: int, width: int, *,
+    operation: str = "MLIL_LOAD_SSA", version: int = 0,
+) -> _FakeMLILInsn:
+    ssa_var = types.SimpleNamespace(var=var, version=version)
+    base = _FakeMLILInsn(
+        0x401004, operation="MLIL_VAR_SSA", src=ssa_var, vars_read=[ssa_var])
+    address = base
+    if "_STRUCT_" not in operation:
+        address = _FakeMLILInsn(
+            0x401004, operation="MLIL_ADD", left=base,
+            right=_FakeMLILInsn(0x401004, operation="MLIL_CONST", constant=offset),
+            vars_read=[ssa_var])
+    operands = {"src" if operation.startswith("MLIL_LOAD") else "dest": address}
+    ins = _FakeMLILInsn(0x401004, operation=operation, size=width, **operands)
+    if "_STRUCT_" in operation:
+        ins.offset = offset
+    return ins
+
+
+def _struct_assist_case() -> tuple[_FakeBV, _FakeFunction, _FakeVariable, list[_FakeMLILInsn]]:
+    pointer = _FakeType("void *", width=8, type_class="PointerTypeClass")
+    pointer.target = _FakeType("void", type_class="VoidTypeClass")
+    var = _FakeVariable(name="c", storage=5, var_type=pointer, identifier=1001)
+    fn = _FakeFunction(0x401000, "handle", "int handle(void *c)")
+    fn.parameter_vars = [var]
+    nodes = [_struct_assist_access(var, 0x28, 8), _struct_assist_access(var, 0x30, 4)]
+    # Model the MLIL traverse API's stream of nested expression nodes.
+    fn.mlil = types.SimpleNamespace(ssa_form=types.SimpleNamespace(
+        traverse=lambda callback: (callback(node) for node in nodes)))
+    bv = _FakeBV(functions=[fn], types_={"cfg": _struct_assist_layout()})
+    return bv, fn, var, nodes
+
+
+def test_decompile_struct_assist_witness_and_no_mutation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, var, _ = _struct_assist_case()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+    before_type, before_pointer = fn.type, var.type
+
+    result = instance._decompile("active", "handle")
+
+    assert len(result["warnings"]) == 1
+    hint = result["warnings"][0]
+    # These are the actionable evidence, not a pin of the explanatory prose.
+    for evidence in ("cfg", "c", "+0x28/8", "flags", "+0x30/4", "depth",
+                     "bn struct show cfg", "bn proto get 0x401000",
+                     "bn proto set 0x401000", "struct cfg *"):
+        assert evidence in hint
+    assert "(char*)c + 0x28" in result["text"]
+    assert fn.type is before_type and var.type is before_pointer
+    assert fn.has_user_type is False and fn.reanalyzed is False
+
+
+@pytest.mark.parametrize("operation", [
+    "MLIL_LOAD_SSA", "MLIL_STORE_SSA", "MLIL_LOAD_STRUCT_SSA", "MLIL_STORE_STRUCT_SSA",
+])
+def test_struct_assist_supports_direct_loads_and_stores(operation):
+    bv, fn, var, nodes = _struct_assist_case()
+    nodes[:] = [_struct_assist_access(var, off, width, operation=operation)
+                for off, width in ((0x28, 8), (0x30, 4))]
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == 1
+
+
+def test_struct_assist_ignores_layout_alias_but_not_distinct_matching_struct():
+    bv, fn, _, _ = _struct_assist_case()
+    bv.types["cfg_alias"] = _FakeType("cfg", type_class="NamedTypeReferenceClass")
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == 1
+    bv.types["other_cfg"] = _struct_assist_layout("other_cfg")
+    assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("case", [
+    "no-layout", "wrong-width", "wrong-offset", "array-member", "bitfield",
+    "union", "inherited", "overlapping", "out-of-bounds", "single-offset",
+    "conflicting-width", "computed-offset", "reassigned-parameter", "arithmetic-only",
+    "no-ssa", "different-parameter",
+])
+def test_struct_assist_requires_consistent_supported_witness(case):
+    bv, fn, var, nodes = _struct_assist_case()
+    layout = bv.types["cfg"]
+    if case == "no-layout":
+        bv.types.clear()
+    elif case == "wrong-width":
+        bv.types["cfg"] = _struct_assist_layout(flags_width=4)
+    elif case == "wrong-offset":
+        layout.members[0].offset = 0x20
+    elif case == "array-member":
+        layout.members[0].type.type_class = "ArrayTypeClass"
+    elif case == "bitfield":
+        layout.members[0].bit_width = 3
+    elif case == "union":
+        layout.type = types.SimpleNamespace(name="UnionStructureType")
+    elif case == "inherited":
+        layout.base_structures = [object()]
+    elif case == "overlapping":
+        layout.members.append(_FakeMember(0x2c, "overlap", layout.members[1].type))
+    elif case == "out-of-bounds":
+        layout.width = 0x30
+    elif case == "single-offset":
+        nodes[1] = _struct_assist_access(var, 0x28, 8)
+    elif case == "conflicting-width":
+        nodes.append(_struct_assist_access(var, 0x28, 4))
+    elif case == "computed-offset":
+        extra = _struct_assist_access(var, 0x38, 4)
+        extra.src.right = extra.src.left  # *(c + c), not a constant offset
+        nodes.append(extra)
+    elif case == "reassigned-parameter":
+        nodes.append(_struct_assist_access(var, 0x38, 4, version=1))
+    elif case == "arithmetic-only":
+        nodes[:] = [node.src for node in nodes]
+    elif case == "no-ssa":
+        fn.mlil.ssa_form = None
+    elif case == "different-parameter":
+        other = _FakeVariable(name="other", storage=6, var_type=var.type, identifier=1002)
+        fn.parameter_vars.append(other)
+        nodes[1] = _struct_assist_access(other, 0x30, 4)
+    assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("pointee", ["StructureTypeClass", "IntegerTypeClass"])
+def test_struct_assist_leaves_typed_parameters_and_rendering_alone(monkeypatch, pointee):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, var, _ = _struct_assist_case()
+    var.type.target.type_class = pointee
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn, [[(0x401004, "return c->flags + c->depth;")]])
+    result = instance._decompile("active", "handle")
+    assert result["text"] == "return c->flags + c->depth;"
+    assert result["warnings"] == []
+
+
+def test_struct_assist_preserves_pointee_qualifiers_in_suggestion():
+    bv, fn, var, _ = _struct_assist_case()
+    var.type.target.const = True
+    var.type.target.volatile = True
+    assert "const volatile struct cfg *" in read_decompile._struct_layout_warnings(bv, fn)[0]
+
+
 def test_decompile_renders_pseudo_c(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

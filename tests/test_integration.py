@@ -3199,3 +3199,62 @@ class TestClassLensRttiGuards922:
         counted = json.loads(shared_bn.run(
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
+
+
+class TestStructLayoutAssistance903:
+    """Known-layout disclosure on the same real typed/untyped function."""
+
+    _SOURCE = """
+        #include <stdint.h>
+        struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };
+        __attribute__((noinline)) uint64_t handle(void *c) {
+            return *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+        }
+        int main(void) {
+            struct cfg c = { .flags = 7, .depth = 3 };
+            return (int)handle(&c);
+        }
+    """
+
+    def test_untyped_hint_typed_rendering_and_ambiguity(self, shared_bn, tmp_path):
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the issue903 regression"
+        source = tmp_path / "struct_assist.c"
+        source.write_text(self._SOURCE)
+        binary = tmp_path / "struct_assist"
+        build = subprocess.run(
+            [cc, "-O2", "-fno-inline", "-fno-stack-protector", "-no-pie",
+             str(source), "-o", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        assert build.returncode == 0, f"struct fixture build failed:\n{build.stdout}\n{build.stderr}"
+        shared_bn.load(binary)
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        before = shared_bn.json("proto", "get", "handle")
+        missing = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in missing["warnings"]), missing
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+        untyped = shared_bn.json("decompile", "handle")
+        hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
+        assert hint is not None, untyped
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+            assert witness in hint
+        assert shared_bn.json("proto", "get", "handle") == before
+        text_result = shared_bn.run("decompile", "handle")
+        assert text_result.returncode == 0, text_result.stderr
+        assert hint in text_result.stdout
+
+        # Application remains an explicit mutation, never part of a read.
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
+        typed = shared_bn.json("decompile", "handle")
+        assert "c->flags" in typed["text"] and "c->depth" in typed["text"], typed
+        assert not any("struct layout candidate" in w for w in typed["warnings"]), typed
+
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        shared_bn.json(
+            "types", "declare",
+            "struct other_cfg { char pad[40]; uint64_t mode; uint32_t count; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
