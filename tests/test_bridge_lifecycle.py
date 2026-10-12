@@ -1277,6 +1277,81 @@ def test_shutdown_request_closes_admission_before_stop_runs(monkeypatch, tmp_pat
         inst.stop()
 
 
+def test_gui_shutdown_refuses_without_retiring_the_live_bridge(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "_collect_open_views_state", lambda **kw: ([], True))
+    monkeypatch.setattr(module, "_active_binary_view", lambda: None)
+    inst = _live_bridge(module, "gui-refusal")
+    try:
+        for op in ("shutdown", "list_targets"):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5)
+                client.connect(str(inst.socket_path))
+                _send_lifecycle_request(client, inst, op)
+                response = _read_lifecycle_response(client)
+                assert response["ok"] is (op == "list_targets")
+                if op == "shutdown":
+                    assert "GUI bridges cannot shut down" in response["error"]
+        assert not inst._shutting_down
+        assert not inst._shutdown_event.is_set()
+        assert inst.socket_path.exists() and inst.registry_path.exists()
+        assert json.loads(inst.registry_path.read_text())["gui"] is True
+    finally:
+        inst.stop()
+
+
+def test_gui_main_thread_stop_never_waits_for_main_thread_handlers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "gui-main")
+    queued = threading.Event()
+    resume_main_thread = threading.Event()
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "is_main_thread", lambda: True)
+
+    def dispatch(payload):
+        queued.set()
+        assert resume_main_thread.wait(5)
+        return {"ok": True, "result": "main-thread-job-finished"}
+
+    def forbidden_wait(timeout):
+        pytest.fail("GUI main-thread teardown waited for a main-thread-bound handler")
+
+    monkeypatch.setattr(inst, "dispatch", dispatch)
+    monkeypatch.setattr(inst._requests_drained, "wait", forbidden_wait)
+    successor = None
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert queued.wait(5)
+            verdict = inst.stop(request_drain_timeout=10, load_join_timeout=10)
+            assert verdict == {
+                "requests_drained": False, "unfinished_requests": 1,
+                "request_drain_timed_out": False, "caller_inflight": False,
+                "request_drain_skipped": "gui_main_thread",
+            }
+            monkeypatch.setattr(module, "_collect_open_views_state", lambda **kw: ([], True))
+            monkeypatch.setattr(module, "_active_binary_view", lambda: None)
+            successor = _live_bridge(module, "gui-main")
+            registry = successor.registry_path.read_bytes()
+            resume_main_thread.set()
+            assert _read_lifecycle_response(client)["result"] == "main-thread-job-finished"
+            inst.stop()
+            assert successor.registry_path.read_bytes() == registry
+            assert _socket_answers(successor.socket_path)
+        finally:
+            resume_main_thread.set()
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            if successor is not None:
+                successor.stop()
+
+
 def _start_gate_bridge(monkeypatch, tmp_path, bound, *, listing=True):
     """A bridge whose socket path already holds a file, with the kernel's
     bound-socket evidence stubbed to *bound* and the availability of that

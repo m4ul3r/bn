@@ -2529,6 +2529,33 @@ def test_target_id_fallback_outranks_id_like_filename_aliases(monkeypatch, suffi
         bridge._headless_views.clear()
 
 
+def test_selector_index_splits_paths_linearly_and_matches_the_resolver(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    records = {}
+    for i in range(80):
+        path = "/samples/" + "/".join(["shared"] * 12) + f"/copy-{i}/demo"
+        for suffix in ("", ".bndb", ".0123456789abcdef.bndb"):
+            vid = str(len(records) + 1)
+            records[vid] = bridge.TargetRecord(
+                vid, object(), vid, path + suffix, "demo" + suffix, "Raw"
+            )
+    original = bridge._path_components
+    splits = []
+
+    def count_splits(path):
+        splits.append(path)
+        return original(path)
+
+    monkeypatch.setattr(bridge, "_path_components", count_splits)
+    selectors = manager._compute_selectors(records)
+    # One split per record plus at most one per candidate, not per other view.
+    assert len(splits) <= sum(1 + len(original(r.filename)) for r in records.values())
+    monkeypatch.setattr(bridge, "_path_components", original)
+    for vid, selector in selectors.items():
+        assert manager._matching_records(records, selector) == [records[vid]]
+
+
 def test_refresh_rows_carry_analysis_state(monkeypatch):
     # target list rows must expose per-target analysis state so an agent can tell
     # a --quick view from a full one without a separate target info per target.

@@ -54,6 +54,7 @@ from ._shared import (
     _write_json_artifact,
     is_auto_function_name,
     is_imported_function,
+    is_main_thread,
 )
 from .op_registry import REGISTRY, op
 from .paths import (
@@ -689,16 +690,49 @@ class TargetManager:
         return type(bv).__name__
 
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
+        # Index the resolver's exact aliases and component suffixes once per
+        # snapshot. Candidate lookup must not re-split every other view's path.
+        exact: dict[str, set[str]] = {}
+        tails: dict[tuple[str, ...], set[str]] = {}
+        paths = {}
+        identities = {}
+        for vid, record in records.items():
+            identities[record.target_id()] = vid
+            parts = paths[vid] = _path_components(record.filename)
+            aliases = [record.view_id, record.filename, record.basename]
+            variants = [parts]
+            if record.basename.endswith(".bndb"):
+                core = record.basename[:-len(".bndb")]
+                aliases.append(core)
+                stem, dot, digest = core.rpartition(".")
+                if dot and len(digest) == 16 and all(
+                    c in "0123456789abcdef" for c in digest
+                ):
+                    aliases.append(stem)
+            if parts and parts[-1].endswith(".bndb"):
+                variants.append(parts[:-1] + (parts[-1][:-len(".bndb")],))
+            for alias in aliases:
+                exact.setdefault(alias, set()).add(vid)
+            for variant in variants:
+                for depth in range(1, len(variant) + 1):
+                    tails.setdefault(variant[-depth:], set()).add(vid)
+
         selectors: dict[str, str] = {}
         for vid, record in records.items():
-            parts = _path_components(record.filename)
+            parts = paths[vid]
             chosen = record.target_id()
             for depth in range(1, len(parts) + 1):
                 candidate = os.sep.join(parts[-depth:])
-                # Use the resolver's relation, including database/cache aliases
-                # and ID precedence, not just literal path suffixes (#919).
-                matches = self._matching_records(records, candidate)
-                if len(matches) == 1 and matches[0] is record:
+                normalized = candidate.strip()
+                if normalized in ("", "active"):
+                    continue
+                if normalized in identities:
+                    matches = {identities[normalized]}
+                else:
+                    matches = exact.get(normalized, set()) | tails.get(
+                        _path_components(normalized), set()
+                    )
+                if matches == {vid}:
                     chosen = candidate
                     break
             selectors[vid] = chosen
@@ -1618,6 +1652,12 @@ class BinaryNinjaBridge:
         load-worker joins too. A request calling stop cannot wait for itself:
         it remains explicitly unfinished in the returned verdict.
         """
+        main_thread_stop = ui is not None and is_main_thread()
+        if main_thread_stop:
+            # GUI handlers and load workers can be waiting for this very thread.
+            # Never wait for them here; report the skipped drain, not a timeout.
+            request_drain_timeout = 0
+            load_join_timeout = 0
         deadline = time.monotonic() + max(0.0, request_drain_timeout)
         with self._requests_drained:
             self._shutting_down = True
@@ -1642,9 +1682,13 @@ class BinaryNinjaBridge:
             verdict = {
                 "requests_drained": self._inflight == 0,
                 "unfinished_requests": self._inflight,
-                "request_drain_timed_out": self._inflight > own_requests,
+                "request_drain_timed_out": (
+                    self._inflight > own_requests and not main_thread_stop
+                ),
                 "caller_inflight": own_requests > 0,
             }
+            if main_thread_stop:
+                verdict["request_drain_skipped"] = "gui_main_thread"
         if not verdict["requests_drained"]:
             with contextlib.suppress(Exception):
                 bn.log_warn(
@@ -1800,6 +1844,7 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "gui": ui is not None,
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,
@@ -4529,6 +4574,11 @@ def _bind_refresh(bridge, params, target):  # only the write gate so reads stay 
 
 @op("shutdown", lock="none")
 def _bind_shutdown(bridge, params, target):
+    if ui is not None:
+        raise RuntimeError(
+            "GUI bridges cannot shut down the Binary Ninja process via RPC; "
+            "use the GUI Restart Bridge command or close Binary Ninja"
+        )
     with bridge._request_state_lock:
         bridge._shutting_down = True
     bridge._shutdown_event.set()
