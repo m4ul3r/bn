@@ -47,6 +47,14 @@ source steps, but now require an incomplete slice: the request length does not
 prove the return count or NUL termination. A zero-filled branch cannot certify
 the alternative short/error-read branch.
 
+`bw_regions` keeps the modeled library-call boundary at every optimization
+level with `-fno-builtin` and an explicit `_FORTIFY_SOURCE=0`. Some compilers
+enable fortify by default; its header wrappers can still expand constant
+copies into vector loads/stores despite `-fno-builtin`. General vector-load
+provenance and multi-store interval unions are not claimed by this modeled-fill
+fixture. The separate `fortified` and `bw_opt_shapes` cases retain their own
+fortified/inlined-operation coverage.
+
 `bw_opt_shapes.literal_init` is a covered-local control, not an obsolete
 completion pin: C initializes all 64 bytes of `char buf[64] = "ping "`, and
 `strcat` preserves its string. Optimized IL may instead copy into `buf + 5`;
@@ -56,12 +64,13 @@ The caller's unresolved `argv` field still withholds whole-slice completeness.
 before `buf[63] = 0`. The `ptr_copy` loop requires an induction proof the
 walker does not provide, rather than whole-array initialization at loop entry.
 
-Every backward case requires a nonempty, source-grounded `origin_kinds`.
-The `bw_regions` read cases retain a modeled `source` even when no byte is
-proven initialized; copy/append/member cases retain their `input` parameter.
-`string_not_full_bytes` must remain incomplete: `snprintf`'s capacity is not
-the number of bytes it initializes. These origin checks do not replace the
-separate leaf and completeness requirements.
+`origin_kinds` is optional when a case checks region coverage rather than the
+choice of one representative origin. A zero/disjoint write is not evidence for
+the consumed bytes, and an indexed address also depends on its selector;
+those cases retain explicit frontier and completeness assertions without
+pinning one path. Overlapping nonzero reads and copy/member cases still check
+their source/parameter origins. `string_not_full_bytes` must remain incomplete:
+`snprintf`'s capacity is not the number of bytes it initializes.
 
 ## `EXPECTED.json` schema
 

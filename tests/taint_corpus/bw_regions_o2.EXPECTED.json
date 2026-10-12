@@ -1,15 +1,16 @@
 {
-  "description": "Read cases retain the modeled source without claiming initialization. Copy/append/member cases retain input parameters even when an uncovered region blocks completeness. snprintf initializes only its C string, never the full output capacity.",
+  "description": "Coverage is checked for the consumed region. Overlapping nonzero reads retain their modeled source without claiming initialization. Zero, disjoint and indexed cases do not pin a representative origin. snprintf capacity is not definite initialized byte length.",
   "lang": "c",
   "cflags": [
     "-O2",
-    "-fno-builtin"
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
   ],
   "backward": [
     {
       "function": "zero_read",
       "sink": "arg:popen:0",
-      "origin_kinds": ["source"],
       "leaves": [
         {
           "kind": "address_of_local_unresolved"
@@ -42,7 +43,6 @@
     {
       "function": "suffix_read",
       "sink": "arg:popen:0",
-      "origin_kinds": ["source"],
       "leaves": [
         {
           "kind": "address_of_local_unresolved"
@@ -53,7 +53,6 @@
     {
       "function": "indexed_row",
       "sink": "arg:popen:0",
-      "origin_kinds": ["source"],
       "leaves": [
         {
           "kind": "address_of_local_unresolved"
@@ -156,7 +155,6 @@
     {
       "function": "byte_suffix_gap",
       "sink": "arg:write:1",
-      "origin_kinds": ["parameter"],
       "complete_slice": false,
       "leaves": [
         {

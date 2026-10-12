@@ -160,8 +160,9 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         _assert_assumptions_contain(result, case.get("assumptions_contain"), stem)
         assert result["slices"], f"{stem}: backward produced no slices"
         kinds = {sl["origin"]["kind"] for sl in result["slices"]}
-        assert kinds & set(case["origin_kinds"]), \
-            f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
+        if "origin_kinds" in case:
+            assert kinds & set(case["origin_kinds"]), \
+                f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
         assert not (kinds & set(case.get("forbid_origin_kinds", []))), \
             f"{stem}: forbidden backward origin kind in {kinds}"
         for want_leaf in case.get("leaves", []):
