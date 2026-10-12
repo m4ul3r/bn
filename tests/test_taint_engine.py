@@ -10416,12 +10416,10 @@ def test_backward_const_ptr_into_writable_storage_is_not_a_literal_928r3():
     assert result2["leaves"] == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is True
 
 
-def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
-    # P3: `memcpy(buf, "lit", n); buf[n] = 0; popen(buf)` -- the weak-origin
-    # tie went to the newest 1-byte store (`constant 0`), and `n`, which
-    # decides where the command is cut, was in no step. The fill outranks the
-    # terminator among weak origins, and a length argument is a walked step
-    # -- so here the parameter `n` is the origin.
+def test_backward_fill_names_a_tainted_length_928r3():
+    # `memcpy(buf, "lit", n); buf[16] = 0; popen(buf)` -- n decides how
+    # many bytes reach the command. It must remain an input and the origin
+    # that drives caller ascent, even though initialization is unproved.
     n = FVar("n", ident=41); n0 = FSSA(n, 0)
     buf = FVar("buf", typ="char[0x40]")
     pg = _BufProgram(params=[n])
@@ -10431,14 +10429,8 @@ def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
     result, reasons, aol = _bw(pg.func())
     assert any("length argument 2 of memcpy bounds" in r for r in reasons), reasons
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "n#0"}, result["slices"][0]["origin"]
-
-    # With a constant length the tie is between two literals: the FILL wins.
-    pg2 = _BufProgram()
-    pg2.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), FExpr("MLIL_CONST", "0x10", constant=0x10)])
-    pg2.aliased_store(buf, 0x10, 0)
-    pg2.sink(buf)
-    result2, _, _ = _bw(pg2.func())
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "memcpy"}, result2["slices"][0]["origin"]
+    assert any("local buffer buf written by memcpy" in r for r in reasons), reasons
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_backward_follows_a_modeled_return_that_derives_from_an_argument_928r3():
@@ -11065,3 +11057,205 @@ def test_backward_return_propagation_is_not_an_exact_alias_933(monkeypatch):
             reads=[returned])
     result, _, _ = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.parametrize("filled,terminator,complete", [
+    (16, 16, True), (15, 16, False), (0, 16, False), (16, 0, True),
+])
+def test_backward_explicit_terminator_requires_initialized_prefix_931(filled, terminator, complete):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    fill = pg.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), _region_const(filled)])
+    pg.aliased_store(buf, terminator, 0).size = 1
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert any(step["address"] == hex(fill.address)
+               for sl in result["slices"] for step in sl["slice"])
+
+
+@pytest.mark.parametrize("filled,suffix,complete", [
+    (16, 16, True), (15, 16, False), (0, 16, False),
+])
+def test_backward_terminated_suffix_requires_initialized_prefix_933(filled, suffix, complete):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(filled)])
+    pg.call(_B_STRCPY, [_region_addr(buf, suffix), _cstr(0x700)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("data,count,complete", [
+    (b"cmd\0", 4, True), (b"cmd\0", 3, False), (b"cmd", 4, False),
+])
+def test_backward_lifted_constant_data_requires_a_copied_nul_931(data, count, complete):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    literal = FExpr("MLIL_CONST_DATA", "lifted bytes",
+                    constant=types.SimpleNamespace(data=data))
+    pg.call(_B_MEMCPY, [_addr_of(buf), literal, _region_const(count)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("callee,size_arg", [("snprintf", 1), ("strlcpy", 2)])
+def test_backward_string_capacity_does_not_initialize_full_byte_range_931(monkeypatch, callee, size_arg):
+    buf, dst = FVar("buf", typ="char[64]"), FVar("dst", typ="char[64]")
+    producer = 0x960
+    monkeypatch.setitem(_B_NAMES, producer, callee)
+    params = [_addr_of(buf), _cstr(0x700), _cstr(0x710)]
+    params[size_arg] = _region_const(64)
+    pg = _BufProgram()
+    pg.call(producer, params)
+    pg.call(_B_MEMCPY, [_addr_of(dst), _addr_of(buf), _region_const(64)])
+    result, _, leaves = _bw(pg.func(), sink="arg:memcpy:1")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert any(l.get("region") == {"offset": 0, "width": 64, "kind": "bytes"} for l in leaves)
+
+
+@pytest.mark.parametrize("operation,complete", [
+    ("prefix_store", True), ("disjoint_fill", True), ("zero_read", True),
+    ("overlapping_store", False), ("overlapping_read", False),
+])
+def test_backward_member_termination_survives_only_nonclobbering_writes_933(operation, complete):
+    obj = FVar("request", typ=types.SimpleNamespace(width=144))
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_region_addr(obj, 8), _region_const(64), _cstr(0x700)])
+    if operation in ("prefix_store", "overlapping_store"):
+        pg.aliased_store(obj, 0 if operation == "prefix_store" else 8, 65).size = 4
+    elif operation == "disjoint_fill":
+        pg.call(_B_MEMSET, [_region_addr(obj, 80), _region_const(65), _region_const(16)])
+    else:
+        pg.call(_B_READ, [_region_const(0), _region_addr(obj, 8),
+                         _region_const(0 if operation == "zero_read" else 1)])
+    pg.call(_B_POPEN, [_region_addr(obj, 8), _cstr(0x710)])
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("requested,complete", [(0, True), (1, True), (63, True), (64, False), (None, False)])
+def test_backward_receive_bound_preserves_untouched_nul_not_initialization_931(requested, complete):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    count = _region_const(requested) if requested is not None else FExpr(
+        "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), count])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+
+
+def test_backward_append_cannot_reuse_the_old_terminator_position_931():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(1)])
+    pg.call(_B_STRCAT, [_addr_of(buf), _cstr(0x700)])
+    pg.call(_B_READ, [_region_const(0), _region_addr(buf, 1), _region_const(63)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_backward_terminator_prefix_proof_requires_every_incoming_path_931():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(16)])
+    pg.phi(0, 1)
+    pg.aliased_store(buf, 16, 0).size = 1
+    pg.sink(buf)
+    result, _, leaves = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert any(l.get("region", {}).get("kind") == "cstring" for l in leaves)
+
+
+@pytest.mark.parametrize("callee", ["strncpy", "__builtin_strncpy", "__strncpy_chk", "strncat", "__strncat_chk"])
+@pytest.mark.parametrize("source", ["string", "bytes", "gap", "zero_count"])
+def test_backward_bounded_strings_read_through_nul_or_count_931(monkeypatch, callee, source):
+    src, dst = FVar("src", typ="char[64]"), FVar("dst", typ="char[64]")
+    copy, consume = 0x961, 0x962
+    monkeypatch.setitem(_B_NAMES, copy, callee)
+    monkeypatch.setitem(_B_NAMES, consume, "write")
+    pg = _BufProgram()
+    if source == "string":
+        pg.call(_B_STRCPY, [_addr_of(src), _cstr(0x700)])
+    elif source != "zero_count":
+        pg.call(_B_MEMSET, [_addr_of(src), _region_const(65),
+                           _region_const(3 if source == "gap" else 4)])
+    count = 0 if source == "zero_count" else 4
+    append = "strncat" in callee
+    if append or source == "zero_count":
+        pg.call(_B_MEMSET, [_addr_of(dst), _region_const(0), _region_const(64)])
+    pg.call(copy, [_addr_of(dst), _addr_of(src), _region_const(count), _region_const(64)])
+    if append:
+        pg.sink(dst)
+        sink = "arg:popen:0"
+    else:
+        pg.call(consume, [_region_const(1), _addr_of(dst), _region_const(count or 64)])
+        sink = "arg:write:1"
+    result, _, _ = _bw(pg.func(), sink=sink)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (source != "gap")
+
+
+@pytest.mark.parametrize("conditional", [False, True])
+def test_strtok_imported_clean_reset_obeys_every_path_semantics_932(conditional):
+    class ImportView(FBV):
+        def get_symbols_by_name(self, name):
+            return [types.SimpleNamespace(address=0x900)] if name == "strtok" else []
+
+    func, _ = _strtok_reset_program(conditional=conditional)
+    if not conditional:
+        for ins in func.mlil.ssa_form.instructions:
+            ins.il_basic_block.outgoing_edges = []
+    reset = func.mlil.ssa_form.instructions[1]
+    reset.dest = FExpr("MLIL_IMPORT", "strtok", constant=0xa000)
+    reset.dest.name = "strtok"
+    result = te.TaintEngine(ImportView({0x900: "strtok", 0x901: "system"}), te.load_models()).forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == (["system"] if conditional else [])
+    if not conditional:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+        assert not any(a.startswith("tokenizer_state_escapes") for a in result["assumptions"])
+
+
+@pytest.mark.parametrize("mode", ["import", "pinned", "ambiguous"])
+@pytest.mark.parametrize("folded", [False, True])
+def test_backward_resolved_consumer_keeps_region_contract_933(mode, folded):
+    class ImportView(FBV):
+        def get_symbols_by_name(self, name):
+            return [types.SimpleNamespace(address=_B_POPEN)] if name == "popen" else []
+
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    sink = pg.sink(buf, folded=folded)
+    if mode == "import":
+        sink.dest = FExpr("MLIL_IMPORT", "popen", constant=0xb000)
+        sink.dest.name = "popen"
+        resolve_map = {}
+    else:
+        sink.dest = FExpr("MLIL_VAR_SSA", "callback", reads=[FSSA(FVar("callback"), 0)])
+        resolve_map = {hex(sink.address): [_B_POPEN, *([_B_MEMCPY] if mode == "ambiguous" else [])]}
+    result = te.TaintEngine(ImportView(_B_NAMES), te.load_models(), resolve_map=resolve_map).backward(
+        pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (mode != "ambiguous")
+    if mode == "ambiguous":
+        assert any(l.get("region", {}).get("kind") == "unknown" for l in result["leaves"])
+
+
+def test_backward_write_bound_overlay_preserves_source_without_inventing_initialization_931():
+    buf = FVar("buf", typ="char[64]")
+    models = te.load_models(extra={"read": {"write_bounds": [{"arg": 1, "kind": "bytes", "len_arg": 2}]}})
+    for initialized in (False, True):
+        pg = _BufProgram()
+        if initialized:
+            pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+        pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(1)])
+        pg.sink(buf)
+        result = te.TaintEngine(FBV(_B_NAMES), models).backward(pg.func(), [te.parse_locator("arg:popen:0")])
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is initialized
+        assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}

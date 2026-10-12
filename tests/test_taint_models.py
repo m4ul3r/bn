@@ -1041,3 +1041,19 @@ def test_scanf_arity_residual_marker_in_weak_seed_set_851():
         "scanf_arity_residual must be in _WEAK_SEED_ASSUMPTION_MARKERS so a "
         "residual-arity assumption withholds safe_to_report_all_clear"
     )
+
+
+@pytest.mark.parametrize("annotation", [
+    {"consumes": [{"arg": 1, "kind": "bounded_cstring"}]},
+    {"consumes": [{"arg": 1, "kind": "bounded_cstring", "len_arg": True}]},
+    {"initializes": [{"arg": 0, "kind": "bounded_cstring", "len_arg": 2}]},
+    {"write_bounds": []},
+    {"write_bounds": [{"arg": 1, "kind": "bytes"}]},
+    {"write_bounds": [{"arg": 1, "kind": "cstring", "len_arg": 2}]},
+    {"write_bounds": [{"arg": 1, "kind": "bytes", "len_arg": -1}]},
+    {"write_bounds": [{"arg": 1, "kind": "bytes", "len_arg": 2, "zero": True}]},
+])
+def test_invalid_bounded_region_annotations_are_rejected_931(annotation):
+    from bn_agent_bridge.taint_models import TaintError, load_models
+    with pytest.raises(TaintError):
+        load_models(extra={"memcpy": annotation})

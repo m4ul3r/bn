@@ -119,7 +119,7 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
                     "writes", "return_bound", "arity_capped", "destinations_unmodeled",
-                    "initializes", "consumes", "preserves_cstring", "return_alias")
+                    "initializes", "consumes", "write_bounds", "preserves_cstring", "return_alias")
 # The roles that move or fill bytes. The remaining roles annotate a flow
 # model (bounds, regions, aliases and disclosures): an overlay
 # entry made of annotations alone is merged INTO the existing model of the same
@@ -259,7 +259,7 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                 _fail(f"`writes` entry {t!r} must be a `*arg:N` token (a pointee the callee "
                       f"fills); a scalar `arg:N` is not written through -- fix the token or "
                       f"use {{}} to mark {name} benign")
-    for key in ("initializes", "consumes"):
+    for key in ("initializes", "consumes", "write_bounds"):
         if key not in model:
             continue
         rules = model[key]
@@ -273,10 +273,12 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                 _fail(f"`{key}` has unknown region fields: {sorted(set(rule) - allowed)}")
             if not _is_int(rule.get("arg")) or rule["arg"] < 0:
                 _fail(f"`{key}.arg` must be a non-negative argument index")
-            if rule.get("kind") not in ("bytes", "cstring"):
-                _fail(f"`{key}.kind` must be `bytes` or `cstring`")
-            if rule["kind"] == "bytes" and "len_arg" not in rule:
-                _fail(f"`{key}` byte regions require `len_arg`")
+            kinds = ("bytes", "cstring", "bounded_cstring") if key == "consumes" else (
+                ("bytes",) if key == "write_bounds" else ("bytes", "cstring"))
+            if rule.get("kind") not in kinds:
+                _fail(f"`{key}.kind` must be one of {', '.join(kinds)}")
+            if rule["kind"] in ("bytes", "bounded_cstring") and "len_arg" not in rule:
+                _fail(f"`{key}` {rule['kind']} regions require `len_arg`")
             for field in ("len_arg", "value_arg", "copy_arg"):
                 if field in rule and (not _is_int(rule[field]) or rule[field] < 0):
                     _fail(f"`{key}.{field}` must be a non-negative argument index")

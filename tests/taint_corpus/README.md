@@ -34,7 +34,7 @@ brittle across compilers/optimisation.
 | `bw_terminate_append.c` | `fill; buf[n] = 0; append; popen` at -O1: the aliased-field terminator (a memory def with no `src_memory`) must not break the writer chain -- the parameter / `read` source copied in by the OLDER writer is the origin, not the literal append; a nested `strcpy(cmd, tmp)` source buffer is walked to its `read` |
 | `bw_memory_paths.c`    | backward memory-path honesty: a conditional fill (memory phi with a writer-less arm) is an `address_of_local_unresolved` frontier; a source buffer overwritten AFTER it was copied is read at the copy's memory version; `&buf` escaping to a global makes a later unmodeled call an opaque writer and a later modeled call that reloads the stash (`strcpy(g_stash, host)`) a fill; a 1-byte terminator after a conditional `read` does not cover the bare arm; a `memset` arm is a literal fill that does |
 | `strtok_escape.c`      | strtok state left tainted at return is disclosed (`tokenizer_state_escapes`) and withholds `safe_to_report_all_clear`; a clean non-NULL `strtok` that lies on EVERY path from the tainted call to the `strtok(NULL)` resets the continuation (negative); one under `if (mode)`, or a priming call before a loop that the back-edge bypasses (`tok_prime_loop`), does not, so the continuation stays a real `system()` flow (positive). `strtok_escape_o1.c` rebuilds it at -O1 |
-| `bw_opt_shapes.c`      | -O1 optimiser shapes (`bw_opt_shapes_o2.c` rebuilds at -O2): a store through a phi'd / non-constant pointer is a writer whose value reaches the ascent (`buf[i] ^= key[i]`, `*p++ = *src++`), never a bare `source` with `complete_slice: true`; a byte-wise `*p++ = *src++` loop is a loop-only fill and stays a frontier leaf; `__builtin_memset` is a literal fill; `char buf[] = "lit"` lifted to `__builtin_strncpy` is modeled; a tainted `memcpy` length is a step and the fill outranks the terminator |
+| `bw_opt_shapes.c`      | -O1 optimiser shapes (`bw_opt_shapes_o2.c` rebuilds at -O2): a store through a phi'd / non-constant pointer retains its input and caller ascent; byte-wise cursor copies remain frontiers where loop initialization cannot be proved; `__builtin_memset` is a literal fill; `char buf[] = "lit"` lifted to `__builtin_strncpy` has concrete constant-data NUL evidence; a tainted `memcpy` length remains an input rather than being hidden by the terminator |
 | `bw_global_operand.c`  | a `CONST_PTR` fill operand is a literal only in read-only storage: `sprintf(cmd, "%s", g_host)` from a `.bss` array is a frontier leaf with origin `global` (`complete_slice: false`); the `.rodata` literal twin is complete |
 | `bw_offset_address.c`  | an address built on a buffer at a VARIABLE offset is that buffer: `popen(line + off)` and `strcpy(buf, &other[i])` walk the `read` that filled it beside the offset; `g_hosts[i]` (a `.bss` array element) is a `global` frontier leaf. `bw_offset_address_o1.c` rebuilds it at -O1 |
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
@@ -46,6 +46,22 @@ initializer. Existing `read`-based offset/append/loop cases still require their
 source steps, but now require an incomplete slice: the request length does not
 prove the return count or NUL termination. A zero-filled branch cannot certify
 the alternative short/error-read branch.
+
+`bw_opt_shapes.literal_init` is a covered-local control, not an obsolete
+completion pin: C initializes all 64 bytes of `char buf[64] = "ping "`, and
+`strcat` preserves its string. Optimized IL may instead copy into `buf + 5`;
+that remains covered because the preceding five bytes were initialized.
+The caller's unresolved `argv` field still withholds whole-slice completeness.
+`read_or_memset` cannot claim the same proof: the `read` arm can leave a gap
+before `buf[63] = 0`. The `ptr_copy` loop requires an induction proof the
+walker does not provide, rather than whole-array initialization at loop entry.
+
+Every backward case requires a nonempty, source-grounded `origin_kinds`.
+The `bw_regions` read cases retain a modeled `source` even when no byte is
+proven initialized; copy/append/member cases retain their `input` parameter.
+`string_not_full_bytes` must remain incomplete: `snprintf`'s capacity is not
+the number of bytes it initializes. These origin checks do not replace the
+separate leaf and completeness requirements.
 
 ## `EXPECTED.json` schema
 

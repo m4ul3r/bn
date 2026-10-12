@@ -87,7 +87,8 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
         # (``arg:1->*arg:0``) and an ``overflow_len`` sink.
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
-        regions = {key: model[key] for key in ("initializes", "consumes", "preserves_cstring", "return_alias")
+        regions = {key: model[key] for key in ("initializes", "consumes", "write_bounds",
+                                              "preserves_cstring", "return_alias")
                    if key in model}
         if model.get("sources") and want in (None, "source"):
             tos = ", ".join(str(s.get("to")) for s in model["sources"])
