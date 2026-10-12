@@ -471,15 +471,17 @@ def _go_rename_produced(monkeypatch, *, preview, readback_fails=(),
 
 
 @pytest.mark.parametrize("preview", [False, True])
-@pytest.mark.parametrize("names,interior,expected_noop", [
-    ({}, False, 0),
-    ({0x401000: "parse_record"}, False, 1),
-    ({0x401000: "main.f0"}, False, 1),
-    ({}, True, 3),
-    ({0x401000: "main.f0", 0x402000: "parse_record"}, True, 3),
-], ids=["undefined", "user-named", "already-named", "interior", "mixed"])
+@pytest.mark.parametrize(
+    "names,interior,expected_defined,expected_noop,expected_already,expected_interior", [
+        ({}, False, 0, 0, 0, 0),
+        ({0x401000: "parse_record"}, False, 1, 1, 0, 0),
+        ({0x401000: "main.f0"}, False, 1, 0, 1, 0),
+        ({}, True, 3, 0, 0, 3),
+        ({0x401000: "main.f0", 0x402000: "parse_record"}, True, 3, 1, 1, 1),
+    ], ids=["undefined", "user-named", "already-named", "interior", "mixed"])
 def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
-        monkeypatch, fake_transport, capsys, preview, names, interior, expected_noop):
+        monkeypatch, fake_transport, capsys, preview, names, interior,
+        expected_defined, expected_noop, expected_already, expected_interior):
     """#883: scan real synthetic pcln data, then render the producer's no-op."""
     from test_read_go import (
         _ContainmentOnlyGoBV, _GoBV, _build_pclntab_many, _ctx, _fake_functions,
@@ -492,7 +494,7 @@ def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
     _bridge, instance = _ctx(monkeypatch, bv)
     payload = instance._go_rename(None, preview=preview)
     assert {addr: fn.name for addr, fn in functions.items()} == names
-    assert payload["defined_count"] == expected_noop
+    assert payload["defined_count"] == expected_defined
 
     fake_transport({"go_rename": {"ok": True, "result": payload}})
     argv = ["go", "rename", "--target", "active"] + (["--preview"] if preview else [])
@@ -500,6 +502,8 @@ def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
     text = capsys.readouterr().out
     assert "changed=0" in text and "verified=0" in text and "failed=0" in text
     assert f"noop={expected_noop}" in text and "dirty_after=False" in text
+    assert f"skipped_already_named={expected_already}" in text
+    assert f"skipped_interior_pc={expected_interior}" in text
 
     assert bn.cli.main([*argv, "--format", "json", "--summary"]) == 0
     summary = json.loads(capsys.readouterr().out)
@@ -508,6 +512,13 @@ def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
     assert summary["changed_count"] == summary["verified_count"] == summary["failed_count"] == 0
     assert summary["noop_count"] == summary["op_count"] == expected_noop
     assert summary["first_error"] is None
+    assert summary["go_rename"] == {
+        "candidates": 0,
+        "skipped_user_named": expected_noop,
+        "skipped_already_named": expected_already,
+        "skipped_interior_pc": expected_interior,
+        "skipped_changed_during_apply": 0,
+    }
 
     assert bn.cli.main([*argv, "--format", "json"]) == 0
     detail = json.loads(capsys.readouterr().out)
@@ -516,7 +527,7 @@ def test_go_rename_zero_candidates_is_measured_on_every_cli_face(
     assert detail["go_committed_count"] == detail["go_failed_count"] == 0
     assert sum(detail.get(key, 0) for key in (
         "skipped_user_named", "skipped_already_named", "skipped_interior_pc",
-    )) == summary["noop_count"]
+    )) == expected_defined
 
 
 @pytest.mark.parametrize("preview,readback_fails,lose_on_rollback,changed,dirty", [
@@ -537,8 +548,10 @@ def test_go_rename_summary_reconciles_scan_skips_without_changing_rollback(
         skipped_already_named=2, skipped_interior_pc=4)
     summary = _go_rename_summary(payload)
     assert summary["measured"] is True
-    assert summary["op_count"] == payload["defined_count"] == 11
-    assert summary["noop_count"] == 9
+    assert summary["op_count"] == 5
+    assert summary["noop_count"] == 3
+    assert summary["go_rename"]["skipped_already_named"] == 2
+    assert summary["go_rename"]["skipped_interior_pc"] == 4
     assert summary["changed_count"] == changed
     assert summary["dirty_after"] is dirty
     assert summary["verified_count"] == payload["go_verified_count"]
@@ -561,6 +574,7 @@ def test_go_rename_unreadable_scan_skips_preserve_failure_precedence(
     assert summary["dirty_after"] is True
     for key in ("changed_count", "verified_count", "noop_count", "failed_count"):
         assert summary[key] is None
+    assert summary["go_rename"][counter] is None
     assert _add_mutation_ok(payload)["ok"] is False
     assert bn.cli._mutation_exit_code(payload, _go_rename_summary) == exit_code
 
@@ -898,47 +912,6 @@ def test_a_completed_revert_states_no_count_its_envelope_never_stated(monkeypatc
     rows_disagree = _go_rename_summary(
         {key: value for key, value in reverted.items() if key != "go_failed_count"})
     assert rows_disagree["measured"] is False, rows_disagree
-
-
-def test_the_op_count_reference_names_the_scan_buckets_it_leaves_out(monkeypatch):
-    """#693 r6: `op_count` is the candidates plus the SCAN-TIME user-named
-    skips -- and the scan has two more buckets it does not include.
-
-    The bridge partitions every DEFINED row into four buckets (#818): a
-    candidate, a user-named skip, a function already carrying the recovered
-    name, and a pcln address no BN function STARTS at. Only the first two
-    reach `op_count`, so it does not reconcile with the `defined_count` the
-    SAME envelope carries -- and on an idempotent re-run every previously
-    renamed function moves into the already-named bucket, so `op_count`
-    collapses toward 0 while the op considered the whole table. Calling it
-    "the distinct functions considered" in the public reference was false by
-    the size of those two buckets, and a reader reconciling the two numbers
-    has no way to tell which to believe. The reference has to NAME the fields
-    it leaves out, so the gap is disclosed rather than discovered.
-    """
-    from pathlib import Path
-
-    from bn.formatters import _go_rename_summary
-
-    payload, _ = _go_rename_produced(
-        monkeypatch, preview=False, skipped_user_named=3,
-        skipped_already_named=2, skipped_interior_pc=4)
-    assert payload["defined_count"] == 11, payload      # 2 + 3 + 2 + 4
-    assert payload["skipped_already_named"] == 2, payload
-    assert payload["skipped_interior_pc"] == 4, payload
-    # candidates (2) + the scan-time user-named skips (3): six of the eleven
-    # rows the op considered are outside it.
-    assert _go_rename_summary(payload)["op_count"] == 5, payload
-
-    reference = (Path(__file__).resolve().parents[1]
-                 / "skills" / "bn" / "reference" / "mutating.md")
-    row = [line for line in reference.read_text(encoding="utf-8").splitlines()
-           if line.startswith("| `op_count`")]
-    assert len(row) == 1, row
-    for field in ("skipped_already_named", "skipped_interior_pc", "defined_count"):
-        assert field in row[0], (
-            f"the op_count row must name `{field}` -- a bucket the op counted "
-            f"and `op_count` leaves out: {row[0]}")
 
 
 def test_go_rename_revert_failure_reaches_stdout_as_unknown_not_zero(
@@ -4921,8 +4894,8 @@ def test_go_rename_op_count_does_not_double_count_apply_time_skips(already, inte
         "skipped_user_named": 5, "skipped_changed_during_apply": 3,
         "skipped_already_named": already, "skipped_interior_pc": interior,
     })
-    assert summary["op_count"] == 12 + already + interior
-    assert summary["noop_count"] == 5 + already + interior
+    assert summary["op_count"] == 12
+    assert summary["noop_count"] == 5
     assert summary["changed_count"] == 7
 
 

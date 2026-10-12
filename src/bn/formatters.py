@@ -5917,8 +5917,7 @@ def _go_rename_summary(value: Any) -> Any:
     committed_count = counters["go_committed_count"]
     verified = counters["go_verified_count"]
     failed = counters["go_failed_count"]
-    skipped = (counters["skipped_user_named"] + counters["skipped_already_named"]
-               + counters["skipped_interior_pc"])
+    skipped = counters["skipped_user_named"]
     rolled_back = value.get("rolled_back")
     reported_success = bool(value.get("success", True))
     # The rows and the counter answer the SAME question on this op, and the
@@ -6045,7 +6044,7 @@ def _go_rename_summary(value: Any) -> Any:
     # `not success`, not on `failed`, is what keeps a revert that failed AFTER
     # every rename verified -- zero failure rows, message only -- from reporting
     # failed=0 with no error while the view sits partially renamed.
-    return _build_mutation_summary(
+    summary = _build_mutation_summary(
         # This op measures through its own counters rather than through
         # `results[]` -- but "measures through" is not "measured": a counter
         # that arrived in a shape no count reads out of leaves the derived
@@ -6070,8 +6069,7 @@ def _go_rename_summary(value: Any) -> Any:
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
         # inside go_renamed_candidates. Already-named and interior-PC rows
-        # are disjoint scan-time skips. Distinct functions considered =
-        # candidates + all scan-time skips, reconciling with defined_count.
+        # are scan-only skips, not operations; disclose them separately.
         op_count=candidates + skipped
                  - counters["skipped_changed_during_apply"],
         reported_success=reported_success,
@@ -6080,10 +6078,7 @@ def _go_rename_summary(value: Any) -> Any:
         failed=failed,
         changed=changed,
         verified=stated_verified,
-        # Every skipped row is deliberately left unchanged, including an
-        # already recovered name or an interior PC we must never rename.
-        # `op_count` above still uses the numeric read: it counts the rows
-        # this envelope reports, even when a missing counter shrinks it.
+        # User-named skips retain the existing operation/noop population.
         noop=stated_noop,
         committed=committed,
         preview=preview,
@@ -6091,6 +6086,23 @@ def _go_rename_summary(value: Any) -> Any:
         message=_text_value(value, "message"),
         default_error="go rename failed",
     )
+    # Preserve operation-count semantics while exposing the scan buckets.
+    # The user-named wire counter includes apply-time skips; its overlap is
+    # explicit here, just as it is in the detailed producer result.
+    summary["go_rename"] = {
+        name: (None if source in unreadable
+               or (source in {"go_renamed_candidates", "skipped_user_named"}
+                   and not _field_present(value, source))
+               else counters[source])
+        for name, source in (
+            ("candidates", "go_renamed_candidates"),
+            ("skipped_user_named", "skipped_user_named"),
+            ("skipped_already_named", "skipped_already_named"),
+            ("skipped_interior_pc", "skipped_interior_pc"),
+            ("skipped_changed_during_apply", "skipped_changed_during_apply"),
+        )
+    }
+    return summary
 
 
 @_discloses
@@ -6130,6 +6142,14 @@ def _render_mutation_summary_text(value: Any) -> str:
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if _field_declared(value, "go_rename"):
+        go = _field_dict(value, "go_rename")
+        line += "\ngo rename: " + "  ".join(
+            f"{key}={_stated_count(go, key)}" for key in (
+                "candidates", "skipped_user_named", "skipped_already_named",
+                "skipped_interior_pc", "skipped_changed_during_apply",
+            )
+        )
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
