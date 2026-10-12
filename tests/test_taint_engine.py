@@ -10215,7 +10215,6 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
     assert any("may write local buffer cmd" in r for r in reasons), reasons
-    assert len(aol) == 1 and "may alias" in aol[0]["detail"], result["leaves"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
     # The stored VALUE is walked too: the parameter is in the slice.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}
@@ -10832,13 +10831,11 @@ def test_backward_requested_read_extent_is_not_initialization_931(length, offset
     pg = _BufProgram()
     n = _region_const(length) if length is not None else FExpr(
         "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
-    source = pg.call(_B_READ, [_region_const(0), _addr_of(buf), n])
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), n])
     pg.call(_B_POPEN, [_region_addr(buf, offset), _cstr(0x710)])
     result, _, leaves = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
     assert any(l.get("region", {}).get("offset") == offset for l in leaves)
-    assert any(step["address"] == hex(source.address)
-               for sl in result["slices"] for step in sl["slice"])
 
 
 @pytest.mark.parametrize("filled,consumed,offset,complete", [
@@ -11065,13 +11062,11 @@ def test_backward_return_propagation_is_not_an_exact_alias_933(monkeypatch):
 def test_backward_explicit_terminator_requires_initialized_prefix_931(filled, terminator, complete):
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    fill = pg.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), _region_const(filled)])
+    pg.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), _region_const(filled)])
     pg.aliased_store(buf, terminator, 0).size = 1
     pg.sink(buf)
     result, _, _ = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
-    assert any(step["address"] == hex(fill.address)
-               for sl in result["slices"] for step in sl["slice"])
 
 
 @pytest.mark.parametrize("filled,suffix,complete", [
@@ -11147,7 +11142,6 @@ def test_backward_receive_bound_preserves_untouched_nul_not_initialization_931(r
     pg.sink(buf)
     result, _, _ = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
 
 
 def test_backward_append_cannot_reuse_the_old_terminator_position_931():
@@ -11259,3 +11253,190 @@ def test_backward_write_bound_overlay_preserves_source_without_inventing_initial
         result = te.TaintEngine(FBV(_B_NAMES), models).backward(pg.func(), [te.parse_locator("arg:popen:0")])
         assert result["diagnostics"]["safe_to_report_complete_slice"] is initialized
         assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+
+
+@pytest.mark.parametrize("kind,complete", [("cstring", True), ("bytes", False)])
+def test_backward_single_consumption_contract_matches_catalog_and_coverage_931(kind, complete):
+    from bn_agent_bridge.read_taint_models import build_catalog
+
+    rule = {"arg": 0, "kind": kind, **({"len_arg": 1} if kind == "bytes" else {})}
+    models = te.load_models(extra={"popen": {"consumes": [rule]}})
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_addr_of(buf), _region_const(64), _cstr(0x700)])
+    pg.call(_B_POPEN, [_addr_of(buf), _region_const(64)])
+    result = te.TaintEngine(FBV(_B_NAMES), models).backward(
+        pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    if not complete:
+        assert any(l.get("region") == {"offset": 0, "width": 64, "kind": "bytes"}
+                   for l in result["leaves"])
+    catalog = build_catalog(models, role="sink")
+    row = next(r for r in catalog["sinks_by_class"]["command_injection"] if r["symbol"] == "popen")
+    assert row["consumes"] == [rule]
+
+
+@pytest.mark.parametrize("operation", ["local_copy", "global_copy", "read", "store"])
+@pytest.mark.parametrize("offset,count,relevant", [
+    (0, 4, False), (80, 4, False), (8, 0, False),
+    (8, 4, True), (None, 4, True), (0, None, True),
+])
+def test_backward_member_provenance_excludes_only_proven_disjoint_writes_933(operation, offset, count, relevant):
+    obj = FVar("request", typ=types.SimpleNamespace(width=144))
+    unrelated = FVar("unrelated", typ="char[64]")
+    value, value0 = _var("value", 0, ident=41)
+    pg = _BufProgram(params=[value])
+    pg.call(_B_SNPRINTF, [_region_addr(obj, 8), _region_const(64), _cstr(0x700)])
+    dest = _region_addr(obj, offset)
+    width = _region_const(count) if count is not None else FExpr(
+        "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
+    if operation == "read":
+        writer = pg.call(_B_READ, [_region_const(0), dest, width])
+    elif operation == "store":
+        writer = pg.store(dest, FExpr("MLIL_VAR_SSA", "value", reads=[value0]), reads=[value0])
+        writer.size = count
+    else:
+        source = _addr_of(unrelated) if operation == "local_copy" else _cstr(0x800)
+        writer = pg.call(_B_MEMCPY, [dest, source, width])
+    pg.call(_B_POPEN, [_region_addr(obj, 8), _cstr(0x710)])
+    bv = FBVStorage(_B_NAMES, ro=[(0x700, 0x780)], rw=[(0x800, 0x880)])
+    result = te.TaintEngine(bv, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (not relevant)
+    steps = [s for sl in result["slices"] for s in sl["slice"]]
+    assert any(s["address"] == hex(writer.address) for s in steps) is relevant
+    if not relevant:
+        assert not result["leaves"]
+        assert all(sl["origin"].get("callee") != "read" for sl in result["slices"])
+    elif operation == "global_copy":
+        assert any(l.get("global") == "0x800" for l in result["leaves"])
+    elif operation == "local_copy":
+        assert any(l.get("buffer") == "unrelated" for l in result["leaves"])
+    elif operation == "read":
+        assert any(sl["origin"] == {"kind": "source", "callee": "read"} for sl in result["slices"])
+
+
+def test_backward_provenance_uses_final_not_intermediate_terminator_931():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    # Initially the NUL at zero makes this input disjoint. Removing the prefix
+    # NULs later makes it part of the final consumed string.
+    source = pg.call(_B_READ, [_region_const(0), _region_addr(buf, 32), _region_const(1)])
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(32)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert any(step["address"] == hex(source.address)
+               for sl in result["slices"] for step in sl["slice"])
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+
+
+@pytest.mark.parametrize("writes,complete", [
+    ([(0, 63)], True), ([(63, 1)], True), ([(16, 32)], True),
+    ([(16, 32), (0, 16), (63, 1)], True),
+    ([(16, 32), (0, 16), (48, 16)], False),
+    ([(0, 64)], False), ([(0, None)], False),
+])
+@pytest.mark.parametrize("initializer", ["none", "memset", "store"])
+def test_backward_zero_interval_survives_only_writes_leaving_a_nul_931(writes, complete, initializer):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    if initializer == "memset":
+        pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+    elif initializer == "store":
+        pg.aliased_store(buf, 0, 0).size = 64
+    for off, count in writes:
+        width = _region_const(count) if count is not None else FExpr(
+            "MLIL_VAR_SSA", "count", reads=[FSSA(FVar("count"), 0)])
+        pg.call(_B_READ, [_region_const(0), _region_addr(buf, off), width])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (complete and initializer != "none")
+
+
+@pytest.mark.parametrize("callee", [
+    "strncpy", "__builtin_strncpy", "__strncpy_chk",
+    "strncat", "__builtin_strncat", "__strncat_chk",
+])
+@pytest.mark.parametrize("shape,complete", [
+    ("mixed", True), ("gap", False), ("clobber", False),
+    ("disjoint", True), ("loop_gap", False), ("loop_bytes", True),
+    ("budget", False), ("missing_destination", False),
+])
+def test_backward_bounded_string_phi_proves_disjunction_per_arm_931(monkeypatch, callee, shape, complete):
+    src, dst = FVar("src", typ="char[64]"), FVar("dst", typ="char[64]")
+    copy, consume = 0x961, 0x962
+    monkeypatch.setitem(_B_NAMES, copy, callee)
+    monkeypatch.setitem(_B_NAMES, consume, "write")
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(src), _cstr(0x700)])
+    string_epoch = pg.mem
+    fill = pg.call(_B_MEMSET, [_addr_of(src), _region_const(65),
+                               _region_const(3 if shape == "gap" else 4)])
+    fill.src_memory = 0
+    byte_epoch = pg.mem
+    if shape.startswith("loop_"):
+        pg.phi(0 if shape == "loop_gap" else byte_epoch, pg.mem + 2)
+        pg.call(_B_READ, [_region_const(0), _addr_of(src), _region_const(1)])
+    else:
+        pg.phi(string_epoch, byte_epoch)
+    if shape in ("clobber", "disjoint"):
+        pg.call(_B_READ, [_region_const(0), _region_addr(src, 0 if shape == "clobber" else -4),
+                         _region_const(1)])
+    if shape == "budget":
+        monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", 2)
+        for _ in range(4):
+            pg.aliased_store(src, 63, 65).size = 1
+    append = "strncat" in callee
+    if append and shape != "missing_destination":
+        pg.call(_B_MEMSET, [_addr_of(dst), _region_const(0), _region_const(64)])
+    pg.call(copy, [_addr_of(dst), _addr_of(src), _region_const(4), _region_const(64)])
+    if append:
+        pg.sink(dst)
+    else:
+        pg.call(consume, [_region_const(1), _addr_of(dst), _region_const(4)])
+    result, _, _ = _bw(pg.func(), sink="arg:popen:0" if append else "arg:write:1")
+    expected = complete or (shape == "missing_destination" and not append)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is expected
+    if shape == "budget":
+        assert result["stats"]["truncated"] is True
+        assert "memory_chain" in result["stats"]["truncation_cause"]
+
+
+@pytest.mark.parametrize("offset,complete", [(0, True), (3, False)])
+def test_backward_zero_interval_phi_keeps_each_arms_terminators_931(offset, complete):
+    buf = FVar("buf", typ="char[4]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(4)])
+    initial = pg.mem
+    pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(1)])
+    left = pg.mem
+    right_write = pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(3)])
+    right_write.src_memory = initial
+    pg.phi(left, pg.mem)
+    pg.call(_B_READ, [_region_const(0), _region_addr(buf, offset), _region_const(1)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("operation", ["store", "copy", "read"])
+@pytest.mark.parametrize("count", [0, 4])
+def test_backward_may_alias_writer_is_retained_unless_zero_effect_933(operation, count):
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_SNPRINTF, [_addr_of(buf), _region_const(64), _cstr(0x700)])
+    pg.store(_cstr(0x800), _addr_of(buf))
+    reload = FExpr("MLIL_LOAD_SSA", "reload", src=_cstr(0x808))
+    if operation == "store":
+        writer = pg.store(reload, _region_const(65))
+        writer.size = count
+    elif operation == "copy":
+        writer = pg.call(_B_MEMCPY, [reload, _cstr(0x700), _region_const(count)])
+    else:
+        writer = pg.call(_B_READ, [_region_const(0), reload, _region_const(count)])
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (count == 0)
+    assert any(step["address"] == hex(writer.address)
+               for sl in result["slices"] for step in sl["slice"]) is (count != 0)

@@ -1057,3 +1057,25 @@ def test_invalid_bounded_region_annotations_are_rejected_931(annotation):
     from bn_agent_bridge.taint_models import TaintError, load_models
     with pytest.raises(TaintError):
         load_models(extra={"memcpy": annotation})
+
+
+@pytest.mark.parametrize("layer", ["extra", "override"])
+@pytest.mark.parametrize("annotation_only", [False, True])
+@pytest.mark.parametrize("kinds", [("cstring", "bytes"), ("bytes", "cstring"), ("cstring", "cstring")])
+def test_duplicate_consumption_arguments_are_refused_931(tmp_path, monkeypatch, layer, annotation_only, kinds):
+    import json
+    from bn_agent_bridge.taint_models import TaintError, load_models
+
+    rules = [{"arg": 0, "kind": kind, **({"len_arg": 1} if kind == "bytes" else {})}
+             for kind in kinds]
+    model = {"consumes": rules}
+    if not annotation_only:
+        model["sink"] = {"class": "command_injection", "tainted_args": [0]}
+    extra = {"popen": model}
+    path = tmp_path / "models.json"
+    monkeypatch.setenv("BN_TAINT_MODELS", str(path))
+    if layer == "override":
+        path.write_text(json.dumps(extra))
+        extra = None
+    with pytest.raises(TaintError):
+        load_models(extra=extra)

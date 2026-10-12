@@ -265,6 +265,7 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         rules = model[key]
         if not isinstance(rules, list) or not rules or not all(isinstance(r, dict) for r in rules):
             _fail(f"`{key}` must be a non-empty list of region objects")
+        consumed_args: set[int] = set()
         for rule in rules:
             allowed = {"arg", "kind", "len_arg"}
             if key == "initializes":
@@ -273,6 +274,11 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                 _fail(f"`{key}` has unknown region fields: {sorted(set(rule) - allowed)}")
             if not _is_int(rule.get("arg")) or rule["arg"] < 0:
                 _fail(f"`{key}.arg` must be a non-negative argument index")
+            if key == "consumes":
+                if rule["arg"] in consumed_args:
+                    _fail(f"`consumes` declares argument {rule['arg']} more than once; "
+                          "each argument requires exactly one consumption contract")
+                consumed_args.add(rule["arg"])
             kinds = ("bytes", "cstring", "bounded_cstring") if key == "consumes" else (
                 ("bytes",) if key == "write_bounds" else ("bytes", "cstring"))
             if rule.get("kind") not in kinds:

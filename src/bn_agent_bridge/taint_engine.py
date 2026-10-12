@@ -103,9 +103,20 @@ class _BufferRegion(NamedTuple):
 
 
 class _StringTermination(NamedTuple):
-    """Initialized through a NUL at/before end; nul is an exact known NUL."""
+    """Initialized through a NUL at/before end, plus exact NUL intervals.
+
+    Every half-open interval in nuls also has an initialized prefix from the
+    consumed start. Retain all of them: successive writes can remove different
+    parts of a zero fill without removing every usable terminator.
+    """
     end: int | None = None
-    nul: int | None = None
+    nuls: tuple[tuple[int, int], ...] = ()
+
+
+class _BufferProof(NamedTuple):
+    """One incoming path's byte/string alternatives, before an all-path join."""
+    initialized: bool = False
+    term: _StringTermination | None = None
 
 
 class _BufferSeed:
@@ -1981,9 +1992,9 @@ class TaintEngine:
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None, *,
                               region: _BufferRegion = _BufferRegion()) -> dict[str, Any]:
-        """Every writer of the local buffer *base_key* on the memory-SSA chain
-        ending at version *mv* (the version the sink READS), newest first,
-        plus whether that chain accounts for the buffer on EVERY path.
+        """Writers that may affect the consumed region of local *base_key* on
+        the memory-SSA chain ending at *mv* (the sink's input), newest first,
+        plus whether that chain accounts for the region on EVERY path.
 
         GOVERNING RULE (PR-928 review rounds 1-3): the walk never EXCLUDES a
         store, out-argument, pointer base or callee it cannot classify with
@@ -1994,6 +2005,9 @@ class TaintEngine:
         a dominating definition, a pointer that cannot hold this frame's stack
         address); anything else is a ``maybe`` writer the consumer turns into
         a blocking ``address_of_local_unresolved`` leaf.
+        Known zero effects and writes proven disjoint from the final consumed
+        bound are excluded from provenance, never from an intermediate NUL
+        bound that later writes might invalidate.
 
         The backward twin of the forward out-param handling: a slice that
         reaches ``p = &buf`` must continue through the bytes' producers, not
@@ -2044,10 +2058,12 @@ class TaintEngine:
         there; writing a requested I/O length is never such a guarantee.
         An append needs prior initialization. Unknown/indexed offsets,
         return-dependent writes and unannotated models prove no coverage.
-        A memory-phi is covered only when every arm is; a loop back-edge arm
-        is neutral (it adds no path that does not also leave through the
-        entry arm). ``truncated`` is True when the walk exhausted
-        ``MEM_CHAIN_BUDGET`` -- writers behind the cut are missing.
+        A memory-phi is covered only when every arm is. Bounded strings retain
+        the string-or-bytes alternative per arm, including across later writes.
+        Loop backedges are neutral, but cannot invent a terminator location;
+        byte initialization can independently establish a loop invariant.
+        ``truncated`` is True when the walk exhausted ``MEM_CHAIN_BUDGET`` --
+        writers behind the cut are missing.
 
         Deliberately does NOT stop at a full-cover writer: ``strcat`` after
         ``strcpy`` both write offset 0 and both feed the sink, and a may-analysis
@@ -2055,18 +2071,16 @@ class TaintEngine:
         anything either (mirrors ``_reaching_writer``)."""
         if region.kind in ("bytes", "bounded_cstring") and region.width == 0:
             return {"writers": [], "covered": True, "truncated": False}
-        if region.kind == "bounded_cstring":
-            string = self._local_buffer_writers(
-                ssaf, base_key, mv, base_size=base_size, region=region._replace(kind="cstring"))
-            byte_range = self._local_buffer_writers(
-                ssaf, base_key, mv, base_size=base_size, region=region._replace(kind="bytes"))
-            return {"writers": string["writers"],
-                    "covered": string["covered"] or byte_range["covered"],
-                    "truncated": string["truncated"] or byte_range["truncated"]}
+        strings = region.kind in ("cstring", "bounded_cstring")
+        bytes_ = region.kind in ("bytes", "bounded_cstring")
+        string_region = region._replace(kind="cstring")
+        byte_region = region._replace(kind="bytes")
         writers: list[tuple] = []     # oldest first while walking; reversed on return
-        # version -> (covered, escaped, termination) once walked; None while active
-        memo: dict[int, tuple[bool, bool, _StringTermination | None] | None] = {}
+        # Do not join alternatives before PHIs: each path may prove either
+        # initialization through NUL or the entire bounded byte demand.
+        memo: dict[int, tuple[frozenset[_BufferProof], bool] | None] = {}
         truncated = False
+        backedge = False
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
         escape_addrs: set[int] = set()
@@ -2095,7 +2109,7 @@ class TaintEngine:
             proof; its normal all-path and memory-chain limits still apply.
             """
             nonlocal truncated
-            if region.kind != "cstring" or region.offset is None or off is None:
+            if not strings or region.offset is None or off is None:
                 return False
             if off < region.offset:
                 return False
@@ -2107,30 +2121,51 @@ class TaintEngine:
             truncated |= prefix["truncated"]
             return prefix["covered"] and not prefix["truncated"]
 
-        def _preserves_string(off: int | None, width: int | None,
-                              term: _StringTermination | None) -> bool:
-            if region.kind != "cstring" or width == 0:
-                return True
+        def _after_write(off: int | None, width: int | None,
+                         term: _StringTermination | None) -> _StringTermination | None:
+            if term is None or width == 0:
+                return term
             if off is None or region.offset is None:
-                return False
+                return None
             if width is not None and off + width <= region.offset:
-                return True
-            if term is None:
-                return False
-            if term.end is not None and off > term.end:
-                return True
-            # A may-write cannot uninitialize the already initialized prefix.
-            # If it misses an exact NUL, the string still terminates there.
-            return term.nul is not None and (
-                off > term.nul or (width is not None and off + width <= term.nul))
+                return term
+            # Subtract the whole POSSIBLE write, not its requested count as
+            # initialized bytes. All untouched NULs keep their initialized prefix.
+            nuls: list[tuple[int, int]] = []
+            for lo, hi in term.nuls:
+                if lo < off:
+                    nuls.append((lo, min(hi, off)))
+                if width is not None and off + width < hi:
+                    nuls.append((max(lo, off + width), hi))
+            end = term.end if term.end is not None and off > term.end else None
+            if nuls:
+                end = min(end, nuls[0][0]) if end is not None else nuls[0][0]
+            return _StringTermination(end, tuple(nuls)) if end is not None else None
 
-        def _call_writer(defn: Any, escaped: bool, cov: bool,
-                         term: _StringTermination | None) -> tuple[bool, _StringTermination | None]:
-            """Record provenance and update initialization/termination proof.
+        def _merge_terms(left: _StringTermination | None,
+                         right: _StringTermination | None) -> _StringTermination | None:
+            if left is None:
+                return right
+            if right is None:
+                return left
+            ends = [e for e in (left.end, right.end) if e is not None]
+            intervals: list[tuple[int, int]] = []
+            for lo, hi in sorted((*left.nuls, *right.nuls)):
+                if intervals and lo <= intervals[-1][1]:
+                    intervals[-1] = (intervals[-1][0], max(hi, intervals[-1][1]))
+                else:
+                    intervals.append((lo, hi))
+            return _StringTermination(min(ends) if ends else None, tuple(intervals))
 
-            Byte initialization is monotone; string termination is not: a
-            later read/memcpy may overwrite the NUL a previous fill established.
-            """
+        def _write_width(model: dict, params: list[Any], idx: int) -> int | None:
+            widths = [self._extent_length(ssaf, params, r)
+                      for r in model.get("write_bounds") or [] if r["arg"] == idx]
+            # Each declared bound is a promise; their intersection is also one.
+            return min((w for w in widths if w is not None), default=None)
+
+        def _call_writer(defn: Any, escaped: bool,
+                         proofs: frozenset[_BufferProof]) -> frozenset[_BufferProof]:
+            """Record writers once; transform each incoming initialization fact."""
             params = self._call_params(defn)
             yes, maybe = _params_touching(params, escaped)
             name = self._callee_name(self._resolve_direct_target(defn))
@@ -2144,27 +2179,78 @@ class TaintEngine:
                 elif escaped:
                     why = "has no taint model and ran after the address of"
                 else:
-                    return cov, term
+                    return proofs
                 writers.append(("opaque", defn, callee, why))
-                return (cov if region.kind != "cstring" else False), None
+                return frozenset(_BufferProof(p.initialized) for p in proofs)
             if not yes and not maybe:
-                return cov, term
+                return proofs
             outs = self._model_out_arg_indices(model)
             if model_is_benign_marker(model):
-                # `{}` promises no taint flows through the call, nothing about
-                # whether it writes its pointer arguments (round 3: memset's
-                # kin were `{}` and read as "writes nothing"). Recorded, so the
-                # call is in the slice; it neither covers nor originates.
+                # A benign taint model is not a no-write promise.
                 writers.append(("benign", defn, callee))
-                return (cov if region.kind != "cstring" else False), None
-            if any(i in maybe for i in outs):
+                return frozenset(_BufferProof(p.initialized) for p in proofs)
+            if any(i in maybe and _write_width(model, params, i) != 0 for i in outs):
                 writers.append(("opaque", defn, callee,
                                 "writes through a pointer argument the walk cannot "
                                 "resolve (it may alias the escaped address of)"))
-                return (cov if region.kind != "cstring" else False), None
-            hit = [i for i in outs if i in yes]
+                return frozenset(_BufferProof(p.initialized) for p in proofs)
+            hit = [i for i in outs if i in yes and _write_width(model, params, i) != 0]
             if not hit:
-                return cov, term
+                return proofs
+            # Delay provenance selection until the FINAL consumed bound is known.
+            # A later write can move the first NUL past a currently disjoint write.
+            writers.append(("fill", defn, mkey or name, params, hit, model))
+            byte_covers = False
+            new_term = None
+            for rule in model.get("initializes") or []:
+                if rule["arg"] not in hit:
+                    continue
+                off = self._must_offset(ssaf, params[rule["arg"]], base_key)
+                width = self._extent_length(ssaf, params, rule)
+                zero = rule.get("zero") is True
+                vi = rule.get("value_arg")
+                if vi is not None and vi < len(params):
+                    zero = any(self._int_const(e) == 0 for e in self._def_chain(ssaf, params[vi]))
+                string = rule["kind"] == "cstring" and (
+                    "len_arg" not in rule or (width is not None and width > 0))
+                byte_width = width if rule["kind"] == "bytes" else None
+                byte_covers |= bytes_ and self._extent_covers(byte_region, off, byte_width)
+                if not strings:
+                    continue
+                rule_covers = self._extent_covers(
+                    string_region, off, byte_width, cstring=string, zero=zero)
+                if string or (zero and byte_width is not None and byte_width > 0):
+                    rule_covers |= _cstring_prefix(defn, off)
+                if rule_covers:
+                    end = off + width - 1 if off is not None and width is not None else None
+                    nuls = ()
+                    if zero and off is not None and width is not None and region.offset is not None:
+                        end = max(off, region.offset)
+                        nuls = ((end, off + width),)
+                    new_term = _merge_terms(new_term, _StringTermination(end, nuls))
+                ci = rule.get("copy_arg")
+                if (ci is not None and ci < len(params) and off is not None
+                        and region.offset is not None and width is not None):
+                    nul = self._literal_terminator(ssaf, params[ci])
+                    if (nul is not None and 0 <= nul < width and region.offset <= off + nul
+                            and (off <= region.offset or _cstring_prefix(defn, off))):
+                        new_term = _merge_terms(new_term, _StringTermination(
+                            off + nul, ((off + nul, off + nul + 1),)))
+            updated: set[_BufferProof] = set()
+            for proof in proofs:
+                term = proof.term
+                if model.get("preserves_cstring") is True:
+                    # Appends retain termination, not the old terminator's position.
+                    term = _StringTermination() if term is not None else None
+                else:
+                    for i in hit:
+                        term = _after_write(self._must_offset(ssaf, params[i], base_key),
+                                            _write_width(model, params, i), term)
+                updated.add(_BufferProof(proof.initialized or byte_covers, _merge_terms(term, new_term)))
+            return frozenset(updated)
+
+        def _fill_provenance(defn: Any, mkey: str, params: list[Any],
+                             hit: list[int], model: dict) -> tuple:
             from_idxs: list[int] = []
             for rule in model.get("propagates") or []:
                 if _try_arg_index(str(rule.get("to") or "")) in hit:
@@ -2191,128 +2277,83 @@ class TaintEngine:
             len_idxs += [r["len_arg"] for r in model.get("initializes") or []
                          if r["arg"] in hit and "len_arg" in r and r["len_arg"] not in len_idxs]
             len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
-            writers.append(("fill", defn, mkey or name, params, from_idxs, is_source, len_idxs))
-            covers = False
-            new_term = None
-            for rule in model.get("initializes") or []:
-                if rule["arg"] not in hit:
-                    continue
-                off = self._must_offset(ssaf, params[rule["arg"]], base_key)
-                width = self._extent_length(ssaf, params, rule)
-                zero = rule.get("zero") is True
-                vi = rule.get("value_arg")
-                if vi is not None and vi < len(params):
-                    zero = any(self._int_const(e) == 0 for e in self._def_chain(ssaf, params[vi]))
-                string = rule["kind"] == "cstring" and (
-                    "len_arg" not in rule or (width is not None and width > 0))
-                # A bounded C-string producer writes THROUGH its NUL, not
-                # necessarily every byte of its capacity argument.
-                byte_width = width if rule["kind"] == "bytes" else None
-                rule_covers = self._extent_covers(
-                    region, off, byte_width, cstring=string, zero=zero)
-                if string or (zero and byte_width is not None and byte_width > 0):
-                    rule_covers |= _cstring_prefix(defn, off)
-                if rule_covers and region.kind == "cstring":
-                    end = off + width - 1 if off is not None and width is not None else None
-                    new_term = _StringTermination(end, end if zero else None)
-                ci = rule.get("copy_arg")
-                if (region.kind == "cstring" and ci is not None and ci < len(params)
-                        and off is not None and region.offset is not None and width is not None):
-                    nul = self._literal_terminator(ssaf, params[ci])
-                    if (nul is not None and 0 <= nul < width and region.offset <= off + nul
-                            and (off <= region.offset or _cstring_prefix(defn, off))):
-                        rule_covers = True
-                        new_term = _StringTermination(off + nul, off + nul)
-                covers |= rule_covers
-            if covers:
-                return True, new_term
-            if model.get("preserves_cstring") is True:
-                # Appends retain termination, not the OLD terminator's position.
-                return cov, _StringTermination() if cov else None
-            preserves = all(any(
-                rule["arg"] == i and _preserves_string(
-                    self._must_offset(ssaf, params[i], base_key),
-                    self._extent_length(ssaf, params, rule), term)
-                for rule in model.get("write_bounds") or []) for i in hit)
-            return (cov if region.kind != "cstring" or preserves else False), term if preserves else None
+            return ("fill", defn, mkey, params, from_idxs, is_source, len_idxs)
 
-        def _store_effect(defn: Any, off: int | None, cov: bool,
-                          term: _StringTermination | None) -> tuple[bool, _StringTermination | None]:
+        def _store_width(defn: Any) -> int | None:
             width = getattr(defn, "size", None)
             if width is None and op_name(defn) == "MLIL_SET_VAR_ALIASED":
                 width = base_size
-            zero = self._int_const(getattr(defn, "src", None)) == 0
-            covers = self._extent_covers(region, off, width, zero=zero) or (
-                zero and width is not None and width > 0 and _cstring_prefix(defn, off))
-            if covers:
-                end = off + width - 1 if off is not None and width is not None else None
-                return True, _StringTermination(end, end) if zero else None
-            preserves = zero or _preserves_string(off, width, term)
-            return cov and preserves, term if preserves else None
+            return width
 
-        def rec(v: Any, depth: int) -> tuple[bool, bool, _StringTermination | None]:
-            """Coverage, escape state and termination certificate at epoch v."""
-            nonlocal truncated
+        def _store_effect(defn: Any, off: int | None,
+                          proofs: frozenset[_BufferProof]) -> frozenset[_BufferProof]:
+            width = _store_width(defn)
+            zero = self._int_const(getattr(defn, "src", None)) == 0
+            byte_covers = bytes_ and self._extent_covers(byte_region, off, width)
+            new_term = None
+            if strings and zero and width is not None and width > 0 and (
+                    self._extent_covers(string_region, off, width, zero=True)
+                    or _cstring_prefix(defn, off)):
+                lo = max(off, region.offset)
+                new_term = _StringTermination(lo, ((lo, off + width),))
+            return frozenset(_BufferProof(
+                p.initialized or byte_covers,
+                _merge_terms(p.term if zero else _after_write(off, width, p.term), new_term))
+                for p in proofs)
+
+        def rec(v: Any, depth: int) -> tuple[frozenset[_BufferProof], bool]:
+            """Per-path initialization alternatives and escape state at epoch v."""
+            nonlocal truncated, backedge
+            unknown = (frozenset({_BufferProof()}), False)
             try:
                 v = int(v)
             except (TypeError, ValueError):
-                return (False, False, None)
+                return unknown
             if v in memo:
                 m = memo[v]
-                # None: *v* is on the stack -- a loop back-edge. Neutral.
-                return m if m is not None else (True, False, None)
+                if m is not None:
+                    return m
+                backedge = True
+                # Neutral for coverage, but not an invented exact terminator
+                # that a loop-body write could use to survive its own clobber.
+                neutral = _BufferProof(not strings, _StringTermination() if strings else None)
+                return frozenset({neutral}), False
             if depth > MEM_CHAIN_BUDGET:
                 truncated = True
-                return (False, False, None)
+                return unknown
             memo[v] = None
             try:
                 defn = ssaf.get_ssa_memory_definition(v)
             except Exception:
                 defn = None
             if defn is None:
-                # The entry state (mem#0): nothing on this path wrote the buffer.
-                res = (False, False, None)
+                res = unknown
             elif "MEM_PHI" in op_name(defn):
                 arms = [rec(sv, depth + 1) for sv in self._mem_phi_sources(defn)]
-                covered = bool(arms) and all(c for c, _, _ in arms)
-                terms = [t for _, _, t in arms]
-                term = None
-                if covered and terms and all(t is not None for t in terms):
-                    end = max(t.end for t in terms) if all(t.end is not None for t in terms) else None
-                    nul = terms[0].nul if all(t.nul == terms[0].nul for t in terms) else None
-                    term = _StringTermination(end, nul)
-                res = (covered, any(e for _, e, _ in arms), term)
+                res = (frozenset(p for facts, _ in arms for p in facts),
+                       any(e for _, e in arms)) if arms else unknown
             else:
-                # Walk to the root FIRST so writers come out oldest-first and an
-                # escape is known before the calls that ran after it.
-                cov, esc, term = rec(self._mem_in(defn), depth + 1)
+                # Walk to the root first: escaped pointers affect later calls.
+                proofs, esc = rec(self._mem_in(defn), depth + 1)
                 op = op_name(defn)
                 if "STORE" in op or op in _NAMED_STORE_OPS:
                     slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == base_key:
-                        writers.append(("store", defn))
-                        cov, term = _store_effect(defn, slot[1], cov, term)
+                        writers.append(("store", defn, slot[1]))
+                        proofs = _store_effect(defn, slot[1], proofs)
                     elif "STORE" in op:
-                        # Not keyed to the buffer: the address may still be
-                        # built on it (a phi'd loop cursor, `[p + i]` with
-                        # `p = &buf`), or be a pointer the walk cannot pin.
                         a = _alias(getattr(defn, "dest", None), esc)
                         if a == "yes":
-                            writers.append(("store", defn))
                             off = self._must_offset(ssaf, getattr(defn, "dest", None), base_key)
-                            cov, term = _store_effect(defn, off, cov, term)
-                        elif a == "maybe":
-                            # Disclosed by its own blocking leaf; it covers
-                            # nothing -- it may write elsewhere.
+                            writers.append(("store", defn, off))
+                            proofs = _store_effect(defn, off, proofs)
+                        elif a == "maybe" and _store_width(defn) != 0:
                             writers.append(("maybe_store", defn,
                                             "stores through a pointer the walk cannot "
                                             "resolve, which may alias"))
+                            proofs = frozenset(_BufferProof(p.initialized) for p in proofs)
                     val = getattr(defn, "src", None)
-                    if _alias(val, esc) != "no":
-                        # From here every writer through the stashed pointer
-                        # is disclosed (a reload is a fill, an unmodeled call
-                        # is opaque). The escape itself writes no byte of the
-                        # buffer, so it covers no path (round 4 P2).
+                    if _store_width(defn) != 0 and _alias(val, esc) != "no":
                         writers.append(("escape", defn))
                         esc = True
                         if "STORE" in op:
@@ -2320,14 +2361,51 @@ class TaintEngine:
                             if c is not None:
                                 escape_addrs.add(int(c))
                 elif self._is_call(defn):
-                    cov, term = _call_writer(defn, esc, cov, term)
-                res = (cov, esc, term)
+                    proofs = _call_writer(defn, esc, proofs)
+                res = (proofs, esc)
             memo[v] = res
             return res
 
-        covered, _, _ = rec(mv, 0)
-        writers.reverse()
-        return {"writers": writers, "covered": covered, "truncated": truncated}
+        proofs, _ = rec(mv, 0)
+        covered = bool(proofs) and all(p.initialized or p.term is not None for p in proofs)
+        if backedge and region.kind == "bounded_cstring" and not covered:
+            # A clobbering loop cannot assume a stable string terminator. It
+            # can still preserve a definite BYTE invariant through its backedge.
+            byte_proof = self._local_buffer_writers(
+                ssaf, base_key, mv, base_size=base_size, region=byte_region)
+            covered = byte_proof["covered"]
+            truncated |= byte_proof["truncated"]
+
+        end = None
+        if bytes_ and region.offset is not None and region.width is not None:
+            end = region.offset + region.width
+        if strings and not truncated and proofs and all(
+                p.term is not None and p.term.end is not None for p in proofs):
+            string_end = max(p.term.end for p in proofs) + 1
+            end = min(end, string_end) if end is not None else string_end
+
+        def _disjoint(off: int | None, width: int | None) -> bool:
+            if width == 0:
+                return True
+            if off is None or width is None or region.offset is None:
+                return False
+            return off + width <= region.offset or (end is not None and off >= end)
+
+        selected: list[tuple] = []
+        for writer in reversed(writers):
+            if writer[0] == "store":
+                _, defn, off = writer
+                if not _disjoint(off, _store_width(defn)):
+                    selected.append(("store", defn))
+            elif writer[0] == "fill":
+                _, defn, mkey, params, hit, model = writer
+                hit = [i for i in hit if not _disjoint(
+                    self._must_offset(ssaf, params[i], base_key), _write_width(model, params, i))]
+                if hit:
+                    selected.append(_fill_provenance(defn, mkey, params, hit, model))
+            else:
+                selected.append(writer)
+        return {"writers": selected, "covered": covered, "truncated": truncated}
 
     def _field_base_is_alloc_or_param(self, ssaf: Any, func: Any, base_var: Any) -> bool:
         """True when *base_var* (the pointer a field load is based on) is itself
