@@ -920,14 +920,16 @@ def test_struct_assist_ignores_layout_alias_but_not_distinct_matching_struct():
 
 
 @pytest.mark.parametrize("other_layout", [False, True], ids=["sole-layout", "ambiguous"])
-def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(other_layout):
+def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(monkeypatch, other_layout):
+    _load_bridge(monkeypatch)
     class TypeClass(IntEnum):
         IntegerTypeClass = 2
         NamedTypeReferenceClass = 11
 
     def reference(name: str, width: int) -> _FakeType:
         alias = _FakeType(name, width=width, type_class=TypeClass.NamedTypeReferenceClass)
-        alias.target = lambda view: view.types.get(name)
+        alias.name = name
+        alias.type_id = ""
         return alias
 
     bv, fn, _, _ = _struct_assist_case()
@@ -951,6 +953,39 @@ def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(other_lay
         assert len(warnings) == 1
         for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
             assert witness in warnings[0]
+
+
+@pytest.mark.parametrize("case, expected_lookups, expected_hints", [
+    ("16-hops", 16, 1), ("17-hops", 16, 0), ("cycle", 2, 0),
+    ("unresolved", 1, 0), ("array-terminal", 1, 0),
+])
+def test_struct_assist_bounds_member_typedef_lookups(case, expected_lookups, expected_hints):
+    bv, fn, _, _ = _struct_assist_case()
+    scalar = bv.types["cfg"].members[0].type
+
+    def reference(index):
+        alias = _FakeType("word_t", width=8, type_class="NamedTypeReferenceClass")
+        alias.name = "word_t"
+        alias.type_id = f"ref-{index}"
+        return alias
+
+    lookups = []
+
+    def lookup(type_id):
+        lookups.append(type_id)
+        if case == "unresolved":
+            return None
+        if case == "array-terminal":
+            return _FakeType("char[8]", width=8, type_class="ArrayTypeClass")
+        index = int(type_id.rsplit("-", 1)[1])
+        if case == "cycle":
+            return reference((index + 1) % 2)
+        return scalar if index + 1 == int(case.split("-")[0]) else reference(index + 1)
+
+    bv.get_type_by_id = lookup
+    bv.types["cfg"].members[0].type = reference(0)
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == expected_hints
+    assert len(lookups) == expected_lookups
 
 
 @pytest.mark.parametrize("case", [

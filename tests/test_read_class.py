@@ -2588,6 +2588,7 @@ def _declared_bv(_also_in_type_table=None, **types_):
     catch the lens reading the wrong one."""
     bv = _make_registry_bv()
     bv.types = dict(types_, **(_also_in_type_table or {}))
+    bv.get_type_by_name = lambda name: bv.types.get(str(name))
     bv.user_type_container = _FakeTypeContainer(dict(types_))
     return bv
 
@@ -2996,22 +2997,10 @@ def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
     on the ALIAS's own kind would leave `class show Widget` answering only for
     the internal `_Widget`, so the kind test follows the chain -- and a chain
     that terminates at an enum is still refused."""
-    class _Alias:
-        type_class = 11         # NamedTypeReferenceClass
-
-        def __init__(self, target, width=0x10):
-            self._target = target
-            self.width = width
-
-        def target(self, bv):
-            return self._target
-
-        def __str__(self):
-            return "alias"
-
-    bv = _declared_bv(Widget=_Alias(_DeclaredType(name="_Widget")),
-                      Color=_Alias(_DeclaredKind("_Color", 5, "enum _Color")),
-                      Broken=_Alias(None))
+    bv = _declared_bv(
+        _also_in_type_table={"_Widget": _DeclaredType(name="_Widget"),
+                            "_Color": _DeclaredKind("_Color", 5, "enum _Color")},
+        Widget=_AliasTo("_Widget"), Color=_AliasTo("_Color"), Broken=_AliasTo(None))
     ctx = _declared_ctx(monkeypatch, bv)
 
     out = read_class._class_show(ctx, None, "Widget")
@@ -3087,13 +3076,10 @@ class _AliasTo:
     type_class = 11             # NamedTypeReferenceClass
     width = 0
 
-    def __init__(self, target, decl="typedef struct _W W", name=None):
-        self._target = target
+    def __init__(self, name, decl="typedef struct _W W"):
         self._decl = decl
-        self.name = name if name is not None else getattr(target, "name", None)
-
-    def target(self, bv):
-        return self._target
+        self.name = name
+        self.type_id = ""
 
     def __str__(self):
         return self._decl
@@ -3125,7 +3111,7 @@ def test_a_declared_alias_reports_the_STRUCTURE_it_resolves_to_675(monkeypatch):
     convention, not two."""
     body = _StructBody(width=0x30, members=[
         types.SimpleNamespace(offset=0, name="a", type="int32_t")])
-    bv = _declared_bv(W=_AliasTo(body))
+    bv = _declared_bv(_also_in_type_table={body.name: body}, W=_AliasTo(body.name))
     ctx = _declared_ctx(monkeypatch, bv)
 
     out = read_class._class_show(ctx, None, "W")
@@ -3146,7 +3132,7 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
     kind it NAMES.
 
     Measured on BN 6.1: a NAMESPACED anonymous typedef --
-    `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of None,
+    `namespace n { typedef struct { ... } Q; }` -- has an unresolved body,
     as does any alias whose body is defined without it, while the alias itself
     states `named_type_class = StructNamedTypeClass` and a width of its own.
     Refusing on an unresolvable target alone therefore dropped a common way a
@@ -3154,7 +3140,7 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
 
     So an unfollowable reference is admitted on the kind it NAMES, with the
     facts it does carry, and an enum alias in the identical shape is still
-    refused. The round-3 fixture could not see this: its `target()` resolved,
+    refused. The round-3 fixture could not see this: its target resolved,
     which made it more forgiving than BN."""
     unresolvable_struct = _AliasTo(None, decl="struct _T T")
     unresolvable_struct.width = 0x10
@@ -3227,21 +3213,21 @@ def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
 
     plain, pointed, arrayed = body("_T"), body("_P", 0x4), body("anonymous_0", 0x4)
     qualified, orphan, glib = body("n::_Q", 0x8), body("_T1", 0x8), body("_X", 0x8)
-    bv = _declared_bv(**{
+    bv = _declared_bv(_also_in_type_table={"NamedT1": body("NamedT1")}, **{
         # the plain declarator: alias -> the body BN named for it
-        "T": _AliasTo(plain, decl="struct _T T"), "_T": plain,
+        "T": _AliasTo("_T", decl="struct _T T"), "_T": plain,
         # a POINTER declarator: nothing resolvable reaches `_P`
         "P": _DeclaredKind("P", 6, "struct _P *", width=8), "_P": pointed,
         # an ARRAY declarator, under BN's own anonymous spelling
         "A": _DeclaredKind("A", 7, "struct anonymous_0 [4]", width=0x10),
         "anonymous_0": arrayed,
         # NAMESPACED: BN puts the underscore on the LEAF
-        "n::Q": _AliasTo(qualified, decl="struct n::_Q n::Q"), "n::_Q": qualified,
+        "n::Q": _AliasTo("n::_Q", decl="struct n::_Q n::Q"), "n::_Q": qualified,
         # an ORPHANED body: its alias was re-declared onto a named struct
-        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan,
+        "T1": _AliasTo("NamedT1", decl="struct NamedT1 T1"), "_T1": orphan,
         # the GLib/GTK idiom -- the user WROTE `_X`, and the heuristic could
         # never have known that
-        "_X": glib, "X": _AliasTo(glib, decl="struct _X X"),
+        "_X": glib, "X": _AliasTo("_X", decl="struct _X X"),
     })
     ctx = _declared_ctx(monkeypatch, bv)
 
