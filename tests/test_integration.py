@@ -3297,3 +3297,34 @@ class TestStructLayoutAssistance903:
         ambiguous = shared_bn.json("decompile", "handle")
         assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
         assert shared_bn.json("proto", "get", "handle") == before
+
+        # Crossing the resolver budget must never turn uncertainty into a
+        # unique direct-layout suggestion. The 16-hop layout is a witness on
+        # its own; longer chains can only block another layout's uniqueness.
+        for hops in (16, 17, 64):
+            shared_bn.json(
+                "py", "exec",
+                "bv.undefine_user_type('cfg')\n"
+                "bv.undefine_user_type('wrapped_cfg')\n"
+                "bv.update_analysis_and_wait()\n")
+            prefix = f"word_{hops}_"
+            declarations = f"typedef unsigned long long {prefix}0; " + "".join(
+                f"typedef {prefix}{index - 1} {prefix}{index}; "
+                for index in range(1, hops))
+            shared_bn.json(
+                "types", "declare",
+                declarations
+                + f"struct wrapped_cfg {{ char pad[40]; {prefix}{hops - 1} flags; "
+                + "unsigned int depth; };")
+            sole = shared_bn.json("decompile", "handle")
+            hints = [w for w in sole["warnings"] if "struct layout candidate" in w]
+            assert len(hints) == (1 if hops == 16 else 0), (hops, sole)
+            if hints:
+                assert "struct wrapped_cfg *" in hints[0]
+            shared_bn.json(
+                "types", "declare",
+                "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                hops, competing)
+            assert shared_bn.json("proto", "get", "handle") == before

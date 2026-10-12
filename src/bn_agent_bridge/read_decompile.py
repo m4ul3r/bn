@@ -363,20 +363,22 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     """Evidence-qualified known-layout assistance; never writes a type (#903).
 
     Match complete scalar members of concrete, non-inherited structs, resolving
-    member typedefs first. Whole-struct aliases do not add candidates (their
-    concrete declarations are already in bv.types). Matching two distinct
-    offsets is a minimum witness, not proof of identity.
+    member typedefs first. Unclassifiable members can block uniqueness but cannot
+    supply a witness. Whole-struct aliases do not add candidates (their concrete
+    declarations are already in bv.types). Matching two distinct offsets is a
+    minimum witness, not proof of identity.
     """
     accesses = _untyped_pointer_accesses(func)
     if not accesses:
         return []
-    layouts: list[tuple[str, dict[tuple[int, int], str]]] = []
+    layouts: list[tuple[str, dict[tuple[int, int], str | None]]] = []
     for name, type_obj in bv.types.items():
         if (_enum_name(type_obj.type_class) != "StructureTypeClass"
                 or _enum_name(type_obj.type) != "StructStructureType"
                 or type_obj.base_structures):
             continue
-        members: dict[tuple[int, int], str] = {}
+        # Named scalar = positive; None = uncertain; absent = incompatible.
+        members: dict[tuple[int, int], str | None] = {}
         end = 0
         for member in sorted(type_obj.members, key=lambda member: member.offset):
             offset, width = int(member.offset), int(member.type.width)
@@ -385,12 +387,14 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
             end = offset + width
             _, member_type, follow_error = read_types._follow_typedef(
                 bv, str(member.name), member.type)
-            if (follow_error is None and member.name and not getattr(member, "bit_width", 0)
-                    and _enum_name(member_type.type_class) in {
-                        "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
-                        "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
-                    }):
-                members[(offset, width)] = str(member.name)
+            if member.name and not getattr(member, "bit_width", 0):
+                if follow_error is not None:
+                    members[(offset, width)] = None
+                elif _enum_name(member_type.type_class) in {
+                    "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
+                    "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
+                }:
+                    members[(offset, width)] = str(member.name)
         else:
             if end <= int(type_obj.width):
                 layouts.append((str(name), members))
@@ -401,6 +405,8 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
         if len(matches) != 1:
             continue  # no witness or ambiguous: never choose a "best" struct
         name, members = matches[0]
+        if any(members[access] is None for access in observed):
+            continue  # the sole possible layout must still have positive witnesses
         evidence = ", ".join(
             f"+{offset:#x}/{width} bytes -> {members[(offset, width)]}"
             for offset, width in sorted(observed)

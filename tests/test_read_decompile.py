@@ -955,11 +955,17 @@ def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(monkeypat
             assert witness in warnings[0]
 
 
-@pytest.mark.parametrize("case, expected_lookups, expected_hints", [
-    ("16-hops", 16, 1), ("17-hops", 16, 0), ("cycle", 2, 0),
-    ("unresolved", 1, 0), ("array-terminal", 1, 0),
+@pytest.mark.parametrize("direct_layout", [False, True], ids=["sole-layout", "competitor"])
+@pytest.mark.parametrize("case, expected_lookups, sole_hints, competing_hints", [
+    ("16-hops", 16, 1, 0), ("17-hops", 16, 0, 0), ("64-hops", 16, 0, 0),
+    ("cycle", 2, 0, 0), ("unresolved", 1, 0, 0),
+    ("array-terminal", 1, 0, 1), ("nested-terminal", 1, 0, 1),
 ])
-def test_struct_assist_bounds_member_typedef_lookups(case, expected_lookups, expected_hints):
+def test_struct_assist_bounds_member_typedef_lookups(
+    monkeypatch, direct_layout, case, expected_lookups, sole_hints, competing_hints,
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
     bv, fn, _, _ = _struct_assist_case()
     scalar = bv.types["cfg"].members[0].type
 
@@ -977,15 +983,77 @@ def test_struct_assist_bounds_member_typedef_lookups(case, expected_lookups, exp
             return None
         if case == "array-terminal":
             return _FakeType("char[8]", width=8, type_class="ArrayTypeClass")
+        if case == "nested-terminal":
+            return _FakeType("struct inner", width=8, members=[
+                _FakeMember(0, "value", scalar)])
         index = int(type_id.rsplit("-", 1)[1])
         if case == "cycle":
             return reference((index + 1) % 2)
         return scalar if index + 1 == int(case.split("-")[0]) else reference(index + 1)
 
     bv.get_type_by_id = lookup
-    bv.types["cfg"].members[0].type = reference(0)
-    assert len(read_decompile._struct_layout_warnings(bv, fn)) == expected_hints
+    if not direct_layout:
+        bv.types.clear()
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = reference(0)
+    bv.types["wrapped_cfg"] = wrapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+
+    result = instance._decompile("active", "handle")
+
+    expected_hints = competing_hints if direct_layout else sole_hints
+    assert len(result["warnings"]) == expected_hints
+    if expected_hints:
+        candidate = "cfg" if direct_layout else "wrapped_cfg"
+        for witness in (f"struct {candidate} *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in result["warnings"][0]
     assert len(lookups) == expected_lookups
+
+
+@pytest.mark.parametrize("case", [
+    "wrong-offset", "wrong-width", "non-scalar-member", "bitfield",
+    "unobserved-opaque", "unrelated-opaque",
+])
+def test_decompile_struct_assist_opaque_members_do_not_hide_supported_layout(monkeypatch, case):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, _, _ = _struct_assist_case()
+    opaque = _FakeType("missing_t", width=8, type_class="NamedTypeReferenceClass")
+    opaque.name = "missing_t"
+    opaque.type_id = "missing-id"
+    bv.get_type_by_id = lambda type_id: None
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = opaque
+    if case == "wrong-offset":
+        # Even with one compatible-but-opaque access, another access rules out
+        # the competitor; uncertainty does not override proven incompatibility.
+        wrapped.members[1].offset = 0x34
+    elif case == "wrong-width":
+        wrapped.members[1].type.width = 2
+    elif case == "non-scalar-member":
+        wrapped.members[1].type = _FakeType(
+            "char[4]", width=4, type_class="ArrayTypeClass")
+    elif case == "bitfield":
+        wrapped.members[0].bit_width = 63
+    elif case == "unobserved-opaque":
+        bv.types["cfg"].members.insert(0, _FakeMember(0x20, "opaque", opaque))
+    elif case == "unrelated-opaque":
+        bv.types["missing_alias"] = opaque
+    if case not in {"unobserved-opaque", "unrelated-opaque"}:
+        bv.types["wrapped_cfg"] = wrapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+
+    result = instance._decompile("active", "handle")
+
+    assert len(result["warnings"]) == 1
+    for witness in ("struct cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+        assert witness in result["warnings"][0]
 
 
 @pytest.mark.parametrize("case", [
