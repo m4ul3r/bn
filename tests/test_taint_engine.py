@@ -9849,6 +9849,41 @@ def test_backward_cyclic_revisits_share_bounded_work_950(monkeypatch, reverse):
     assert aol and "walk budget" in aol[0]["detail"]
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("escape", [False, True])
+def test_backward_loop_carried_escape_revisits_earlier_opaque_call(reverse, escape):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    arms = (1, 4)
+    header = pg.phi(*(reversed(arms) if reverse else arms))
+    pg.call(_B_FILL_GLOBAL, [])
+    pg.store(_cstr(0x800), _addr_of(buf) if escape else _region_const(0))
+    sink = pg.sink(buf, folded=True)
+    sink.src_memory = header.dest_memory
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (not escape)
+    assert bool(aol) is escape
+    assert any("may be written by fill_global" in r for r in reasons) is escape
+
+
+def test_backward_loop_escape_retry_spends_shared_budget(monkeypatch):
+    # Each traversal fits on its own; their cumulative work does not.
+    monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", 24)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    header = pg.phi(1, 4)
+    pg.call(_B_FILL_GLOBAL, [])
+    pg.store(_cstr(0x800), _addr_of(buf))
+    sink = pg.sink(buf, folded=True)
+    sink.src_memory = header.dest_memory
+    result, _, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["memory_chain"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol and "walk budget" in aol[0]["detail"]
+
+
 def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
     # Astra P1 (budget): an opaque fill, hundreds of unrelated memory
     # definitions, then a one-byte constant store next to the sink -- the walk
@@ -11076,6 +11111,40 @@ def test_backward_scalar_local_load_does_not_certify_a_may_source_931():
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
     assert any(l.get("region") == {"offset": 0, "width": 1, "kind": "bytes"} for l in leaves)
+
+
+@pytest.mark.parametrize("with_caller", [False, True])
+def test_backward_indexed_local_load_retains_index_origin_and_caller(with_caller):
+    index = FVar("index", ident=21)
+    index0 = FSSA(index, 0)
+    buf, value = FVar("buf", typ="char[64]"), FSSA(FVar("value"), 1)
+    pg = _BufProgram(name="run", params=[index])
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(7), _region_const(64)])
+    iv = FExpr("MLIL_VAR_SSA", "index#0", reads=[index0])
+    pointer = FExpr("MLIL_ADD", "&buf + index#0", reads=[index0],
+                    left=_addr_of(buf), right=iv)
+    load = FExpr("MLIL_LOAD_SSA", "buf[index]", reads=[index0],
+                 src=pointer, src_memory=pg.mem)
+    load.size = 1
+    _set(pg, value, "value = buf[index]", load)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    callee = pg.func()
+    if with_caller:
+        outer = FVar("outer", ident=22)
+        outer0 = FSSA(outer, 0)
+        caller = _BufProgram(name="main", params=[outer])
+        caller._addr = 0x100
+        site = caller.call(_B_RUN, [FExpr("MLIL_VAR_SSA", "outer#0", reads=[outer0])],
+                           reads=[outer0])
+        callee.caller_sites = [FSite(caller.func(), site.address)]
+    result, _, aol = _bw(callee, sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol and aol[0]["region"]["offset"] is None
+    sl = result["slices"][0]
+    assert sl["origin"]["kind"] == "parameter"
+    assert sl["origin"]["var"] == ("outer#0" if with_caller else "index#0")
+    assert sl.get("crossed_functions", []) == (["run"] if with_caller else [])
 
 
 @pytest.mark.parametrize("offset,complete", [(0, True), (32, False)])

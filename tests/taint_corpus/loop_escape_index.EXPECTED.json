@@ -1,0 +1,15 @@
+{
+  "description": "Loop-carried escape makes an earlier unmodeled helper opaque; indexed scalar LOAD keeps the index parameter and caller ascent without certifying unknown-offset coverage. Analyze only.",
+  "lang": "c",
+  "backward": [
+    {"function": "escape_loop", "sink": "arg:popen:0",
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "leaf_details_contain": ["helper"],
+     "complete_slice": false},
+    {"function": "idx_pick", "sink": "arg:malloc:0",
+     "origin_kinds": ["parameter"],
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "expect_crossed": "idx_pick",
+     "complete_slice": false}
+  ]
+}

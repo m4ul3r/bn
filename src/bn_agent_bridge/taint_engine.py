@@ -2107,6 +2107,8 @@ class TaintEngine:
         budget = _budget if _budget is not None else _MemoryChainBudget()
         backedge = False
         cycle_reads = 0
+        escape_seen = False
+        backedge_escaped = False
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
         escape_addrs: set[int] = set()
@@ -2346,7 +2348,7 @@ class TaintEngine:
 
         def rec(v: Any, depth: int) -> tuple[frozenset[_BufferProof], bool]:
             """Per-path initialization alternatives and escape state at epoch v."""
-            nonlocal truncated, backedge, cycle_reads
+            nonlocal truncated, backedge, cycle_reads, escape_seen
             budget.take()
             try:
                 v = int(v)
@@ -2361,7 +2363,7 @@ class TaintEngine:
                 # Neutral for coverage, but not an invented exact terminator
                 # that a loop-body write could use to survive its own clobber.
                 neutral = _proof(not strings, _StringTermination() if strings else None)
-                return frozenset({neutral}), False
+                return frozenset({neutral}), backedge_escaped
             if depth > MEM_CHAIN_BUDGET:
                 raise _MemoryChainExhausted
             memo[v] = None
@@ -2408,6 +2410,7 @@ class TaintEngine:
                     if _store_width(defn) != 0 and _alias(val, esc) != "no":
                         writers.append(("escape", defn))
                         esc = True
+                        escape_seen = True
                         if "STORE" in op:
                             c = self._const_ptr_addr(ssaf, getattr(defn, "dest", None))
                             if c is not None:
@@ -2427,7 +2430,20 @@ class TaintEngine:
 
         try:
             unknown = (frozenset({_proof()}), False)
-            proofs, _ = rec(mv, 0)
+            while True:
+                escape_count = len(escape_addrs)
+                proofs, _ = rec(mv, 0)
+                if not backedge or not escape_seen:
+                    break
+                if backedge_escaped and len(escape_addrs) == escape_count:
+                    break
+                # The first traversal discovers escapes at the loop bottom.
+                # Revisit earlier calls with a may-escaped backedge and all
+                # discovered stash addresses; never finalize the clean-first-
+                # iteration assumption for later iterations. New aliases can
+                # discover more stashes, so retry until stable within budget.
+                backedge_escaped = True
+                memo.clear()
             covered = bool(proofs) and all(p.initialized or p.term is not None for p in proofs)
             if backedge and region.kind == "bounded_cstring" and not covered:
                 # A clobbering loop cannot assume a stable string terminator. It
@@ -6990,6 +7006,8 @@ class TaintEngine:
                     _walk_local_buffer(
                         defn, local, d, getattr(src_expr, "src_memory", None),
                         self._local_region(ssaf, pointer, local, demand))
+                    for r in expr_reads(pointer):
+                        walk(r, d + 1, mv)
                     return
                 la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
                 if la is not None:

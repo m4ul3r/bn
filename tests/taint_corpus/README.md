@@ -41,6 +41,7 @@ brittle across compilers/optimisation.
 | `bw_regions.c`        | #931/#933: zero/short/full-request reads, suffix/indexed rows and append-only buffers remain incomplete; initialized struct-member strings and exact byte ranges are covered without requiring unrelated fields. `bw_regions_o1.c` / `bw_regions_o2.c` rebuild at -O1/-O2 |
 | `strtok_fixpoint.c`   | #932: two-entry/two-back-edge tokenizer CFG with two unused-return initializers; the NULL continuation reaches `system` even when IL enumerates it first. O0/O1/O2 variants share the source |
 | `loop_exit.c`        | #950: exact synthetic -O1 loop with filled/unwritten exits in both source orders; cyclic memory-PHI memoization must retain an unresolved entry path |
+| `loop_escape_index.c` | loop-bottom address escape makes the next iteration's earlier helper an opaque writer; indexed scalar LOAD preserves parameter origin and caller ascent at O0. `loop_escape_index_o1.c` checks the escape at O1 |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -80,6 +81,14 @@ memory-SSA tests for both exit-arm orders, `memset`/`strcpy` writers, initialize
 entry controls, and shared-budget exhaustion. Cyclic results that consulted a
 neutral backedge are not cached for other exit arms; revisits remain bounded
 by the same proof allowance. This does not claim arbitrary loop induction.
+
+`loop_escape_index` retains the review's invented probe source. Analyze it
+only; its helper can copy an unbounded environment string. The O0 index case
+checks parameter origin and ascent without certifying unknown-offset bytes.
+At O1 the compiler can fold the LOAD away, so that variant checks only the
+loop-carried escape. Deterministic memory-SSA controls cover both PHI orders,
+unescaped initialized loops with unrelated unmodeled calls, and shared-budget
+exhaustion on escape-state revisits.
 
 ## `EXPECTED.json` schema
 
