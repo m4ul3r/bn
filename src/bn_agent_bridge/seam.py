@@ -1530,19 +1530,55 @@ class BridgeContext:
         return cls if kind == "typeinfo" else None
 
     def _global_vtable_stores(self, bv, record):
-        """Global data symbols whose stored value is this class's vtable addr."""
+        """Global data refs to the vtable's proven address point, else its symbol."""
         vt = record.get("vtable")
         if not vt:
             return []
         addr = int(vt["address"], 16)
+        # Enrichment decodes the layout before instance recovery. A layout that
+        # passed the Itanium header gate has its vptr address point at slot zero,
+        # not at the public object head (#935). Reuse that decision, including
+        # capped/unreadable slot scans; neither an undecoded registry entry nor
+        # no_local_vtable_body proves that two header words may be skipped.
+        if "truncated_reason" in vt and vt["truncated_reason"] != "no_local_vtable_body":
+            addr += 2 * self._pointer_size(bv)
         out = []
         getter = getattr(bv, "get_data_refs", None)
+        # ABI entries are not instances, but only a proven object width owns
+        # their interior. Consecutive vptrs (even before the next symbol) cannot
+        # distinguish an untyped VTT from an unnamed neighboring object.
+        abi_ranges = []
+        unknown_abi_extent = False
+        data_var_at = getattr(bv, "get_data_var_at", None)
+        ptr = self._pointer_size(bv)
+        for symbol in bv.get_symbols():
+            raw = str(getattr(symbol, "raw_name", "") or "")
+            short = str(getattr(symbol, "short_name", "") or "")
+            if not (raw.startswith(("_ZTT", "_ZTC"))
+                    or short.startswith(("VTT for ", "construction vtable for "))):
+                continue
+            start = int(symbol.address)
+            var = data_var_at(start) if callable(data_var_at) else None
+            width = int(getattr(getattr(var, "type", None), "width", 0) or 0)
+            end = start + max(width, ptr)
+            if not width:
+                unknown_abi_extent = True
+            abi_ranges.append((start, end))
         for ref in (getter(addr) if callable(getter) else []):
+            if any(start <= int(ref) < end for start, end in abi_ranges):
+                continue
             sym = bv.get_symbol_at(int(ref)) if hasattr(bv, "get_symbol_at") else None
             out.append({
                 "symbol": str(getattr(sym, "short_name", "") or getattr(sym, "name", "")) if sym else None,
                 "address": hex(int(ref)),
             })
+        if out and unknown_abi_extent:
+            note = ("stored-global references may include entries of untyped VTT or "
+                    "construction-table objects; their extent is unknown, so totals "
+                    "count references, not proven instances")
+            notes = record.setdefault("notes", [])
+            if note not in notes:
+                notes.append(note)
         return out
 
     def _ctor_construction_sites(self, bv, record, *, cap=None):

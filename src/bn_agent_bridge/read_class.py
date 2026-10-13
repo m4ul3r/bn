@@ -215,6 +215,40 @@ def _sym_entry(sym) -> dict[str, Any] | None:
     }
 
 
+def _vtable_symbol_entry(ctx, bv, sym, class_name: str) -> dict[str, Any] | None:
+    """Normalize BN's stripped primary-vtable symbol from slot array to head.
+
+    A readable zero offset-to-top and same-class typeinfo pair is necessary,
+    but construction tables share that header. Require a fully resolved,
+    nonvirtual RTTI ancestry before adjusting an address point. Keep an already
+    decodable object head and never move the BN symbol itself.
+    """
+    entry = _sym_entry(sym)
+    if entry is None or ctx is None or _is_alias_symbol(sym):
+        return entry
+    ptr = ctx._pointer_size(bv)
+    address = int(sym.address)
+    head = address - 2 * ptr
+    if head < 0 or address % ptr:
+        return entry
+    # A symbol at an object head already satisfies the layout reader's gate.
+    ti = ctx._read_pointer_value(bv, address + ptr, size=ptr)
+    if ti and ctx._typeinfo_name_at(bv, ti) is not None:
+        return entry
+    if ctx._read_pointer_value(bv, head, size=ptr) != 0:
+        return entry
+    ti = ctx._read_pointer_value(bv, head + ptr, size=ptr)
+    if not ti or ctx._typeinfo_name_at(bv, ti) != class_name:
+        return entry
+    if any(_typeinfo_is_import_slot(ctx, bv, addr)
+           for addr in (address, head, head + ptr, ti)):
+        return entry
+    if not _has_nonvirtual_rtti_ancestry(ctx, bv, ti, ptr):
+        return entry
+    entry["address"] = hex(head)
+    return entry
+
+
 # #622 criterion (d) -- "class list / class show reuse a per-view registry (or
 # cheaper show path) rather than demangling every function on every call" -- is
 # DELIVERED by the per-view registry memo below, and the memo that follows it
@@ -288,11 +322,11 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
     added by ``_class_show`` only for the requested class (too costly for every
     class).
 
-    This is the memoised half: it reads only ``bv`` (``ctx`` is used for the
-    stateless word read that links a vtable to its typeinfo, see
-    :func:`_merge_spelling_variants`), so it is cached per view on the view's
-    generation counter by :func:`_build_class_registry`. Callers must never
-    mutate what it returns -- they get their own copy."""
+    This is the memoised half: it reads only ``bv`` (``ctx`` supplies the
+    stateless header reads that normalize a slot-array symbol and link a
+    vtable to its typeinfo), so it is cached per view on the view's generation
+    counter by :func:`_build_class_registry`. Callers must never mutate what
+    it returns -- they get their own copy."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
 
@@ -331,7 +365,7 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
 
     for cls, rec in registry.items():
         syms = rtti.get(cls, {})
-        rec["vtable"] = _sym_entry(syms.get("vtable"))
+        rec["vtable"] = _vtable_symbol_entry(ctx, bv, syms.get("vtable"), cls)
         rec["typeinfo"] = _sym_entry(syms.get("typeinfo"))
         rec["typeinfo_name"] = _sym_entry(syms.get("typeinfo_name"))
         if syms.get("vtable") or syms.get("typeinfo") or syms.get("typeinfo_name"):
@@ -456,8 +490,8 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     generation counter and invalidated by BN's own symbol/function notifications
     -- a rename changes which classes exist, so the registry is rebuilt after any
     such change, and a view with no notification surface is never cached (every
-    call rescans, exactly as before). ``ctx`` reaches the scan only for the
-    stateless vtable-header read that merges a class's spelling variants (#922).
+    call rescans, exactly as before). ``ctx`` supplies stateless vtable-header
+    reads for slot-array normalization and class spelling variants.
 
     Records are copied on the way out because the callers WRITE to them:
     ``_class_list`` sets ``rec["bases"]`` for its page rows and ``_class_show``
@@ -1674,6 +1708,59 @@ def _bases_for_record(ctx, bv, rec: dict[str, Any]) -> list[dict[str, Any]]:
     return _rtti_bases(ctx, bv, typeinfo_addr)
 
 
+def _has_nonvirtual_rtti_ancestry(ctx, bv, typeinfo_addr: int, ptr: int) -> bool:
+    """Prove construction tables impossible; unknown ancestry is not proof.
+
+    Structural base inference drops unresolved entries, so use the ABI selector
+    and require every declared entry to be readable before reusing _rtti_bases.
+    """
+    pending = [typeinfo_addr]
+    seen: set[int] = set()
+    while pending:
+        addr = pending.pop()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        if (_typeinfo_is_import_slot(ctx, bv, addr)
+                or ctx._typeinfo_name_at(bv, addr) is None):
+            return False
+        vptr = ctx._read_pointer_value(bv, addr, size=ptr)
+        kind = None
+        if vptr:
+            # The ABI vptr is two words past the selector's object head.
+            # An unrelated adjacent extern can occupy the exact vptr address.
+            for candidate in (vptr - 2 * ptr, vptr):
+                sym = bv.get_symbol_at(candidate)
+                name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "")
+                for abi, layout in (("__class_type_info", "base"),
+                                    ("__si_class_type_info", "si"),
+                                    ("__vmi_class_type_info", "vmi")):
+                    if "__cxxabiv1" in name and abi in name:
+                        kind = layout
+                        break
+                if kind:
+                    break
+        if kind is None:
+            return False
+        after_name = addr + 2 * ptr
+        if kind == "si":
+            if not ctx._read_pointer_value(bv, after_name, size=ptr):
+                return False
+        elif kind == "vmi":
+            count = ctx._read_u32(bv, after_name + 4)
+            if count is None or not 0 < count <= 64:
+                return False
+            for index in range(count):
+                base = after_name + 8 + index * 2 * ptr
+                flags = ctx._read_pointer_value(bv, base + ptr, size=ptr)
+                if (not ctx._read_pointer_value(bv, base, size=ptr)
+                        or flags is None or flags & 1):
+                    return False
+        bases = _rtti_bases(ctx, bv, addr, kind_hint=kind)
+        pending.extend(int(base["address"], 16) for base in bases)
+    return True
+
+
 def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) -> list[dict[str, Any]]:
     """Base classes from an Itanium ``_ZTI`` object. ``kind_hint`` selects the
     layout: 'base' (no bases), 'si' (single), 'vmi' (multiple). When absent,
@@ -1773,8 +1860,9 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
-    """Best-effort: where objects of this class are constructed and which
-    globals hold one. Empty (not an error) when nothing is found.
+    """Best-effort constructor sites and global address-point references.
+    Untyped ABI containers can leave ambiguous references (disclosed in notes);
+    stored-global totals count references, not proven object instances.
 
     ``cap`` bounds each LISTING only (#822: the same shape as the vtable cap),
     so the result also reports what the cap hid: ``*_total`` is the exact number

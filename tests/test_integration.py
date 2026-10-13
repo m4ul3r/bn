@@ -28,6 +28,7 @@ DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
+CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3378,6 +3379,228 @@ class TestClassLensRttiGuards922:
         counted = json.loads(shared_bn.run(
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
+
+    def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
+        # Both builds use the same source/options except -s. Compare raw slot
+        # words within each view; across views only proven external symbols use
+        # their identity, since BN assigns their synthetic addresses per view.
+        expected_totals = {
+            "svc::Codec": 5, "svc::HexCodec": 5, "svc::Handler": 4,
+            "svc::EchoHandler": 4, "svc::AuditHandler": 5, "svc::Pipe": 4,
+        }
+        snapshots = []
+        for binary in (CLASSES_BINARY, CLASSES_STRIPPED_BINARY):
+            target = shared_bn.load(binary)
+            cards = {name: shared_bn.json("class", "show", name, "-t", target)
+                     for name in expected_totals}
+            tables = {
+                name: [(int(vt["address"], 16), len(vt["slots"]))
+                       for vt in [card["vtable"], *card.get("secondary_vtables", [])]]
+                for name, card in cards.items()
+            }
+            raw = shared_bn.json(
+                "py", "exec",
+                "import binaryninja as bn\n"
+                "ptr = bv.address_size\n"
+                f"tables = {tables!r}\n"
+                "result = {\n"
+                "    'ptr': ptr,\n"
+                "    'externals': {hex(s.address): {'raw_name': s.raw_name,\n"
+                "        'namespace': str(s.namespace)}\n"
+                "        for s in bv.get_symbols_of_type(bn.SymbolType.ExternalSymbol)},\n"
+                "    'codec_symbols': [hex(s.address) for s in bv.get_symbols()\n"
+                "        if s.short_name in ('vtable for svc::Codec',\n"
+                "                            '_vtable_for_svc::Codec', 'vtable_for_svc::Codec')],\n"
+                "    'tables': {name: [{\n"
+                "        'head': hex(head),\n"
+                "        'offset_to_top': bv.read_int(head, ptr),\n"
+                "        'typeinfo': hex(bv.read_int(head + ptr, ptr, False)),\n"
+                "        'slots': [hex(bv.read_int(head + (2 + i) * ptr, ptr, False))\n"
+                "                  for i in range(count)],\n"
+                "    } for head, count in entries] for name, entries in tables.items()},\n"
+                "}\n",
+                "-t", target,
+            )["result"]
+            for name, card in cards.items():
+                vt = card["vtable"]
+                assert vt["total"] == expected_totals[name], card
+                assert vt["scan_truncated"] is False, vt
+                for layout, words in zip(
+                    [vt, *card.get("secondary_vtables", [])], raw["tables"][name], strict=True,
+                ):
+                    assert words["typeinfo"] == card["typeinfo"]["address"]
+                    assert [s["address"] for s in layout["slots"]] == words["slots"]
+                assert raw["tables"][name][0]["offset_to_top"] == 0
+                if name != "svc::Pipe":
+                    assert "secondary_vtables" not in card, card
+            codec = cards["svc::Codec"]["vtable"]
+            assert [s.get("null", False) for s in codec["slots"]] == [
+                False, True, True, False, False]
+            assert codec["slots"][3]["pure_virtual"] is True
+            assert "typeinfo_backwalk" not in codec
+            # The supplied stripped repro puts this symbol on the FIRST SLOT;
+            # the class card must still name the preceding object head.
+            symbol_address = int(codec["address"], 16)
+            if binary == CLASSES_STRIPPED_BINARY:
+                symbol_address += 2 * raw["ptr"]
+            assert hex(symbol_address) in raw["codec_symbols"], raw
+            (secondary,) = cards["svc::Pipe"]["secondary_vtables"]
+            assert secondary["offset_to_top"] == -8
+            assert secondary["typeinfo_backwalk"] is True
+            assert secondary["confidence"] == "rtti"
+            assert secondary["confidence_reason"] in ("thunk_slots", "bn_vtable_group")
+            assert raw["tables"]["svc::Pipe"][1]["offset_to_top"] == -8
+            imported = shared_bn.json("class", "show", "std::runtime_error", "-t", target)
+            assert imported["typeinfo"]["import_slot"] is True
+            assert imported["bases"] == [] and imported["vtable"] is None
+            assert "secondary_vtables" not in imported
+            for name, pure_index in (("svc::Codec", 3), ("svc::Handler", 2)):
+                address = raw["tables"][name][0]["slots"][pure_index]
+                assert raw["externals"][address]["raw_name"] == "__cxa_pure_virtual"
+            snapshots.append({
+                name: [{**words, "slots": [
+                    raw["externals"].get(address, address) for address in words["slots"]
+                ]} for words in entries]
+                for name, entries in raw["tables"].items()
+            })
+        assert snapshots[0] == snapshots[1]
+
+    @pytest.mark.parametrize("stripped", [False, True])
+    def test_virtual_base_construction_tables_are_not_promoted_945(self, shared_bn, tmp_path, stripped):
+        source = tmp_path / "construction.cpp"
+        source.write_text("""
+struct V { long v = 1; virtual ~V() {} virtual int vf() { return 1; } };
+struct B : virtual V {
+    long b = 2; virtual int bf() { return 2; } int vf() override { return 3; }
+};
+struct C : virtual V { long c = 3; virtual int cf() { return 4; } };
+struct D : B, C {
+    long d = 4; int bf() override { return 5; } int cf() override { return 6; }
+};
+int main(int argc, char **) {
+    D d; B b; B *p = argc > 1 ? static_cast<B *>(&d) : &b;
+    return p->bf();
+}
+""")
+        binary = tmp_path / "construction"
+        build = subprocess.run(
+            ["c++", "-O0", "-fno-stack-protector", *(["-s"] if stripped else []),
+             "-o", str(binary), str(source)], capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        # Check the actual native shape, not a fake population: B has both
+        # complete and construction address points; C is only constructed in D.
+        candidates = shared_bn.json(
+            "py", "exec",
+            "result = {name: [hex(s.address) for s in bv.get_symbols()\n"
+            "    if s.short_name in ('vtable for ' + name, '_vtable_for_' + name)\n"
+            "    and bv.read_int(s.address - 2 * bv.address_size, bv.address_size) == 0]\n"
+            "    for name in ('B', 'C')}\n",
+            "-t", target,
+        )["result"]
+        assert len(candidates["B"]) >= 2, candidates
+        assert len(candidates["C"]) == 1, candidates
+        for name in ("B", "C"):
+            card = shared_bn.json("class", "show", name, "-t", target)
+            assert card["vtable"]["address"] in candidates[name], card
+            assert card["vtable"]["slots"] == [], card
+            assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card
+
+    def test_typeinfo_backwalk_excludes_only_proven_vtt_extent_945(self, shared_bn, tmp_path):
+        source = tmp_path / "vtt.cpp"
+        source.write_text("""
+struct V { virtual int v() { return 1; } };
+struct B : virtual V { virtual int b() { return 2; } };
+B global_b;
+int main() { return global_b.b(); }
+""")
+        binary = tmp_path / "vtt"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(source)],
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        result = shared_bn.json(
+            "py", "exec",
+            "from bn_agent_bridge import read_class, seam\n"
+            "ctx = seam.BridgeContext(None)\n"
+            "record = read_class._build_class_registry(ctx, bv)['B']\n"
+            "record['vtable'] = None\n"
+            "card = read_class._enrich(ctx, bv, record)\n"
+            "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
+            "var = bv.get_data_var_at(vtt.address)\n"
+            "point = int(card['vtable']['address'], 16) + 2 * bv.address_size\n"
+            "import binaryninja as bn\n"
+            "bv.define_user_data_var(vtt.address, bn.Type.array(\n"
+            "    bn.Type.pointer(bv.arch, bn.Type.void()), 2))\n"
+            "typed_record = read_class._build_class_registry(ctx, bv)['B']\n"
+            "typed_record['vtable'] = None\n"
+            "typed = read_class._enrich(ctx, bv, typed_record)\n"
+            "result = {'card': card, 'typed': typed, 'vtt': hex(vtt.address),\n"
+            "    'width': var.type.width if var else None,\n"
+            "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
+            "-t", target,
+        )["result"]
+        assert result["card"]["vtable"]["typeinfo_backwalk"] is True, result
+        assert result["card"]["vtable"]["slots"], result
+        assert result["vtt"] in result["refs"], result
+        assert result["width"] is None, result
+        assert [ref["address"] for ref in result["card"]["instances"]["stored_globals"]] == [
+            ref for ref in result["refs"] if ref != result["vtt"]]
+        assert any("extent is unknown" in note for note in result["card"]["notes"])
+        assert result["typed"]["instances"]["stored_globals"] == [], result
+
+    def test_untyped_vtt_preserves_native_unnamed_neighbor_945(self, shared_bn, tmp_path):
+        source = tmp_path / "boundary.cpp"
+        source.write_text("""
+struct V { virtual int v() { return 1; } };
+struct B : virtual V { virtual int b() { return 2; } };
+B global_b;
+struct R { long x = 42; virtual int r() { return 3; } };
+R global_r;
+int main() { return global_b.b() + global_r.r(); }
+""")
+        layout = tmp_path / "boundary.ld"
+        layout.write_text(
+            "SECTIONS { .boundary : { *(.data.rel.ro.local._ZTT1B) "
+            "*(.data.rel.local.global_r) } } INSERT BEFORE .data;\n")
+        named = tmp_path / "boundary"
+        unnamed = tmp_path / "boundary-unnamed"
+        build = subprocess.run(
+            ["c++", "-O0", "-fdata-sections", f"-Wl,-T,{layout}",
+             "-o", str(named), str(source)], capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        stripped = subprocess.run(
+            ["objcopy", "--strip-symbol=global_r", str(named), str(unnamed)],
+            capture_output=True, text=True,
+        )
+        assert stripped.returncode == 0, stripped.stderr
+        cards = []
+        for binary in (named, unnamed):
+            target = shared_bn.load(binary)
+            card = shared_bn.json("class", "show", "R", "-t", target)
+            cards.append(card)
+            raw = shared_bn.json(
+                "py", "exec",
+                "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
+                "point = bv.read_int(vtt.address + 2*bv.address_size, bv.address_size, False)\n"
+                "var = bv.get_data_var_at(vtt.address)\n"
+                "result = {'neighbor': hex(vtt.address + 2*bv.address_size),\n"
+                "    'width': var.type.width if var else None,\n"
+                "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
+                "-t", target,
+            )["result"]
+            assert raw["width"] is None, raw
+            assert raw["neighbor"] in raw["refs"], raw
+            assert card["instances"]["stored_globals_total"] == 1, card
+            assert card["instances"]["stored_globals"][0]["address"] == raw["neighbor"], card
+            assert any("extent is unknown" in note for note in card["notes"])
+        assert cards[0]["vtable"] == cards[1]["vtable"]
+        assert cards[0]["instances"]["stored_globals"][0]["symbol"] == "global_r"
+        assert cards[1]["instances"]["stored_globals"][0]["symbol"] is None
 
 
 class TestStructLayoutAssistance903:

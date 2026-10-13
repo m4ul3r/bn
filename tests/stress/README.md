@@ -24,6 +24,14 @@ make -C tests/fixtures clean
 | `parser_x86_64`        | a length-prefixed record parser (source→sink)   |
 | `dispatch_table_x86_64`| a const function-pointer dispatch table (indirect source→sink) |
 | `classes_x86_64`       | a C++ PIE: single-inheritance vtables, an exception subclass of an imported class, a template class, an abstract class with zeroed destructor slots, one multiple-inheritance class (class lens, #922) |
+| `classes_stripped_x86_64` | the same C++ PIE built with `-s`: synthesized slot-array vtable symbols must recover the same object heads and slot contents without phantom secondaries (#935) |
+| `canary_x86_64`        | a stack-protected buffer: frame-map canary evidence and slot-to-canary distances |
+
+The paired class-lens regression checks slot addresses against each view's raw
+words. Across the symbolized/stripped views, local and null slots, object heads,
+and RTTI headers remain exact; only slots proven by BN to point to an
+`ExternalSymbol` compare by raw symbol name and namespace instead of BN's
+per-view synthesized address (for example, `__cxa_pure_virtual`).
 
 ## Multi-instance stress test
 
