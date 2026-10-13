@@ -3378,3 +3378,251 @@ class TestClassLensRttiGuards922:
         counted = json.loads(shared_bn.run(
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
+
+
+class TestStructLayoutAssistance903:
+    """Known-layout disclosure on the same real typed/untyped function."""
+
+    _SOURCE = """
+        #include <stdint.h>
+        struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };
+        __attribute__((noinline)) uint64_t handle(void *c) {
+            return *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+        }
+        __attribute__((noipa)) void sink(void) { __asm__ volatile(""); }
+        /* The call keeps c in a callee-saved copy that reaches past cfg. */
+        __attribute__((noinline)) uint64_t handle_alias(void *c) {
+            uint64_t sum = *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+            sink();
+            return sum + *(uint32_t *)((char *)c + 0x80);
+        }
+        int main(void) {
+            struct cfg c[3] = { { .flags = 7, .depth = 3 } };
+            return (int)(handle(c) + handle_alias(c));
+        }
+    """
+
+    def test_untyped_hint_typed_rendering_and_ambiguity(self, shared_bn, tmp_path):
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the issue903 regression"
+        source = tmp_path / "struct_assist.c"
+        source.write_text(self._SOURCE)
+        binary = tmp_path / "struct_assist"
+        build = subprocess.run(
+            [cc, "-O2", "-fno-inline", "-fno-stack-protector", "-no-pie",
+             str(source), "-o", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        assert build.returncode == 0, f"struct fixture build failed:\n{build.stdout}\n{build.stderr}"
+        shared_bn.load(binary)
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        # A fresh ELF already has loader-provided layouts: its header can match
+        # these same accesses and later make cfg ambiguous. Establish an empty
+        # inventory explicitly, without blacklisting names or changing offsets.
+        remaining_types = shared_bn.json(
+            "py", "exec",
+            "for name in list(bv.types.keys()):\n"
+            "    if bv.is_type_auto_defined(name):\n"
+            "        bv.undefine_type(bv.get_type_id(name))\n"
+            "    else:\n"
+            "        bv.undefine_user_type(name)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [str(name) for name in bv.types.keys()]\n")["result"]
+        assert remaining_types == [], remaining_types
+        before = shared_bn.json("proto", "get", "handle")
+        missing = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in missing["warnings"]), missing
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+        untyped = shared_bn.json("decompile", "handle")
+        hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
+        assert hint is not None, untyped
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+            assert witness in hint
+        assert shared_bn.json("proto", "get", "handle") == before
+        text_result = shared_bn.run("decompile", "handle")
+        assert text_result.returncode == 0, text_result.stderr
+        assert hint in text_result.stdout
+
+        # Accesses through a copy of the parameter must not be dropped from
+        # the witness while the body visibly uses an offset cfg cannot hold.
+        shared_bn.json("proto", "set", "handle_alias", "uint64_t handle_alias(void *c)")
+        aliased = shared_bn.json("decompile", "handle_alias")
+        assert "0x80" in aliased["text"], aliased
+        assert not any("struct layout candidate" in w for w in aliased["warnings"]), aliased
+
+        # A bitfield storage unit at a witnessed offset is potentially
+        # compatible; it must block uniqueness rather than be skipped. The C
+        # declaration path refuses bitfields, so build the native member.
+        bit_widths = shared_bn.json(
+            "py", "exec",
+            "from binaryninja import StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'lo', bit_width=20)\n"
+            "bv.define_user_type('bits_cfg', s)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [m.bit_width for m in bv.get_type_by_name('bits_cfg').members]\n")["result"]
+        assert bit_widths == [0, 0, 20], bit_widths
+        blocked = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in blocked["warnings"]), blocked
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('bits_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
+
+        # Equally concrete layouts that cfg's uniqueness must account for: a
+        # base-less class, and identical structs carrying a trailing flexible
+        # array or an unresolved (zero-width) named member past the accesses.
+        builder = (
+            "from binaryninja import NamedTypeReferenceClass, StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'depth')\n")
+        competitors = {
+            "K": ("ClassStructureType", None),
+            "flex_cfg": ("StructStructureType",
+                         builder + "s.insert(52, Type.array(Type.char(), 0), 'tail')\n"),
+            "ext_cfg": ("StructStructureType", builder + (
+                "s.insert(56, Type.named_type_reference(\n"
+                "    NamedTypeReferenceClass.StructNamedTypeClass, 'missing_t'), 'ext')\n")),
+        }
+        for name, (kind, script) in competitors.items():
+            if script is None:
+                shared_bn.json(
+                    "types", "declare",
+                    f"class {name} {{ public: char pad[40]; uint64_t flags; uint32_t depth; }};")
+            else:
+                shared_bn.json(
+                    "py", "exec",
+                    script + f"bv.define_user_type({name!r}, s)\n"
+                    "bv.update_analysis_and_wait()\n")
+            shape = shared_bn.json(
+                "py", "exec",
+                f"t = bv.get_type_by_name({name!r})\n"
+                "result = [t.type.name, [m.type.width for m in t.members]]\n")["result"]
+            assert shape[0] == kind, (name, shape)
+            if script is not None:
+                assert shape[1][-1] == 0, (name, shape)
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                name, competing)
+            if script is None:
+                # A sole matching class is not suggested as `struct K *`.
+                shared_bn.json(
+                    "py", "exec",
+                    "bv.undefine_user_type('cfg')\n"
+                    "bv.update_analysis_and_wait()\n")
+                sole = shared_bn.json("decompile", "handle")
+                assert not any("struct layout candidate" in w for w in sole["warnings"]), sole
+                shared_bn.json(
+                    "types", "declare",
+                    "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+            shared_bn.json(
+                "py", "exec",
+                f"bv.undefine_user_type({name!r})\n"
+                "bv.update_analysis_and_wait()\n")
+            restored = shared_bn.json("decompile", "handle")
+            assert any("struct layout candidate" in w for w in restored["warnings"]), (
+                name, restored)
+
+        # Redeclaring an embedded type can leave the outer struct's stored
+        # width stale. That unobserved tail must not drop an otherwise
+        # identical competitor and so fabricate cfg's uniqueness.
+        shared_bn.json(
+            "types", "declare",
+            "struct ext { uint32_t a; }; "
+            "struct so_cfg { char pad[40]; uint64_t flags; uint32_t depth; struct ext tail; };")
+        fresh = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in fresh["warnings"]), fresh
+        shared_bn.json(
+            "types", "declare", "struct ext { uint32_t a, b, c, d; };")
+        stale = shared_bn.json(
+            "py", "exec",
+            "t = bv.get_type_by_name('so_cfg')\n"
+            "result = [t.width, max(m.offset + m.type.width for m in t.members)]\n")["result"]
+        assert stale[1] > stale[0], stale
+        grown = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in grown["warnings"]), grown
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('so_cfg')\n"
+            "bv.undefine_user_type('ext')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
+
+        # Application remains an explicit mutation, never part of a read.
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
+        typed = shared_bn.json("decompile", "handle")
+        assert "c->flags" in typed["text"] and "c->depth" in typed["text"], typed
+        assert not any("struct layout candidate" in w for w in typed["warnings"]), typed
+
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        shared_bn.json(
+            "types", "declare",
+            "struct other_cfg { char pad[40]; uint64_t mode; uint32_t count; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+
+        # A typedef on a scalar member must neither hide a compatible layout
+        # nor make a distinct, direct-scalar layout appear uniquely compatible.
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('cfg')\n"
+            "bv.undefine_user_type('other_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        shared_bn.json(
+            "types", "declare",
+            "typedef unsigned long long word_t; "
+            "struct wrapped_cfg { char pad[40]; word_t flags; unsigned int depth; }; "
+            "typedef struct wrapped_cfg wrapped_alias;")
+        wrapped = shared_bn.json("decompile", "handle")
+        hints = [w for w in wrapped["warnings"] if "struct layout candidate" in w]
+        assert len(hints) == 1, wrapped
+        for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in hints[0]
+        assert shared_bn.json("proto", "get", "handle") == before
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+        assert shared_bn.json("proto", "get", "handle") == before
+
+        # Crossing the resolver budget must never turn uncertainty into a
+        # unique direct-layout suggestion. The 16-hop layout is a witness on
+        # its own; longer chains can only block another layout's uniqueness.
+        for hops in (16, 17, 64):
+            shared_bn.json(
+                "py", "exec",
+                "bv.undefine_user_type('cfg')\n"
+                "bv.undefine_user_type('wrapped_cfg')\n"
+                "bv.update_analysis_and_wait()\n")
+            prefix = f"word_{hops}_"
+            declarations = f"typedef unsigned long long {prefix}0; " + "".join(
+                f"typedef {prefix}{index - 1} {prefix}{index}; "
+                for index in range(1, hops))
+            shared_bn.json(
+                "types", "declare",
+                declarations
+                + f"struct wrapped_cfg {{ char pad[40]; {prefix}{hops - 1} flags; "
+                + "unsigned int depth; };")
+            sole = shared_bn.json("decompile", "handle")
+            hints = [w for w in sole["warnings"] if "struct layout candidate" in w]
+            assert len(hints) == (1 if hops == 16 else 0), (hops, sole)
+            if hints:
+                assert "struct wrapped_cfg *" in hints[0]
+            shared_bn.json(
+                "types", "declare",
+                "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                hops, competing)
+            assert shared_bn.json("proto", "get", "handle") == before

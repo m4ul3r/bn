@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import io
+import itertools
 import json
 import socket
 import sys
@@ -11,6 +12,7 @@ import time
 import types
 import weakref
 from collections.abc import Mapping
+from enum import IntEnum
 from pathlib import Path
 
 import pytest
@@ -1084,6 +1086,462 @@ def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
         rd._linear_decode_arch(_Ctx(), bv, 0x401000, "arm")
     with pytest.raises(ValueError, match="aarch64"):
         rd._linear_decode_arch(_Ctx(), bv, 0x401000, "thumb")
+
+
+def _struct_assist_layout(name: str = "cfg", *, flags_width: int = 8) -> _FakeType:
+    def integer(width: int) -> _FakeType:
+        return _FakeType(
+            f"uint{width * 8}_t", width=width, type_class="IntegerTypeClass")
+    layout = _FakeType(f"struct {name}", width=0x38, members=[
+        _FakeMember(0x28, "flags", integer(flags_width)),
+        _FakeMember(0x30, "depth", integer(4)),
+    ])
+    layout.type = types.SimpleNamespace(name="StructStructureType")
+    layout.base_structures = []
+    return layout
+
+
+_STRUCT_ASSIST_EXPRS = itertools.count()
+
+
+def _struct_assist_node(operation: str, **operands) -> _FakeMLILInsn:
+    node = _FakeMLILInsn(0x401004, operation=operation, **operands)
+    node.expr_index = next(_STRUCT_ASSIST_EXPRS)
+    return node
+
+
+def _struct_assist_read(var: _FakeVariable, version: int = 0) -> _FakeMLILInsn:
+    ssa_var = types.SimpleNamespace(var=var, version=version)
+    return _struct_assist_node("MLIL_VAR_SSA", src=ssa_var, vars_read=[ssa_var])
+
+
+def _struct_assist_access(
+    var: _FakeVariable, offset: int, width: int, *,
+    operation: str = "MLIL_LOAD_SSA", version: int = 0,
+) -> _FakeMLILInsn:
+    base = _struct_assist_read(var, version)
+    address = base
+    if "_STRUCT_" not in operation:
+        address = _struct_assist_node(
+            "MLIL_ADD", left=base,
+            right=_struct_assist_node("MLIL_CONST", constant=offset),
+            vars_read=base.vars_read)
+    operands = {"src" if operation.startswith("MLIL_LOAD") else "dest": address}
+    ins = _struct_assist_node(operation, size=width, **operands)
+    if "_STRUCT_" in operation:
+        ins.offset = offset
+    return ins
+
+
+def _struct_assist_walk(node, callback):
+    """Pre-order expression walk, like MLIL ``traverse`` over nested operands."""
+    yield callback(node)
+    for name in ("dest", "src", "left", "right"):
+        child = getattr(node, name, None)
+        if isinstance(child, _FakeMLILInsn):
+            yield from _struct_assist_walk(child, callback)
+    for child in node.params:
+        yield from _struct_assist_walk(child, callback)
+
+
+def _struct_assist_case() -> tuple[_FakeBV, _FakeFunction, _FakeVariable, list[_FakeMLILInsn]]:
+    pointer = _FakeType("void *", width=8, type_class="PointerTypeClass")
+    pointer.target = _FakeType("void", type_class="VoidTypeClass")
+    var = _FakeVariable(name="c", storage=5, var_type=pointer, identifier=1001)
+    fn = _FakeFunction(0x401000, "handle", "int handle(void *c)")
+    fn.parameter_vars = [var]
+    nodes = [_struct_assist_access(var, 0x28, 8), _struct_assist_access(var, 0x30, 4)]
+    fn.mlil = types.SimpleNamespace(ssa_form=types.SimpleNamespace(
+        traverse=lambda callback: (
+            result for node in nodes for result in _struct_assist_walk(node, callback))))
+    bv = _FakeBV(functions=[fn], types_={"cfg": _struct_assist_layout()})
+    return bv, fn, var, nodes
+
+
+def test_decompile_struct_assist_witness_and_no_mutation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, var, _ = _struct_assist_case()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+    before_type, before_pointer = fn.type, var.type
+
+    result = instance._decompile("active", "handle")
+
+    assert len(result["warnings"]) == 1
+    hint = result["warnings"][0]
+    # These are the actionable evidence, not a pin of the explanatory prose.
+    for evidence in ("cfg", "c", "+0x28/8", "flags", "+0x30/4", "depth",
+                     "bn struct show cfg", "bn proto get 0x401000",
+                     "bn proto set 0x401000", "struct cfg *",
+                     # Excluded alternatives are disclosed, not claimed ruled out.
+                     "nested struct, union, array or base class"):
+        assert evidence in hint
+    assert "(char*)c + 0x28" in result["text"]
+    assert fn.type is before_type and var.type is before_pointer
+    assert fn.has_user_type is False and fn.reanalyzed is False
+
+
+@pytest.mark.parametrize("operation", [
+    "MLIL_LOAD_SSA", "MLIL_STORE_SSA", "MLIL_LOAD_STRUCT_SSA", "MLIL_STORE_STRUCT_SSA",
+])
+def test_struct_assist_supports_direct_loads_and_stores(operation):
+    bv, fn, var, nodes = _struct_assist_case()
+    nodes[:] = [_struct_assist_access(var, off, width, operation=operation)
+                for off, width in ((0x28, 8), (0x30, 4))]
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == 1
+
+
+def test_struct_assist_ignores_layout_alias_but_not_distinct_matching_struct():
+    bv, fn, _, _ = _struct_assist_case()
+    bv.types["cfg_alias"] = _FakeType("cfg", type_class="NamedTypeReferenceClass")
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == 1
+    bv.types["other_cfg"] = _struct_assist_layout("other_cfg")
+    assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("other_layout", [False, True], ids=["sole-layout", "ambiguous"])
+def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(monkeypatch, other_layout):
+    _load_bridge(monkeypatch)
+    class TypeClass(IntEnum):
+        IntegerTypeClass = 2
+        NamedTypeReferenceClass = 11
+
+    def reference(name: str, width: int) -> _FakeType:
+        alias = _FakeType(name, width=width, type_class=TypeClass.NamedTypeReferenceClass)
+        alias.name = name
+        alias.type_id = ""
+        return alias
+
+    bv, fn, _, _ = _struct_assist_case()
+    if not other_layout:
+        bv.types.clear()
+    # Model two member typedef hops through the view's registered type table,
+    # with numeric enums rather than permissive string-only type classes.
+    bv.types["word_t"] = _FakeType(
+        "unsigned long long", width=8, type_class=TypeClass.IntegerTypeClass)
+    bv.types["flags_t"] = reference("word_t", 8)
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = reference("flags_t", 8)
+    bv.types["wrapped_cfg"] = wrapped
+    # A whole-struct alias must not create another concrete candidate.
+    bv.types["wrapped_alias"] = reference("wrapped_cfg", wrapped.width)
+
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    if other_layout:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in warnings[0]
+
+
+@pytest.mark.parametrize("direct_layout", [False, True], ids=["sole-layout", "competitor"])
+@pytest.mark.parametrize("case, expected_lookups, sole_hints, competing_hints", [
+    ("16-hops", 16, 1, 0), ("17-hops", 16, 0, 0), ("64-hops", 16, 0, 0),
+    ("cycle", 2, 0, 0), ("unresolved", 1, 0, 0),
+    ("array-terminal", 1, 0, 1), ("nested-terminal", 1, 0, 1),
+])
+def test_struct_assist_bounds_member_typedef_lookups(
+    monkeypatch, direct_layout, case, expected_lookups, sole_hints, competing_hints,
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, _, _ = _struct_assist_case()
+    scalar = bv.types["cfg"].members[0].type
+
+    def reference(index):
+        alias = _FakeType("word_t", width=8, type_class="NamedTypeReferenceClass")
+        alias.name = "word_t"
+        alias.type_id = f"ref-{index}"
+        return alias
+
+    lookups = []
+
+    def lookup(type_id):
+        lookups.append(type_id)
+        if case == "unresolved":
+            return None
+        if case == "array-terminal":
+            return _FakeType("char[8]", width=8, type_class="ArrayTypeClass")
+        if case == "nested-terminal":
+            return _FakeType("struct inner", width=8, members=[
+                _FakeMember(0, "value", scalar)])
+        index = int(type_id.rsplit("-", 1)[1])
+        if case == "cycle":
+            return reference((index + 1) % 2)
+        return scalar if index + 1 == int(case.split("-")[0]) else reference(index + 1)
+
+    bv.get_type_by_id = lookup
+    if not direct_layout:
+        bv.types.clear()
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = reference(0)
+    bv.types["wrapped_cfg"] = wrapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+
+    result = instance._decompile("active", "handle")
+
+    expected_hints = competing_hints if direct_layout else sole_hints
+    assert len(result["warnings"]) == expected_hints
+    if expected_hints:
+        candidate = "cfg" if direct_layout else "wrapped_cfg"
+        for witness in (f"struct {candidate} *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in result["warnings"][0]
+    assert len(lookups) == expected_lookups
+
+
+@pytest.mark.parametrize("case", [
+    "wrong-offset", "wrong-width", "non-scalar-member",
+    "unobserved-opaque", "unrelated-opaque",
+])
+def test_decompile_struct_assist_opaque_members_do_not_hide_supported_layout(monkeypatch, case):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, _, _ = _struct_assist_case()
+    opaque = _FakeType("missing_t", width=8, type_class="NamedTypeReferenceClass")
+    opaque.name = "missing_t"
+    opaque.type_id = "missing-id"
+    bv.get_type_by_id = lambda type_id: None
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[0].type = opaque
+    if case == "wrong-offset":
+        # Even with one compatible-but-opaque access, another access rules out
+        # the competitor; uncertainty does not override proven incompatibility.
+        wrapped.members[1].offset = 0x34
+    elif case == "wrong-width":
+        wrapped.members[1].type.width = 2
+    elif case == "non-scalar-member":
+        wrapped.members[1].type = _FakeType(
+            "char[4]", width=4, type_class="ArrayTypeClass")
+    elif case == "unobserved-opaque":
+        bv.types["cfg"].members.insert(0, _FakeMember(0x20, "opaque", opaque))
+    elif case == "unrelated-opaque":
+        bv.types["missing_alias"] = opaque
+    if case not in {"unobserved-opaque", "unrelated-opaque"}:
+        bv.types["wrapped_cfg"] = wrapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, fn, [[
+        (0x401004, "return *(uint64_t*)((char*)c + 0x28) + *(uint32_t*)((char*)c + 0x30);")
+    ]])
+
+    result = instance._decompile("active", "handle")
+
+    assert len(result["warnings"]) == 1
+    for witness in ("struct cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+        assert witness in result["warnings"][0]
+
+
+@pytest.mark.parametrize("case", [
+    "no-layout", "wrong-width", "wrong-offset", "array-member", "bitfield",
+    "union", "inherited", "overlapping", "out-of-bounds", "single-offset",
+    "conflicting-width", "computed-offset", "reassigned-parameter", "arithmetic-only",
+    "no-ssa", "different-parameter",
+])
+def test_struct_assist_requires_consistent_supported_witness(case):
+    bv, fn, var, nodes = _struct_assist_case()
+    layout = bv.types["cfg"]
+    if case == "no-layout":
+        bv.types.clear()
+    elif case == "wrong-width":
+        bv.types["cfg"] = _struct_assist_layout(flags_width=4)
+    elif case == "wrong-offset":
+        layout.members[0].offset = 0x20
+    elif case == "array-member":
+        layout.members[0].type.type_class = "ArrayTypeClass"
+    elif case == "bitfield":
+        layout.members[0].bit_width = 3
+    elif case == "union":
+        layout.type = types.SimpleNamespace(name="UnionStructureType")
+    elif case == "inherited":
+        layout.base_structures = [object()]
+    elif case == "overlapping":
+        layout.members.append(_FakeMember(0x2c, "overlap", layout.members[1].type))
+    elif case == "out-of-bounds":
+        layout.width = 0x30
+    elif case == "single-offset":
+        nodes[1] = _struct_assist_access(var, 0x28, 8)
+    elif case == "conflicting-width":
+        nodes.append(_struct_assist_access(var, 0x28, 4))
+    elif case == "computed-offset":
+        extra = _struct_assist_access(var, 0x38, 4)
+        extra.src.right = extra.src.left  # *(c + c), not a constant offset
+        nodes.append(extra)
+    elif case == "reassigned-parameter":
+        nodes.append(_struct_assist_access(var, 0x38, 4, version=1))
+    elif case == "arithmetic-only":
+        nodes[:] = [node.src for node in nodes]
+    elif case == "no-ssa":
+        fn.mlil.ssa_form = None
+    elif case == "different-parameter":
+        other = _FakeVariable(name="other", storage=6, var_type=var.type, identifier=1002)
+        fn.parameter_vars.append(other)
+        nodes[1] = _struct_assist_access(other, 0x30, 4)
+    assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("case, hints", [
+    ("copy", 0), ("phi", 0), ("call-argument", 0), ("derived-pointer", 0),
+    ("stored-value", 0), ("address-taken", 0), ("null-check", 1),
+])
+def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
+    bv, fn, var, nodes = _struct_assist_case()
+    alias = _FakeVariable(name="rbx", storage=7, var_type=var.type, identifier=1003)
+    alias_ssa = types.SimpleNamespace(var=alias, version=1)
+    if case == "copy":
+        # rbx#1 = c#0, then an access through the copy outside cfg's layout.
+        nodes.append(_struct_assist_node(
+            "MLIL_SET_VAR_SSA", dest=alias_ssa, src=_struct_assist_read(var)))
+        nodes.append(_struct_assist_access(alias, 0x80, 4, version=1))
+    elif case == "phi":
+        nodes.append(_struct_assist_node(
+            "MLIL_VAR_PHI", dest=alias_ssa,
+            src=[types.SimpleNamespace(var=var, version=0), alias_ssa]))
+    elif case == "call-argument":
+        nodes.append(_struct_assist_node(
+            "MLIL_CALL_SSA", params=[_struct_assist_read(var)]))
+    elif case == "derived-pointer":
+        nodes.append(_struct_assist_node("MLIL_SET_VAR_SSA", dest=alias_ssa, src=(
+            _struct_assist_node(
+                "MLIL_ADD", left=_struct_assist_read(var),
+                right=_struct_assist_node("MLIL_CONST", constant=0x10)))))
+    elif case == "stored-value":
+        nodes.append(_struct_assist_node(
+            "MLIL_STORE_SSA", size=8,
+            dest=_struct_assist_node("MLIL_CONST_PTR", constant=0x404000),
+            src=_struct_assist_read(var)))
+    elif case == "address-taken":
+        nodes.append(_struct_assist_node("MLIL_ADDRESS_OF", src=var))
+    elif case == "null-check":
+        # A comparison result cannot carry the pointer to unseen accesses.
+        nodes.append(_struct_assist_node(
+            "MLIL_CMP_E", left=_struct_assist_read(var),
+            right=_struct_assist_node("MLIL_CONST", constant=0)))
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == hints
+
+
+@pytest.mark.parametrize("case, hints", [
+    ("bitfield-unit", 0), ("split-bitfields", 0), ("overlapping-members", 0),
+    ("unobserved-bitfield", 1), ("class-competitor", 0), ("sole-class", 0),
+    ("flexible-tail-competitor", 0), ("unresolved-tail-competitor", 0),
+    ("zero-width-before-access", 0), ("own-flexible-tail", 1),
+    ("overrun-competitor", 0), ("sole-overrun", 0),
+])
+def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
+    bv, fn, _, _ = _struct_assist_case()
+    other = _struct_assist_layout("other_cfg")
+    unit = other.members[1].type
+
+    def bitfield(offset: int, name: str, bits: int) -> _FakeMember:
+        member = _FakeMember(offset, name, unit)
+        member.bit_width = bits
+        return member
+
+    if case == "bitfield-unit":
+        other.members[1] = bitfield(0x30, "lo", 20)
+        other.width = 0x33  # BN sizes a trailing bitfield to the bit
+    elif case == "split-bitfields":
+        # BN reports the second field at its first byte with the unit's width.
+        other.members[1:] = [bitfield(0x30, "lo", 16), bitfield(0x32, "hi", 16)]
+        other.width = 0x38
+    elif case == "overlapping-members":
+        other.members.append(_FakeMember(0x2c, "overlap", unit))
+    elif case in {"class-competitor", "sole-class"}:
+        # A base-less class is as concrete a layout as a struct, but is never
+        # itself suggested as `struct K *`.
+        other.type = types.SimpleNamespace(name="ClassStructureType")
+        if case == "sole-class":
+            del bv.types["cfg"]
+    elif case in {"flexible-tail-competitor", "own-flexible-tail"}:
+        if case == "own-flexible-tail":
+            other = bv.types["cfg"]
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "char[0]", width=0, type_class="ArrayTypeClass")))
+    elif case == "unresolved-tail-competitor":
+        other.members.append(_FakeMember(0x38, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case in {"overrun-competitor", "sole-overrun"}:
+        # A redeclared embedded type can outgrow the outer struct's stored
+        # width; the unobserved stale tail must not drop the competitor.
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "struct ext", width=16, type_class="StructureTypeClass")))
+        if case == "sole-overrun":
+            del bv.types["cfg"]
+    elif case == "zero-width-before-access":
+        # An unknown-width member may extend over every later byte.
+        other.members.insert(0, _FakeMember(0x20, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case == "unobserved-bitfield":
+        # Unclassifiable storage away from every access does not block cfg.
+        other = bv.types["cfg"]
+        other.members.append(bitfield(0x34, "spare", 3))
+    bv.types[str(other).removeprefix("struct ")] = other
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    assert len(warnings) == hints
+    if hints:
+        assert "struct cfg *" in warnings[0]
+
+
+def test_struct_assist_resolves_only_observed_member_typedefs():
+    bv, fn, _, _ = _struct_assist_case()
+    lookups = []
+    scalar = _FakeType("uint32_t", width=4, type_class="IntegerTypeClass")
+
+    def lookup(type_id):
+        lookups.append(type_id)
+        return scalar
+
+    def reference(index: int) -> _FakeType:
+        alias = _FakeType("u32_t", width=4, type_class="NamedTypeReferenceClass")
+        alias.name = "u32_t"
+        alias.type_id = f"ref-{index}"
+        return alias
+
+    bv.get_type_by_id = lookup
+    for index in range(200):
+        decoy = _FakeType(f"struct decoy{index}", width=0x40, members=[
+            _FakeMember(offset, f"f{offset:x}", reference(index))
+            for offset in (*range(0, 0x28, 4), 0x34, 0x38, 0x3c)
+        ])
+        decoy.type = types.SimpleNamespace(name="StructStructureType")
+        decoy.base_structures = []
+        bv.types[f"decoy{index}"] = decoy
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[1].type = reference(-1)
+    wrapped.members.insert(0, _FakeMember(0x20, "unobserved", reference(-2)))
+    bv.types["wrapped_cfg"] = wrapped
+    del bv.types["cfg"]
+
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+
+    assert len(warnings) == 1 and "struct wrapped_cfg *" in warnings[0]
+    assert lookups == ["ref--1"]
+
+
+@pytest.mark.parametrize("pointee", ["StructureTypeClass", "IntegerTypeClass"])
+def test_struct_assist_leaves_typed_parameters_and_rendering_alone(monkeypatch, pointee):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn, var, _ = _struct_assist_case()
+    var.type.target.type_class = pointee
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn, [[(0x401004, "return c->flags + c->depth;")]])
+    result = instance._decompile("active", "handle")
+    assert result["text"] == "return c->flags + c->depth;"
+    assert result["warnings"] == []
+
+
+def test_struct_assist_preserves_pointee_qualifiers_in_suggestion():
+    bv, fn, var, _ = _struct_assist_case()
+    var.type.target.const = True
+    var.type.target.volatile = True
+    assert "const volatile struct cfg *" in read_decompile._struct_layout_warnings(bv, fn)[0]
 
 
 def test_decompile_renders_pseudo_c(monkeypatch):
