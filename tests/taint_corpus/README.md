@@ -46,6 +46,7 @@ brittle across compilers/optimisation.
 | `stash_pointer_width.c` | exact narrow/full pointer reload controls at O0/O1; partial reload plus zero-extension must not certify initialization. Copied LOAD epoch control is checked at O0; O1 may fold the scalar sink |
 | `nested_escape_paths.c` | #951: native O0 nested call/escape arrangements require an opaque helper leaf; no-escape nests stay covered. Includes single-loop and differing-offset cache controls |
 | `store_member_identity.c` | exact O0 direct-store lossy destination and STRUCT-stash member PHIs remain incomplete; matching-member full-pointer control stays complete |
+| `scalar_member_regions.c` | exact Opus O0 scalar STRUCT-read fixture: unwritten member/mirror/pointer-store variants remain incomplete; genuinely initialized consumed member stays covered |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -138,6 +139,23 @@ BN may erase `0x67` and lift a truncated destination as a named local write
 the lifted model; disassembly is required for machine-level address-width
 claims. No opcode blacklist or weakened native regression is used to hide
 that upstream limit.
+
+`scalar_member_regions` retains the Opus scalar-member source exactly and
+uses its O0 flags (`-fno-inline -fno-builtin`). Analyze only: wrong-member reads
+are intentionally uninitialized. The initialized-member control checks that
+coverage is not blanket-disabled. Deterministic equivalent plain LOAD,
+LOAD_STRUCT and named aliased-field forms cover direct/copied bases, nonzero
+base plus member offsets exactly once, unknown geometry, read epochs and
+selector provenance.
+
+The scalar STRUCT root is corroborated natively by that O0 shape. The Sol
+O0 fixture instead lifts to named aliased-field reads; O1 can fold undefined
+reads away or produce non-memory SSA-field `entry` origins. Those separate
+representations are not credited as a STRUCT-path repair. The float-constant
+numeric-coercion defect is exercised synthetically with an integer-zero
+control; no native direct FLOAT_CONST reproduction is claimed. Integer
+bit-pattern and verified byte-data evidence remain supported without adding
+floating evaluation.
 
 ## `EXPECTED.json` schema
 

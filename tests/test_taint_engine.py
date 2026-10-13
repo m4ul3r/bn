@@ -12111,3 +12111,194 @@ def test_literal_nul_proof_does_not_erase_pointer_transformations(transform):
     engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
     assert engine._literal_terminator(pg.func().mlil.ssa_form, expr) == (
         1 if transform == "exact" else None)
+
+
+@pytest.mark.parametrize("form,copied", [
+    ("MLIL_LOAD_SSA", False), ("MLIL_LOAD_SSA", True),
+    ("MLIL_LOAD_STRUCT_SSA", False), ("MLIL_LOAD_STRUCT_SSA", True),
+    ("MLIL_VAR_ALIASED_FIELD", False),
+])
+@pytest.mark.parametrize("initialized", [0, 32])
+@pytest.mark.parametrize("consumed", [0, 32])
+def test_scalar_read_forms_share_member_geometry(form, copied, initialized, consumed):
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_region_addr(obj, initialized), _region_const(7), _region_const(8)])
+    pointer, reads = _addr_of(obj), []
+    if copied:
+        ptr = FSSA(FVar("pointer"), 1)
+        _set(pg, ptr, "pointer = &object", pointer)
+        pointer, reads = FExpr("MLIL_VAR_SSA", "pointer", reads=[ptr]), [ptr]
+    if form == "MLIL_VAR_ALIASED_FIELD":
+        load = FExpr(form, "named member read", src=FSSA(obj, pg.mem), src_memory=pg.mem)
+        load.offset = consumed
+    else:
+        if form == "MLIL_LOAD_SSA":
+            pointer = _plus(pointer, _region_const(consumed))
+            pointer.vars_read = reads
+        load = FExpr(form, "pointer member read", src=pointer, reads=reads, src_memory=pg.mem)
+        if form == "MLIL_LOAD_STRUCT_SSA":
+            load.offset = consumed
+    load.size = 4
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member read", load, reads=reads)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (initialized == consumed)
+    assert bool(aol) is (initialized != consumed)
+    if aol:
+        assert aol[0]["region"] == {"offset": consumed, "width": 4, "kind": "bytes"}
+
+
+@pytest.mark.parametrize("form", ["MLIL_LOAD_SSA", "MLIL_LOAD_STRUCT_SSA"])
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("initialized", [32, 40])
+def test_scalar_read_combines_base_and_member_displacements_once(form, copied, initialized):
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_region_addr(obj, initialized), _region_const(7), _region_const(8)])
+    pointer, reads = _region_addr(obj, 8), []
+    if copied:
+        ptr = FSSA(FVar("pointer"), 1)
+        _set(pg, ptr, "pointer = &object + 8", pointer)
+        pointer, reads = FExpr("MLIL_VAR_SSA", "pointer", reads=[ptr]), [ptr]
+    if form == "MLIL_LOAD_SSA":
+        pointer = _plus(pointer, _region_const(24))
+        pointer.vars_read = reads
+    load = FExpr(form, "member read", src=pointer, reads=reads, src_memory=pg.mem)
+    if form == "MLIL_LOAD_STRUCT_SSA":
+        load.offset = 24
+    load.size = 4
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member read", load, reads=reads)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (initialized == 32)
+    if aol:
+        assert aol[0]["region"] == {"offset": 32, "width": 4, "kind": "bytes"}
+
+
+@pytest.mark.parametrize("form", ["MLIL_LOAD_STRUCT_SSA", "MLIL_VAR_ALIASED_FIELD"])
+@pytest.mark.parametrize("unknown", ["member", "width", "zero_width"])
+def test_unknown_scalar_read_geometry_cannot_become_empty_or_offset_zero(form, unknown):
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(obj), _region_const(0), _region_const(64)])
+    pointer = FSSA(obj, pg.mem) if form == "MLIL_VAR_ALIASED_FIELD" else _addr_of(obj)
+    load = FExpr(form, "unknown member read", src=pointer, src_memory=pg.mem)
+    load.offset = None if unknown == "member" else 0
+    load.size = None if unknown == "width" else (0 if unknown == "zero_width" else 4)
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = unknown read", load)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol and aol[0]["region"] == {
+        "offset": None if unknown == "member" else 0,
+        "width": 4 if unknown == "member" else None, "kind": "bytes"}
+
+
+@pytest.mark.parametrize("form", ["MLIL_LOAD_STRUCT_SSA", "MLIL_VAR_ALIASED_FIELD"])
+def test_scalar_member_provenance_stays_at_read_epoch(form):
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_region_addr(obj, 32), _region_const(7), _region_const(8)])
+    ptr = FSSA(FVar("pointer"), 1)
+    _set(pg, ptr, "pointer = &object", _addr_of(obj))
+    pointer = (FSSA(obj, pg.mem) if form == "MLIL_VAR_ALIASED_FIELD"
+               else FExpr("MLIL_VAR_SSA", "pointer", reads=[ptr]))
+    reads = [] if form == "MLIL_VAR_ALIASED_FIELD" else [ptr]
+    load = FExpr(form, "member read", src=pointer, reads=reads, src_memory=pg.mem)
+    load.offset, load.size = 32, 4
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member read", load, reads=reads)
+    pg.call(_B_READ, [_region_const(0), _addr_of(obj), _region_const(64)])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, reasons, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert aol == []
+    assert result["slices"][0]["origin"].get("callee") == "memset"
+    assert not any("written by read" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("operation,value,complete", [
+    ("MLIL_FLOAT_CONST", 0.998039186000824, False),
+    ("MLIL_FLOAT_CONST", 0.0, False),
+    ("MLIL_CONST", 0x3F7F7F7F, False),
+    ("MLIL_CONST", 0, True),
+])
+def test_nul_proof_uses_integer_bit_patterns_not_float_numeric_coercion(operation, value, complete):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    source = FExpr(operation, "scalar literal", constant=value)
+    writer = pg.store(_addr_of(buf), source)
+    writer.size = 4
+    pg.sink(buf, folded=True)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+
+
+@pytest.mark.parametrize("initialized", [0, 32])
+def test_plain_named_scalar_read_starts_at_fixed_object_storage(initialized):
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_region_addr(obj, initialized), _region_const(7), _region_const(8)])
+    load = FExpr("MLIL_VAR_ALIASED", "named read", src=FSSA(obj, pg.mem), src_memory=pg.mem)
+    load.size = 4
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = named read", load)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, _ = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (initialized == 0)
+
+
+@pytest.mark.parametrize("copied", [False, True])
+def test_scalar_struct_read_unknown_base_keeps_index_origin(copied):
+    index = FVar("index", ident=91)
+    index0 = FSSA(index, 0)
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram(params=[index])
+    pg.call(_B_MEMSET, [_addr_of(obj), _region_const(7), _region_const(64)])
+    pointer = _addr_of(obj)
+    reads = [index0]
+    if copied:
+        ptr = FSSA(FVar("pointer"), 1)
+        _set(pg, ptr, "pointer = &object", pointer)
+        pointer = FExpr("MLIL_VAR_SSA", "pointer", reads=[ptr])
+        reads.insert(0, ptr)
+    pointer = _plus(pointer, FExpr("MLIL_VAR_SSA", "index", reads=[index0]))
+    pointer.vars_read = reads
+    load = FExpr("MLIL_LOAD_STRUCT_SSA", "indexed member read", src=pointer,
+                 reads=reads, src_memory=pg.mem)
+    load.offset, load.size = 32, 4
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = indexed member", load, reads=reads)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert result["slices"][0]["origin"]["kind"] == "parameter"
+    assert aol and aol[0]["region"] == {"offset": None, "width": 4, "kind": "bytes"}
+
+
+@pytest.mark.parametrize("member", [0, 32, None])
+@pytest.mark.parametrize("width", [4, None])
+def test_nonlocal_scalar_struct_read_passes_canonical_geometry(member, width):
+    pointer = FVar("pointer", ident=92)
+    pointer0 = FSSA(pointer, 0)
+    pg = _BufProgram(params=[pointer])
+    address = FExpr("MLIL_VAR_SSA", "pointer", reads=[pointer0])
+    writer = pg.store(address, _region_const(64), reads=[pointer0])
+    writer.size = 4
+    load = FExpr("MLIL_LOAD_STRUCT_SSA", "external member read", src=address,
+                 reads=[pointer0], src_memory=pg.mem)
+    load.offset, load.size = member, width
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = external member", load, reads=[pointer0])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, _ = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (member == 0 and width == 4)
+    if member != 0 or width is None:
+        assert any(leaf["kind"] == "field_load_unresolved"
+                   and leaf["offset"] == (hex(member) if member is not None else None)
+                   and leaf["width"] == width for leaf in result["leaves"])

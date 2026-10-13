@@ -1185,10 +1185,10 @@ class TaintEngine:
     # AddressOf-only rule misses.
 
     def _int_const(self, expr: Any) -> int | None:
-        if expr is None or "CONST" not in op_name(expr):
+        if expr is None or op_name(expr) not in ("MLIL_CONST", "MLIL_CONST_PTR"):
             return None
         c = getattr(expr, "constant", None)
-        if c is None:
+        if c is None or isinstance(c, float):
             return None
         try:
             return int(c)
@@ -1931,13 +1931,21 @@ class TaintEngine:
     def _memory_member_offset(ins: Any) -> int | None:
         """The explicit field displacement of a supported memory operation."""
         op = op_name(ins)
-        if op in ("MLIL_LOAD", "MLIL_LOAD_SSA", "MLIL_STORE", "MLIL_STORE_SSA"):
+        if op in ("MLIL_LOAD", "MLIL_LOAD_SSA", "MLIL_STORE", "MLIL_STORE_SSA",
+                  "MLIL_VAR_ALIASED"):
             return 0
         if op in ("MLIL_LOAD_STRUCT", "MLIL_LOAD_STRUCT_SSA",
-                  "MLIL_STORE_STRUCT", "MLIL_STORE_STRUCT_SSA"):
+                  "MLIL_STORE_STRUCT", "MLIL_STORE_STRUCT_SSA", "MLIL_VAR_ALIASED_FIELD"):
             off = getattr(ins, "offset", None)
             return off if isinstance(off, int) else None
         return None
+
+    def _scalar_read_region(self, expr: Any) -> _BufferRegion:
+        """Read-relative member geometry, shared by pointer and named forms."""
+        width = getattr(expr, "size", None)
+        if not isinstance(width, int) or width <= 0:
+            width = None
+        return _BufferRegion(self._memory_member_offset(expr), width, "bytes")
 
     def _must_reaching_offsets(self, ssaf: Any, mv: Any, la: tuple, lw: Any,
                                base_key: Any, active: set[int], visited: set | None,
@@ -7266,20 +7274,23 @@ class TaintEngine:
                 aliased = getattr(src_expr, "src", None)
                 aliased = getattr(aliased, "var", aliased)
                 if aliased is not None:
-                    _walk_local_buffer(
-                        defn, aliased, d, self._mem_in(defn),
-                        _BufferRegion(getattr(src_expr, "offset", 0),
-                                      getattr(src_expr, "size", None), "bytes"))
+                    read_memory = self._mem_in(src_expr)
+                    if read_memory is None:
+                        read_memory = self._mem_in(defn)
+                    _walk_local_buffer(defn, aliased, d, read_memory,
+                                       self._scalar_read_region(src_expr))
                     return
             if src_expr is not None and "LOAD" in op_name(src_expr):
                 pointer = getattr(src_expr, "src", None)
+                demand = self._scalar_read_region(src_expr)
+                load_memory = self._mem_in(src_expr)
+                if load_memory is None:
+                    load_memory = self._mem_in(defn)
                 local = self._pointee_var(ssaf, pointer, arithmetic=True)
                 locals_, _ = self._address_terms(pointer)
                 if local is None and len(locals_) == 1:
                     local = locals_[0]
                 if local is not None:
-                    demand = _BufferRegion(0, getattr(src_expr, "size", None), "bytes")
-                    load_memory = getattr(src_expr, "src_memory", None)
                     _walk_local_buffer(
                         defn, local, d, load_memory,
                         self._local_region(ssaf, pointer, local, demand))
@@ -7291,11 +7302,13 @@ class TaintEngine:
                         else:
                             walk(r, d + 1, load_memory)
                     return
-                la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
+                la = self._addr_base_offset(ssaf, pointer)
                 if la is not None:
-                    rec = self._reaching_writer(
-                        ssaf, getattr(src_expr, "src_memory", None), la,
-                        getattr(src_expr, "size", None), set(), 0)
+                    la = (la[0], la[1] + demand.offset
+                          if isinstance(la[1], int) and demand.offset is not None else None)
+                    rec = (self._reaching_writer(
+                        ssaf, load_memory, la, demand.width, set(), 0)
+                           if la[1] is not None and demand.width is not None else None)
                     if rec is not None and rec[0] == "store":
                         # Recover the reaching store and continue the slice through
                         # the value it wrote -- not the base pointer's allocation,
@@ -7305,7 +7318,7 @@ class TaintEngine:
                         st_reads = expr_reads(getattr(store_defn, "src", None))
                         if st_reads:
                             for r in st_reads:
-                                walk(r, d + 1, mv)
+                                walk(r, d + 1, self._mem_in(store_defn))
                         else:
                             cval = self._int_const(getattr(store_defn, "src", None))
                             if cval is not None:
@@ -7322,19 +7335,19 @@ class TaintEngine:
                         # particular loaded field was initialized (#931).
                         leaf = {"kind": "field_load_unresolved",
                                 "address": hex(int(getattr(defn, "address", 0))),
-                                "offset": hex(la[1]), "width": getattr(src_expr, "size", None),
+                                "offset": hex(la[1]), "width": demand.width,
                                 "il_text": str(defn),
                                 "detail": f"{callee} may write this field; its requested "
                                           "length does not prove initialized bytes"}
                         if leaf not in self._bw_leaves:
                             self._bw_leaves.append(leaf)
                         return
-                    base_var = self._addr_base_var(ssaf, getattr(src_expr, "src", None))
+                    base_var = self._addr_base_var(ssaf, pointer)
                     if self._field_base_is_alloc_or_param(ssaf, func, base_var):
                         # No reaching store/source in scope and the base is an
                         # allocation/parameter: a silent stop here reads as
                         # "locally allocated / clean". Surface it honestly (#158).
-                        width = getattr(src_expr, "size", None)
+                        width = demand.width
                         base_label = var_label(base_var) if base_var is not None else None
                         leaf = {
                             "kind": "field_load_unresolved",

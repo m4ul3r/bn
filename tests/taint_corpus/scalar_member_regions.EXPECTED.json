@@ -1,0 +1,11 @@
+{
+  "description": "Exact Opus O0 scalar STRUCT-load fixture: consumption geometry names the actual member, not offset zero. Analyze only; O1 can fold undefined reads away.",
+  "lang": "c",
+  "cflags": ["-fno-inline", "-fno-builtin"],
+  "backward": [
+    {"function": "scalar_member_wrong", "sink": "arg:malloc:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "scalar_member_ctl", "sink": "arg:malloc:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "scalar_member_mirror", "sink": "arg:malloc:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "scalar_member_ptr_store", "sink": "arg:malloc:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false}
+  ]
+}
