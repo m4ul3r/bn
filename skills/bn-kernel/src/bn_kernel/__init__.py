@@ -986,9 +986,9 @@ class Session:
         # backends read: bn.Client resolves it per call, and the cli backend passes
         # this process's environment to the child `bn`. Setting it is therefore
         # process-wide ON PURPOSE -- two sessions with different cache_dirs in one
-        # kernel conflict, and the last explicit value wins. It is set BEFORE the
-        # native client is constructed, because that client resolves its socket at
-        # construction time.
+        # kernel conflict, and the last explicit value wins. Neither backend pins
+        # this root: native discovery reads the current environment per request,
+        # and each CLI child inherits it at spawn.
         if cache_dir is not None:
             try:
                 configured_cache = os.fspath(cache_dir)
@@ -999,7 +999,6 @@ class Session:
             if isinstance(configured_cache, bytes):
                 configured_cache = os.fsdecode(configured_cache)
             os.environ[_ENV_CACHE_DIR] = configured_cache
-        self.cache_dir = os.environ.get(_ENV_CACHE_DIR)
 
         if backend == "cli":
             self.backend: Backend = "cli"
@@ -1019,6 +1018,16 @@ class Session:
         else:
             self.backend = "native"
         _register_session(self)
+
+    @property
+    def cache_dir(self) -> str:
+        """Current effective registry root, not a session-local binding.
+
+        Resolve BN_CACHE_DIR (including ~ expansion and empty/unset defaults)
+        on access, just as reads do. Relative overrides remain relative.
+        Inspect os.environ for the raw override.
+        """
+        return str(_cache_root())
 
     def _root_argv(self) -> list[str]:
         argv: list[str] = []
@@ -1447,6 +1456,17 @@ class Session:
         aggregate["offset"] = initial_offset
         aggregate["returned"] = len(items)
         aggregate["total"] = seen_total
+        # Match Client.collect: callsite coverage on the final page describes a
+        # cumulative scan from row zero, not just that page's rows. In particular,
+        # has_more=False does NOT prove caller enumeration completed. Replace
+        # the group so an exact total cannot retain an earlier lower bound.
+        for field in (
+            "scan_truncated", "caller_scan_truncated", "caller_scan_note",
+            "callers_scanned", "caller_total", "total_lower_bound",
+        ):
+            aggregate.pop(field, None)
+            if field in payload:
+                aggregate[field] = payload[field]
         aggregate["has_more"] = bool(
             bridge_has_more and limit is not None and len(items) >= limit
         )

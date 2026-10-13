@@ -4503,27 +4503,24 @@ def test_session_lifecycle_refuses_when_a_live_bridge_does_not_answer(
 
 
 @pytest.mark.parametrize("verb", ["restart", "stop"])
-def test_session_lifecycle_refuses_a_legacy_gui_strict_enumeration_failure(
-    monkeypatch, capsys, verb
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("discard", [False, True])
+def test_gui_lifecycle_never_escalates_to_process_signals(
+    monkeypatch, capsys, verb, legacy, discard
 ):
-    # The legacy GUI pair registers no instance id (its selector is `default`);
-    # a modal main thread makes its strict tab walk raise, which arrives as the
-    # bridge's `ok: false`. P2: restart's strict capture only buys something if
-    # that refusal is honoured -- before, it reloaded nothing AND discarded.
-    from bn.transport import BridgeError
-
     calls = _unsaved_guard_fixture(
-        monkeypatch, _UNSAVED_ROWS, instance_id=None,
-        listing=_raising(BridgeError(
-            "Unable to enumerate every open BinaryView tab: a UI query raised mid-walk"
-        )),
+        monkeypatch, _UNSAVED_ROWS, instance_id=None if legacy else "owned-gui"
     )
-
-    rc = bn.cli.main(["session", verb, "default", "--format", "json"])
-
-    assert rc == 2
-    assert "cannot verify whether instance default has unsaved changes" in capsys.readouterr().err
-    assert [op for op, _ in calls] == ["list_targets"]
+    inst = bn.cli.find_lifecycle_instance("default" if legacy else "owned-gui")
+    if not legacy:
+        inst.meta["gui"] = True
+    argv = ["session", verb, "default" if legacy else "owned-gui", "--format", "json"]
+    if discard:
+        argv.append("--discard-unsaved")
+    assert bn.cli.main(argv) == 2
+    assert "only supported for headless sessions" in capsys.readouterr().err
+    assert calls == []
+    assert not _FakeSignaller.instances
 
 
 def test_session_stop_discard_unsaved_proceeds_past_an_unanswered_probe(monkeypatch, capsys):

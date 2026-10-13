@@ -265,14 +265,14 @@ _EXPORT_ARGS = [
         "--count",
         action="store_true",
         default=False,
-        help="Show the total export count instead of listing",
+        help="Count global/weak definitions from any symbol table, not loader-visible exports",
     )
 ]
 
 
 @command(
     "exports",
-    help="List exported symbols (a binary's public API)",
+    help="List global/weak definitions from any symbol table, not loader-visible exports",
     target=True,
     paged=True,
     fanout=True,
@@ -282,7 +282,8 @@ _EXPORT_ARGS = [
 @command(
     "exports",
     "list",
-    help="List exported symbols (alias for `exports`)",
+    help="List global/weak definitions from any symbol table, not loader-visible exports "
+         "(alias for `exports`)",
     target=True,
     paged=True,
     fanout=True,
@@ -376,11 +377,12 @@ def _data_vars(args: argparse.Namespace) -> int:
 
 @command("data", "symbols",
          help="List named data symbols (address + name), including internal ones "
-              "the exports list omits",
+              "the exports list omits. Every page rescans the full population; "
+              "use --out FILE without --limit for one whole-set request",
          target=True,
          paged=True,
          prefer_when="you need addressable data globals (including renamed/internal ones); "
-                     "`exports` only shows the public surface",
+                     "`exports` filters definitions by global/weak binding, not loader visibility",
          see_also=("exports", "data vars"),
          estimable=True)
 def _data_symbols(args: argparse.Namespace) -> int:
@@ -756,9 +758,12 @@ def _batch_target_from_cli(args: argparse.Namespace,
                      "{\"op\": \"rename_symbol\", \"identifier\": \"sub_1000\", \"new_name\": \"parse\"} "
                      "or {\"op\": \"set_comment\", \"address\": \"0x1000\", \"comment\": \"...\"}. "
                      "Kinds: rename_symbol, set_comment, delete_comment, set_prototype, "
-                     "local_rename, local_retype, struct_field_set, struct_field_rename, "
-                     "struct_field_delete, types_declare. A missing required field is reported "
-                     "as status 'invalid_request' naming the field.\n"
+                     "local_rename, local_retype, data_retype, struct_field_set, "
+                     "struct_field_rename, struct_field_delete, types_declare, function_create, "
+                     "tag_add, tag_remove, tag_type_create, tag_type_remove. "
+                     "Required fields: the bn skill's reference/mutating.md, "
+                     "'Batch op kinds and required fields'. A missing required field is "
+                     "reported as status 'invalid_request' naming the field.\n"
                      "Ceilings: a manifest over 5000 ops, or whose serialized request exceeds "
                      "the bridge's hard 32 MiB wire limit, is refused before anything is "
                      "sent. A large batch holds the write lock for the whole run and reverts "

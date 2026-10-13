@@ -1041,15 +1041,17 @@ def test_render_type_layout_expands_anonymous_aggregate(monkeypatch):
 
 
 class _TypedefRef(_FakeType):
-    """A BN NamedTypeReference: the alias carries no members of its own and
-    resolves to the registered underlying type through `.target(bv)`."""
+    """Native-shaped reference; ``target(bv)`` recursively follows the chain."""
 
-    def __init__(self, decl, target):
-        super().__init__(decl, type_class="NamedTypeReferenceClass")
-        self._target = target
+    def __init__(self, name, *, type_id=""):
+        super().__init__(name, type_class="NamedTypeReferenceClass")
+        self.name = name
+        self.type_id = type_id
 
     def target(self, bv):
-        return self._target
+        target = (bv.get_type_by_id(self.type_id) if self.type_id
+                  else bv.get_type_by_name(self.name))
+        return target.target(bv) if isinstance(target, _TypedefRef) else target
 
 
 def _registered(type_obj, name):
@@ -1068,7 +1070,7 @@ def test_struct_show_follows_typedef_to_underlying_struct(monkeypatch):
         _FakeType("struct", width=0x10, members=[_FakeMember(0x0, "data", "uint8_t[16]")]),
         "_AnonymousBody",
     )
-    alias = _TypedefRef("struct _AnonymousBody", body)
+    alias = _TypedefRef("_AnonymousBody")
     bv = _FakeBV(types_={"AliasName": alias, "_AnonymousBody": body})
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
 
@@ -1084,16 +1086,15 @@ def test_struct_show_follows_typedef_to_underlying_struct(monkeypatch):
 
 
 def test_struct_show_follows_a_typedef_chain(monkeypatch):
-    """A typedef of a typedef resolves through every hop to the struct body
-    (BN's `.target()` may itself hand back another NamedTypeReference)."""
+    """A typedef of a typedef resolves one registered reference at a time."""
     bridge = _load_bridge(monkeypatch)
     ctx = bridge.BinaryNinjaBridge().ctx
     body = _registered(
         _FakeType("struct", width=0x4, members=[_FakeMember(0x0, "hp", "int32_t")]),
         "_Body",
     )
-    mid = _TypedefRef("struct _Body", body)
-    outer = _TypedefRef("MidAlias", mid)
+    mid = _TypedefRef("_Body")
+    outer = _TypedefRef("MidAlias")
     bv = _FakeBV(types_={"OuterAlias": outer, "MidAlias": mid, "_Body": body})
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
 
@@ -1106,20 +1107,19 @@ def test_struct_show_distinguishes_scalar_from_an_unfollowable_alias(monkeypatch
     """Two different failures must not share one misleading message: an alias
     that WAS followed to a scalar is genuinely not struct-like, while an alias
     whose chain cannot be followed at all (self-referential here, and the same
-    path covers a raised target()) must say so and name the reason (#674 review:
+    path covers a raised lookup) must say so and name the reason (#674 review:
     the previous assertion pinned both to 'not a struct-like type')."""
     bridge = _load_bridge(monkeypatch)
     ctx = bridge.BinaryNinjaBridge().ctx
     scalar = _FakeType("int32_t", type_class="IntegerTypeClass")
-    broken = _TypedefRef("RaisingAlias", None)
+    broken = _TypedefRef("MissingBody", type_id="broken-id")
 
-    def _raise(bv):
+    def _raise(type_id):
         raise RuntimeError("symbol resolution failed")
 
-    broken.target = _raise
-    loop = _TypedefRef("SelfAlias", None)
-    loop._target = loop                      # pathological self-referential typedef
+    loop = _TypedefRef("SelfAlias")
     bv = _FakeBV(types_={"TileCount": scalar, "SelfAlias": loop, "RaisingAlias": broken})
+    bv.get_type_by_id = _raise
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
 
     # (i) a followed scalar keeps the original, accurate message.
@@ -1138,6 +1138,67 @@ def test_struct_show_distinguishes_scalar_from_an_unfollowable_alias(monkeypatch
     assert "RaisingAlias" in str(raised.value)
     assert "not a struct-like type" not in str(raised.value)
     assert "resolve" in str(raised.value).lower()
+
+
+@pytest.mark.parametrize("lookup_kind", ["id", "name"])
+@pytest.mark.parametrize("hops, cyclic", [(16, False), (17, False), (2, True)],
+                         ids=["at-budget", "over-budget", "short-cycle"])
+def test_struct_show_typedef_budget_counts_real_lookups(monkeypatch, lookup_kind, hops, cyclic):
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    body = _registered(
+        _FakeType("struct", width=4, members=[_FakeMember(0, "value", "int32_t")]),
+        "_Body",
+    )
+
+    def reference(index):
+        # IDs, not display names, distinguish native references. Name-only
+        # references instead use the referenced name as their stable identity.
+        return (_TypedefRef("same_display_name", type_id=f"id-{index}")
+                if lookup_kind == "id" else _TypedefRef(f"ref-{index}"))
+
+    lookups = []
+
+    def lookup(key):
+        lookups.append(key)
+        # Keep a regressed recursive target() bounded without relying on Python's
+        # recursion limit. The assertions below enforce the actual 16/2 bounds.
+        if len(lookups) > 32:
+            raise RuntimeError("synthetic lookup safety limit exceeded")
+        index = int(key.rsplit("-", 1)[1])
+        if index + 1 == hops:
+            return reference(0) if cyclic else body
+        return reference(index + 1)  # a fresh wrapper on EVERY visit, like BN
+
+    bv = _FakeBV(types_={"Alias": reference(0)})
+    if lookup_kind == "id":
+        bv.get_type_by_id = lookup
+    else:
+        bv.get_type_by_name = lambda name: bv.types["Alias"] if name == "Alias" else lookup(name)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    if hops == 16:
+        entry = bridge.read_types._type_info(ctx, None, "Alias", require_struct=True)
+        assert entry["name"] == "_Body"
+        assert [member["name"] for member in entry["members"]] == ["value"]
+    else:
+        with pytest.raises(RuntimeError, match="cyclic" if cyclic else "longer than"):
+            bridge.read_types._type_info(ctx, None, "Alias", require_struct=True)
+    assert len(lookups) == (2 if cyclic else 16)
+
+
+def test_struct_show_does_not_resolve_a_missing_id_by_display_name(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    # A same-named body does not satisfy a reference to a different/missing ID.
+    alias = _TypedefRef("Body", type_id="missing-id")
+    body = _FakeType("struct", width=4, members=[_FakeMember(0, "value", "int32_t")])
+    bv = _FakeBV(types_={"Alias": alias, "Body": body})
+    bv.get_type_by_id = lambda type_id: None
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="Could not resolve typedef"):
+        bridge.read_types._type_info(ctx, None, "Alias", require_struct=True)
 
 
 def _nested_anonymous_aggregate(levels: int):

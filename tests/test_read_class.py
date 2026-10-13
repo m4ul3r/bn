@@ -6,7 +6,10 @@ import types
 
 import pytest
 
-from _bridge_fakes import _FakeArch, _FakeBV, _FakeConstPtr, _FakeLLILInstruction, _FakeSection
+from _bridge_fakes import (
+    _FakeArch, _FakeBV, _FakeConstPtr, _FakeFunction, _FakeLLILInstruction,
+    _FakeSection, _FakeSegment,
+)
 
 read_class = importlib.import_module("bn_agent_bridge.read_class")
 seam = importlib.import_module("bn_agent_bridge.seam")
@@ -773,18 +776,18 @@ def test_resolve_class_names_cross_namespace_leaf():
 def test_class_list_envelope_filters_and_pages():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True)
     assert out["kind"] == "classes" and "classes" not in out  # #275: items-only
     assert out["returned"] == len(out["items"])
     assert out["has_more"] is False
     names = [c["name"] for c in out["items"]]
     assert "net::Session" in names and out["total"] == len(names)
     # Default (no --all) drops name-only clusters like the bare "net" namespace.
-    confirmed = read_class._class_list(_Ctx(), None, include_all=False)
+    confirmed = read_class._class_list(_Ctx(None), None, include_all=False)
     assert "net" not in [c["name"] for c in confirmed["items"]]
     assert "net::Session" in [c["name"] for c in confirmed["items"]]
 
@@ -792,11 +795,11 @@ def test_class_list_envelope_filters_and_pages():
 def test_class_list_envelope_has_more_when_paged():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, limit=1)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, limit=1)
     assert out["kind"] == "classes" and "classes" not in out
     assert out["limit"] == 1
     assert out["returned"] == 1
@@ -829,11 +832,11 @@ def test_class_list_no_stl_filters_library_classes():
     syms = [_Sym("_ZTVN3net7SessionE", "_vtable_for_net::Session", 0x9000)]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, no_stl=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, no_stl=True)
     names = [c["name"] for c in out["items"]]
     assert "net::Session" in names
     assert "std::vector<int>" not in names
@@ -841,7 +844,7 @@ def test_class_list_no_stl_filters_library_classes():
     assert out["no_stl"] is True
     assert out["library_suppressed"] >= 2
     # Without --no-stl the library classes are present.
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert "std::vector<int>" in [c["name"] for c in full["items"]]
     assert full["library_suppressed"] == 0
 
@@ -857,7 +860,7 @@ def test_class_list_populates_bases_for_shown_rows():
     ]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
@@ -866,7 +869,7 @@ def test_class_list_populates_bases_for_shown_rows():
                 return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
             return []
 
-    out = read_class._class_list(_Ctx(), None)
+    out = read_class._class_list(_Ctx(None), None)
     row = next(c for c in out["items"] if c["name"] == "net::Session")
     assert row["bases"] == ["net::Endpoint"]
 
@@ -1148,6 +1151,7 @@ def test_class_show_assembles_full_record():
     class _ShowCtx:
         _find_function = seam.BridgeContext._find_function
         _sections_at = seam.BridgeContext._sections_at
+        _read_pointer_value = seam.BridgeContext._read_pointer_value
 
         def _resolve_view(self, sel):
             return bv
@@ -1286,13 +1290,13 @@ def test_class_show_detects_thunks_only_for_requested_class(monkeypatch, class_m
 def test_class_show_unknown_name_errors_with_hint():
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
     import pytest
     with pytest.raises(read_class.OperationFailure) as exc:
-        read_class._class_show(_Ctx(), None, "net::Nope")
+        read_class._class_show(_Ctx(None), None, "net::Nope")
     assert "class list" in str(exc.value).lower()
 
 
@@ -1300,13 +1304,13 @@ def test_class_show_unknown_name_suggests_close_matches():
     # #413: a near-miss should point at the real class name, not just "run class list".
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
     import pytest
     with pytest.raises(read_class.OperationFailure) as exc:
-        read_class._class_show(_Ctx(), None, "net::Sesion")  # typo of net::Session
+        read_class._class_show(_Ctx(None), None, "net::Sesion")  # typo of net::Session
     msg = str(exc.value)
     assert "did you mean" in msg.lower()
     assert "net::Session" in msg
@@ -1476,14 +1480,14 @@ def test_class_list_count_only_484():
     # non-class artifact_count, without building/paging rows.
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    out = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    out = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     assert out["kind"] == "classes"
     assert "items" not in out and "count" in out
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert out["count"] == full["total"]                 # count matches the full listing
     assert out["total"] == full["total"]
     assert "artifact_count" in out and out["artifact_count"] >= 0
@@ -1502,11 +1506,11 @@ def test_class_list_labels_non_class_rtti_artifacts_481():
     ]
     bv = _RegistryBV(fns, syms)
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    rows = {r["name"]: r for r in read_class._class_list(_Ctx(), None, include_all=True)["items"]}
+    rows = {r["name"]: r for r in read_class._class_list(_Ctx(None), None, include_all=True)["items"]}
     assert rows["net::Session"]["artifact"] is False           # real class (ctor + vtable)
     artifacts = [r for r in rows.values() if r["artifact"]]
     assert artifacts                                            # the function-type typeinfo row
@@ -2333,21 +2337,21 @@ def test_class_list_discloses_quick_analysis_state():
     bridge_state = importlib.import_module("bn_agent_bridge.bridge_state")
     bv = _make_registry_bv()
 
-    class _Ctx:
+    class _Ctx(seam.BridgeContext):
         def _resolve_view(self, sel):
             return bv
 
-    full = read_class._class_list(_Ctx(), None, include_all=True)
+    full = read_class._class_list(_Ctx(None), None, include_all=True)
     assert full["analysis_state"] == "full"
     assert full["partial"] is False
-    full_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    full_count = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     assert full_count["analysis_state"] == "full"
     assert full_count["partial"] is False
 
     bridge_state._quick_loaded_views.add(bv)
     try:
-        quick = read_class._class_list(_Ctx(), None, include_all=True)
-        quick_count = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+        quick = read_class._class_list(_Ctx(None), None, include_all=True)
+        quick_count = read_class._class_list(_Ctx(None), None, include_all=True, count_only=True)
     finally:
         bridge_state._quick_loaded_views.discard(bv)
 
@@ -2588,6 +2592,7 @@ def _declared_bv(_also_in_type_table=None, **types_):
     catch the lens reading the wrong one."""
     bv = _make_registry_bv()
     bv.types = dict(types_, **(_also_in_type_table or {}))
+    bv.get_type_by_name = lambda name: bv.types.get(str(name))
     bv.user_type_container = _FakeTypeContainer(dict(types_))
     return bv
 
@@ -2996,22 +3001,10 @@ def test_a_declared_typedef_of_a_struct_is_still_a_class_675(monkeypatch):
     on the ALIAS's own kind would leave `class show Widget` answering only for
     the internal `_Widget`, so the kind test follows the chain -- and a chain
     that terminates at an enum is still refused."""
-    class _Alias:
-        type_class = 11         # NamedTypeReferenceClass
-
-        def __init__(self, target, width=0x10):
-            self._target = target
-            self.width = width
-
-        def target(self, bv):
-            return self._target
-
-        def __str__(self):
-            return "alias"
-
-    bv = _declared_bv(Widget=_Alias(_DeclaredType(name="_Widget")),
-                      Color=_Alias(_DeclaredKind("_Color", 5, "enum _Color")),
-                      Broken=_Alias(None))
+    bv = _declared_bv(
+        _also_in_type_table={"_Widget": _DeclaredType(name="_Widget"),
+                            "_Color": _DeclaredKind("_Color", 5, "enum _Color")},
+        Widget=_AliasTo("_Widget"), Color=_AliasTo("_Color"), Broken=_AliasTo(None))
     ctx = _declared_ctx(monkeypatch, bv)
 
     out = read_class._class_show(ctx, None, "Widget")
@@ -3087,13 +3080,10 @@ class _AliasTo:
     type_class = 11             # NamedTypeReferenceClass
     width = 0
 
-    def __init__(self, target, decl="typedef struct _W W", name=None):
-        self._target = target
+    def __init__(self, name, decl="typedef struct _W W"):
         self._decl = decl
-        self.name = name if name is not None else getattr(target, "name", None)
-
-    def target(self, bv):
-        return self._target
+        self.name = name
+        self.type_id = ""
 
     def __str__(self):
         return self._decl
@@ -3125,7 +3115,7 @@ def test_a_declared_alias_reports_the_STRUCTURE_it_resolves_to_675(monkeypatch):
     convention, not two."""
     body = _StructBody(width=0x30, members=[
         types.SimpleNamespace(offset=0, name="a", type="int32_t")])
-    bv = _declared_bv(W=_AliasTo(body))
+    bv = _declared_bv(_also_in_type_table={body.name: body}, W=_AliasTo(body.name))
     ctx = _declared_ctx(monkeypatch, bv)
 
     out = read_class._class_show(ctx, None, "W")
@@ -3146,7 +3136,7 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
     kind it NAMES.
 
     Measured on BN 6.1: a NAMESPACED anonymous typedef --
-    `namespace n { typedef struct { ... } Q; }` -- reads `target(bv)` of None,
+    `namespace n { typedef struct { ... } Q; }` -- has an unresolved body,
     as does any alias whose body is defined without it, while the alias itself
     states `named_type_class = StructNamedTypeClass` and a width of its own.
     Refusing on an unresolvable target alone therefore dropped a common way a
@@ -3154,7 +3144,7 @@ def test_an_UNRESOLVABLE_alias_is_admitted_on_the_kind_it_NAMES_675(monkeypatch)
 
     So an unfollowable reference is admitted on the kind it NAMES, with the
     facts it does carry, and an enum alias in the identical shape is still
-    refused. The round-3 fixture could not see this: its `target()` resolved,
+    refused. The round-3 fixture could not see this: its target resolved,
     which made it more forgiving than BN."""
     unresolvable_struct = _AliasTo(None, decl="struct _T T")
     unresolvable_struct.width = 0x10
@@ -3227,21 +3217,21 @@ def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
 
     plain, pointed, arrayed = body("_T"), body("_P", 0x4), body("anonymous_0", 0x4)
     qualified, orphan, glib = body("n::_Q", 0x8), body("_T1", 0x8), body("_X", 0x8)
-    bv = _declared_bv(**{
+    bv = _declared_bv(_also_in_type_table={"NamedT1": body("NamedT1")}, **{
         # the plain declarator: alias -> the body BN named for it
-        "T": _AliasTo(plain, decl="struct _T T"), "_T": plain,
+        "T": _AliasTo("_T", decl="struct _T T"), "_T": plain,
         # a POINTER declarator: nothing resolvable reaches `_P`
         "P": _DeclaredKind("P", 6, "struct _P *", width=8), "_P": pointed,
         # an ARRAY declarator, under BN's own anonymous spelling
         "A": _DeclaredKind("A", 7, "struct anonymous_0 [4]", width=0x10),
         "anonymous_0": arrayed,
         # NAMESPACED: BN puts the underscore on the LEAF
-        "n::Q": _AliasTo(qualified, decl="struct n::_Q n::Q"), "n::_Q": qualified,
+        "n::Q": _AliasTo("n::_Q", decl="struct n::_Q n::Q"), "n::_Q": qualified,
         # an ORPHANED body: its alias was re-declared onto a named struct
-        "T1": _AliasTo(body("NamedT1"), decl="struct NamedT1 T1"), "_T1": orphan,
+        "T1": _AliasTo("NamedT1", decl="struct NamedT1 T1"), "_T1": orphan,
         # the GLib/GTK idiom -- the user WROTE `_X`, and the heuristic could
         # never have known that
-        "_X": glib, "X": _AliasTo(glib, decl="struct _X X"),
+        "_X": glib, "X": _AliasTo("_X", decl="struct _X X"),
     })
     ctx = _declared_ctx(monkeypatch, bv)
 
@@ -4354,3 +4344,294 @@ def test_import_slot_test_reads_only_the_sections_922():
     assert read_class._typeinfo_is_import_slot(_Ctx(), bv, 0x9400) is True
     assert read_class._typeinfo_is_import_slot(_Ctx(), bv, 0x9100) is False
     assert _Ctx.calls == [0x9400, 0x9100]
+
+
+# --- #935: stripped primary-vtable symbols name the slot array, not the head ---
+
+
+def _slot_array_bv(ptr=8):
+    return _FakeBV(
+        symbols=[
+            _Sym("_vtable_for_svc::Codec", "vtable for svc::Codec", 0x9000 + 2 * ptr),
+            _Sym("_typeinfo_for_svc::Codec", "typeinfo for svc::Codec", 0x9100),
+            _Sym("_ZTVN10__cxxabiv117__class_type_infoE",
+                 "vtable for __cxxabiv1::__class_type_info", 0x9800,
+                 "SymbolType.ExternalSymbol"),
+        ],
+        memory={
+            0x9000: b"".join(w.to_bytes(ptr, "little")
+                             for w in (0, 0x9100, 0x400000, 0, 0, 0xdead, 0x400020)),
+            0x9100: (0x9800 + 2 * ptr).to_bytes(ptr, "little"),
+        },
+        arch=_FakeArch(name="x86_64" if ptr == 8 else "x86", address_size=ptr),
+    )
+
+
+def _slot_array_global_bv(ptr=8):
+    """Byte-backed table and globals referencing its head, vptr and next slot."""
+    bv = _slot_array_bv(ptr)
+    bv._memory[0x9000] += (0x9100).to_bytes(ptr, "little")  # next-object boundary
+    bv.functions = [_FakeFunction(a, f"sub_{a:x}") for a in (0x400000, 0x400020)]
+    bv._symbols.append(_Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0xdead,
+                            "SymbolType.ExternalSymbol"))
+    bv._data_refs = {0x9100: [0x9000 + ptr]}
+    for address, name, value in (
+        (0xa000, "global_codec", 0x9000 + 2 * ptr),
+        (0xa010, "head_pointer", 0x9000),
+        (0xa020, "later_slot_pointer", 0x9000 + 4 * ptr),
+    ):
+        bv._symbols.append(_Sym(name, name, address))
+        bv._memory[address] = value.to_bytes(ptr, "little")
+        bv._data_refs[value] = [address]
+    bv.sections = {
+        ".text": _FakeSection(".text", 0x400000, 0x401000, "ReadOnlyCodeSectionSemantics"),
+        ".data.rel.ro": _FakeSection(".data.rel.ro", 0x9000, 0xa100),
+        ".extern": _FakeSection(".extern", 0xdead, 0xdeae),
+    }
+    bv._segments = {
+        0x400000: _FakeSegment(start=0x400000, end=0x401000, executable=True),
+        0x9000: _FakeSegment(start=0x9000, end=0xa100),
+        0xdead: _FakeSegment(start=0xdead, end=0xdeae),
+    }
+    bv.user_type_container = types.SimpleNamespace(types={})
+    return bv
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("symbol_position", ["head", "slots", "absent"])
+def test_class_show_stored_global_uses_address_point_935(monkeypatch, ptr, symbol_position):
+    bv = _slot_array_global_bv(ptr)
+    if symbol_position == "head":
+        bv._symbols[0].address = 0x9000
+    elif symbol_position == "absent":
+        bv._symbols.pop(0)  # typeinfo backwalk must use the same address point
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9000"
+    assert [slot["address"] for slot in card["vtable"]["slots"]] == [
+        "0x400000", "0x0", "0x0", "0xdead", "0x400020"]
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
+    assert card["instances"]["stored_globals_truncated"] is False
+
+
+def test_stored_global_keeps_proven_address_point_when_slots_unreadable_935(monkeypatch):
+    bv = _slot_array_global_bv()
+    bv._memory[0x9000] = bv._memory[0x9000][:16]  # only the header is readable
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9000"
+    assert card["vtable"]["truncated_reason"] == "unreadable_row"
+    assert card["vtable"]["slots"] == []
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
+
+
+@pytest.mark.parametrize("refusal", [
+    "unreadable_offset", "nonzero_offset", "unresolved_typeinfo", "import_alias", "got",
+])
+def test_stored_global_does_not_offset_an_unproven_vtable_935(monkeypatch, refusal):
+    bv = _slot_array_global_bv()
+    if refusal == "unreadable_offset":
+        bv._memory[0x9008] = bv._memory.pop(0x9000)[8:]
+    elif refusal == "nonzero_offset":
+        bv._memory[0x9000] = _le64(8) + bv._memory[0x9000][8:]
+    elif refusal == "unresolved_typeinfo":
+        bv._symbols.pop(1)
+    elif refusal == "import_alias":
+        bv._symbols[0].type = "SymbolType.ImportAddressSymbol"
+    else:
+        bv.sections[".got"] = _FakeSection(".got", 0x9010, 0x9018)
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    # A registry entry alone does not authorize the adjustment either.
+    record = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    assert ctx._global_vtable_stores(bv, record) == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    card = read_class._class_show(ctx, None, "svc::Codec")
+
+    assert card["vtable"]["address"] == "0x9010"
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+    assert card["vtable"]["slots"] == []
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"}]
+    assert card["instances"]["stored_globals_total"] == 1
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("marker", ["vtable for ", "_vtable_for_"])
+def test_registry_normalizes_a_proven_slot_array_symbol_935(ptr, marker):
+    bv = _slot_array_bv(ptr)
+    sym = bv._symbols[0]
+    sym.short_name = marker + "svc::Codec"
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9000"
+    assert rec["typeinfo"]["address"] == "0x9100"
+    assert sym.address == 0x9000 + 2 * ptr  # read-only: BN's symbol is untouched
+
+
+@pytest.mark.parametrize("secondary", [False, True])
+def test_slot_array_symbol_preserves_slots_and_secondary_provenance_935(monkeypatch, secondary):
+    rows = {0: _code_row(0), 1: _null_row(1), 2: _null_row(2),
+            3: _extern_row(3, 0xdead), 4: _code_row(4), 5: _data_row(5)}
+    if secondary:
+        rows.update({
+            5: {"readable": True, "value": hex((1 << 64) - 8),
+                "target": {"status": "unmapped"}},
+            6: _data_row(6, 0x9100), 7: _code_row(7), 8: _code_row(8),
+            9: _data_row(9),
+        })
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_pointer_table_layout", _WindowCtx(rows)._pointer_table_layout)
+    cards = []
+    for symbol_address in (0x9000, 0x9010):
+        bv = _slot_array_bv()
+        bv._symbols[0].address = symbol_address
+        bv._symbols.append(_Sym("__cxa_pure_virtual", "__cxa_pure_virtual", 0xdead,
+                                "SymbolType.ExternalSymbol"))
+        bv._data_refs = {0x9100: [0x9008]}
+        if secondary:
+            bv._memory[0x9038] = _le64((1 << 64) - 8, 0x9100)
+            bv._data_refs[0x9100].append(0x9040)
+            bv._symbols.append(_Sym("_vtable_for_svc::Codec{for `svc::Source'}",
+                                    "vtable for svc::Codec{for `svc::Source'}", 0x9048))
+        rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+        cards.append(read_class._enrich(ctx, bv, rec))
+    symbolized, stripped = cards
+    assert stripped["vtable"] == symbolized["vtable"]
+    vt = stripped["vtable"]
+    assert vt["address"] == "0x9000"
+    assert vt["total"] == 5 and vt["scan_truncated"] is False
+    assert [s["address"] for s in vt["slots"]] == [
+        "0x400000", "0x0", "0x0", "0xdead", "0x400020"]
+    assert [s.get("null", False) for s in vt["slots"]] == [False, True, True, False, False]
+    assert vt["slots"][3]["pure_virtual"] is True
+    assert "typeinfo_backwalk" not in vt  # normalized symbol, not backwalk recovery
+    if secondary:
+        assert stripped["secondary_vtables"] == symbolized["secondary_vtables"]
+        (table,) = stripped["secondary_vtables"]
+        assert table["address"] == "0x9038" and table["offset_to_top"] == -8
+        assert table["typeinfo_backwalk"] is True
+        assert table["confidence"] == "rtti"
+        assert table["confidence_reason"] == "bn_vtable_group"
+        assert [s["address"] for s in table["slots"]] == ["0x400038", "0x400040"]
+    else:
+        assert "secondary_vtables" not in stripped
+
+
+@pytest.mark.parametrize("offset_to_top", [None, 8, 0xffff0000, (1 << 64) - 8])
+def test_slot_array_symbol_requires_a_readable_primary_offset_935(offset_to_top):
+    bv = _slot_array_bv()
+    if offset_to_top is None:
+        bv._memory = {0x9008: _le64(0x9100, 0x400000, 0)}
+    else:
+        bv._memory[0x9000] = _le64(offset_to_top, 0x9100, 0x400000, 0)
+    ctx = seam.BridgeContext(None)
+    rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+    card = read_class._enrich(ctx, bv, rec)
+    assert card["vtable"]["slots"] == []
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+    assert "secondary_vtables" not in card
+
+
+@pytest.mark.parametrize("typeinfo_marker", [
+    "typeinfo for svc::Other", "vtable for svc::Codec", "typeinfo name for svc::Codec", "",
+])
+def test_slot_array_symbol_requires_typeinfo_for_the_same_class_935(typeinfo_marker):
+    bv = _slot_array_bv()
+    bv._symbols[1].short_name = typeinfo_marker
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("symbol_index", [0, 1])
+@pytest.mark.parametrize("symbol_type", read_class._ALIAS_SYMBOL_TYPES)
+def test_slot_array_symbol_refuses_import_aliases_935(symbol_index, symbol_type):
+    bv = _slot_array_bv()
+    bv._symbols[symbol_index].type = f"SymbolType.{symbol_type}"
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("got_address", [0x9000, 0x9008, 0x9010, 0x9100])
+def test_slot_array_symbol_refuses_got_words_without_alias_symbols_935(got_address):
+    bv = _slot_array_bv()
+    bv.sections = {".got": _FakeSection(".got", got_address, got_address + 8)}
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+def test_slot_array_normalization_preserves_an_existing_object_head_935():
+    bv = _slot_array_bv()
+    # Two adjacent plausible headers: the existing symbol's own header wins.
+    bv._memory[0x9000] = _le64(0, 0x9100, 0, 0x9100, 0x400000)
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == "0x9010"
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("extra_candidate", [False, True])
+def test_construction_address_point_is_not_a_complete_table_945(ptr, extra_candidate):
+    bv = _slot_array_bv(ptr)
+    bv._symbols.append(_Sym("abi_vmi", "vtable for __cxxabiv1::__vmi_class_type_info", 0x9900))
+    bv._symbols.append(_Sym("base_ti", "typeinfo for svc::VirtualBase", 0x9200))
+    bv._memory[0x9100] = (
+        (0x9900 + 2 * ptr).to_bytes(ptr, "little") + bytes(ptr)
+        + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        + (0x9200).to_bytes(ptr, "little") + (3).to_bytes(ptr, "little")
+    )
+    bv._memory[0x9200] = (0x9800 + 2 * ptr).to_bytes(ptr, "little")
+    if extra_candidate:
+        bv._symbols.append(_Sym("complete_slots", "vtable for svc::Codec", 0x9400 + 2 * ptr))
+        bv._memory[0x9400] = b"".join(
+            w.to_bytes(ptr, "little") for w in (0, 0x9100, 0x400020, 0))
+    ctx = seam.BridgeContext(None)
+    rec = read_class._build_class_registry(ctx, bv)["svc::Codec"]
+    card = read_class._enrich(ctx, bv, rec)
+    assert card["vtable"]["address"] == hex(0x9000 + 2 * ptr)
+    assert card["vtable"]["slots"] == []
+    assert card["vtable"]["truncated_reason"] == "no_local_vtable_body"
+
+
+@pytest.mark.parametrize("ancestry", [
+    "nonvirtual", "virtual", "unresolved", "import", "got",
+    "unknown_selector", "unreadable_base", "unreadable_flags",
+])
+def test_normalization_requires_proven_transitive_nonvirtual_ancestry_945(ancestry):
+    bv = _slot_array_bv()
+    bv._symbols.extend([
+        _Sym("abi_si", "vtable for __cxxabiv1::__si_class_type_info", 0x9900),
+        _Sym("abi_vmi", "vtable for __cxxabiv1::__vmi_class_type_info", 0x9a00),
+        _Sym("middle_ti", "typeinfo for svc::Middle", 0x9200),
+        _Sym("base_ti", "typeinfo for svc::Base", 0x9300),
+    ])
+    bv._memory[0x9100] = _le64(0x9910, 0, 0x9200)
+    bv._memory[0x9200] = (
+        _le64(0x9a10, 0) + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        + _le64(0x9300, 3 if ancestry == "virtual" else 2)
+    )
+    bv._memory[0x9300] = _le64(0x9810, 0)
+    if ancestry == "unresolved":
+        bv._symbols.pop()
+    elif ancestry == "import":
+        bv._symbols[-1].type = "SymbolType.ImportedDataSymbol"
+    elif ancestry == "got":
+        bv.sections = {".got": _FakeSection(".got", 0x9300, 0x9308)}
+    elif ancestry == "unknown_selector":
+        bv._memory[0x9300] = _le64(0xdead, 0)
+    elif ancestry == "unreadable_base":
+        bv._memory[0x9200] = bv._memory[0x9200][:24]
+    elif ancestry == "unreadable_flags":
+        bv._memory[0x9200] = bv._memory[0x9200][:32]
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == ("0x9000" if ancestry == "nonvirtual" else "0x9010")

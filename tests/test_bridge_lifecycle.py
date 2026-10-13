@@ -957,6 +957,7 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     Direction 2 is red on the pre-fix base (#799); direction 1 is red on a
     one-shot that never re-arms.
     """
+    import socket
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
 
@@ -964,7 +965,13 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     reowner = _live_bridge(module, "rearm1")
     reowner.stop()
     reowner.start()  # the same object binds the path again
-    assert _socket_answers(reowner.socket_path), "the rebind is not serving"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect(str(reowner.socket_path))
+        _send_lifecycle_request(client, reowner, "list_targets")
+        response = _read_lifecycle_response(client)
+    assert response["ok"] is True, response
+    assert response["result"] == []
     reowner.stop()
     assert not reowner.socket_path.exists(), (
         "the stop() that ended the rebind left that bind's own socket behind"
@@ -988,6 +995,361 @@ def test_stop_removes_only_the_files_of_the_bind_it_is_ending(monkeypatch, tmp_p
     assert log_path.read_text(encoding="utf-8") == "successor serving\n"
 
     successor.stop()
+
+
+def _send_lifecycle_request(client, instance, op="blocked", *, idle_probe=False):
+    client.sendall(json.dumps({
+        "op": op, "_bridge_identity": instance.bridge_identity,
+        "idle_probe": idle_probe,
+    }).encode() + b"\n")
+
+
+def _read_lifecycle_response(client):
+    with client.makefile("rb") as stream:
+        return json.loads(stream.read())
+
+
+@pytest.mark.parametrize("idle_probe", [False, True])
+def test_rebind_does_not_readmit_a_request_on_the_old_listener(
+        monkeypatch, tmp_path, idle_probe):
+    import socket
+    import threading
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    instance = _live_bridge(module, "old-listener")
+    old_server = instance._server
+    accepted = threading.Event()
+    setup = module.BridgeHandler.setup
+
+    def observe_setup(handler):
+        setup(handler)
+        if handler.server is old_server:
+            accepted.set()
+
+    monkeypatch.setattr(module.BridgeHandler, "setup", observe_setup)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(instance.socket_path))
+            assert accepted.wait(5)
+            instance.stop()
+            instance.start()
+            before = module.time.monotonic() - 60
+            instance._last_activity = before
+            _send_lifecycle_request(
+                client, instance, "list_targets", idle_probe=idle_probe)
+            response = _read_lifecycle_response(client)
+            assert response["ok"] is False
+            assert response["error"] == "bridge is shutting down"
+            if idle_probe:
+                assert instance._last_activity == before
+            else:
+                assert instance._last_activity > before
+            assert instance._try_idle_shutdown(
+                now=module.time.monotonic(), timeout=30) is idle_probe
+    finally:
+        instance.stop()
+
+
+@pytest.mark.parametrize("pause_at", ["dispatch", "response"])
+def test_stop_drains_requests_through_response_and_refuses_new_work(
+    monkeypatch, tmp_path, pause_at
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+    second_accepted = threading.Event()
+    listener_stopped = threading.Event()
+    accepted = 0
+    accepted_lock = threading.Lock()
+    dispatched = []
+    original_handle = module.BridgeHandler.handle
+    original_write = module.BridgeHandler._write_response
+
+    def handle(handler):
+        nonlocal accepted
+        with accepted_lock:
+            accepted += 1
+            if accepted == 2:
+                second_accepted.set()
+        original_handle(handler)
+
+    def dispatch(payload):
+        dispatched.append(payload["op"])
+        if pause_at == "dispatch":
+            started.set()
+            assert release.wait(10)
+        return {"ok": True, "result": {"completed": True}}
+
+    def write_response(handler, encoded, **kwargs):
+        if pause_at == "response" and kwargs.get("op") == "blocked":
+            started.set()
+            assert release.wait(10)
+        original_write(handler, encoded, **kwargs)
+
+    monkeypatch.setattr(module.BridgeHandler, "handle", handle)
+    monkeypatch.setattr(module.BridgeHandler, "_write_response", write_response)
+    inst = _live_bridge(module, "drain1")
+    monkeypatch.setattr(inst, "dispatch", dispatch)
+    original_shutdown = inst._server.shutdown
+
+    def shutdown():
+        original_shutdown()
+        listener_stopped.set()
+
+    monkeypatch.setattr(inst._server, "shutdown", shutdown)
+    verdicts = []
+    stopper = threading.Thread(
+        target=lambda: verdicts.append(inst.stop(request_drain_timeout=5)),
+        daemon=True,
+    )
+    with socket.socket(socket.AF_UNIX) as client, socket.socket(socket.AF_UNIX) as late:
+        client.settimeout(5)
+        late.settimeout(5)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert started.wait(5)
+            # Accepted before shutdown, but not admitted until after it latched.
+            late.connect(str(inst.socket_path))
+            assert second_accepted.wait(5)
+            stopper.start()
+            assert listener_stopped.wait(5)
+            assert stopper.is_alive()
+            assert inst.registry_path.exists()
+            assert inst.socket_path.exists()
+            _send_lifecycle_request(late, inst, "late")
+            assert _read_lifecycle_response(late)["ok"] is False
+            assert dispatched == ["blocked"]
+            release.set()
+            assert _read_lifecycle_response(client)["result"] == {"completed": True}
+            stopper.join(5)
+            assert not stopper.is_alive()
+            assert verdicts == [{
+                "requests_drained": True, "unfinished_requests": 0,
+                "request_drain_timed_out": False, "caller_inflight": False,
+            }]
+            assert not inst.socket_path.exists()
+            assert not inst.registry_path.exists()
+        finally:
+            release.set()
+            if stopper.ident is not None:
+                stopper.join(5)
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+
+
+@pytest.mark.parametrize("request_drain_timeout", [0, 0.05])
+def test_stop_deadline_reports_unfinished_request_and_preserves_successor(
+    monkeypatch, tmp_path, request_drain_timeout
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "deadline1")
+    started = threading.Event()
+    release = threading.Event()
+
+    def dispatch(payload):
+        started.set()
+        assert release.wait(10)
+        inst._write_registry()  # a late completion must not republish the old owner
+        return {"ok": True, "result": "finished"}
+
+    monkeypatch.setattr(inst, "dispatch", dispatch)
+    successor = None
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert started.wait(5)
+            before = time.monotonic()
+            verdict = inst.stop(request_drain_timeout=request_drain_timeout)
+            assert time.monotonic() - before < 3
+            assert verdict == {
+                "requests_drained": False, "unfinished_requests": 1,
+                "request_drain_timed_out": True, "caller_inflight": False,
+            }
+            assert not inst.socket_path.exists()
+            successor = _live_bridge(module, "deadline1")
+            registry = successor.registry_path.read_bytes()
+            release.set()
+            assert _read_lifecycle_response(client)["result"] == "finished"
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            assert successor.registry_path.read_bytes() == registry
+            assert _socket_answers(successor.socket_path)
+        finally:
+            release.set()
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            if successor is not None:
+                successor.stop()
+
+
+def test_zero_budget_stop_can_overtake_a_drainer_without_unlinking_successor(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "forced1")
+    started = threading.Event()
+    release = threading.Event()
+    draining = threading.Event()
+    original_shutdown = inst._server.shutdown
+
+    def shutdown():
+        original_shutdown()
+        draining.set()
+
+    def dispatch(payload):
+        started.set()
+        assert release.wait(10)
+        return {"ok": True, "result": "finished"}
+
+    monkeypatch.setattr(inst._server, "shutdown", shutdown)
+    monkeypatch.setattr(inst, "dispatch", dispatch)
+    stopper = threading.Thread(
+        target=lambda: inst.stop(request_drain_timeout=5), daemon=True,
+    )
+    successor = None
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert started.wait(5)
+            stopper.start()
+            assert draining.wait(5)
+            verdict = inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            assert verdict["unfinished_requests"] == 1
+            successor = _live_bridge(module, "forced1")
+            registry = successor.registry_path.read_bytes()
+            release.set()
+            assert _read_lifecycle_response(client)["result"] == "finished"
+            stopper.join(5)
+            assert not stopper.is_alive()
+            assert successor.registry_path.read_bytes() == registry
+            assert _socket_answers(successor.socket_path)
+        finally:
+            release.set()
+            if stopper.ident is not None:
+                stopper.join(5)
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            if successor is not None:
+                successor.stop()
+
+
+def test_stop_from_request_reports_itself_unfinished_without_self_deadlock(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "selfstop1")
+    monkeypatch.setattr(inst, "dispatch", lambda payload: {
+        "ok": True, "result": inst.stop(request_drain_timeout=5),
+    })
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(2)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert _read_lifecycle_response(client)["result"] == {
+                "requests_drained": False, "unfinished_requests": 1,
+                "request_drain_timed_out": False, "caller_inflight": True,
+            }
+        finally:
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+
+
+def test_shutdown_request_closes_admission_before_stop_runs(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "admission1")
+    try:
+        for op in ("shutdown", "list_targets"):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5)
+                client.connect(str(inst.socket_path))
+                _send_lifecycle_request(client, inst, op)
+                response = _read_lifecycle_response(client)
+                assert response["ok"] is (op == "shutdown")
+    finally:
+        inst.stop()
+
+
+def test_gui_shutdown_refuses_without_retiring_the_live_bridge(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "_collect_open_views_state", lambda **kw: ([], True))
+    monkeypatch.setattr(module, "_active_binary_view", lambda: None)
+    inst = _live_bridge(module, "gui-refusal")
+    try:
+        for op in ("shutdown", "list_targets"):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5)
+                client.connect(str(inst.socket_path))
+                _send_lifecycle_request(client, inst, op)
+                response = _read_lifecycle_response(client)
+                assert response["ok"] is (op == "list_targets")
+                if op == "shutdown":
+                    assert "GUI bridges cannot shut down" in response["error"]
+        assert not inst._shutting_down
+        assert not inst._shutdown_event.is_set()
+        assert inst.socket_path.exists() and inst.registry_path.exists()
+        assert json.loads(inst.registry_path.read_text())["gui"] is True
+    finally:
+        inst.stop()
+
+
+def test_gui_main_thread_stop_never_waits_for_main_thread_handlers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = _live_bridge(module, "gui-main")
+    queued = threading.Event()
+    resume_main_thread = threading.Event()
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "is_main_thread", lambda: True)
+
+    def dispatch(payload):
+        queued.set()
+        assert resume_main_thread.wait(5)
+        return {"ok": True, "result": "main-thread-job-finished"}
+
+    def forbidden_wait(timeout):
+        pytest.fail("GUI main-thread teardown waited for a main-thread-bound handler")
+
+    monkeypatch.setattr(inst, "dispatch", dispatch)
+    monkeypatch.setattr(inst._requests_drained, "wait", forbidden_wait)
+    successor = None
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        try:
+            client.connect(str(inst.socket_path))
+            _send_lifecycle_request(client, inst)
+            assert queued.wait(5)
+            verdict = inst.stop(request_drain_timeout=10, load_join_timeout=10)
+            assert verdict == {
+                "requests_drained": False, "unfinished_requests": 1,
+                "request_drain_timed_out": False, "caller_inflight": False,
+                "request_drain_skipped": "gui_main_thread",
+            }
+            monkeypatch.setattr(module, "_collect_open_views_state", lambda **kw: ([], True))
+            monkeypatch.setattr(module, "_active_binary_view", lambda: None)
+            successor = _live_bridge(module, "gui-main")
+            registry = successor.registry_path.read_bytes()
+            resume_main_thread.set()
+            assert _read_lifecycle_response(client)["result"] == "main-thread-job-finished"
+            inst.stop()
+            assert successor.registry_path.read_bytes() == registry
+            assert _socket_answers(successor.socket_path)
+        finally:
+            resume_main_thread.set()
+            inst.stop(request_drain_timeout=0, load_join_timeout=0)
+            if successor is not None:
+                successor.stop()
 
 
 def _start_gate_bridge(monkeypatch, tmp_path, bound, *, listing=True):

@@ -1530,11 +1530,18 @@ class BridgeContext:
         return cls if kind == "typeinfo" else None
 
     def _global_vtable_stores(self, bv, record):
-        """Global data symbols whose stored value is this class's vtable addr."""
+        """Global data refs to the vtable's proven address point, else its symbol."""
         vt = record.get("vtable")
         if not vt:
             return []
         addr = int(vt["address"], 16)
+        # Enrichment decodes the layout before instance recovery. A layout that
+        # passed the Itanium header gate has its vptr address point at slot zero,
+        # not at the public object head (#935). Reuse that decision, including
+        # capped/unreadable slot scans; neither an undecoded registry entry nor
+        # no_local_vtable_body proves that two header words may be skipped.
+        if "truncated_reason" in vt and vt["truncated_reason"] != "no_local_vtable_body":
+            addr += 2 * self._pointer_size(bv)
         out = []
         getter = getattr(bv, "get_data_refs", None)
         for ref in (getter(addr) if callable(getter) else []):

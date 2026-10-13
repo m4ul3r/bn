@@ -793,6 +793,7 @@ def _session_stop(args: argparse.Namespace) -> int:
     # that unreachable process is exactly the one this command must be able to
     # stop (#694).
     inst = cli.find_lifecycle_instance(target_id)
+    _require_headless_lifecycle(inst)
     # Refuse to discard committed-but-unsaved work (M-01): `bn close` discloses
     # a discard, so a stop that silently threw the same edits away was the one
     # path that lost them without a word. A bridge that cannot be REACHED is
@@ -896,6 +897,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Lifecycle lookup (#694): a socket-less bridge is hidden from normal
     # discovery, but restarting it is a legitimate way to recover it.
     inst = cli.find_lifecycle_instance(target_id)
+    _require_headless_lifecycle(inst)
     if inst is None:
         raise BridgeError(
             f"No bridge instance found with id: {target_id}. See `bn session list`."
@@ -1042,6 +1044,20 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["discarded_unsaved"] = discarded
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures or association_error or reload_capture_failed else 0
+
+
+def _require_headless_lifecycle(inst: Any) -> None:
+    # The legacy default registry has no instance ID. New registries also
+    # declare GUI ownership explicitly, including named embedded bridges.
+    if inst is not None and (
+        inst.instance_id is None
+        or (isinstance(inst.meta, dict) and inst.meta.get("gui") is True)
+    ):
+        raise BridgeError(
+            "session stop/restart is only supported for headless sessions; "
+            "use the GUI Restart Bridge command or close Binary Ninja. "
+            "No shutdown request or process signal was sent."
+        )
 
 
 def _require_signal_delivered(reason: str | None, target_id: str) -> None:
