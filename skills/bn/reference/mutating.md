@@ -56,7 +56,7 @@ Mutations print a compact **text status line** by default. Use `--format json --
 
 ### Compact status keys
 
-This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present in the summary object except `prototype_user_type_residue`, emitted only when true, and `overlapping_functions`, emitted only when a create landed inside an existing function:
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present except `prototype_user_type_residue` (only when true), `overlapping_functions` (only for a create inside an existing function), and `go_rename` (only for Go rename):
 
 | key | meaning |
 |---|---|
@@ -65,15 +65,22 @@ This table describes the stable object from `--format json --summary`; the defau
 | `committed` | whether live apply reached commit, including all-noop; `go rename` with no candidates reports false |
 | `preview` | whether preview was requested |
 | `measured` | false when result rows or required counters cannot establish counts |
-| `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes `skipped_already_named` and `skipped_interior_pc`, so it need not equal `defined_count` and can be zero on a repeat run. |
+| `op_count` | For `go rename`, candidates plus scan-time `skipped_user_named`; excludes already-named and interior-PC scan skips. Apply-time skips are not counted twice. This need not equal `defined_count` and can be zero on a repeat run. |
 | `changed_count`, `verified_count`, `noop_count`, `failed_count` | measured counts; an unknown derived count is `null`, not zero |
 | `rolled_back` | meaningful when `committed` is false; false/null on a committed run does not mean restore ran |
 | `first_error` | first failure or measurement explanation; inspect even when `dirty_after` is false |
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 | `overlapping_functions` | the `{name, address, offset, instruction_boundary, truncated}` of each function a `function create --allow-overlap` landed inside (`truncated` says whether the host was cut at the new start or left intact); absent for an ordinary create |
+| `go_rename` | Go-only compact scan disclosure: `candidates`, `skipped_user_named`, `skipped_already_named`, `skipped_interior_pc`, and `skipped_changed_during_apply`; also rendered as a second text line |
 
-`go rename` counts through its own counters rather than one `results[]` row per rename. If a counter is missing, unreadable, or inconsistent with failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a live clean revert it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
+`go rename` counts through its own counters rather than one `results[]` row per rename. Its `noop_count` retains `skipped_user_named`, which includes `skipped_changed_during_apply`; that overlap is subtracted from `candidates + noop_count` to obtain `op_count`. Already-named and interior-PC rows are scan-only skips, disclosed separately in `go_rename` rather than added to operation counts. Those two buckets and the apply-time overlap are optional in the full result; their absence means zero, while an unreadable supplied value is unknown, not zero.
+
+A genuine zero-candidate scan explicitly reports zero verified, committed, and failed renames. Both live and preview runs then report `measured: true`, `changed_count: 0`, `verified_count: 0`, `failed_count: 0`, `dirty_after: false`, and exit 0; `committed` stays false. The additional compact scan disclosure explains an idempotent re-run or containment-only scan without changing the operation population. This describes what this call changed, not whether the view had earlier unsaved edits.
+
+Unknown fields in the compact `go_rename` disclosure remain JSON `null` and render as `?` in text, including spilled status and text output files; a measured zero still renders as `0`.
+
+If a required measurement source is missing, a supplied counter is unreadable, or a failure counter contradicts the failure rows, `measured` is false; do not trust a zero-looking `op_count` as proof nothing changed. Under a successful `--preview`, `changed_count` counts changes that would land even though the view is reverted. After a failed preview or live run whose revert completed it is zero; an incomplete revert leaves it unknown. Exit 3 for a classified failure wins over exit 4 for an unmeasured result. Read back and save before closing whenever `dirty_after` is true or the result cannot establish cleanliness.
 
 ## Batch apply
 
