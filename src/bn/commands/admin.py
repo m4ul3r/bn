@@ -793,6 +793,7 @@ def _session_stop(args: argparse.Namespace) -> int:
     # that unreachable process is exactly the one this command must be able to
     # stop (#694).
     inst = cli.find_lifecycle_instance(target_id)
+    _require_headless_lifecycle(inst)
     # Refuse to discard committed-but-unsaved work (M-01): `bn close` discloses
     # a discard, so a stop that silently threw the same edits away was the one
     # path that lost them without a word. A bridge that cannot be REACHED is
@@ -814,7 +815,6 @@ def _session_stop(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         discarded = _unsaved_targets_or_refuse("stop", target_id, rows, discard=discard)
-    _require_headless_lifecycle(inst)
     # One verified pin for the whole escalation, opened BEFORE the graceful
     # shutdown so the process this command may later signal is pinned throughout
     # (#694): the pid cannot be recycled while pinned, and both SIGTERM and
@@ -897,6 +897,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Lifecycle lookup (#694): a socket-less bridge is hidden from normal
     # discovery, but restarting it is a legitimate way to recover it.
     inst = cli.find_lifecycle_instance(target_id)
+    _require_headless_lifecycle(inst)
     if inst is None:
         raise BridgeError(
             f"No bridge instance found with id: {target_id}. See `bn session list`."
@@ -949,7 +950,6 @@ def _session_restart(args: argparse.Namespace) -> int:
     # process is stopped: the reload below reopens each target from disk, so
     # anything not saved is gone.
     discarded = _unsaved_targets_or_refuse("restart", target_id, rows, discard=discard)
-    _require_headless_lifecycle(inst)
 
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
