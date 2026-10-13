@@ -44,7 +44,8 @@ def _render_target_info_text_with_annotations(value: Any) -> str:
                  help="ID for the bridge instance to auto-spawn (alias of --instance)"),
              arg("--no-bndb", action="store_true",
                  help="Open the raw bytes: skip both an adjacent <binary>.bndb and a "
-                      "database saved to the cache"),
+                      "database saved to the cache. The cache is machine-wide; set "
+                      "BN_CACHE_DIR per agent or project to isolate them"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
                       "immediately; strings and the full function set need `bn refresh`. Never "
@@ -251,7 +252,9 @@ def _target_close(args: argparse.Namespace) -> int:
                       "<cache>/bndb/<name>.<first 16 hex of the binary's sha256>.bndb -- "
                       "<cache> is $BN_CACHE_DIR, else the user cache dir (~/.cache/bn on "
                       "Linux) -- which a later `bn load` of the same bytes restores; an "
-                      "explicit path never falls back"),
+                      "explicit path never falls back. The cache is shared by every bn "
+                      "instance using it: set BN_CACHE_DIR per agent or project to keep "
+                      "their saved analyses apart"),
              arg("--path", dest="path_flag", default=None,
                  help="Output path (alias for the positional)"),
          ])
