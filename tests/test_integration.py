@@ -3475,6 +3475,41 @@ int main(int argc, char **) {
             assert card["vtable"]["slots"] == [], card
             assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card
 
+    def test_typeinfo_backwalk_does_not_turn_vtt_entries_into_instances_945(self, shared_bn, tmp_path):
+        source = tmp_path / "vtt.cpp"
+        source.write_text("""
+struct V { virtual int v() { return 1; } };
+struct B : virtual V { virtual int b() { return 2; } };
+B global_b;
+int main() { return global_b.b(); }
+""")
+        binary = tmp_path / "vtt"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(source)],
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        result = shared_bn.json(
+            "py", "exec",
+            "from bn_agent_bridge import read_class, seam\n"
+            "ctx = seam.BridgeContext(None)\n"
+            "record = read_class._build_class_registry(ctx, bv)['B']\n"
+            "record['vtable'] = None\n"
+            "card = read_class._enrich(ctx, bv, record)\n"
+            "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
+            "var = bv.get_data_var_at(vtt.address)\n"
+            "point = int(card['vtable']['address'], 16) + 2 * bv.address_size\n"
+            "result = {'card': card, 'vtt': hex(vtt.address),\n"
+            "    'width': var.type.width if var else None,\n"
+            "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
+            "-t", target,
+        )["result"]
+        assert result["card"]["vtable"]["typeinfo_backwalk"] is True, result
+        assert result["card"]["vtable"]["slots"], result
+        assert result["vtt"] in result["refs"], result
+        assert result["card"]["instances"]["stored_globals"] == [], result
+
 
 class TestStructLayoutAssistance903:
     """Known-layout disclosure on the same real typed/untyped function."""

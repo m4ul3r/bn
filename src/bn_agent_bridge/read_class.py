@@ -1727,7 +1727,9 @@ def _has_nonvirtual_rtti_ancestry(ctx, bv, typeinfo_addr: int, ptr: int) -> bool
         vptr = ctx._read_pointer_value(bv, addr, size=ptr)
         kind = None
         if vptr:
-            for candidate in (vptr, vptr - 2 * ptr):
+            # The ABI vptr is two words past the selector's object head.
+            # An unrelated adjacent extern can occupy the exact vptr address.
+            for candidate in (vptr - 2 * ptr, vptr):
                 sym = bv.get_symbol_at(candidate)
                 name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "")
                 for abi, layout in (("__class_type_info", "base"),
