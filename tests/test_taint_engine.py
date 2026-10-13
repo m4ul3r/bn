@@ -185,6 +185,7 @@ class FBV:
     def __init__(self, addr_names, funcs=None):
         self._names = addr_names
         self._funcs = funcs or {}
+        self.arch = types.SimpleNamespace(address_size=8)
 
     def get_function_at(self, addr):
         if addr in self._funcs:
@@ -11798,3 +11799,182 @@ def test_must_stash_offset_loop_retains_initialized_entry(reverse):
     ssaf = pg.func().mlil.ssa_form
     assert engine._must_offset(
         ssaf, _stash_load(0x800, header.dest_memory), te.var_key(buf)) == 0
+
+
+@pytest.mark.parametrize("pointer_width", [4, 8])
+@pytest.mark.parametrize("load_width,delta", [(1, 0), (4, 0), (8, 0), (4, 4)])
+def test_backward_stash_reload_requires_exact_pointer_value(pointer_width, load_width, delta):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.store(_cstr(0x800), _addr_of(buf)).size = pointer_width
+    load = _stash_load(0x800, pg.mem)
+    load.size = load_width
+    if delta:
+        load.src = _plus(_cstr(0x800), _region_const(delta))
+    pg.call(_B_STRCPY, [load, _cstr(0x700)])
+    pg.sink(buf, folded=True)
+    bv = FBV(_B_NAMES)
+    bv.arch.address_size = pointer_width
+    engine = te.TaintEngine(bv, te.load_models())
+    exact = load_width == pointer_width and delta == 0
+    assert engine._must_offset(pg.func().mlil.ssa_form, load, te.var_key(buf)) == (
+        0 if exact else None)
+    result = engine.backward(pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is exact
+    assert any("written by strcpy" in step["reason"]
+               for sl in result["slices"] for step in sl["slice"])
+
+
+@pytest.mark.parametrize("operation", [
+    "MLIL_LOW_PART", "MLIL_ZX", "MLIL_SX", "MLIL_VAR_SSA_FIELD",
+    "MLIL_NEG", "MLIL_NOT", "MLIL_BOOL_TO_INT",
+])
+@pytest.mark.parametrize("location", ["value", "slot"])
+def test_must_stash_rejects_unsupported_pointer_transformations(operation, location):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    ptr = FSSA(FVar("ptr"), 1)
+    _set(pg, ptr, "ptr = &buf", _addr_of(buf))
+    value = FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr])
+    transformed = FExpr(operation, "transformed pointer", reads=[ptr], src=value)
+    transformed.size = 8
+    if location == "value":
+        writer = pg.store(_cstr(0x800), transformed)
+        load = _stash_load(0x800, pg.mem)
+    else:
+        writer = pg.store(transformed, _addr_of(buf))
+        load = FExpr("MLIL_LOAD_SSA", "load transformed slot", src=value, src_memory=pg.mem)
+        load.size = 8
+    writer.size = 8
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._must_offset(pg.func().mlil.ssa_form, load, te.var_key(buf)) is None
+
+
+@pytest.mark.parametrize("shape", ["copy", "arithmetic", "unknown_abi"])
+def test_must_offset_rejects_explicit_narrowing_and_unknown_abi(shape):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    ptr = FSSA(FVar("ptr"), 1)
+    if shape == "arithmetic":
+        expr = _region_addr(buf, 1)
+        expr.size = 4
+    elif shape == "copy":
+        _set(pg, ptr, "narrow ptr = &buf", _addr_of(buf))
+        pg.instrs[-1].size = 4
+        expr = FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr])
+    else:
+        expr = _addr_of(buf)
+    bv = FBV(_B_NAMES)
+    if shape == "unknown_abi":
+        bv.arch = None
+    assert te.TaintEngine(bv, te.load_models())._must_offset(
+        pg.func().mlil.ssa_form, expr, te.var_key(buf)) is None
+
+
+@pytest.mark.parametrize("later_read", [False, True])
+def test_backward_copied_scalar_load_uses_load_epoch(later_read):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(7), _region_const(64)])
+    ptr, value = FSSA(FVar("ptr"), 1), FSSA(FVar("value"), 1)
+    _set(pg, ptr, "ptr = &buf + 2", _region_addr(buf, 2))
+    pointer = _plus(FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr]), _region_const(3))
+    pointer.vars_read = [ptr]
+    load = FExpr("MLIL_LOAD_SSA", "byte load", reads=[ptr], src=pointer, src_memory=pg.mem)
+    load.size = 1
+    _set(pg, value, "value = byte load", load, reads=[ptr])
+    if later_read:
+        pg.call(_B_READ, [_region_const(0), _addr_of(buf), _region_const(64)])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, reasons, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert aol == []
+    assert result["slices"][0]["origin"].get("callee") == "memset"
+    assert not any("written by read" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("arrangement", ["inner_call", "outer_call"])
+@pytest.mark.parametrize("escape", [False, True])
+def test_backward_overlapping_nested_cycles_share_escape(reverse, arrangement, escape):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    if arrangement == "inner_call":
+        pg.phi(*((5, 1) if reverse else (1, 5)))
+        pg.phi(*((4, 2) if reverse else (2, 4)))
+        pg.call(_B_FILL_GLOBAL, [])
+        stash = pg.store(_cstr(0x800), _addr_of(buf) if escape else _region_const(0))
+        stash.src_memory = 3
+    else:
+        pg.phi(*((4, 1) if reverse else (1, 4)))
+        pg.call(_B_FILL_GLOBAL, [])
+        pg.phi(*((5, 3) if reverse else (3, 5)))
+        pg.store(_cstr(0x800), _addr_of(buf) if escape else _region_const(0))
+    sink = pg.sink(buf, folded=True)
+    sink.src_memory = 2
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (not escape)
+    assert bool(aol) is escape
+    assert any("may be written by fill_global" in reason for reason in reasons) is escape
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_must_offset_moving_stash_value_stops_without_budget_exhaustion(inline):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(65), _region_const(64)])
+    pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    pg.phi(2, 4)
+    load = _stash_load(0x800, 3)
+    if not inline:
+        value = FSSA(FVar("cursor"), 1)
+        _set(pg, value, "cursor = stash", load)
+        load = FExpr("MLIL_VAR_SSA", "cursor", reads=[value])
+    pg.store(_cstr(0x800), _plus(load, _region_const(1))).size = 8
+    call = pg.call(_B_STRCPY, [_stash_load(0x800, 3), _cstr(0x700)])
+    call.src_memory = 3
+    pg.sink(buf, folded=True)
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    budget = te._MemoryChainBudget()
+    assert engine._must_offset(pg.func().mlil.ssa_form, _stash_load(0x800, 3),
+                               te.var_key(buf), _budget=budget) is None
+    assert budget.remaining > 0
+    result, _, aol = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert result["stats"]["truncated"] is False
+    assert aol
+
+
+def test_local_offset_cache_retains_transient_operands(monkeypatch):
+    import weakref
+
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), _region_const(64)])
+
+    class FreshDestination:
+        def __init__(self, instruction, offset):
+            self.instruction, self.offset = instruction, offset
+
+        def __getattr__(self, name):
+            if name == "dest":
+                # An indexed destination reaches _offset rather than the keyed
+                # field-store fast path; each access creates fresh IL operands.
+                index = FSSA(FVar(f"index{self.offset}"), 0)
+                return _plus(_addr_of(buf), FExpr("MLIL_VAR_SSA", "index", reads=[index]))
+            return getattr(self.instruction, name)
+
+    for offset in (8, 16):
+        instruction = pg.store(_region_addr(buf, offset), _region_const(65))
+        instruction.size = 8
+        pg.mem_defs[pg.mem] = FreshDestination(instruction, offset)
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    original, refs = engine._must_offset, []
+
+    def observed(ssaf, expr, base_key, *args, **kwargs):
+        assert all(ref() is not None for ref in refs)
+        refs.append(weakref.ref(expr))
+        return original(ssaf, expr, base_key, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "_must_offset", observed)
+    result = engine._local_buffer_writers(
+        pg.func().mlil.ssa_form, te.var_key(buf), pg.mem,
+        region=te._BufferRegion(0, 64, "bytes"))
+    assert result["covered"] is True and result["truncated"] is False
+    assert len(refs) >= 3

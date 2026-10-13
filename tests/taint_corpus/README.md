@@ -43,6 +43,8 @@ brittle across compilers/optimisation.
 | `loop_exit.c`        | #950: exact synthetic -O1 loop with filled/unwritten exits in both source orders; cyclic memory-PHI memoization must retain an unresolved entry path |
 | `loop_escape_index.c` | loop-bottom address escape makes the next iteration's earlier helper an opaque writer; indexed scalar LOAD preserves parameter origin and caller ascent at O0. `loop_escape_index_o1.c` checks the escape at O1 |
 | `stash_must_paths.c` | do-while and conditional stash reloads must not certify the unwritten first/alternate path; a stash after a finished loop leaves it covered. O0 pointer-copy byte LOAD is covered; O1 variant checks stash paths |
+| `stash_pointer_width.c` | exact narrow/full pointer reload controls at O0/O1; partial reload plus zero-extension must not certify initialization. Copied LOAD epoch control is checked at O0; O1 may fold the scalar sink |
+| `nested_escape_paths.c` | #951: native O0 nested call/escape arrangements require an opaque helper leaf; no-escape nests stay covered. Includes single-loop and differing-offset cache controls |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -101,6 +103,24 @@ must-query work. Retry evidence stays deduplicated and retains known parameter
 sources even when the shared allowance is exhausted. Copied pointer LOAD
 controls use nonzero offsets and preserve index origins without adding an
 unrelated unknown-region demand.
+
+`stash_pointer_width` retains the Sol review's exact invented source and
+compiler flags (`-fno-builtin -fno-strict-aliasing -fno-inline`). Analyze only:
+the narrow reload does not reconstruct the stack pointer. Full-width STORE/
+LOAD controls remain covered; deterministic 32/64-bit, subfield, extension,
+cast/operator and unknown-ABI controls require conservative pointer identity.
+The copied-base epoch defect was reproduced synthetically, not natively:
+O0 folds the base copy and O1 can make the scalar sink bounded/unseeded.
+The deterministic test excludes post-load writer provenance.
+
+`nested_escape_paths` retains the Opus review's exact invented source.
+Analyze only: helper copies may overflow. Both O0 inner-call/outer-escape and
+outer-call/inner-escape arrangements must name the opaque helper, while their
+no-escape controls stay covered. Both mocked PHI orders complement the native
+compiler shape. Overlapping cycles share escape state under the same allowance;
+sequential loops remain separate. Moving inline/SSA stash values stop as unknown
+without exhausting the allowance, and transient-operand cache tests check
+object lifetime rather than relying on nondeterministic allocator id reuse.
 
 ## `EXPECTED.json` schema
 

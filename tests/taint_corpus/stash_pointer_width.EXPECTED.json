@@ -1,0 +1,10 @@
+{
+  "description": "Exact reviewer boundary: narrow stash reload is not full pointer identity; full-width reload remains covered. Analyze only.",
+  "lang": "c",
+  "cflags": ["-fno-inline", "-fno-builtin", "-fno-strict-aliasing"],
+  "backward": [
+    {"function": "truncated_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "full_stash", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "copied_epoch", "sink": "arg:malloc:0", "origin_kinds": ["call"], "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true}
+  ]
+}

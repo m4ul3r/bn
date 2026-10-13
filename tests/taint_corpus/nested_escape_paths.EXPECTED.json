@@ -1,0 +1,14 @@
+{
+  "description": "#951: nested overlapping cycles carry escapes between inner/outer helper arrangements. No-escape nests stay covered. Analyze only.",
+  "lang": "c",
+  "cflags": ["-fno-inline"],
+  "backward": [
+    {"function": "nested_inner_call", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "leaf_details_contain": ["helper"], "complete_slice": false},
+    {"function": "nested_outer_call", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "leaf_details_contain": ["helper"], "complete_slice": false},
+    {"function": "nested_inner_call_ctl", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "nested_outer_call_ctl", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "single_loop", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "leaf_details_contain": ["helper"], "complete_slice": false},
+    {"function": "reuse_store_fill", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "reuse_many", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false}
+  ]
+}
