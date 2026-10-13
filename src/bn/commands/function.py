@@ -425,6 +425,16 @@ def _decompile(args: argparse.Namespace) -> int:
         warnings = value.get("warnings") if isinstance(value, dict) else None
         if warnings:
             text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
+        # #977: `<annotation redacted>` alone read as a comment that never
+        # landed. Say how many were hidden and the flag that shows them; counts
+        # cover the whole function, not just a --lines slice.
+        summary = value.get("annotation_summary") if isinstance(value, dict) else None
+        hidden = summary.get("hidden") if isinstance(summary, dict) else None
+        if isinstance(hidden, int) and hidden > 0:
+            noun = "line" if hidden == 1 else "lines"
+            text += (f"\n\nnote: {hidden} stored comment {noun} not written by this "
+                     "session shown as <annotation redacted>; --include-annotations "
+                     "to show them")
         # #820: a --quick view's body is unresolved-name Pseudo-C with an empty
         # `warnings` list, so text mode stated nothing was wrong. Lead with the
         # view-level state -- `analysis_skipped` is a PER-FUNCTION flag and is
@@ -525,8 +535,15 @@ def _render_disasm_text(value: Any) -> str:
     text = _text_field("text")(value)
     if not isinstance(value, dict):
         return text
+    # #966: the function's last instruction runs into another function's entry.
+    # Only where the listing reaches that instruction: under a --lines slice
+    # that stops earlier the note would sit after an unrelated line.
+    continues = value.get("continues_into")
     selected = value.get("line_range")
     total = value.get("total_lines")
+    reaches_end = not isinstance(selected, dict) or selected.get("end") == total
+    if isinstance(continues, dict) and continues.get("note") and reaches_end:
+        text = f"{text}\n// {continues['note']}"
     if not isinstance(selected, dict) or not isinstance(total, int):
         return text
     start = selected.get("start")

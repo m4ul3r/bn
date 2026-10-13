@@ -1633,6 +1633,52 @@ def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
     assert "ccc" not in out and "ddd" not in out
 
 
+@pytest.mark.parametrize("line_range,shown", [
+    (None, True),
+    ({"start": 1, "end": 2}, True),
+    # A slice that stops before the last instruction must not end in the note.
+    ({"start": 1, "end": 1}, False),
+])
+def test_disasm_notes_where_execution_continues_966(fake_transport, capsys, line_range, shown):
+    text = "aaa\nbbb" if line_range is None or line_range["end"] == 2 else "aaa"
+    fake_transport({"disasm": {"ok": True, "result": {
+        "text": text, "total_lines": 2, "line_range": line_range,
+        "continues_into": {"name": "sub_4000f8", "address": "0x4000f8",
+                           "note": "execution falls through into sub_4000f8 @ 0x4000f8"},
+    }}})
+
+    rc = bn.cli.main(["disasm", "0x4000dc", "--target", "active"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert ("// execution falls through into sub_4000f8 @ 0x4000f8" in out) is shown
+
+
+@pytest.mark.parametrize("hidden,expected", [
+    (1, "note: 1 stored comment line not written by this session shown as "
+        "<annotation redacted>; --include-annotations to show them"),
+    (0, None),
+])
+def test_decompile_text_footer_counts_hidden_annotations_977(fake_transport, capsys,
+                                                            hidden, expected):
+    fake_transport({"decompile": {"ok": True, "result": {
+        "function": {"name": "sub_401200", "address": "0x401200"},
+        "text": "void sub_401200()\n{\n    return;  // <annotation redacted>\n}",
+        "warnings": [],
+        "annotation_summary": {"comment_count": 1, "redacted": True,
+                               "hidden": hidden, "session_shown": 0},
+    }}})
+
+    rc = bn.cli.main(["decompile", "sub_401200", "--target", "active"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    if expected is None:
+        assert "include-annotations" not in out
+    else:
+        assert out.rstrip().endswith(expected)
+
+
 def test_function_list_count_prints_total(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":

@@ -571,6 +571,16 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # Stable view_id -> the comments THIS bridge wrote and verified, keyed
+        # (scope, address) -> body, scope "address" (a global address comment)
+        # or "function_doc" (fn.comment, keyed at the function start). Decompile
+        # redacts stored comment bodies so a planted or stale database note is
+        # not read as fact (#740); a body the analyst wrote through this bridge
+        # is neither, so the redaction exempts it and marks it instead (#977).
+        # Keyed by location as well as body, so an inherited note that merely
+        # shares a location or a spelling with one is never credited to this
+        # session.
+        self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
@@ -587,6 +597,47 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
+
+    def note_session_annotations(self, bv, results) -> None:
+        """Record the comments a committed mutation verified on *bv* (#977).
+
+        Only ``verified`` rows count: a ``noop`` set means the body was already
+        stored, which is exactly the inherited case the redaction exists for.
+        A verified delete forgets the location."""
+        entries: list[tuple[tuple[str, int], str | None]] = []
+        for row in results or []:
+            if not isinstance(row, dict) or row.get("status") != "verified":
+                continue
+            op_name = row.get("op")
+            if op_name not in ("set_comment", "delete_comment"):
+                continue
+            try:
+                address = int(str(row.get("address")), 16)
+            except (TypeError, ValueError):
+                continue
+            scope = "function_doc" if row.get("scope") == "function_doc" else "address"
+            body = None
+            if op_name == "set_comment":
+                body = str((row.get("requested") or {}).get("comment") or "")
+            entries.append(((scope, address), body or None))
+        if not entries:
+            return
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is None:
+                return
+            ledger = self._session_annotations.setdefault(vid, {})
+            for key, body in entries:
+                if body is None:
+                    ledger.pop(key, None)
+                else:
+                    ledger[key] = body
+
+    def session_annotations(self, bv) -> dict[tuple[str, int], str]:
+        """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return dict(self._session_annotations.get(vid, {})) if vid is not None else {}
 
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
@@ -676,6 +727,7 @@ class TargetManager:
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
+                self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
 
@@ -911,6 +963,10 @@ class TargetManager:
                 # restart would then reopen its raw bytes (#753 review).
                 self._database_paths = {
                     vid: path for vid, path in self._database_paths.items()
+                    if vid in alive
+                }
+                self._session_annotations = {
+                    vid: ledger for vid, ledger in self._session_annotations.items()
                     if vid in alive
                 }
                 # The provenance verdicts, keyed on the file session id so a
@@ -4074,8 +4130,8 @@ class BinaryNinjaBridge:
             # For the same reason the op's `annotation_summary` is not copied
             # here -- `redacted: true` beside a populated `comments` map would
             # be a false claim about the artifact.
-            decompile = read_decompile._redact_rendered_annotations(
-                decompile, read_decompile._annotation_bodies(func, comments)
+            decompile, _summary = read_decompile._redact_function_annotations(
+                self.ctx, bv, func, comments, decompile
             )
         bundle_warnings = self._render_warnings(decompile)
         stub = self._analysis_stub_warning(func, decompile)
@@ -4466,7 +4522,13 @@ class BinaryNinjaBridge:
             if committed_change or rollback_left_state or residue_left_state:
                 try:
                     selector = a[0] if a else k.get("selector")
-                    self.targets.mark_dirty(self.targets.resolve(selector))
+                    view = self.targets.resolve(selector)
+                    self.targets.mark_dirty(view)
+                    # #977: only a COMMITTED write is the analyst's annotation; a
+                    # failed rollback's leftovers are stamped `rollback_failed`,
+                    # never `verified`, so they cannot enter the ledger here.
+                    if committed_change:
+                        self.targets.note_session_annotations(view, result.get("results"))
                 except Exception:
                     pass
             return result

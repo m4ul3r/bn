@@ -944,6 +944,10 @@ def _render_proto_text(value: Any) -> str:
     # carried none, which is the exact skew #619 made a suite-wide invariant.
     raw_width_note = _text_value(value, "return_width_note")
     width_note = f"\n\nnote: {raw_width_note}" if raw_width_note else ""
+    # #966: a prototype with callee-saved/link-register parameters, or a body
+    # BN split at a shared tail, is disclosed the same way.
+    split_notes = _field_list(value, "split_body_notes") or []
+    width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
