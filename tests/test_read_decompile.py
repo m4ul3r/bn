@@ -1339,7 +1339,9 @@ def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
 
 @pytest.mark.parametrize("case, hints", [
     ("bitfield-unit", 0), ("split-bitfields", 0), ("overlapping-members", 0),
-    ("unobserved-bitfield", 1),
+    ("unobserved-bitfield", 1), ("class-competitor", 0), ("sole-class", 0),
+    ("flexible-tail-competitor", 0), ("unresolved-tail-competitor", 0),
+    ("zero-width-before-access", 0), ("own-flexible-tail", 1),
 ])
 def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
     bv, fn, _, _ = _struct_assist_case()
@@ -1360,6 +1362,24 @@ def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case,
         other.width = 0x38
     elif case == "overlapping-members":
         other.members.append(_FakeMember(0x2c, "overlap", unit))
+    elif case in {"class-competitor", "sole-class"}:
+        # A base-less class is as concrete a layout as a struct, but is never
+        # itself suggested as `struct K *`.
+        other.type = types.SimpleNamespace(name="ClassStructureType")
+        if case == "sole-class":
+            del bv.types["cfg"]
+    elif case in {"flexible-tail-competitor", "own-flexible-tail"}:
+        if case == "own-flexible-tail":
+            other = bv.types["cfg"]
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "char[0]", width=0, type_class="ArrayTypeClass")))
+    elif case == "unresolved-tail-competitor":
+        other.members.append(_FakeMember(0x38, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case == "zero-width-before-access":
+        # An unknown-width member may extend over every later byte.
+        other.members.insert(0, _FakeMember(0x20, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
     elif case == "unobserved-bitfield":
         # Unclassifiable storage away from every access does not block cfg.
         other = bv.types["cfg"]

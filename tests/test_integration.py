@@ -3443,6 +3443,62 @@ class TestStructLayoutAssistance903:
         assert any("struct layout candidate" in w
                    for w in shared_bn.json("decompile", "handle")["warnings"])
 
+        # Equally concrete layouts that cfg's uniqueness must account for: a
+        # base-less class, and identical structs carrying a trailing flexible
+        # array or an unresolved (zero-width) named member past the accesses.
+        builder = (
+            "from binaryninja import NamedTypeReferenceClass, StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'depth')\n")
+        competitors = {
+            "K": ("ClassStructureType", None),
+            "flex_cfg": ("StructStructureType",
+                         builder + "s.insert(52, Type.array(Type.char(), 0), 'tail')\n"),
+            "ext_cfg": ("StructStructureType", builder + (
+                "s.insert(56, Type.named_type_reference(\n"
+                "    NamedTypeReferenceClass.StructNamedTypeClass, 'missing_t'), 'ext')\n")),
+        }
+        for name, (kind, script) in competitors.items():
+            if script is None:
+                shared_bn.json(
+                    "types", "declare",
+                    f"class {name} {{ public: char pad[40]; uint64_t flags; uint32_t depth; }};")
+            else:
+                shared_bn.json(
+                    "py", "exec",
+                    script + f"bv.define_user_type({name!r}, s)\n"
+                    "bv.update_analysis_and_wait()\n")
+            shape = shared_bn.json(
+                "py", "exec",
+                f"t = bv.get_type_by_name({name!r})\n"
+                "result = [t.type.name, [m.type.width for m in t.members]]\n")["result"]
+            assert shape[0] == kind, (name, shape)
+            if script is not None:
+                assert shape[1][-1] == 0, (name, shape)
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                name, competing)
+            if script is None:
+                # A sole matching class is not suggested as `struct K *`.
+                shared_bn.json(
+                    "py", "exec",
+                    "bv.undefine_user_type('cfg')\n"
+                    "bv.update_analysis_and_wait()\n")
+                sole = shared_bn.json("decompile", "handle")
+                assert not any("struct layout candidate" in w for w in sole["warnings"]), sole
+                shared_bn.json(
+                    "types", "declare",
+                    "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+            shared_bn.json(
+                "py", "exec",
+                f"bv.undefine_user_type({name!r})\n"
+                "bv.update_analysis_and_wait()\n")
+            restored = shared_bn.json("decompile", "handle")
+            assert any("struct layout candidate" in w for w in restored["warnings"]), (
+                name, restored)
+
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
         typed = shared_bn.json("decompile", "handle")
