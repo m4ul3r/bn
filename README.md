@@ -126,7 +126,7 @@ Single-function escape hatch — analyze just one function without a full refres
 bn decompile handle_request --force-analysis
 ```
 
-Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there.
+Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there. That includes an adjacent `<binary>.bndb`, which `bn load <binary>` prefers (pass `--no-bndb` for the raw bytes). A database `bn save` wrote to the cache (`<cache>/bndb/`, used when the binary's own directory is read-only) is different: the cache is shared by every bn instance on the machine, so `--quick` never restores it — the raw bytes load quickly and the note names the skipped entry with the `bn load <entry>` that restores it.
 
 ### Detecting a quick view programmatically
 

@@ -60,14 +60,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-analysis",
         dest="quick",
         action="store_true",
-        help="Preload binaries without full analysis (fast); run `bn refresh` for full analysis",
+        help="Preload binaries without full analysis (fast); run `bn refresh` for full analysis. "
+        "Never restores a cached database; an adjacent <binary>.bndb is still preferred",
     )
     parser.add_argument(
         "--no-bndb",
         dest="no_bndb",
         action="store_true",
-        help="Open the raw binary even if an adjacent <binary>.bndb exists "
-        "(default: load the saved sidecar database, like `bn load`)",
+        help="Open the raw binary even if an adjacent <binary>.bndb or a cached database "
+        "exists (default: load the saved database, like `bn load`)",
     )
     args = parser.parse_args(argv)
 

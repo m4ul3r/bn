@@ -1399,6 +1399,34 @@ def test_load_bndb_recovers_analyzed_view_from_raw_default(monkeypatch, tmp_path
     bridge._headless_views.clear()
 
 
+def test_load_bndb_recovery_keeps_the_shared_file_open_for_the_product_view(monkeypatch, tmp_path):
+    """#776: recovering the product view from a raw-default .bndb publishes it
+    WITHOUT closing the raw container. That is the ownership model, not a leak:
+    both views hang off ONE FileMetadata, and `FileMetadata.close()` closes the
+    file -- the product view included. Measured on BN 6.1 (three cycles): the
+    replaced raw wrapper is released without a close, the product view stays
+    readable, and the one close of the published target's file frees raw view,
+    product view and file exactly once. The per-view fakes elsewhere give each
+    view its own file, which is why a missing close looked like a leak there."""
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    bndb = tmp_path / "router_image.bndb"
+    bndb.write_bytes(b"")
+    analyzed = _LoadBV(filename=str(bndb), view_type="ELF", functions=[object(), object()])
+    raw = _LoadBV(filename=str(bndb), view_type="Raw", functions=[],
+                  existing_views=["ELF", "Raw"], db_views={"ELF": analyzed})
+    closes: list[str] = []
+    raw.file.close = lambda: closes.append(raw.file.filename)
+    analyzed.file = raw.file                       # one FileMetadata, two views
+    sys.modules["binaryninja"].load = lambda path, update_analysis=True: raw
+
+    instance._load_binary(str(bndb))
+
+    assert bridge._headless_views == [analyzed]
+    assert closes == []                            # closing raw would close the target
+    assert bridge._headless_views[0].file is raw.file
+    bridge._headless_views.clear()
+
+
 def test_load_bndb_raw_no_analysis_warns_hard(monkeypatch, tmp_path):
     """#458: a .bndb that restores a raw container with no saved product view must
     emit a hard restore-failure diagnostic (not the soft 'confirm this is the
@@ -1700,6 +1728,59 @@ def test_load_binary_no_bndb_skips_cache(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_quick_never_restores_a_cached_database(monkeypatch, tmp_path):
+    # #956: the cache is one directory for every bn instance on the machine, so
+    # `--quick` restoring the entry another run saved turned a ~1s raw look into
+    # a full database load carrying that run's renames. A quick load opens the
+    # raw bytes and names the entry it left alone, with the command to use it.
+    data = b"\x7fELF v1"
+    bridge, instance, loaded_paths, views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    raw = tmp_path / "ro" / "widgetd"
+    raw.parent.mkdir()
+    raw.write_bytes(data)
+    cache_bndb = bridge._cache_bndb_path(str(raw.resolve()), bridge._hash_file(raw).sha256)
+    cache_bndb.parent.mkdir(parents=True)
+    cache_bndb.write_bytes(b"BNDB")
+
+    result = instance._load_binary(str(raw), quick=True)
+
+    assert loaded_paths == [str(raw)]
+    assert result["analysis_state"] == "quick"
+    skipped = [n for n in result["notes"]
+               if n.startswith(f"--quick: did not restore the cached database {cache_bndb} ")]
+    assert len(skipped) == 1, result["notes"]
+    assert "matches the content hash of widgetd" in skipped[0]
+    assert skipped[0].endswith(f"`bn load {cache_bndb}`")
+    assert "--quick ignored" not in " ".join(result["notes"])
+    bridge._headless_views.clear()
+
+
+def test_preload_binary_quick_never_restores_a_cached_database(monkeypatch, tmp_path):
+    # #956 parity: `bn-agent --quick <raw>` takes the same rule as `bn load --quick`.
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    loaded_paths: list[str] = []
+    sys.modules["binaryninja"].load = lambda path, update_analysis=True: (
+        loaded_paths.append(path) or _LoadBV(filename=path)
+    )
+    raw = tmp_path / "ro" / "widgetd"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF v1")
+    cache_bndb = bridge._cache_bndb_path(str(raw.resolve()), bridge._hash_file(raw).sha256)
+    cache_bndb.parent.mkdir(parents=True)
+    cache_bndb.write_bytes(b"BNDB")
+
+    bv = bridge._preload_binary(str(raw), quick=True)
+
+    assert loaded_paths == [str(raw)]
+    assert bv in bridge._quick_loaded_views
+    bridge._headless_views.clear()
+
+
+
 def test_load_binary_adjacent_bndb_preferred_over_cache(monkeypatch, tmp_path):
     # When BOTH an adjacent .bndb and a cache copy exist, the adjacent one wins
     # (it's next to the binary, the canonical location).
@@ -1918,8 +1999,13 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
     result = instance._load_binary(str(raw))
 
     assert loaded_paths == [str(cache_bndb)]
-    assert "restored cached database" in " ".join(result["notes"])
-    assert "unverified" not in " ".join(result["notes"])
+    notes = " ".join(result["notes"])
+    assert f"restored cached database {cache_bndb} (its name matches the content hash of parse_record; saved " in notes
+    assert "shared by every bn instance on this machine" in notes
+    assert "unverified" not in notes
+    # What the substituted database already held is stated at load (#956).
+    assert (f"{cache_bndb.name} already held 0 comment(s), 0 function doc(s) and "
+            "0 analyst symbol(s) when opened") in notes
     bridge._headless_views.clear()
 
 
@@ -1941,7 +2027,7 @@ def test_load_binary_still_finds_legacy_path_keyed_cache(monkeypatch, tmp_path):
 
     assert loaded_paths == [str(legacy)]
     notes = " ".join(result["notes"])
-    assert "restored cached database" in notes
+    assert f"restored cached database {legacy} (legacy entry named for the path {raw.resolve()}" in notes
     assert "database provenance unverified (saved before content validation)" in notes
     bridge._headless_views.clear()
 
@@ -2331,6 +2417,69 @@ def test_target_rows_keep_the_load_time_provenance_verdict(monkeypatch, tmp_path
         assert block["source_verified"] is verdict
         assert block["analysis_cache_restored"] is True
         assert phrase in block["provenance_hint"], block["provenance_hint"]
+    bridge._headless_views.clear()
+
+
+class _SymbolLoadBV(_LoadBV):
+    """A loaded view whose symbol table a test can grow after the load."""
+
+    def __init__(self, *args, symbols=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.symbol_table = list(symbols)
+
+    def get_symbols(self, start=None, length=None):
+        if start is None:
+            return list(self.symbol_table)
+        return [s for s in self.symbol_table if start <= s.address < start + (length or 1)]
+
+
+def test_provenance_hint_counts_only_what_the_view_held_at_open(monkeypatch, tmp_path):
+    """#973: the hint fired for the session's OWN work -- after a rename on a
+    raw load, and after `save` re-homed the view to a .bndb -- so agents learned
+    to ignore it. A raw open inherits nothing; a database open is judged by
+    what it held when opened. The counts stay current: the gate reads them."""
+    from types import SimpleNamespace
+
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    views: dict[str, _SymbolLoadBV] = {}
+
+    def fake_load(path, update_analysis=True):
+        loaded_paths.append(path)
+        inherited = ([SimpleNamespace(auto=False, name="parse_header", address=0x401000)]
+                     if path.endswith(".bndb") else [])
+        views[path] = _SymbolLoadBV(filename=path, symbols=inherited)
+        return views[path]
+
+    sys.modules["binaryninja"].load = fake_load
+    raw = tmp_path / "widgetd"
+    raw.write_bytes(b"\x7fELF")
+    database = tmp_path / "prior.bndb"
+    database.write_bytes(b"BNDB")
+
+    instance._load_binary(str(raw), prefer_bndb=False)
+    instance._load_binary(str(database))
+    # This session renames a function in each view; the raw one is then saved
+    # and re-homed to its .bndb, the shape that flipped `cache-restored`.
+    for view in views.values():
+        view.symbol_table.append(SimpleNamespace(auto=False, name="my_handler", address=0x402000))
+    raw_view = views[str(raw)]
+    raw_view.file.filename = str(raw) + ".bndb"
+
+    raw_block = bridge.read_listing._existing_annotations(
+        instance.ctx, raw_view, filename=raw_view.file.filename)
+    db_block = bridge.read_listing._existing_annotations(
+        instance.ctx, views[str(database)], filename=str(database))
+
+    assert raw_block["analyst_symbols"] == 1
+    assert raw_block["analysis_cache_restored"] is False
+    assert raw_block["provenance_hint"] is None
+    assert "present_at_open" not in raw_block
+    assert db_block["analyst_symbols"] == 2
+    assert db_block["analysis_cache_restored"] is True
+    assert db_block["present_at_open"] == {
+        "comments": 0, "function_comments": 0, "analyst_symbols": 1, "placeholder_symbols": 0}
+    assert ("0 comment(s), 0 function doc(s), 1 analyst symbol(s) present when the "
+            "database was opened") in db_block["provenance_hint"]
     bridge._headless_views.clear()
 
 

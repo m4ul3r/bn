@@ -913,13 +913,14 @@ class TargetManager:
                     vid: path for vid, path in self._database_paths.items()
                     if vid in alive
                 }
-                # The provenance verdicts, keyed on the file session id so a
-                # GUI tab's transient wrapper cannot lose one; pruned here
-                # (same complete-snapshot rule) since nothing else drops a
-                # closed view's entry.
+                # The provenance verdicts and open-time annotation records,
+                # keyed on the file session id so a GUI tab's transient wrapper
+                # cannot lose one; pruned here (same complete-snapshot rule)
+                # since nothing else drops a closed view's entry.
                 open_sessions = {record.session_id for record in alive.values()}
-                for key in [k for k in _source_verified if k not in open_sessions]:
-                    del _source_verified[key]
+                for verdicts in (_source_verified, _opened_annotations):
+                    for key in [k for k in verdicts if k not in open_sessions]:
+                        del verdicts[key]
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -2374,10 +2375,11 @@ class BinaryNinjaBridge:
         # a save then certifies the bytes the view loaded, whatever sits at
         # the path by then. The same identity judges a preferred database.
         identity = _load_identity(resolved)
-        substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+        substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
         if substitute is not None:
             load_path = substitute.path
-            notes.append(_sidecar_note(substitute, resolved))
+        if sidecar_note:
+            notes.append(sidecar_note)
         # A preferred database `_database_provenance` refused: its note's first
         # sentence, awaiting the tail that says what happened instead.
         refused: str | None = None
@@ -2579,6 +2581,14 @@ class BinaryNinjaBridge:
             # analysis_state="unanalyzed" (not "full"), matching the WARNING note.
             if bndb_unanalyzed:
                 _unanalyzed_views.add(bv)
+            # #973: what the view carried BEFORE this session could touch it
+            # (it is still unpublished), so the provenance hint never counts
+            # the session's own annotations -- or a save's re-home -- as
+            # inherited. Measured outside the lock; recorded inside it below.
+            opened_known, opened_record = _opened_annotation_record(
+                bv, load_path if load_path.suffix == ".bndb" else None)
+            if substitute is not None and opened_record is not None:
+                notes.append(_opened_annotation_note(opened_record))
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -2595,6 +2605,8 @@ class BinaryNinjaBridge:
                     published = True  # latched: view now owned by _headless_views
                 if verified is not None:
                     _source_verified[view_session_key(bv)] = verified
+                if opened_known:
+                    _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
 
             self._record_project_root(workdir)
@@ -2628,6 +2640,7 @@ class BinaryNinjaBridge:
                 _quick_loaded_views.discard(bv)
                 _unanalyzed_views.discard(bv)
                 _source_verified.pop(view_session_key(bv), None)
+                _opened_annotations.pop(view_session_key(bv), None)
             raise
         finally:
             with _load_in_progress_lock:
@@ -4537,6 +4550,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views,
     _headless_views_lock,
     _quick_loaded_views,
+    _opened_annotations,
     _source_verified,
     _unanalyzed_views,
     view_session_key,
@@ -5716,6 +5730,10 @@ class _SidecarChoice:
 
     path: Path
     source: str  # "adjacent" | "cache"
+    # For a cache entry: found under the name keyed on the content sha256 of
+    # the bytes being loaded (True), or under the legacy PATH-keyed name a
+    # save wrote before content keying (False). Always False for "adjacent".
+    content_keyed: bool = False
 
 
 def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
@@ -5724,14 +5742,14 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
     path as given.
 
     Shared by the runtime ``bn load`` path (`_load_binary`) and the headless
-    preload path (`_preload_binary`) so both honor a saved database -- otherwise
-    `bn-agent foo` silently re-analyzes from scratch and drops the saved work that
-    `bn load foo` would have picked up (#178). Prefers an adjacent
-    ``<path>.bndb``; if none (e.g. the binary is on a read-only mount), falls back
-    to the writable-cache copy `_save_database` wrote there (#318): the
-    content-keyed name first, then the legacy path-keyed name. A request that
-    already points at a ``.bndb`` (or prefer_bndb=False, or a raw file whose
-    *identity* could not be taken) resolves to None.
+    preload path (`_preload_binary`), through `_choose_sidecar`, so both honor a
+    saved database -- otherwise `bn-agent foo` silently re-analyzes from scratch
+    and drops the saved work that `bn load foo` would have picked up (#178).
+    Prefers an adjacent ``<path>.bndb``; if none (e.g. the binary is on a
+    read-only mount), falls back to the writable-cache copy `_save_database`
+    wrote there (#318): the content-keyed name first, then the legacy path-keyed
+    name. A request that already points at a ``.bndb`` (or prefer_bndb=False,
+    or a raw file whose *identity* could not be taken) resolves to None.
 
     The choice is by path; whether the database actually describes the bytes
     now at ``resolved`` is decided AFTER it is opened (`_database_provenance`),
@@ -5742,11 +5760,64 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
     sibling = Path(str(resolved) + ".bndb")
     if sibling.exists():
         return _SidecarChoice(sibling, "adjacent")
-    for cached in (_cache_bndb_path(str(resolved), identity.sha256),
-                   _cache_bndb_path(str(resolved))):
+    for cached, content_keyed in ((_cache_bndb_path(str(resolved), identity.sha256), True),
+                                  (_cache_bndb_path(str(resolved)), False)):
         if cached.exists():
-            return _SidecarChoice(cached, "cache")
+            return _SidecarChoice(cached, "cache", content_keyed)
     return None
+
+
+def _choose_sidecar(resolved: Path, prefer_bndb: bool, quick: bool,
+                    identity: _SourceIdentity | None) -> tuple[_SidecarChoice | None, str | None]:
+    """`_resolve_bndb_sidecar` plus the load's own policy on it, for both load
+    paths: ``(database to open instead, note)``, either may be None.
+
+    ``--quick`` never restores a CACHE entry (#956). The cache is one directory
+    for every bn instance on the machine, so the entry a quick look found was
+    written by whichever earlier run saved these bytes: restoring it replaced
+    the ~1s raw load the flag promises with a full database load (54s measured
+    on a firmware binary) and started a "fresh" look with that run's renames.
+    The quick load opens the raw bytes and the note names the entry it left
+    alone and how to restore it. An adjacent ``<binary>.bndb`` is still
+    preferred: it sits beside the file, where someone put it on purpose, and
+    the "--quick ignored" note says so.
+    """
+    choice = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+    if choice is None:
+        return None, None
+    if quick and choice.source == "cache":
+        return None, (
+            f"--quick: did not restore the cached database {choice.path} "
+            f"({_cache_entry_description(choice, resolved)}); loaded the raw "
+            f"bytes without analysis. To restore that analysis instead: "
+            f"`bn load {shlex.quote(str(choice.path))}`"
+        )
+    return choice, _sidecar_note(choice, resolved)
+
+
+def _cache_entry_description(choice: _SidecarChoice, resolved: Path) -> str:
+    """Why a cache entry was picked for *resolved*, and when it was written --
+    the two facts an agent needs to judge whose analysis it is about to get."""
+    why = (
+        f"its name matches the content hash of {resolved.name}"
+        if choice.content_keyed else
+        f"legacy entry named for the path {resolved}, saved before content keying"
+    )
+    try:
+        mtime = choice.path.stat().st_mtime
+    except OSError:
+        return f"{why}; save time unknown"
+    saved = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"{why}; saved {saved}, {_age_text(time.time() - mtime)} ago"
+
+
+def _age_text(seconds: float) -> str:
+    """A coarse human age: ``45s``, ``12m``, ``5h``, ``3d``."""
+    seconds = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
@@ -5755,13 +5826,44 @@ def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
         # The binary's own mount had no writable adjacent .bndb (a read-only
         # firmware image), so the annotations were saved to the writable cache.
         # Restore them instead of silently re-analyzing blank, which looked
-        # like total annotation loss (#318).
+        # like total annotation loss (#318) -- and say which entry and whose:
+        # the cache is shared by every bn instance on the machine (#956).
         return (
-            f"restored cached database {choice.path} (saved when "
-            f"{resolved.name}'s mount had no writable adjacent .bndb -- "
-            f"annotations preserved); pass --no-bndb to load the raw bytes"
+            f"restored cached database {choice.path} "
+            f"({_cache_entry_description(choice, resolved)}; the cache is shared "
+            "by every bn instance on this machine, so its annotations may be "
+            "another run's); pass --no-bndb to load the raw bytes"
         )
     return f"loaded {choice.path} instead of {resolved} (use --no-bndb to skip)"
+
+
+def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str, Any] | None]:
+    """What *bv* carried as the bridge opened it, for `_opened_annotations`
+    (#973): ``(known, record)``. A raw open inherits nothing -- ``(True,
+    None)``; a database open records its counts and path; ``(False, None)``
+    when those counts cannot be read, so the hint falls back to the current
+    counts rather than claim a clean inheritance it never measured."""
+    if database is None:
+        return True, None
+    try:
+        summary = read_listing._annotation_summary(None, bv)
+    except Exception:  # noqa: BLE001 - unmeasured is "unknown", never zero
+        return False, None
+    return True, {
+        "path": str(database),
+        **{key: summary[key] for key in (
+            "comments", "function_comments", "analyst_symbols", "placeholder_symbols")},
+    }
+
+
+def _opened_annotation_note(record: dict[str, Any]) -> str:
+    """The load note stating what a substituted database already held."""
+    return (
+        f"{Path(record['path']).name} already held {record['comments']} comment(s), "
+        f"{record['function_comments']} function doc(s) and "
+        f"{record['analyst_symbols']} analyst symbol(s) when opened -- not this "
+        "run's work (`bn target info` keeps reporting them as existing_annotations)"
+    )
 
 
 def _view_function_count(bv) -> int:
@@ -5905,10 +6007,10 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
 
     resolved = Path(path).expanduser().resolve()
     identity = _load_identity(resolved)
-    substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+    substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
     load_path = substitute.path if substitute is not None else resolved
-    if substitute is not None:
-        bn.log_info(_sidecar_note(substitute, resolved))
+    if sidecar_note:
+        bn.log_info(sidecar_note)
     bv = binaryninja.load(str(load_path), update_analysis=False)
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
@@ -5960,8 +6062,14 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
             _quick_loaded_views.discard(bv)
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
+        opened_known, opened_record = _opened_annotation_record(
+            bv, load_path if load_path.suffix == ".bndb" else None)
+        if substitute is not None and opened_record is not None:
+            bn.log_info(_opened_annotation_note(opened_record))
         if verified is not None:
             _source_verified[view_session_key(bv)] = verified
+        if opened_known:
+            _opened_annotations[view_session_key(bv)] = opened_record
         with _headless_views_lock:
             _headless_views.append(bv)
             published = True  # latched: view now owned by _headless_views
@@ -5978,6 +6086,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
             _quick_loaded_views.discard(bv)
             _unanalyzed_views.discard(bv)
             _source_verified.pop(view_session_key(bv), None)
+            _opened_annotations.pop(view_session_key(bv), None)
         raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
