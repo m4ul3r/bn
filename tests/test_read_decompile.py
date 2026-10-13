@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import io
+import itertools
 import json
 import socket
 import sys
@@ -843,24 +844,47 @@ def _struct_assist_layout(name: str = "cfg", *, flags_width: int = 8) -> _FakeTy
     return layout
 
 
+_STRUCT_ASSIST_EXPRS = itertools.count()
+
+
+def _struct_assist_node(operation: str, **operands) -> _FakeMLILInsn:
+    node = _FakeMLILInsn(0x401004, operation=operation, **operands)
+    node.expr_index = next(_STRUCT_ASSIST_EXPRS)
+    return node
+
+
+def _struct_assist_read(var: _FakeVariable, version: int = 0) -> _FakeMLILInsn:
+    ssa_var = types.SimpleNamespace(var=var, version=version)
+    return _struct_assist_node("MLIL_VAR_SSA", src=ssa_var, vars_read=[ssa_var])
+
+
 def _struct_assist_access(
     var: _FakeVariable, offset: int, width: int, *,
     operation: str = "MLIL_LOAD_SSA", version: int = 0,
 ) -> _FakeMLILInsn:
-    ssa_var = types.SimpleNamespace(var=var, version=version)
-    base = _FakeMLILInsn(
-        0x401004, operation="MLIL_VAR_SSA", src=ssa_var, vars_read=[ssa_var])
+    base = _struct_assist_read(var, version)
     address = base
     if "_STRUCT_" not in operation:
-        address = _FakeMLILInsn(
-            0x401004, operation="MLIL_ADD", left=base,
-            right=_FakeMLILInsn(0x401004, operation="MLIL_CONST", constant=offset),
-            vars_read=[ssa_var])
+        address = _struct_assist_node(
+            "MLIL_ADD", left=base,
+            right=_struct_assist_node("MLIL_CONST", constant=offset),
+            vars_read=base.vars_read)
     operands = {"src" if operation.startswith("MLIL_LOAD") else "dest": address}
-    ins = _FakeMLILInsn(0x401004, operation=operation, size=width, **operands)
+    ins = _struct_assist_node(operation, size=width, **operands)
     if "_STRUCT_" in operation:
         ins.offset = offset
     return ins
+
+
+def _struct_assist_walk(node, callback):
+    """Pre-order expression walk, like MLIL ``traverse`` over nested operands."""
+    yield callback(node)
+    for name in ("dest", "src", "left", "right"):
+        child = getattr(node, name, None)
+        if isinstance(child, _FakeMLILInsn):
+            yield from _struct_assist_walk(child, callback)
+    for child in node.params:
+        yield from _struct_assist_walk(child, callback)
 
 
 def _struct_assist_case() -> tuple[_FakeBV, _FakeFunction, _FakeVariable, list[_FakeMLILInsn]]:
@@ -870,9 +894,9 @@ def _struct_assist_case() -> tuple[_FakeBV, _FakeFunction, _FakeVariable, list[_
     fn = _FakeFunction(0x401000, "handle", "int handle(void *c)")
     fn.parameter_vars = [var]
     nodes = [_struct_assist_access(var, 0x28, 8), _struct_assist_access(var, 0x30, 4)]
-    # Model the MLIL traverse API's stream of nested expression nodes.
     fn.mlil = types.SimpleNamespace(ssa_form=types.SimpleNamespace(
-        traverse=lambda callback: (callback(node) for node in nodes)))
+        traverse=lambda callback: (
+            result for node in nodes for result in _struct_assist_walk(node, callback))))
     bv = _FakeBV(functions=[fn], types_={"cfg": _struct_assist_layout()})
     return bv, fn, var, nodes
 
@@ -1014,7 +1038,7 @@ def test_struct_assist_bounds_member_typedef_lookups(
 
 
 @pytest.mark.parametrize("case", [
-    "wrong-offset", "wrong-width", "non-scalar-member", "bitfield",
+    "wrong-offset", "wrong-width", "non-scalar-member",
     "unobserved-opaque", "unrelated-opaque",
 ])
 def test_decompile_struct_assist_opaque_members_do_not_hide_supported_layout(monkeypatch, case):
@@ -1036,8 +1060,6 @@ def test_decompile_struct_assist_opaque_members_do_not_hide_supported_layout(mon
     elif case == "non-scalar-member":
         wrapped.members[1].type = _FakeType(
             "char[4]", width=4, type_class="ArrayTypeClass")
-    elif case == "bitfield":
-        wrapped.members[0].bit_width = 63
     elif case == "unobserved-opaque":
         bv.types["cfg"].members.insert(0, _FakeMember(0x20, "opaque", opaque))
     elif case == "unrelated-opaque":
@@ -1102,6 +1124,116 @@ def test_struct_assist_requires_consistent_supported_witness(case):
         fn.parameter_vars.append(other)
         nodes[1] = _struct_assist_access(other, 0x30, 4)
     assert read_decompile._struct_layout_warnings(bv, fn) == []
+
+
+@pytest.mark.parametrize("case, hints", [
+    ("copy", 0), ("phi", 0), ("call-argument", 0), ("derived-pointer", 0),
+    ("stored-value", 0), ("address-taken", 0), ("null-check", 1),
+])
+def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
+    bv, fn, var, nodes = _struct_assist_case()
+    alias = _FakeVariable(name="rbx", storage=7, var_type=var.type, identifier=1003)
+    alias_ssa = types.SimpleNamespace(var=alias, version=1)
+    if case == "copy":
+        # rbx#1 = c#0, then an access through the copy outside cfg's layout.
+        nodes.append(_struct_assist_node(
+            "MLIL_SET_VAR_SSA", dest=alias_ssa, src=_struct_assist_read(var)))
+        nodes.append(_struct_assist_access(alias, 0x80, 4, version=1))
+    elif case == "phi":
+        nodes.append(_struct_assist_node(
+            "MLIL_VAR_PHI", dest=alias_ssa,
+            src=[types.SimpleNamespace(var=var, version=0), alias_ssa]))
+    elif case == "call-argument":
+        nodes.append(_struct_assist_node(
+            "MLIL_CALL_SSA", params=[_struct_assist_read(var)]))
+    elif case == "derived-pointer":
+        nodes.append(_struct_assist_node("MLIL_SET_VAR_SSA", dest=alias_ssa, src=(
+            _struct_assist_node(
+                "MLIL_ADD", left=_struct_assist_read(var),
+                right=_struct_assist_node("MLIL_CONST", constant=0x10)))))
+    elif case == "stored-value":
+        nodes.append(_struct_assist_node(
+            "MLIL_STORE_SSA", size=8,
+            dest=_struct_assist_node("MLIL_CONST_PTR", constant=0x404000),
+            src=_struct_assist_read(var)))
+    elif case == "address-taken":
+        nodes.append(_struct_assist_node("MLIL_ADDRESS_OF", src=var))
+    elif case == "null-check":
+        # A comparison result cannot carry the pointer to unseen accesses.
+        nodes.append(_struct_assist_node(
+            "MLIL_CMP_E", left=_struct_assist_read(var),
+            right=_struct_assist_node("MLIL_CONST", constant=0)))
+    assert len(read_decompile._struct_layout_warnings(bv, fn)) == hints
+
+
+@pytest.mark.parametrize("case, hints", [
+    ("bitfield-unit", 0), ("split-bitfields", 0), ("overlapping-members", 0),
+    ("unobserved-bitfield", 1),
+])
+def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
+    bv, fn, _, _ = _struct_assist_case()
+    other = _struct_assist_layout("other_cfg")
+    unit = other.members[1].type
+
+    def bitfield(offset: int, name: str, bits: int) -> _FakeMember:
+        member = _FakeMember(offset, name, unit)
+        member.bit_width = bits
+        return member
+
+    if case == "bitfield-unit":
+        other.members[1] = bitfield(0x30, "lo", 20)
+        other.width = 0x33  # BN sizes a trailing bitfield to the bit
+    elif case == "split-bitfields":
+        # BN reports the second field at its first byte with the unit's width.
+        other.members[1:] = [bitfield(0x30, "lo", 16), bitfield(0x32, "hi", 16)]
+        other.width = 0x38
+    elif case == "overlapping-members":
+        other.members.append(_FakeMember(0x2c, "overlap", unit))
+    elif case == "unobserved-bitfield":
+        # Unclassifiable storage away from every access does not block cfg.
+        other = bv.types["cfg"]
+        other.members.append(bitfield(0x34, "spare", 3))
+    bv.types[str(other).removeprefix("struct ")] = other
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    assert len(warnings) == hints
+    if hints:
+        assert "struct cfg *" in warnings[0]
+
+
+def test_struct_assist_resolves_only_observed_member_typedefs():
+    bv, fn, _, _ = _struct_assist_case()
+    lookups = []
+    scalar = _FakeType("uint32_t", width=4, type_class="IntegerTypeClass")
+
+    def lookup(type_id):
+        lookups.append(type_id)
+        return scalar
+
+    def reference(index: int) -> _FakeType:
+        alias = _FakeType("u32_t", width=4, type_class="NamedTypeReferenceClass")
+        alias.name = "u32_t"
+        alias.type_id = f"ref-{index}"
+        return alias
+
+    bv.get_type_by_id = lookup
+    for index in range(200):
+        decoy = _FakeType(f"struct decoy{index}", width=0x40, members=[
+            _FakeMember(offset, f"f{offset:x}", reference(index))
+            for offset in (*range(0, 0x28, 4), 0x34, 0x38, 0x3c)
+        ])
+        decoy.type = types.SimpleNamespace(name="StructStructureType")
+        decoy.base_structures = []
+        bv.types[f"decoy{index}"] = decoy
+    wrapped = _struct_assist_layout("wrapped_cfg")
+    wrapped.members[1].type = reference(-1)
+    wrapped.members.insert(0, _FakeMember(0x20, "unobserved", reference(-2)))
+    bv.types["wrapped_cfg"] = wrapped
+    del bv.types["cfg"]
+
+    warnings = read_decompile._struct_layout_warnings(bv, fn)
+
+    assert len(warnings) == 1 and "struct wrapped_cfg *" in warnings[0]
+    assert lookups == ["ref--1"]
 
 
 @pytest.mark.parametrize("pointee", ["StructureTypeClass", "IntegerTypeClass"])

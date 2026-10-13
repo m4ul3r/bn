@@ -302,7 +302,11 @@ def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, 
 
     SSA version zero ties the witness to the incoming parameter, not a later
     value stored in the same variable. Any unsupported memory address using
-    that variable disqualifies it rather than cherry-picking its easy accesses.
+    that variable disqualifies it rather than cherry-picking its easy accesses,
+    and so does any other use through which the pointer value can reach code
+    the witness does not inspect: a copy, PHI, derived pointer, call argument
+    or stored value. Only a comparison, whose result cannot carry the pointer,
+    is exempt.
     """
     parameters = {
         _taint.var_key(var): (index, var)
@@ -317,9 +321,42 @@ def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, 
         return []
     accesses: dict[tuple, set[tuple[int, int]]] = {key: set() for key in parameters}
     unsupported: set[tuple] = set()
+    # Expression indexes of incoming-parameter reads; each must be an accepted
+    # access base or a comparison operand.
+    uses: dict[int, tuple] = {}
+    accounted: set[int] = set()
+
+    def incoming(node: Any) -> tuple | None:
+        if _taint.op_name(node) != "MLIL_VAR_SSA" or node.src.version != 0:
+            return None
+        key = _taint.var_key(node.src)
+        return key if key in parameters else None
 
     def collect(ins: Any) -> None:
         op = _taint.op_name(ins)
+        if op == "MLIL_VAR_SSA":
+            key = incoming(ins)
+            if key is not None:
+                uses[int(ins.expr_index)] = key
+            return
+        if op == "MLIL_VAR_PHI":
+            unsupported.update(
+                _taint.var_key(src) for src in ins.src
+                if src.version == 0 and _taint.var_key(src) in parameters)
+            return
+        if op in {
+            "MLIL_VAR_SSA_FIELD", "MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD",
+            "MLIL_ADDRESS_OF", "MLIL_ADDRESS_OF_FIELD",
+        }:
+            key = _taint.var_key(ins.src)
+            if key in parameters:
+                unsupported.add(key)
+            return
+        if op.startswith("MLIL_CMP_"):
+            for operand in (ins.left, ins.right):
+                if incoming(operand) is not None:
+                    accounted.add(int(operand.expr_index))
+            return
         if op not in {
             "MLIL_LOAD_SSA", "MLIL_LOAD_STRUCT_SSA",
             "MLIL_STORE_SSA", "MLIL_STORE_STRUCT_SSA",
@@ -338,20 +375,19 @@ def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, 
             if _taint.op_name(right) == "MLIL_CONST":
                 offset += int(right.constant)
                 base = left
-        if _taint.op_name(base) != "MLIL_VAR_SSA" or base.src.version != 0:
-            unsupported.update(touched)
-            return
-        key = _taint.var_key(base.src)
+        key = incoming(base)
         width = int(ins.size)
-        if key not in parameters or touched != {key} or offset < 0 or width <= 0:
+        if key is None or touched != {key} or offset < 0 or width <= 0:
             unsupported.update(touched)
             return
+        accounted.add(int(base.expr_index))
         accesses[key].add((offset, width))
 
     # traverse visits nested loads as well as top-level stores. Its callback
     # returns None, so draining the generator need not retain any IL objects.
     for _ in ssa.traverse(collect):
         pass
+    unsupported.update(key for index, key in uses.items() if index not in accounted)
     return [
         (index, var, accesses[key])
         for key, (index, var) in parameters.items()
@@ -359,44 +395,69 @@ def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, 
     ]
 
 
+_SCALAR_TYPE_CLASSES = frozenset({
+    "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
+    "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
+})
+
+
 def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     """Evidence-qualified known-layout assistance; never writes a type (#903).
 
     Match complete scalar members of concrete, non-inherited structs, resolving
-    member typedefs first. Unclassifiable members can block uniqueness but cannot
-    supply a witness. Whole-struct aliases do not add candidates (their concrete
-    declarations are already in bv.types). Matching two distinct offsets is a
-    minimum witness, not proof of identity.
+    typedefs only for members at observed offsets/widths. Unclassifiable members
+    -- unresolved typedefs, bitfield storage units and overlapping members --
+    can block uniqueness but cannot supply a witness. Whole-struct aliases do not
+    add candidates (their concrete declarations are already in bv.types).
+    Matching two distinct offsets is a minimum witness, not proof of identity.
     """
     accesses = _untyped_pointer_accesses(func)
     if not accesses:
         return []
+    observed_sets = [observed for _, _, observed in accesses]
+    observed_keys = set().union(*observed_sets)
     layouts: list[tuple[str, dict[tuple[int, int], str | None]]] = []
     for name, type_obj in bv.types.items():
         if (_enum_name(type_obj.type_class) != "StructureTypeClass"
                 or _enum_name(type_obj.type) != "StructStructureType"
                 or type_obj.base_structures):
             continue
-        # Named scalar = positive; None = uncertain; absent = incompatible.
-        members: dict[tuple[int, int], str | None] = {}
+        scalars: dict[tuple[int, int], Any] = {}
+        uncertain: list[tuple[int, int]] = []  # byte spans [start, end)
         end = 0
+        # BN can size a struct ending in a bitfield to the bit, short of the
+        # storage unit's last byte; the unit still bounds the layout.
+        limit = int(type_obj.width)
         for member in sorted(type_obj.members, key=lambda member: member.offset):
             offset, width = int(member.offset), int(member.type.width)
-            if offset < end or width <= 0:
-                break  # overlapping/incomplete layouts are not a unique witness
-            end = offset + width
-            _, member_type, follow_error = read_types._follow_typedef(
-                bv, str(member.name), member.type)
-            if member.name and not getattr(member, "bit_width", 0):
-                if follow_error is not None:
-                    members[(offset, width)] = None
-                elif _enum_name(member_type.type_class) in {
-                    "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
-                    "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
-                }:
-                    members[(offset, width)] = str(member.name)
+            if width <= 0:
+                break  # incomplete layouts are not a unique witness
+            if offset < end:
+                uncertain.append((offset, min(end, offset + width)))
+            end = max(end, offset + width)
+            if getattr(member, "bit_width", 0):
+                # Compilers may access any part of a bitfield's storage unit.
+                uncertain.append((offset, offset + width))
+                limit = max(limit, offset + width)
+            elif member.name:
+                scalars[(offset, width)] = member
         else:
-            if end <= int(type_obj.width):
+            if end > limit:
+                continue
+            # Named scalar = positive; None = uncertain; absent = incompatible.
+            members: dict[tuple[int, int], str | None] = {}
+            for offset, width in observed_keys:
+                if any(offset < hi and lo < offset + width for lo, hi in uncertain):
+                    members[(offset, width)] = None
+                elif (offset, width) in scalars:
+                    member = scalars[(offset, width)]
+                    _, member_type, follow_error = read_types._follow_typedef(
+                        bv, str(member.name), member.type)
+                    if follow_error is not None:
+                        members[(offset, width)] = None
+                    elif _enum_name(member_type.type_class) in _SCALAR_TYPE_CLASSES:
+                        members[(offset, width)] = str(member.name)
+            if any(observed <= members.keys() for observed in observed_sets):
                 layouts.append((str(name), members))
 
     warnings = []

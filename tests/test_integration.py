@@ -3210,9 +3210,16 @@ class TestStructLayoutAssistance903:
         __attribute__((noinline)) uint64_t handle(void *c) {
             return *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
         }
+        __attribute__((noipa)) void sink(void) { __asm__ volatile(""); }
+        /* The call keeps c in a callee-saved copy that reaches past cfg. */
+        __attribute__((noinline)) uint64_t handle_alias(void *c) {
+            uint64_t sum = *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+            sink();
+            return sum + *(uint32_t *)((char *)c + 0x80);
+        }
         int main(void) {
-            struct cfg c = { .flags = 7, .depth = 3 };
-            return (int)handle(&c);
+            struct cfg c[3] = { { .flags = 7, .depth = 3 } };
+            return (int)(handle(c) + handle_alias(c));
         }
     """
 
@@ -3258,6 +3265,36 @@ class TestStructLayoutAssistance903:
         text_result = shared_bn.run("decompile", "handle")
         assert text_result.returncode == 0, text_result.stderr
         assert hint in text_result.stdout
+
+        # Accesses through a copy of the parameter must not be dropped from
+        # the witness while the body visibly uses an offset cfg cannot hold.
+        shared_bn.json("proto", "set", "handle_alias", "uint64_t handle_alias(void *c)")
+        aliased = shared_bn.json("decompile", "handle_alias")
+        assert "0x80" in aliased["text"], aliased
+        assert not any("struct layout candidate" in w for w in aliased["warnings"]), aliased
+
+        # A bitfield storage unit at a witnessed offset is potentially
+        # compatible; it must block uniqueness rather than be skipped. The C
+        # declaration path refuses bitfields, so build the native member.
+        bit_widths = shared_bn.json(
+            "py", "exec",
+            "from binaryninja import StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'lo', bit_width=20)\n"
+            "bv.define_user_type('bits_cfg', s)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [m.bit_width for m in bv.get_type_by_name('bits_cfg').members]\n")["result"]
+        assert bit_widths == [0, 0, 20], bit_widths
+        blocked = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in blocked["warnings"]), blocked
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('bits_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
 
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
