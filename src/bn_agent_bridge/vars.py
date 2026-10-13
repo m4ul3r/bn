@@ -218,14 +218,15 @@ def _list_locals(func) -> list[dict[str, Any]]:
 
 _CANARY_SYMBOL = "__stack_chk_guard"
 # TLS canary slots of the x86 Linux ABIs: fs:0x28 (x86_64) and gs:0x14 (i386).
-_TLS_CANARY_SLOTS = {("fsbase", 0x28), ("gsbase", 0x14)}
+_TLS_CANARY_SLOTS = {("x86_64", "fsbase", 0x28), ("x86", "gsbase", 0x14)}
 _CONSTANT_OPS = ("MLIL_CONST", "MLIL_CONST_PTR", "MLIL_IMPORT")
 
 
-def _is_canary_load(view, expr) -> bool:
+def _is_canary_load(func, expr) -> bool:
     """True when ``expr`` loads the stack-protector guard value: a load of the
     ``__stack_chk_guard`` symbol (directly, or through one pointer such as a GOT
-    slot) or of the x86 TLS canary slot."""
+    slot) or of the x86 TLS canary slot, identified by its architectural register
+    rather than the variable's mutable display name."""
     if expr.operation.name != "MLIL_LOAD":
         return False
     address = expr.src
@@ -233,14 +234,16 @@ def _is_canary_load(view, expr) -> bool:
         address = address.src
     op = address.operation.name
     if op in _CONSTANT_OPS:
-        symbol = view.get_symbol_at(int(address.constant))
+        symbol = func.view.get_symbol_at(int(address.constant))
         return symbol is not None and str(symbol.name).split("@")[0] == _CANARY_SYMBOL
     if op == "MLIL_ADD":
         for base, offset in ((address.left, address.right), (address.right, address.left)):
             if (
                 base.operation.name == "MLIL_VAR"
                 and offset.operation.name in _CONSTANT_OPS
-                and (str(base.src.name), int(offset.constant)) in _TLS_CANARY_SLOTS
+                and _variable_source_name(base.src) == "RegisterVariableSourceType"
+                and (func.arch.name, func.arch.get_reg_name(base.src.storage),
+                     int(offset.constant)) in _TLS_CANARY_SLOTS
             ):
                 return True
     return False
@@ -271,12 +274,11 @@ def _find_canary_storage(func) -> int | None:
         mlil = func.mlil
         if mlil is None:
             return None
-        view = func.view
         for block in list(mlil.basic_blocks):
             guard_registers: set[int | None] = set()
             for ins in block:
                 from_guard = ins.operation.name == "MLIL_SET_VAR" and (
-                    _is_canary_load(view, ins.src)
+                    _is_canary_load(func, ins.src)
                     or (ins.src.operation.name == "MLIL_VAR"
                         and _variable_identifier(ins.src.src) in guard_registers)
                 )
@@ -339,10 +341,11 @@ def _list_frame(func) -> dict[str, Any]:
     offsets = sorted(by_storage)
     slots: list[dict[str, Any]] = []
     for i, storage in enumerate(offsets):
-        if i + 1 < len(offsets):
-            distance: int | None = offsets[i + 1] - storage
-        elif storage < 0:
-            distance = -storage
+        if storage < 0:
+            next_offset = min(offsets[i + 1], 0) if i + 1 < len(offsets) else 0
+            distance: int | None = next_offset - storage
+        elif i + 1 < len(offsets):
+            distance = offsets[i + 1] - storage
         else:
             distance = None
         variables = []
