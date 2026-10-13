@@ -4071,9 +4071,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #795 adds eleven further CLI count reads to this combined population.
     # #889 adds the data-symbol total read; its offset read was already covered.
     # M-12 adds the strings `noise_strings` count read.
-    assert len(sites) == 55, (
+    # #968 adds the `strings --with-xrefs` row's `xref_function_count` and
+    # `data_ref_count`; #969 the imports listing's `library_unattributed`.
+    assert len(sites) == 58, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 55. A "
+        "count helper, not 58. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4198,6 +4200,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # exemption fails with the branch it exempts.
         "_render_name_address_list_text(self_defined_excluded) [count not "
         "stated in this context]",
+        # #969: the same harness cut as `self_defined_excluded` above -- the
+        # inner paged-list boundary discloses first. The footer's own wording
+        # is pinned in
+        # `test_imports_text_points_unattributed_rows_at_needed_libraries_969`.
+        "_render_name_address_list_text(library_unattributed) [count not "
+        "stated in this context]",
+        # #968: a ROW fragment of `strings --with-xrefs`, reached only through
+        # `_render_strings_rows`; pinned by
+        # `tests/test_cli_misc.py::test_strings_with_xrefs_forwards_flag_and_renders_functions_968`.
+        "_string_xref_suffix(data_ref_count) [not a payload renderer]",
+        "_string_xref_suffix(xref_function_count) [not a payload renderer]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
@@ -6519,6 +6532,7 @@ _STRING_SHAPE_GUARDS = {
     ("_render_orient_text", "raw", 0): "reaches_the_output",
     ("_render_proto_text", "prototype", 0): "reaches_the_output",
     ("_render_py_exec_text", "result", 0): "reaches_the_output",
+    ("_render_read_escaped_text", "hex_str", 0): "reaches_the_output",
     ("_render_read_text", "hex_str", 0): "reaches_the_output",
     ("_render_sections_text", "n", 0): "reaches_the_output",
     ("_render_trace_frontiers", "reason", 0): "reaches_the_output",
@@ -9355,3 +9369,43 @@ def test_class_list_keeps_both_hidden_share_disclosures_after_integration():
     assert "2 user-declared class types (--all to show)" in out
     assert "malformed library_suppressed field" in out
     assert "malformed declared_suppressed field" not in out
+
+
+def test_target_info_text_states_dynamic_link_info_969():
+    from bn.formatters import _render_target_info_text
+
+    out = _render_target_info_text({
+        "selector": "libwidget.so.2", "needed_libraries": ["libc.so.6", "libz.so.1"],
+        "soname": "libwidget.so.2", "rpath": None, "runpath": "$ORIGIN/../lib",
+    })
+    assert "\tneeded libraries: libc.so.6, libz.so.1" in out
+    assert "\tsoname: libwidget.so.2" in out
+    assert "\trunpath: $ORIGIN/../lib" in out
+    assert "rpath:" not in out.replace("runpath:", "")
+    # A static target answers "none"; a `target list` row (no key) says nothing.
+    assert "\tneeded libraries: 0 (no DT_NEEDED entries)" in _render_target_info_text(
+        {"selector": "fw", "needed_libraries": []})
+    assert "needed libraries" not in _render_target_info_text({"selector": "fw"})
+
+
+def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
+    from bn.formatters import _render_imports_summary_text, _render_name_address_list_text
+
+    out = _render_name_address_list_text({
+        "kind": "imports", "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False,
+        "items": [{"address": "0x1000", "name": "printf", "kind": "function", "library": "libc.so.6"},
+                  {"address": "0x1010", "name": "__gmon_start__", "kind": "function", "library": None}],
+        "library_unattributed": 1, "needed_libraries": ["libc.so.6", "libz.so.1"],
+    })
+    assert "0x1000  printf [libc.so.6]" in out
+    assert ("// 1 import(s) carry no library (no symbol version names one); "
+            "this target needs: libc.so.6, libz.so.1") in out
+
+    summary = _render_imports_summary_text({
+        "total_symbols": 3, "needed_libraries": ["libc.so.6"],
+        "by_library": {"libc.so.6": 2, "(unattributed)": 1},
+    })
+    assert "by library (symbol version requirements):\n      2  libc.so.6\n      1  (unattributed)" in summary
+    # Nothing attributed: the section would only restate the total.
+    assert "by library" not in _render_imports_summary_text(
+        {"total_symbols": 3, "by_library": {"(unattributed)": 3}})

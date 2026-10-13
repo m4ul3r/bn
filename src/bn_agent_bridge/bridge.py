@@ -3257,6 +3257,10 @@ class BinaryNinjaBridge:
                 "import_symbol_count": "rows returned by imports",
                 "imported_function_count": "callable imported function targets",
             },
+            # #969: the dependency answer an agent asks `target info` for first
+            # (DT_NEEDED, plus DT_SONAME / DT_RPATH / DT_RUNPATH), which used
+            # to live only in `imports --summary`.
+            **read_misc._dynamic_link_info(bv),
             # #793: the SAME annotation block `evidence orient` publishes, from
             # the same builder, so the two surfaces cannot disagree about whether
             # this view already carries inherited state. Orient answered this
@@ -5036,6 +5040,7 @@ def _bind_strings(bridge, params, target):
             params.get("probable_format_strings"), label="probable_format_strings", default=False
         ),
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
+        with_xrefs=_validate_bool(params.get("with_xrefs"), label="with_xrefs", default=False),
     )
 
 

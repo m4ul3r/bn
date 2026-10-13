@@ -1685,6 +1685,17 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines.append(
             f"\timports: {import_symbols} symbols{callable_suffix}"
         )
+    # #969: the dependency list, on `target info` (target list rows carry no
+    # such key and render nothing). Declared-but-empty is a real answer -- a
+    # static or non-ELF target has no DT_NEEDED -- so it prints as "none".
+    if _field_declared(value, "needed_libraries"):
+        needed = [_escape_control_chars(str(lib)) for lib in _field_list(value, "needed_libraries")]
+        listed = ", ".join(needed) if needed else "0 (no DT_NEEDED entries)"
+        lines.append(f"\tneeded libraries: {listed}")
+    for key in ("soname", "rpath", "runpath"):
+        text = _text_value(value, key)
+        if text:
+            lines.append(f"\t{key}: {_escape_control_chars(text)}")
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
     segments = _field_list(value, "segments")
@@ -2034,6 +2045,16 @@ def _render_name_address_list_text(value: Any) -> str:
         # fabricated zero the choke point exists to stop (#619/#683).
         note = ("// the payload's self-defined-excluded count is not a number "
                 "that can be read (use --format json)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # #969: `library: null` rows are imports no ELF symbol version binds to a
+    # library; name the DT_NEEDED list they can come from, so the null points at
+    # the answer rather than reading as "no dependency".
+    unattributed = _nonnegative_count(value, "library_unattributed")
+    if unattributed:
+        needed = ", ".join(_escape_control_chars(str(lib))
+                           for lib in _field_list(value, "needed_libraries"))
+        note = (f"// {unattributed} import(s) carry no library (no symbol version names one); "
+                f"this target needs: {needed or '?'} (also in `bn target info`)")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
 
@@ -4791,6 +4812,15 @@ def _render_imports_summary_text(value: Any) -> str:
         lines.append("needed libraries (DT_NEEDED):")
         for lib in needed:
             lines.append(f"  {lib}")
+    # #969: per-import library attribution (ELF symbol versioning), aggregated.
+    # Shown only when at least one import IS attributed: a lone
+    # "(unattributed)" row restates the total and says nothing.
+    by_library = _field_dict(value, "by_library")
+    if any(lib != "(unattributed)" for lib in by_library):
+        lines.append("")
+        lines.append("by library (symbol version requirements):")
+        for lib, count in sorted(by_library.items(), key=lambda x: -_int_or_default(x[1])):
+            lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(lib)}")
     # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
     # rather than printing dangling "by namespace:"/"by kind:" headers.
     namespaces = _field_dict(value, "namespaces")
@@ -4843,8 +4873,27 @@ def _render_strings_rows(value: Any) -> str:
                 suffix += f"; code_refs={refs}"
             suffix += "]"
             row += suffix
+        # #968 --with-xrefs: the functions that reference this string, capped
+        # by the bridge; the stated total names how many the cap left out.
+        if _field_declared(item, "xref_functions"):
+            row += _string_xref_suffix(item)
         lines.append(row)
     return "\n".join(lines)
+
+
+def _string_xref_suffix(item: dict[str, Any]) -> str:
+    """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
+    functions = [fn for fn in _field_list(item, "xref_functions") if isinstance(fn, dict)]
+    names = [_escape_control_chars(_text_value(fn, "name") or _text_value(fn, "address") or "?")
+             for fn in functions]
+    total = _nonnegative_count(item, "xref_function_count")
+    text = ", ".join(names) if names else "0 functions"
+    if total > len(names):
+        text += f" (+{total - len(names)} more)"
+    data_refs = _nonnegative_count(item, "data_ref_count")
+    if data_refs:
+        text += f"; {data_refs} data ref(s)"
+    return f"  [xrefs: {text}]"
 
 
 def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
@@ -5141,6 +5190,58 @@ def _render_read_text(value: Any) -> str:
         lines.append(f"note: {note}")
 
     return "\n".join(lines)
+
+
+# #971: the C escapes `read --encoding escaped` writes. Every escape stands for
+# exactly one byte, so `\0` is always one NUL (no octal run-on) and `\xHH` is
+# always two digits.
+_C_ESCAPES = {0x00: "\\0", 0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+              0x0B: "\\v", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+
+
+def _c_escape_bytes(data: bytes) -> str:
+    """*data* as the body of a C string literal, one escape per non-printable byte."""
+    return "".join(
+        _C_ESCAPES.get(b) or (chr(b) if 0x20 <= b < 0x7F else f"\\x{b:02x}")
+        for b in data
+    )
+
+
+# Source bytes per `read --encoding escaped` text line: short enough that a
+# harness's line truncation cannot hide the tail of a string table.
+_READ_ESCAPED_LINE_BYTES = 64
+
+
+@_discloses
+def _render_read_escaped_text(value: Any) -> str:
+    """`read --encoding escaped`: each line an address and a quoted C-escaped
+    run, so the NULs separating adjacent short strings stay visible on a
+    terminal and in an agent harness, where raw bytes drop them (#971)."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    hex_str = value.get("hex")
+    if not isinstance(hex_str, str):
+        return _render_fallback_text(value)
+    try:
+        data = bytes.fromhex(hex_str)
+    except ValueError:
+        return _render_fallback_text(value)
+    address = value.get("address", "0x0")
+    try:
+        base = int(str(address), 16) if str(address).lower().startswith("0x") else int(address)
+    except (TypeError, ValueError):
+        base = 0
+    width = _READ_ESCAPED_LINE_BYTES
+    lines = [f'{base + offset:08x}: "{_c_escape_bytes(data[offset:offset + width])}"'
+             for offset in range(0, len(data), width)]
+    if not lines:
+        lines.append(f"{base:08x}: (no bytes)")
+    note = _text_value(value, "note")
+    if note:
+        lines.append("")
+        lines.append(f"note: {note}")
+    return "\n".join(lines)
+
 
 
 @_discloses

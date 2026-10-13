@@ -55,8 +55,8 @@ bn types show <name>
 bn struct show <name>
 bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangled symbols + RTTI (+ your own declared class types under --all)
 bn class show <Name>                                  # one class: methods, vtable, size, bases, instances; falls back to a class type you declared
-bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
-bn imports
+bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt] [--with-xrefs]
+bn imports [--summary]                                # rows carry `library` from ELF symbol versions; DT_NEEDED is in `target info`
 bn exports [--count]                                 # global/weak definitions from any symbol table, not loader-visible exports
 bn go functions [--summary | --count]                # recover Go names from .gopclntab (then `bn go rename`, a mutation)
 bn sections [--query <q>]
@@ -94,7 +94,9 @@ Notes:
 - `evidence calls <reg-fn> --arg-struct N --field name:type@offset` reads a stack-built descriptor at each registration call. `ptr` resolves a callback/data symbol when possible; unknown, computed, and merged values remain marked. Confirm heuristic values at `source_address`. `evidence function` pairs calls with raw ABI and IL evidence; its `argument_confidence` and arity warnings matter when the decompiler guesses arguments. `evidence virtual-call` may return several providers or a typed unresolved reason; a capped scan is not absence.
 - `trace <caller> <call-addr> --arg N` follows MLIL SSA backward within the caller. `--interprocedural` follows return values into internal callees; it does not map callee parameters up into callers or follow output-pointer writes. The boundary leaf is `out_param_not_followed` locally or `interprocedural_out_param_not_followed` with `--interprocedural`. Use xrefs and another trace to climb callers.
 - `function cfg` contains block edges. In asm view, edge `to` values are addresses; in MLIL/HLIL they are IL instruction indexes. `data vars` requires an address window; `data symbols` lists internal DataSymbols that exports omits. These read under the shared read lock, unlike arbitrary `py exec`.
-- `bn read <addr> --length N` reads mapped bytes, with a hard ceiling of 100000 bytes per request. A short mapped read sets `short_read`; a request above the ceiling sets `capped`. Either is partial, with `requested_length` and a note. Under `--encoding bytes`, the note is visible on stderr while stdout carries the raw bytes. An unmapped start errors.
+- `bn read <addr> [N]` (or `--length N`) reads mapped bytes, with a hard ceiling of 100000 bytes per request. A short mapped read sets `short_read`; a request above the ceiling sets `capped`. Either is partial, with `requested_length` and a note. `--encoding escaped` prints the bytes as a quoted C-escaped string (`\0`, `\n`, `\xHH`, one escape per byte), so the NULs between adjacent short strings stay visible. Under `--encoding bytes`, the note is visible on stderr while stdout carries the raw bytes; NULs are invisible on a terminal, so use it for redirection or `--out`. An unmapped start errors.
+- `strings --min-length/--max-length` count decoded characters, not storage bytes; a row's `length` is bytes and `chars` is characters. `strings --with-xrefs` adds, per listed string, the functions that reference it (`xref_functions`, first 8, plus `xref_function_count`, `code_ref_count`, `data_ref_count`), so a filtered set such as `__func__`-style logger names maps to its users in one call.
+- `target info` states `needed_libraries` (DT_NEEDED), `soname`, `rpath` and `runpath`. An `imports` row's `library` is the library its ELF symbol version requires (`.gnu.version_r`); an unversioned import (or a target with no symbol versioning, common with musl/uClibc) stays `null`, and the listing then names the DT_NEEDED list it can come from.
 
 Before an unfamiliar large read, use `--estimate-output` to measure its output without emitting the body; then slice with `--limit`, `--lines`, or `--out`.
 

@@ -36,6 +36,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import read_xrefs
 from .bridge_state import _quick_loaded_views
 from ._shared import OperationFailure, _parse_address, _validate_count
+from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic
 
 _STRING_TYPE_NAMES: dict[int, str] = {
     0: "ascii",
@@ -351,7 +352,7 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
              min_length: int | None = None, max_length: int | None = None,
              section: str | None = None, no_crt: bool = False, regex: bool = False,
              probable_format_strings: bool = False, count_only: bool = False,
-             domain_sections_only: bool = False):
+             domain_sections_only: bool = False, with_xrefs: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     # allow_none mirrors the sibling list ops (imports/sections): limit=None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
@@ -411,9 +412,13 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
                 continue
         elif needle and needle not in value.lower():
             continue
-        if min_length is not None and length < min_length:
+        # #946: the length filters are documented in CHARACTERS (decoded Unicode
+        # code points), so they compare the decoded value's length. BN's
+        # `StringReference.length` is the encoded byte span -- 4x the character
+        # count for UTF-32 -- and stays the row's `length` (bytes) metadata.
+        if min_length is not None and len(value) < min_length:
             continue
-        if max_length is not None and length > max_length:
+        if max_length is not None and len(value) > max_length:
             continue
         if section:
             secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
@@ -462,7 +467,7 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     start, stop = _page_window(len(survivors), offset=offset, limit=limit)
     page = _paged_envelope(
         kind="strings",
-        items=[_string_entry(row, bv) for row in survivors[start:stop]],
+        items=[_string_entry(row, bv, with_xrefs=with_xrefs) for row in survivors[start:stop]],
         total=len(survivors),
         offset=offset,
         limit=limit,
@@ -482,7 +487,8 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     return page
 
 
-def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv) -> dict[str, Any]:
+def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv, *,
+                  with_xrefs: bool = False) -> dict[str, Any]:
     """Build ONE `strings` row from a retained survivor tuple (#814).
 
     Split out so a row's per-row work -- the string-`type` decode and, in
@@ -516,15 +522,87 @@ def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv) -> 
         entry["format_directives"] = directives
         entry["directive_count"] = len(directives)
         entry["code_refs"] = read_xrefs._code_ref_count(bv, address)
+    if with_xrefs:
+        entry.update(_string_xref_functions(bv, address))
     return entry
 
 
-def _needed_libraries(bv) -> list[str]:
-    """DT_NEEDED shared objects this binary links against, if BN exposes them."""
+# #968: the most referencing functions one `strings --with-xrefs` row names. The
+# row states the full distinct count beside the capped list, so a string
+# referenced from many functions reads as "N more", never as a short list.
+_STRING_XREF_FUNCTION_CAP = 8
+
+
+def _string_xref_functions(bv, address: int) -> dict[str, Any]:
+    """Which functions reference the string at *address* (#968).
+
+    Turns "string -> referencing functions" into one call: an agent recovering
+    names from `__func__`-style logger strings used to pay one `xrefs` call per
+    string. Code refs (the #284-filtered population `xrefs` renders) give the
+    functions; data refs are counted, not resolved, because a pointer table
+    holding the string is not a function that uses it."""
+    code_refs = read_xrefs._genuine_code_refs(bv, address)
+    functions: dict[int, str] = {}
+    for ref in code_refs:
+        fn = getattr(ref, "function", None)
+        if fn is None:
+            continue
+        functions.setdefault(int(fn.start), str(fn.name))
     try:
-        return sorted({str(lib) for lib in (getattr(bv, "libraries", None) or [])})
+        data_ref_count = len(read_xrefs._data_refs_once(bv, address))
     except Exception:
-        return []
+        data_ref_count = 0
+    ordered = sorted(functions.items())
+    return {
+        "code_ref_count": len(code_refs),
+        "data_ref_count": data_ref_count,
+        "xref_function_count": len(ordered),
+        "xref_functions": [
+            {"address": hex(start), "name": name}
+            for start, name in ordered[:_STRING_XREF_FUNCTION_CAP]
+        ],
+    }
+
+
+def _needed_libraries(bv, elf_info: ElfDynamicInfo | None = None) -> list[str]:
+    """DT_NEEDED shared objects this binary links against: BN's list, else the
+    one the file's own dynamic section names."""
+    try:
+        libraries = sorted({str(lib) for lib in (getattr(bv, "libraries", None) or [])})
+    except Exception:
+        libraries = []
+    if not libraries and elf_info is not None:
+        libraries = sorted(set(elf_info.needed))
+    return libraries
+
+
+def _elf_dynamic_info(bv) -> ElfDynamicInfo | None:
+    """The ELF dynamic-section facts BN does not expose (#969), read from the
+    ORIGINAL file bytes (the view's raw parent), or None for a non-ELF / static
+    view or one with no raw parent."""
+    raw = getattr(bv, "parent_view", None)
+    read = getattr(raw, "read", None)
+    if not callable(read):
+        return None
+    try:
+        base = int(getattr(raw, "start", 0) or 0)
+        return parse_elf_dynamic(lambda offset, size: read(base + offset, size))
+    except Exception:
+        return None
+
+
+def _dynamic_link_info(bv) -> dict[str, Any]:
+    """`target info`'s dynamic-linking block (#969): DT_NEEDED, DT_SONAME,
+    DT_RPATH and DT_RUNPATH. Every key is always present (an empty list / null
+    when the target has none), so a reader never has to tell "absent" from
+    "not reported"."""
+    elf_info = _elf_dynamic_info(bv)
+    return {
+        "needed_libraries": _needed_libraries(bv, elf_info),
+        "soname": elf_info.soname if elf_info else None,
+        "rpath": elf_info.rpath if elf_info else None,
+        "runpath": elf_info.runpath if elf_info else None,
+    }
 
 
 def _defined_symbol_names(bv) -> set[str]:
@@ -642,7 +720,19 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    needed_libraries = _needed_libraries(bv)
+    elf_info = _elf_dynamic_info(bv)
+    needed_libraries = _needed_libraries(bv, elf_info)
+    versioned = elf_info.import_libraries if elf_info is not None else {}
+
+    def _library_for(namespace: str, raw_name: str) -> str | None:
+        # A real per-library BN namespace wins; BN's sentinels are not a
+        # dependency. Otherwise the loader's own binding: the verneed library
+        # the symbol's version names (#969). An unversioned import stays None
+        # rather than being guessed from the DT_NEEDED list.
+        if namespace and namespace not in _BN_SENTINEL_NAMESPACES:
+            return namespace
+        return versioned.get(raw_name) or versioned.get(raw_name.split("@", 1)[0])
+
     defined_names = _defined_symbol_names(bv)
     items = []
     self_defined_excluded = 0
@@ -696,10 +786,10 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                     and _slot_carries_jump_slot_reloc(bv, sym.address)):
                 entry_kind = "function"
             namespace = str(getattr(sym, "namespace", "") or "")
-            # Only surface `library` when it's a real per-library namespace;
-            # BN's sentinels become None so agents don't read them as a
-            # dependency. `namespace` keeps the raw value under an honest name.
-            library = namespace if namespace not in _BN_SENTINEL_NAMESPACES else None
+            # A real per-library namespace, else the verneed binding (#969);
+            # BN's sentinels never surface as a dependency. `namespace` keeps
+            # the raw value under an honest name.
+            library = _library_for(namespace, raw_name)
             items.append(
                 {
                     "name": name,
@@ -752,11 +842,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             {
                 "name": read_xrefs._import_symbol_name(symbol),
                 "address": hex(address),
-                "library": (
-                    namespace
-                    if namespace not in _BN_SENTINEL_NAMESPACES
-                    else None
-                ),
+                "library": _library_for(namespace, raw_name),
                 "namespace": namespace,
                 "raw_name": raw_name,
                 "kind": entry_kind,
@@ -827,6 +913,14 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         result["got_collapsed"] = got_collapsed
     if relocation_recovered:
         result["relocation_recovered"] = relocation_recovered
+    # #969: rows whose `library` could not be attributed (an unversioned import,
+    # or a target with no symbol versioning at all), counted over the whole
+    # listing, with the DT_NEEDED list beside it -- so `library: null` points at
+    # the answer instead of reading as "no dependency".
+    unattributed = sum(1 for item in items if not item["library"])
+    if unattributed and needed_libraries:
+        result["library_unattributed"] = unattributed
+        result["needed_libraries"] = needed_libraries
     return result
 
 
@@ -892,17 +986,23 @@ def _imports_build_summary(
     # "needed_libraries" (DT_NEEDED), which is what agents actually want.
     namespaces: dict[str, int] = {}
     by_kind: dict[str, int] = {}
+    by_library: dict[str, int] = {}
     for item in items:
         ns = str(item.get("namespace", "") or "") or "(none)"
         namespaces[ns] = namespaces.get(ns, 0) + 1
         kind = str(item.get("kind", "unknown"))
         by_kind[kind] = by_kind.get(kind, 0) + 1
+        # #969: the per-row `library` attribution, aggregated; an import no
+        # version requirement binds is counted, not dropped.
+        library = str(item.get("library") or "") or "(unattributed)"
+        by_library[library] = by_library.get(library, 0) + 1
     return {
         # #275: a keyed aggregate, not a flat collection -- keeps its namespaces/
         # by_kind maps but carries a `kind` discriminator like every other read.
         "kind": "imports_summary",
         "total_symbols": len(items),
         "needed_libraries": needed_libraries or [],
+        "by_library": dict(sorted(by_library.items(), key=lambda x: (-x[1], x[0]))),
         "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
         "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
     }
