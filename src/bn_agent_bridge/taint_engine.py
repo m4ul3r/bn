@@ -414,25 +414,36 @@ class TaintEngine:
                 seeds.append((var, call_site))
         return (reg, seeds)
 
-    def _pointee_var(self, ssaf: Any, expr: Any, depth: int = 0) -> Any:
+    def _pointee_var(self, ssaf: Any, expr: Any, depth: int = 0, *,
+                     arithmetic: bool = False) -> Any:
         """Follow a pointer expression to the underlying stack Variable.
 
         Handles the common ``rsi#1 = &buf`` / aliased-buffer pattern: an
         ``MLIL_ADDRESS_OF`` yields its source Variable directly; an SSA var is
-        chased through its definition. Returns a Variable or None.
+        chased through its definition. Returns a Variable or None. Scalar LOAD
+        consumers may request arithmetic roots; forward descriptor tracking
+        must retain its element/field identity rather than collapsing to a local.
         """
         if expr is None or depth > 6:
             return None
         name = op_name(expr)
         if "ADDRESS_OF" in name:
             return getattr(expr, "src", None) or getattr(expr, "var", None)
+        if arithmetic and name in ("MLIL_ADD", "MLIL_SUB"):
+            roots = [self._pointee_var(ssaf, getattr(expr, side, None), depth + 1,
+                                       arithmetic=True)
+                     for side in ("left", "right")]
+            roots = [root for root in roots if root is not None]
+            return roots[0] if roots and all(var_key(root) == var_key(roots[0])
+                                            for root in roots) else None
         if is_ssa_var(expr):
             try:
                 d = ssaf.get_ssa_var_definition(expr)
             except Exception:
                 d = None
             if d is not None:
-                return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1)
+                return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1,
+                                         arithmetic=arithmetic)
             return None
         # a var-ssa expression wrapping an SSAVariable
         reads = expr_reads(expr)
@@ -442,7 +453,8 @@ class TaintEngine:
             except Exception:
                 d = None
             if d is not None:
-                return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1)
+                return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1,
+                                         arithmetic=arithmetic)
         return None
 
     def _pointee_tainted(self, ssaf: Any, expr: Any, tainted: set):
@@ -1813,8 +1825,68 @@ class TaintEngine:
                 and width is not None and off <= region.offset
                 and region.offset + region.width <= off + width)
 
+    def _must_reaching_offsets(self, ssaf: Any, mv: Any, la: tuple, lw: Any,
+                               base_key: Any, active: set[int], visited: set | None,
+                               depth: int, budget: _MemoryChainBudget) -> frozenset[int] | None:
+        """Offsets stored on EVERY reaching path; None means an unproved path.
+
+        Unlike the may-provenance query, unknown/overlapping stores and calls
+        stop this proof. An active backedge adds no value, but entry must still
+        supply one. All expansion shares the caller's bounded allowance.
+        """
+        budget.take()
+        if mv is None or depth > 64:
+            return None
+        try:
+            mv = int(mv)
+        except (TypeError, ValueError):
+            return None
+        if mv in active:
+            return frozenset()
+        try:
+            defn = ssaf.get_ssa_memory_definition(mv)
+        except Exception:
+            defn = None
+        if defn is None:
+            return None
+        active.add(mv)
+        try:
+            op = op_name(defn)
+            if "MEM_PHI" in op:
+                offsets: set[int] = set()
+                for sv in self._mem_phi_sources(defn, _budget=budget):
+                    found = self._must_reaching_offsets(
+                        ssaf, sv, la, lw, base_key, active, visited, depth + 1, budget)
+                    if found is None:
+                        return None
+                    budget.take(len(found))
+                    offsets.update(found)
+                    if len(offsets) > 1:
+                        return None
+                return frozenset(offsets)
+            if "STORE" not in op:
+                return None
+            sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
+            if sa is None or sa[0] != la[0]:
+                return None
+            width = getattr(defn, "size", None)
+            if not isinstance(width, int) or not isinstance(lw, int) or width <= 0 or lw <= 0:
+                return None
+            relation = self._store_covers_load(sa[1], width, la[1], lw)
+            if relation == "cover":
+                off = self._must_offset(ssaf, getattr(defn, "src", None), base_key,
+                                        visited, _budget=budget)
+                return None if off is None else frozenset({off})
+            if relation != "disjoint":
+                return None
+            return self._must_reaching_offsets(
+                ssaf, self._mem_in(defn), la, lw, base_key, active, visited, depth + 1, budget)
+        finally:
+            active.remove(mv)
+
     def _must_offset(self, ssaf: Any, expr: Any, base_key: Any,
-                     visited: set | None = None, depth: int = 0) -> int | None:
+                     visited: set | None = None, depth: int = 0, *,
+                     _budget: _MemoryChainBudget | None = None) -> int | None:
         """The constant byte offset into local *base_key* that the pointer
         *expr* holds on EVERY path, else None -- the must-alias question
         coverage asks. ``&base`` is 0, ``&base:field`` / ``&base + c`` is the
@@ -1838,11 +1910,11 @@ class TaintEngine:
             left, right = getattr(expr, "left", None), getattr(expr, "right", None)
             rc = self._int_const(right)
             if rc is not None and "PTR" not in op_name(right):
-                off = self._must_offset(ssaf, left, base_key, visited, depth + 1)
+                off = self._must_offset(ssaf, left, base_key, visited, depth + 1, _budget=_budget)
                 return None if off is None else off + (rc if op == "MLIL_ADD" else -rc)
             lc = self._int_const(left)
             if op == "MLIL_ADD" and lc is not None and "PTR" not in op_name(left):
-                off = self._must_offset(ssaf, right, base_key, visited, depth + 1)
+                off = self._must_offset(ssaf, right, base_key, visited, depth + 1, _budget=_budget)
                 return None if off is None else off + lc
             return None
         if "LOAD" in op:
@@ -1853,12 +1925,16 @@ class TaintEngine:
             la = self._addr_base_offset(ssaf, getattr(expr, "src", None))
             if la is None:
                 return None
-            rw = self._reaching_writer(ssaf, getattr(expr, "src_memory", None), la,
-                                       getattr(expr, "size", None), set(), 0)
-            if rw is None or rw[0] != "store":
+            budget = _budget if _budget is not None else _MemoryChainBudget()
+            try:
+                offsets = self._must_reaching_offsets(
+                    ssaf, getattr(expr, "src_memory", None), la, getattr(expr, "size", None),
+                    base_key, set(), visited, 0, budget)
+            except _MemoryChainExhausted:
+                if _budget is not None:
+                    raise
                 return None
-            return self._must_offset(ssaf, getattr(rw[1], "src", None), base_key,
-                                     visited, depth + 1)
+            return next(iter(offsets)) if offsets and len(offsets) == 1 else None
         if is_ssa_var(expr):
             key = (var_key(expr), getattr(expr, "version", None))
             visited = visited if visited is not None else set()
@@ -1873,9 +1949,10 @@ class TaintEngine:
                 return None
             dop = op_name(d)
             if dop == "MLIL_SET_VAR_SSA":
-                return self._must_offset(ssaf, getattr(d, "src", None), base_key, visited, depth + 1)
+                return self._must_offset(ssaf, getattr(d, "src", None), base_key, visited,
+                                         depth + 1, _budget=_budget)
             if dop == "MLIL_VAR_PHI":
-                offs = {self._must_offset(ssaf, a, base_key, visited, depth + 1)
+                offs = {self._must_offset(ssaf, a, base_key, visited, depth + 1, _budget=_budget)
                         for a in (getattr(d, "src", None) or [])}
                 return offs.pop() if len(offs) == 1 else None
             if self._is_call(d):
@@ -1884,11 +1961,12 @@ class TaintEngine:
                 idx = (model or {}).get("return_alias")
                 params = self._call_params(d)
                 if idx is not None and idx < len(params):
-                    return self._must_offset(ssaf, params[idx], base_key, visited, depth + 1)
+                    return self._must_offset(ssaf, params[idx], base_key, visited,
+                                             depth + 1, _budget=_budget)
             return None
         reads = expr_reads(expr)
         if len(reads) == 1 and "LOAD" not in op:
-            return self._must_offset(ssaf, reads[0], base_key, visited, depth + 1)
+            return self._must_offset(ssaf, reads[0], base_key, visited, depth + 1, _budget=_budget)
         return None
 
     def _var_byte_size(self, v: Any) -> int | None:
@@ -2107,8 +2185,12 @@ class TaintEngine:
         budget = _budget if _budget is not None else _MemoryChainBudget()
         backedge = False
         cycle_reads = 0
-        escape_seen = False
-        backedge_escaped = False
+        active: list[int] = []
+        active_positions: dict[int, int] = {}
+        cycle_members: dict[int, set[int]] = {}
+        escape_epochs: set[int] = set()
+        escaped_backedges: set[int] = set()
+        offsets: dict[int, int | None] = {}
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
         escape_addrs: set[int] = set()
@@ -2123,6 +2205,12 @@ class TaintEngine:
         def _alias(expr: Any, escaped: bool) -> str:
             return self._ptr_aliases_local(ssaf, expr, base_key, escaped=escaped,
                                            escape_addrs=escape_addrs)
+
+        def _offset(expr: Any) -> int | None:
+            key = id(expr)
+            if key not in offsets:
+                offsets[key] = self._must_offset(ssaf, expr, base_key, _budget=budget)
+            return offsets[key]
 
         def _params_touching(params: list[Any], escaped: bool) -> tuple[list[int], list[int]]:
             """``(yes, maybe)`` argument indices pointing into the buffer."""
@@ -2241,13 +2329,15 @@ class TaintEngine:
             # Delay provenance selection until the FINAL consumed bound is known.
             # A later write can move the first NUL past a currently disjoint write.
             writers.append(("fill", defn, mkey or name, params, hit, model))
+            for i in hit:
+                _offset(params[i])
             byte_covers = False
             new_term = None
             for rule in model.get("initializes") or []:
                 budget.take()
                 if rule["arg"] not in hit:
                     continue
-                off = self._must_offset(ssaf, params[rule["arg"]], base_key)
+                off = _offset(params[rule["arg"]])
                 width = self._extent_length(ssaf, params, rule)
                 zero = rule.get("zero") is True
                 vi = rule.get("value_arg")
@@ -2287,7 +2377,7 @@ class TaintEngine:
                     term = _StringTermination() if term is not None else None
                 else:
                     for i in hit:
-                        term = _after_write(self._must_offset(ssaf, params[i], base_key),
+                        term = _after_write(_offset(params[i]),
                                             _write_width(model, params, i), term)
                 updated.add(_proof(proof.initialized or byte_covers, _merge_terms(term, new_term)))
             return frozenset(updated)
@@ -2348,7 +2438,7 @@ class TaintEngine:
 
         def rec(v: Any, depth: int) -> tuple[frozenset[_BufferProof], bool]:
             """Per-path initialization alternatives and escape state at epoch v."""
-            nonlocal truncated, backedge, cycle_reads, escape_seen
+            nonlocal truncated, backedge, cycle_reads
             budget.take()
             try:
                 v = int(v)
@@ -2360,14 +2450,21 @@ class TaintEngine:
                     return m
                 backedge = True
                 cycle_reads += 1
+                members = cycle_members.setdefault(v, set())
+                # Retain only the active cycle, not ancestors after its exit.
+                path = active[active_positions[v]:]
+                budget.take(len(path))
+                members.update(path)
                 # Neutral for coverage, but not an invented exact terminator
                 # that a loop-body write could use to survive its own clobber.
                 neutral = _proof(not strings, _StringTermination() if strings else None)
-                return frozenset({neutral}), backedge_escaped
+                return frozenset({neutral}), v in escaped_backedges
             if depth > MEM_CHAIN_BUDGET:
                 raise _MemoryChainExhausted
             memo[v] = None
             cycle_start = cycle_reads
+            active_positions[v] = len(active)
+            active.append(v)
             try:
                 defn = ssaf.get_ssa_memory_definition(v)
             except Exception:
@@ -2398,7 +2495,7 @@ class TaintEngine:
                     elif "STORE" in op:
                         a = _alias(getattr(defn, "dest", None), esc)
                         if a == "yes":
-                            off = self._must_offset(ssaf, getattr(defn, "dest", None), base_key)
+                            off = _offset(getattr(defn, "dest", None))
                             writers.append(("store", defn, off))
                             proofs = _store_effect(defn, off, proofs)
                         elif a == "maybe" and _store_width(defn) != 0:
@@ -2410,7 +2507,7 @@ class TaintEngine:
                     if _store_width(defn) != 0 and _alias(val, esc) != "no":
                         writers.append(("escape", defn))
                         esc = True
-                        escape_seen = True
+                        escape_epochs.add(v)
                         if "STORE" in op:
                             c = self._const_ptr_addr(ssaf, getattr(defn, "dest", None))
                             if c is not None:
@@ -2426,6 +2523,8 @@ class TaintEngine:
                 memo[v] = res
             else:
                 del memo[v]
+            active.pop()
+            del active_positions[v]
             return res
 
         try:
@@ -2433,16 +2532,18 @@ class TaintEngine:
             while True:
                 escape_count = len(escape_addrs)
                 proofs, _ = rec(mv, 0)
-                if not backedge or not escape_seen:
+                newly_escaped: set[int] = set()
+                for epoch, members in cycle_members.items():
+                    budget.take(len(members))
+                    if not members.isdisjoint(escape_epochs):
+                        newly_escaped.add(epoch)
+                changed = not newly_escaped.issubset(escaped_backedges)
+                escaped_backedges.update(newly_escaped)
+                if not changed and (not escaped_backedges or len(escape_addrs) == escape_count):
                     break
-                if backedge_escaped and len(escape_addrs) == escape_count:
-                    break
-                # The first traversal discovers escapes at the loop bottom.
-                # Revisit earlier calls with a may-escaped backedge and all
-                # discovered stash addresses; never finalize the clean-first-
-                # iteration assumption for later iterations. New aliases can
-                # discover more stashes, so retry until stable within budget.
-                backedge_escaped = True
+                # Only a cycle containing an escape can carry it to an earlier
+                # epoch. A stash strictly after a loop must not taint that loop.
+                # Keep discovered writers on budget cuts, but discard stale facts.
                 memo.clear()
             covered = bool(proofs) and all(p.initialized or p.term is not None for p in proofs)
             if backedge and region.kind == "bounded_cstring" and not covered:
@@ -2476,7 +2577,12 @@ class TaintEngine:
             return off + width <= region.offset or (end is not None and off >= end)
 
         selected: list[tuple] = []
+        selected_keys: set[tuple[str, int]] = set()
         for writer in reversed(writers):
+            key = (writer[0], int(getattr(writer[1], "instr_index", writer[1].address)))
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
             if writer[0] == "store":
                 _, defn, off = writer
                 if not _disjoint(off, _store_width(defn)):
@@ -2484,7 +2590,7 @@ class TaintEngine:
             elif writer[0] == "fill":
                 _, defn, mkey, params, hit, model = writer
                 hit = [i for i in hit if not _disjoint(
-                    self._must_offset(ssaf, params[i], base_key), _write_width(model, params, i))]
+                    offsets.get(id(params[i])), _write_width(model, params, i))]
                 if hit:
                     selected.append(_fill_provenance(defn, mkey, params, hit, model))
             else:
@@ -6997,7 +7103,7 @@ class TaintEngine:
                     return
             if src_expr is not None and "LOAD" in op_name(src_expr):
                 pointer = getattr(src_expr, "src", None)
-                local = self._pointee_var(ssaf, pointer)
+                local = self._pointee_var(ssaf, pointer, arithmetic=True)
                 locals_, _ = self._address_terms(pointer)
                 if local is None and len(locals_) == 1:
                     local = locals_[0]
@@ -7007,7 +7113,12 @@ class TaintEngine:
                         defn, local, d, getattr(src_expr, "src_memory", None),
                         self._local_region(ssaf, pointer, local, demand))
                     for r in expr_reads(pointer):
-                        walk(r, d + 1, mv)
+                        if self._pointee_var(ssaf, r, arithmetic=True) == local:
+                            # A base copy already has this LOAD's resolved demand;
+                            # do not invent a second unknown-region consumption.
+                            walk(r, d + 1, mv, demand, pointer)
+                        else:
+                            walk(r, d + 1, mv)
                     return
                 la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
                 if la is not None:

@@ -10323,11 +10323,12 @@ def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
     cmd = FVar("cmd", typ="char[0x80]")
     pg = _BufProgram(params=[host])
     pg.aliased_store(cmd, 0, 0)
-    pg.store(FExpr("MLIL_CONST_PTR", "0x404018", constant=0x404018), _addr_of(cmd))
+    pg.store(FExpr("MLIL_CONST_PTR", "0x404018", constant=0x404018), _addr_of(cmd)).size = 8
     # The reload reads the memory the escape store defined: the store reaching
     # it wrote &cmd, so it is a must-alias of &cmd + 0 and the fill covers.
     reload = FExpr("MLIL_LOAD_SSA", "[0x404018].q", reads=[], src_memory=pg.mem,
                    src=FExpr("MLIL_CONST_PTR", "0x404018", constant=0x404018))
+    reload.size = 8
     pg.call(_B_STRCPY, [reload,
                         FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
     pg.sink(cmd)
@@ -11646,3 +11647,154 @@ def test_backward_loop_invariant_shares_memory_work_allowance_931(monkeypatch, b
     assert result["stats"]["truncated"] is (not complete)
     if not complete:
         assert result["stats"]["truncation_cause"] == ["memory_chain"]
+
+
+def _stash_load(addr, memory):
+    expr = FExpr("MLIL_LOAD_SSA", "stash reload", src=_cstr(addr), src_memory=memory)
+    expr.size = 8
+    return expr
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("shape", ["dowhile", "branch"])
+def test_backward_stash_may_path_cannot_prove_initialization(reverse, shape):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    if shape == "dowhile":
+        arms = (0, 3)
+        pg.phi(*(reversed(arms) if reverse else arms))
+        pg.call(_B_STRCPY, [_stash_load(0x800, pg.mem), _cstr(0x700)])
+        pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    else:
+        pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+        arms = (0, 1)
+        pg.phi(*(reversed(arms) if reverse else arms))
+        pg.call(_B_STRCPY, [_stash_load(0x800, pg.mem), _cstr(0x700)])
+    pg.sink(buf, folded=True)
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol and any("written by strcpy" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("arm", ["same", "different", "entry", "call", "partial", "unknown"])
+def test_must_stash_offset_requires_every_reaching_arm(reverse, arm):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    first = pg.mem
+    if arm == "entry":
+        second = 0
+    elif arm == "call":
+        pg.call(_B_FILL_GLOBAL, [])
+        second = pg.mem
+    else:
+        value = _region_addr(buf, 1) if arm == "different" else _addr_of(buf)
+        writer = pg.store(_cstr(0x800), value)
+        writer.src_memory = 0
+        if arm != "unknown":
+            writer.size = 1 if arm == "partial" else 8
+        second = pg.mem
+    arms = (first, second)
+    pg.phi(*(reversed(arms) if reverse else arms))
+    ssaf = pg.func().mlil.ssa_form
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._must_offset(ssaf, _stash_load(0x800, pg.mem), te.var_key(buf)) == (
+        0 if arm == "same" else None)
+    # The may-provenance query must not become an all-path proof.
+    assert engine._reaching_writer(ssaf, pg.mem, (("gconst", 0x800), 0), 8, set(), 0) is not None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_backward_later_escape_does_not_contaminate_earlier_loop(reverse):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    arms = (1, 3)
+    header = pg.phi(*(reversed(arms) if reverse else arms))
+    pg.call(_B_FILL_GLOBAL, [])
+    stash = pg.store(_cstr(0x800), _addr_of(buf))
+    stash.src_memory = header.dest_memory
+    pg.sink(buf, folded=True)
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert aol == []
+    assert not any("may be written" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("budget", [24, 256])
+def test_backward_escape_retry_deduplicates_writers_and_retains_sources(monkeypatch, budget):
+    monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", budget)
+    host = FVar("host", ident=31)
+    host0 = FSSA(host, 0)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram(params=[host])
+    pg.call(_B_STRCPY, [_addr_of(buf), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])],
+            reads=[host0])
+    header = pg.phi(1, 4)
+    pg.call(_B_FILL_GLOBAL, [])
+    pg.store(_cstr(0x800), _addr_of(buf))
+    sink = pg.sink(buf, folded=True)
+    sink.src_memory = header.dest_memory
+    result, reasons, _ = _bw(pg.func())
+    assert result["slices"][0]["origin"]["kind"] == "parameter"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert result["stats"]["truncated"] is (budget == 24)
+    assert sum("local buffer buf written by strcpy" in reason for reason in reasons) == 1
+    assert sum("address of local buffer buf stored to memory" in reason for reason in reasons) == 1
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_backward_pointer_copy_load_uses_its_byte_demand(indexed):
+    index = FVar("index", ident=32)
+    index0 = FSSA(index, 0)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram(params=[index])
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(7), _region_const(64)])
+    ptr, value = FSSA(FVar("ptr"), 1), FSSA(FVar("value"), 1)
+    _set(pg, ptr, "ptr = &buf + 2", _region_addr(buf, 2))
+    rd = [ptr, index0] if indexed else [ptr]
+    off = FExpr("MLIL_VAR_SSA", "index#0", reads=[index0]) if indexed else _region_const(3)
+    pointer = FExpr("MLIL_ADD", "ptr + off", reads=rd,
+                    left=FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr]), right=off)
+    load = FExpr("MLIL_LOAD_SSA", "byte load", reads=rd, src=pointer, src_memory=pg.mem)
+    load.size = 1
+    _set(pg, value, "value = byte load", load, reads=rd)
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, aol = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (not indexed)
+    assert bool(aol) is indexed
+    if indexed:
+        assert result["slices"][0]["origin"]["kind"] == "parameter"
+
+
+def test_must_stash_offset_work_is_bounded(monkeypatch):
+    monkeypatch.setattr(te, "MEM_CHAIN_BUDGET", 16)
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    for _ in range(8):
+        pg.phi(pg.mem, pg.mem)
+    ssaf = pg.func().mlil.ssa_form
+    definition = ssaf.get_ssa_memory_definition
+    visits = []
+
+    def counted(version):
+        visits.append(version)
+        return definition(version)
+
+    monkeypatch.setattr(ssaf, "get_ssa_memory_definition", counted)
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._must_offset(ssaf, _stash_load(0x800, pg.mem), te.var_key(buf)) is None
+    assert len(visits) <= 16
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_must_stash_offset_loop_retains_initialized_entry(reverse):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    arms = (1, 3)
+    header = pg.phi(*(reversed(arms) if reverse else arms))
+    # A disjoint write on the same known global base cannot alter the stash.
+    pg.store(_plus(_cstr(0x800), _region_const(16)), _region_const(0)).size = 8
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    ssaf = pg.func().mlil.ssa_form
+    assert engine._must_offset(
+        ssaf, _stash_load(0x800, header.dest_memory), te.var_key(buf)) == 0

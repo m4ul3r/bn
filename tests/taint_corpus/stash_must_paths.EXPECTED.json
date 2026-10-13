@@ -1,0 +1,12 @@
+{
+  "description": "May-reaching stash provenance must not certify initialization; later escape must not contaminate a finished loop. Analyze only.",
+  "lang": "c",
+  "cflags": ["-fno-inline"],
+  "backward": [
+    {"function": "dowhile_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "dowhile_stash_strcpy", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "branch_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "escape_after_loop", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "ptr_copy_load", "sink": "arg:malloc:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true}
+  ]
+}

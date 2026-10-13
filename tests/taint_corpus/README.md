@@ -42,6 +42,7 @@ brittle across compilers/optimisation.
 | `strtok_fixpoint.c`   | #932: two-entry/two-back-edge tokenizer CFG with two unused-return initializers; the NULL continuation reaches `system` even when IL enumerates it first. O0/O1/O2 variants share the source |
 | `loop_exit.c`        | #950: exact synthetic -O1 loop with filled/unwritten exits in both source orders; cyclic memory-PHI memoization must retain an unresolved entry path |
 | `loop_escape_index.c` | loop-bottom address escape makes the next iteration's earlier helper an opaque writer; indexed scalar LOAD preserves parameter origin and caller ascent at O0. `loop_escape_index_o1.c` checks the escape at O1 |
+| `stash_must_paths.c` | do-while and conditional stash reloads must not certify the unwritten first/alternate path; a stash after a finished loop leaves it covered. O0 pointer-copy byte LOAD is covered; O1 variant checks stash paths |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -89,6 +90,17 @@ At O1 the compiler can fold the LOAD away, so that variant checks only the
 loop-carried escape. Deterministic memory-SSA controls cover both PHI orders,
 unescaped initialized loops with unrelated unmodeled calls, and shared-budget
 exhaustion on escape-state revisits.
+
+`stash_must_paths` retains the round-two review's invented source and is
+analyzed only: the do-while and conditional-stash paths intentionally consume
+uninitialized bytes. O0/O1 cases distinguish must-reaching initialization from
+may-reaching provenance, including inlined `strcpy` stores. Deterministic
+tests cover both PHI orders, agreeing/disagreeing stash values, bare-entry,
+opaque-call, partial/unknown-width arms, initialized loop entries, and bounded
+must-query work. Retry evidence stays deduplicated and retains known parameter
+sources even when the shared allowance is exhausted. Copied pointer LOAD
+controls use nonzero offsets and preserve index origins without adding an
+unrelated unknown-region demand.
 
 ## `EXPECTED.json` schema
 
