@@ -1140,10 +1140,9 @@ def _render_comment_list_text(value: Any) -> str:
         # distinguishable in one listing -- same `[doc]` marker `comment get
         # --function` already uses.
         prefix = "[doc] " if item.get("scope") == "function_doc" else ""
-        # Both cells carry settable text -- `comment` via `comment set`, and the
-        # containing function's symbol name via `rename`, which accepts a control
-        # char (`_require_nonempty_name` rejects only empty/whitespace). Either
-        # one raw splits the row (#771).
+        # Comments accept controls, and symbol names from existing databases or
+        # external writers can contain them too. Either raw cell splits the row
+        # (#771), even though bn symbol rename now rejects controls (#923).
         lines.append(f"{address}  {_escape_control_chars(func)}  {prefix}"
                      f"{_escape_control_chars(comment)}")
     return "\n".join(lines)

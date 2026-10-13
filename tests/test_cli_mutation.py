@@ -1341,6 +1341,76 @@ def test_symbol_rename_rejects_whitespace_new_name(fake_transport, capsys):
     assert [call["op"] for call in calls] == []
 
 
+@pytest.mark.parametrize("command", [["rename"], ["symbol", "rename"]])
+@pytest.mark.parametrize("control", ["\0", "\t", "\n", "\r", "\x1b", "\x1f", "\x7f", "\x80", "\x85", "\x9f"])
+def test_symbol_rename_control_name_is_invalid_before_send(fake_transport, capsys, command, control):
+    calls = fake_transport({})
+    rc = bn.cli.main([
+        *command, "--target", "fixture", "parse_record", f"bad{control}name", "--format", "json",
+    ])
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "invalid_request"
+    assert payload["observed"]["request_sent"] is False
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", [["rename"], ["symbol", "rename"]])
+@pytest.mark.parametrize("name", ["''", '""', "ns::operator[]", "café"])
+def test_symbol_rename_printable_name_reaches_verified_state(monkeypatch, capsys, command, name):
+    from _bridge_fakes import _FakeFunction, _FakeMutationBV, _load_bridge
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def send(op, *, params=None, target=None, **kwargs):
+        return instance.dispatch({"op": op, "params": params, "target": target})
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    rc = bn.cli.main([*command, "--target", "fixture", hex(fn.start), name, "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["results"][0]["status"] == "verified"
+    assert fn.name == name
+
+
+def test_batch_control_symbol_name_refuses_before_sibling_write(monkeypatch, tmp_path, capsys):
+    from _bridge_fakes import _FakeFunction, _FakeMutationBV, _load_bridge
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def send(op, *, params=None, target=None, **kwargs):
+        response = instance.dispatch({"op": op, "params": params, "target": target})
+        if not response["ok"]:
+            # Match send_request's structured-error boundary, not just its wire.
+            raise bn.cli.BridgeError(
+                response["error"], status=response.get("status"),
+                requested=response.get("requested"), observed=response.get("observed"),
+            )
+        return response
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    manifest = tmp_path / "changes.json"
+    manifest.write_text(json.dumps({"ops": [
+        {"op": "set_comment", "function": hex(fn.start), "comment": "must not land"},
+        {"op": "rename_symbol", "identifier": hex(fn.start), "new_name": "bad\nname"},
+    ]}), encoding="utf-8")
+    rc = bn.cli.main(["batch", "apply", "--target", "fixture", str(manifest), "--format", "json"])
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "invalid_request"
+    assert fn.name == "parse_record"
+    assert fn.comment == ""
+    assert bv.events == []
+
+
 @pytest.mark.parametrize("bad_name", ["", "   "])
 def test_local_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
     """An empty/whitespace-only new name is refused client-side (exit 3) before
