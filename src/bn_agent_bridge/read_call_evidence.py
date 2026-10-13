@@ -591,53 +591,6 @@ def _callee_used_arg_position(callee_fn, storage_positions: dict[int, int]) -> i
     return highest
 
 
-def _variadic_determination(callee_fn) -> bool | None:
-    """Did BN DETERMINE whether this callee is variadic, and what did it decide?
-
-    ``True``/``False`` is a determination; ``None`` means BN never made one, and
-    the two must not be collapsed. BN states ``has_variable_arguments`` as a
-    ``BoolWithConfidence`` -- a value AND whether analysis ever settled it -- and
-    the object is truthy by its VALUE, so ``bool(flag)`` silently reads
-    "never determined" as a firm "not variadic". Measured cost of reading it that
-    way: 72 of 1242 call rows on an unmutated image demoted, every one of them a
-    printf-style helper BN recovered as ``T(fixed..., char argN @ rax)`` without
-    marking it variadic. Its prologue spills the whole register save area, and
-    those spills are honest version-0 reads -- def-use soundness cannot separate
-    them from consumed arguments, only the varargs flag can, and a flag nobody
-    determined separates nothing.
-
-    So the answer is only a determination when the flag is both PRESENT and
-    DETERMINED. Absent type, absent flag, zero confidence, or a confidence that
-    is not a number at all -> ``None``. A flag carrying no ``confidence``
-    attribute is not a ``BoolWithConfidence`` but a stated bool (a declared
-    signature, a test fake), and a stated value is a determination.
-
-    ``is_variadic`` elsewhere in this module stays the two-state
-    :func:`il_format._function_is_variadic`: for a diagnostic that only reports
-    what the prototype SAYS (#558) and for `arity_mismatch` (#704), "not marked
-    variadic" is the right reading. It is this witness, which contradicts the
-    prototype rather than reporting it, that may not guess.
-    """
-    func_type = getattr(callee_fn, "type", None)
-    if func_type is None:
-        return None
-    flag = getattr(func_type, "has_variable_arguments", None)
-    if flag is None:
-        return None
-    confidence = getattr(flag, "confidence", None)
-    if confidence is not None:
-        try:
-            determined = int(confidence) > 0
-        except (TypeError, ValueError):
-            return None
-        if not determined:
-            return None
-    try:
-        return bool(getattr(flag, "value", flag))
-    except Exception:  # noqa: BLE001 - an unreadable flag determined nothing
-        return None
-
-
 def _callee_arg_use_witness(bv, callee_fn, *, variadic: bool | None) -> tuple[int, str] | None:
     """The arity the callee's own body DEMONSTRATES by USING an incoming argument,
     with the register that witnessed it -- or None for no claim.
@@ -679,7 +632,7 @@ def _callee_arg_use_witness(bv, callee_fn, *, variadic: bool | None) -> tuple[in
       determined IS variadic -- a variadic body reads the argument registers
       through the register save area / `va_list`, so a register read is not an
       arity there, and an undetermined flag cannot tell the two apart. See
-      :func:`_variadic_determination`;
+      :func:`il_format._variadic_determination`;
     * **no ABI register list** (a stack-arguments-only platform, or a view whose
       calling convention is unknown) -- no register is an argument register, so
       there is no position to compare against, and a view whose architecture
@@ -847,7 +800,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # The witness takes the THREE-state varargs answer, not `is_variadic`: it
     # contradicts the recovered prototype, so it may only speak where BN actually
     # determined the callee is not variadic (#882 round 2).
-    variadic = _variadic_determination(callee_fn)
+    variadic = il_format._variadic_determination(callee_fn)
     callee_use: tuple[int, str] | None
     if read_cache is None:
         callee_use = _callee_arg_use_witness(bv, callee_fn, variadic=variadic)

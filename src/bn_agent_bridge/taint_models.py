@@ -469,14 +469,25 @@ def _canonical_cxx_alloc(name: str) -> str | None:
 # sink and an internal `close64` running `system()` would falsely borrow the
 # benign empty `close` model (suppressing descent -> a confident false
 # all-clear). Only names on this list alias, and only when the base is itself a
-# real model key (enforced in ``lookup_model``). Restricted to the offset-taking
-# APIs this catalog actually models; add a pair here only when its base model is
-# present. Other genuine LFS64 symbols exist (lseek64, open64/openat64, mmap64,
-# ftruncate64/truncate64, preadv64/pwritev64) but are omitted until their base
-# is modeled.
+# real model key (enforced in ``lookup_model``). Restricted to the LFS APIs
+# this catalog actually models; add a pair here only when its base model is
+# present. Other genuine LFS64 symbols exist (lseek64, mmap64, ftruncate64,
+# preadv64/pwritev64) but are omitted until their base is modeled.
 _LFS64_ALIASES: dict[str, str] = {
     "pread64": "pread",
     "pwrite64": "pwrite",
+    # #957: the path_injection sinks' large-file spellings.
+    "open64": "open",
+    "openat64": "openat",
+    "creat64": "creat",
+    "fopen64": "fopen",
+    "freopen64": "freopen",
+    "stat64": "stat",
+    "lstat64": "lstat",
+    "fstatat64": "fstatat",
+    "xstat64": "xstat",
+    "lxstat64": "lxstat",
+    "truncate64": "truncate",
 }
 
 

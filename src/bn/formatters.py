@@ -4124,8 +4124,8 @@ def _leaf_group_key(leaf: Any) -> tuple:
     if not isinstance(leaf, dict):
         # Group malformed leaves by (type, repr): a type key can't collide with a
         # real `kind` string, and keying on the repr too means two DISTINCT
-        # broken leaves each render instead of one hiding behind an `(xN)` count
-        # of rows that only look alike because both are broken.
+        # broken leaves each render instead of one hiding behind a `[N leaves]`
+        # count of rows that only look alike because both are broken.
         return (type(leaf), repr(leaf))
     kind = leaf.get("kind")
     kind = kind if isinstance(kind, str) else str(kind)
@@ -4164,7 +4164,8 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12) -> list[str]:
         g = groups[gk]
         line = _render_leaf_line(g["rep"])
         if g["count"] > 1:
-            line += f"  (x{g['count']})"
+            # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
+            line += f"  [{g['count']} leaves]"
         out.append(line)
     if ngroups > top_n:
         hidden = order[top_n:]
@@ -4457,6 +4458,16 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     lines.append(f"  {f!r}")
                     continue
                 lines.append(_render_flow_line(f))
+                # #980: a finding whose class differs from its catalog entry says
+                # so, and why, on the compact view -- `taint models` lists the
+                # call as `[overflow_len] memcpy`, and two names for one sink with
+                # no explanation sent the reader to the source to find out.
+                _sink_d = _field_dict(f, "sink")
+                _cat = _text_value(_sink_d, "catalog_class")
+                if _cat:
+                    _why = _text_value(_sink_d, "relabel")
+                    lines.append(f"      {_cat} → {_sink_d.get('class') or '?'}"
+                                 + (f": {_why}" if _why else ""))
                 if full:
                     _detail = _field_dict(f, "sink").get('detail') or ''
                     if _detail:
@@ -4618,7 +4629,11 @@ def _render_taint_models_text(value: Any) -> str:
                 lines.append(f"  {s!r}")
                 continue
             p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
-            lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}")
+            # #958: `--callsites` expands sources too; the JSON always carried
+            # them and the text dropped them, so the flag read as ignored.
+            lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
+                         f"{_callsite_count_note(s)}")
+            lines.extend(_render_callsite_rows(s, indent="    "))
     sbc = _field_dict(value, "sinks_by_class")
     if sbc:
         lines.append("")
@@ -4659,24 +4674,45 @@ def _render_taint_models_text(value: Any) -> str:
     return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
-def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
-    """One present/catalog sink entry: the model line plus, under --callsites, its
-    enriched callsite rows (address + containing function + non-audit kind)."""
-    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+def _callsite_count_note(e: dict[str, Any]) -> str:
+    """` (3 callsites)` / ` (4 callsites, 3 application)`, or "" without --callsites."""
     count = e.get("callsite_count")
-    if count is not None:
-        audit = e.get("audit_callsite_count")
-        if isinstance(audit, int) and audit != count:
-            cs = f" ({count} callsites, {audit} application)"
-        else:
-            cs = f" ({count} callsites)"
-    else:
-        cs = ""
-    desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
-    out = [f"    {e.get('symbol', '<unknown>')} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
+    if count is None:
+        return ""
+    noun = "callsite" if count == 1 else "callsites"
+    audit = e.get("audit_callsite_count")
+    if isinstance(audit, int) and audit != count:
+        return f" ({count} {noun}, {audit} application)"
+    return f" ({count} {noun})"
+
+
+def _sink_arg_spec(e: dict[str, Any]) -> str:
+    """Which arguments arm a catalog sink: `arg [2]`, `len arg 2 into arg 1`
+    (the read/recv bounded-write pair, #958 -- previously `arg []`), both for an
+    entry that arms a format AND a length (snprintf), `unconditional` for gets."""
+    parts = []
+    targs = e.get("tainted_args")
+    if targs:
+        parts.append(f"arg {targs}")
+    la = e.get("len_arg")
+    if la is not None:
+        ba = e.get("buf_arg")
+        parts.append(f"len arg {la}" + (f" into arg {ba}" if ba is not None else ""))
+    return ", ".join(parts) if parts else "unconditional"
+
+
+_HIDDEN_KIND_LABELS = {"import_thunk": "import stub", "self_stub": "self stub",
+                       "inline_builtin": "constant-argument inline builtin"}
+
+
+def _render_callsite_rows(e: dict[str, Any], *, indent: str) -> list[str]:
+    """The enriched callsite rows of a present model entry (address + containing
+    function + non-audit kind + one line of disassembly), then a count of the
+    non-audit rows the bridge left out (#958: `--all-sites` shows them)."""
+    out = []
     for c in _field_list(e, "callsites"):
         if not isinstance(c, dict):
-            out.append(f"      {c!r}")
+            out.append(f"{indent}{c!r}")
             continue
         fn = c.get("function") or "?"
         kind = c.get("kind")
@@ -4687,7 +4723,26 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
         # queue. Omitted when empty so a view that cannot disassemble (or a
         # bridge older than this CLI) renders exactly the previous row.
         dis = str(c.get("disasm") or "").strip()
-        out.append(f"      {c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+        out.append(f"{indent}{c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+    hidden = _field_dict(e, "hidden_callsites")
+    shown = [(k, n) for k, n in hidden.items()
+             if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+    if shown:
+        total = sum(n for _, n in shown)
+        what = ", ".join(f"{n} {_HIDDEN_KIND_LABELS.get(k, k)}" for k, n in shown)
+        out.append(f"{indent}+{total} non-audit row(s) hidden ({what}); --all-sites to show")
+    return out
+
+
+def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
+    """One present/catalog sink entry: the model line plus, under --callsites, its
+    enriched callsite rows (address + containing function + non-audit kind)."""
+    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+    desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
+    head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
+            f"{_callsite_count_note(e)}{desc}")
+    out = [head]
+    out.extend(_render_callsite_rows(e, indent="      "))
     return out
 
 
@@ -6584,6 +6639,10 @@ def _render_trace_text(value: Any) -> str:
             if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
                     and step.get("out_param_callee")):
                 line += f" (via {step['out_param_callee']})"
+            if reason == "function_parameter":
+                slot = _trace_param_slot(step)
+                if slot:
+                    line += f" ({slot})"
             if reason == "field_load":
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
@@ -6615,6 +6674,22 @@ def _render_trace_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _trace_param_slot(step: Any) -> str:
+    """`param 3, x3` for a function-parameter terminal (#959): the 0-based
+    parameter position and the register it arrives in, or "" when the bridge
+    sent neither. A malformed index renders nothing rather than a wrong slot."""
+    if not isinstance(step, dict):
+        return ""
+    idx = step.get("param_index")
+    parts = []
+    if isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0:
+        parts.append(f"param {idx}")
+    reg = _text_value(step, "param_register")
+    if reg:
+        parts.append(reg)
+    return ", ".join(parts)
+
+
 def _render_trace_frontiers(frontiers: Any) -> list[str]:
     """Concise top-level roll-up of where the slice stopped (#552): one line per
     reason group with its count and a couple of examples. A factual summary of
@@ -6632,17 +6707,27 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
             reason = str(reason)
         label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
         # Name the resolved callee(s) at a boundary so the roll-up reads
-        # `call boundary x3 (strlen, memcpy)` rather than a bare count.
-        callees = []
+        # `call boundary [3 steps] (strlen, memcpy)` rather than a bare count,
+        # and the parameter(s) a slice ended at with their slot (#959).
+        named = []
         for ex in (_field_list(g, "examples")):
             if not isinstance(ex, dict):
                 continue
             nm = ex.get("callee") or ex.get("out_param_callee")
-            if nm and nm not in callees:
-                callees.append(str(nm))
-        line = f"    {label}  x{g.get('count', 0)}"
-        if callees:
-            line += f" ({', '.join(callees)})"
+            if not nm and reason == "function_parameter":
+                slot = _trace_param_slot(ex)
+                var = str(ex.get("ssa_label") or "").split("#", 1)[0]
+                nm = f"{var} = {slot}" if var and slot else (var or slot)
+            if nm and nm not in named:
+                named.append(str(nm))
+        # #959: the count is bracketed and spelled out. `x{count}` collided with
+        # AArch64 register names -- `function parameter  x1` read as "arrives in
+        # x1" while the slice actually ended at the fourth parameter (x3).
+        count = g.get("count", 0)
+        noun = "step" if count == 1 else "steps"
+        line = f"    {label}  [{count} {noun}]"
+        if named:
+            line += f" ({', '.join(named)})"
         out.append(line)
     return out
 

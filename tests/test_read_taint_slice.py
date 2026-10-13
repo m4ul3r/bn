@@ -259,6 +259,36 @@ def test_truncation_note_uses_address_selector_when_name_unknown(monkeypatch):
     assert "proto set the callee" not in note
 
 
+def test_truncation_note_for_a_declared_variadic_callee_is_not_proto_advice_948(monkeypatch):
+    # #948: `void my_logger(const char *fmt, ...)` is already variadic. The note
+    # still discloses the candidate stores, but must not promise that declaring
+    # `...` (again) restores them, nor claim the stores are proven arguments.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    call_addr = 0x1c
+    block = [_store(_reg("sp"), 0x10),
+             _store(_add(_reg("sp"), _const(4)), 0x12),
+             _call(call_addr)]
+    callee = types.SimpleNamespace(
+        name="my_logger", start=0x1000,
+        type=types.SimpleNamespace(has_variable_arguments=True))
+    note = rts._call_model_truncation_note(
+        _BVFn(_FMT_STR, {0x1000: callee}), _func(block), block[-1], call_addr,
+        [_fmt_ptr(0x5000)], "my_logger")
+    assert note is not None
+    assert "already declared variadic" in note and "not a prototype defect" in note
+    assert "proto set" not in note
+    assert "candidate" in note and "not proven to feed the call" in note
+
+
+def test_out_of_range_message_for_a_declared_variadic_callee_948(monkeypatch):
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    func = _func([], arg_regs=("x0", "x1", "x2", "x3"), name="handle")
+    msg = rts._out_of_range_arg_msg(func, 1, 1, variadic_callee="app_log")
+    assert "app_log is already declared variadic" in msg
+    assert "not a prototype defect" in msg
+    assert "already declared variadic" not in rts._out_of_range_arg_msg(func, 1, 1)
+
+
 def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):
     # #534: a real indirect call_insn (register-indirect dest, no constant and no
     # symbol name) resolves to `.address is None` -- exercise the prose branch via
@@ -385,11 +415,61 @@ def test_render_trace_frontiers_text(monkeypatch):
     ]
     out = "\n".join(_render_trace_frontiers(frontiers))
     assert "frontiers (3 terminal step(s) in 2 group(s)):" in out
-    assert "call boundary  x2 (strlen, memcpy)" in out
-    assert "undefined / no reaching definition  x1" in out
+    assert "call boundary  [2 steps] (strlen, memcpy)" in out
+    assert "undefined / no reaching definition  [1 step]" in out
     # Empty / missing frontiers render nothing.
     assert _render_trace_frontiers([]) == []
     assert _render_trace_frontiers(None) == []
+
+
+def _aarch64_param_slice_fixture(monkeypatch):
+    """`copy_tail(d, s, pad, n)` whose memcpy length is its FOURTH parameter:
+    the slice ends at `arg4#0`, which AArch64 passes in x3 -- not x1, the
+    register the old `x{count}` suffix spelled for a single terminal."""
+    from _bridge_fakes import _FakeSSAVariable
+
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    regs = {0: "x0", 1: "x1", 2: "x2", 3: "x3"}
+    params = [types.SimpleNamespace(name=f"arg{i + 1}", identifier=100 + i,
+                                    source_type=1, storage=i) for i in range(4)]
+    source = types.SimpleNamespace(
+        parameter_vars=params,
+        arch=types.SimpleNamespace(get_reg_name=lambda storage: regs[storage]))
+    ssa_func = types.SimpleNamespace(source_function=source,
+                                     get_ssa_var_definition=lambda v: None)
+    return rts, ssa_func, _FakeSSAVariable("arg4#0")
+
+
+def test_parameter_terminal_names_its_slot_and_register_959(monkeypatch):
+    rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
+    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    assert trace[0]["reason"] == "function_parameter"
+    assert trace[0]["param_index"] == 3
+    assert trace[0]["param_register"] == "x3"
+    # The roll-up keeps the slot, so the frontier line can name it.
+    example = rts._summarize_frontiers(trace)[0]["examples"][0]
+    assert example["param_index"] == 3 and example["param_register"] == "x3"
+
+
+def test_parameter_frontier_text_cannot_read_as_a_register_959(monkeypatch):
+    from bn.formatters import _render_trace_text
+
+    rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
+    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    text = _render_trace_text({"trace": trace, "frontiers": rts._summarize_frontiers(trace)})
+    assert "function parameter  [1 step] (arg4 = param 3, x3)" in text
+    assert "arg4#0  —  function parameter (param 3, x3)" in text
+    assert " x1" not in text
+
+
+def test_stack_passed_parameter_frontier_has_no_register_959(monkeypatch):
+    # A stack-passed parameter has no register; naming one by position in the
+    # int-arg list would be a guess, so only the slot is shown.
+    rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
+    ssa_func.source_function.parameter_vars[3].source_type = 0
+    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    assert trace[0]["param_index"] == 3
+    assert "param_register" not in trace[0]
 
 
 def test_backward_slice_assumptions_nonempty_when_truncated(monkeypatch):

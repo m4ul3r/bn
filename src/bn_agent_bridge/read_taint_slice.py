@@ -48,7 +48,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
-from ._shared import OperationFailure, _parse_address
+from ._shared import OperationFailure, _parse_address, is_imported_function
 from .bridge_state import require_analysis
 from .read_taint_models import build_catalog
 from .read_listing import _analysis_state_fields
@@ -137,7 +137,10 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
     result is always a CATALOG, not a findings list -- see ``build_catalog``'s
     top-level ``presence_catalog``/``is_finding`` markers (#555)."""
     present_only = bool(params.get("present"))
-    want_callsites = bool(params.get("callsites"))
+    # #958: `--all-sites` shows the non-audit rows (import stubs, self stubs,
+    # constant-argument inline builtins) that are otherwise only counted.
+    all_sites = bool(params.get("all_sites"))
+    want_callsites = bool(params.get("callsites")) or all_sites
     if (present_only or want_callsites) and selector is None:
         raise OperationFailure(
             "unsupported",
@@ -156,7 +159,7 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
                         + [{"role": "propagator", **p} for p in catalog["propagators"]])
     if selector is not None:
         bv = ctx._resolve_view(selector)
-        present_keys, info = _present_models(bv, models, want_callsites)
+        present_keys, info = _present_models(bv, models, want_callsites, all_sites=all_sites)
         _annotate_presence(catalog, present_keys, info, present_only)
         # #811: presence is computed by walking this view's functions/symbols, so
         # on a quick-loaded view a modeled sink can be reported ABSENT merely
@@ -183,26 +186,38 @@ def _containing_fn(bv, addr: int):
         return None
 
 
-def _is_thunk_fn(bv, fn) -> bool:
-    """True if ``fn`` is a PLT-style veneer / same-name thunk that forwards to a
-    different target -- BN's ``is_thunk`` flag, or a single-tailcall body that
-    ``follow_thunk`` resolves elsewhere. Mirrors ``read_xrefs._is_thunk_like``
-    without a cross-module import (this module never imports ``read_xrefs``)."""
-    if bool(getattr(fn, "is_thunk", False)):
+# Linker-generated import stubs live in these sections; a function there is a
+# stub whatever BN named or typed it (#958).
+_STUB_SECTIONS = frozenset({".plt", ".plt.sec", ".plt.got", ".iplt", "__stubs",
+                            "__auth_stubs", ".MIPS.stubs"})
+
+
+def _is_import_stub_fn(bv, fn) -> bool:
+    """True if ``fn`` is an import stub (a PLT entry / linker veneer), NOT merely
+    a function whose body is one tail call.
+
+    #958: BN's ``is_thunk`` flag and a single-tailcall body are also true of an
+    ordinary application wrapper (`void log_copy(d, s, n) { memcpy(d, s, n); }`
+    compiled to `b memcpy`), whose tail branch IS an audit site; labelling it
+    `import_thunk` hid a real caller. A stub is recognised by what the linker
+    makes of it instead: an import symbol, a stub section, or a veneer name."""
+    if is_imported_function(fn):
+        return True
+    name = str(getattr(fn, "name", "") or "")
+    if name.endswith("_veneer"):
         return True
     try:
-        resolved = _taint.follow_thunk(bv, fn)
+        sections = bv.get_sections_at(int(getattr(fn, "start", 0)))
     except Exception:
-        resolved = None
-    return (resolved is not None
-            and int(getattr(resolved, "start", -1)) != int(getattr(fn, "start", -2)))
+        return False
+    return any(str(getattr(s, "name", "")) in _STUB_SECTIONS for s in sections or [])
 
 
 def _classify_callsite(bv, addr: int, sink_key: str, models) -> tuple[str | None, str]:
     """(containing-function-name, kind) for a present-model callsite.
 
     ``kind`` is one of ``app_caller`` (a real application caller body),
-    ``import_thunk`` (an import/PLT veneer -- #560), or ``self_stub`` (the
+    ``import_thunk`` (an import stub -- #560/#958), or ``self_stub`` (the
     modeled symbol's own body referencing itself, e.g. a self-tailcall stub).
     Thunk/self-stub sites are NON-audit: they inflate a sink's callsite count
     without being places an analyst would triage."""
@@ -210,12 +225,90 @@ def _classify_callsite(bv, addr: int, sink_key: str, models) -> tuple[str | None
     if fn is None:
         return None, "app_caller"
     fname = str(getattr(fn, "name", "")) or None
-    if _is_thunk_fn(bv, fn):
+    if _is_import_stub_fn(bv, fn):
         return fname, "import_thunk"
     ck, _ = _taint.lookup_model(models, fname or "")
     if ck is not None and ck == sink_key:
         return fname, "self_stub"
     return fname, "app_caller"
+
+
+_CALL_OPS = frozenset({"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL", "LLIL_JUMP",
+                       "MLIL_CALL", "MLIL_TAILCALL", "MLIL_CALL_UNTYPED",
+                       "MLIL_TAILCALL_UNTYPED"})
+# RegisterValueType names whose `.value` is the branch target itself.
+_TARGET_VALUE_TYPES = frozenset({"ConstantValue", "ConstantPointerValue",
+                                 "ImportedAddressValue", "ExternalPointerValue"})
+
+
+def _branch_target(dest) -> int | None:
+    """The address a call/jump destination expression resolves to: a constant,
+    a load from a constant slot (`call [rip+GOT]`, a PLT `jmp [GOT]`), or the
+    value BN's dataflow pins the operand to. None for anything else."""
+    if dest is None:
+        return None
+    op = il_format._il_op_name(dest)
+    if "CONST" in op or "IMPORT" in op:
+        c = getattr(dest, "constant", None)
+        return int(c) if isinstance(c, int) else None
+    if "LOAD" in op:
+        src = getattr(dest, "src", None)
+        if "CONST" in il_format._il_op_name(src):
+            c = getattr(src, "constant", None)
+            return int(c) if isinstance(c, int) else None
+    try:
+        value = getattr(dest, "value", None)
+        if getattr(getattr(value, "type", None), "name", None) in _TARGET_VALUE_TYPES:
+            return int(value.value)
+    except Exception:
+        return None
+    return None
+
+
+def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -> str | None:
+    """How the instruction at *addr* (a code reference to the modeled symbol)
+    uses that symbol (#958):
+
+    * ``"call"``   -- a call or tail branch whose target is one of *targets*;
+    * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
+      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`) and
+      every argument the model flags is a constant, so no taint can arm it;
+    * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
+      import's slot sits on, the stub's own `ldr`/`add` of its slot;
+    * ``None``     -- the view cannot answer (no function, no IL API), so the
+      caller keeps the row rather than dropping a site it could not judge."""
+    get_llil = getattr(fn, "get_llil_at", None) if fn is not None else None
+    if not callable(get_llil):
+        return None
+    try:
+        llil = get_llil(int(addr))
+    except Exception:
+        return None
+    if llil is None:
+        return None
+    if il_format._il_op_name(llil) in _CALL_OPS:
+        return "call" if _branch_target(getattr(llil, "dest", None)) in targets else "data"
+    try:
+        mlil = getattr(llil, "mlil", None)
+    except Exception:
+        mlil = None
+    if mlil is not None and il_format._il_op_name(mlil) in _CALL_OPS \
+            and _branch_target(getattr(mlil, "dest", None)) in targets:
+        params = list(getattr(mlil, "params", []) or [])
+        flagged = [params[i] for i in flagged_args if 0 <= i < len(params)]
+        if flagged and all("CONST" in il_format._il_op_name(p) for p in flagged):
+            return "inline"
+        return "call"
+    return "data"
+
+
+def _flagged_args(model: dict[str, Any] | None) -> list[int]:
+    """The argument indices a sink model arms (tainted_args + len_arg)."""
+    sink = (model or {}).get("sink") or {}
+    idxs = [int(a) for a in (sink.get("tainted_args") or []) if isinstance(a, int)]
+    if isinstance(sink.get("len_arg"), int) and sink["len_arg"] not in idxs:
+        idxs.append(sink["len_arg"])
+    return idxs
 
 
 def _pick_resolved(key: str, raws: list[str]) -> str | None:
@@ -244,11 +337,18 @@ def _disasm_at(bv, addr: int) -> str:
         return ""
 
 
-def _present_models(bv, models, want_callsites):
+def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     """Map the binary's symbols to model keys via the engine's own normalization;
     return ``(present model-key set, {model-key: info})`` where ``info`` carries
     the raw binary spellings (#556) and, under ``want_callsites``, enriched
-    callsite rows with containing function + kind (#553/#560)."""
+    callsite rows with containing function + kind (#553/#560).
+
+    #958: a row is a callsite only when the instruction CALLS the symbol (or
+    tail-branches to it). A code reference is not a call: every `adrp` of the
+    page an import's GOT slot sits on references that slot, which listed 47
+    `memcpy` "callsites" for a binary with three. Non-audit rows (stubs and
+    constant-argument inline builtins) are counted but, unless ``all_sites``,
+    left out of ``callsites`` so the list is the work queue it is used as."""
     present: set[str] = set()
     info: dict[str, dict[str, Any]] = {}
     # #472: several distinct binary symbol spellings can normalize to the SAME
@@ -256,59 +356,65 @@ def _present_models(bv, models, want_callsites):
     # accumulate their callsites into one slot instead of overwriting, and track
     # every raw spelling so the model output can name what xrefs/callsites expect.
     raw_names: dict[str, set[str]] = {}
-    seen_addrs: dict[str, set[str]] = {}
     names: set[str] = set()
     for fn in getattr(bv, "functions", []) or []:
         names.add(str(getattr(fn, "name", "")))
     for sym in (getattr(bv, "get_symbols", lambda: [])() or []):
         names.add(str(getattr(sym, "name", "")))
+    keyed: dict[str, list[Any]] = {}
     for nm in names:
         key, _model = _taint.lookup_model(models, nm)
         if not key:
             continue
         present.add(key)
         raw_names.setdefault(key, set()).add(nm)
+        info.setdefault(key, {})
         if want_callsites:
-            slot = info.setdefault(key, {"callsites": []})
-            seen = seen_addrs.setdefault(key, set())
-            for sym in (getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or []):
-                for ref in (getattr(bv, "get_code_refs", lambda a: [])(
-                        getattr(sym, "address", 0)) or []):
-                    ai = int(getattr(ref, "address", 0))
-                    a = hex(ai)
-                    # Dedup addresses so an alias resolving to the same site is not
-                    # double-counted (#472).
-                    if a in seen:
-                        continue
-                    seen.add(a)
-                    fname, kind = _classify_callsite(bv, ai, key, models)
-                    # #794: carry one line of context per row. The row answered
-                    # {address, function, kind}, which says WHERE a modeled sink
-                    # is called but nothing about WHAT the call looks like, so
-                    # triaging a callsite queue cost a `bn disasm` round-trip per
-                    # row. `disasm` is the key the sibling address-row emitters
-                    # already use -- `read_xrefs` on its ref rows and `seam` on
-                    # its call-context row -- so reusing the name and the guarded
-                    # call keeps one contract rather than a second spelling of
-                    # the same field. (`read_evidence` is NOT one of them: its
-                    # `il_format._disasm_entry` returns {address, text}, a
-                    # different shape under a different key.)
-                    slot["callsites"].append(
-                        {"address": a, "function": fname, "kind": kind,
-                         "disasm": _disasm_at(bv, ai)})
-        else:
-            info.setdefault(key, {})
+            keyed.setdefault(key, []).extend(
+                getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or [])
+    for key, syms in keyed.items():
+        slot = info[key]
+        # Every address the symbol answers to (stub, GOT slot, extern) is a call
+        # target; a call to any of them is a call to the import.
+        targets = {int(getattr(s, "address", 0)) for s in syms}
+        flagged = _flagged_args(models.get(key))
+        rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for target in sorted(targets):
+            for ref in (getattr(bv, "get_code_refs", lambda a: [])(target) or []):
+                ai = int(getattr(ref, "address", 0))
+                # Dedup addresses so an alias resolving to the same site is not
+                # double-counted (#472).
+                if ai in seen:
+                    continue
+                seen.add(ai)
+                shape = _callsite_shape(_containing_fn(bv, ai), ai, targets, flagged)
+                if shape == "data":
+                    continue
+                fname, kind = _classify_callsite(bv, ai, key, models)
+                if shape == "inline" and kind == "app_caller":
+                    kind = "inline_builtin"
+                # #794: carry one line of context per row. `disasm` is the key
+                # the sibling address-row emitters (`read_xrefs` ref rows,
+                # `seam`'s call-context row) already use.
+                rows.append({"address": hex(ai), "function": fname, "kind": kind,
+                             "disasm": _disasm_at(bv, ai)})
+        rows.sort(key=lambda r: int(r["address"], 16))
+        slot["callsite_count"] = len(rows)
+        # #560: application-caller subset -- the real VR work queue.
+        slot["audit_callsite_count"] = sum(1 for r in rows if r["kind"] == "app_caller")
+        hidden: dict[str, int] = {}
+        if not all_sites:
+            for r in rows:
+                if r["kind"] != "app_caller":
+                    hidden[r["kind"]] = hidden.get(r["kind"], 0) + 1
+            rows = [r for r in rows if r["kind"] == "app_caller"]
+        slot["callsites"] = rows
+        slot["hidden_callsites"] = hidden
     for key, rn in raw_names.items():
-        slot = info.setdefault(key, {})
+        slot = info[key]
         slot["raw_symbols"] = sorted(rn)
         slot["resolved_symbol"] = _pick_resolved(key, slot["raw_symbols"])
-        if want_callsites:
-            cs = slot.get("callsites") or []
-            slot["callsite_count"] = len(cs)
-            # #560: application-caller subset -- the real VR work queue, excluding
-            # import-thunk / self-stub sites that only inflate the raw count.
-            slot["audit_callsite_count"] = sum(
-                1 for c in cs if c["kind"] == "app_caller")
     return present, info
 
 
@@ -331,6 +437,7 @@ def _annotate_presence(catalog, present_keys, info, present_only):
             entry["callsite_count"] = data["callsite_count"]
             entry["callsites"] = data.get("callsites", [])
             entry["audit_callsite_count"] = data.get("audit_callsite_count", 0)
+            entry["hidden_callsites"] = data.get("hidden_callsites", {})
         return entry["present"]
     catalog["sources"] = [e for e in catalog["sources"] if (_mark(e) or not present_only)]
     for cls, lst in list(catalog["sinks_by_class"].items()):
@@ -631,20 +738,41 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
         return None
     disp = callee_name or "the callee"
     off_list = ", ".join(f"sp+{hex(o)}" for o in offsets)
+    fn_name = getattr(func, "name", "<fn>")
+    target = None
+    if call_insn is not None:
+        try:
+            target = _taint.resolve_call_target(bv, call_insn, follow_thunks=True)
+        except Exception:
+            target = None
+    # #948: the stores are found by OFFSET SHAPE (a contiguous run near sp in
+    # the call's block), which does not prove they are this call's arguments --
+    # so they are stated as candidates, never as proven-dropped arguments.
+    observed = (
+        f"{disp} was recovered with {len(params)} MLIL argument(s) (all "
+        f"register-passed), and the call's LLIL block has {len(offsets)} candidate "
+        f"outgoing stack store(s) [{off_list}] before it (identified by offset shape "
+        f"only, not proven to feed the call)")
+    if il_format._variadic_determination(getattr(target, "function", None)) is True:
+        # #948: the callee is ALREADY declared variadic, so "declare it variadic"
+        # promised a fix that changes nothing. If those stores are arguments,
+        # this is a call-recovery limit at this site, not a prototype defect.
+        return (
+            f"possible call-model truncation (#489): {observed}. {disp} is already "
+            f"declared variadic, so this is not a prototype defect and redeclaring it "
+            f"will not restore them: if the stores are stack-passed varargs, BN's "
+            f"call model at this site omits them and `trace`/`taint`/`defuse` cannot "
+            f"see them. Inspect the stores with `bn il {fn_name} --view llil --ssa`."
+        )
     # Pick a RUNNABLE `proto set` selector: the callee name if known, else its
     # resolved entry address (a direct call's constant dest still gives us an
     # address even when the target is unnamed). An unnamed/indirect callee with
     # neither has no runnable selector -- emit prose guidance, never the literal
     # `bn proto set the callee ...` command, which cannot be copy-pasted (#534).
     selector = callee_name or None
-    if selector is None and call_insn is not None:
-        try:
-            addr = _taint.resolve_call_target(
-                bv, call_insn, follow_thunks=True).address
-        except Exception:
-            addr = None
-        if addr is not None:
-            selector = hex(int(addr))
+    addr = getattr(target, "address", None)
+    if selector is None and addr is not None:
+        selector = hex(int(addr))
     if selector is not None:
         proto_name = callee_name or "<callee>"
         remedy = (
@@ -660,20 +788,20 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
             "the resolved target's address or name and re-run."
         )
     return (
-        f"call-model truncation (#489): {disp} was recovered with {len(params)} MLIL "
-        f"argument(s) (all register-passed), but LLIL shows {len(offsets)} outgoing "
-        f"stack-arg store(s) [{off_list}] feeding this call -- those stack-passed "
-        f"arg(s) are DROPPED from the call model, most often a variadic callee "
-        f"auto-typed as fixed-arity. `trace`/`taint`/`defuse` cannot see them until "
-        f"the prototype is fixed: {remedy} Inspect the stores with "
-        f"`bn il {getattr(func, 'name', '<fn>')} --view llil --ssa`."
+        f"call-model truncation (#489): {observed}. If they are arguments they are "
+        f"DROPPED from the call model, most often a variadic callee auto-typed as "
+        f"fixed-arity. `trace`/`taint`/`defuse` cannot see them until the prototype "
+        f"is fixed: {remedy} Inspect the stores with "
+        f"`bn il {fn_name} --view llil --ssa`."
     )
 
 
-def _out_of_range_arg_msg(func, arg_index: int, n: int) -> str:
+def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
+                          variadic_callee: str | None = None) -> str:
     """The precise out-of-range message for `trace --arg N`, with the #324 stack-
     passed / first-missing-register notes. Used when no #433 register fallback
-    applies."""
+    applies. *variadic_callee* names a callee BN DETERMINED variadic (#948): its
+    missing args are a call-recovery limit, never a mis-typed prototype."""
     only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
     # --arg is 0-based against the MLIL call's recovered parameters, which can
     # differ from the argument positions the decompiler renders (an implicit/
@@ -710,6 +838,12 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int) -> str:
             f"call through a too-narrow function-pointer type), it may be a "
             f"real register-passed arg BN dropped; inspect `bn il {func.name} "
             f"--view llil --ssa` for the args feeding the call (#324)."
+        )
+    if variadic_callee:
+        msg += (
+            f" {variadic_callee} is already declared variadic, so a missing argument "
+            f"here is a limit of BN's call recovery at this site, not a prototype "
+            f"defect -- redeclaring the prototype will not add it."
         )
     return msg
 
@@ -859,8 +993,17 @@ def _build_backward_trace(
             # actually is one; otherwise stay neutral (don't mislead
             # provenance slices).
             entry["terminates"] = True
-            if _is_parameter_ssa_var(ctx, ssa_func, ssa_var):
+            param_index = _parameter_index(ssa_func, ssa_var)
+            if param_index is not None:
                 entry["reason"] = "function_parameter"
+                # #959: WHICH parameter, and the register it arrives in. The
+                # roll-up used to say only "function parameter", so the reader
+                # had to map `arg4` to an ABI slot by hand -- and on AArch64 the
+                # count suffix `x1` read as the register itself.
+                entry["param_index"] = param_index
+                param_reg = _parameter_register(ssa_func, param_index)
+                if param_reg:
+                    entry["param_register"] = param_reg
             else:
                 entry["reason"] = "undefined_or_global"
                 # #416/#672: a value that bottoms out at a LOCAL whose address
@@ -1000,7 +1143,7 @@ def _build_backward_trace(
 # fields, so a capped boundary and a genuinely terminal one look identical here.
 _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "out_param_callee",
-    "base", "offset", "width", "function_context",
+    "base", "offset", "width", "function_context", "param_index", "param_register",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1076,27 +1219,52 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     return assumptions
 
 
-def _is_parameter_ssa_var(ctx, ssa_func, ssa_var) -> bool:
-    """True if *ssa_var* (an SSA variable with no reaching definition) is a
-    formal parameter of the function, vs. an undefined local or a global.
+def _parameter_index(ssa_func, ssa_var) -> int | None:
+    """The 0-based position of *ssa_var* (an SSA variable with no reaching
+    definition) among the function's formal parameters, or None when it is an
+    undefined local or a global.
 
     Matched against the source function's ``parameter_vars`` by identifier
-    first, then by base name. Returns False whenever parameter information
+    first, then by base name. Returns None whenever parameter information
     is unavailable, so the caller falls back to a neutral label rather than
     guessing 'parameter'."""
     source = getattr(ssa_func, "source_function", None)
     params = list(getattr(source, "parameter_vars", []) or [])
     if not params:
-        return False
+        return None
     base = getattr(ssa_var, "var", ssa_var)
     ident = getattr(base, "identifier", None)
     base_name = str(ssa_var).split("#")[0]
-    for param in params:
+    for pos, param in enumerate(params):
         if ident is not None and getattr(param, "identifier", None) == ident:
-            return True
+            return pos
         if base_name and str(getattr(param, "name", param)) == base_name:
-            return True
-    return False
+            return pos
+    return None
+
+
+def _is_parameter_ssa_var(ctx, ssa_func, ssa_var) -> bool:
+    """True if *ssa_var* is a formal parameter of the function (see
+    :func:`_parameter_index`)."""
+    return _parameter_index(ssa_func, ssa_var) is not None
+
+
+def _parameter_register(ssa_func, param_index: int) -> str | None:
+    """The register parameter *param_index* arrives in, read from the parameter
+    variable's own storage -- not from its position in the calling convention's
+    integer-register list, which a float or stack-passed parameter earlier in
+    the list would shift (#959). None for a stack-passed parameter or when the
+    storage is unreadable."""
+    source = getattr(ssa_func, "source_function", None)
+    try:
+        param = list(getattr(source, "parameter_vars", []) or [])[param_index]
+        # VariableSourceType.RegisterVariableSourceType == 1 (no BN import here).
+        if int(getattr(param, "source_type", -1)) != 1:
+            return None
+        name = source.arch.get_reg_name(int(param.storage))
+    except Exception:
+        return None
+    return str(name) if name else None
 
 
 def _resolve_callee(ctx, bv, call_insn):
@@ -1383,9 +1551,17 @@ def _backward_slice(
         initial_vars, recovered_reg, recovered_callee = _recover_trace_arg_via_reg(
             ctx, bv, func, call_insn, target_addr, arg_index, view)
         if not initial_vars:
+            try:
+                _oor_callee = _resolve_callee(ctx, bv, call_insn)
+            except Exception:
+                _oor_callee = None
             raise OperationFailure(
                 "invalid_arg_index",
-                _out_of_range_arg_msg(func, arg_index, len(params)))
+                _out_of_range_arg_msg(
+                    func, arg_index, len(params),
+                    variadic_callee=(str(getattr(_oor_callee, "name", "") or "the callee")
+                                     if il_format._variadic_determination(_oor_callee) is True
+                                     else None)))
 
     arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
 

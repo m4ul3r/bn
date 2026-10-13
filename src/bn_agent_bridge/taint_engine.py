@@ -68,6 +68,7 @@ from . import taint_il as _taint_il_mod  # noqa: F401
 from . import taint_locators as _taint_locators_mod  # noqa: F401
 from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
+from .il_format import _variadic_determination
 
 
 # Caller sites the backward ascent follows per function. Module-level (not a
@@ -3435,6 +3436,138 @@ class TaintEngine:
         """Backward-compatible bool wrapper over :meth:`_bounded_copy_reason`."""
         return self._bounded_copy_reason(ssaf, params, length_idx, dest_idx) is not None
 
+    def _source_side_verdict(self, ssaf: Any, params: list[Any], length_idx: int,
+                             model: dict[str, Any], eff_sink: dict[str, Any]) -> dict[str, Any]:
+        """#980: the copy-SOURCE half of a destination-bounded copy.
+
+        ``dst = malloc(n); memcpy(dst, src, n)`` cannot overflow ``dst``, but with
+        a fixed-size ``src`` and an attacker-controlled ``n`` it over-reads
+        ``src``. Returns *eff_sink* re-headlined to ``overread_len`` when the
+        source is a fixed-size object (a typed global, a stack local, a
+        constant-size allocation) and the length is not provably within it;
+        otherwise still ``bounded_len``, stating whether the source fit or could
+        not be sized at all -- a bounded write is never left reading as "safe"
+        while the read side was never looked at."""
+        srcs = sorted(_model_buffer_source_args(model))
+        if len(srcs) != 1 or srcs[0] >= len(params):
+            return eff_sink
+        src_expr, len_expr = params[srcs[0]], params[length_idx]
+        cap = self._buffer_capacity(ssaf, src_expr)
+        unchecked = {**eff_sink, "src_capacity": None,
+                     "relabel": eff_sink["relabel"] + "; source capacity not checked",
+                     "detail": eff_sink["detail"] + f"; the copy source (arg{srcs[0]}) could not "
+                     "be sized against the length, so an over-read of it is NOT ruled out -- "
+                     "check that it holds at least the copied length"}
+        if cap is None:
+            return unchecked
+        size, where, alloc_size = cap
+        bound = self._length_upper_bound(ssaf, len_expr)
+        fits = ((alloc_size is not None and self._same_ssa_value(ssaf, alloc_size, len_expr))
+                or (size is not None and bound is not None and bound <= size))
+        if fits:
+            return {**eff_sink, "src_capacity": size, "src_capacity_source": where,
+                    "relabel": eff_sink["relabel"] + "; source holds the copied length",
+                    "detail": eff_sink["detail"] + f"; the copy source ({where}) provably "
+                    "holds the copied length"}
+        # An over-read needs a FINITE source the length can exceed: a known size,
+        # or a stack/global object of unrecovered size (still fixed) against a
+        # length with no upper bound at all. An allocation of some other unknown
+        # size could be large enough, so it stays unchecked.
+        if size is None and (alloc_size is not None or bound is not None):
+            return {**unchecked, "src_capacity_source": where}
+        return {**eff_sink, "class": "overread_len", "src_capacity": size,
+                "src_capacity_source": where,
+                "relabel": eff_sink["relabel"] + f"; source is {where}, not provably >= length",
+                "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is {where} "
+                "and the attacker-derived length is not provably within it -- an over-read of "
+                "the source"}
+
+    def _buffer_capacity(self, ssaf: Any, expr: Any,
+                         depth: int = 0) -> tuple[int | None, str, Any] | None:
+        """``(bytes available from expr, description, alloc_size_expr)`` for a
+        pointer into a fixed-size object, else None. Follows SSA copies and
+        constant offsets to a typed global (``&table``), a stack local
+        (``&buf``), or an allocation in this function. The size is BN's type
+        width for an object (a recovered type, so an estimate with its
+        provenance in the description); for an allocation it is the constant
+        size, or None with the size expression when that is not a constant."""
+        if expr is None or depth > 6:
+            return None
+        op = op_name(expr)
+        if op in ("MLIL_ADD",):
+            off = self._int_const(getattr(expr, "right", None))
+            base = getattr(expr, "left", None)
+            if off is None:
+                off = self._int_const(base)
+                base = getattr(expr, "right", None)
+            if off is None or off < 0:
+                return None
+            inner = self._buffer_capacity(ssaf, base, depth + 1)
+            if inner is None or inner[0] is None:
+                return None
+            if off >= inner[0]:
+                return None
+            return inner[0] - off, f"{inner[1]} at +{hex(off)}", None
+        if "CONST" in op:
+            addr = self._int_const(expr)
+            dv = None
+            try:
+                dv = self.bv.get_data_var_at(int(addr)) if addr is not None else None
+            except Exception:
+                dv = None
+            width = getattr(getattr(dv, "type", None), "width", None)
+            if not isinstance(width, int) or width <= 0:
+                return None
+            return width, f"a {width}-byte global typed `{dv.type}` @ {hex(addr)}", None
+        if op == "MLIL_ADDRESS_OF":
+            var = getattr(expr, "src", None)
+            width = self._var_byte_size(var)
+            name = getattr(var, "name", var)
+            if not width:
+                # BN often types a stripped binary's stack buffer `void`: its
+                # size is unrecovered, but a stack local is still a fixed object.
+                return None, f"the stack local `{name}` (size not recovered)", None
+            return width, f"a {width}-byte local `{name}` typed `{getattr(var, 'type', '?')}`", None
+        v = self._as_single_ssa_var(expr)
+        if v is None:
+            return None
+        size_expr, _wrapper = self._dest_alloc(ssaf, expr)
+        if size_expr is not None:
+            const = self._int_const(size_expr)
+            return const, (f"a {const}-byte allocation" if const is not None
+                           else f"an allocation of `{size_expr}` bytes"), size_expr
+        try:
+            d = ssaf.get_ssa_var_definition(v)
+        except Exception:
+            d = None
+        if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+            return self._buffer_capacity(ssaf, getattr(d, "src", None), depth + 1)
+        return None
+
+    def _length_upper_bound(self, ssaf: Any, expr: Any) -> int | None:
+        """The largest value *expr* can take, when BN's value set (or a modeled
+        receive bound, #159) states one; None when it is unbounded/unknown."""
+        const = self._int_const(expr)
+        if const is not None:
+            return const
+        bound = self._syscall_bound_for_length(ssaf, expr)
+        if bound is not None:
+            return bound
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        try:
+            if kind in ("ConstantValue", "ConstantPointerValue"):
+                return int(pvs.value)
+            if kind in ("UnsignedRangeValue", "SignedRangeValue"):
+                ends = [int(r.end) for r in pvs.ranges]
+                return max(ends) if ends and min(int(r.start) for r in pvs.ranges) >= 0 else None
+            if kind == "InSetOfValues":
+                vals = [int(x) for x in pvs.values]
+                return max(vals) if vals and min(vals) >= 0 else None
+        except Exception:
+            return None
+        return None
+
     def _residual_chunk_length(self, ssaf: Any, params: list[Any], length_idx: int,
                                dest_idx: int) -> tuple[str, str] | None:
         """``(total_expr, cursor_expr)`` when the copy is the chunked-read
@@ -3807,6 +3940,23 @@ class TaintEngine:
         if not confirmed:
             return None
         name = str(getattr(callee_fn, "name", "?"))
+        common = {
+            "kind": "arg_under_recovered",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": name,
+                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "recovered_params": n_params,
+            "dropped_args": confirmed,
+            "stack_dropped_args": stack_confirmed,
+        }
+        # #948: a callee whose type BN DETERMINED to be variadic is not
+        # under-recovered -- its named formals are all there is, and the dropped
+        # indices are its `...` arguments, which the engine maps nowhere. Saying
+        # "recover the prototype" sent the reader to redeclare a correct one.
+        variadic = _variadic_determination(callee_fn)
+        if variadic is True:
+            return {**common, "cause": "varargs_not_followed", "callee_variadic": True,
+                    "note": self._varargs_tail_note(name, n_params, confirmed)}
         stack_note = ""
         if stack_confirmed:
             stack_note = (
@@ -3815,13 +3965,9 @@ class TaintEngine:
                 f"callee auto-typed as fixed-arity, so declare it variadic: "
                 f"`bn proto set {name} \"<ret> {name}(<fixed args>, ...)\"`.")
         return {
-            "kind": "arg_under_recovered",
-            "address": hex(int(getattr(ins, "address", 0))),
-            "callee": {"name": name,
-                       "address": hex(int(getattr(callee_fn, "start", 0)))},
-            "recovered_params": n_params,
-            "dropped_args": confirmed,
-            "stack_dropped_args": stack_confirmed,
+            **common,
+            "cause": "signature_under_recovered",
+            "callee_variadic": variadic,
             "note": (f"tainted arg(s) {confirmed} passed to {name} but Binary Ninja "
                      f"recovered only {n_params} parameter(s) -- the callee's "
                      f"signature is likely under-recovered, so taint into it was "
@@ -3829,6 +3975,19 @@ class TaintEngine:
                      f"`bn proto set {name} \"<prototype>\"`, then re-run this taint "
                      f"query.{stack_note}"),
         }
+
+    @staticmethod
+    def _varargs_tail_note(name: str, n_params: int, idxs: list) -> str:
+        """The #948 disclosure for taint landing in a determined-variadic
+        callee's `...` tail: a tracking limit, stated with the observed counts,
+        and never a prototype repair."""
+        return (f"tainted arg(s) {sorted(idxs)} passed to {name} land in its variadic "
+                f"tail: {name} is declared variadic (`...`) with {n_params} named "
+                f"parameter(s), and taint is mapped only onto named parameters, so the "
+                f"flow into its varargs was NOT followed. This is a tracking limit, not "
+                f"a signature defect -- the prototype is already variadic and "
+                f"redeclaring it changes nothing. Inspect how {name} consumes its "
+                f"va_list (e.g. a v*printf call), or seed `bn taint forward` inside it.")
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
@@ -3846,13 +4005,24 @@ class TaintEngine:
                                "assumptions": [], "out_params": frozenset(), "handoff_node": []}
         if not valid:
             out["reached_return"] = True
-            out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
-            out["leaves"].append(self._frontier_leaf(
+            leaf = self._frontier_leaf(
                 ins, callee_fn, tainted_args,
                 "tainted data passed to in-binary callee whose parameters BN did not "
                 "recover, so taint into it was dropped. If it is a real callee with a "
                 "wrong signature, apply `bn proto set <callee> \"<prototype>\"` and "
-                "re-run; otherwise investigate"))
+                "re-run; otherwise investigate")
+            if _variadic_determination(callee_fn) is True:
+                # #948: every tainted arg is in a correctly-variadic tail.
+                leaf.update(cause="varargs_not_followed", callee_variadic=True,
+                            note=self._varargs_tail_note(
+                                str(callee_fn.name), n_params, list(tainted_args)))
+                out["assumptions"].append(
+                    f"tainted args to {callee_fn.name} land in its variadic tail, which "
+                    f"is not followed; conservative")
+            else:
+                out["assumptions"].append(
+                    f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
+            out["leaves"].append(leaf)
             return out
         if depth + 1 > max_depth:
             self._truncated = True
@@ -4494,7 +4664,14 @@ class TaintEngine:
                                         "class": "bounded_len",
                                         "detail": (sink.get("detail") or "")
                                         + f" (attacker-derived length, but {_bnd_reason})",
+                                        "relabel": "destination sized by the copy length",
                                     }
+                                    # #980: bounding the WRITE says nothing about the
+                                    # READ. Size the copy source and re-headline to
+                                    # `overread_len` when it is a fixed-size object
+                                    # the length is not provably within.
+                                    eff_sink = self._source_side_verdict(
+                                        ssaf, params, argidx, model, eff_sink)
                                 elif sink.get("class") == "overflow_len":
                                     # Length is the return of a modeled receive
                                     # call bounded by a constant count arg
@@ -4623,6 +4800,11 @@ class TaintEngine:
                                             "build reuses registers, so read them against "
                                             "the IL rather than expecting `cap`/`progress`)",
                                         }
+                                # #980: a finding re-headlined away from its catalog
+                                # class names that class, so `taint models` and the
+                                # finding are visibly the same sink.
+                                if eff_sink.get("class") != sink.get("class"):
+                                    eff_sink = {**eff_sink, "catalog_class": sink.get("class")}
                                 findings.append(_tag_unconditional_flow(
                                     self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
                     else:
@@ -6045,6 +6227,13 @@ class TaintEngine:
                 **({"length_shape": sink["length_shape"]} if sink.get("length_shape") else {}),
                 **({"residual_total": sink["residual_total"]} if sink.get("residual_total") else {}),
                 **({"residual_cursor": sink["residual_cursor"]} if sink.get("residual_cursor") else {}),
+                # #980: why the finding's class differs from the catalog's, and
+                # what the copy SOURCE was sized as (None = could not be sized).
+                **({"catalog_class": sink["catalog_class"]} if sink.get("catalog_class") else {}),
+                **({"relabel": sink["relabel"]} if sink.get("relabel") else {}),
+                **({"src_capacity": sink["src_capacity"]} if "src_capacity" in sink else {}),
+                **({"src_capacity_source": sink["src_capacity_source"]}
+                   if sink.get("src_capacity_source") else {}),
             },
             "path": path,
         }
