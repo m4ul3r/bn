@@ -507,6 +507,37 @@ class TestBatchManifestTarget:
         assert payload["preview"] is True
         assert payload["results"][0]["status"] == "verified"
 
+    def test_a_name_an_earlier_op_renamed_names_the_rename_975(self, shared_bn, tmp_path):
+        """#975: a later op that names a function by the `sub_<addr>` spelling an
+        earlier op in the same batch replaced must say so -- not offer
+        close-but-unrelated "Did you mean" functions, which reads as a wrong
+        address. Stripped, so the name is BN's synthesized one: a named ELF
+        symbol would keep resolving after the rename and hide the defect."""
+        stripped = tmp_path / "add_stripped"
+        build = subprocess.run(["strip", "-o", str(stripped), str(ADD_BINARY)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(stripped, copy=False)
+        auto = next(f for f in shared_bn.json("function", "list", "--limit", "500")["items"]
+                    if f["name"].startswith("sub_"))
+        old, address = auto["name"], auto["address"]
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": old, "new_name": "handle_request"},
+            {"op": "set_comment", "function": old, "comment": "entry"},
+        ]}), encoding="utf-8")
+
+        result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                               "--format", "json")
+        assert result.returncode == 3, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["rolled_back"] is True
+        failed = payload["results"][1]
+        assert failed["status"] == "unsupported"
+        assert "Did you mean" not in failed["message"]
+        assert (f"operation 0 of this batch renamed {old} (at {address}) to "
+                "handle_request") in failed["message"], failed["message"]
+
 
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names

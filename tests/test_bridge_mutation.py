@@ -402,6 +402,84 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
     assert not _has_event(bv, "commit")
 
 
+@pytest.mark.parametrize("restore_ok", [True, False])
+def test_preview_verification_failure_never_claims_verified_937(monkeypatch, restore_ok):
+    """#937: a preview whose readback FAILED kept its exit/status/rollback
+    contract but said "Preview verified and reverted." -- on the clean-revert
+    branch and on the restore-failure branch alike. The message must name the
+    failed verification, and still report whether the revert held."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verification_failed"},
+    )
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
+                        lambda ctx, bv_, restores: restore_ok)
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is restore_ok
+    assert result["results"][0]["status"] == "verification_failed"
+    assert "verified" not in result["message"].replace("verification failed", "")
+    assert result["message"].startswith("Preview verification failed")
+    assert ("may be left modified" in result["message"]) is (not restore_ok)
+
+
+def test_a_name_renamed_earlier_in_the_batch_is_explained_975(monkeypatch):
+    """#975: a later op naming a function by the spelling an earlier op renamed
+    away failed with the resolver's lexically-close but unrelated suggestions.
+    The failure must name the rename (and follow a chained one), while a lookup
+    failure unrelated to any rename keeps its own message."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    renamed = {"sub_401d10": "handle_request", "handle_request": "handle_request_v2"}
+
+    def apply(bv_, op, restores=None, **kwargs):
+        name = op.get("identifier") or op.get("function")
+        if op["op"] == "rename_symbol":
+            return {"op": "rename_symbol", "kind": "function", "address": "0x401d10",
+                    "before_name": name, "new_name": op["new_name"], "requested": {}}
+        if name in renamed or name == "sub_missing":
+            raise bridge.OperationFailure(
+                "unsupported", f"Function not found: {name}. Did you mean: sub_4025dc")
+        return {"op": op["op"], "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    rename = {"op": "rename_symbol", "identifier": "sub_401d10", "new_name": "handle_request"}
+    comment = {"op": "set_comment", "function": "sub_401d10", "comment": "entry"}
+
+    result = instance._mutation("active", True, [rename, comment])
+    row = result["results"][1]
+    assert row["status"] == "unsupported"
+    assert "Did you mean" not in row["message"]
+    assert row["message"].startswith(
+        "sub_401d10 not found: operation 0 of this batch renamed sub_401d10 "
+        "(at 0x401d10) to handle_request.")
+
+    chained = {"op": "rename_symbol", "identifier": "handle_request",
+               "new_name": "handle_request_v2"}
+    result = instance._mutation("active", True, [rename, chained, comment])
+    assert "to handle_request, then to handle_request_v2" in result["results"][2]["message"]
+    assert "refer to it as handle_request_v2" in result["results"][2]["message"]
+
+    unrelated = {"op": "set_comment", "function": "sub_missing", "comment": "entry"}
+    result = instance._mutation("active", True, [rename, unrelated])
+    assert result["results"][1]["message"] == (
+        "Function not found: sub_missing. Did you mean: sub_4025dc")
+
+
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     """If reverting BN's propagation onto aliased siblings (the var-drift
     restore) fails, the preview left the view modified and must report
