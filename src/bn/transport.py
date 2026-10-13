@@ -23,6 +23,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -81,6 +82,58 @@ REFRESH_REQUEST_TIMEOUT = 3600.0
 SPAWN_LOCK_TIMEOUT = 30.0
 DEFAULT_SPAWN_TIMEOUT = 60.0
 CANCEL_REQUEST_TIMEOUT = 0.25
+# How long a request may go unanswered before the CLI asks the bridge whether it
+# is queued behind another writer, and the budget for that one question (#976).
+WRITE_GATE_NOTICE_AFTER = 2.0
+WRITE_GATE_STATUS_TIMEOUT = 1.0
+# Set to 1/true/yes to make a write-gated request fail fast with `busy: ...`
+# instead of queueing behind the writer that holds the gate (#976).
+NO_WAIT_ENV = "BN_NO_WAIT"
+
+
+def _no_wait_requested() -> bool:
+    return os.environ.get(NO_WAIT_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) -> None:
+    """Tell the user on stderr when *request_id* is queued behind another writer.
+
+    A write-gated request (py exec, a mutation, decompile --force-analysis)
+    waits silently for whatever holds the bridge's write gate -- a refresh can
+    hold it for minutes -- while reads in the same window answer at once, so a
+    queue looked exactly like a hang (#976). One side-channel question, asked
+    only after the request has already gone unanswered for a while; a bridge
+    that predates `write_gate_status`, or any failure to ask, prints nothing.
+    """
+    try:
+        response = _send_request_to_instance(
+            instance,
+            "write_gate_status",
+            params={"request_id": request_id},
+            timeout=WRITE_GATE_STATUS_TIMEOUT,
+            resolved=True,
+            connect_retries=1,
+            idle_probe=True,
+        )
+    except BridgeError:
+        return
+    status = response.get("result")
+    if not isinstance(status, dict) or status.get("waiting") is not True:
+        return
+    holder = status.get("holder")
+    if isinstance(holder, dict) and isinstance(holder.get("op"), str):
+        what = f"the running {holder['op']}"
+        elapsed = holder.get("elapsed_seconds")
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+            what += f" (started {elapsed:g}s ago)"
+    else:
+        what = "another write operation"
+    print(
+        f"bn: {op} is waiting for {what} to finish; it will run after that. "
+        f"Set {NO_WAIT_ENV}=1 to fail fast instead of waiting.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _resolve_timeout(
@@ -1399,6 +1452,10 @@ def _send_request_to_instance(
     # every ordinary request's envelope is byte-for-byte unchanged.
     if idle_probe:
         payload["idle_probe"] = True
+    elif _no_wait_requested():
+        # #976: refuse instead of queueing behind another writer. Same
+        # only-when-true rule as idle_probe; a probe never takes the write gate.
+        payload["no_wait"] = True
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
     if op == "batch_apply":
@@ -1448,11 +1505,30 @@ def _send_request_to_instance(
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+                # #976: after WRITE_GATE_NOTICE_AFTER of silence, ask once on a
+                # side connection whether this request is queued behind another
+                # writer and say so on stderr, so a queue is distinguishable
+                # from a hang. A timer, not a recv timeout, so this request's
+                # own deadline is untouched. A probe (the status question
+                # itself included) never asks.
+                notice = None
+                if not idle_probe:
+                    notice = threading.Timer(
+                        WRITE_GATE_NOTICE_AFTER,
+                        _report_write_gate_wait,
+                        args=(instance, str(payload["id"]), op),
+                    )
+                    notice.daemon = True
+                    notice.start()
+                try:
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                finally:
+                    if notice is not None:
+                        notice.cancel()
             last_error = None
             break
         except OSError as exc:
@@ -1739,57 +1815,72 @@ def _spawn_instance_unlocked(
         # caller that formats it later -- keeps the fd alive with it (#618).
         log_file.close()
 
-    while time.monotonic() < deadline:
-        if reg_path.exists():
+    # From here this call OWNS the child until it hands back the instance that
+    # child registered. Every other exit -- a refused registry, an early exit,
+    # the registration timeout, but ALSO an exception escaping the poll loop
+    # (the deadline expiring inside `_remaining_deadline`, a failing registry
+    # read, a KeyboardInterrupt) -- must reap it. The child runs in its own
+    # session, so nothing else will: an exception that bypassed the reap left a
+    # live bridge that never registered and that no `instance list/find/gc` or
+    # `session stop` could see (#916). The child we hold is the thing reaped,
+    # never a pid read from a registry, and no discovery file is unlinked here.
+    owned = True
+    try:
+        while time.monotonic() < deadline:
+            if reg_path.exists():
+                remaining = _remaining_deadline(deadline, "waiting for bridge registration")
+                # include_unreachable so a registry that exists under this id is SEEN
+                # (and reported as an ownership collision below) rather than silently
+                # skipped until the spawn deadline expires (#694).
+                inst = _load_instance(
+                    reg_path,
+                    socket_timeout=min(0.2, remaining or 0.2),
+                    include_unreachable=True,
+                )
+                if inst is not None:
+                    # Verify the registered process is the child WE spawned. A
+                    # different live pid means a stale registry slipped past the
+                    # liveness purge or another process raced us under this id;
+                    # reap our orphan rather than return someone else's bridge (#92).
+                    if inst.pid != proc.pid:
+                        raise BridgeError(
+                            f"Bridge instance id {instance_id!r} is already owned by "
+                            f"another process (pid {inst.pid}); refusing to return a "
+                            "bridge this call did not start."
+                        )
+                    owned = False
+                    return inst
+            exit_code = proc.poll()
+            if exit_code is not None:
+                message = (
+                    f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
+                    f"exited with code {exit_code} before registering."
+                )
+                # The note goes to the CALLER, not into the log: the log is the file
+                # the note is about, and writing it there grows the very thing this
+                # arm is trying not to destroy, once per attempt.
+                _append_spawn_diagnostic(log_path, message)
+                raise BridgeError(
+                    f"{message}{leftover_note}{_log_tail(log_path, start=log_start)}"
+                )
             remaining = _remaining_deadline(deadline, "waiting for bridge registration")
-            # include_unreachable so a registry that exists under this id is SEEN
-            # (and reported as an ownership collision below) rather than silently
-            # skipped until the spawn deadline expires (#694).
-            inst = _load_instance(
-                reg_path,
-                socket_timeout=min(0.2, remaining or 0.2),
-                include_unreachable=True,
-            )
-            if inst is not None:
-                # Verify the registered process is the child WE spawned. A
-                # different live pid means a stale registry slipped past the
-                # liveness purge or another process raced us under this id;
-                # reap our orphan rather than return someone else's bridge (#92).
-                if inst.pid != proc.pid:
-                    _reap_child(proc)
-                    raise BridgeError(
-                        f"Bridge instance id {instance_id!r} is already owned by "
-                        f"another process (pid {inst.pid}); refusing to return a "
-                        "bridge this call did not start."
-                    )
-                return inst
-        exit_code = proc.poll()
-        if exit_code is not None:
-            message = (
-                f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-                f"exited with code {exit_code} before registering."
-            )
-            # The note goes to the CALLER, not into the log: the log is the file
-            # the note is about, and writing it there grows the very thing this
-            # arm is trying not to destroy, once per attempt.
-            _append_spawn_diagnostic(log_path, message)
-            raise BridgeError(
-                f"{message}{leftover_note}{_log_tail(log_path, start=log_start)}"
-            )
-        remaining = _remaining_deadline(deadline, "waiting for bridge registration")
-        time.sleep(min(poll_interval, remaining or poll_interval))
+            time.sleep(min(poll_interval, remaining or poll_interval))
 
-    # The child is still running but never registered. Kill it so a slow
-    # starter can't register later and show up as a surprise extra instance.
-    message = (
-        f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-        f"did not register within {timeout:g}s and was terminated. "
-        f"Check {log_path}. Retry the same command; on a heavily loaded host, "
-        "set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
-    )
-    _append_spawn_diagnostic(log_path, message)
-    _reap_child(proc)
-    raise BridgeError(f"{message}{leftover_note}")
+        # The child is still running but never registered. Kill it so a slow
+        # starter can't register later and show up as a surprise extra instance.
+        message = (
+            f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
+            f"did not register within {timeout:g}s and was terminated. "
+            f"Check {log_path}. Retry the same command; on a heavily loaded host, "
+            "set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
+        )
+        _append_spawn_diagnostic(log_path, message)
+        raise BridgeError(f"{message}{leftover_note}")
+    finally:
+        # An exited child was already collected by poll(); only a live one needs
+        # the terminate/kill escalation. The original failure keeps propagating.
+        if owned and proc.poll() is None:
+            _reap_child(proc)
 
 
 def wait_for_teardown(

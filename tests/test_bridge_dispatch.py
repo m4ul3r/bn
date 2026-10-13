@@ -187,6 +187,96 @@ def test_refresh_resolves_target_under_write_gate(monkeypatch):
     assert gate_held_at_resolve["v"] is True  # gate acquired before the target was resolved
 
 
+def _refresh_parked_on_gate(monkeypatch, bridge, instance):
+    """Start a dispatched refresh whose analysis blocks until released."""
+    bv = _FakeMutationBV()
+    analyzing = threading.Event()
+    release = threading.Event()
+
+    def analyze():
+        analyzing.set()
+        assert release.wait(timeout=5.0), "test driver never released the refresh"
+
+    bv.update_analysis_and_wait = analyze
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+    thread = threading.Thread(
+        target=instance.dispatch,
+        args=({"op": "refresh", "params": {}, "target": "active", "id": "refresh-1"},),
+        daemon=True,
+    )
+    thread.start()
+    assert analyzing.wait(timeout=5.0)
+    return release, thread
+
+
+def test_write_queued_behind_refresh_is_reported_by_write_gate_status(monkeypatch):
+    """#976: a write-gated request behind a running refresh used to wait with
+    nothing able to say so. `write_gate_status` must answer -- while the gate is
+    held -- that this request id is queued, and behind which op."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    release, refresh = _refresh_parked_on_gate(monkeypatch, bridge, instance)
+
+    def status(request_id):
+        response = instance.dispatch(
+            {"op": "write_gate_status", "params": {"request_id": request_id}})
+        assert response["ok"] is True, response
+        return response["result"]
+
+    writer = threading.Thread(
+        target=instance.dispatch,
+        args=({"op": "py_exec", "params": {"code": "1"}, "target": "active", "id": "write-1"},),
+        daemon=True,
+    )
+    try:
+        assert status("write-1")["waiting"] is False  # not sent yet
+        writer.start()
+        deadline = time.monotonic() + 5.0
+        while not status("write-1")["waiting"]:
+            assert time.monotonic() < deadline, "queued write never reported as waiting"
+            time.sleep(0.01)
+        observed = status("write-1")
+        assert observed["holder"]["op"] == "refresh"
+        assert observed["holder"]["elapsed_seconds"] >= 0
+        assert status("some-other-request")["waiting"] is False
+    finally:
+        release.set()
+        refresh.join(timeout=5.0)
+        writer.join(timeout=5.0)
+
+    assert not writer.is_alive()
+    after = status("write-1")
+    assert after == {"kind": "write_gate_status", "request_id": "write-1",
+                     "waiting": False, "holder": None}
+
+
+@pytest.mark.parametrize("payload", [
+    {"op": "py_exec", "params": {"code": "1"}},                       # lock="write"
+    {"op": "set_comment", "params": {"comment": "x", "address": "0x1000"}},  # self-locking
+])
+def test_no_wait_write_refuses_busy_instead_of_queueing_behind_refresh(monkeypatch, payload):
+    """#976: `no_wait` turns the silent queue into an immediate `busy:` refusal
+    that names what holds the gate -- for a lock="write" op and for a mutation
+    that takes the gate inside its own body alike."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    release, refresh = _refresh_parked_on_gate(monkeypatch, bridge, instance)
+    try:
+        started = time.monotonic()
+        response = instance.dispatch(
+            {**payload, "target": "active", "id": "write-1", "no_wait": True})
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+        refresh.join(timeout=5.0)
+
+    assert response["ok"] is False
+    assert response["error"].startswith("busy: refresh in progress (started ")
+    assert "BN_NO_WAIT" in response["error"]
+    assert instance._write_gate.locked() is False
+
+
 def test_mutation_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
     """#628: a mutation op is @op lock="none" and self-manages locking -- the write
     gate serializes writers for the WHOLE op, while the exclusive target lock covers
