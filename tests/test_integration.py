@@ -3224,8 +3224,19 @@ class TestStackFrameMap:
         buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
         assert buffer["to_canary"] == canary - buffer["storage"] >= 44
 
-    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn):
-        shared_bn.load(CANARY_BINARY)
+    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn, tmp_path):
+        # Optimization keeps the argument directly in the load address, rather
+        # than an O0 spill/copy that the old name-keyed rule did not recognize.
+        binary = tmp_path / "context_word"
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the frame regression"
+        build = subprocess.run(
+            [cc, "-O2", "-fstack-protector-all", "-o", str(binary),
+             str(FIXTURES_DIR / "src" / "canary.c")],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
         function = "read_context_word"
         before = shared_bn.json("local", "list", "--frame", function)
         assert before["canary_storage"] is None, before
