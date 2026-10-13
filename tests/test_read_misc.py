@@ -1323,8 +1323,8 @@ def test_imports_external_dedups_against_got_only_imports(monkeypatch):
 
 
 def test_exports_lists_global_weak_definitions_only(monkeypatch):
-    """`bn exports` lists the global/weak DEFINITIONS (the public API); local
-    definitions are internal and excluded (#198)."""
+    """`bn exports` lists global/weak definitions from any symbol table;
+    local definitions are excluded, without proving loader visibility (#921)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_bn = sys.modules["binaryninja"]

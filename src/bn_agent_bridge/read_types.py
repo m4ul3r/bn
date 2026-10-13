@@ -84,20 +84,29 @@ def _follow_typedef(bv, resolved_name: str, type_obj):
     """Follow a typedef chain to the underlying registered type so struct-shaped
     reads can see the body's members (#674). Returns ``(name, type_obj, reason)``;
     *reason* is None when the chain was followed to a terminal type, and otherwise
-    says why it could not be: an unresolvable ``target()``, a cycle, or a chain
+    says why it could not be: an unresolvable reference, a cycle, or a chain
     past ``_MAX_TYPEDEF_FOLLOW``. A called-out reason is what lets the caller
     report an unresolvable alias distinctly from a type that really has no
-    members."""
-    seen: list = []
+    members. Each hop performs one view lookup: native ``target(bv)`` recursively
+    follows the entire chain and would bypass both the budget and cycle guard."""
+    seen: set[tuple[str, object]] = set()
     while _is_named_type_ref(type_obj):
-        if any(type_obj is prior for prior in seen):
-            return resolved_name, type_obj, "the typedef chain is cyclic"
-        if len(seen) >= _MAX_TYPEDEF_FOLLOW:
-            return (resolved_name, type_obj,
-                    f"the typedef chain is longer than {_MAX_TYPEDEF_FOLLOW} hops")
-        seen.append(type_obj)
         try:
-            target = type_obj.target(bv)
+            type_id = getattr(type_obj, "type_id", None)
+            name = None if type_id else getattr(type_obj, "name", None)
+            target = None
+            if type_id or name:
+                # Native lookups return fresh wrappers; Python object identity
+                # cannot detect cycles. An ID is authoritative when present.
+                key = ("id", type_id) if type_id else ("name", name)
+                if key in seen:
+                    return resolved_name, type_obj, "the typedef chain is cyclic"
+                if len(seen) >= _MAX_TYPEDEF_FOLLOW:
+                    return (resolved_name, type_obj,
+                            f"the typedef chain is longer than {_MAX_TYPEDEF_FOLLOW} hops")
+                seen.add(key)
+                target = (bv.get_type_by_id(type_id) if type_id
+                          else bv.get_type_by_name(name))
         except Exception:
             target = None
         if target is None:

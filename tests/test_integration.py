@@ -26,6 +26,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
+CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 
@@ -578,6 +579,127 @@ class TestProtoSetUnnamedParams:
         proto_result = next(r for r in commit_parsed["results"]
                             if r.get("op") == "set_prototype")
         assert proto_result["before_has_user_type"] is False, commit_parsed
+
+
+class TestUserPrototypePreview:
+    """#803: a changed USER prototype previews without losing its baseline."""
+
+    def _state(self, shared_bn, start: int) -> dict:
+        return json.loads(_py_line(shared_bn, (
+            "import json\n"
+            f"f = bv.get_function_at({start})\n"
+            "print('STATE=' + json.dumps({'name': f.name, 'prototype': str(f.type), "
+            "'has_user_type': f.has_user_type}))\n"
+        ), "STATE"))
+
+    def test_user_prototype_preview_restores_exact_prior_type_and_provenance(self, shared_bn):
+        shared_bn.load(ADD_BINARY)
+        start, _ = _function_start_and_size(shared_bn, "add")
+        baseline = shared_bn.json(
+            "proto", "set", hex(start), "int32_t add(int32_t left, int32_t right)",
+        )
+        assert baseline["success"] is True
+        assert baseline["committed"] is True
+        before = self._state(shared_bn, start)
+        assert before["has_user_type"] is True
+        changed = "uint64_t add(uint64_t wide, uint32_t count, void* context)"
+        preview = shared_bn.json("proto", "set", hex(start), changed, "--preview")
+        assert preview["success"] is True
+        assert preview["preview"] is True
+        assert preview["committed"] is False
+        assert preview["rolled_back"] is True
+        row, = preview["results"]
+        assert row["status"] == "verified"
+        assert row["before_has_user_type"] is True
+        assert row["before_prototype"] == before["prototype"]
+        assert row["expected_prototype"] != before["prototype"]
+        assert row["observed"]["prototype"] != before["prototype"]
+        after = self._state(shared_bn, start)
+        assert after["has_user_type"] is True
+        assert after == before  # Exact prototype (including names) and provenance.
+
+
+class TestLocalMutationProvenance:
+    """#801: preview and failed batches restore AUTO locals, not USER copies."""
+
+    def _state(self, shared_bn, start: int, identifier: int) -> dict:
+        return json.loads(_py_line(shared_bn, (
+            "import json\n"
+            f"f = bv.get_function_at({start})\n"
+            f"v = next(v for v in f.vars if v.identifier == {identifier})\n"
+            "print('STATE=' + json.dumps({"
+            "'name': v.name, 'type': str(v.type), "
+            "'user_defined': f.is_var_user_defined(v), 'comment': f.comment}))\n"
+        ), "STATE"))
+
+    def _baseline(self, shared_bn) -> tuple[int, dict, dict]:
+        shared_bn.load(ADD_BINARY)
+        start, _ = _function_start_and_size(shared_bn, "mul")
+        locals_ = shared_bn.json("local", "list", hex(start))["items"]
+        # The unoptimised synthetic loop has integer stack locals. Select by
+        # structure, not a compiler/BN-version-specific auto variable name.
+        local = next(v for v in locals_ if not v["is_parameter"]
+                     and v["source_type"] == "StackVariableSourceType"
+                     and v["type"] == "int32_t")
+        assert local["identifier"] is not None
+        before = self._state(shared_bn, start, local["identifier"])
+        assert before["user_defined"] is False
+        assert (before["name"], before["type"]) == (local["name"], local["type"])
+        return start, local, before
+
+    def test_auto_local_rename_preview_restores_name_type_and_provenance(self, shared_bn):
+        start, local, before = self._baseline(shared_bn)
+        new_name = "preview_loop_count"
+        assert before["name"] != new_name
+        preview = shared_bn.json(
+            "local", "rename", hex(start), local["local_id"], new_name, "--preview",
+        )
+        assert preview["success"] is True
+        assert preview["preview"] is True
+        assert preview["committed"] is False
+        assert preview["rolled_back"] is True
+        row, = preview["results"]
+        assert row["status"] == "verified"  # A real rename, never a noop.
+        assert row["before_name"] == before["name"]
+        assert row["observed"]["variable"] == new_name
+        after = self._state(shared_bn, start, local["identifier"])
+        assert after["user_defined"] is False
+        assert after == before
+
+    def test_auto_local_mixed_batch_failure_restores_name_type_and_provenance(self, shared_bn, tmp_path):
+        start, local, before = self._baseline(shared_bn)
+        new_name = "rollback_loop_count"
+        assert before["name"] != new_name
+        comment = "temporary loop audit"
+        assert before["comment"] != comment
+        unmapped = _py_line(shared_bn, (
+            "assert not bv.is_valid_offset(bv.end)\n"
+            "print('UNMAPPED=' + hex(bv.end))\n"
+        ), "UNMAPPED")
+        manifest = tmp_path / "local-rollback.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "local_rename", "function": hex(start),
+             "variable": local["local_id"], "new_name": new_name},
+            {"op": "set_comment", "function": hex(start), "comment": comment},
+            # Valid request shape, but fails during apply AFTER the two writes.
+            {"op": "set_comment", "address": unmapped, "comment": "cannot land"},
+        ]}), encoding="utf-8")
+        result = shared_bn.run("batch", "apply", str(manifest), "--format", "json")
+        assert result.returncode == 3, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["success"] is False
+        assert payload["preview"] is False
+        assert payload["committed"] is False
+        assert payload["rolled_back"] is True
+        assert [r["status"] for r in payload["results"]] == [
+            "reverted", "reverted", "invalid_request",
+        ], payload
+        renamed = payload["results"][0]
+        assert renamed["before_name"] == before["name"]
+        assert renamed["new_name"] == new_name
+        after = self._state(shared_bn, start, local["identifier"])
+        assert after["user_defined"] is False
+        assert after == before  # Name, exact type, provenance AND sibling comment.
 
 
 class TestStructFieldTypedef:
@@ -3079,6 +3201,31 @@ class TestTypesDeclarePartialDrop760:
         assert parsed["committed"] is False, parsed
 
 
+class TestStackFrameMap:
+    """`local list --frame` on a real stack-protected frame: the canary slot is
+    found from the guard copy BN lifts in the prologue, and every row is one
+    distinct stack offset."""
+
+    def test_frame_marks_canary_and_measures_buffer_headroom(self, shared_bn):
+        shared_bn.load(CANARY_BINARY)
+        frame = shared_bn.json("local", "list", "--frame", "copy_label")
+        locals_ = shared_bn.json("local", "list", "copy_label")["items"]
+
+        slots = frame["items"]
+        stack_offsets = {item["storage"] for item in locals_ if item["storage"] <= 0
+                         and item["source_type"] == "StackVariableSourceType"}
+        assert [slot["storage"] for slot in slots] == sorted(stack_offsets)
+        assert frame["slot_count"] == len(slots)
+
+        canary = frame["canary_storage"]
+        assert canary is not None, frame
+        assert [slot["storage"] for slot in slots if slot["kind"] == "canary"] == [canary]
+        # The 44-byte buffer sits below the canary with at least its own size of
+        # headroom; `to_canary` is measured from its offset to the canary slot.
+        buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
+        assert buffer["to_canary"] == canary - buffer["storage"] >= 44
+
+
 class TestClassLensRttiGuards922:
     """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
     adjacency of vtables and `__si_class_type_info` records, the extern vptr of
@@ -3327,3 +3474,169 @@ int main(int argc, char **) {
             assert card["vtable"]["address"] in candidates[name], card
             assert card["vtable"]["slots"] == [], card
             assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card
+
+
+class TestStructLayoutAssistance903:
+    """Known-layout disclosure on the same real typed/untyped function."""
+
+    _SOURCE = """
+        #include <stdint.h>
+        struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };
+        __attribute__((noinline)) uint64_t handle(void *c) {
+            return *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+        }
+        __attribute__((noipa)) void sink(void) { __asm__ volatile(""); }
+        /* The call keeps c in a callee-saved copy that reaches past cfg. */
+        __attribute__((noinline)) uint64_t handle_alias(void *c) {
+            uint64_t sum = *(uint64_t *)((char *)c + 40) + *(uint32_t *)((char *)c + 48);
+            sink();
+            return sum + *(uint32_t *)((char *)c + 0x80);
+        }
+        int main(void) {
+            struct cfg c[3] = { { .flags = 7, .depth = 3 } };
+            return (int)(handle(c) + handle_alias(c));
+        }
+    """
+
+    def test_untyped_hint_typed_rendering_and_ambiguity(self, shared_bn, tmp_path):
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the issue903 regression"
+        source = tmp_path / "struct_assist.c"
+        source.write_text(self._SOURCE)
+        binary = tmp_path / "struct_assist"
+        build = subprocess.run(
+            [cc, "-O2", "-fno-inline", "-fno-stack-protector", "-no-pie",
+             str(source), "-o", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        assert build.returncode == 0, f"struct fixture build failed:\n{build.stdout}\n{build.stderr}"
+        shared_bn.load(binary)
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        # A fresh ELF already has loader-provided layouts: its header can match
+        # these same accesses and later make cfg ambiguous. Establish an empty
+        # inventory explicitly, without blacklisting names or changing offsets.
+        remaining_types = shared_bn.json(
+            "py", "exec",
+            "for name in list(bv.types.keys()):\n"
+            "    if bv.is_type_auto_defined(name):\n"
+            "        bv.undefine_type(bv.get_type_id(name))\n"
+            "    else:\n"
+            "        bv.undefine_user_type(name)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [str(name) for name in bv.types.keys()]\n")["result"]
+        assert remaining_types == [], remaining_types
+        before = shared_bn.json("proto", "get", "handle")
+        missing = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in missing["warnings"]), missing
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+        untyped = shared_bn.json("decompile", "handle")
+        hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
+        assert hint is not None, untyped
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+            assert witness in hint
+        assert shared_bn.json("proto", "get", "handle") == before
+        text_result = shared_bn.run("decompile", "handle")
+        assert text_result.returncode == 0, text_result.stderr
+        assert hint in text_result.stdout
+
+        # Accesses through a copy of the parameter must not be dropped from
+        # the witness while the body visibly uses an offset cfg cannot hold.
+        shared_bn.json("proto", "set", "handle_alias", "uint64_t handle_alias(void *c)")
+        aliased = shared_bn.json("decompile", "handle_alias")
+        assert "0x80" in aliased["text"], aliased
+        assert not any("struct layout candidate" in w for w in aliased["warnings"]), aliased
+
+        # A bitfield storage unit at a witnessed offset is potentially
+        # compatible; it must block uniqueness rather than be skipped. The C
+        # declaration path refuses bitfields, so build the native member.
+        bit_widths = shared_bn.json(
+            "py", "exec",
+            "from binaryninja import StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'lo', bit_width=20)\n"
+            "bv.define_user_type('bits_cfg', s)\n"
+            "bv.update_analysis_and_wait()\n"
+            "result = [m.bit_width for m in bv.get_type_by_name('bits_cfg').members]\n")["result"]
+        assert bit_widths == [0, 0, 20], bit_widths
+        blocked = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in blocked["warnings"]), blocked
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('bits_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
+
+        # Application remains an explicit mutation, never part of a read.
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
+        typed = shared_bn.json("decompile", "handle")
+        assert "c->flags" in typed["text"] and "c->depth" in typed["text"], typed
+        assert not any("struct layout candidate" in w for w in typed["warnings"]), typed
+
+        shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
+        shared_bn.json(
+            "types", "declare",
+            "struct other_cfg { char pad[40]; uint64_t mode; uint32_t count; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+
+        # A typedef on a scalar member must neither hide a compatible layout
+        # nor make a distinct, direct-scalar layout appear uniquely compatible.
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('cfg')\n"
+            "bv.undefine_user_type('other_cfg')\n"
+            "bv.update_analysis_and_wait()\n")
+        shared_bn.json(
+            "types", "declare",
+            "typedef unsigned long long word_t; "
+            "struct wrapped_cfg { char pad[40]; word_t flags; unsigned int depth; }; "
+            "typedef struct wrapped_cfg wrapped_alias;")
+        wrapped = shared_bn.json("decompile", "handle")
+        hints = [w for w in wrapped["warnings"] if "struct layout candidate" in w]
+        assert len(hints) == 1, wrapped
+        for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
+            assert witness in hints[0]
+        assert shared_bn.json("proto", "get", "handle") == before
+
+        shared_bn.json(
+            "types", "declare",
+            "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+        ambiguous = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
+        assert shared_bn.json("proto", "get", "handle") == before
+
+        # Crossing the resolver budget must never turn uncertainty into a
+        # unique direct-layout suggestion. The 16-hop layout is a witness on
+        # its own; longer chains can only block another layout's uniqueness.
+        for hops in (16, 17, 64):
+            shared_bn.json(
+                "py", "exec",
+                "bv.undefine_user_type('cfg')\n"
+                "bv.undefine_user_type('wrapped_cfg')\n"
+                "bv.update_analysis_and_wait()\n")
+            prefix = f"word_{hops}_"
+            declarations = f"typedef unsigned long long {prefix}0; " + "".join(
+                f"typedef {prefix}{index - 1} {prefix}{index}; "
+                for index in range(1, hops))
+            shared_bn.json(
+                "types", "declare",
+                declarations
+                + f"struct wrapped_cfg {{ char pad[40]; {prefix}{hops - 1} flags; "
+                + "unsigned int depth; };")
+            sole = shared_bn.json("decompile", "handle")
+            hints = [w for w in sole["warnings"] if "struct layout candidate" in w]
+            assert len(hints) == (1 if hops == 16 else 0), (hops, sole)
+            if hints:
+                assert "struct wrapped_cfg *" in hints[0]
+            shared_bn.json(
+                "types", "declare",
+                "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                hops, competing)
+            assert shared_bn.json("proto", "get", "handle") == before

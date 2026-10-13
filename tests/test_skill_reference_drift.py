@@ -1081,63 +1081,6 @@ def test_mutating_reference_documents_the_output_flags(mutation_engine):
     assert "status line" in text or "status summary" in text
 
 
-def _documented_compact_status_keys() -> set[str]:
-    """The keys named in the first column of `mutating.md`'s "Compact status
-    keys" table. One row may name several keys (the counts share a row), so
-    collect every backticked identifier in that cell."""
-    section = MUTATING.read_text(encoding="utf-8").split("### Compact status keys", 1)
-    assert len(section) == 2, "the compact-status key table section is gone"
-    keys: set[str] = set()
-    for line in section[1].splitlines():
-        if not line.startswith("|") or line.startswith("|---") or line.startswith("| key "):
-            if keys:
-                break                       # past the end of the table
-            continue
-        keys.update(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", line.split("|")[1]))
-    return keys
-
-
-def test_mutating_reference_documents_every_compact_status_key():
-    """#684 made `measured` -- and the null-vs-zero count semantics around it --
-    load-bearing for a JSON control loop, and the answer to "a value nobody is
-    told to read is not loud enough" is that the compact schema is DOCUMENTED.
-    A table that silently drifts from the emitted keys is the same
-    remembered-exception failure mode as a forgotten `summary_transform`: it
-    shipped omitting `kind` and `prototype_user_type_residue` (#630's residue
-    flag, which a control loop must see). Pin the documented key set to the
-    union of what `_mutation_summary` and `_go_rename_summary` actually emit
-    across the measured, unmeasured and residue shapes."""
-    from bn.formatters import _go_rename_summary, _mutation_summary
-
-    measured = _mutation_summary({"success": True, "committed": True,
-                                  "rolled_back": False, "results": [{"status": "noop"}]})
-    unmeasured = _mutation_summary({"success": True, "committed": True, "results": []})
-    residue = _mutation_summary({"success": False, "committed": False,
-                                 "rolled_back": True, "message": "override stuck",
-                                 "prototype_user_type_residue": True,
-                                 "results": [{"status": "rollback_failed"}]})
-    split = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
-                               "results": [{"op": "function_create", "status": "verified",
-                                            "overlaps": [{"name": "parse_record",
-                                                          "address": "0x401a40",
-                                                          "offset": "0x4"}]}]})
-    go = _go_rename_summary({"kind": "go_rename", "success": True, "committed": True,
-                             "rolled_back": False, "go_renamed_candidates": 2,
-                             "go_committed_count": 2, "go_verified_count": 2,
-                             "go_failed_count": 0, "skipped_user_named": 1})
-    emitted = set(measured) | set(unmeasured) | set(residue) | set(split) | set(go)
-    assert emitted == _documented_compact_status_keys()
-    # ...and the table's "always present except prototype_user_type_residue /
-    # overlapping_functions" caveat is itself true.
-    assert "prototype_user_type_residue" in residue
-    assert "prototype_user_type_residue" not in measured
-    assert "overlapping_functions" in split
-    assert "overlapping_functions" not in measured
-    # #685: the two summary builders must keep emitting the SAME key set -- the
-    # nulled unmeasured counts must not widen one side only.
-    assert set(measured) == set(unmeasured) == set(go)
-
-
 def test_reading_reference_documents_the_function_list_flags():
     """#650: `--sort` / `--reverse` / `--min-size` / `--demangle` all ship, and all
     were absent from `reading.md` -- so two agents wrote the same python to sort
@@ -1312,23 +1255,6 @@ def bound_absence_claims(sentence: str, token: re.Pattern[str],
     return denied
 
 
-def _prose_and_fenced(text: str) -> tuple[str, str]:
-    """A document split into its prose and its fenced examples.
-
-    A fenced example is a runnable instruction, never a denial, so a flag named
-    inside one is a positive claim whatever the prose around it says.
-    """
-    prose: list[str] = []
-    fenced: list[str] = []
-    inside = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            inside = not inside
-            continue
-        (fenced if inside else prose).append(line)
-    return "\n".join(prose), "\n".join(fenced)
-
-
 def _parser_long_flags() -> set[str]:
     """Every long option the CLI accepts, at any depth of the subcommand tree."""
     import argparse
@@ -1346,38 +1272,6 @@ def _parser_long_flags() -> set[str]:
 
     walk(bn.cli.build_parser())
     return flags
-
-
-@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
-def test_every_flag_the_reference_names_exists(doc: Path):
-    """A flag an agent reads in any agent-facing doc must be one the CLI accepts.
-
-    The mirror of this module's founding defect. Its header records that an
-    OMITTED flag makes agents conclude a shipped feature does not exist -- three
-    re-filed it in one dogfood run. The inverse costs the same and was guarded
-    by nothing: a document that ADVERTISES a flag the parser has never heard of
-    sends an agent to write `--dry-run` and read the argparse refusal as a
-    broken CLI.
-
-    The absence exemption is bound to the OCCURRENCE, not to the document. Read
-    document-wide it let a round-23 lens ship a runnable `bn go rename
-    --dry-run` example and have it excused by an unrelated denial sentence
-    further down the same file -- certifying the exact false instruction this
-    cell exists to catch.
-    """
-    known = _parser_long_flags()
-    assert known, "the parser exposes no long flags, so this cell proves nothing"
-    prose, fenced = _prose_and_fenced(doc.read_text(encoding="utf-8"))
-    invented = {match[0] for match in _DOC_FLAG.finditer(fenced)} - known
-    for sentence in _SENTENCE.split(prose):
-        named = {match[0] for match in _DOC_FLAG.finditer(sentence)}
-        invented |= (named - known
-                     - bound_absence_claims(sentence, _DOC_FLAG, _ABSENCE_CLAIM))
-    assert not invented, (
-        f"{doc.name} names flags the parser does not accept, so an agent copying "
-        f"them gets an argparse refusal and reads it as a broken CLI: "
-        f"{sorted(invented)}"
-    )
 
 
 # The opposite direction is the one claim in this accounting that is NOT

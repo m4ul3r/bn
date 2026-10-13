@@ -5,7 +5,7 @@ The decompile/IL/disasm read-op cluster that used to live on
 ``BridgeContext`` seam (``ctx``) in place of ``self``. ``BinaryNinjaBridge``
 keeps a thin delegating shim for every name the test suite / op binders
 reference (``_decompile``, ``_function_info``, ``_get_prototype``,
-``_list_locals_for_function``, ``_il``, ``_disasm``, ``_structured_il``,
+``_list_locals_for_function``, ``_list_frame_for_function``, ``_il``, ``_disasm``, ``_structured_il``,
 ``_defuse``, ``_resolved_calls``, ``_possible_values``, ``_pvs_targets``,
 ``_force_function_analysis``).
 
@@ -24,12 +24,13 @@ Outbound calls resolve through:
   * ``_shared`` -- module-free helpers (``_parse_address``, ``OperationFailure``).
 
 Import direction is one-way: this module imports ``il_format``, ``vars``,
-``taint_engine``, and ``_shared`` (plus stdlib + binaryninja). It NEVER imports
-``bridge`` or ``seam`` -- those import THIS module one-way (design spec §3.2).
+``taint_engine``, ``read_types``, and ``_shared`` (plus stdlib + binaryninja).
+It NEVER imports ``bridge`` or ``seam`` -- those import THIS module one-way.
 """
 from __future__ import annotations
 
 import re
+import shlex
 
 from typing import Any
 
@@ -39,6 +40,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
+from . import read_types
 from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
@@ -291,6 +293,203 @@ def _flattened_guard_warning(bv, func) -> str | None:
     )
 
 
+def _enum_name(value: Any) -> str:
+    return str(getattr(value, "name", value))
+
+
+def _untyped_pointer_accesses(func: Any) -> list[tuple[int, Any, set[tuple[int, int]]]]:
+    """Direct incoming void-pointer accesses only, not alias/type recovery.
+
+    SSA version zero ties the witness to the incoming parameter, not a later
+    value stored in the same variable. Any unsupported memory address using
+    that variable disqualifies it rather than cherry-picking its easy accesses,
+    and so does any other use through which the pointer value can reach code
+    the witness does not inspect: a copy, PHI, derived pointer, call argument
+    or stored value. Only a comparison, whose result cannot carry the pointer,
+    is exempt.
+    """
+    parameters = {
+        _taint.var_key(var): (index, var)
+        for index, var in enumerate(getattr(func, "parameter_vars", ()))
+        if _enum_name(getattr(var.type, "type_class", None)) == "PointerTypeClass"
+        and _enum_name(getattr(var.type.target, "type_class", None)) == "VoidTypeClass"
+    }
+    if not parameters:
+        return []
+    ssa = getattr(getattr(func, "mlil", None), "ssa_form", None)
+    if ssa is None:
+        return []
+    accesses: dict[tuple, set[tuple[int, int]]] = {key: set() for key in parameters}
+    unsupported: set[tuple] = set()
+    # Expression indexes of incoming-parameter reads; each must be an accepted
+    # access base or a comparison operand.
+    uses: dict[int, tuple] = {}
+    accounted: set[int] = set()
+
+    def incoming(node: Any) -> tuple | None:
+        if _taint.op_name(node) != "MLIL_VAR_SSA" or node.src.version != 0:
+            return None
+        key = _taint.var_key(node.src)
+        return key if key in parameters else None
+
+    def collect(ins: Any) -> None:
+        op = _taint.op_name(ins)
+        if op == "MLIL_VAR_SSA":
+            key = incoming(ins)
+            if key is not None:
+                uses[int(ins.expr_index)] = key
+            return
+        if op == "MLIL_VAR_PHI":
+            unsupported.update(
+                _taint.var_key(src) for src in ins.src
+                if src.version == 0 and _taint.var_key(src) in parameters)
+            return
+        if op in {
+            "MLIL_VAR_SSA_FIELD", "MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD",
+            "MLIL_ADDRESS_OF", "MLIL_ADDRESS_OF_FIELD",
+        }:
+            key = _taint.var_key(ins.src)
+            if key in parameters:
+                unsupported.add(key)
+            return
+        if op.startswith("MLIL_CMP_"):
+            for operand in (ins.left, ins.right):
+                if incoming(operand) is not None:
+                    accounted.add(int(operand.expr_index))
+            return
+        if op not in {
+            "MLIL_LOAD_SSA", "MLIL_LOAD_STRUCT_SSA",
+            "MLIL_STORE_SSA", "MLIL_STORE_STRUCT_SSA",
+        }:
+            return
+        address = ins.src if op.startswith("MLIL_LOAD") else ins.dest
+        touched = {_taint.var_key(v) for v in address.vars_read} & parameters.keys()
+        if not touched:
+            return
+        base = address
+        offset = int(ins.offset) if "_STRUCT_" in op else 0
+        if _taint.op_name(base) == "MLIL_ADD":
+            left, right = base.left, base.right
+            if _taint.op_name(left) == "MLIL_CONST":
+                left, right = right, left
+            if _taint.op_name(right) == "MLIL_CONST":
+                offset += int(right.constant)
+                base = left
+        key = incoming(base)
+        width = int(ins.size)
+        if key is None or touched != {key} or offset < 0 or width <= 0:
+            unsupported.update(touched)
+            return
+        accounted.add(int(base.expr_index))
+        accesses[key].add((offset, width))
+
+    # traverse visits nested loads as well as top-level stores. Its callback
+    # returns None, so draining the generator need not retain any IL objects.
+    for _ in ssa.traverse(collect):
+        pass
+    unsupported.update(key for index, key in uses.items() if index not in accounted)
+    return [
+        (index, var, accesses[key])
+        for key, (index, var) in parameters.items()
+        if key not in unsupported and len({off for off, _ in accesses[key]}) >= 2
+    ]
+
+
+_SCALAR_TYPE_CLASSES = frozenset({
+    "BoolTypeClass", "IntegerTypeClass", "FloatTypeClass",
+    "EnumerationTypeClass", "PointerTypeClass", "WideCharTypeClass",
+})
+
+
+def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
+    """Evidence-qualified known-layout assistance; never writes a type (#903).
+
+    Match complete scalar members of concrete, non-inherited structs, resolving
+    typedefs only for members at observed offsets/widths. Unclassifiable members
+    -- unresolved typedefs, bitfield storage units and overlapping members --
+    can block uniqueness but cannot supply a witness. Whole-struct aliases do not
+    add candidates (their concrete declarations are already in bv.types).
+    Matching two distinct offsets is a minimum witness, not proof of identity.
+    """
+    accesses = _untyped_pointer_accesses(func)
+    if not accesses:
+        return []
+    observed_sets = [observed for _, _, observed in accesses]
+    observed_keys = set().union(*observed_sets)
+    layouts: list[tuple[str, dict[tuple[int, int], str | None]]] = []
+    for name, type_obj in bv.types.items():
+        if (_enum_name(type_obj.type_class) != "StructureTypeClass"
+                or _enum_name(type_obj.type) != "StructStructureType"
+                or type_obj.base_structures):
+            continue
+        scalars: dict[tuple[int, int], Any] = {}
+        uncertain: list[tuple[int, int]] = []  # byte spans [start, end)
+        end = 0
+        # BN can size a struct ending in a bitfield to the bit, short of the
+        # storage unit's last byte; the unit still bounds the layout.
+        limit = int(type_obj.width)
+        for member in sorted(type_obj.members, key=lambda member: member.offset):
+            offset, width = int(member.offset), int(member.type.width)
+            if width <= 0:
+                break  # incomplete layouts are not a unique witness
+            if offset < end:
+                uncertain.append((offset, min(end, offset + width)))
+            end = max(end, offset + width)
+            if getattr(member, "bit_width", 0):
+                # Compilers may access any part of a bitfield's storage unit.
+                uncertain.append((offset, offset + width))
+                limit = max(limit, offset + width)
+            elif member.name:
+                scalars[(offset, width)] = member
+        else:
+            if end > limit:
+                continue
+            # Named scalar = positive; None = uncertain; absent = incompatible.
+            members: dict[tuple[int, int], str | None] = {}
+            for offset, width in observed_keys:
+                if any(offset < hi and lo < offset + width for lo, hi in uncertain):
+                    members[(offset, width)] = None
+                elif (offset, width) in scalars:
+                    member = scalars[(offset, width)]
+                    _, member_type, follow_error = read_types._follow_typedef(
+                        bv, str(member.name), member.type)
+                    if follow_error is not None:
+                        members[(offset, width)] = None
+                    elif _enum_name(member_type.type_class) in _SCALAR_TYPE_CLASSES:
+                        members[(offset, width)] = str(member.name)
+            if any(observed <= members.keys() for observed in observed_sets):
+                layouts.append((str(name), members))
+
+    warnings = []
+    for index, var, observed in accesses:
+        matches = [(name, members) for name, members in layouts if observed <= members.keys()]
+        if len(matches) != 1:
+            continue  # no witness or ambiguous: never choose a "best" struct
+        name, members = matches[0]
+        if any(members[access] is None for access in observed):
+            continue  # the sole possible layout must still have positive witnesses
+        evidence = ", ".join(
+            f"+{offset:#x}/{width} bytes -> {members[(offset, width)]}"
+            for offset, width in sorted(observed)
+        )
+        qualifiers = " ".join(
+            q for q in ("const", "volatile") if bool(getattr(var.type.target, q, False))
+        )
+        pointer_type = f"{qualifiers + ' ' if qualifiers else ''}struct {name} *"
+        address = hex(int(func.start))
+        warnings.append(
+            f"struct layout candidate for parameter {index + 1} ({var.name}): "
+            f"observed direct MLIL accesses {evidence} match declared struct {name}. "
+            "Offsets and widths alone do not prove the parameter's type. "
+            f"Review `bn struct show {shlex.quote(name)}` and `bn disasm {address}`; "
+            f"if confirmed, use `bn proto get {address}`, then `bn proto set {address}` "
+            f"with the full prototype, changing only this parameter to "
+            f"`{pointer_type}` (preserve other parameters, qualifiers and calling convention). "
+            "No type was applied."
+        )
+    return warnings
+
+
 def _decompile_batch(
     ctx,
     selector: str | None,
@@ -378,6 +577,7 @@ def _decompile(
     guard_warn = _flattened_guard_warning(bv, func)
     if guard_warn:
         warnings.append(guard_warn)
+    warnings.extend(_struct_layout_warnings(bv, func))
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
@@ -577,6 +777,26 @@ def _list_locals_for_function(ctx, selector: str | None, identifier):
         "kind": "locals",
         "items": variables,
         "locals": variables,
+    }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
+
+
+def _list_frame_for_function(ctx, selector: str | None, identifier):
+    bv = ctx._resolve_view(selector)
+    func = ctx._find_function(bv, identifier, contained=True)
+    frame = vars_mod._list_frame(func)
+    result = {
+        "function": {
+            "name": func.name,
+            "address": hex(func.start),
+            "raw_name": getattr(func, "raw_name", func.name),
+        },
+        "kind": "frame",
+        "items": frame["slots"],
+        "slot_count": frame["slot_count"],
+        "variable_count": frame["variable_count"],
+        "canary_storage": frame["canary_storage"],
     }
     _annotate_containment(ctx, result, identifier, func)
     return result

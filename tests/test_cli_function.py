@@ -295,6 +295,38 @@ def test_local_list_text_notes_mid_function_resolution(fake_transport, capsys):
     assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
 
 
+def test_local_list_frame_renders_one_row_per_slot_with_markers(fake_transport, capsys):
+    def slot(storage, kind, names, type_, nxt, to_canary):
+        return {"storage": storage, "kind": kind, "names": names, "types": [type_],
+                "distance_to_next_slot": nxt, "to_canary": to_canary, "variables": []}
+
+    calls = fake_transport({"list_frame": {"ok": True, "result": {
+        "function": {"name": "format_report", "address": "0x40c3a0"},
+        "kind": "frame",
+        "items": [
+            slot(-160, "local", ["var_a0", "var_a0_1"], "uint16_t", 8, 120),
+            slot(-112, "saved_register", ["__saved_fp"], "int64_t", 24, 72),
+            slot(-88, "local", ["var_58"], "int64_t", 8, 48),
+            slot(-40, "canary", ["var_28"], "int64_t", 40, None),
+        ],
+        "slot_count": 4,
+        "variable_count": 5,
+        "canary_storage": -40,
+    }}})
+
+    rc = bn.cli.main(["local", "list", "--frame", "format_report", "--target", "active"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_frame"]
+    out, _ = capsys.readouterr()
+    assert "(4 stack slots, 5 variables; canary at -40 (-0x28))" in out
+    rows = {line.split()[0]: line.split() for line in out.splitlines() if line.startswith("  -")}
+    assert rows["-160"][-2:] == ["var_a0,", "var_a0_1"]
+    assert rows["-88"][2:4] == ["8", "48"]
+    assert "saved_register" in rows["-112"] and "canary" in rows["-40"]
+    assert rows["-40"][3] == "-"
+
+
 def test_disasm_count_on_mid_function_address_steers_to_linear(fake_transport, capsys):
     # #371.3: `disasm <mid-addr> --count N` slices from the function prologue, not
     # the requested address -- an agent inspecting a call site via an xref address
