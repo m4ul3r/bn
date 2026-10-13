@@ -832,10 +832,16 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
 
 def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None,
              count_only: bool = False):
-    """List a binary's EXPORTED symbols -- its public API. Exports are the
-    globally/weakly-bound DEFINITIONS (the dynsym entries `nm -D --defined-only`
-    shows); local/no-binding symbols are internal and excluded. Mirrors the
-    `imports` envelope (name/address/kind + demangled display_name) (#198)."""
+    """List global/weak definitions from any symbol table, not loader-visible exports.
+
+    Select FunctionSymbol/DataSymbol definitions from BN's combined symbols by
+    binding, without checking their source table or dynamic-loader visibility.
+    On ELF, this can include .symtab definitions absent from .dynsym, so it is
+    NOT equivalent to ``nm -D --defined-only``. Known local/no-binding symbols
+    are excluded; definitions without binding metadata are retained.
+    ``count_only`` counts the same population as the listing. Mirrors the
+    ``imports`` envelope (name/address/kind + demangled display_name) (#198).
+    """
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)

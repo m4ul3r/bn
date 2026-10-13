@@ -61,6 +61,7 @@ def _serve_one(bridge, inst, payload, *, dispatched: bool = False) -> float:
     handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO((json.dumps(payload) + "\n").encode("utf-8"))
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.handle()
     assert inst._inflight == 0, "every request must balance its accounting"

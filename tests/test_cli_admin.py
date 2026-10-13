@@ -4526,6 +4526,27 @@ def test_session_lifecycle_refuses_a_legacy_gui_strict_enumeration_failure(
     assert [op for op, _ in calls] == ["list_targets"]
 
 
+@pytest.mark.parametrize("verb", ["restart", "stop"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("discard", [False, True])
+def test_gui_lifecycle_never_escalates_to_process_signals(
+    monkeypatch, capsys, verb, legacy, discard
+):
+    calls = _unsaved_guard_fixture(
+        monkeypatch, [], instance_id=None if legacy else "owned-gui"
+    )
+    inst = bn.cli.find_lifecycle_instance("default" if legacy else "owned-gui")
+    if not legacy:
+        inst.meta["gui"] = True
+    argv = ["session", verb, "default" if legacy else "owned-gui", "--format", "json"]
+    if discard:
+        argv.append("--discard-unsaved")
+    assert bn.cli.main(argv) == 2
+    assert "only supported for headless sessions" in capsys.readouterr().err
+    assert [op for op, _ in calls] == ["list_targets"]
+    assert not _FakeSignaller.instances
+
+
 def test_session_stop_discard_unsaved_proceeds_past_an_unanswered_probe(monkeypatch, capsys):
     # `--discard-unsaved` is the consent: the stop proceeds, says on stderr
     # that it could not verify, and claims no discard it cannot name.

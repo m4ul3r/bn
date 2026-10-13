@@ -54,6 +54,7 @@ from ._shared import (
     _write_json_artifact,
     is_auto_function_name,
     is_imported_function,
+    is_main_thread,
 )
 from .op_registry import REGISTRY, op
 from .paths import (
@@ -689,24 +690,52 @@ class TargetManager:
         return type(bv).__name__
 
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
-        components = {vid: _path_components(r.filename) for vid, r in records.items()}
+        # Index the resolver's exact aliases and component suffixes once per
+        # snapshot. Candidate lookup must not re-split every other view's path.
+        exact: dict[str, set[str]] = {}
+        tails: dict[tuple[str, ...], set[str]] = {}
+        paths = {}
+        identities = {}
+        for vid, record in records.items():
+            identities[record.target_id()] = vid
+            parts = paths[vid] = _path_components(record.filename)
+            aliases = [record.view_id, record.filename, record.basename]
+            variants = [parts]
+            if record.basename.endswith(".bndb"):
+                core = record.basename[:-len(".bndb")]
+                aliases.append(core)
+                stem, dot, digest = core.rpartition(".")
+                if dot and len(digest) == 16 and all(
+                    c in "0123456789abcdef" for c in digest
+                ):
+                    aliases.append(stem)
+            if parts and parts[-1].endswith(".bndb"):
+                variants.append(parts[:-1] + (parts[-1][:-len(".bndb")],))
+            for alias in aliases:
+                exact.setdefault(alias, set()).add(vid)
+            for variant in variants:
+                for depth in range(1, len(variant) + 1):
+                    tails.setdefault(variant[-depth:], set()).add(vid)
+
         selectors: dict[str, str] = {}
         for vid, record in records.items():
-            my_parts = components[vid]
-            if not my_parts:
-                selectors[vid] = record.target_id()
-                continue
-            chosen: str | None = None
-            for depth in range(1, len(my_parts) + 1):
-                suffix = my_parts[-depth:]
-                if not any(
-                    other_parts[-depth:] == suffix
-                    for other_vid, other_parts in components.items()
-                    if other_vid != vid and len(other_parts) >= depth
-                ):
-                    chosen = os.sep.join(suffix)
+            parts = paths[vid]
+            chosen = record.target_id()
+            for depth in range(1, len(parts) + 1):
+                candidate = os.sep.join(parts[-depth:])
+                normalized = candidate.strip()
+                if normalized in ("", "active"):
+                    continue
+                if normalized in identities:
+                    matches = {identities[normalized]}
+                else:
+                    matches = exact.get(normalized, set()) | tails.get(
+                        _path_components(normalized), set()
+                    )
+                if matches == {vid}:
+                    chosen = candidate
                     break
-            selectors[vid] = chosen or record.target_id()
+            selectors[vid] = chosen
         return selectors
 
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
@@ -762,13 +791,33 @@ class TargetManager:
                     return True
         return False
 
+    def _matching_records(
+        self, records: dict[str, TargetRecord], selector: str | None
+    ) -> list[TargetRecord]:
+        """The matching relation shared by listings and resolution.
+
+        A live full target_id outranks filename aliases, so the last-resort
+        selector remains usable even with a file named after another view's ID.
+        PinnedTarget retains its stricter identity-only semantics, including
+        when its view has disappeared.
+        """
+        candidate = str(selector).strip() if selector is not None else None
+        if not isinstance(selector, PinnedTarget):
+            for record in records.values():
+                if candidate == record.target_id():
+                    return [record]
+        return [
+            record for record in records.values()
+            if self._matches_record(record, selector)
+        ]
+
     def matches_target(self, target_id: str, selector: str | None) -> bool:
         """Whether ``selector`` names the record with ``target_id``. Locked."""
         with self._lock:
-            for record in self._records.values():
-                if record.target_id() == target_id:
-                    return self._matches_record(record, selector)
-        return False
+            return any(
+                record.target_id() == target_id
+                for record in self._matching_records(self._records, selector)
+            )
 
     def _default_view(self, targets: list[dict[str, Any]]):
         """The view a bare / empty / ``"active"`` selector means, decided from
@@ -957,11 +1006,7 @@ class TargetManager:
             return active, targets
 
         with self._lock:
-            matches: list[tuple[TargetRecord, Any]] = []
-            for record in self._records.values():
-                if not self._matches_record(record, selector):
-                    continue
-                matches.append((record, record.view))
+            matches = self._matching_records(self._records, selector)
 
         if not matches:
             raise RuntimeError(_format_unknown_target_error(selector, targets))
@@ -969,12 +1014,12 @@ class TargetManager:
             selectors_by_view = {t["view_id"]: t["selector"] for t in targets}
             candidates = ", ".join(
                 selectors_by_view.get(record.view_id, record.target_id())
-                for record, _ in matches
+                for record in matches
             )
             raise RuntimeError(
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
             )
-        return matches[0][1], targets
+        return matches[0].view, targets
 
     def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
         """Gate a destructive op that named no target, and pin what it may act on.
@@ -1145,8 +1190,8 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         # Default: a request whose envelope never parsed stamps the idle clock,
         # so an unreadable request can never be treated as a free probe (#756).
         idle_probe = False
-        # Idle-reaper accounting: count EVERY non-empty request as in-flight from
-        # here through the response write (leave_request runs in the finally, after
+        # Idle-reaper and stop-drain accounting: count EVERY non-empty request
+        # through the response write (leave_request runs in the finally, after
         # the write), so the bridge is never deemed idle mid-response -- including
         # for malformed requests, which get an error response but no dispatch. The
         # getattr fallbacks keep the SimpleNamespace test fakes (and a GUI server
@@ -1155,15 +1200,10 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         enter_request = getattr(bridge, "_enter_request", None)
         leave_request = getattr(bridge, "_leave_request", None)
         counted = enter_request is not None
-        admitted = enter_request() if counted else True
+        admitted = enter_request(self.server) if counted else True
         try:
             if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
                 response = _json_response(ok=False, error="request too large")
-            elif not admitted:
-                # The idle reaper latched shutdown between accept and admission --
-                # refuse cleanly instead of starting work into a process that is
-                # about to exit (#637 review).
-                response = _json_response(ok=False, error="bridge is shutting down")
             else:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
@@ -1188,7 +1228,10 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                         idle_probe = payload.get("idle_probe") is True
                         expected_identity = getattr(bridge, "bridge_identity", None)
                         actual_identity = payload.get("_bridge_identity")
-                        if (
+                        if not admitted:
+                            response = _json_response(
+                                ok=False, error="bridge is shutting down")
+                        elif (
                             expected_identity is not None
                             and actual_identity != expected_identity
                         ):
@@ -1401,6 +1444,8 @@ class BinaryNinjaBridge:
         # while releasing _target_lock between chunks so reads stay responsive.
         self._write_gate = threading.Lock()
         self._request_state_lock = threading.Lock()
+        self._requests_drained = threading.Condition(self._request_state_lock)
+        self._request_threads: dict[threading.Thread, int] = {}
         self._active_requests: set[str] = set()
         self._cancelled_requests: set[str] = set()
         self._shutdown_event = threading.Event()
@@ -1409,8 +1454,8 @@ class BinaryNinjaBridge:
         # and lowered only after the response is written, independent of the client
         # request id -- so idle is never miscounted mid-response or for id-less
         # requests. `_last_activity` (monotonic) is stamped when a request finishes.
-        # `_shutting_down` latches when the reaper decides to stop, so admission and
-        # the idle->shutdown decision are mutually exclusive under _request_state_lock.
+        # `_shutting_down` latches on explicit stop as well as idle expiry;
+        # admission and either shutdown decision share _request_state_lock.
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
@@ -1542,6 +1587,8 @@ class BinaryNinjaBridge:
             # socket file the rollback already removed, and the registry and the log
             # belong to the spawn.
             self._instance_state_released = False
+            with self._request_state_lock:
+                self._shutting_down = False
             # #612: tighten the freshly-bound socket to owner-only. Even with the
             # peercred check this is defense-in-depth (a wrong-uid peer can't even
             # connect() to a 0o600 socket owned by us). Best-effort-with-warning: a
@@ -1595,36 +1642,77 @@ class BinaryNinjaBridge:
             raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
-    def stop(self, *, load_join_timeout: float = 2.0):
-        # Latch teardown and refuse every not-yet-started load job under ONE hold
-        # of _teardown_lock (#694). Holding it across both halves is what closes
-        # the interleaving: a worker checks the latch and performs its
-        # queued->running transition under the same lock, so it can only observe
-        # "not stopped" while this hold has not happened yet -- it can never slip
-        # between the latch and the refusal and start a load into a dying process.
-        # Lock order everywhere is teardown -> load-jobs.
+    def stop(
+        self, *, load_join_timeout: float = 2.0, request_drain_timeout: float = 2.0
+    ) -> dict[str, Any]:
+        """Stop admission, drain received requests, then release this bind.
+
+        The request budget is shared by all handlers and includes response writes.
+        Zero skips the drain for emergency teardown; zero both timeouts to skip
+        load-worker joins too. A request calling stop cannot wait for itself:
+        it remains explicitly unfinished in the returned verdict.
+        """
+        main_thread_stop = ui is not None and is_main_thread()
+        if main_thread_stop:
+            # GUI handlers and load workers can be waiting for this very thread.
+            # Never wait for them here; report the skipped drain, not a timeout.
+            request_drain_timeout = 0
+            load_join_timeout = 0
+        deadline = time.monotonic() + max(0.0, request_drain_timeout)
+        with self._requests_drained:
+            self._shutting_down = True
+        # Lock order remains teardown -> load-jobs (#694). Do not hold either
+        # lock while draining: an admitted handler may need them to finish.
         with self._teardown_lock:
             self._stopped = True
             self._refuse_queued_load_jobs_locked()
-            # Take our discovery files away HERE -- before anything releases our
-            # bind -- so a stale stop cannot unlink a successor's (#799).
-            self._release_own_instance_state_locked()
-        # Only now release the bind. Nothing below this line unlinks anything.
-        # `_server` is cleared here too, so a repeat stop() cannot reach a live
-        # server -- the one-shot above is already spent by then.
-        server, self._server = self._server, None
+            server = self._server
+        # Stop accepting connections, but retain the bind and discovery files
+        # throughout the drain. Already accepted readers will refuse new work.
         if server is not None:
             with contextlib.suppress(Exception):
                 server.shutdown()
+        with self._requests_drained:
+            own_requests = self._request_threads.get(threading.current_thread(), 0)
+            while self._inflight > own_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._requests_drained.wait(remaining)
+            verdict = {
+                "requests_drained": self._inflight == 0,
+                "unfinished_requests": self._inflight,
+                "request_drain_timed_out": (
+                    self._inflight > own_requests and not main_thread_stop
+                ),
+                "caller_inflight": own_requests > 0,
+            }
+            if main_thread_stop:
+                verdict["request_drain_skipped"] = "gui_main_thread"
+        if not verdict["requests_drained"]:
+            with contextlib.suppress(Exception):
+                bn.log_warn(
+                    "BN Agent Bridge stopping with unfinished requests: "
+                    f"{json.dumps(verdict, sort_keys=True)}"
+                )
+        with self._teardown_lock:
+            # A concurrent zero-budget stop may already have released this bind.
+            # Never let a late drainer touch a successor's files (#799).
+            if self._server is server:
+                self._release_own_instance_state_locked()
+                self._server = None
+            else:
+                server = None
+        # Unlink BEFORE releasing the bind. Nothing below unlinks any path.
+        if server is not None:
             with contextlib.suppress(Exception):
                 server.server_close()
-        # Join what can be joined. A load already inside
-        # update_analysis_and_wait() is not interruptible, so the latch -- not
-        # this join -- is what makes teardown final; the join just gives a
-        # nearly-done worker the chance to finish before the files disappear.
+        # Loads already inside analysis cannot be interrupted. The latch, not
+        # these joins, prevents a late worker from republishing discovery files.
         for thread in self._load_worker_threads():
             with contextlib.suppress(RuntimeError):
                 thread.join(timeout=load_join_timeout)
+        return verdict
 
     def _release_own_instance_state_locked(self):
         """Remove this bridge's discovery files. Caller MUST hold _teardown_lock.
@@ -1756,6 +1844,7 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "gui": ui is not None,
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,
@@ -1904,19 +1993,19 @@ class BinaryNinjaBridge:
             self._active_requests.discard(request_id)
             self._cancelled_requests.discard(request_id)
 
-    def _enter_request(self) -> bool:
-        """Count a received request as in-flight (for the idle reaper) and report
-        whether real work may be dispatched. ALWAYS increments _inflight -- even for
-        a malformed request or one arriving after shutdown latched -- so every
-        response, error responses included, is covered through its write and every
-        request resets the idle clock. Must ALWAYS be balanced by _leave_request().
-        Returns False when the reaper has already latched shutdown: the caller must
-        not dispatch, but must still write its (refusal) response and leave. Raising
-        _inflight under the same lock the reaper checks makes counting and the
-        idle->shutdown decision mutually exclusive (closes the check-then-set race)."""
+    def _enter_request(self, server: ThreadedUnixServer | None = None) -> bool:
+        """Count a received request for idle reaping and bounded stop draining.
+
+        ALWAYS increments, including malformed/refused requests, until the
+        response write completes. False means shutdown has latched or the request
+        belongs to a retired listener: write the refusal, then balance accounting.
+        """
         with self._request_state_lock:
             self._inflight += 1
-            return not self._shutting_down
+            thread = threading.current_thread()
+            self._request_threads[thread] = self._request_threads.get(thread, 0) + 1
+            return (not self._shutting_down
+                    and (server is None or server is self._server))
 
     def _leave_request(self, *, stamp_activity: bool = True) -> None:
         """Balance a prior _enter_request and stamp the idle clock. Called only after
@@ -1940,6 +2029,13 @@ class BinaryNinjaBridge:
         with self._request_state_lock:
             if self._inflight > 0:
                 self._inflight -= 1
+            thread = threading.current_thread()
+            count = self._request_threads.get(thread, 0)
+            if count <= 1:
+                self._request_threads.pop(thread, None)
+            else:
+                self._request_threads[thread] = count - 1
+            self._requests_drained.notify_all()
             if stamp_activity:
                 self._last_activity = time.monotonic()
 
@@ -3745,6 +3841,8 @@ class BinaryNinjaBridge:
                 result = {"kind": "go_rename", "success": True, "committed": False,
                           "preview": preview, "results": [],
                           "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                          "go_verified_count": 0, "go_committed_count": 0,
+                          "go_failed_count": 0,
                           "defined_count": recovered.get("defined_count", 0)}
                 return _disclose_go_rename_skips(
                     result,
@@ -4481,6 +4579,13 @@ def _bind_refresh(bridge, params, target):  # only the write gate so reads stay 
 
 @op("shutdown", lock="none")
 def _bind_shutdown(bridge, params, target):
+    if ui is not None:
+        raise RuntimeError(
+            "GUI bridges cannot shut down the Binary Ninja process via RPC; "
+            "use the GUI Restart Bridge command or close Binary Ninja"
+        )
+    with bridge._request_state_lock:
+        bridge._shutting_down = True
     bridge._shutdown_event.set()
     return {"shutting_down": True}
 

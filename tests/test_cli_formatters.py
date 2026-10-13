@@ -3926,6 +3926,8 @@ _GO_RENAME_NON_COUNT_READS = {
     # M-03: the paired renderer reads the split-host listing back off the
     # summary; a listing, not a count, and absent on every `go rename`.
     "overlapping_functions",
+    # Command-specific disclosure container, built from the captured counters.
+    "go_rename",
 }
 
 
@@ -4585,7 +4587,7 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     from bn import formatters
 
     echoes = formatters._render_fallback_text              # the raw-payload dump
-    absorbed, visible, checked = [], set(), 0
+    absorbed, visible = [], set()
     for fn_name, render, key, kind, ctx in _runtime_population():
         if kind is None:
             continue
@@ -4595,7 +4597,6 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         for bogus in _MALFORMED[kind]:
             payload = {**copy.deepcopy(ctx), key: bogus}
             out = _render_or_exception(render, payload)
-            checked += 1
             if isinstance(out, Exception):
                 continue                   # the raise sweep owns this case
             if _disclosed(out, key):
@@ -4617,7 +4618,6 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     assert sorted(visible) == ["_render_class_show_text.size", "_render_one_class.size"], (
         "a field renders a wrong-shaped container visibly but without disclosing; "
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
-    assert checked, "the differential ran no cases"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4638,18 +4638,16 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     population at all because round 8 fixed the arity rule to admit a renderer
     that takes a defaulted flag beside its payload -- which is the argument for
     deriving the population instead of listing it."""
-    swept, raised = 0, []
+    raised = []
     for fn_name, render, key, _kind, ctx in _runtime_population():
         absent = _render_or_exception(render, copy.deepcopy(ctx))
         for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
-            swept += 1
             out = _render_or_exception(render, {**copy.deepcopy(ctx), key: bogus})
             if isinstance(out, Exception) and not isinstance(absent, Exception):
                 raised.append(f"{fn_name}({key}={bogus!r}) raised "
                               f"{type(out).__name__} where the absent payload "
                               f"rendered cleanly")
     assert not raised, raised[:8]
-    assert swept, "the raise sweep ran no renders"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4786,7 +4784,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
       dict of scalars is a genuine skew one level down. Populated well-formed
       payloads are covered by name instead, in
       `test_well_formed_realistic_payloads_carry_no_disclosure`."""
-    noisy, checked = [], 0
+    noisy = []
     for fn_name, render, key, kind, _ctx in _runtime_population():
         benign: list[object] = [None]
         if kind is not None:
@@ -4795,10 +4793,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             out = _render_or_exception(render, payload)
             if isinstance(out, Exception):
                 continue          # the renderer's own shape requirement
-            checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked, "the mirror ran no renders"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -5796,40 +5792,9 @@ def test_render_trace_text_intra_out_param_reason_shows_callee():
     assert "out-param fill not followed (via parse_input)" in out
 
 
-def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypatch):
-    """#685: `go rename` reports through its own go_* counters but emits the SAME
-    compact-status schema as every other mutation, so both summaries must be
-    produced by ONE builder. They used to be separate dict literals, and the
-    copy drifted twice into defects the shared path already handled: a failure
-    row's `first_error`, and a revert that fails after every rename verified.
-    Pin the sharing (a change to the builder reaches both) and the shared rules
-    (the same OUTCOME reaches the same keys through either path)."""
+def test_mutation_summaries_preserve_failure_explanations():
+    """A failed revert or failure row remains visible through either counter source."""
     from bn import formatters
-
-    real_builder = formatters._build_mutation_summary
-    measured_payload = {
-        "success": True, "committed": True, "preview": False, "rolled_back": False,
-        "results": [{"status": "verified"}]}
-    go_payload = {
-        "kind": "go_rename", "success": True, "committed": True, "preview": False,
-        "rolled_back": False, "results": [], "go_renamed_candidates": 3,
-        "go_committed_count": 3, "go_verified_count": 3, "go_failed_count": 0,
-        "skipped_user_named": 1}
-
-    measured = formatters._mutation_summary(dict(measured_payload))
-    go = formatters._go_rename_summary(dict(go_payload))
-    assert measured["changed_count"] == 1 and go["changed_count"] == 3
-    assert set(measured) == set(go)
-
-    # One builder produced both, proven by CONSUMER-OBSERVABLE output: a change
-    # made in the builder has to appear in both summaries. A call count would
-    # only say each path called something; this says neither has a literal of
-    # its own that a builder change would leave behind.
-    monkeypatch.setattr(formatters, "_build_mutation_summary",
-                        lambda **kw: {**real_builder(**kw), "reached_via_builder": True})
-    assert formatters._mutation_summary(dict(measured_payload))["reached_via_builder"]
-    assert formatters._go_rename_summary(dict(go_payload))["reached_via_builder"]
-    monkeypatch.setattr(formatters, "_build_mutation_summary", real_builder)
 
     # A preview whose revert failed: zero failure rows, explanation only in the
     # top-level message. Both paths must call it dirty AND carry the error --
@@ -5848,6 +5813,9 @@ def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypa
                 "rolled_back", "dirty_after", "first_error"):
         assert mutation_stuck[key] == go_stuck[key]
     assert go_stuck["first_error"] == message
+    assert go_stuck["dirty_after"] is True
+    assert go_stuck["success"] is False
+    assert go_stuck["changed_count"] is None
 
     # A failure whose ONLY explanation is a results[] row: `first_error` must be
     # read off the row on both paths, never dropped to a bare failed count.

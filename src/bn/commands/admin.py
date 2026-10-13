@@ -814,6 +814,7 @@ def _session_stop(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         discarded = _unsaved_targets_or_refuse("stop", target_id, rows, discard=discard)
+    _require_headless_lifecycle(inst)
     # One verified pin for the whole escalation, opened BEFORE the graceful
     # shutdown so the process this command may later signal is pinned throughout
     # (#694): the pid cannot be recycled while pinned, and both SIGTERM and
@@ -948,6 +949,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     # process is stopped: the reload below reopens each target from disk, so
     # anything not saved is gone.
     discarded = _unsaved_targets_or_refuse("restart", target_id, rows, discard=discard)
+    _require_headless_lifecycle(inst)
 
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
@@ -1042,6 +1044,20 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["discarded_unsaved"] = discarded
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures or association_error or reload_capture_failed else 0
+
+
+def _require_headless_lifecycle(inst: Any) -> None:
+    # The legacy default registry has no instance ID. New registries also
+    # declare GUI ownership explicitly, including named embedded bridges.
+    if inst is not None and (
+        inst.instance_id is None
+        or (isinstance(inst.meta, dict) and inst.meta.get("gui") is True)
+    ):
+        raise BridgeError(
+            "session stop/restart is only supported for headless sessions; "
+            "use the GUI Restart Bridge command or close Binary Ninja. "
+            "No shutdown request or process signal was sent."
+        )
 
 
 def _require_signal_delivered(reason: str | None, target_id: str) -> None:

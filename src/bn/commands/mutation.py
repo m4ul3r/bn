@@ -28,13 +28,13 @@ _RENAME_ARGS = [
          target=True, fmt="json", args=_RENAME_ARGS)
 @command("symbol", "rename", help="Rename a symbol", target=True, fmt="json", args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
-    # An empty/whitespace-only name is not a usable identifier; reject it before
-    # any op is sent rather than letting the bridge "verify" a degenerate
-    # unnamed function (#363). The bridge enforces the same contract for batch /
-    # raw-socket callers.
+    # Refuse empty names and actual controls before sending any op (#363/#923).
+    # Printable punctuation, including literal quote characters, is a name.
     with _mutation_preflight(args):
         if not args.new_name.strip():
             raise BridgeError("new name must be non-empty")
+        if any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in args.new_name):
+            raise BridgeError("new name must not contain control characters")
     return _mutate(
         args,
         "rename_symbol",
