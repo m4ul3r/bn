@@ -3520,6 +3520,32 @@ class TestStructLayoutAssistance903:
             assert any("struct layout candidate" in w for w in restored["warnings"]), (
                 name, restored)
 
+        # Redeclaring an embedded type can leave the outer struct's stored
+        # width stale. That unobserved tail must not drop an otherwise
+        # identical competitor and so fabricate cfg's uniqueness.
+        shared_bn.json(
+            "types", "declare",
+            "struct ext { uint32_t a; }; "
+            "struct so_cfg { char pad[40]; uint64_t flags; uint32_t depth; struct ext tail; };")
+        fresh = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in fresh["warnings"]), fresh
+        shared_bn.json(
+            "types", "declare", "struct ext { uint32_t a, b, c, d; };")
+        stale = shared_bn.json(
+            "py", "exec",
+            "t = bv.get_type_by_name('so_cfg')\n"
+            "result = [t.width, max(m.offset + m.type.width for m in t.members)]\n")["result"]
+        assert stale[1] > stale[0], stale
+        grown = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in grown["warnings"]), grown
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('so_cfg')\n"
+            "bv.undefine_user_type('ext')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
+
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
         typed = shared_bn.json("decompile", "handle")

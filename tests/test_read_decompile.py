@@ -1138,7 +1138,9 @@ def test_decompile_struct_assist_witness_and_no_mutation(monkeypatch):
     # These are the actionable evidence, not a pin of the explanatory prose.
     for evidence in ("cfg", "c", "+0x28/8", "flags", "+0x30/4", "depth",
                      "bn struct show cfg", "bn proto get 0x401000",
-                     "bn proto set 0x401000", "struct cfg *"):
+                     "bn proto set 0x401000", "struct cfg *",
+                     # Excluded alternatives are disclosed, not claimed ruled out.
+                     "nested struct, union, array or base class"):
         assert evidence in hint
     assert "(char*)c + 0x28" in result["text"]
     assert fn.type is before_type and var.type is before_pointer
@@ -1391,6 +1393,7 @@ def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
     ("unobserved-bitfield", 1), ("class-competitor", 0), ("sole-class", 0),
     ("flexible-tail-competitor", 0), ("unresolved-tail-competitor", 0),
     ("zero-width-before-access", 0), ("own-flexible-tail", 1),
+    ("overrun-competitor", 0), ("sole-overrun", 0),
 ])
 def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
     bv, fn, _, _ = _struct_assist_case()
@@ -1425,6 +1428,13 @@ def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case,
     elif case == "unresolved-tail-competitor":
         other.members.append(_FakeMember(0x38, "ext", _FakeType(
             "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case in {"overrun-competitor", "sole-overrun"}:
+        # A redeclared embedded type can outgrow the outer struct's stored
+        # width; the unobserved stale tail must not drop the competitor.
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "struct ext", width=16, type_class="StructureTypeClass")))
+        if case == "sole-overrun":
+            del bv.types["cfg"]
     elif case == "zero-width-before-access":
         # An unknown-width member may extend over every later byte.
         other.members.insert(0, _FakeMember(0x20, "ext", _FakeType(
