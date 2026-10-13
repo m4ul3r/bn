@@ -1544,14 +1544,14 @@ class BridgeContext:
             addr += 2 * self._pointer_size(bv)
         out = []
         getter = getattr(bv, "get_data_refs", None)
-        # VTT entries are address-point pointers, not object instances. BN
-        # sometimes leaves a symbolized VTT untyped: then follow its contiguous
-        # ABI entries, stopping at the next named object or a non-vtable word.
+        # ABI entries are not instances, but only a proven object width owns
+        # their interior. Consecutive vptrs (even before the next symbol) cannot
+        # distinguish an untyped VTT from an unnamed neighboring object.
         abi_ranges = []
+        unknown_abi_extent = False
         data_var_at = getattr(bv, "get_data_var_at", None)
-        symbols = list(bv.get_symbols())
         ptr = self._pointer_size(bv)
-        for symbol in symbols:
+        for symbol in bv.get_symbols():
             raw = str(getattr(symbol, "raw_name", "") or "")
             short = str(getattr(symbol, "short_name", "") or "")
             if not (raw.startswith(("_ZTT", "_ZTC"))
@@ -1561,16 +1561,8 @@ class BridgeContext:
             var = data_var_at(start) if callable(data_var_at) else None
             width = int(getattr(getattr(var, "type", None), "width", 0) or 0)
             end = start + max(width, ptr)
-            if not width and (raw.startswith("_ZTT") or short.startswith("VTT for ")):
-                boundary = min((int(s.address) for s in symbols if int(s.address) > start),
-                               default=end)
-                end = start
-                while end < boundary:
-                    point = self._read_pointer_value(bv, end, size=ptr)
-                    ti = self._read_pointer_value(bv, point - ptr, size=ptr) if point else None
-                    if not ti or self._typeinfo_name_at(bv, ti) is None:
-                        break
-                    end += ptr
+            if not width:
+                unknown_abi_extent = True
             abi_ranges.append((start, end))
         for ref in (getter(addr) if callable(getter) else []):
             if any(start <= int(ref) < end for start, end in abi_ranges):
@@ -1580,6 +1572,13 @@ class BridgeContext:
                 "symbol": str(getattr(sym, "short_name", "") or getattr(sym, "name", "")) if sym else None,
                 "address": hex(int(ref)),
             })
+        if out and unknown_abi_extent:
+            note = ("stored-global references may include entries of untyped VTT or "
+                    "construction-table objects; their extent is unknown, so totals "
+                    "count references, not proven instances")
+            notes = record.setdefault("notes", [])
+            if note not in notes:
+                notes.append(note)
         return out
 
     def _ctor_construction_sites(self, bv, record, *, cap=None):

@@ -1860,8 +1860,9 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
-    """Best-effort: where objects of this class are constructed and which
-    globals hold one. Empty (not an error) when nothing is found.
+    """Best-effort constructor sites and global address-point references.
+    Untyped ABI containers can leave ambiguous references (disclosed in notes);
+    stored-global totals count references, not proven object instances.
 
     ``cap`` bounds each LISTING only (#822: the same shape as the vtable cap),
     so the result also reports what the cap hid: ``*_total`` is the exact number

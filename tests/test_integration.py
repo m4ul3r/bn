@@ -3496,7 +3496,7 @@ int main(int argc, char **) {
             assert card["vtable"]["slots"] == [], card
             assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card
 
-    def test_typeinfo_backwalk_does_not_turn_vtt_entries_into_instances_945(self, shared_bn, tmp_path):
+    def test_typeinfo_backwalk_excludes_only_proven_vtt_extent_945(self, shared_bn, tmp_path):
         source = tmp_path / "vtt.cpp"
         source.write_text("""
 struct V { virtual int v() { return 1; } };
@@ -3521,7 +3521,13 @@ int main() { return global_b.b(); }
             "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
             "var = bv.get_data_var_at(vtt.address)\n"
             "point = int(card['vtable']['address'], 16) + 2 * bv.address_size\n"
-            "result = {'card': card, 'vtt': hex(vtt.address),\n"
+            "import binaryninja as bn\n"
+            "bv.define_user_data_var(vtt.address, bn.Type.array(\n"
+            "    bn.Type.pointer(bv.arch, bn.Type.void()), 2))\n"
+            "typed_record = read_class._build_class_registry(ctx, bv)['B']\n"
+            "typed_record['vtable'] = None\n"
+            "typed = read_class._enrich(ctx, bv, typed_record)\n"
+            "result = {'card': card, 'typed': typed, 'vtt': hex(vtt.address),\n"
             "    'width': var.type.width if var else None,\n"
             "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
             "-t", target,
@@ -3529,7 +3535,61 @@ int main() { return global_b.b(); }
         assert result["card"]["vtable"]["typeinfo_backwalk"] is True, result
         assert result["card"]["vtable"]["slots"], result
         assert result["vtt"] in result["refs"], result
-        assert result["card"]["instances"]["stored_globals"] == [], result
+        assert result["width"] is None, result
+        assert [ref["address"] for ref in result["card"]["instances"]["stored_globals"]] == [
+            ref for ref in result["refs"] if ref != result["vtt"]]
+        assert any("extent is unknown" in note for note in result["card"]["notes"])
+        assert result["typed"]["instances"]["stored_globals"] == [], result
+
+    def test_untyped_vtt_preserves_native_unnamed_neighbor_945(self, shared_bn, tmp_path):
+        source = tmp_path / "boundary.cpp"
+        source.write_text("""
+struct V { virtual int v() { return 1; } };
+struct B : virtual V { virtual int b() { return 2; } };
+B global_b;
+struct R { long x = 42; virtual int r() { return 3; } };
+R global_r;
+int main() { return global_b.b() + global_r.r(); }
+""")
+        layout = tmp_path / "boundary.ld"
+        layout.write_text(
+            "SECTIONS { .boundary : { *(.data.rel.ro.local._ZTT1B) "
+            "*(.data.rel.local.global_r) } } INSERT BEFORE .data;\n")
+        named = tmp_path / "boundary"
+        unnamed = tmp_path / "boundary-unnamed"
+        build = subprocess.run(
+            ["c++", "-O0", "-fdata-sections", f"-Wl,-T,{layout}",
+             "-o", str(named), str(source)], capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        stripped = subprocess.run(
+            ["objcopy", "--strip-symbol=global_r", str(named), str(unnamed)],
+            capture_output=True, text=True,
+        )
+        assert stripped.returncode == 0, stripped.stderr
+        cards = []
+        for binary in (named, unnamed):
+            target = shared_bn.load(binary)
+            card = shared_bn.json("class", "show", "R", "-t", target)
+            cards.append(card)
+            raw = shared_bn.json(
+                "py", "exec",
+                "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
+                "point = bv.read_int(vtt.address + 2*bv.address_size, bv.address_size, False)\n"
+                "var = bv.get_data_var_at(vtt.address)\n"
+                "result = {'neighbor': hex(vtt.address + 2*bv.address_size),\n"
+                "    'width': var.type.width if var else None,\n"
+                "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
+                "-t", target,
+            )["result"]
+            assert raw["width"] is None, raw
+            assert raw["neighbor"] in raw["refs"], raw
+            assert card["instances"]["stored_globals_total"] == 1, card
+            assert card["instances"]["stored_globals"][0]["address"] == raw["neighbor"], card
+            assert any("extent is unknown" in note for note in card["notes"])
+        assert cards[0]["vtable"] == cards[1]["vtable"]
+        assert cards[0]["instances"]["stored_globals"][0]["symbol"] == "global_r"
+        assert cards[1]["instances"]["stored_globals"][0]["symbol"] is None
 
 
 class TestStructLayoutAssistance903:
