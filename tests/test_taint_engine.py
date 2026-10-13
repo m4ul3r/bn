@@ -12302,3 +12302,247 @@ def test_nonlocal_scalar_struct_read_passes_canonical_geometry(member, width):
         assert any(leaf["kind"] == "field_load_unresolved"
                    and leaf["offset"] == (hex(member) if member is not None else None)
                    and leaf["width"] == width for leaf in result["leaves"])
+
+
+def _member_store(pg, address, member, value, *, struct=True, reads=()):
+    dest = address if struct else _plus(address, _region_const(member))
+    if not struct:
+        dest.vars_read = list(te.expr_reads(address))
+    writer = pg.store(dest, value, reads=reads)
+    writer.size = 8
+    if struct:
+        writer.operation, writer.offset = FOp("MLIL_STORE_STRUCT_SSA"), member
+    return writer
+
+
+def _member_load(address, member, memory, *, struct=True):
+    src = address if struct else _plus(address, _region_const(member))
+    reads = list(te.expr_reads(address))
+    if not struct:
+        src.vars_read = reads
+    load = FExpr("MLIL_LOAD_STRUCT_SSA" if struct else "MLIL_LOAD_SSA",
+                 "member read", src=src, reads=reads, src_memory=memory)
+    load.size = 8
+    if struct:
+        load.offset = member
+    return load
+
+
+@pytest.mark.parametrize("store_struct,load_struct", [(False, False), (False, True),
+                                                      (True, False), (True, True)])
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("stored,loaded", [(0, 0), (0, 8), (8, 0), (8, 8)])
+def test_nonlocal_reaching_writer_and_read_share_effective_geometry(
+        store_struct, load_struct, copied, stored, loaded):
+    pointer = FVar("pointer", ident=101)
+    pointer0 = FSSA(pointer, 0)
+    pg = _BufProgram(params=[pointer])
+    address = FExpr("MLIL_VAR_SSA", "pointer", reads=[pointer0])
+    if copied:
+        copy = FSSA(FVar("copy"), 1)
+        _set(pg, copy, "copy pointer", address, reads=[pointer0])
+        address = FExpr("MLIL_VAR_SSA", "copy", reads=[copy])
+    _member_store(pg, address, stored, _region_const(64), struct=store_struct)
+    load = _member_load(address, loaded, pg.mem, struct=load_struct)
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member", load, reads=te.expr_reads(address))
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, _ = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (stored == loaded)
+    if stored == loaded:
+        assert result["slices"][0]["origin"]["kind"] == "constant"
+        assert result["slices"][0]["origin"]["value"] == 64
+    else:
+        assert any(leaf["kind"] == "field_load_unresolved"
+                   and leaf["offset"] == hex(loaded) and leaf["width"] == 8
+                   for leaf in result["leaves"])
+
+
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("with_caller", [False, True])
+def test_disjoint_struct_store_retains_earlier_source_and_caller(copied, with_caller):
+    pointer, source = FVar("pointer", ident=102), FVar("source", ident=103)
+    pointer0, source0 = FSSA(pointer, 0), FSSA(source, 0)
+    pg = _BufProgram(name="run", params=[pointer, source])
+    address = FExpr("MLIL_VAR_SSA", "pointer", reads=[pointer0])
+    if copied:
+        copy = FSSA(FVar("copy"), 1)
+        _set(pg, copy, "copy pointer", address, reads=[pointer0])
+        address = FExpr("MLIL_VAR_SSA", "copy", reads=[copy])
+    _member_store(pg, address, 0, FExpr("MLIL_VAR_SSA", "source", reads=[source0]),
+                  reads=[source0])
+    _member_store(pg, address, 8, _region_const(1))
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member", _member_load(address, 0, pg.mem),
+         reads=te.expr_reads(address))
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    function = pg.func()
+    if with_caller:
+        outer = FVar("outer", ident=104)
+        outer0 = FSSA(outer, 0)
+        caller = _BufProgram(name="main", params=[outer])
+        caller._addr = 0x100
+        site = caller.call(_B_RUN, [_cstr(0x900),
+                                   FExpr("MLIL_VAR_SSA", "outer", reads=[outer0])], reads=[outer0])
+        function.caller_sites = [FSite(caller.func(), site.address)]
+    result, _, _ = _bw(function, sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert result["slices"][0]["origin"]["kind"] == "parameter"
+    assert result["slices"][0]["origin"]["var"] == ("outer#0" if with_caller else "source#0")
+    assert result["slices"][0].get("crossed_functions", []) == (["run"] if with_caller else [])
+
+
+@pytest.mark.parametrize("store_struct,load_struct", [(False, False), (False, True),
+                                                      (True, False), (True, True)])
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("later_member", [0, 8, None])
+def test_forward_disjoint_or_unknown_struct_write_cannot_hide_tainted_member(
+        store_struct, load_struct, copied, later_member):
+    pointer, source = FVar("pointer", ident=105), FVar("source", ident=106)
+    pointer0, source0 = FSSA(pointer, 0), FSSA(source, 0)
+    pg = _BufProgram(params=[pointer, source])
+    address = FExpr("MLIL_VAR_SSA", "pointer", reads=[pointer0])
+    if copied:
+        copy = FSSA(FVar("copy"), 1)
+        _set(pg, copy, "copy pointer", address, reads=[pointer0])
+        address = FExpr("MLIL_VAR_SSA", "copy", reads=[copy])
+    _member_store(pg, address, 0, FExpr("MLIL_VAR_SSA", "source", reads=[source0]),
+                  struct=store_struct, reads=[source0])
+    _member_store(pg, address, later_member, _region_const(1),
+                  struct=True if later_member is None else store_struct)
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member", _member_load(address, 0, pg.mem, struct=load_struct),
+         reads=te.expr_reads(address))
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).forward(
+        pg.func(), [te.parse_locator("param:1")])
+    assert any(sink["sink"]["callee"] == "memcpy" for sink in result["reached_sinks"]) is (
+        later_member != 0)
+
+
+@pytest.mark.parametrize("later_member", [0, 8])
+def test_forward_named_member_write_read_geometry_preserves_possible_source(later_member):
+    source = FVar("source", ident=107)
+    source0 = FSSA(source, 0)
+    obj, pg = FVar("object", typ="char[16]"), _BufProgram(params=[source])
+    writer = pg.aliased_store(obj, 0, 0)
+    writer.src = FExpr("MLIL_VAR_SSA", "source", reads=[source0])
+    writer.vars_read, writer.size = [source0], 8
+    pg.aliased_store(obj, later_member, 1).size = 8
+    load = FExpr("MLIL_VAR_ALIASED_FIELD", "named member",
+                 src=FSSA(obj, pg.mem), src_memory=pg.mem)
+    load.offset, load.size = 0, 8
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = member", load, reads=[FSSA(obj, pg.mem)])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).forward(
+        pg.func(), [te.parse_locator("param:0")])
+    assert any(sink["sink"]["callee"] == "memcpy" for sink in result["reached_sinks"]) is (
+        later_member != 0)
+
+
+@pytest.mark.parametrize("member,repoints", [(0, False), (8, True), (12, True), (16, False)])
+def test_struct_pointer_slot_keys_and_repointing_share_member_geometry(member, repoints):
+    pg = _BufProgram()
+    address = _cstr(0x800)
+    load = _member_load(address, 8, 0)
+    writer = _member_store(pg, address, member, _cstr(0x900))
+    if member == 12:
+        writer.size = 4  # partial overwrite of the eight-byte pointer slot
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    ssaf = pg.func().mlil.ssa_form
+    key = engine._buffer_slot_key(ssaf, load)
+    assert key == (("gconst", 0x800), 8)
+    assert engine._store_to_slot_between(ssaf, pg.instrs, key, -1, 2) is repoints
+    assert engine._addr_base_offset(ssaf, load) == (("gload", 0x808), 0)
+
+
+@pytest.mark.parametrize("member,repoints", [(0, True), (4, True), (8, False), (16, False)])
+def test_struct_global_context_pointer_repointing_uses_effective_range(member, repoints):
+    pg = _BufProgram()
+    writer = _member_store(pg, _cstr(0x800), member, _cstr(0x900))
+    if member == 4:
+        writer.size = 4
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    ssaf = pg.func().mlil.ssa_form
+    key = (("gload", 0x800), 16)
+    assert engine._store_to_slot_between(ssaf, pg.instrs, key, -1, 2) is repoints
+
+
+@pytest.mark.parametrize("read_member", [0, 8])
+def test_forward_descriptor_struct_member_keys_do_not_collapse_fields(read_member):
+    source, array, index = FVar("source", ident=108), FVar("array", ident=109), FVar("index", ident=110)
+    source0, index0 = FSSA(source, 0), FSSA(index, 0)
+    pg = _BufProgram(params=[source, index])
+    pointer = FSSA(FVar("pointer"), 1)
+    _set(pg, pointer, "pointer = &array", _addr_of(array))
+    address = _elem_addr(pointer, index0, 0)
+    _member_store(pg, address, 0, FExpr("MLIL_VAR_SSA", "source", reads=[source0]),
+                  reads=[source0])
+    _member_store(pg, address, 8, _region_const(1))
+    value = FSSA(FVar("value"), 1)
+    load = _member_load(address, read_member, pg.mem)
+    _set(pg, value, "value = array member", load, reads=[pointer, index0])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).forward(
+        pg.func(), [te.parse_locator("param:0")])
+    assert any(sink["sink"]["callee"] == "memcpy" for sink in result["reached_sinks"]) is (
+        read_member == 0)
+
+
+def test_unknown_named_member_write_retains_provenance_without_nul_certainty():
+    obj, pg = FVar("object", typ="char[64]"), _BufProgram()
+    writer = pg.aliased_store(obj, 0, 0)
+    writer.offset, writer.size = None, 1
+    pg.sink(obj, folded=True)
+    result, reasons, aol = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert aol
+    assert any("store into local buffer object" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("store_member", [None, _OFF, _OFF + 16])
+def test_forward_struct_pointer_slot_correlation_uses_shared_geometry(models, store_member):
+    function = _slot_recv_func(intervening_store=store_member is not None)
+    instructions = function.mlil.ssa_form.instructions
+    for instruction in instructions:
+        if instruction.instr_index in (1, 5):
+            load = instruction.src
+            load.operation = FOp("MLIL_LOAD_STRUCT_SSA")
+            load.offset = load.src.right.constant
+            load.src = load.src.left
+        elif instruction.instr_index == 3 and store_member is not None:
+            instruction.operation = FOp("MLIL_STORE_STRUCT_SSA")
+            instruction.dest = instruction.dest.left
+            instruction.offset, instruction.size = store_member, 8
+    result = _slot_engine(models).forward(function, [te.parse_locator("arg:recvfrom:1")])
+    assert bool(result["reached_sinks"]) is (store_member != _OFF)
+    if store_member == _OFF:
+        assert any("may be missed" in assumption for assumption in result["assumptions"])
+    else:
+        assert not any("may be missed" in assumption for assumption in result["assumptions"])
+
+
+def test_nonlocal_struct_load_keeps_earlier_source_at_actual_read_epoch():
+    pointer, source = FVar("pointer", ident=111), FVar("source", ident=112)
+    pointer0, source0 = FSSA(pointer, 0), FSSA(source, 0)
+    pg = _BufProgram(params=[pointer, source])
+    address = FExpr("MLIL_VAR_SSA", "pointer", reads=[pointer0])
+    _member_store(pg, address, 8, FExpr("MLIL_VAR_SSA", "source", reads=[source0]),
+                  reads=[source0])
+    load = _member_load(address, 8, pg.mem)
+    _member_store(pg, address, 8, _region_const(1))
+    value = FSSA(FVar("value"), 1)
+    _set(pg, value, "value = earlier member", load, reads=[pointer0])
+    pg.call(_B_MEMCPY, [_cstr(0x800), _cstr(0x700),
+                       FExpr("MLIL_VAR_SSA", "value", reads=[value])], reads=[value])
+    result, _, _ = _bw(pg.func(), sink="arg:memcpy:2")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert result["slices"][0]["origin"]["kind"] == "parameter"
+    assert result["slices"][0]["origin"]["index"] == 1

@@ -47,6 +47,7 @@ brittle across compilers/optimisation.
 | `nested_escape_paths.c` | #951: native O0 nested call/escape arrangements require an opaque helper leaf; no-escape nests stay covered. Includes single-loop and differing-offset cache controls |
 | `store_member_identity.c` | exact O0 direct-store lossy destination and STRUCT-stash member PHIs remain incomplete; matching-member full-pointer control stays complete |
 | `scalar_member_regions.c` | exact Opus O0 scalar STRUCT-read fixture: unwritten member/mirror/pointer-store variants remain incomplete; genuinely initialized consumed member stays covered |
+| `external_member_regions.c` | nonlocal matching STORE/LOAD members recover the real writer, unwritten members remain frontiers, and a disjoint later write preserves parameter source. O1 variant checks surviving wrong-member/source forms |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -156,6 +157,21 @@ numeric-coercion defect is exercised synthetically with an integer-zero
 control; no native direct FLOAT_CONST reproduction is claimed. Integer
 bit-pattern and verified byte-data evidence remain supported without adding
 floating evaluation.
+
+`external_member_regions` retains the Sol nonlocal source exactly. At O0,
+the matching `p->b` writer/read is covered, `p->a` remains unresolved after only
+`p->b` was written, and the earlier `source` in `p->a` survives a later `p->b`
+literal. O1 keeps the wrong-member read but can forward the source directly
+and fold the matching constant to a bounded/unseeded sink; those cases are
+not miscredited as matching-memory proof. Inputs are analyzed only.
+
+The shared geometry audit also covers forward memory correlation, named
+writers/reads, descriptor-array field keys and indirect pointer slots.
+Deterministic direct/copied and mixed plain/STRUCT forms exercise positive,
+disjoint/overlapping and source-retention controls. The forward sibling was
+reported statically and is exercised behaviorally here, not claimed as a
+native forward vulnerability reproduction. May semantics and strict local
+coverage remain separate.
 
 ## `EXPECTED.json` schema
 

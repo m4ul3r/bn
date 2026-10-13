@@ -1271,7 +1271,8 @@ class TaintEngine:
                     val = getattr(a, "value", None)
                     c = getattr(val, "value", val)
                 try:
-                    return (("gload", int(c)), 0)
+                    member = self._memory_member_offset(expr)
+                    return (("gload", int(c) + member), 0) if member is not None else None
                 except (TypeError, ValueError):
                     return None
             return None
@@ -1328,23 +1329,35 @@ class TaintEngine:
             sz = 0
         return sz if sz in (4, 8) else 8
 
-    def _field_store_slot(self, ssaf: Any, ins: Any):
-        """The ``(base, offset)`` slot a store writes, unifying BN's store shapes:
-        MLIL_STORE_SSA (dest is an address expr `&v + off`), MLIL_SET_VAR_(ALIASED_)FIELD
-        (dest is the struct VAR -> `(v, 0)`, with the field byte offset in ``ins.offset``),
-        and MLIL_SET_VAR_ALIASED (a whole address-taken scalar, e.g. a `size_t& capacity`
-        out-param slot -> `(v, 0)`; #442). None when unresolvable."""
+    def _memory_address(self, ssaf: Any, ins: Any):
+        """Effective may-location for a memory read/write, including its member.
+
+        This normalizes geometry, not certainty: pointer roots still use the
+        existing may resolver, while named objects denote their fixed storage.
+        A known root with an unknown displacement retains offset None.
+        """
         op = op_name(ins)
-        if "STORE" in op:
-            return self._addr_base_offset(ssaf, getattr(ins, "dest", None))
-        if op in ("MLIL_SET_VAR_FIELD", "MLIL_SET_VAR_ALIASED_FIELD"):
-            ba = self._addr_base_offset(ssaf, getattr(ins, "dest", None))
-            if ba is None:
-                return None
-            return (ba[0], ba[1] + int(getattr(ins, "offset", 0) or 0))
-        if op == "MLIL_SET_VAR_ALIASED":
-            dest = getattr(ins, "dest", None)
-            return (var_key(dest), 0) if dest is not None else None
+        if op in _NAMED_STORE_OPS:
+            obj = getattr(ins, "dest", None)
+            base = (var_key(obj), 0) if obj is not None else None
+        elif op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
+            obj = getattr(ins, "src", None)
+            base = (var_key(obj), 0) if obj is not None else None
+        elif "STORE" in op or "LOAD" in op:
+            pointer = getattr(ins, "dest" if "STORE" in op else "src", None)
+            base = self._addr_base_offset(ssaf, pointer)
+        else:
+            return None
+        if base is None:
+            return None
+        member = self._memory_member_offset(ins)
+        return (base[0], base[1] + member
+                if isinstance(base[1], int) and member is not None else None)
+
+    def _field_store_slot(self, ssaf: Any, ins: Any):
+        """The effective may-location of a writer, never of a read."""
+        if "STORE" in op_name(ins) or op_name(ins) in _NAMED_STORE_OPS:
+            return self._memory_address(ssaf, ins)
         return None
 
     def _value_stored_to_field(self, ssaf: Any, instrs: Any, target_slot: tuple, before_addr: int):
@@ -1465,10 +1478,11 @@ class TaintEngine:
         if defn is None:
             return None
         op = op_name(defn)
-        if "STORE" in op:
-            sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
+        if "STORE" in op or op in _NAMED_STORE_OPS:
+            sa = self._field_store_slot(ssaf, defn)
             if sa is not None and sa[0] == la[0]:
-                rel = self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw)
+                rel = (self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw)
+                       if isinstance(sa[1], int) and isinstance(la[1], int) else "overlap")
                 if rel != "disjoint":
                     for r in expr_reads(getattr(defn, "src", None)):
                         if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
@@ -1480,7 +1494,7 @@ class TaintEngine:
                     # tainted store underneath (#562 false all-clear).
                     if rel == "cover":
                         return None  # matching store wrote untainted data -> not tainted via memory
-            return self._walk_mem(ssaf, getattr(defn, "src_memory", None), la, lw, tainted, seen, depth + 1)
+            return self._walk_mem(ssaf, self._mem_in(defn), la, lw, tainted, seen, depth + 1)
         if "MEM_PHI" in op:
             for sv in self._mem_phi_sources(defn):
                 res = self._walk_mem(ssaf, sv, la, lw, tainted, seen, depth + 1)
@@ -1492,8 +1506,8 @@ class TaintEngine:
     def _load_tainted_via_memory(self, ssaf, load_expr, tainted):
         """If a load reads bytes that a tainted store wrote (matched by address
         along the memory-version chain), return the source node; else None."""
-        la = self._addr_base_offset(ssaf, getattr(load_expr, "src", None))
-        mv = getattr(load_expr, "src_memory", None)
+        la = self._memory_address(ssaf, load_expr)
+        mv = self._mem_in(load_expr)
         if la is None or mv is None:
             return None
         lw = getattr(load_expr, "size", None)
@@ -1580,12 +1594,12 @@ class TaintEngine:
         if defn is None:
             return None
         op = op_name(defn)
-        if "STORE" in op:
-            sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
-            if sa is not None and sa[0] == la[0] \
+        if "STORE" in op or op in _NAMED_STORE_OPS:
+            sa = self._field_store_slot(ssaf, defn)
+            if sa is not None and sa[0] == la[0] and isinstance(sa[1], int) \
                     and self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw) == "cover":
                 return ("store", defn)
-            return self._reaching_writer(ssaf, getattr(defn, "src_memory", None), la, lw, seen, depth + 1)
+            return self._reaching_writer(ssaf, self._mem_in(defn), la, lw, seen, depth + 1)
         if "MEM_PHI" in op:
             for sv in self._mem_phi_sources(defn):
                 res = self._reaching_writer(ssaf, sv, la, lw, seen, depth + 1)
@@ -1932,10 +1946,11 @@ class TaintEngine:
         """The explicit field displacement of a supported memory operation."""
         op = op_name(ins)
         if op in ("MLIL_LOAD", "MLIL_LOAD_SSA", "MLIL_STORE", "MLIL_STORE_SSA",
-                  "MLIL_VAR_ALIASED"):
+                  "MLIL_VAR_ALIASED", "MLIL_SET_VAR_ALIASED"):
             return 0
         if op in ("MLIL_LOAD_STRUCT", "MLIL_LOAD_STRUCT_SSA",
-                  "MLIL_STORE_STRUCT", "MLIL_STORE_STRUCT_SSA", "MLIL_VAR_ALIASED_FIELD"):
+                  "MLIL_STORE_STRUCT", "MLIL_STORE_STRUCT_SSA", "MLIL_VAR_ALIASED_FIELD",
+                  "MLIL_SET_VAR_FIELD", "MLIL_SET_VAR_ALIASED_FIELD"):
             off = getattr(ins, "offset", None)
             return off if isinstance(off, int) else None
         return None
@@ -2649,8 +2664,8 @@ class TaintEngine:
                         # A named object is fixed storage, not a pointer's value.
                         # Do not chase its definition through a may-slot resolver.
                         dst = getattr(defn, "dest", None)
-                        named_off = getattr(defn, "offset", 0) or 0
-                        slot = (var_key(dst), named_off) if isinstance(named_off, int) else None
+                        named_off = self._memory_member_offset(defn)
+                        slot = (var_key(dst), named_off) if dst is not None else None
                     else:
                         slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == base_key:
@@ -3692,7 +3707,8 @@ class TaintEngine:
         if expr is None or depth > 6:
             return None
         if "LOAD" in op_name(expr):
-            return self._addr_base_offset(ssaf, getattr(expr, "src", None))
+            key = self._memory_address(ssaf, expr)
+            return key if key is not None and isinstance(key[1], int) else None
         v = self._as_single_ssa_var(expr)
         if v is None:
             reads = expr_reads(expr)
@@ -3709,7 +3725,8 @@ class TaintEngine:
         if src is None:
             return None
         if "LOAD" in op_name(src):
-            return self._addr_base_offset(ssaf, getattr(src, "src", None))
+            key = self._memory_address(ssaf, src)
+            return key if key is not None and isinstance(key[1], int) else None
         return self._buffer_slot_key(ssaf, src, depth + 1)
 
     def _store_to_slot_between(self, ssaf: Any, instrs: Any, key: tuple, lo_idx: int, hi_idx: int) -> bool:
@@ -3723,51 +3740,31 @@ class TaintEngine:
         never *under*-blocks; an unprovable case stays uncorrelated (honest)."""
         base = key[0] if key else None
         base_global = base[1] if isinstance(base, tuple) and base and base[0] == "gload" else None
+
+        def overlaps(start: int | None, width: int | None, target: int) -> bool:
+            if start is None:
+                return True
+            if width is None:
+                return start < target + self._ptr_size()
+            return self._store_covers_load(start, width, target, self._ptr_size()) != "disjoint"
+
         for ins in instrs:
             idx = getattr(ins, "instr_index", None)
             if idx is None or not (lo_idx < idx < hi_idx):
                 continue
-            if "STORE" not in op_name(ins):
+            if "STORE" not in op_name(ins) and op_name(ins) not in _NAMED_STORE_OPS:
                 continue
-            dest = getattr(ins, "dest", None)
-            sk = self._addr_base_offset(ssaf, dest)
-            if sk is not None and sk == key:
+            sk = self._field_store_slot(ssaf, ins)
+            if sk is None:
+                continue
+            width = getattr(ins, "size", None)
+            if sk[0] == key[0] and overlaps(sk[1], width, key[1]):
                 return True
-            if base_global is not None and self._store_addr_const(ssaf, dest) == base_global:
-                return True
+            if base_global is not None and isinstance(sk[0], tuple) and sk[0][0] == "gconst":
+                start = sk[0][1] + sk[1] if isinstance(sk[1], int) else None
+                if overlaps(start, width, base_global):
+                    return True
         return False
-
-    def _store_addr_const(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
-        """The constant address a store writes *to* (``[0xG] = v`` -> ``0xG``),
-        following SSA copies to a CONST_PTR. Used to detect a re-point of a
-        ``("gload", G)`` slot's base global. None if the destination isn't a
-        constant address."""
-        if expr is None or depth > 6:
-            return None
-        if "CONST_PTR" in op_name(expr):
-            c = getattr(expr, "constant", None)
-            if c is None:
-                v = getattr(expr, "value", None)
-                c = getattr(v, "value", v)
-            try:
-                return int(c)
-            except (TypeError, ValueError):
-                return None
-        if is_ssa_var(expr):
-            try:
-                d = ssaf.get_ssa_var_definition(expr)
-            except Exception:
-                d = None
-            return self._store_addr_const(ssaf, getattr(d, "src", None), depth + 1) if d is not None else None
-        reads = expr_reads(expr)
-        if len(reads) == 1:
-            try:
-                d = ssaf.get_ssa_var_definition(reads[0])
-            except Exception:
-                d = None
-            if d is not None:
-                return self._store_addr_const(ssaf, getattr(d, "src", None), depth + 1)
-        return None
 
     def _register_indirect_buffer_slot(self, ssaf, ptr_expr, callsite, callee, idx,
                                        buffer_slots, add_assumption,
@@ -4864,13 +4861,19 @@ class TaintEngine:
         # to avoid re-running the recursive address resolution N times (#420).
         elem_key_cache: dict = {}
 
-        def elem_key(ins: Any, addr: Any):
+        def elem_key(ins: Any, addr: Any, memory: Any = None):
+            member = self._memory_member_offset(memory if memory is not None else ins)
+            if member is None:
+                return None
             idx = getattr(ins, "instr_index", None)
-            if idx is None:
-                return self._elem_field_key(ssaf, addr)
-            if idx not in elem_key_cache:
-                elem_key_cache[idx] = self._elem_field_key(ssaf, addr)
-            return elem_key_cache[idx]
+            if idx is not None and idx in elem_key_cache:
+                return elem_key_cache[idx]
+            key = self._elem_field_key(ssaf, addr)
+            if key is not None:
+                key = (key[0], key[1], key[2] + member)
+            if idx is not None:
+                elem_key_cache[idx] = key
+            return key
 
         def apply_model(ins, params, model, mkey, name, *, site_taddr=None):
             """Apply a function model's sink-detection + taint propagation at a call
@@ -5863,7 +5866,8 @@ class TaintEngine:
                 # pointer aliasing the AddressOf rule misses). Additive + sound.
                 if opn == "MLIL_SET_VAR_SSA":
                     src_expr = getattr(ins, "src", None)
-                    if src_expr is not None and "LOAD" in op_name(src_expr):
+                    if src_expr is not None and ("LOAD" in op_name(src_expr) or
+                            op_name(src_expr) in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD")):
                         msrc = self._load_tainted_via_memory(ssaf, src_expr, tainted)
                         reason = "loads value stored through a tainted pointer (mem-SSA)"
                         assume = "heap/pointer load resolved via memory-SSA store correlation"
@@ -5881,7 +5885,7 @@ class TaintEngine:
                             # recv buffer pointer was loaded from -- so it re-loads the
                             # SAME (filled) buffer pointer. Correlate it, unless the slot
                             # was provably re-pointed between the recv and here.
-                            sk = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
+                            sk = self._buffer_slot_key(ssaf, src_expr)
                             slot = buffer_slots.get(sk) if sk is not None else None
                             if slot is not None:
                                 lo = slot.get("recv_idx")
@@ -5904,7 +5908,7 @@ class TaintEngine:
                             # tainted ("elem", base, field) that the array's fill (in
                             # this function or carried from a callee) produced, so the
                             # parser-filled hdr[] reconnects to the per-element copy.
-                            ek = elem_key(ins, getattr(src_expr, "src", None))
+                            ek = elem_key(ins, getattr(src_expr, "src", None), src_expr)
                             if ek is not None and (ek, None) in tainted:
                                 msrc = (ek, None)
                                 reason = ("loads a tainted descriptor-array element field "
@@ -7302,10 +7306,8 @@ class TaintEngine:
                         else:
                             walk(r, d + 1, load_memory)
                     return
-                la = self._addr_base_offset(ssaf, pointer)
+                la = self._memory_address(ssaf, src_expr)
                 if la is not None:
-                    la = (la[0], la[1] + demand.offset
-                          if isinstance(la[1], int) and demand.offset is not None else None)
                     rec = (self._reaching_writer(
                         ssaf, load_memory, la, demand.width, set(), 0)
                            if la[1] is not None and demand.width is not None else None)
