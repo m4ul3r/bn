@@ -3225,6 +3225,27 @@ class TestStackFrameMap:
         buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
         assert buffer["to_canary"] == canary - buffer["storage"] >= 44
 
+    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn):
+        shared_bn.load(CANARY_BINARY)
+        function = "read_context_word"
+        before = shared_bn.json("local", "list", "--frame", function)
+        assert before["canary_storage"] is None, before
+        parameter = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["is_parameter"]
+        )
+        shared_bn.json("local", "rename", function, parameter["local_id"], "fsbase")
+        renamed = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["local_id"] == parameter["local_id"]
+        )
+        assert renamed["name"] == "fsbase"
+        after = shared_bn.json("local", "list", "--frame", function)
+        assert after["canary_storage"] is None, after
+        assert [(s["storage"], s["kind"], s["to_canary"]) for s in after["items"]] == [
+            (s["storage"], s["kind"], s["to_canary"]) for s in before["items"]
+        ]
+
 
 class TestClassLensRttiGuards922:
     """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
@@ -3475,6 +3496,41 @@ int main(int argc, char **) {
             assert card["vtable"]["slots"] == [], card
             assert card["vtable"]["truncated_reason"] == "no_local_vtable_body", card
 
+    def test_typeinfo_backwalk_does_not_turn_vtt_entries_into_instances_945(self, shared_bn, tmp_path):
+        source = tmp_path / "vtt.cpp"
+        source.write_text("""
+struct V { virtual int v() { return 1; } };
+struct B : virtual V { virtual int b() { return 2; } };
+B global_b;
+int main() { return global_b.b(); }
+""")
+        binary = tmp_path / "vtt"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(source)],
+            capture_output=True, text=True,
+        )
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        result = shared_bn.json(
+            "py", "exec",
+            "from bn_agent_bridge import read_class, seam\n"
+            "ctx = seam.BridgeContext(None)\n"
+            "record = read_class._build_class_registry(ctx, bv)['B']\n"
+            "record['vtable'] = None\n"
+            "card = read_class._enrich(ctx, bv, record)\n"
+            "vtt = next(s for s in bv.get_symbols() if s.raw_name == '_ZTT1B')\n"
+            "var = bv.get_data_var_at(vtt.address)\n"
+            "point = int(card['vtable']['address'], 16) + 2 * bv.address_size\n"
+            "result = {'card': card, 'vtt': hex(vtt.address),\n"
+            "    'width': var.type.width if var else None,\n"
+            "    'refs': [hex(ref) for ref in bv.get_data_refs(point)]}\n",
+            "-t", target,
+        )["result"]
+        assert result["card"]["vtable"]["typeinfo_backwalk"] is True, result
+        assert result["card"]["vtable"]["slots"], result
+        assert result["vtt"] in result["refs"], result
+        assert result["card"]["instances"]["stored_globals"] == [], result
+
 
 class TestStructLayoutAssistance903:
     """Known-layout disclosure on the same real typed/untyped function."""
@@ -3570,6 +3626,62 @@ class TestStructLayoutAssistance903:
             "bv.update_analysis_and_wait()\n")
         assert any("struct layout candidate" in w
                    for w in shared_bn.json("decompile", "handle")["warnings"])
+
+        # Equally concrete layouts that cfg's uniqueness must account for: a
+        # base-less class, and identical structs carrying a trailing flexible
+        # array or an unresolved (zero-width) named member past the accesses.
+        builder = (
+            "from binaryninja import NamedTypeReferenceClass, StructureBuilder, Type\n"
+            "s = StructureBuilder.create()\n"
+            "s.insert(0, Type.array(Type.char(), 40), 'pad')\n"
+            "s.insert(40, Type.int(8, False), 'flags')\n"
+            "s.insert(48, Type.int(4, False), 'depth')\n")
+        competitors = {
+            "K": ("ClassStructureType", None),
+            "flex_cfg": ("StructStructureType",
+                         builder + "s.insert(52, Type.array(Type.char(), 0), 'tail')\n"),
+            "ext_cfg": ("StructStructureType", builder + (
+                "s.insert(56, Type.named_type_reference(\n"
+                "    NamedTypeReferenceClass.StructNamedTypeClass, 'missing_t'), 'ext')\n")),
+        }
+        for name, (kind, script) in competitors.items():
+            if script is None:
+                shared_bn.json(
+                    "types", "declare",
+                    f"class {name} {{ public: char pad[40]; uint64_t flags; uint32_t depth; }};")
+            else:
+                shared_bn.json(
+                    "py", "exec",
+                    script + f"bv.define_user_type({name!r}, s)\n"
+                    "bv.update_analysis_and_wait()\n")
+            shape = shared_bn.json(
+                "py", "exec",
+                f"t = bv.get_type_by_name({name!r})\n"
+                "result = [t.type.name, [m.type.width for m in t.members]]\n")["result"]
+            assert shape[0] == kind, (name, shape)
+            if script is not None:
+                assert shape[1][-1] == 0, (name, shape)
+            competing = shared_bn.json("decompile", "handle")
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
+                name, competing)
+            if script is None:
+                # A sole matching class is not suggested as `struct K *`.
+                shared_bn.json(
+                    "py", "exec",
+                    "bv.undefine_user_type('cfg')\n"
+                    "bv.update_analysis_and_wait()\n")
+                sole = shared_bn.json("decompile", "handle")
+                assert not any("struct layout candidate" in w for w in sole["warnings"]), sole
+                shared_bn.json(
+                    "types", "declare",
+                    "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
+            shared_bn.json(
+                "py", "exec",
+                f"bv.undefine_user_type({name!r})\n"
+                "bv.update_analysis_and_wait()\n")
+            restored = shared_bn.json("decompile", "handle")
+            assert any("struct layout candidate" in w for w in restored["warnings"]), (
+                name, restored)
 
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")

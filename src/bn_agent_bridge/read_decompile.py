@@ -406,10 +406,12 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
 
     Match complete scalar members of concrete, non-inherited structs, resolving
     typedefs only for members at observed offsets/widths. Unclassifiable members
-    -- unresolved typedefs, bitfield storage units and overlapping members --
-    can block uniqueness but cannot supply a witness. Whole-struct aliases do not
-    add candidates (their concrete declarations are already in bv.types).
-    Matching two distinct offsets is a minimum witness, not proof of identity.
+    -- unresolved typedefs, bitfield storage units, overlapping members and
+    members of unknown (zero) width -- can block uniqueness but cannot supply a
+    witness. Base-less classes are equally concrete layouts: they compete with
+    structs but are never suggested themselves. Whole-struct aliases do not add
+    candidates (their concrete declarations are already in bv.types). Matching
+    two distinct offsets is a minimum witness, not proof of identity.
     """
     accesses = _untyped_pointer_accesses(func)
     if not accesses:
@@ -419,9 +421,12 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     layouts: list[tuple[str, dict[tuple[int, int], str | None]]] = []
     for name, type_obj in bv.types.items():
         if (_enum_name(type_obj.type_class) != "StructureTypeClass"
-                or _enum_name(type_obj.type) != "StructStructureType"
                 or type_obj.base_structures):
             continue
+        kind = _enum_name(type_obj.type)
+        if kind not in {"StructStructureType", "ClassStructureType"}:
+            continue
+        witness = kind == "StructStructureType"
         scalars: dict[tuple[int, int], Any] = {}
         uncertain: list[tuple[int, int]] = []  # byte spans [start, end)
         end = 0
@@ -431,7 +436,10 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
         for member in sorted(type_obj.members, key=lambda member: member.offset):
             offset, width = int(member.offset), int(member.type.width)
             if width <= 0:
-                break  # incomplete layouts are not a unique witness
+                # Unresolved type or flexible array: it may occupy anything
+                # from here to the struct's end (nothing, if it is trailing).
+                uncertain.append((offset, int(type_obj.width)))
+                continue
             if offset < end:
                 uncertain.append((offset, min(end, offset + width)))
             end = max(end, offset + width)
@@ -441,24 +449,23 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
                 limit = max(limit, offset + width)
             elif member.name:
                 scalars[(offset, width)] = member
-        else:
-            if end > limit:
-                continue
-            # Named scalar = positive; None = uncertain; absent = incompatible.
-            members: dict[tuple[int, int], str | None] = {}
-            for offset, width in observed_keys:
-                if any(offset < hi and lo < offset + width for lo, hi in uncertain):
+        if end > limit:
+            continue
+        # Named scalar = positive; None = uncertain; absent = incompatible.
+        members: dict[tuple[int, int], str | None] = {}
+        for offset, width in observed_keys:
+            if any(offset < hi and lo < offset + width for lo, hi in uncertain):
+                members[(offset, width)] = None
+            elif (offset, width) in scalars:
+                member = scalars[(offset, width)]
+                _, member_type, follow_error = read_types._follow_typedef(
+                    bv, str(member.name), member.type)
+                if follow_error is not None:
                     members[(offset, width)] = None
-                elif (offset, width) in scalars:
-                    member = scalars[(offset, width)]
-                    _, member_type, follow_error = read_types._follow_typedef(
-                        bv, str(member.name), member.type)
-                    if follow_error is not None:
-                        members[(offset, width)] = None
-                    elif _enum_name(member_type.type_class) in _SCALAR_TYPE_CLASSES:
-                        members[(offset, width)] = str(member.name)
-            if any(observed <= members.keys() for observed in observed_sets):
-                layouts.append((str(name), members))
+                elif _enum_name(member_type.type_class) in _SCALAR_TYPE_CLASSES:
+                    members[(offset, width)] = str(member.name) if witness else None
+        if any(observed <= members.keys() for observed in observed_sets):
+            layouts.append((str(name), members))
 
     warnings = []
     for index, var, observed in accesses:

@@ -556,6 +556,8 @@ def test_frame_detects_the_x86_tls_canary_and_ignores_a_clobbered_guard_register
                         source_type="RegisterVariableSourceType")
     fsbase = _FakeVariable(name="fsbase", storage=1, var_type="int64_t", identifier=11,
                            source_type="RegisterVariableSourceType")
+    fn.arch = types.SimpleNamespace(
+        name="x86_64", get_reg_name={0: "rax", 1: "fsbase"}.get)
     tls_guard = _mlil("MLIL_LOAD", src=_mlil(
         "MLIL_ADD", left=_mlil("MLIL_VAR", src=fsbase), right=_mlil("MLIL_CONST", constant=0x28)))
     fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
@@ -584,6 +586,8 @@ def _tls_guard_frame(*clobber):
     regs = {name: _FakeVariable(name=name, storage=i, var_type="int64_t", identifier=10 + i,
                                 source_type="RegisterVariableSourceType")
             for i, name in enumerate(("rax", "fsbase", "rcx", "rdx"))}
+    fn.arch = types.SimpleNamespace(
+        name="x86_64", get_reg_name={var.storage: name for name, var in regs.items()}.get)
     tls_guard = _mlil("MLIL_LOAD", src=_mlil(
         "MLIL_ADD", left=_mlil("MLIL_VAR", src=regs["fsbase"]), right=_mlil("MLIL_CONST", constant=0x28)))
     fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
@@ -626,6 +630,29 @@ def test_frame_canary_keeps_a_guard_copy_that_survives_unrelated_writes(monkeypa
     assert bridge.vars_mod._list_frame(fn)["canary_storage"] == -16
 
 
+@pytest.mark.parametrize("architecture,register,source,offset,display,expected", [
+    ("x86_64", "fsbase", "RegisterVariableSourceType", 0x28, "renamed_tls", -16),
+    ("x86", "gsbase", "RegisterVariableSourceType", 0x14, "renamed_tls", -16),
+    ("x86_64", "rdi", "RegisterVariableSourceType", 0x28, "fsbase", None),
+    ("x86_64", "fsbase", "StackVariableSourceType", 0x28, "fsbase", None),
+    ("x86_64", "gsbase", "RegisterVariableSourceType", 0x14, "gsbase", None),
+])
+def test_frame_tls_canary_uses_architectural_identity(
+    monkeypatch, architecture, register, source, offset, display, expected,
+):
+    bridge = _load_bridge(monkeypatch)
+    fn = _tls_guard_frame()
+    address = fn.mlil.basic_blocks[0][0].src.src
+    base = address.left.src
+    base.name = display
+    base.source_type = types.SimpleNamespace(name=source)
+    address.right.constant = offset
+    fn.arch = types.SimpleNamespace(
+        name=architecture, get_reg_name=lambda storage: register if storage == 1 else "rax")
+
+    assert bridge.vars_mod._list_frame(fn)["canary_storage"] == expected
+
+
 def test_frame_without_canary_evidence_marks_no_canary(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     fn = _FakeFunction(0x401000, "leaf")   # no `.mlil`: no evidence, no guess
@@ -640,6 +667,28 @@ def test_frame_without_canary_evidence_marks_no_canary(monkeypatch):
     assert [(s["kind"], s["distance_to_next_slot"], s["to_canary"]) for s in frame["slots"]] == [
         ("local", 16, None), ("local", 8, None),
     ]
+
+
+def test_frame_negative_slots_stop_at_entry_pointer_without_a_zero_slot(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "frame_boundary")
+    fn.stack_layout = [
+        _FakeVariable(name="first", storage=-16, var_type="int64_t", identifier=1),
+        _FakeVariable(name="alias", storage=-16, var_type="int64_t", identifier=2),
+        _FakeVariable(name="last", storage=-8, var_type="int64_t", identifier=3),
+        _FakeVariable(name="arg_8", storage=8, var_type="int64_t", identifier=4),
+        _FakeVariable(name="arg_18", storage=24, var_type="int64_t", identifier=5),
+    ]
+
+    frame = bridge.vars_mod._list_frame(fn)
+    assert [(slot["storage"], slot["distance_to_next_slot"]) for slot in frame["slots"]] == [
+        (-16, 8), (-8, 8), (8, 16), (24, None),
+    ]
+    assert [
+        (item["storage"], item["distance_to_next_slot"])
+        for item in instance._list_locals(fn) if item["storage"] < 0
+    ] == [(-16, 8), (-16, 8), (-8, 8)]
 
 
 def test_find_variable_selector_prefers_local_id(monkeypatch):
@@ -1339,7 +1388,9 @@ def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
 
 @pytest.mark.parametrize("case, hints", [
     ("bitfield-unit", 0), ("split-bitfields", 0), ("overlapping-members", 0),
-    ("unobserved-bitfield", 1),
+    ("unobserved-bitfield", 1), ("class-competitor", 0), ("sole-class", 0),
+    ("flexible-tail-competitor", 0), ("unresolved-tail-competitor", 0),
+    ("zero-width-before-access", 0), ("own-flexible-tail", 1),
 ])
 def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
     bv, fn, _, _ = _struct_assist_case()
@@ -1360,6 +1411,24 @@ def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case,
         other.width = 0x38
     elif case == "overlapping-members":
         other.members.append(_FakeMember(0x2c, "overlap", unit))
+    elif case in {"class-competitor", "sole-class"}:
+        # A base-less class is as concrete a layout as a struct, but is never
+        # itself suggested as `struct K *`.
+        other.type = types.SimpleNamespace(name="ClassStructureType")
+        if case == "sole-class":
+            del bv.types["cfg"]
+    elif case in {"flexible-tail-competitor", "own-flexible-tail"}:
+        if case == "own-flexible-tail":
+            other = bv.types["cfg"]
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "char[0]", width=0, type_class="ArrayTypeClass")))
+    elif case == "unresolved-tail-competitor":
+        other.members.append(_FakeMember(0x38, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case == "zero-width-before-access":
+        # An unknown-width member may extend over every later byte.
+        other.members.insert(0, _FakeMember(0x20, "ext", _FakeType(
+            "missing_t", width=0, type_class="NamedTypeReferenceClass")))
     elif case == "unobserved-bitfield":
         # Unclassifiable storage away from every access does not block cfg.
         other = bv.types["cfg"]

@@ -1544,7 +1544,37 @@ class BridgeContext:
             addr += 2 * self._pointer_size(bv)
         out = []
         getter = getattr(bv, "get_data_refs", None)
+        # VTT entries are address-point pointers, not object instances. BN
+        # sometimes leaves a symbolized VTT untyped: then follow its contiguous
+        # ABI entries, stopping at the next named object or a non-vtable word.
+        abi_ranges = []
+        data_var_at = getattr(bv, "get_data_var_at", None)
+        symbols = list(bv.get_symbols())
+        ptr = self._pointer_size(bv)
+        for symbol in symbols:
+            raw = str(getattr(symbol, "raw_name", "") or "")
+            short = str(getattr(symbol, "short_name", "") or "")
+            if not (raw.startswith(("_ZTT", "_ZTC"))
+                    or short.startswith(("VTT for ", "construction vtable for "))):
+                continue
+            start = int(symbol.address)
+            var = data_var_at(start) if callable(data_var_at) else None
+            width = int(getattr(getattr(var, "type", None), "width", 0) or 0)
+            end = start + max(width, ptr)
+            if not width and (raw.startswith("_ZTT") or short.startswith("VTT for ")):
+                boundary = min((int(s.address) for s in symbols if int(s.address) > start),
+                               default=end)
+                end = start
+                while end < boundary:
+                    point = self._read_pointer_value(bv, end, size=ptr)
+                    ti = self._read_pointer_value(bv, point - ptr, size=ptr) if point else None
+                    if not ti or self._typeinfo_name_at(bv, ti) is None:
+                        break
+                    end += ptr
+            abi_ranges.append((start, end))
         for ref in (getter(addr) if callable(getter) else []):
+            if any(start <= int(ref) < end for start, end in abi_ranges):
+                continue
             sym = bv.get_symbol_at(int(ref)) if hasattr(bv, "get_symbol_at") else None
             out.append({
                 "symbol": str(getattr(sym, "short_name", "") or getattr(sym, "name", "")) if sym else None,

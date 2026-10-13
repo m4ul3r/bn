@@ -4635,3 +4635,58 @@ def test_normalization_requires_proven_transitive_nonvirtual_ancestry_945(ancest
         bv._memory[0x9200] = bv._memory[0x9200][:32]
     rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
     assert rec["vtable"]["address"] == ("0x9000" if ancestry == "nonvirtual" else "0x9010")
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("kind", ["root", "si", "virtual"])
+def test_abi_selector_head_precedes_adjacent_extern_945(ptr, kind):
+    bv = _slot_array_bv(ptr)
+    bv._symbols.extend([
+        _Sym("abi_si", "vtable for __cxxabiv1::__si_class_type_info", 0x9800 + ptr),
+        _Sym("abi_vmi", "vtable for __cxxabiv1::__vmi_class_type_info", 0x9800 + 2 * ptr),
+        _Sym("base_ti", "typeinfo for svc::Base", 0x9200),
+    ])
+    word = lambda value: value.to_bytes(ptr, "little")
+    bv._memory[0x9200] = word(0x9800 + 2 * ptr) + bytes(ptr)
+    if kind == "si":
+        bv._memory[0x9100] = word(0x9800 + 3 * ptr) + bytes(ptr) + word(0x9200)
+    elif kind == "virtual":
+        bv._memory[0x9100] = (
+            word(0x9800 + 4 * ptr) + bytes(ptr)
+            + bytes(4) + (1).to_bytes(4, "little") + word(0x9200) + word(3)
+        )
+    rec = read_class._build_class_registry(seam.BridgeContext(None), bv)["svc::Codec"]
+    assert rec["vtable"]["address"] == hex(0x9000 + (2 * ptr if kind == "virtual" else 0))
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("symbol_position", ["head", "slots", "absent"])
+@pytest.mark.parametrize("typed_vtt", [False, True])
+def test_stored_globals_exclude_vtt_and_construction_data_945(monkeypatch, ptr, symbol_position, typed_vtt):
+    bv = _slot_array_global_bv(ptr)
+    if symbol_position == "head":
+        bv._symbols[0].address = 0x9000
+    elif symbol_position == "absent":
+        bv._symbols.pop(0)  # decoded through the RTTI backwalk
+    bv._symbols.extend([
+        _Sym("_ZTTN3svc5CodecE", "VTT for svc::Codec", 0xa040),
+        _Sym("_ZTCN3svc7DerivedE0_N3svc5CodecE",
+             "construction vtable for svc::Codec-in-svc::Derived", 0xa060),
+        _Sym("neighbor", "neighbor", 0xa080),
+    ])
+    bv.get_data_var_at = lambda address: (
+        types.SimpleNamespace(type=types.SimpleNamespace(width=3 * ptr))
+        if address == 0xa060 or (address == 0xa040 and typed_vtt) else None
+    )
+    bv._memory[0xa040] = b"".join(
+        (0x9000 + 2 * ptr).to_bytes(ptr, "little") for _ in range(3))
+    refs = bv._data_refs[0x9000 + 2 * ptr]
+    refs.extend([0xa040, 0xa040 + ptr, 0xa060 + ptr, 0xa080])
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+    card = read_class._class_show(ctx, None, "svc::Codec")
+    assert card["instances"]["stored_globals"] == [
+        {"symbol": "global_codec", "address": "0xa000"},
+        {"symbol": "neighbor", "address": "0xa080"},
+    ]
+    assert card["instances"]["stored_globals_total"] == 2
