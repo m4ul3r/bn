@@ -227,10 +227,13 @@ def _is_canary_load(func, expr) -> bool:
     ``__stack_chk_guard`` symbol (directly, or through one pointer such as a GOT
     slot) or of the x86 TLS canary slot, identified by its architectural register
     rather than the variable's mutable display name."""
-    if expr.operation.name != "MLIL_LOAD":
+    if expr.operation.name != "MLIL_LOAD" or expr.size != func.arch.address_size:
         return False
     address = expr.src
     if address.operation.name == "MLIL_LOAD":
+        if (address.size != func.arch.address_size
+                or address.src.operation.name not in _CONSTANT_OPS):
+            return False
         address = address.src
     op = address.operation.name
     if op in _CONSTANT_OPS:
@@ -265,30 +268,42 @@ def _find_canary_storage(func) -> int | None:
     """Storage of the stack slot the prologue copies the stack-protector guard
     into, or None when no such copy is found.
 
-    Only an observed ``slot = guard`` (or ``reg = guard; slot = reg`` within one
-    basic block) counts; a function without that evidence gets no canary rather
-    than a guessed one. Any write to a register ends its guard copy, whatever
+    Only an observed full-ABI-word ``slot = guard`` (or ``reg = guard; slot = reg``
+    within one basic block) counts; partial loads or copies are not guard
+    evidence. Any write to a register ends its guard copy, whatever
     instruction makes it (a call output, a split or partial-field write as much
     as a plain assignment). Any failure reading MLIL is treated as no evidence."""
     try:
         mlil = func.mlil
         if mlil is None:
             return None
+        guard_width = func.arch.address_size
         for block in list(mlil.basic_blocks):
-            guard_registers: set[int | None] = set()
+            guard_registers: set[int] = set()
             for ins in block:
-                from_guard = ins.operation.name == "MLIL_SET_VAR" and (
-                    _is_canary_load(func, ins.src)
-                    or (ins.src.operation.name == "MLIL_VAR"
-                        and _variable_identifier(ins.src.src) in guard_registers)
+                from_guard = (
+                    ins.operation.name == "MLIL_SET_VAR"
+                    and ins.size == guard_width
+                    and (
+                        _is_canary_load(func, ins.src)
+                        or (ins.src.operation.name == "MLIL_VAR"
+                            and ins.src.size == guard_width
+                            and _variable_identifier(ins.src.src) in guard_registers)
+                    )
                 )
                 for written in _vars_written(ins):
-                    guard_registers.discard(_variable_identifier(written))
+                    written_id = _variable_identifier(written)
+                    if written_id is None:
+                        guard_registers.clear()
+                    else:
+                        guard_registers.discard(written_id)
                 if not from_guard:
                     continue
                 if _variable_source_name(ins.dest) == "StackVariableSourceType":
                     return int(ins.dest.storage)
-                guard_registers.add(_variable_identifier(ins.dest))
+                identifier = _variable_identifier(ins.dest)
+                if identifier is not None:
+                    guard_registers.add(identifier)
     except Exception:
         return None
     return None

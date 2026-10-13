@@ -121,7 +121,7 @@ Most collections use `{kind, items, total, offset, limit, returned, has_more}`. 
 | `sections` | `.items[].name`, `.start`, `.end`, `.length`, `.semantics` |
 | `types` | `.items[].decl`, `.layout`, and aggregate `.members[]` |
 | `local list` → `.items[]` | same list retained under `.locals`; rows carry `.local_id`; stack rows carry `.distance_to_next_slot` (slot pitch, not object size; the top negative slot measures to entry-SP offset 0 even when no slot is recovered there) |
-| `local list --frame` → `.items[]` | one row per distinct stack offset: `.storage`, `.kind` (`local`/`saved_register`/`canary`/`return_address`/`caller_frame`), `.names`, `.distance_to_next_slot`, `.to_canary`, `.variables[].local_id`; top level `.canary_storage`. TLS canary evidence uses architectural register identity, not mutable local names. |
+| `local list --frame` → `.items[]` | one row per distinct stack offset: `.storage`, `.kind` (`local`/`saved_register`/`canary`/`return_address`/`caller_frame`), `.names`, `.distance_to_next_slot`, `.to_canary`, `.variables[].local_id`; top level `.canary_storage`. Canary evidence requires a full-ABI-word guard load and copy; TLS identity comes from architectural registers, not mutable local names. |
 | `xrefs` | `.items[]`, with `.kind` and `.caller_function` per reference |
 | `callsites` | `.items[].caller_static`, `.callee`, `.containing_function` |
 | `comment list` | `.items[].comment` and `.scope` (`address` or `function_doc`) |
