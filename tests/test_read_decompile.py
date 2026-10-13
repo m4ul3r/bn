@@ -476,6 +476,7 @@ def _mlil(operation: str, **fields):
     # split passes its outputs explicitly, and a field write (`rax.al = ...`) or
     # typed syscall reports NOTHING -- the gap `_vars_written` covers.
     fields.setdefault("vars_written", [fields["dest"]] if operation == "MLIL_SET_VAR" else [])
+    fields.setdefault("size", 8)
     return types.SimpleNamespace(operation=types.SimpleNamespace(name=operation), **fields)
 
 
@@ -485,6 +486,7 @@ def _aliased_frame_function():
     the canary, and the caller's argument area. The prologue copies the guard
     through a GOT-style symbol load into x8, then into var_28."""
     fn = _FakeFunction(0x40c3a0, "format_report")
+    fn.arch = types.SimpleNamespace(name="aarch64", address_size=8)
     ident = iter(range(3000, 4000))
 
     def stack(name, storage, var_type="int64_t", index=0):
@@ -557,7 +559,7 @@ def test_frame_detects_the_x86_tls_canary_and_ignores_a_clobbered_guard_register
     fsbase = _FakeVariable(name="fsbase", storage=1, var_type="int64_t", identifier=11,
                            source_type="RegisterVariableSourceType")
     fn.arch = types.SimpleNamespace(
-        name="x86_64", get_reg_name={0: "rax", 1: "fsbase"}.get)
+        name="x86_64", address_size=8, get_reg_name={0: "rax", 1: "fsbase"}.get)
     tls_guard = _mlil("MLIL_LOAD", src=_mlil(
         "MLIL_ADD", left=_mlil("MLIL_VAR", src=fsbase), right=_mlil("MLIL_CONST", constant=0x28)))
     fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
@@ -587,7 +589,8 @@ def _tls_guard_frame(*clobber):
                                 source_type="RegisterVariableSourceType")
             for i, name in enumerate(("rax", "fsbase", "rcx", "rdx"))}
     fn.arch = types.SimpleNamespace(
-        name="x86_64", get_reg_name={var.storage: name for name, var in regs.items()}.get)
+        name="x86_64", address_size=8,
+        get_reg_name={var.storage: name for name, var in regs.items()}.get)
     tls_guard = _mlil("MLIL_LOAD", src=_mlil(
         "MLIL_ADD", left=_mlil("MLIL_VAR", src=regs["fsbase"]), right=_mlil("MLIL_CONST", constant=0x28)))
     fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
@@ -647,10 +650,44 @@ def test_frame_tls_canary_uses_architectural_identity(
     base.name = display
     base.source_type = types.SimpleNamespace(name=source)
     address.right.constant = offset
+    width = 4 if architecture == "x86" else 8
+    for instruction in fn.mlil.basic_blocks[0]:
+        instruction.size = instruction.src.size = width
     fn.arch = types.SimpleNamespace(
-        name=architecture, get_reg_name=lambda storage: register if storage == 1 else "rax")
+        name=architecture, address_size=width,
+        get_reg_name=lambda storage: register if storage == 1 else "rax")
 
     assert bridge.vars_mod._list_frame(fn)["canary_storage"] == expected
+
+
+@pytest.mark.parametrize("load,register_write,stack_write,stack_read", [
+    (1, 8, 8, 8),
+    (8, 1, 8, 8),
+    (8, 8, 1, 8),
+    (8, 8, 8, 1),
+])
+def test_frame_canary_requires_a_full_guard_copy(
+    monkeypatch, load, register_write, stack_write, stack_read,
+):
+    bridge = _load_bridge(monkeypatch)
+    fn = _tls_guard_frame()
+    loaded, stored = fn.mlil.basic_blocks[0]
+    loaded.size, loaded.src.size = register_write, load
+    stored.size, stored.src.size = stack_write, stack_read
+
+    frame = bridge.vars_mod._list_frame(fn)
+    assert frame["canary_storage"] is None
+    assert all(slot["kind"] == "local" and slot["to_canary"] is None
+               for slot in frame["slots"])
+
+
+def test_frame_dereferencing_the_guard_is_not_copying_the_guard(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _tls_guard_frame()
+    loaded = fn.mlil.basic_blocks[0][0]
+    loaded.src = _mlil("MLIL_LOAD", src=loaded.src)
+
+    assert bridge.vars_mod._list_frame(fn)["canary_storage"] is None
 
 
 def test_frame_without_canary_evidence_marks_no_canary(monkeypatch):
@@ -1138,7 +1175,9 @@ def test_decompile_struct_assist_witness_and_no_mutation(monkeypatch):
     # These are the actionable evidence, not a pin of the explanatory prose.
     for evidence in ("cfg", "c", "+0x28/8", "flags", "+0x30/4", "depth",
                      "bn struct show cfg", "bn proto get 0x401000",
-                     "bn proto set 0x401000", "struct cfg *"):
+                     "bn proto set 0x401000", "struct cfg *",
+                     # Excluded alternatives are disclosed, not claimed ruled out.
+                     "nested struct, union, array or base class"):
         assert evidence in hint
     assert "(char*)c + 0x28" in result["text"]
     assert fn.type is before_type and var.type is before_pointer
@@ -1391,6 +1430,7 @@ def test_struct_assist_parameter_value_must_not_escape_witness(case, hints):
     ("unobserved-bitfield", 1), ("class-competitor", 0), ("sole-class", 0),
     ("flexible-tail-competitor", 0), ("unresolved-tail-competitor", 0),
     ("zero-width-before-access", 0), ("own-flexible-tail", 1),
+    ("overrun-competitor", 0), ("sole-overrun", 0),
 ])
 def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case, hints):
     bv, fn, _, _ = _struct_assist_case()
@@ -1425,6 +1465,13 @@ def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case,
     elif case == "unresolved-tail-competitor":
         other.members.append(_FakeMember(0x38, "ext", _FakeType(
             "missing_t", width=0, type_class="NamedTypeReferenceClass")))
+    elif case in {"overrun-competitor", "sole-overrun"}:
+        # A redeclared embedded type can outgrow the outer struct's stored
+        # width; the unobserved stale tail must not drop the competitor.
+        other.members.append(_FakeMember(0x38, "tail", _FakeType(
+            "struct ext", width=16, type_class="StructureTypeClass")))
+        if case == "sole-overrun":
+            del bv.types["cfg"]
     elif case == "zero-width-before-access":
         # An unknown-width member may extend over every later byte.
         other.members.insert(0, _FakeMember(0x20, "ext", _FakeType(

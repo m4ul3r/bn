@@ -3225,8 +3225,19 @@ class TestStackFrameMap:
         buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
         assert buffer["to_canary"] == canary - buffer["storage"] >= 44
 
-    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn):
-        shared_bn.load(CANARY_BINARY)
+    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn, tmp_path):
+        # Optimization keeps the argument directly in the load address, rather
+        # than an O0 spill/copy that the old name-keyed rule did not recognize.
+        binary = tmp_path / "context_word"
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the frame regression"
+        build = subprocess.run(
+            [cc, "-O2", "-fstack-protector-all", "-o", str(binary),
+             str(FIXTURES_DIR / "src" / "canary.c")],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
         function = "read_context_word"
         before = shared_bn.json("local", "list", "--frame", function)
         assert before["canary_storage"] is None, before
@@ -3742,6 +3753,32 @@ class TestStructLayoutAssistance903:
             restored = shared_bn.json("decompile", "handle")
             assert any("struct layout candidate" in w for w in restored["warnings"]), (
                 name, restored)
+
+        # Redeclaring an embedded type can leave the outer struct's stored
+        # width stale. That unobserved tail must not drop an otherwise
+        # identical competitor and so fabricate cfg's uniqueness.
+        shared_bn.json(
+            "types", "declare",
+            "struct ext { uint32_t a; }; "
+            "struct so_cfg { char pad[40]; uint64_t flags; uint32_t depth; struct ext tail; };")
+        fresh = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in fresh["warnings"]), fresh
+        shared_bn.json(
+            "types", "declare", "struct ext { uint32_t a, b, c, d; };")
+        stale = shared_bn.json(
+            "py", "exec",
+            "t = bv.get_type_by_name('so_cfg')\n"
+            "result = [t.width, max(m.offset + m.type.width for m in t.members)]\n")["result"]
+        assert stale[1] > stale[0], stale
+        grown = shared_bn.json("decompile", "handle")
+        assert not any("struct layout candidate" in w for w in grown["warnings"]), grown
+        shared_bn.json(
+            "py", "exec",
+            "bv.undefine_user_type('so_cfg')\n"
+            "bv.undefine_user_type('ext')\n"
+            "bv.update_analysis_and_wait()\n")
+        assert any("struct layout candidate" in w
+                   for w in shared_bn.json("decompile", "handle")["warnings"])
 
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
