@@ -26,6 +26,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
+CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
@@ -3197,6 +3198,63 @@ class TestTypesDeclarePartialDrop760:
         parsed = json.loads(res.stdout)
         assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
         assert parsed["committed"] is False, parsed
+
+
+class TestStackFrameMap:
+    """`local list --frame` on a real stack-protected frame: the canary slot is
+    found from the guard copy BN lifts in the prologue, and every row is one
+    distinct stack offset."""
+
+    def test_frame_marks_canary_and_measures_buffer_headroom(self, shared_bn):
+        shared_bn.load(CANARY_BINARY)
+        frame = shared_bn.json("local", "list", "--frame", "copy_label")
+        locals_ = shared_bn.json("local", "list", "copy_label")["items"]
+
+        slots = frame["items"]
+        stack_offsets = {item["storage"] for item in locals_ if item["storage"] <= 0
+                         and item["source_type"] == "StackVariableSourceType"}
+        assert [slot["storage"] for slot in slots] == sorted(stack_offsets)
+        assert frame["slot_count"] == len(slots)
+
+        canary = frame["canary_storage"]
+        assert canary is not None, frame
+        assert [slot["storage"] for slot in slots if slot["kind"] == "canary"] == [canary]
+        # The 44-byte buffer sits below the canary with at least its own size of
+        # headroom; `to_canary` is measured from its offset to the canary slot.
+        buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
+        assert buffer["to_canary"] == canary - buffer["storage"] >= 44
+
+    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn, tmp_path):
+        # Optimization keeps the argument directly in the load address, rather
+        # than an O0 spill/copy that the old name-keyed rule did not recognize.
+        binary = tmp_path / "context_word"
+        cc = shutil.which("cc") or shutil.which("gcc")
+        assert cc is not None, "a C compiler is required for the frame regression"
+        build = subprocess.run(
+            [cc, "-O2", "-fstack-protector-all", "-o", str(binary),
+             str(FIXTURES_DIR / "src" / "canary.c")],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
+        function = "read_context_word"
+        before = shared_bn.json("local", "list", "--frame", function)
+        assert before["canary_storage"] is None, before
+        parameter = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["is_parameter"]
+        )
+        shared_bn.json("local", "rename", function, parameter["local_id"], "fsbase")
+        renamed = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["local_id"] == parameter["local_id"]
+        )
+        assert renamed["name"] == "fsbase"
+        after = shared_bn.json("local", "list", "--frame", function)
+        assert after["canary_storage"] is None, after
+        assert [(s["storage"], s["kind"], s["to_canary"]) for s in after["items"]] == [
+            (s["storage"], s["kind"], s["to_canary"]) for s in before["items"]
+        ]
 
 
 class TestClassLensRttiGuards922:

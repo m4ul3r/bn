@@ -999,6 +999,74 @@ def _render_local_list_text(value: Any) -> str:
     return _resolution_note(value) + "\n".join(lines)
 
 
+def _fmt_frame_storage(value: Any) -> str:
+    """A frame offset as decimal ``storage`` (what `local list --format json`
+    reports) plus its signed hex, disclosing an uncoercible one (#619)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"<unknown: {value!r}>"
+    sign = "-" if value < 0 else "+"
+    return f"{value} ({sign}0x{abs(value):x})"
+
+
+def _fmt_frame_distance(value: Any) -> str:
+    """A byte distance cell: ``-`` for an explicit absence (``None``), ``?`` for a
+    value that is present but not an int (#619)."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "?"
+    return str(value)
+
+
+@_discloses
+def _render_local_frame_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    function = _field_dict(value, "function")
+    slots = _field_list(value, "items")
+    rows = [slot for slot in slots if isinstance(slot, dict)]
+    malformed = [slot for slot in slots if not isinstance(slot, dict)]
+
+    canary = value.get("canary_storage")
+    canary_note = (f"canary at {_fmt_frame_storage(canary)}" if canary is not None
+                   else "canary slot not found")
+    header = (f"{_escape_control_chars(function.get('name', '<unknown>'))} @ "
+              f"{function.get('address', '<unknown>')} "
+              f"({_fmt_count(value.get('slot_count'))} stack slots, "
+              f"{_fmt_count(value.get('variable_count'))} variables; {canary_note})")
+    lines = [header]
+    if rows:
+        table = [("storage", "next", "to_canary", "kind", "type", "names")]
+        for slot in rows:
+            kind = slot.get("kind")
+            table.append((
+                _fmt_frame_storage(slot.get("storage")),
+                _fmt_frame_distance(slot.get("distance_to_next_slot")),
+                _fmt_frame_distance(slot.get("to_canary")),
+                "" if kind == "local" else _escape_control_chars(kind if kind is not None else "?"),
+                " | ".join(_escape_control_chars(t) for t in _field_list(slot, "types")) or "?",
+                ", ".join(_escape_control_chars(n) for n in _field_list(slot, "names")) or "?",
+            ))
+        widths = [max(len(row[col]) for row in table) for col in range(5)]
+        lines.append("")
+        for row in table:
+            cells = [row[0].ljust(widths[0]), row[1].rjust(widths[1]), row[2].rjust(widths[2]),
+                     row[3].ljust(widths[3]), row[4].ljust(widths[4]), row[5]]
+            lines.append("  " + "  ".join(cells).rstrip())
+        lines.extend([
+            "",
+            "next: bytes to the next recovered slot (slot pitch, not object size -- BN can split "
+            "one buffer into several slots); to_canary: bytes from this offset to the canary slot.",
+        ])
+    if malformed:
+        lines.extend(["", f"malformed entries ({len(malformed)}):"])
+        for item in malformed:
+            lines.append(f"  {item!r}")
+    if not rows and not malformed:
+        lines.extend(["", _empty_result("stack slots")])
+    return _resolution_note(value) + "\n".join(lines)
+
+
 @_discloses
 def _render_type_info_text(value: Any) -> str:
     if not isinstance(value, dict):

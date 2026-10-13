@@ -173,22 +173,38 @@ def _sort_variable_entries(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _annotate_stack_spans(entries: list[dict[str, Any]]) -> None:
-    """Add ``span_to_next`` (bytes to the next stack slot) to each stack variable.
+    """Add ``distance_to_next_slot`` to each stack variable.
 
     BN gives a variable's frame offset (``storage``, negative for a stack slot)
-    but not its size, so judging a buffer overflow meant dropping to a ``py exec``
-    over ``func.stack_layout`` to subtract adjacent offsets. The distance to the
-    next-higher stack slot IS the slot's capacity; compute it once here so every
-    stack var carries it. The top-most slot spans to 0 (the saved frame base).
-    Register/flag locals (non-negative storage) get no span. (F20)
+    but not its size. ``distance_to_next_slot`` is the byte distance from this
+    offset to the next-higher DISTINCT recovered stack offset; the top-most slot
+    measures to 0 (the entry stack pointer). Register/flag locals (non-negative
+    storage) get none. (F20)
+
+    It is slot PITCH, not capacity. BN recovers one object as several adjacent
+    slots -- a memset'd 48-byte buffer can surface as a run of 8-byte slots -- so
+    an object's real extent can run past the next slot. For overflow headroom use
+    ``list_frame`` (``bn local list --frame``), whose ``to_canary`` measures to
+    the canary slot.
+
+    Several variables can share one offset (SSA versions, HLIL-rendered aliases);
+    distance is measured between distinct offsets, so every alias of a slot
+    carries the same value rather than 0 for all but the last.
+
+    ``span_to_next`` repeats the value under its original F20 name, retained for
+    bn-tui's stack viewer (``LocalVariable.span_to_next``, labelled "slot"); drop
+    it once that consumer reads ``distance_to_next_slot``.
     """
-    stack = sorted(
-        (e for e in entries if isinstance(e.get("storage"), int) and e["storage"] < 0),
-        key=lambda e: e["storage"],
-    )
-    for i, entry in enumerate(stack):
-        next_storage = stack[i + 1]["storage"] if i + 1 < len(stack) else 0
-        entry["span_to_next"] = next_storage - entry["storage"]
+    stack = [
+        e for e in entries
+        if isinstance(e.get("storage"), int) and not isinstance(e["storage"], bool) and e["storage"] < 0
+    ]
+    offsets = sorted({e["storage"] for e in stack})
+    next_offset = {offset: offsets[i + 1] if i + 1 < len(offsets) else 0 for i, offset in enumerate(offsets)}
+    for entry in stack:
+        distance = next_offset[entry["storage"]] - entry["storage"]
+        entry["distance_to_next_slot"] = distance
+        entry["span_to_next"] = distance
 
 
 def _list_locals(func) -> list[dict[str, Any]]:
@@ -198,6 +214,184 @@ def _list_locals(func) -> list[dict[str, Any]]:
     ]
     _annotate_stack_spans(variables)
     return _sort_variable_entries(variables)
+
+
+_CANARY_SYMBOL = "__stack_chk_guard"
+# TLS canary slots of the x86 Linux ABIs: fs:0x28 (x86_64) and gs:0x14 (i386).
+_TLS_CANARY_SLOTS = {("x86_64", "fsbase", 0x28), ("x86", "gsbase", 0x14)}
+_CONSTANT_OPS = ("MLIL_CONST", "MLIL_CONST_PTR", "MLIL_IMPORT")
+
+
+def _is_canary_load(func, expr) -> bool:
+    """True when ``expr`` loads the stack-protector guard value: a load of the
+    ``__stack_chk_guard`` symbol (directly, or through one pointer such as a GOT
+    slot) or of the x86 TLS canary slot, identified by its architectural register
+    rather than the variable's mutable display name."""
+    if expr.operation.name != "MLIL_LOAD" or expr.size != func.arch.address_size:
+        return False
+    address = expr.src
+    if address.operation.name == "MLIL_LOAD":
+        if (address.size != func.arch.address_size
+                or address.src.operation.name not in _CONSTANT_OPS):
+            return False
+        address = address.src
+    op = address.operation.name
+    if op in _CONSTANT_OPS:
+        symbol = func.view.get_symbol_at(int(address.constant))
+        return symbol is not None and str(symbol.name).split("@")[0] == _CANARY_SYMBOL
+    if op == "MLIL_ADD":
+        for base, offset in ((address.left, address.right), (address.right, address.left)):
+            if (
+                base.operation.name == "MLIL_VAR"
+                and offset.operation.name in _CONSTANT_OPS
+                and _variable_source_name(base.src) == "RegisterVariableSourceType"
+                and (func.arch.name, func.arch.get_reg_name(base.src.storage),
+                     int(offset.constant)) in _TLS_CANARY_SLOTS
+            ):
+                return True
+    return False
+
+
+def _vars_written(ins) -> list:
+    """Every variable a non-SSA MLIL instruction writes. BN's ``vars_written``
+    returns nothing for a partial field write (``rax.al = ...``) and for a typed
+    syscall, so those two name their written variables here."""
+    op = ins.operation.name
+    if op == "MLIL_SET_VAR_FIELD":
+        return [ins.dest]
+    if op == "MLIL_SYSCALL":
+        return list(ins.output)
+    return list(ins.vars_written)
+
+
+def _find_canary_storage(func) -> int | None:
+    """Storage of the stack slot the prologue copies the stack-protector guard
+    into, or None when no such copy is found.
+
+    Only an observed full-ABI-word ``slot = guard`` (or ``reg = guard; slot = reg``
+    within one basic block) counts; partial loads or copies are not guard
+    evidence. Any write to a register ends its guard copy, whatever
+    instruction makes it (a call output, a split or partial-field write as much
+    as a plain assignment). Any failure reading MLIL is treated as no evidence."""
+    try:
+        mlil = func.mlil
+        if mlil is None:
+            return None
+        guard_width = func.arch.address_size
+        for block in list(mlil.basic_blocks):
+            guard_registers: set[int] = set()
+            for ins in block:
+                from_guard = (
+                    ins.operation.name == "MLIL_SET_VAR"
+                    and ins.size == guard_width
+                    and (
+                        _is_canary_load(func, ins.src)
+                        or (ins.src.operation.name == "MLIL_VAR"
+                            and ins.src.size == guard_width
+                            and _variable_identifier(ins.src.src) in guard_registers)
+                    )
+                )
+                for written in _vars_written(ins):
+                    written_id = _variable_identifier(written)
+                    if written_id is None:
+                        guard_registers.clear()
+                    else:
+                        guard_registers.discard(written_id)
+                if not from_guard:
+                    continue
+                if _variable_source_name(ins.dest) == "StackVariableSourceType":
+                    return int(ins.dest.storage)
+                identifier = _variable_identifier(ins.dest)
+                if identifier is not None:
+                    guard_registers.add(identifier)
+    except Exception:
+        return None
+    return None
+
+
+def _frame_slot_kind(storage: int, names: list[str], canary: int | None) -> str:
+    if storage == canary:
+        return "canary"
+    if any(name.startswith("__saved_") for name in names):
+        return "saved_register"
+    if "__return_addr" in names:
+        return "return_address"
+    if storage >= 0:
+        return "caller_frame"
+    return "local"
+
+
+def _list_frame(func) -> dict[str, Any]:
+    """One row per DISTINCT ``func.stack_layout`` offset, ascending.
+
+    ``bn local list`` has one row per variable, so a frame whose slots carry
+    several SSA versions or aliases each reads as dozens of rows. Here the
+    aliases collapse into their slot, which is what a layout question ("how far
+    is this buffer from the canary") needs. Each row carries:
+
+    * ``distance_to_next_slot`` -- bytes to the next distinct offset (slot pitch,
+      NOT capacity; see ``_annotate_stack_spans``); the top-most negative slot
+      measures to 0, a non-negative top slot has none;
+    * ``to_canary`` -- bytes from this offset to the canary slot, for slots
+      below it: the headroom a write starting here has before it reaches the
+      canary, however BN split the object into slots;
+    * ``kind`` -- ``canary``, ``saved_register``, ``return_address``,
+      ``caller_frame`` (non-negative storage) or ``local``.
+
+    Variables keep their ``local_id`` so a row can drive ``local rename`` /
+    ``local retype`` directly. Collapsing happens here only: the canonical
+    iteration that resolves ``local_id`` selectors is untouched.
+    """
+    parameter_markers = {_variable_marker(var) for var in list(func.parameter_vars)}
+    by_storage: dict[int, list[Any]] = {}
+    seen: set[tuple[int | None, int]] = set()
+    for var in list(func.stack_layout):
+        marker = _variable_marker(var)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        by_storage.setdefault(int(var.storage), []).append(var)
+
+    canary = _find_canary_storage(func)
+    offsets = sorted(by_storage)
+    slots: list[dict[str, Any]] = []
+    for i, storage in enumerate(offsets):
+        if storage < 0:
+            next_offset = min(offsets[i + 1], 0) if i + 1 < len(offsets) else 0
+            distance: int | None = next_offset - storage
+        elif i + 1 < len(offsets):
+            distance = offsets[i + 1] - storage
+        else:
+            distance = None
+        variables = []
+        for var in by_storage[storage]:
+            is_parameter = _variable_marker(var) in parameter_markers
+            variables.append(
+                {
+                    "name": str(var.name),
+                    "type": str(var.type),
+                    "is_parameter": is_parameter,
+                    "local_id": _local_id(func, var, is_parameter=is_parameter),
+                }
+            )
+        names = [item["name"] for item in variables]
+        slots.append(
+            {
+                "storage": storage,
+                "kind": _frame_slot_kind(storage, names, canary),
+                "names": names,
+                "types": list(dict.fromkeys(item["type"] for item in variables)),
+                "distance_to_next_slot": distance,
+                "to_canary": canary - storage if canary is not None and storage < canary else None,
+                "variables": variables,
+            }
+        )
+    return {
+        "slots": slots,
+        "slot_count": len(slots),
+        "variable_count": len(seen),
+        "canary_storage": canary,
+    }
 
 
 def _find_variables_by_name(func, name: str) -> list[tuple[Any, bool]]:

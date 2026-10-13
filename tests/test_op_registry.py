@@ -12,6 +12,9 @@ from _bridge_fakes import _load_bridge
 EXPECTED_READ = {
     "doctor", "list_targets", "target_info", "function_info", "get_prototype",
     "list_functions", "list_locals", "search_functions", "callsites", "decompile",
+    # `local list --frame`: the same function's stack_layout collapsed to one
+    # row per distinct offset, a pure read like `list_locals`.
+    "list_frame",
     # #676 item 5: the multi-identifier form of `decompile`. READ-locked like
     # its singular sibling -- it loops the same handler under one lock instead
     # of paying a round trip and a lock acquisition per function.

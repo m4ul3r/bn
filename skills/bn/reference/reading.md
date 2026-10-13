@@ -46,6 +46,7 @@ bn function cfg <fn> [--view {asm|mlil|hlil}]        # basic-block graph: blocks
 bn function structured-il <fn>                       # flat per-instruction list: op plus vars_read/vars_written, no block partitioning
 bn proto get <fn>
 bn local list <fn>
+bn local list --frame <fn>                           # stack frame map: one row per distinct stack offset, saved-register/canary markers, bytes to the canary
 bn data vars --start <addr> --end <addr>             # typed data variables in an address window (the window is mandatory)
 bn data symbols [--limit N] [--offset N]             # named DataSymbols, internal ones included (paged: 100 by default)
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
@@ -113,7 +114,8 @@ Most collections use `{kind, items, total, offset, limit, returned, has_more}`. 
 | `function list` / `function search`, `imports`, `exports` | `.items[].name`, `.items[].address` |
 | `sections` | `.items[].name`, `.start`, `.end`, `.length`, `.semantics` |
 | `types` | `.items[].decl`, `.layout`, and aggregate `.members[]` |
-| `local list` → `.items[]` | same list retained under `.locals`; rows carry `.local_id` |
+| `local list` → `.items[]` | same list retained under `.locals`; rows carry `.local_id`; stack rows carry `.distance_to_next_slot` (slot pitch, not object size; the top negative slot measures to entry-SP offset 0 even when no slot is recovered there) |
+| `local list --frame` → `.items[]` | one row per distinct stack offset: `.storage`, `.kind` (`local`/`saved_register`/`canary`/`return_address`/`caller_frame`), `.names`, `.distance_to_next_slot`, `.to_canary`, `.variables[].local_id`; top level `.canary_storage`. Canary evidence requires a full-ABI-word guard load and copy; TLS identity comes from architectural registers, not mutable local names. |
 | `xrefs` | `.items[]`, with `.kind` and `.caller_function` per reference |
 | `callsites` | `.items[].caller_static`, `.callee`, `.containing_function` |
 | `comment list` | `.items[].comment` and `.scope` (`address` or `function_doc`) |

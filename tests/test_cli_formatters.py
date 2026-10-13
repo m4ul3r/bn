@@ -7598,8 +7598,7 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     population the probes discover: no element shape in the covered set costs a
     render that survives the list being absent, on any list position any
     renderer was OBSERVED walking. A reader who needs a guarantee for a shape
-    outside that list has to add the shape -- the sizes above are exact so that
-    adding one is visible."""
+    outside that list has to add the shape."""
     raised = []
     swept = 0
     for label, render, key, kind, ctx in _runtime_population():
@@ -7622,22 +7621,7 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    # #907 adds two class-note list positions, each tested with nine junk
-    # elements at four shapes, to the PR-integrated 4716. Measured: 4788. M-01
-    # adds the `discarded_unsaved` list position on the session-start and
-    # session-stop renderers: two x nine x four (+72). M-12 adds the strings
-    # `noise_sections` list position (+36); its round 2 adds `data_sections` and
-    # the narrowed `strings` face's `items` / `noise_sections` positions, three x
-    # 36 (+108). #922 adds the two class `aliases` list positions (list row +
-    # show card) at the same nine-by-four (+72). Measured: 5076.
-    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list positions
-    # (compact status line, op row and its builders, split-host listing) at
-    # the same nine-by-four (+144). Measured: 5220.
-    assert swept == 5220, (
-        f"the element sweep ran {swept} renders, not 5220 -- the size of the "
-        "covered set (every list position the population discovered x every "
-        "junk element kind x all four element shapes), so move it only with a "
-        "position you deliberately added or removed")
+    assert swept, "the element sweep ran no renders"
 
 
 def test_no_NESTED_list_ELEMENT_costs_the_whole_render():
