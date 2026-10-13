@@ -246,13 +246,27 @@ def _is_canary_load(view, expr) -> bool:
     return False
 
 
+def _vars_written(ins) -> list:
+    """Every variable a non-SSA MLIL instruction writes. BN's ``vars_written``
+    returns nothing for a partial field write (``rax.al = ...``) and for a typed
+    syscall, so those two name their written variables here."""
+    op = ins.operation.name
+    if op == "MLIL_SET_VAR_FIELD":
+        return [ins.dest]
+    if op == "MLIL_SYSCALL":
+        return list(ins.output)
+    return list(ins.vars_written)
+
+
 def _find_canary_storage(func) -> int | None:
     """Storage of the stack slot the prologue copies the stack-protector guard
     into, or None when no such copy is found.
 
     Only an observed ``slot = guard`` (or ``reg = guard; slot = reg`` within one
     basic block) counts; a function without that evidence gets no canary rather
-    than a guessed one. Any failure reading MLIL is treated as no evidence."""
+    than a guessed one. Any write to a register ends its guard copy, whatever
+    instruction makes it (a call output, a split or partial-field write as much
+    as a plain assignment). Any failure reading MLIL is treated as no evidence."""
     try:
         mlil = func.mlil
         if mlil is None:
@@ -261,20 +275,18 @@ def _find_canary_storage(func) -> int | None:
         for block in list(mlil.basic_blocks):
             guard_registers: set[int | None] = set()
             for ins in block:
-                if ins.operation.name != "MLIL_SET_VAR":
-                    continue
-                src = ins.src
-                from_guard = _is_canary_load(view, src) or (
-                    src.operation.name == "MLIL_VAR" and _variable_identifier(src.src) in guard_registers
+                from_guard = ins.operation.name == "MLIL_SET_VAR" and (
+                    _is_canary_load(view, ins.src)
+                    or (ins.src.operation.name == "MLIL_VAR"
+                        and _variable_identifier(ins.src.src) in guard_registers)
                 )
-                dest = ins.dest
-                if _variable_source_name(dest) == "StackVariableSourceType":
-                    if from_guard:
-                        return int(dest.storage)
-                elif from_guard:
-                    guard_registers.add(_variable_identifier(dest))
-                else:
-                    guard_registers.discard(_variable_identifier(dest))
+                for written in _vars_written(ins):
+                    guard_registers.discard(_variable_identifier(written))
+                if not from_guard:
+                    continue
+                if _variable_source_name(ins.dest) == "StackVariableSourceType":
+                    return int(ins.dest.storage)
+                guard_registers.add(_variable_identifier(ins.dest))
     except Exception:
         return None
     return None

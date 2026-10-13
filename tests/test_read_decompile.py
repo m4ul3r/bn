@@ -470,6 +470,10 @@ def test_list_locals_without_hlil_falls_back_to_param_and_stack(monkeypatch):
 
 
 def _mlil(operation: str, **fields):
+    # BN 6.1's `vars_written`: a plain assignment names its `dest`, a call or
+    # split passes its outputs explicitly, and a field write (`rax.al = ...`) or
+    # typed syscall reports NOTHING -- the gap `_vars_written` covers.
+    fields.setdefault("vars_written", [fields["dest"]] if operation == "MLIL_SET_VAR" else [])
     return types.SimpleNamespace(operation=types.SimpleNamespace(name=operation), **fields)
 
 
@@ -567,6 +571,57 @@ def test_frame_detects_the_x86_tls_canary_and_ignores_a_clobbered_guard_register
     assert [(s["storage"], s["kind"], s["to_canary"]) for s in frame["slots"]] == [
         (-56, "local", 40), (-24, "local", 8), (-16, "canary", None),
     ]
+
+
+def _tls_guard_frame(*clobber):
+    """``rax = fs:[0x28]; <clobber>; var_10 = rax`` -- the store is the canary
+    only when no instruction in between wrote rax."""
+    fn = _FakeFunction(0x401189, "copy_name")
+    slot = _FakeVariable(name="var_10", storage=-16, var_type="int64_t", identifier=2)
+    fn.stack_layout = [_FakeVariable(name="str", storage=-56, var_type="char[0x28]", identifier=1), slot]
+    regs = {name: _FakeVariable(name=name, storage=i, var_type="int64_t", identifier=10 + i,
+                                source_type="RegisterVariableSourceType")
+            for i, name in enumerate(("rax", "fsbase", "rcx", "rdx"))}
+    tls_guard = _mlil("MLIL_LOAD", src=_mlil(
+        "MLIL_ADD", left=_mlil("MLIL_VAR", src=regs["fsbase"]), right=_mlil("MLIL_CONST", constant=0x28)))
+    fn.view = types.SimpleNamespace(get_symbol_at=lambda address: None)
+    fn.mlil = types.SimpleNamespace(basic_blocks=[[
+        _mlil("MLIL_SET_VAR", dest=regs["rax"], src=tls_guard),
+        *(build(regs) for build in clobber),
+        _mlil("MLIL_SET_VAR", dest=slot, src=_mlil("MLIL_VAR", src=regs["rax"])),
+    ]])
+    return fn
+
+
+@pytest.mark.parametrize("writer", [
+    lambda r: _mlil("MLIL_CALL", output=[r["rax"]], vars_written=[r["rax"]],
+                    dest=_mlil("MLIL_CONST_PTR", constant=0x401000), params=[]),
+    lambda r: _mlil("MLIL_SET_VAR_SPLIT", high=r["rdx"], low=r["rax"], vars_written=[r["rdx"], r["rax"]],
+                    src=_mlil("MLIL_CONST", constant=0)),
+    lambda r: _mlil("MLIL_SET_VAR_FIELD", dest=r["rax"], offset=0, src=_mlil("MLIL_CONST", constant=0)),
+    lambda r: _mlil("MLIL_SYSCALL", output=[r["rax"]], params=[]),
+], ids=["call_output", "set_var_split", "set_var_field", "syscall_output"])
+def test_frame_canary_ignores_a_guard_register_any_instruction_overwrote(monkeypatch, writer):
+    bridge = _load_bridge(monkeypatch)
+
+    frame = bridge.vars_mod._list_frame(_tls_guard_frame(writer))
+
+    assert frame["canary_storage"] is None
+    assert all(s["kind"] == "local" and s["to_canary"] is None for s in frame["slots"])
+
+
+def test_frame_canary_keeps_a_guard_copy_that_survives_unrelated_writes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _tls_guard_frame(
+        # rcx = rax copies the guard; a call writing only rdx and a self-copy of
+        # rax leave rax holding it.
+        lambda r: _mlil("MLIL_SET_VAR", dest=r["rcx"], src=_mlil("MLIL_VAR", src=r["rax"])),
+        lambda r: _mlil("MLIL_CALL", output=[r["rdx"]], vars_written=[r["rdx"]],
+                        dest=_mlil("MLIL_CONST_PTR", constant=0x401000), params=[]),
+        lambda r: _mlil("MLIL_SET_VAR", dest=r["rax"], src=_mlil("MLIL_VAR", src=r["rax"])),
+    )
+
+    assert bridge.vars_mod._list_frame(fn)["canary_storage"] == -16
 
 
 def test_frame_without_canary_evidence_marks_no_canary(monkeypatch):
