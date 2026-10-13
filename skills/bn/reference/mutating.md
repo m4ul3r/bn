@@ -105,6 +105,9 @@ The manifest must be an object with an `ops` array. Validation runs before apply
 
 ### Batch op kinds and required fields
 
+`bn batch apply --help` lists every accepted kind; use this table for its required fields and interactive equivalent.
+Help locates this reference within the installed `bn` skill; a source checkout or a particular working directory is not required.
+
 | `op` | required fields | one of | interactive equivalent |
 |---|---|---|---|
 | `rename_symbol` | `identifier`, `new_name` | — | `bn symbol rename` |

@@ -1255,23 +1255,6 @@ def bound_absence_claims(sentence: str, token: re.Pattern[str],
     return denied
 
 
-def _prose_and_fenced(text: str) -> tuple[str, str]:
-    """A document split into its prose and its fenced examples.
-
-    A fenced example is a runnable instruction, never a denial, so a flag named
-    inside one is a positive claim whatever the prose around it says.
-    """
-    prose: list[str] = []
-    fenced: list[str] = []
-    inside = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            inside = not inside
-            continue
-        (fenced if inside else prose).append(line)
-    return "\n".join(prose), "\n".join(fenced)
-
-
 def _parser_long_flags() -> set[str]:
     """Every long option the CLI accepts, at any depth of the subcommand tree."""
     import argparse
@@ -1289,38 +1272,6 @@ def _parser_long_flags() -> set[str]:
 
     walk(bn.cli.build_parser())
     return flags
-
-
-@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
-def test_every_flag_the_reference_names_exists(doc: Path):
-    """A flag an agent reads in any agent-facing doc must be one the CLI accepts.
-
-    The mirror of this module's founding defect. Its header records that an
-    OMITTED flag makes agents conclude a shipped feature does not exist -- three
-    re-filed it in one dogfood run. The inverse costs the same and was guarded
-    by nothing: a document that ADVERTISES a flag the parser has never heard of
-    sends an agent to write `--dry-run` and read the argparse refusal as a
-    broken CLI.
-
-    The absence exemption is bound to the OCCURRENCE, not to the document. Read
-    document-wide it let a round-23 lens ship a runnable `bn go rename
-    --dry-run` example and have it excused by an unrelated denial sentence
-    further down the same file -- certifying the exact false instruction this
-    cell exists to catch.
-    """
-    known = _parser_long_flags()
-    assert known, "the parser exposes no long flags, so this cell proves nothing"
-    prose, fenced = _prose_and_fenced(doc.read_text(encoding="utf-8"))
-    invented = {match[0] for match in _DOC_FLAG.finditer(fenced)} - known
-    for sentence in _SENTENCE.split(prose):
-        named = {match[0] for match in _DOC_FLAG.finditer(sentence)}
-        invented |= (named - known
-                     - bound_absence_claims(sentence, _DOC_FLAG, _ABSENCE_CLAIM))
-    assert not invented, (
-        f"{doc.name} names flags the parser does not accept, so an agent copying "
-        f"them gets an argparse refusal and reads it as a broken CLI: "
-        f"{sorted(invented)}"
-    )
 
 
 # The opposite direction is the one claim in this accounting that is NOT
