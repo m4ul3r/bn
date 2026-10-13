@@ -1666,14 +1666,39 @@ class BridgeContext:
         name = str(type_name)
         query = name[:-2] if name.endswith("_t") and len(name) > 2 else name
         search_hint = f"`bn types --query {query}` to search available types"
+        class_note = self._class_vtable_note(name, available)
         if suggestions:
             raise RuntimeError(
                 f"Type not found: {name}. Did you mean: {', '.join(suggestions)}. "
-                f"Or try {search_hint}."
+                f"Or try {search_hint}.{class_note}"
             )
         raise RuntimeError(
-            f"Type not found: {name}. No similar type names; try {search_hint}."
+            f"Type not found: {name}. No similar type names; try {search_hint}.{class_note}"
         )
+
+    @staticmethod
+    def _class_vtable_note(name: str, available: list[str]) -> str:
+        """#963: a C++ class whose RTTI BN analysed has a vtable TYPE but no
+        instance struct, so `struct show <Class>` missed while the suggestions
+        listed `<Class>::VTable` and BN's `<Base>::<Class>::VTable` spellings,
+        which read like nested types that should not exist. Say what they are
+        and how to get an instance struct whose virtual calls render by name."""
+        own = [n for n in available if n == f"{name}::VTable" or n.endswith(f"::{name}::VTable")]
+        derived = sorted(n for n in available
+                         if n.startswith(f"{name}::") and n.endswith("::VTable") and n not in own)
+        if not own and not derived:
+            return ""
+        if own:
+            listed = f"BN's RTTI analysis created only its vtable type ({', '.join(own[:3])})"
+        else:
+            listed = (f"BN created no vtable type for {name} itself, only for classes derived "
+                      f"from it ({', '.join(derived[:3])})")
+        vt = (own or derived)[0]
+        return (f" No struct named {name} is defined: {listed}; BN names a derived class's "
+                f"vtable type `<Base>::<Class>::VTable`. Declare the instance struct with a typed "
+                f"vptr, e.g. bn types declare 'struct `{name}` {{ struct `{vt}`* vtable; }};', "
+                f"then type `this` as struct `{name}`* so virtual calls render as "
+                f"this->vtable-><method>().")
 
     @staticmethod
     def _is_anonymous_aggregate(member_type) -> bool:
@@ -1689,8 +1714,59 @@ class BridgeContext:
         rest = m.group(2).strip()
         return rest == "" or rest.startswith("{")
 
-    def _render_type_layout(self, type_obj) -> str:
+    @staticmethod
+    def _base_entries(type_obj) -> list[dict]:
+        """#965: the C++ bases a structure records (`base_structures`), as
+        ``{name, offset, width}``. Empty for a type with none -- and for anything
+        that is not a structure, whose BN object has no such attribute."""
+        out: list[dict] = []
+        try:
+            bases = list(getattr(type_obj, "base_structures", None) or [])
+        except Exception:
+            return out
+        for base in bases:
+            base_type = getattr(base, "type", None)
+            name = getattr(base_type, "name", None)
+            entry: dict = {"name": str(name if name is not None else base_type)}
+            for key in ("offset", "width"):
+                try:
+                    entry[key] = hex(int(getattr(base, key)))
+                except Exception:
+                    pass
+            out.append(entry)
+        return out
+
+    @staticmethod
+    def _inherited_members(type_obj, bv) -> list[tuple[int, Any, str]]:
+        """#965: ``(offset, member, base name)`` for every member a structure
+        inherits, read through BN's own ``members_including_inherited`` so the
+        offsets are the ones BN lays the bases out at (the member offsets it
+        returns are already relative to the derived struct). Empty without a
+        view (a base is a named reference only a view can resolve) or bases."""
+        if bv is None or not getattr(type_obj, "base_structures", None):
+            return []
+        reader = getattr(type_obj, "members_including_inherited", None)
+        if not callable(reader):
+            return []
+        out = []
+        try:
+            for inherited in list(reader(bv)):
+                base = getattr(inherited, "base", None)
+                if base is None:
+                    continue
+                member = getattr(inherited, "member", None)
+                base_name = getattr(base, "name", None)
+                out.append((int(getattr(member, "offset", 0)), member,
+                            str(base_name if base_name is not None else base)))
+        except Exception:
+            return []
+        return out
+
+    def _render_type_layout(self, type_obj, bv=None) -> str:
         header = str(type_obj)
+        bases = self._base_entries(type_obj)
+        if bases:
+            header += " : " + ", ".join(base["name"] for base in bases)
         try:
             width = int(getattr(type_obj, "width", 0))
             header = f"{header} // size=0x{width:x}"
@@ -1702,8 +1778,26 @@ class BridgeContext:
             return header
 
         tc = str(getattr(getattr(type_obj, "type_class", None), "name", "") or "")
+        inherited = self._inherited_members(type_obj, bv)
+        if not inherited:
+            lines = [header]
+            self._append_member_lines(lines, members, "Enum" in tc, depth=0)
+            return "\n".join(lines)
+        # Inherited fields interleaved with the struct's own in offset order and
+        # labelled with the base they come from: a derived struct otherwise
+        # renders as its own members after an unexplained gap (#965).
+        rows: list[tuple[int, list[str]]] = [
+            (offset, [(f"0x{offset:04x}: {getattr(member, 'type', '<unknown>')} "
+                       f"{getattr(member, 'name', '<anonymous>')}  [from {base_name}]")])
+            for offset, member, base_name in inherited
+        ]
+        for member in list(members):
+            own: list[str] = []
+            self._append_member_lines(own, [member], "Enum" in tc, depth=0)
+            rows.append((int(getattr(member, "offset", 0) or 0), own))
         lines = [header]
-        self._append_member_lines(lines, members, "Enum" in tc, depth=0)
+        for _, block in sorted(rows, key=lambda row: row[0]):
+            lines.extend(block)
         return "\n".join(lines)
 
     def _append_member_lines(self, lines: list, members, is_enum: bool, *, depth: int) -> None:
@@ -1771,7 +1865,7 @@ class BridgeContext:
             out.append(entry)
         return out
 
-    def _type_entry(self, type_name, type_obj):
+    def _type_entry(self, type_name, type_obj, bv=None):
         type_class = getattr(type_obj, "type_class", None)
         kind = "unknown"
         if type_class is not None:
@@ -1783,15 +1877,26 @@ class BridgeContext:
             "name": str(type_name),
             "kind": kind,
             "decl": str(type_obj),
-            "layout": self._render_type_layout(type_obj),
+            "layout": self._render_type_layout(type_obj, bv),
         }
         members = self._member_entries(type_obj)
         if members is not None:
             entry["members"] = members
+        bases = self._base_entries(type_obj)
+        if bases:
+            # Absent for a type without bases, so an ordinary entry grows no key.
+            entry["bases"] = bases
+            inherited = self._inherited_members(type_obj, bv)
+            if inherited:
+                entry["inherited_members"] = [
+                    {"name": str(getattr(member, "name", "<anonymous>")), "offset": hex(offset),
+                     "type": str(getattr(member, "type", "")), "from": base_name}
+                    for offset, member, base_name in sorted(inherited, key=lambda row: row[0])
+                ]
         return entry
 
     def _current_type_entry(self, bv, type_name: str):
         type_obj = bv.get_type_by_name(type_name)
         if type_obj is None:
             return None
-        return self._type_entry(type_name, type_obj)
+        return self._type_entry(type_name, type_obj, bv)

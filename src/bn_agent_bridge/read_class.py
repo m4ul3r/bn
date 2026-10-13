@@ -367,6 +367,12 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
         syms = rtti.get(cls, {})
         rec["vtable"] = _vtable_symbol_entry(ctx, bv, syms.get("vtable"), cls)
         rec["typeinfo"] = _sym_entry(syms.get("typeinfo"))
+        # #960: what the typeinfo's own ABI selector says it describes, so a
+        # typeinfo for an enum or fundamental type is classified by the ABI's
+        # statement rather than by the shape of its demangled name alone.
+        rec["typeinfo_abi"] = (_typeinfo_abi_kind(ctx, bv, int(rec["typeinfo"]["address"], 16),
+                                                  ctx._pointer_size(bv))
+                               if rec["typeinfo"] and ctx is not None else None)
         rec["typeinfo_name"] = _sym_entry(syms.get("typeinfo_name"))
         if syms.get("vtable") or syms.get("typeinfo") or syms.get("typeinfo_name"):
             rec["confidence"] = "rtti"
@@ -960,22 +966,45 @@ def _is_type_expression_name(name: str) -> bool:
     # A function type / pointer / reference / array / multi-token fundamental type.
     if any(c in core for c in "(*[&") or " " in core:
         return True
-    _FUNDAMENTAL = {
-        "void", "bool", "char", "signed", "unsigned", "short", "int", "long",
-        "float", "double", "wchar_t", "char8_t", "char16_t", "char32_t", "nullptr_t",
-        "__int128", "decltype(nullptr)",
-    }
     # A bare fundamental type has no `::` qualifier and is a known keyword.
-    return "::" not in core and core.lstrip("_") in _FUNDAMENTAL
+    return _is_fundamental_type_name(core)
+
+
+# Fundamental types as BN's demangler spells their typeinfo: the C++ keywords,
+# plus the fixed-width names it substitutes for the integer manglings (`_ZTIi`
+# demangles to `typeinfo for int32_t`, `_ZTIh` to `uint8_t`, `_ZTIg` to
+# `float128`). The keyword set alone let `int32_t` through as a class (#960).
+_FUNDAMENTAL_TYPE_NAMES = frozenset({
+    "void", "bool", "char", "signed", "unsigned", "short", "int", "long",
+    "float", "double", "wchar_t", "char8_t", "char16_t", "char32_t", "nullptr_t",
+    "int128", "__int128", "decltype(nullptr)", "std::nullptr_t",
+    "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t",
+    "int64_t", "uint64_t", "int128_t", "uint128_t", "float128",
+})
+
+
+def _is_fundamental_type_name(name: str) -> bool:
+    return name.strip() in _FUNDAMENTAL_TYPE_NAMES
 
 
 def _is_non_class_rtti_artifact(rec: dict[str, Any]) -> bool:
     """#481: an RTTI row that is typeinfo for a NON-object TYPE (function/pointer/
-    fundamental), not a domain class. Requires rtti confidence, no vtable, no clustered
-    methods AND a type-expression name (so a real typeinfo-only class isn't mislabeled)."""
+    fundamental/enum), not a domain class.
+
+    Decided, in order of authority (#960): the typeinfo's own ABI selector
+    (``__enum_type_info``, ``__fundamental_type_info``, ...) when it can be read;
+    else a bare fundamental-type name, which no class can carry, whatever vtable
+    or base a neighbouring object made it appear to have; else -- the original
+    #481 rule -- a type-expression name on a row with no vtable and no clustered
+    methods (so a real typeinfo-only class isn't mislabeled)."""
+    if rec["confidence"] != "rtti":
+        return False
+    if rec.get("typeinfo_abi") == "nonclass":
+        return True
+    if _is_fundamental_type_name(rec["name"]):
+        return True
     return bool(
-        rec["confidence"] == "rtti"
-        and rec["vtable"] is None
+        rec["vtable"] is None
         and len(rec["methods"]) == 0
         and _is_type_expression_name(rec["name"])
     )
@@ -1701,11 +1730,55 @@ def _bases_for_record(ctx, bv, rec: dict[str, Any]) -> list[dict[str, Any]]:
     ti = rec.get("typeinfo")
     if not ti:
         return []
+    # #960: typeinfo for a non-class type has no bases; when its selector is
+    # unreadable the fundamental name alone says so, and decoding it would read
+    # the next object in memory as a "base".
+    if rec.get("typeinfo_abi") == "nonclass" or _is_fundamental_type_name(str(rec.get("name") or "")):
+        return []
     typeinfo_addr = int(ti["address"], 16)
     if _typeinfo_is_import_slot(ctx, bv, typeinfo_addr):
         _note_typeinfo_import(rec)
         return []
     return _rtti_bases(ctx, bv, typeinfo_addr)
+
+
+# The Itanium typeinfo classes, keyed by the selector a typeinfo's vptr names:
+# the three that describe a CLASS (and their base layout), and the ones that
+# describe a non-class TYPE -- a fundamental (`int`), an enum, a pointer, a
+# function, an array, a pointer-to-member. A non-class typeinfo has no bases;
+# reading its trailing words as a base list decodes whatever object follows.
+_CLASS_TYPEINFO_ABIS = (("__class_type_info", "base"),
+                        ("__si_class_type_info", "si"),
+                        ("__vmi_class_type_info", "vmi"))
+_NON_CLASS_TYPEINFO_ABIS = ("__fundamental_type_info", "__enum_type_info",
+                            "__pointer_type_info", "__pointer_to_member_type_info",
+                            "__function_type_info", "__array_type_info")
+
+
+def _typeinfo_abi_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str | None:
+    """The layout a typeinfo's ABI selector declares: 'base'/'si'/'vmi' for a
+    class typeinfo, 'nonclass' for a fundamental/enum/pointer/function/array/
+    member-pointer typeinfo, or None when the vptr names no selector this can
+    read (stripped, relocated to zero, or an unrelated symbol)."""
+    get_symbol_at = getattr(bv, "get_symbol_at", None)
+    if not callable(get_symbol_at):
+        return None
+    vptr = ctx._read_pointer_value(bv, typeinfo_addr, size=ptr)
+    if not vptr:
+        return None
+    # The ABI vptr is two words past the selector's object head.
+    # An unrelated adjacent extern can occupy the exact vptr address.
+    for candidate in (vptr - 2 * ptr, vptr):
+        sym = get_symbol_at(candidate)
+        name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "")
+        if "__cxxabiv1" not in name:
+            continue
+        for abi, layout in _CLASS_TYPEINFO_ABIS:
+            if abi in name:
+                return layout
+        if any(abi in name for abi in _NON_CLASS_TYPEINFO_ABIS):
+            return "nonclass"
+    return None
 
 
 def _has_nonvirtual_rtti_ancestry(ctx, bv, typeinfo_addr: int, ptr: int) -> bool:
@@ -1724,23 +1797,8 @@ def _has_nonvirtual_rtti_ancestry(ctx, bv, typeinfo_addr: int, ptr: int) -> bool
         if (_typeinfo_is_import_slot(ctx, bv, addr)
                 or ctx._typeinfo_name_at(bv, addr) is None):
             return False
-        vptr = ctx._read_pointer_value(bv, addr, size=ptr)
-        kind = None
-        if vptr:
-            # The ABI vptr is two words past the selector's object head.
-            # An unrelated adjacent extern can occupy the exact vptr address.
-            for candidate in (vptr - 2 * ptr, vptr):
-                sym = bv.get_symbol_at(candidate)
-                name = str(getattr(sym, "short_name", "") or getattr(sym, "raw_name", "") or "")
-                for abi, layout in (("__class_type_info", "base"),
-                                    ("__si_class_type_info", "si"),
-                                    ("__vmi_class_type_info", "vmi")):
-                    if "__cxxabiv1" in name and abi in name:
-                        kind = layout
-                        break
-                if kind:
-                    break
-        if kind is None:
+        kind = _typeinfo_abi_kind(ctx, bv, addr, ptr)
+        if kind not in ("base", "si", "vmi"):
             return False
         after_name = addr + 2 * ptr
         if kind == "si":
@@ -1777,7 +1835,14 @@ def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) ->
             "kind": kind,
         }
 
-    kind = kind_hint or _infer_rtti_kind(ctx, bv, typeinfo_addr, ptr)
+    kind = kind_hint or _typeinfo_abi_kind(ctx, bv, typeinfo_addr, ptr)
+    if kind == "nonclass":
+        # #960: typeinfo for a fundamental/enum/... type has no bases. It is two
+        # words long, so structural inference read the NEXT object as a "base"
+        # (an `int32_t` row showing a `std::basic_ios<...>` base).
+        return []
+    if kind is None:
+        kind = _infer_rtti_kind(ctx, bv, typeinfo_addr, ptr)
     if kind == "base":
         return []
     if kind == "si":

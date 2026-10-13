@@ -900,6 +900,105 @@ class TestTypesDeclareBitfield:
         assert parsed["results"][0]["status"] == "verified", parsed["results"]
 
 
+class TestTypeStringsAndInheritance:
+    """#961 / #962 / #964 / #965 against BN's real type system: member objects
+    that are fresh on every access, a `::`-qualified type registered under its
+    component list, a parser that drops C++ base clauses, and the per-type
+    declare summary. None of these can be modelled faithfully by the fakes."""
+
+    def test_retype_field_under_its_own_name(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Probe961 { void* vtable; int field; };")
+        res = shared_bn.run("struct", "field", "set", "Probe961", "0", "vtable", "void**",
+                            "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        assert json.loads(res.stdout)["results"][0]["status"] == "verified"
+        assert "void** vtable" in shared_bn.run("struct", "show", "Probe961").stdout
+
+    def test_tagged_and_backticked_qualified_field_types_resolve(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Probe962 { void* vtable; int field; };")
+        # Registered the way a recovered C++ type is: under its component list.
+        shared_bn.json("py", "exec", "--code",
+                       "import binaryninja as bn\n"
+                       "s = bn.StructureBuilder.create()\n"
+                       "s.append(bn.Type.pointer(bv.arch, bn.Type.void()), 'slot0')\n"
+                       "bv.define_user_type(bn.QualifiedName(['demo', 'Widget', 'VTable']),"
+                       " bn.Type.structure_type(s))\n")
+        for spelling in ("struct demo::Widget::VTable*", "struct `demo::Widget::VTable`*",
+                         "demo::Widget::VTable*"):
+            res = shared_bn.run("struct", "field", "set", "Probe962", "0", "vtable", spelling,
+                                "--format", "json")
+            assert res.returncode == 0, f"{spelling}: {res.stdout}\n{res.stderr}"
+        assert "struct demo::Widget::VTable* vtable" in shared_bn.run(
+            "struct", "show", "Probe962").stdout
+        # A tag keyword that contradicts the type's kind fails, naming the spelling.
+        bad = shared_bn.run("struct", "field", "set", "Probe962", "0", "vtable",
+                            "union demo::Widget::VTable*", "--format", "json")
+        assert bad.returncode == 3, bad.stdout
+        assert "struct `demo::Widget::VTable`" in bad.stdout, bad.stdout
+        # An unquoted qualified name in a declaration body gets its spelling.
+        res = shared_bn.run("types", "declare", "struct Holder962 { demo::Widget::VTable* v; };",
+                            "--format", "json")
+        assert res.returncode == 3, res.stdout
+        assert "struct `demo::Widget::VTable`" in res.stdout, res.stdout
+
+    def test_declared_bases_are_recorded_and_shown(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        summary = shared_bn.json(
+            "types", "declare",
+            "struct Base965 { void* vtable; int x; }; struct Mid965 : Base965 { int m; }; "
+            "struct Derived965 : public Mid965 { int y; }; "
+            "struct Two965 : Base965, Mid965 { char c; }; "
+            "struct Virt965 : virtual Base965 { int z; };",
+            "--summary")
+        # #964: counted per type, not per op.
+        declared = summary["declared_types"]
+        assert declared["count"] == 5, summary
+        assert set(declared["names"]) == {"Base965", "Mid965", "Derived965", "Two965", "Virt965"}
+        # A virtual base has no fixed offset: declared as parsed, and disclosed.
+        assert list(declared["unattached_bases"]) == ["Virt965"], summary
+
+        shown = shared_bn.run("struct", "show", "Derived965").stdout
+        assert shown.splitlines() == [
+            "struct Derived965 : Mid965 // size=0x18",
+            "0x0000: void* vtable  [from Base965]",
+            "0x0008: int32_t x  [from Base965]",
+            "0x0010: int32_t m  [from Mid965]",
+            "0x0014: int32_t y",
+        ], shown
+        two = shared_bn.json("struct", "show", "Two965")
+        assert two["bases"] == [{"name": "Base965", "offset": "0x0", "width": "0x10"},
+                                {"name": "Mid965", "offset": "0x10", "width": "0x18"}], two
+        assert [(m["offset"], m["name"]) for m in two["inherited_members"]] == [
+            ("0x0", "vtable"), ("0x8", "x"), ("0x10", "vtable"), ("0x18", "x"), ("0x20", "m")]
+        assert two["members"] == [{"name": "c", "offset": "0x24", "type": "char"}], two
+
+    def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
+        """#963: BN's parser returns a type a declaration only references as an
+        EMPTY named struct; defining it overwrote BN's own `...::VTable` with a
+        0-byte stub, so the typed vptr led nowhere and the virtual call in
+        `svc::dispatch` stayed a raw `*(this + 0x10)`."""
+        shared_bn.load(CLASSES_BINARY)
+        vtable = "svc::Handler::svc::EchoHandler::VTable"
+        miss = shared_bn.run("struct", "show", "svc::Handler")
+        assert miss.returncode == 2
+        assert "No struct named svc::Handler is defined" in miss.stderr + miss.stdout
+        before = shared_bn.json("types", "show", vtable)
+        declared = shared_bn.json(
+            "types", "declare", f"struct `svc::Handler` {{ struct `{vtable}`* vtable; }};")
+        row = declared["results"][0]
+        assert list(row["defined_types"]) == ["svc::Handler"], row
+        assert row["referenced_existing_types"] == [vtable], row
+        assert shared_bn.json("types", "show", vtable)["layout"] == before["layout"]
+
+        locals_ = shared_bn.json("local", "list", "svc::dispatch")
+        this = next(v for v in locals_["items"] if v["is_parameter"] and v["name"] == "this")
+        shared_bn.json("local", "retype", "svc::dispatch", this["local_id"], "struct `svc::Handler`*")
+        text = shared_bn.json("decompile", "svc::dispatch")["text"]
+        assert "this->vtable->handle(" in text, text
+
+
 class TestDisasmLinear:
     """Regression for #314: `disasm` must be able to linearly disassemble an
     arbitrary MAPPED address (a missed handler / vtable slot BN left as data),

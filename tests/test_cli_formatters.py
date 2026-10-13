@@ -3928,6 +3928,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "overlapping_functions",
     # Command-specific disclosure container, built from the captured counters.
     "go_rename",
+    # #964: the paired renderer reads the per-type `types declare` disclosure
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "declared_types",
 }
 
 
@@ -4849,7 +4852,7 @@ def test_class_show_skewed_primary_vtable_slots_say_more_than_the_empty_case():
     base = {"name": "Widget", "confidence": "rtti", "vtable": {"address": "0x10"}}
     skewed = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": "bad"}})
     empty = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": []}})
-    assert "no slots resolved here" in skewed        # the empty case's explanation
+    assert "slots not proven" in skewed              # the empty case's explanation
     assert "malformed slots field" in skewed         # plus what the empty case cannot say
     assert all(line in skewed for line in empty.splitlines())
     assert skewed != empty
