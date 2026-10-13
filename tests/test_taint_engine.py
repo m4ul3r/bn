@@ -11978,3 +11978,136 @@ def test_local_offset_cache_retains_transient_operands(monkeypatch):
         region=te._BufferRegion(0, 64, "bytes"))
     assert result["covered"] is True and result["truncated"] is False
     assert len(refs) >= 3
+
+
+@pytest.mark.parametrize("operation", [
+    "exact", "MLIL_LOW_PART", "MLIL_ZX", "MLIL_NOT", "MLIL_VAR_SSA_FIELD",
+])
+@pytest.mark.parametrize("kind", ["cstring", "bytes", "bounded_cstring"])
+def test_backward_all_direct_store_proofs_require_exact_destination(operation, kind):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    ptr = FSSA(FVar("ptr"), 1)
+    _set(pg, ptr, "ptr = &buf", _addr_of(buf))
+    destination = FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr])
+    destination.size = 8
+    if operation != "exact":
+        destination = FExpr(operation, "transformed ptr", reads=[ptr], src=destination)
+        destination.size = 4 if operation == "MLIL_LOW_PART" else 8
+    writer = pg.store(destination, _region_const(0), reads=[ptr])
+    writer.size = 1
+    pg.call(_B_POPEN, [_addr_of(buf), _region_const(1)])
+    rule = {"arg": 0, "kind": kind}
+    if kind != "cstring":
+        rule["len_arg"] = 1
+    models = te.load_models(extra={"popen": {"consumes": [rule]}})
+    result = te.TaintEngine(FBV(_B_NAMES), models).backward(
+        pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (operation == "exact")
+    assert any(step["address"] == hex(writer.address)
+               for sl in result["slices"] for step in sl["slice"])
+
+
+@pytest.mark.parametrize("same_version", [False, True])
+def test_must_stash_slot_retains_exact_ssa_value_epoch(same_version):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    slot = FVar("slot", ident=81)
+    slot0, slot1 = FSSA(slot, 0), FSSA(slot, 1)
+    other = FSSA(FVar("other", ident=82), 0)
+    _, phi = _vphi(slot, 1, [slot0, other], *pg._next())
+    pg.instrs.append(phi)
+    pg.store(FExpr("MLIL_VAR_SSA", "slot#0", reads=[slot0]), _addr_of(buf)).size = 8
+    value = slot0 if same_version else slot1
+    load = FExpr("MLIL_LOAD_SSA", "slot load",
+                 src=FExpr("MLIL_VAR_SSA", "slot", reads=[value]), src_memory=pg.mem)
+    load.size = 8
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._must_offset(pg.func().mlil.ssa_form, load, te.var_key(buf)) == (
+        0 if same_version else None)
+
+
+@pytest.mark.parametrize("stack_alias", [False, True])
+def test_must_stash_different_keys_do_not_prove_disjointness(stack_alias):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    first, second = FVar("slot", ident=83), FVar("other_slot", ident=84)
+    if stack_alias:
+        first.storage = second.storage = -64
+        a, b = _addr_of(first), _addr_of(second)
+    else:
+        a = FExpr("MLIL_VAR_SSA", "slot#0", reads=[FSSA(first, 0)])
+        b = FExpr("MLIL_VAR_SSA", "other_slot#0", reads=[FSSA(second, 0)])
+    pg.store(a, _addr_of(buf)).size = 8
+    pg.store(b, _cstr(0x900)).size = 8
+    load = FExpr("MLIL_LOAD_SSA", "possibly overwritten slot", src=a, src_memory=pg.mem)
+    load.size = 8
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._must_offset(pg.func().mlil.ssa_form, load, te.var_key(buf)) is None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("same_member", [False, True])
+def test_backward_struct_stash_member_positions_survive_phi(reverse, same_member):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    stored = 0 if reverse else 8
+    loaded = stored if same_member else (8 if reverse else 0)
+    pg.store(_cstr(0x800), _cstr(0x900)).size = 8
+    pg.mem_defs[pg.mem].operation = FOp("MLIL_STORE_STRUCT_SSA")
+    pg.mem_defs[pg.mem].offset = 8 if reverse else 0
+    pg.store(_cstr(0x800), _addr_of(buf)).size = 8
+    pg.mem_defs[pg.mem].operation = FOp("MLIL_STORE_STRUCT_SSA")
+    pg.mem_defs[pg.mem].offset = stored
+    load = _stash_load(0x800, pg.mem)
+    load.operation = FOp("MLIL_LOAD_STRUCT_SSA")
+    load.offset = loaded
+    returned = FSSA(FVar("returned"), 1)
+    literal = FSSA(FVar("literal"), 1)
+    _set(pg, returned, "returned = member", load)
+    _set(pg, literal, "literal = &buf", _addr_of(buf))
+    merged = FVar("merged")
+    value, phi = _vphi(merged, 1, [returned, literal], *pg._next())
+    pg.instrs.append(phi)
+    pg.call(_B_STRCPY, [FExpr("MLIL_VAR_SSA", "merged", reads=[value]), _cstr(0x700)])
+    pg.sink(buf, folded=True)
+    result, reasons, aol = _bw(pg.func())
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is same_member
+    assert bool(aol) is (not same_member)
+    assert any("written by strcpy" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("consumer_offset", [0, 8])
+def test_backward_struct_store_uses_explicit_member_offset(consumer_offset):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    writer = pg.store(_addr_of(buf), _region_const(0))
+    writer.operation = FOp("MLIL_STORE_STRUCT_SSA")
+    writer.offset, writer.size = 8, 1
+    pg.call(_B_POPEN, [_region_addr(buf, consumer_offset), _cstr(0x700)])
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (consumer_offset == 8)
+
+
+@pytest.mark.parametrize("transform", ["exact", "MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"])
+def test_definite_fill_extent_does_not_erase_scalar_conversions(transform):
+    buf, pg = FVar("buf", typ="char[64]"), _BufProgram()
+    count = _region_const(64)
+    if transform != "exact":
+        count = FExpr(transform, "converted count", src=count)
+        count.size = 8
+    pg.call(_B_MEMSET, [_addr_of(buf), _region_const(0), count])
+    pg.sink(buf, folded=True)
+    result, reasons, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (transform == "exact")
+    assert any("written by memset" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize("transform", ["exact", "MLIL_ZX", "MLIL_NOT", "MLIL_LOW_PART"])
+def test_literal_nul_proof_does_not_erase_pointer_transformations(transform):
+    pg = _BufProgram()
+    expr = FExpr("MLIL_CONST_DATA", "literal bytes",
+                 constant=types.SimpleNamespace(data=b"x\0"))
+    if transform != "exact":
+        expr = FExpr(transform, "transformed literal", src=expr)
+        expr.size = 8
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    assert engine._literal_terminator(pg.func().mlil.ssa_form, expr) == (
+        1 if transform == "exact" else None)

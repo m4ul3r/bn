@@ -1773,15 +1773,45 @@ class TaintEngine:
         # not inherit whichever model happened to be encountered first.
         return next(iter(regions)) if len(regions) == 1 else _BufferRegion()
 
+    def _exact_int_const(self, ssaf: Any, expr: Any) -> int | None:
+        """A literal through exact scalar copies, never an erased conversion."""
+        seen: set = set()
+        for _ in range(8):
+            value = self._int_const(expr)
+            if value is not None:
+                return value
+            var = self._as_single_ssa_var(expr)
+            if var is None:
+                return None
+            var_width = getattr(getattr(var.var, "type", None), "width", None)
+            expr_width = getattr(expr, "size", None)
+            if var_width is not None and expr_width is not None and var_width != expr_width:
+                return None
+            key = self._ssa_var_key(var)
+            if key in seen:
+                return None
+            seen.add(key)
+            try:
+                definition = ssaf.get_ssa_var_definition(var)
+            except Exception:
+                return None
+            if definition is None or op_name(definition) != "MLIL_SET_VAR_SSA":
+                return None
+            source = getattr(definition, "src", None)
+            width, source_width = getattr(definition, "size", None), getattr(source, "size", None)
+            if var_width is not None and width is not None and var_width != width:
+                return None
+            if width is not None and source_width is not None and width != source_width:
+                return None
+            expr = source
+        return None
+
     def _extent_length(self, ssaf: Any, params: list[Any], rule: dict) -> int | None:
         idx = rule.get("len_arg")
         if idx is None or idx >= len(params):
             return None
-        for expr in self._def_chain(ssaf, params[idx]):
-            value = self._int_const(expr)
-            if value is not None:
-                return value if value >= 0 else None
-        return None
+        value = self._exact_int_const(ssaf, params[idx])
+        return value if value is not None and value >= 0 else None
 
     def _literal_terminator(self, ssaf: Any, expr: Any) -> int | None:
         """A NUL's byte offset in immutable storage, verified from the view.
@@ -1790,6 +1820,19 @@ class TaintEngine:
         unlike the format-display helper, a truncated read is not termination.
         """
         for value in self._def_chain(ssaf, expr):
+            if is_ssa_var(value):
+                try:
+                    definition = ssaf.get_ssa_var_definition(value)
+                except Exception:
+                    break
+                if (definition is None or op_name(definition) != "MLIL_SET_VAR_SSA"
+                        or not self._pointer_sized(value) or not self._pointer_sized(definition)):
+                    break
+            elif op_name(value) == "MLIL_VAR_SSA" and not self._pointer_sized(value):
+                break
+            if (not is_ssa_var(value)
+                    and op_name(value) not in ("MLIL_VAR_SSA", "MLIL_CONST_DATA")):
+                break
             if op_name(value) == "MLIL_CONST_DATA":
                 try:
                     data = bytes(value.constant.data)
@@ -1797,8 +1840,12 @@ class TaintEngine:
                     return nul if nul >= 0 else None
                 except (AttributeError, TypeError, ValueError, OSError):
                     return None
-        addr = self._const_ptr_addr(ssaf, expr)
-        if addr is None or self._const_ptr_storage(addr) != "readonly":
+        location = self._must_stash_address(ssaf, expr)
+        if (location is None or not isinstance(location[0], tuple)
+                or location[0][0] != "gconst"):
+            return None
+        addr = location[0][1] + location[1]
+        if self._const_ptr_storage(addr) != "readonly":
             return None
         try:
             if self.bv.read(addr, 1) == b"\x00":
@@ -1873,11 +1920,23 @@ class TaintEngine:
                 if not self._pointer_sized(definition):
                     return None
                 return self._must_stash_address(ssaf, getattr(definition, "src", None), depth + 1)
-            return var_key(expr), 0
+            return ("ssa", var_key(expr), getattr(expr, "version", None)), 0
         if op == "MLIL_VAR_SSA":
             reads = expr_reads(expr)
             if len(reads) == 1:
                 return self._must_stash_address(ssaf, reads[0], depth + 1)
+        return None
+
+    @staticmethod
+    def _memory_member_offset(ins: Any) -> int | None:
+        """The explicit field displacement of a supported memory operation."""
+        op = op_name(ins)
+        if op in ("MLIL_LOAD", "MLIL_LOAD_SSA", "MLIL_STORE", "MLIL_STORE_SSA"):
+            return 0
+        if op in ("MLIL_LOAD_STRUCT", "MLIL_LOAD_STRUCT_SSA",
+                  "MLIL_STORE_STRUCT", "MLIL_STORE_STRUCT_SSA"):
+            off = getattr(ins, "offset", None)
+            return off if isinstance(off, int) else None
         return None
 
     def _must_reaching_offsets(self, ssaf: Any, mv: Any, la: tuple, lw: Any,
@@ -1924,6 +1983,11 @@ class TaintEngine:
             if "STORE" not in op:
                 return None
             sa = self._must_stash_address(ssaf, getattr(defn, "dest", None))
+            member = self._memory_member_offset(defn)
+            if sa is not None and member is not None:
+                sa = (sa[0], sa[1] + member)
+            else:
+                return None
             if sa is None or sa[0] != la[0]:
                 return None
             width = getattr(defn, "size", None)
@@ -1984,6 +2048,11 @@ class TaintEngine:
             # (`g_stash = buf; strcpy(g_stash, host)`). A call or an
             # unresolved store in between leaves it unproven.
             la = self._must_stash_address(ssaf, getattr(expr, "src", None))
+            member = self._memory_member_offset(expr)
+            if la is not None and member is not None:
+                la = (la[0], la[1] + member)
+            else:
+                return None
             if la is None:
                 return None
             loads = _loads if _loads is not None else set()
@@ -2416,7 +2485,7 @@ class TaintEngine:
                 zero = rule.get("zero") is True
                 vi = rule.get("value_arg")
                 if vi is not None and vi < len(params):
-                    zero = any(self._int_const(e) == 0 for e in self._def_chain(ssaf, params[vi]))
+                    zero = self._exact_int_const(ssaf, params[vi]) == 0
                 string = rule["kind"] == "cstring" and (
                     "len_arg" not in rule or (width is not None and width > 0))
                 byte_width = width if rule["kind"] == "bytes" else None
@@ -2492,6 +2561,12 @@ class TaintEngine:
                 width = base_size
             return width
 
+        def _store_offset(defn: Any) -> int | None:
+            """Only exact destination identity may establish bytes or NULs."""
+            off = _offset(getattr(defn, "dest", None))
+            member = self._memory_member_offset(defn)
+            return off + member if off is not None and member is not None else None
+
         def _store_effect(defn: Any, off: int | None,
                           proofs: frozenset[_BufferProof]) -> frozenset[_BufferProof]:
             width = _store_width(defn)
@@ -2562,14 +2637,22 @@ class TaintEngine:
                 proofs, esc = rec(self._mem_in(defn), depth + 1)
                 op = op_name(defn)
                 if "STORE" in op or op in _NAMED_STORE_OPS:
-                    slot = self._field_store_slot(ssaf, defn)
+                    if op in _NAMED_STORE_OPS:
+                        # A named object is fixed storage, not a pointer's value.
+                        # Do not chase its definition through a may-slot resolver.
+                        dst = getattr(defn, "dest", None)
+                        named_off = getattr(defn, "offset", 0) or 0
+                        slot = (var_key(dst), named_off) if isinstance(named_off, int) else None
+                    else:
+                        slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == base_key:
-                        writers.append(("store", defn, slot[1]))
-                        proofs = _store_effect(defn, slot[1], proofs)
+                        off = slot[1] if op in _NAMED_STORE_OPS else _store_offset(defn)
+                        writers.append(("store", defn, off))
+                        proofs = _store_effect(defn, off, proofs)
                     elif "STORE" in op:
                         a = _alias(getattr(defn, "dest", None), esc)
                         if a == "yes":
-                            off = _offset(getattr(defn, "dest", None))
+                            off = _store_offset(defn)
                             writers.append(("store", defn, off))
                             proofs = _store_effect(defn, off, proofs)
                         elif a == "maybe" and _store_width(defn) != 0:

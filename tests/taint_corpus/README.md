@@ -45,6 +45,7 @@ brittle across compilers/optimisation.
 | `stash_must_paths.c` | do-while and conditional stash reloads must not certify the unwritten first/alternate path; a stash after a finished loop leaves it covered. O0 pointer-copy byte LOAD is covered; O1 variant checks stash paths |
 | `stash_pointer_width.c` | exact narrow/full pointer reload controls at O0/O1; partial reload plus zero-extension must not certify initialization. Copied LOAD epoch control is checked at O0; O1 may fold the scalar sink |
 | `nested_escape_paths.c` | #951: native O0 nested call/escape arrangements require an opaque helper leaf; no-escape nests stay covered. Includes single-loop and differing-offset cache controls |
+| `store_member_identity.c` | exact O0 direct-store lossy destination and STRUCT-stash member PHIs remain incomplete; matching-member full-pointer control stays complete |
 
 The region-coverage cases deliberately distinguish a may-source from a proven
 initializer. Existing `read`-based offset/append/loop cases still require their
@@ -121,6 +122,22 @@ compiler shape. Overlapping cycles share escape state under the same allowance;
 sequential loops remain separate. Moving inline/SSA stash values stop as unknown
 without exhausting the allowance, and transient-operand cache tests check
 object lifetime rather than relying on nondeterministic allocator id reuse.
+
+`store_member_identity` retains the Opus O0 source exactly. Analyze only:
+the wrong-member and truncated-pointer paths intentionally leave `buf`
+uninitialized. It checks both STRUCT-member arrangements and the genuinely
+matching-member control. Deterministic byte, string and bounded-string cases
+retain possible-store provenance while requiring strict destination identity
+for coverage, including the keyed-store path. Slot-value SSA versions and
+possibly aliasing different pointer/stack keys stay conservative; a known
+same-base disjoint-member control is retained.
+
+The corresponding O1 address-size-override case is **not** an engine fix claim:
+BN may erase `0x67` and lift a truncated destination as a named local write
+([#954](https://github.com/m4ul3r/bn/issues/954)). These guarantees are scoped to
+the lifted model; disassembly is required for machine-level address-width
+claims. No opcode blacklist or weakened native regression is used to hide
+that upstream limit.
 
 ## `EXPECTED.json` schema
 
