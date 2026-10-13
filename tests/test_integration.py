@@ -579,6 +579,127 @@ class TestProtoSetUnnamedParams:
         assert proto_result["before_has_user_type"] is False, commit_parsed
 
 
+class TestUserPrototypePreview:
+    """#803: a changed USER prototype previews without losing its baseline."""
+
+    def _state(self, shared_bn, start: int) -> dict:
+        return json.loads(_py_line(shared_bn, (
+            "import json\n"
+            f"f = bv.get_function_at({start})\n"
+            "print('STATE=' + json.dumps({'name': f.name, 'prototype': str(f.type), "
+            "'has_user_type': f.has_user_type}))\n"
+        ), "STATE"))
+
+    def test_user_prototype_preview_restores_exact_prior_type_and_provenance(self, shared_bn):
+        shared_bn.load(ADD_BINARY)
+        start, _ = _function_start_and_size(shared_bn, "add")
+        baseline = shared_bn.json(
+            "proto", "set", hex(start), "int32_t add(int32_t left, int32_t right)",
+        )
+        assert baseline["success"] is True
+        assert baseline["committed"] is True
+        before = self._state(shared_bn, start)
+        assert before["has_user_type"] is True
+        changed = "uint64_t add(uint64_t wide, uint32_t count, void* context)"
+        preview = shared_bn.json("proto", "set", hex(start), changed, "--preview")
+        assert preview["success"] is True
+        assert preview["preview"] is True
+        assert preview["committed"] is False
+        assert preview["rolled_back"] is True
+        row, = preview["results"]
+        assert row["status"] == "verified"
+        assert row["before_has_user_type"] is True
+        assert row["before_prototype"] == before["prototype"]
+        assert row["expected_prototype"] != before["prototype"]
+        assert row["observed"]["prototype"] != before["prototype"]
+        after = self._state(shared_bn, start)
+        assert after["has_user_type"] is True
+        assert after == before  # Exact prototype (including names) and provenance.
+
+
+class TestLocalMutationProvenance:
+    """#801: preview and failed batches restore AUTO locals, not USER copies."""
+
+    def _state(self, shared_bn, start: int, identifier: int) -> dict:
+        return json.loads(_py_line(shared_bn, (
+            "import json\n"
+            f"f = bv.get_function_at({start})\n"
+            f"v = next(v for v in f.vars if v.identifier == {identifier})\n"
+            "print('STATE=' + json.dumps({"
+            "'name': v.name, 'type': str(v.type), "
+            "'user_defined': f.is_var_user_defined(v), 'comment': f.comment}))\n"
+        ), "STATE"))
+
+    def _baseline(self, shared_bn) -> tuple[int, dict, dict]:
+        shared_bn.load(ADD_BINARY)
+        start, _ = _function_start_and_size(shared_bn, "mul")
+        locals_ = shared_bn.json("local", "list", hex(start))["items"]
+        # The unoptimised synthetic loop has integer stack locals. Select by
+        # structure, not a compiler/BN-version-specific auto variable name.
+        local = next(v for v in locals_ if not v["is_parameter"]
+                     and v["source_type"] == "StackVariableSourceType"
+                     and v["type"] == "int32_t")
+        assert local["identifier"] is not None
+        before = self._state(shared_bn, start, local["identifier"])
+        assert before["user_defined"] is False
+        assert (before["name"], before["type"]) == (local["name"], local["type"])
+        return start, local, before
+
+    def test_auto_local_rename_preview_restores_name_type_and_provenance(self, shared_bn):
+        start, local, before = self._baseline(shared_bn)
+        new_name = "preview_loop_count"
+        assert before["name"] != new_name
+        preview = shared_bn.json(
+            "local", "rename", hex(start), local["local_id"], new_name, "--preview",
+        )
+        assert preview["success"] is True
+        assert preview["preview"] is True
+        assert preview["committed"] is False
+        assert preview["rolled_back"] is True
+        row, = preview["results"]
+        assert row["status"] == "verified"  # A real rename, never a noop.
+        assert row["before_name"] == before["name"]
+        assert row["observed"]["variable"] == new_name
+        after = self._state(shared_bn, start, local["identifier"])
+        assert after["user_defined"] is False
+        assert after == before
+
+    def test_auto_local_mixed_batch_failure_restores_name_type_and_provenance(self, shared_bn, tmp_path):
+        start, local, before = self._baseline(shared_bn)
+        new_name = "rollback_loop_count"
+        assert before["name"] != new_name
+        comment = "temporary loop audit"
+        assert before["comment"] != comment
+        unmapped = _py_line(shared_bn, (
+            "assert not bv.is_valid_offset(bv.end)\n"
+            "print('UNMAPPED=' + hex(bv.end))\n"
+        ), "UNMAPPED")
+        manifest = tmp_path / "local-rollback.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "local_rename", "function": hex(start),
+             "variable": local["local_id"], "new_name": new_name},
+            {"op": "set_comment", "function": hex(start), "comment": comment},
+            # Valid request shape, but fails during apply AFTER the two writes.
+            {"op": "set_comment", "address": unmapped, "comment": "cannot land"},
+        ]}), encoding="utf-8")
+        result = shared_bn.run("batch", "apply", str(manifest), "--format", "json")
+        assert result.returncode == 3, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["success"] is False
+        assert payload["preview"] is False
+        assert payload["committed"] is False
+        assert payload["rolled_back"] is True
+        assert [r["status"] for r in payload["results"]] == [
+            "reverted", "reverted", "invalid_request",
+        ], payload
+        renamed = payload["results"][0]
+        assert renamed["before_name"] == before["name"]
+        assert renamed["new_name"] == new_name
+        after = self._state(shared_bn, start, local["identifier"])
+        assert after["user_defined"] is False
+        assert after == before  # Name, exact type, provenance AND sibling comment.
+
+
 class TestStructFieldTypedef:
     """Regression for #246: field ops on a typedef'd (NamedTypeReference) struct
     must follow the alias to the underlying tag instead of crashing in
