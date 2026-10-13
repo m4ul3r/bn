@@ -846,15 +846,27 @@ def _render_capabilities_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
+                display_key: str = "display_name") -> Any:
+    """The function/symbol name a text row prints (#978): the demangled
+    ``display_name`` the bridge sends beside the raw name -- the spelling
+    ``decompile`` and ``class show`` print, so a name carries from one command to
+    the next -- unless ``--mangled`` asked for the raw one. Falls back to the raw
+    name when there is no display name (a C symbol, an older bridge)."""
+    if not isinstance(entry, dict):
+        return None
+    if not mangled and entry.get(display_key):
+        return entry[display_key]
+    return entry.get(name_key)
+
+
 @_discloses
-def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
+def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
     function = _field_dict(value, "function")
-    header_name = function.get("name", "<unknown>")
-    if demangle and function.get("display_name"):
-        header_name = function["display_name"]
+    header_name = _shown_name(function, mangled=mangled) or "<unknown>"
     lines = [
         f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
@@ -1081,7 +1093,7 @@ def _render_type_info_text(value: Any) -> str:
 
 
 @_discloses
-def _render_field_xrefs_text(value: Any) -> str:
+def _render_field_xrefs_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
@@ -1102,8 +1114,10 @@ def _render_field_xrefs_text(value: Any) -> str:
     if code_refs:
         for ref in code_refs:
             details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
+            function = _shown_name(ref, mangled=mangled, name_key="function",
+                                   display_key="function_display_name")
+            if function:
+                details.append(str(function))
             if ref.get("incoming_type"):
                 details.append(f"type={ref['incoming_type']}")
             if ref.get("disasm"):
@@ -1187,11 +1201,12 @@ def _render_comment_text(value: Any) -> str:
 
 
 @_discloses
-def _render_comment_list_text(value: Any) -> str:
+def _render_comment_list_text(value: Any, *, mangled: bool = False) -> str:
     # Paged envelope ({items,total,...}) -> render the page + the shared footer;
     # a bare list falls through to the per-item body below (back-compat) (#131).
     if _field_declared(value, "items"):
-        return _render_paged_list_text(value, "items", _render_comment_list_text)
+        return _render_paged_list_text(
+            value, "items", lambda items: _render_comment_list_text(items, mangled=mangled))
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1202,7 +1217,8 @@ def _render_comment_list_text(value: Any) -> str:
             lines.append(_render_fallback_text(item))
             continue
         address = item.get("address", "<unknown>")
-        func = item.get("function") or "<global>"
+        func = _shown_name(item, mangled=mangled, name_key="function",
+                           display_key="function_display_name") or "<global>"
         comment = item.get("comment", "")
         # #643: mark function documentation comments so the two stores are
         # distinguishable in one listing -- same `[doc]` marker `comment get
@@ -1947,10 +1963,10 @@ def _render_spill_gc_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
-    """Render a BARE list of name/address rows (imports, function pages). With
-    ``demangle``, show the demangled ``display_name`` instead of the raw name so
-    a C++ listing is greppable/clusterable without c++filt (#196)."""
+def _render_name_address_rows(value: Any, *, mangled: bool = False) -> str:
+    """Render a BARE list of name/address rows (imports, exports, function pages).
+    A row's demangled ``display_name`` is shown unless ``mangled`` (#196/#978),
+    so a C++ listing is greppable/clusterable without c++filt."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1962,9 +1978,8 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
             lines.append(_render_fallback_text(item))
             continue
         address = item.get("address", "<unknown>")
-        name = item.get("name") or item.get("function") or "<unknown>"
-        if demangle and item.get("display_name"):
-            name = item["display_name"]
+        name = (_shown_name(item, mangled=mangled) or item.get("function")
+                or "<unknown>")
         line = f"{address}  {_escape_control_chars(name)}"
         kind = item.get("kind")
         if kind and kind != "function":
@@ -2009,10 +2024,11 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
 
 
 @_discloses
-def _render_name_address_list_text(value: Any) -> str:
-    """Render imports: the paged {items, total, ...} envelope (with a footer),
-    or a bare list for back-compat / internal callers (#122)."""
-    body = _render_paged_list_text(value, "items", _render_name_address_rows)
+def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
+    """Render imports/exports: the paged {items, total, ...} envelope (with a
+    footer), or a bare list for back-compat / internal callers (#122)."""
+    body = _render_paged_list_text(
+        value, "items", lambda items: _render_name_address_rows(items, mangled=mangled))
     # Surface PIC self-references dropped from the survey so the exclusion isn't
     # silent (#202) -- through the ONE READER the three imports surfaces share,
     # so the decision cannot be made three ways. `isinstance(excluded, int)`
@@ -2036,6 +2052,12 @@ def _render_name_address_list_text(value: Any) -> str:
                 "that can be read (use --format json)")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
+
+
+def _render_mangled_name_address_list_text(value: Any) -> str:
+    """``exports --mangled``: :func:`_render_name_address_list_text` printing the
+    raw symbol names instead of the demangled display names (#978)."""
+    return _render_name_address_list_text(value, mangled=True)
 
 
 @_discloses
@@ -2551,20 +2573,36 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     # trace of the 16th record is the JSON-only disclosure the text face was
     # missing. Absent keys add nothing.
     note = _duplicate_starts_note(value, total_key="count")
-    return line if not note else f"{line}\n{note}"
+    for extra in (note, _mangled_only_note(value)):
+        if extra:
+            line = f"{line}\n{extra}"
+    return line
+
+
+def _mangled_only_note(value: Any) -> str:
+    """`function search` matches the demangled display name by default (#978);
+    say how many functions only a raw (mangled) spelling would have matched, so
+    a mangled query that now finds nothing points at `--mangled` instead of
+    reading as absence."""
+    count = _nonnegative_count(value, "mangled_only_matches")
+    if not count:
+        return ""
+    noun = "function matches" if count == 1 else "functions match"
+    return (f"// {count} more {noun} only by mangled name; "
+            "pass --mangled to search raw symbol names")
 
 
 @_discloses
-def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
+def _render_function_list_text(value: Any, *, mangled: bool = False) -> str:
     """Render a paged function listing, with a footer stating the true total and
     remainder (#59). Prefers the canonical `items` key (every other list command
     uses it), falling back to the deprecated byte-identical `functions` alias for
-    an older bridge that emits only the latter (#223). ``demangle`` shows the
-    demangled display_name (#196). A quick-loaded (partial) listing is prefixed
-    with a warning so the page isn't mistaken for the whole binary (#437)."""
+    an older bridge that emits only the latter (#223). Rows show the demangled
+    display_name unless ``mangled`` (#978). A quick-loaded (partial) listing is
+    prefixed with a warning so the page isn't mistaken for the whole binary (#437)."""
     page_key = "items" if _field_declared(value, "items") else "functions"
     body = _quick_partial_prefix(value) + _render_paged_list_text(
-        value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
+        value, page_key, lambda items: _render_name_address_rows(items, mangled=mangled))
     # The #757 collapse counts ride the ENVELOPE, not a row, so the note survives
     # `--offset`/`--limit` slicing and sits after the paging footer -- the same
     # placement `_render_name_address_list_text` gives `self_defined_excluded`
@@ -2575,11 +2613,13 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     # of 15"); this note does not, so borrowing that rule rendered an empty
     # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
     # beside it (#757 review).
-    note = _duplicate_starts_note(value)
-    return body if not note else f"{body}\n{note}"
+    for note in (_duplicate_starts_note(value), _mangled_only_note(value)):
+        if note:
+            body = f"{body}\n{note}"
+    return body
 
 
-def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
+def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
     for ref in refs:
@@ -2599,7 +2639,7 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
         if caller or isinstance(ref.get("caller_function"), dict):
             key = ("fn", str(caller.get("address")), str(caller.get("name")))
             caller_address = caller.get("address")
-            caller_name = caller.get("name")
+            caller_name = _shown_name(caller, mangled=mangled)
         else:
             # No containing function: group by the ref's own resolved label
             # (symbol, else section) so refs under DIFFERENT symbols/sections do
@@ -2694,7 +2734,7 @@ def _render_xrefs_any_text(value: Any) -> str:
 
 
 @_discloses
-def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
+def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
@@ -2706,7 +2746,7 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         import_label = f"import: {value.get('import_name', '<unknown>')}{scanned}"
 
     def _render_group(refs: list[Any], total: int, label: str) -> list[str]:
-        groups = _group_refs_by_caller(refs)
+        groups = _group_refs_by_caller(refs, mangled=mangled)
         if not groups:
             return [f"{label}:", "- none"]
         site_word = "site" if total == 1 else "sites"
@@ -3763,7 +3803,8 @@ def _render_init_arrays_text(value: Any) -> str:
 
 
 @_discloses
-def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
+def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
+                           mangled: bool = False) -> str:
     # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
@@ -3821,35 +3862,45 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         # A tailcall (tail-branch into the target) has no real return site, so flag
         # it -- its caller_static is the byte after the branch, not a return addr (#47).
         kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
+        # #979: every label is the row's JSON key, so a filter written from the
+        # text (`.containing_function`, `.hlil_statement`) finds the field.
         primary = (
-            f"caller_static {caller_static} | call {call_addr}{kind_tag}"
+            f"caller_static {caller_static} | call_addr {call_addr}{kind_tag}"
             if prefer_caller_static
-            else f"call {call_addr} | caller_static {caller_static}{kind_tag}"
+            else f"call_addr {call_addr} | caller_static {caller_static}{kind_tag}"
         )
+        # #978: the demangled display name, the spelling decompile prints.
+        containing_name = _shown_name(containing, mangled=mangled) or "<unknown>"
+        callee_name = _shown_name(callee, mangled=mangled) or "<unknown>"
         lines = [
             primary,
             (
-                f"within: {containing.get('name', '<unknown>')} @ "
+                f"containing_function: {containing_name} @ "
                 f"{containing.get('address', '<unknown>')}"
             ),
-            f"callee: {callee.get('name', '<unknown>')} @ {callee.get('address', '<unknown>')}",
+            f"callee: {callee_name} @ {callee.get('address', '<unknown>')}",
         ]
         if call_index is not None:
-            lines.append(f"call-index: {call_index}")
-        if row.get("within_query"):
-            lines.append(f"within-query: {row['within_query']}")
+            lines.append(f"call_index: {call_index}")
+        within_query = row.get("within_query")
+        if within_query:
+            # With no --within the bridge echoes each caller's raw name here;
+            # show that the way the containing_function line does (#978).
+            if within_query == containing.get("name"):
+                within_query = containing_name
+            lines.append(f"within_query: {within_query}")
         if row.get("hlil_statement"):
-            lines.append(f"hlil: {row['hlil_statement']}")
+            lines.append(f"hlil_statement: {row['hlil_statement']}")
         elif row.get("hlil_statement_reason"):
             # #557: say WHY the HLIL statement is null instead of silently omitting it.
-            lines.append(f"hlil: null ({row['hlil_statement_reason']})")
+            lines.append(f"hlil_statement: null ({row['hlil_statement_reason']})")
         if row.get("pre_branch_condition"):
-            lines.append(f"pre-branch: {row['pre_branch_condition']}")
+            lines.append(f"pre_branch_condition: {row['pre_branch_condition']}")
         variadic = _field_dict(row, "callee_variadic")
         if variadic.get("is_variadic"):
             # #558: steer to the argument-recovery views for an imported variadic callee.
             lines.append(
-                f"variadic-callee: {variadic.get('name', '?')} — HLIL may show only fixed "
+                f"callee_variadic: {variadic.get('name', '?')} — HLIL may show only fixed "
                 f"args; run `bn evidence function {containing.get('name', '<caller>')}` "
                 f"or `bn disasm {containing.get('name', '<caller>')} --linear`"
             )
@@ -3857,14 +3908,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         call_instruction = _field_dict(row, "call_instruction")
         previous = _field_list(row, "previous_instructions")
         next_instructions = _field_list(row, "next_instructions")
-        lines.append("context:")
+        # The context block spans three JSON keys; name them once so the `>`
+        # row is findable as `call_instruction` (#979).
+        lines.append("context: previous_instructions, > call_instruction, next_instructions")
         for item in previous:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
         if row.get("disasm_context_reason"):
             # #816: the call site is real (its identity fields are usable) but the
             # disassembly sweep produced no entry at its address, so the context is
-            # null by evidence, not by omission -- say WHY, mirroring `hlil: null (...)`.
+            # null by evidence, not by omission -- say WHY, mirroring
+            # `hlil_statement: null (...)`.
             lines.append(f"> unavailable ({row['disasm_context_reason']})")
         else:
             lines.append(

@@ -524,6 +524,16 @@ def preview_arg(
     return arg("--preview", action="store_true", help=help)
 
 
+def mangled_arg(
+    help: str = "Show raw (mangled) C++ symbol names in text instead of the "
+                "demangled display names; JSON always carries both",
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--mangled`` opt-out for every read that prints function names
+    (#978): text defaults to the demangled display name ``decompile`` and ``class
+    show`` print, so a name carries from one command to the next."""
+    return arg("--mangled", action="store_true", default=False, help=help)
+
+
 def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
     """The shared ``--summary`` / ``--quiet`` flag for mutation commands (#408).
 
@@ -666,7 +676,8 @@ def _build_from_commands(root: BnArgumentParser) -> None:
         if len(path) > 1:
             _ensure_intermediate(path[:-1])
         sub = _get_subparsers(path[:-1])
-        parser = sub.add_parser(path[-1], help=_GROUP_HELP.get(path, ""))
+        group_help = _GROUP_HELP.get(path, "")
+        parser = sub.add_parser(path[-1], help=group_help, description=group_help or None)
         # Carry -t/--instance on the intermediate group parser so they can appear
         # BEFORE the leaf (`bn bundle -t X function F`), at parity with
         # single-level commands and root-level -t. Both helpers use SUPPRESS
@@ -695,7 +706,11 @@ def _build_from_commands(root: BnArgumentParser) -> None:
         if path in node_parsers:
             cmd = node_parsers[path]
         else:
-            cmd = _get_subparsers(parent).add_parser(path[-1], help=spec["help"])
+            # `help` only labels the row in the PARENT's subcommand menu; the
+            # leaf's own `--help`/`--help-full` print `description`, so pass the
+            # registry text as both or the leaf help drops it (#936).
+            cmd = _get_subparsers(parent).add_parser(
+                path[-1], help=spec["help"], description=spec["help"])
             node_parsers[path] = cmd
 
         # A group node never carries the estimate flag, even when the node is also

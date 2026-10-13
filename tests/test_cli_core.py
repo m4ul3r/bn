@@ -760,6 +760,30 @@ def test_help_full_prints_leaf_help_without_required_positionals(capsys):
     assert stderr == ""
 
 
+def test_every_leaf_help_shows_its_registered_description():
+    # #936: the registry `help` text only labelled the row in the parent menu;
+    # the leaf's own --help/--help-full dropped it, hiding guidance such as the
+    # `data symbols` scan-cost warning. Every leaf must now carry it.
+    import argparse
+
+    from bn.cli import _COMMANDS
+
+    def norm(text: str) -> str:
+        return " ".join(text.split())
+
+    root = bn.cli.build_parser()
+    missing = []
+    for spec in _COMMANDS:
+        leaf = root
+        for name in spec["path"]:
+            sub = next(a for a in leaf._actions if isinstance(a, argparse._SubParsersAction))
+            leaf = sub.choices[name]
+        want = norm(spec["help"])
+        if want not in norm(leaf.format_help()) or want not in norm(leaf.format_help_for_full()):
+            missing.append(" ".join(spec["path"]))
+    assert missing == []
+
+
 def test_build_id_for_package_detects_engine_edit(tmp_path):
     # #161: the whole-package fingerprint changes when ANY .py / model .json in
     # the package changes -- not just bridge.py.

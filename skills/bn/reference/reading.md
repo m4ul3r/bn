@@ -7,11 +7,11 @@ Read-command catalog for the `bn` skill. Open when surveying/decompiling. See `.
 bn target info
 bn target list [--format json]                       # open targets + their selectors; `selector` is what -t takes
 bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
-bn function list [--sort {address|size|name}] [--reverse] [--min-size 64] [--demangle]
+bn function list [--sort {address|size|name}] [--reverse] [--min-size 64] [--mangled]
 bn function list [--named | --unnamed]               # meaningful names vs BN's auto sub_* (import thunks in neither)
 bn function search attachment [--count]              # --count here = MATCHES, not the whole-binary total
 bn function search --regex 'attach|detach|follow'
-bn function search <q> [--sort … --reverse --min-size N --demangle]
+bn function search <q> [--sort … --reverse --min-size N --mangled]
 bn function info <fn> [--verbose] [--blocks]         # --blocks: basic-block address ranges + edges
 bn decompile <fn> [<fn> …] [--addresses] [--lines 40:80] [--force-analysis] [--include-annotations]
 bn il <fn> [--view {hlil|mlil|llil}] [--ssa]          # --level is an accepted alias for --view
@@ -74,7 +74,8 @@ bn bundle function <fn> [--out bundle.json]          # export; does not mutate t
 
 Notes:
 
-- `function search` is a case-insensitive substring search. Use `--exact` for a known API, `--word` for an identifier token, or an anchored `--regex` for a family. A regex-shaped zero-hit literal query may be retried as a regex; `regex_fallback` discloses that choice. Confirm a source or sink against the import and actual call target, not its name alone.
+- `function search` is a case-insensitive substring search over the demangled display name. Use `--exact` for a known API, `--word` for an identifier token, or an anchored `--regex` for a family. A regex-shaped zero-hit literal query may be retried as a regex; `regex_fallback` discloses that choice. Confirm a source or sink against the import and actual call target, not its name alone.
+- **Names in text are demangled.** `function list/search/info`, `xrefs`, `callsites`, `comment list` and `exports` print the demangled display name (`demo::Widget::handle`), the spelling `decompile` and `class show` use, and any of them resolves as an identifier. JSON keeps the raw `name` (mangled for C++) beside `display_name` (`function_display_name` on `comment list` and `xrefs --field` rows). `--mangled` prints raw names instead; on `function search` it also matches raw names, and a default search whose query only a mangled name contains reports `mangled_only_matches`.
 - `function list --count` counts all functions; `function search <query> --count` counts matches. `--sort size --reverse --min-size N` is useful for large functions. `--named` / `--unnamed` separate meaningful names from auto `sub_*` names.
 - `exports` lists global/weak function and data definitions from any symbol table in BN's combined symbols; `exports list` is an alias, and `--count` counts that same population. It does **not** establish dynamic-loader visibility. On ELF, a global definition may exist only in `.symtab`, not `.dynsym`; use `readelf --dyn-syms` or `nm -D --defined-only` to inspect the dynamic table instead. The synthetic ELF case reported in [#921](https://github.com/m4ul3r/bn/issues/921) had 235 definitions under `bn exports --count` but only 2 under `nm -D --defined-only`: those are different populations, not evidence that all 235 are dynamically exported.
 - **Duplicate function start addresses are disclosed (#757).** Binary Ninja can hold more than one Function record for one start address. Where an answer holds such an address it publishes `duplicate_starts_collapsed` / `duplicate_starts_unresolved`, and every text face that answer reaches discloses it too. This entry states no more than that on purpose: every summary of what the collapse does to a given answer has been false on some shape of it, so the answer carries that truth and this page does not restate it.
@@ -162,4 +163,4 @@ bn callsites parse_record --within process_message --caller-static
 bn callsites parse_record --within-file /tmp/callers.txt --format json
 ```
 
-`--within-file` accepts one function identifier per non-empty line, with `#` comments. A null `hlil_statement` means BN could not localize a safe statement; JSON may include a bounded `decompile_excerpt` for context. The excerpt is built for the requested page, so use `--limit` to bound its cost. Caller enumeration can stop at its budget; a short list with `caller_scan_truncated: true` is not proof that other callers do not exist.
+`--within-file` accepts one function identifier per non-empty line, with `#` comments. Each text label (`call_addr`, `caller_static`, `containing_function:`, `callee:`, `hlil_statement:`, `pre_branch_condition:`, `call_index:`, the `context:` block's `call_instruction`) is the JSON key that carries the value. A null `hlil_statement` means BN could not localize a safe statement; JSON may include a bounded `decompile_excerpt` for context. The excerpt is built for the requested page, so use `--limit` to bound its cost. Caller enumeration can stop at its budget; a short list with `caller_scan_truncated: true` is not proof that other callers do not exist.

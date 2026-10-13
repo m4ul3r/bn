@@ -37,6 +37,7 @@ try:
 except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
     bn = None  # type: ignore[assignment]
 
+from . import il_format
 from . import mutation_engine
 from . import read_misc
 from .bridge_state import _quick_loaded_views
@@ -976,10 +977,13 @@ def _list_comments(
             if needle and needle not in text.lower():
                 continue
             funcs = bv.get_functions_containing(addr)
-            func_name = funcs[0].name if funcs else None
+            owner = funcs[0] if funcs else None
             items.append({
                 "address": hex(addr),
-                "function": func_name,
+                "function": owner.name if owner is not None else None,
+                # #978: the demangled spelling the text face shows.
+                "function_display_name": (
+                    il_format._display_name(owner) if owner is not None else None),
                 "comment": text,
                 "scope": "address",
             })
@@ -1000,6 +1004,7 @@ def _list_comments(
             items.append({
                 "address": hex(int(fn.start)),
                 "function": fn.name,
+                "function_display_name": il_format._display_name(fn),
                 "comment": doc,
                 "scope": "function_doc",
             })

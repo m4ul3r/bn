@@ -2544,6 +2544,7 @@ _MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
     "_render_go_functions_summary_text": _COVERED_IN_FORMATTERS,
     "_render_go_functions_text": _COVERED_IN_FORMATTERS,
     "_render_imports_summary_text": _COVERED_IN_FORMATTERS,
+    "_render_mangled_name_address_list_text": _COVERED_IN_FORMATTERS,
     "_render_name_address_list_text": _COVERED_IN_FORMATTERS,
     "_render_py_exec_text": _COVERED_IN_FORMATTERS,
     "_render_read_text": _COVERED_IN_FORMATTERS,

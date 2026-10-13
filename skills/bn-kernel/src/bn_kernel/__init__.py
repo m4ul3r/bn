@@ -710,6 +710,7 @@ _SEARCH_FILTERS = frozenset(
         "regex",
         "exact",
         "word",
+        "mangled",
         "min_address",
         "max_address",
         "min_size",

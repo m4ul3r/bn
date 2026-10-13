@@ -8,7 +8,7 @@ from typing import Any
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, _refuse_count_only_slices, arg, blank_selector, command,
-                   decode_json_input, mutex, mutation_output_args, preview_arg,
+                   decode_json_input, mangled_arg, mutex, mutation_output_args, preview_arg,
                    read_text_input)
 from ..formatters import (
     _discloses,
@@ -22,6 +22,7 @@ from ..formatters import (
     _render_go_rename_text,
     _go_rename_summary,
     _render_imports_summary_text,
+    _render_mangled_name_address_list_text,
     _render_name_address_list_text,
     _render_py_exec_text,
     _render_read_text,
@@ -266,7 +267,8 @@ _EXPORT_ARGS = [
         action="store_true",
         default=False,
         help="Count global/weak definitions from any symbol table, not loader-visible exports",
-    )
+    ),
+    mangled_arg(),
 ]
 
 
@@ -307,7 +309,8 @@ def _exports(args: argparse.Namespace) -> int:
         "list_exports",
         params,
         require_target=True,
-        text_renderer=_render_name_address_list_text,
+        text_renderer=(_render_mangled_name_address_list_text if args.mangled
+                       else _render_name_address_list_text),
         page_label="exports",
         paged_spill=True,
         stem="exports",

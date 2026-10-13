@@ -214,6 +214,10 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     callee_address = int(callee.start)
+    # #978: both ends carry the raw name AND the demangled display name, read
+    # once per function rather than per call row.
+    callee_identity = il_format._function_identity(callee)
+    container_identity = il_format._function_identity(func)
     # An exported function's intra-lib callers reach it through a same-name PLT
     # stub; treat a call to the stub as a call to the callee so `callsites
     # --within` sees through it (#286), mirroring the xrefs union.
@@ -290,14 +294,8 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
         rows.append(
             {
-                "callee": {
-                    "name": str(callee.name),
-                    "address": hex(callee_address),
-                },
-                "containing_function": {
-                    "name": str(func.name),
-                    "address": hex(int(func.start)),
-                },
+                "callee": dict(callee_identity),
+                "containing_function": dict(container_identity),
                 "call_addr": hex(call_addr),
                 "call_kind": call_kind,
                 "instruction_length": instruction_length,
@@ -1503,6 +1501,7 @@ def _search_functions(
     count_only: bool = False,
     sort: str = "address",
     reverse: bool = False,
+    mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1561,19 +1560,27 @@ def _search_functions(
         list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
     )
     matched: list[tuple[Any, str]] = []
+    # Functions only a raw (mangled) spelling matched: not results by default,
+    # but counted so an empty or short answer can say `--mangled` finds more.
+    mangled_only: list[Any] = []
     for fn in population:
-        # Match across name forms (mangled fn.name, demangled display_name, raw)
-        # so a demangled C++ query finds a function BN named with the mangled
-        # symbol -- the same greppability `--demangle` gives the listing (#196).
+        # #978: match the spelling the text face SHOWS -- the demangled display
+        # name -- by default, so a short class-name query no longer hits every
+        # function whose MANGLED name happens to contain the letters. `mangled`
+        # matches the raw spellings (fn.name / raw_name) instead, for a query
+        # copied from a mangled symbol.
         display = il_format._display_name(fn)
-        raw = str(getattr(fn, "raw_name", fn.name))
-        if any(matches(str(form)) for form in (fn.name, display, raw) if form):
+        raw_forms = tuple(
+            form for form in (str(fn.name), str(getattr(fn, "raw_name", fn.name))) if form)
+        if any(matches(form) for form in (raw_forms if mangled else (display,)) if form):
             # #814: retain the live Function plus the display name this match
             # already computed -- NOT a row. The row (and the size/block/label
             # projections behind it) is built for the returned page only, so a
             # `function search --limit 20` over a 50k-function target no longer
             # sizes and materializes every match.
             matched.append((fn, display))
+        elif not mangled and any(matches(form) for form in raw_forms if form != display):
+            mangled_only.append(fn)
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
         # doesn't return each export twice (16-byte veneer + real body). size IS
@@ -1583,6 +1590,9 @@ def _search_functions(
             (fn, display) for fn, display in matched
             if (il_format._function_size(fn) or 0) >= min_size
         ]
+        mangled_only = [fn for fn in mangled_only
+                        if (il_format._function_size(fn) or 0) >= min_size]
+    hint = {"mangled_only_matches": len(mangled_only)} if mangled_only else {}
     # After `--min-size`, for the same reason `_list_functions` recounts there.
     collapsed_starts, unresolved_starts = collapse.counts([fn for fn, _ in matched])
     if count_only:
@@ -1590,7 +1600,7 @@ def _search_functions(
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
         result = {"kind": "functions", "count": len(matched), "total": len(matched),
-                  **_analysis_state_fields(bv)}
+                  **hint, **_analysis_state_fields(bv)}
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
@@ -1609,5 +1619,6 @@ def _search_functions(
     result = read_misc._paged_envelope(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
+    result.update(hint)
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))

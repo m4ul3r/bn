@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import types
 
 import bn.cli
@@ -1194,32 +1195,28 @@ def test_render_callsites_text_footer_when_paged():
 
 
 def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
-    calls = fake_transport({"callsites": {
-        "ok": True,
-        "result": [
-            {
-                "callee": {"name": "crt_rand", "address": "0x461746"},
-                    "containing_function": {
-                        "name": "bonus_pick_random_type",
-                        "address": "0x412470",
-                    },
-                    "within_query": "bonus_pick_random_type",
-                    "call_index": 0,
-                    "call_addr": "0x4124a0",
-                    "instruction_length": 5,
-                    "caller_static": "0x4124a5",
-                    "call_instruction": {"address": "0x4124a0", "text": "call crt_rand"},
-                    "previous_instructions": [
-                        {"address": "0x41249c", "text": "mov eax, 0"},
-                    ],
-                    "next_instructions": [
-                        {"address": "0x4124a5", "text": "cmp eax, 0xd"},
-                    ],
-                    "hlil_statement": "edx_1:eax_1 = sx.q(crt_rand())",
-                    "pre_branch_condition": "result == 2",
-                }
-            ],
-        }})
+    row = {
+        "callee": {"name": "crt_rand", "address": "0x461746"},
+        "containing_function": {
+            "name": "bonus_pick_random_type",
+            "address": "0x412470",
+        },
+        "within_query": "bonus_pick_random_type",
+        "call_index": 0,
+        "call_addr": "0x4124a0",
+        "instruction_length": 5,
+        "caller_static": "0x4124a5",
+        "call_instruction": {"address": "0x4124a0", "text": "call crt_rand"},
+        "previous_instructions": [
+            {"address": "0x41249c", "text": "mov eax, 0"},
+        ],
+        "next_instructions": [
+            {"address": "0x4124a5", "text": "cmp eax, 0xd"},
+        ],
+        "hlil_statement": "edx_1:eax_1 = sx.q(crt_rand())",
+        "pre_branch_condition": "result == 2",
+    }
+    calls = fake_transport({"callsites": {"ok": True, "result": [row]}})
 
     rc = bn.cli.main(
         [
@@ -1243,13 +1240,77 @@ def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
     assert calls[-1]["params"]["context"] == 3
     assert calls[-1]["params"]["caller_static"] is True
     output = capsys.readouterr().out
-    assert output.startswith("caller_static 0x4124a5 | call 0x4124a0")
-    assert "within: bonus_pick_random_type @ 0x412470" in output
-    assert "call-index: 0" in output
-    assert "within-query: bonus_pick_random_type" in output
-    assert "hlil: edx_1:eax_1 = sx.q(crt_rand())" in output
-    assert "pre-branch: result == 2" in output
+    assert output.startswith("caller_static 0x4124a5 | call_addr 0x4124a0")
+    assert "containing_function: bonus_pick_random_type @ 0x412470" in output
+    assert "call_index: 0" in output
+    assert "within_query: bonus_pick_random_type" in output
+    assert "hlil_statement: edx_1:eax_1 = sx.q(crt_rand())" in output
+    assert "pre_branch_condition: result == 2" in output
     assert "> 0x4124a0  call crt_rand" in output
+    # #979: a jq filter written from the text labels must find the fields, so
+    # every name the text prints as a label is a JSON key of the row.
+    lines = output.splitlines()
+    labels = {line.split(":", 1)[0] for line in lines if re.match(r"^[a-z_]+: ", line)}
+    labels |= set(lines[0].replace("|", " ").split()[0::2])
+    context = next(line for line in lines if line.startswith("context: "))
+    labels |= set(context.removeprefix("context: ").replace(">", "").replace(",", " ").split())
+    assert labels - {"context"} <= set(row)
+
+
+_WIDGET = {"name": "_ZN4demo6Widget6handleEi", "display_name": "demo::Widget::handle",
+           "address": "0x402a4c"}
+
+
+@pytest.mark.parametrize("argv, op, result", [
+    (["function", "search", "Widget"], "search_functions",
+     {"kind": "functions", "items": [dict(_WIDGET, raw_name=_WIDGET["name"])], "total": 1}),
+    (["function", "list"], "list_functions",
+     {"kind": "functions", "items": [dict(_WIDGET, raw_name=_WIDGET["name"])], "total": 1}),
+    (["exports"], "list_exports",
+     {"kind": "exports", "items": [dict(_WIDGET, raw_name=_WIDGET["name"])], "total": 1}),
+    (["function", "info", "0x402a4c"], "function_info", {"function": _WIDGET}),
+    (["xrefs", "copy_tail"], "xrefs",
+     {"address": "0x402b00", "items": [
+         {"kind": "code", "address": "0x402a60", "function": _WIDGET["name"],
+          "caller_function": _WIDGET}], "total": 1}),
+    (["callsites", "memcpy"], "callsites",
+     {"items": [{"callee": {"name": "memcpy", "display_name": "memcpy", "address": "0x400100"},
+                 "containing_function": _WIDGET, "within_query": _WIDGET["name"],
+                 "call_addr": "0x402a60",
+                 "caller_static": "0x402a64", "previous_instructions": [],
+                 "next_instructions": []}], "total": 1}),
+    (["comment", "list"], "list_comments",
+     {"kind": "comments", "items": [
+         {"address": "0x402a60", "function": _WIDGET["name"],
+          "function_display_name": _WIDGET["display_name"], "comment": "len check",
+          "scope": "address"}], "total": 1}),
+])
+def test_text_names_are_demangled_unless_mangled_978(fake_transport, capsys, argv, op, result):
+    """#978: every text surface that prints a function name prints the demangled
+    display name `decompile`/`class show` use; `--mangled` restores the raw one."""
+    fake_transport({op: {"ok": True, "result": result}})
+    assert bn.cli.main([*argv, "--format", "text", "--target", "active"]) == 0
+    shown = capsys.readouterr().out
+    assert "demo::Widget::handle" in shown
+    # A raw spelling may only appear as the `(raw: ...)` column, never as the name.
+    assert re.search(r"(?<!raw: )_ZN4demo6Widget6handleEi", shown) is None
+
+    assert bn.cli.main([*argv, "--format", "text", "--target", "active", "--mangled"]) == 0
+    raw = capsys.readouterr().out
+    assert "_ZN4demo6Widget6handleEi" in raw
+    assert "demo::Widget::handle" not in raw
+
+
+def test_function_search_sends_mangled_and_points_at_it_978(fake_transport, capsys):
+    calls = fake_transport({"search_functions": {"ok": True, "result": {
+        "kind": "functions", "items": [], "total": 0, "mangled_only_matches": 2}}})
+    assert bn.cli.main(["function", "search", "6Widget", "--target", "active"]) == 0
+    assert calls[0]["params"]["mangled"] is False
+    out = capsys.readouterr().out
+    assert "2 more functions match only by mangled name; pass --mangled" in out
+
+    assert bn.cli.main(["function", "search", "6Widget", "--mangled", "--target", "active"]) == 0
+    assert calls[-1]["params"]["mangled"] is True
 
 
 def test_callsites_text_omits_null_hlil_and_pre_branch(fake_transport, capsys):
@@ -1277,9 +1338,9 @@ def test_callsites_text_omits_null_hlil_and_pre_branch(fake_transport, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "call-index: 3" in output
-    assert "hlil:" not in output
-    assert "pre-branch:" not in output
+    assert "call_index: 3" in output
+    assert "hlil_statement:" not in output
+    assert "pre_branch_condition:" not in output
 
 
 def test_target_summary_text_shows_function_counts():

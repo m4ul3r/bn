@@ -655,8 +655,8 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
                             "format_arg_index": 1, "note": "..."},
     }], "total": 1, "has_more": False}
     out = _render_callsites_text(value)
-    assert "hlil: null (no_hlil_mapping)" in out
-    assert "variadic-callee: sscanf" in out
+    assert "hlil_statement: null (no_hlil_mapping)" in out
+    assert "callee_variadic: sscanf" in out
     assert "bn evidence function parse_line" in out
 
 
@@ -673,7 +673,7 @@ def test_render_callsites_shows_missing_context_reason():
         "previous_instructions": [], "next_instructions": [],
     }], "total": 1, "has_more": False}
     out = _render_callsites_text(value)
-    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "call_addr 0x4124a6 | caller_static 0x4124ab" in out
     assert "> unavailable (no_structured_disasm_entry)" in out
     assert "<unknown>" not in out
 
@@ -701,7 +701,7 @@ def test_render_callsites_flags_an_incomplete_caller_scan():
         "callers_scanned": 1, "caller_total": None, "caller_scan_note": note,
     }
     out = _render_callsites_text(value)
-    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "call_addr 0x4124a6 | caller_static 0x4124ab" in out
     assert "note: the caller scan was incomplete" in out
     assert note in out
 
@@ -4071,9 +4071,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #795 adds eleven further CLI count reads to this combined population.
     # #889 adds the data-symbol total read; its offset read was already covered.
     # M-12 adds the strings `noise_strings` count read.
-    assert len(sites) == 55, (
+    # #978 adds the `function search` mangled-only match count.
+    assert len(sites) == 56, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 55. A "
+        "count helper, not 56. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4137,6 +4138,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "renderer]",
         "_duplicate_starts_note(duplicate_starts_unresolved) [not a payload "
         "renderer]",
+        # #978: the `function search` mangled-only line is a fragment helper the
+        # list and `--count` renderers both append, like the line above.
+        "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",

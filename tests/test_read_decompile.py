@@ -3474,6 +3474,50 @@ def test_function_list_carries_demangled_display_name(monkeypatch):
     assert item["display_name"] == "foo::bar::recv"
 
 
+def _cxx_function(start: int, mangled: str, demangled: str) -> _FakeFunction:
+    fn = _FakeFunction(start, mangled)
+    fn.symbol = _FakeSymbol("FunctionSymbol")
+    fn.symbol.short_name = demangled
+    return fn
+
+
+def test_function_search_matches_the_display_name_by_default_978(monkeypatch):
+    """#978: a short class-name query matched any function whose MANGLED name
+    happened to contain the letters. Default search matches the demangled
+    display name the text prints; `mangled` matches raw spellings instead, and
+    a default search reports what only a mangled spelling would have matched."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _cxx_function(0x401000, "_ZN4demo6Widget6handleEi", "demo::Widget::handle"),
+        _cxx_function(0x402000, "_ZN4demo5Gizmo3runEv", "demo::Gizmo::run"),
+        _FakeFunction(0x403000, "main"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def names(result):
+        return [item["display_name"] for item in result["items"]]
+
+    shown = instance._search_functions(None, "Widget::handle")
+    assert names(shown) == ["demo::Widget::handle"]
+    assert "mangled_only_matches" not in shown
+    assert instance._search_functions(None, "Widget::handle", mangled=True)["items"] == []
+
+    # `6Widget` occurs only inside the mangled spelling.
+    raw_query = instance._search_functions(None, "6Widget")
+    assert raw_query["items"] == [] and raw_query["mangled_only_matches"] == 1
+    counted = instance._search_functions(None, "6Widget", count_only=True)
+    assert counted["count"] == 0 and counted["mangled_only_matches"] == 1
+    raw_hit = instance._search_functions(None, "6Widget", mangled=True)
+    assert [item["name"] for item in raw_hit["items"]] == ["_ZN4demo6Widget6handleEi"]
+    assert "mangled_only_matches" not in raw_hit
+
+    # An unmangled name is the same spelling either way.
+    for mangled in (False, True):
+        assert names(instance._search_functions(None, "main", mangled=mangled)) == ["main"]
+
+
+
 def test_backward_slice_constant_arg_reports_value_hint(monkeypatch):
     """A constant/immediate arg (e.g. read(fd, buf, 0x1fff)'s count) has no SSA
     definition to trace. Instead of a renderer-only "constant or immediate" line
