@@ -49,26 +49,31 @@ from .bridge_state import require_analysis, _quick_loaded_views
 
 
 def _callee_variadic_hint(callee) -> dict[str, Any] | None:
-    """A provenance-labeled hint when the callee is an imported variadic
-    (printf/scanf-family) function (#558): HLIL callsite text can show only the
-    fixed argument, so point at the argument-recovery views. Returns None for a
-    non-variadic callee. Never asserts a finding -- it steers, it does not judge."""
+    """A provenance-labeled hint when the callee is variadic (#558): HLIL callsite
+    text can show only the fixed argument(s), so point at the argument-recovery
+    views. Returns None for a non-variadic callee. Never asserts a finding -- it
+    steers, it does not judge. ``callee_imported`` is BN's symbol kind (#949), and
+    only a known printf/scanf-family callee is said to take a format string."""
     name = str(getattr(callee, "name", "") or "")
     family = il_format._variadic_format_family(name)
     if family is None and not il_format._function_is_variadic(callee):
         return None
     fmt_index = family[0] if family is not None else None
     is_scanf = bool(family[1]) if family is not None else False
+    imported = is_imported_function(callee)
+    kind = "an imported variadic function" if imported else "a variadic function"
+    supplied = ("a format string and additional arguments" if family is not None
+                else "variadic arguments")
     return {
         "name": il_format._normalize_libc_name(name),
+        "callee_imported": imported,
         "is_variadic": True,
         "family": "scanf" if is_scanf else ("printf" if family is not None else None),
         "format_arg_index": fmt_index,
         "note": (
-            "callee is an imported variadic function; the HLIL statement may show only "
-            "the fixed argument(s) even when ABI setup supplied a format string and "
-            "additional arguments. Run `bn evidence function <caller>` for the format "
-            "string, destination pointers, and raw ABI argument candidates, or inspect "
+            f"callee is {kind}; the HLIL statement may show only the fixed argument(s) "
+            f"even when ABI setup supplied {supplied}. Run `bn evidence function <caller>` "
+            "for the recovered arguments and raw ABI argument candidates, or inspect "
             "`bn disasm <caller> --linear`."
         ),
     }

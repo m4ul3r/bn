@@ -41,7 +41,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
-from ._shared import _parse_address, _validate_count, is_imported_function
+from ._shared import _parse_address, _validate_count, is_imported_function, is_imported_symbol
 from .read_listing import _analysis_state_fields
 
 
@@ -904,45 +904,81 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     return evidence
 
 
+def _callee_imported(bv, dest_value, callee_fn) -> bool | None:
+    """Is the callee an import, by BN's symbol kind (#949)? None when neither a
+    function nor a symbol at the destination says -- an indirect call, or an
+    address BN has no symbol for -- so callers can word it neutrally instead of
+    guessing."""
+    if callee_fn is not None and getattr(callee_fn, "symbol", None) is not None:
+        return is_imported_function(callee_fn)
+    if dest_value is not None:
+        getter = getattr(bv, "get_symbol_at", None)
+        sym = getter(int(dest_value)) if callable(getter) else None
+        if sym is not None:
+            return is_imported_symbol(sym)
+    return None
+
+
+def _fixed_param_count(callee_fn) -> int | None:
+    """The number of FIXED formals in the callee's recovered prototype, or None."""
+    params = getattr(getattr(callee_fn, "type", None), "parameters", None)
+    try:
+        return len(params) if params is not None else None
+    except TypeError:
+        return None
+
+
 def _variadic_diagnostic(ctx, bv, dest_value, target, arg_source,
                          arguments: list[dict[str, Any]],
                          candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Provenance-labeled under-recovery diagnostic for an imported variadic
-    (printf/scanf-family) call (#558).
+    """Provenance-labeled arity diagnostic for a call to a variadic callee (#558).
 
     HLIL can render a scanf-family call showing only the fixed argument even
     though ABI setup supplied a format string and destination pointers, so a
     non-expert agent concludes the call has fewer arguments than it really does.
-    This DESCRIBES the shortfall and points to a lower-IL follow-up; it never
-    asserts a vulnerability. Returns None when the callee is not a recognized
-    variadic format function.
+    This DESCRIBES a shortfall and points to a lower-IL follow-up; it never
+    asserts a vulnerability. Returns None when the callee is not variadic.
+
+    ``arity_status`` keeps what is DEMONSTRATED apart from what is not (#949):
+
+    * ``under_recovered`` -- fewer arguments than a known requirement: the fixed
+      formals (the format argument included, for a known format family), or the
+      count a parsed format literal implies;
+    * ``complete`` -- a parsed format literal's count is met;
+    * ``unknown`` -- the fixed requirement is met and nothing says how many
+      variadic arguments the call needs. A variadic prototype alone is not a
+      format contract: varargs may legally be absent, and argument zero is not
+      a format string merely because the function is variadic.
+
+    ``callee_imported`` is BN's symbol kind, or None when BN has no symbol to
+    ask; the warning only calls the callee an import when that says so.
     """
     callee_name = _callee_name_for_call(ctx, bv, dest_value, target)
     if callee_name is None:
         return None
+    callee_fn = _callee_function_for_call(ctx, bv, dest_value, target)
     family = il_format._variadic_format_family(callee_name)
-    # Fall back to BN's recovered prototype for a variadic callee we don't have a
-    # format-arg-index table for -- still worth flagging, just without format parse.
     fmt_index: int | None
     is_scanf = False
     if family is not None:
         fmt_index, is_scanf = family
+        fixed_required: int | None = fmt_index + 1
     else:
-        callee_fn = None
-        if dest_value is not None:
-            getter = getattr(bv, "get_function_at", None)
-            callee_fn = getter(int(dest_value)) if callable(getter) else None
         if callee_fn is None or not il_format._function_is_variadic(callee_fn):
             return None
         fmt_index = None
+        fixed_required = _fixed_param_count(callee_fn)
 
     recovered = len(arguments)
+    imported = _callee_imported(bv, dest_value, callee_fn)
     diag: dict[str, Any] = {
         "callee": il_format._normalize_libc_name(callee_name),
+        "callee_imported": imported,
         "is_variadic": True,
         "family": "scanf" if is_scanf else ("printf" if family is not None else None),
         "format_arg_index": fmt_index,
         "recovered_arg_count": recovered,
+        "fixed_arg_count": fixed_required,
         "format_string": None,
         "format_conversions": None,
         "expected_min_arg_count": None,
@@ -965,30 +1001,31 @@ def _variadic_diagnostic(ctx, bv, dest_value, target, arg_source,
             diag["format_conversions"] = conversions
             diag["expected_min_arg_count"] = fmt_index + 1 + conversions
 
-    # Under-recovered when the recovered arg count falls short of what the format
-    # (or, absent a parsed format, the mere presence of variadic setup) implies.
-    if diag["expected_min_arg_count"] is not None:
-        under = recovered < int(diag["expected_min_arg_count"])
-    elif fmt_index is not None:
-        # Format not parseable (often BN dropped it too): only the fixed args are
-        # present, so no variadic argument was recovered -> likely under-recovered.
-        under = recovered <= fmt_index + 1
+    if fixed_required is not None and recovered < fixed_required:
+        diag["expected_min_arg_count"] = fixed_required
+        status = "under_recovered"
+    elif diag["expected_min_arg_count"] is not None:
+        status = ("under_recovered" if recovered < int(diag["expected_min_arg_count"])
+                  else "complete")
     else:
-        # Unknown-index variadic prototype: flag when nothing beyond a lone arg shows.
-        under = recovered <= 1
-    diag["under_recovered"] = bool(under)
+        status = "unknown"
+    diag["arity_status"] = status
+    diag["under_recovered"] = status == "under_recovered"
 
-    if under:
-        role = "destination pointer(s)" if is_scanf else "variadic value(s)"
-        if diag["expected_min_arg_count"] is not None:
+    if status == "under_recovered":
+        if conversions is not None:
+            role = "destination pointer(s)" if is_scanf else "value(s)"
             shortfall = (
                 f"recovered {recovered} of an expected >= {diag['expected_min_arg_count']} "
-                f"argument(s) (format + {conversions} {role})"
+                f"argument(s) (format + {conversions} variadic {role})"
             )
         else:
-            shortfall = f"recovered only {recovered} fixed argument(s); variadic {role} not surfaced in HLIL"
+            scope = ("up to and including the format string" if fmt_index is not None
+                     else "the callee's prototype declares before `...`")
+            shortfall = f"recovered {recovered} of the {fixed_required} argument(s) {scope}"
+        kind = "imported variadic call" if imported else "variadic call"
         diag["warning"] = (
-            f"imported variadic call `{diag['callee']}` under-recovered in HLIL: {shortfall}. "
+            f"{kind} `{diag['callee']}` under-recovered in HLIL: {shortfall}. "
             f"Raw ABI candidates are in `argument_candidates` (low confidence); inspect "
             f"`bn disasm <caller> --linear` or `bn il <caller> --view llil` for the full "
             f"argument setup."

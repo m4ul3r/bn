@@ -1045,11 +1045,14 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
 
 @command("evidence", "surface",
          help="Enumerate the hidden code surface (init/ctor pointers, vtable/dispatch tables, "
-              "data-referenced code BN did not functionize) that a passive function list misses",
+              "data- or code-referenced code BN did not functionize) that a passive function "
+              "list misses",
          target=True,
-         prefer_when="find code reachable through DATA (constructors, vtable/dispatch slots, "
-                     "pointer-table callbacks) that `function list` misses on a stripped/optimized "
-                     "target; read-only -- it reports addresses, it does not create functions",
+         prefer_when="find code reachable through DATA or an address taken in code "
+                     "(constructors, vtable/dispatch slots, pointer-table callbacks, "
+                     "`sa_handler = handler` registrations) that `function list` misses on a "
+                     "stripped/optimized target; read-only -- it reports addresses, it does not "
+                     "create functions",
          see_also=("evidence init", "evidence table", "function create"),
          args=[
              arg("--table-min-run", dest="table_min_run", type=_positive_int, default=3, metavar="N",

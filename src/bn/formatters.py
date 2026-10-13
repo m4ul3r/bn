@@ -3246,8 +3246,8 @@ def _render_surface_text(value: Any) -> str:
         code_likely = [c for c in cands if isinstance(c, dict) and c.get("code_likely")]
         lines.append("")
         lines.append(
-            f"missing-function candidates (executable, data-referenced, no BN function): "
-            f"{len(code_likely)} code-likely of {len(cands)}")
+            f"missing-function candidates (executable, data- or code-referenced, "
+            f"no BN function): {len(code_likely)} code-likely of {len(cands)}")
         # Show the high-confidence subset first; then the rest, marked with why.
         ordered = code_likely + [c for c in cands if isinstance(c, dict) and not c.get("code_likely")]
         for c in ordered:
@@ -3268,9 +3268,12 @@ def _render_surface_text(value: Any) -> str:
                 suffix = "  -> " + _render_string_literal(clipped, truncated=len(text) > 48)
             else:
                 suffix = ""
+            sites_total = c.get("referenced_from_total")
+            more = (f" (+{sites_total - 1} more site(s))"
+                    if isinstance(sites_total, int) and sites_total > 1 else "")
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
-                f"via {c.get('provenance', '?')}  [{tag}: {', '.join(why)}]{suffix}")
+                f"via {c.get('provenance', '?')}{more}  [{tag}: {', '.join(why)}]{suffix}")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
