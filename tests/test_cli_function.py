@@ -1313,6 +1313,29 @@ def test_function_search_sends_mangled_and_points_at_it_978(fake_transport, caps
     assert calls[-1]["params"]["mangled"] is True
 
 
+@pytest.mark.parametrize("argv, op, result", [
+    (["function", "search", "Widget"], "search_functions",
+     {"kind": "functions", "items": [dict(_WIDGET, raw_name=_WIDGET["name"])], "total": 1}),
+    (["function", "list"], "list_functions",
+     {"kind": "functions", "items": [dict(_WIDGET, raw_name=_WIDGET["name"])], "total": 1}),
+    (["function", "info", "0x402a4c"], "function_info", {"function": _WIDGET}),
+])
+def test_retired_demangle_flag_is_accepted_hidden_and_changes_nothing_978(
+        fake_transport, capsys, argv, op, result):
+    """Scripts written for #196's opt-in `--demangle` must keep running: the flag
+    is accepted, hidden from help, and output equals the (demangled) default."""
+    calls = fake_transport({op: {"ok": True, "result": result}})
+    base = [*argv, "--format", "text", "--target", "active"]
+    assert bn.cli.main(base) == 0
+    default = capsys.readouterr().out
+    assert bn.cli.main([*base, "--demangle"]) == 0
+    assert capsys.readouterr().out == default
+    assert calls[0]["params"] == calls[1]["params"]
+    with pytest.raises(SystemExit):
+        bn.cli.main([*argv[:2], "--help"])
+    assert "--demangle" not in capsys.readouterr().out
+
+
 def test_callsites_text_omits_null_hlil_and_pre_branch(fake_transport, capsys):
     fake_transport({"callsites": {
         "ok": True,

@@ -534,6 +534,14 @@ def mangled_arg(
     return arg("--mangled", action="store_true", default=False, help=help)
 
 
+def demangle_compat_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The retired ``--demangle`` opt-in (#196), still ACCEPTED and hidden: text
+    is demangled by default since #978, so the flag changes nothing, but a script
+    written against older docs must not hit an argparse error."""
+    return arg("--demangle", action="store_true", default=False, dest="_demangle_compat",
+               help=argparse.SUPPRESS)
+
+
 def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
     """The shared ``--summary`` / ``--quiet`` flag for mutation commands (#408).
 

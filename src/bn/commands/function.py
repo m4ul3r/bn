@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, mangled_arg, mutex, mutation_output_args, preview_arg, read_text_input
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, demangle_compat_arg, mangled_arg, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     disclosure_boundary,
     _render_call_descriptors_text,
@@ -55,7 +55,7 @@ from ..transport import BridgeError
                  help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
-             mangled_arg(),
+             mangled_arg(), demangle_compat_arg(),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
                  help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
                       "veneers, typically <= 16 bytes)"),
@@ -144,6 +144,7 @@ def _function_list(args: argparse.Namespace) -> int:
                  help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
+             demangle_compat_arg(),
              mangled_arg("Match and show raw (mangled) C++ symbol names instead of the "
                          "demangled display names; JSON always carries both"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
@@ -227,7 +228,7 @@ def _function_search(args: argparse.Namespace) -> int:
          args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
                arg("--verbose", "-v", action="store_true", default=False,
                    help="Show full parameter and local variable details"),
-               mangled_arg(),
+               mangled_arg(), demangle_compat_arg(),
                # #653.10: `--lines` slices a decompile blindly because the line
                # numbers are unknowable until after the full decompile. Block ranges
                # make a huge dispatcher targetable (`disasm --linear <block start>`,
