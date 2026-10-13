@@ -3224,6 +3224,27 @@ class TestStackFrameMap:
         buffer = next(slot for slot in slots if "char" in " ".join(slot["types"]))
         assert buffer["to_canary"] == canary - buffer["storage"] >= 44
 
+    def test_renamed_argument_does_not_fabricate_tls_canary(self, shared_bn):
+        shared_bn.load(CANARY_BINARY)
+        function = "read_context_word"
+        before = shared_bn.json("local", "list", "--frame", function)
+        assert before["canary_storage"] is None, before
+        parameter = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["is_parameter"]
+        )
+        shared_bn.json("local", "rename", function, parameter["local_id"], "fsbase")
+        renamed = next(
+            item for item in shared_bn.json("local", "list", function)["items"]
+            if item["local_id"] == parameter["local_id"]
+        )
+        assert renamed["name"] == "fsbase"
+        after = shared_bn.json("local", "list", "--frame", function)
+        assert after["canary_storage"] is None, after
+        assert [(s["storage"], s["kind"], s["to_canary"]) for s in after["items"]] == [
+            (s["storage"], s["kind"], s["to_canary"]) for s in before["items"]
+        ]
+
 
 class TestClassLensRttiGuards922:
     """#922: the class lens against a real PIE C++ build -- the `.data.rel.ro`
