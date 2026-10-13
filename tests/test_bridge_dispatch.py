@@ -2476,6 +2476,86 @@ def test_selector_falls_back_to_target_id_for_identical_paths(monkeypatch):
     bridge._headless_views.clear()
 
 
+@pytest.mark.parametrize("paths", [
+    ["/samples/runtime/demo", "/samples/runtime/demo.bndb", "/samples/copy/demo"],
+    ["/samples/left/demo.bndb", "/samples/right/demo.bndb"],
+    ["/samples/demo", "/cache/demo.0123456789abcdef.bndb"],
+    ["/samples/demo.bndb", "/samples/demo.bndb"],
+    ["/samples/active", "/samples/other"],
+    ["active", "   ", ""],
+    ["/samples/other", "/samples/1"],
+    ["/samples/demo ", "/samples/demo"],
+])
+def test_listed_selectors_round_trip_through_resolution(monkeypatch, paths):
+    """#919: every advertised selector must survive the resolver's aliases."""
+    bridge = _load_bridge(monkeypatch)
+    views = [_FakeFileBV(path, session_id=str(i)) for i, path in enumerate(paths)]
+    _register_views(bridge, *views)
+    manager = bridge.TargetManager()
+    try:
+        rows = manager.refresh()
+        for row, view in zip(rows, views, strict=True):
+            assert manager.resolve(row["selector"]) is view
+            assert manager.resolve(row["target_id"]) is view
+    finally:
+        bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("suffix", ["", ".bndb", ".0123456789abcdef.bndb"])
+def test_target_id_fallback_outranks_id_like_filename_aliases(monkeypatch, suffix):
+    bridge = _load_bridge(monkeypatch)
+    alpha = _FakeFileBV("/samples/demo", session_id="1")
+    database = _FakeFileBV("/samples/demo.bndb", session_id="2")
+    _register_views(bridge, alpha, database)
+    manager = bridge.TargetManager()
+    alpha_id = manager.refresh()[0]["target_id"]
+    named_like_id = _FakeFileBV(f"/samples/{alpha_id}{suffix}", session_id="3")
+    _register_views(bridge, alpha, database, named_like_id)
+    try:
+        rows = manager.refresh()
+        assert rows[0]["selector"] == alpha_id  # raw path collides at every depth
+        for row, view in zip(rows, [alpha, database, named_like_id], strict=True):
+            assert manager.resolve(row["selector"]) is view
+            assert manager.resolve(row["target_id"]) is view
+        assert manager.matches_target(alpha_id, alpha_id)
+        assert not manager.matches_target(rows[2]["target_id"], alpha_id)
+        assert manager.resolve(bridge.PinnedTarget(alpha_id)) is alpha
+
+        # An internal pin must not acquire human alias semantics after close.
+        _register_views(bridge, named_like_id)
+        with pytest.raises(RuntimeError, match="Unknown target selector"):
+            manager.resolve(bridge.PinnedTarget(alpha_id))
+    finally:
+        bridge._headless_views.clear()
+
+
+def test_selector_index_splits_paths_linearly_and_matches_the_resolver(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    records = {}
+    for i in range(80):
+        path = "/samples/" + "/".join(["shared"] * 12) + f"/copy-{i}/demo"
+        for suffix in ("", ".bndb", ".0123456789abcdef.bndb"):
+            vid = str(len(records) + 1)
+            records[vid] = bridge.TargetRecord(
+                vid, object(), vid, path + suffix, "demo" + suffix, "Raw"
+            )
+    original = bridge._path_components
+    splits = []
+
+    def count_splits(path):
+        splits.append(path)
+        return original(path)
+
+    monkeypatch.setattr(bridge, "_path_components", count_splits)
+    selectors = manager._compute_selectors(records)
+    # One split per record plus at most one per candidate, not per other view.
+    assert len(splits) <= sum(1 + len(original(r.filename)) for r in records.values())
+    monkeypatch.setattr(bridge, "_path_components", original)
+    for vid, selector in selectors.items():
+        assert manager._matching_records(records, selector) == [records[vid]]
+
+
 def test_refresh_rows_carry_analysis_state(monkeypatch):
     # target list rows must expose per-target analysis state so an agent can tell
     # a --quick view from a full one without a separate target info per target.
@@ -4659,6 +4739,7 @@ def test_bridge_handler_invalid_request_is_counted_during_its_write(monkeypatch)
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
     handler.rfile = io.BytesIO(b"not json at all\n")  # never becomes a dict -> no dispatch
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _InflightProbeWriter(inst)
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4694,6 +4775,7 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
         + b"\n"
     )
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4721,6 +4803,7 @@ def test_bridge_response_echoes_the_request_id(monkeypatch):
         + b"\n"
     )
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4745,6 +4828,7 @@ def test_bridge_response_omits_id_when_the_request_had_none(monkeypatch):
         + b"\n"
     )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4775,6 +4859,7 @@ def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
         + b"\n"
     )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 
@@ -4798,6 +4883,7 @@ def test_bridge_handler_refuses_request_when_shutting_down(monkeypatch):
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
     handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
     handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
 

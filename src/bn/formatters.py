@@ -999,6 +999,74 @@ def _render_local_list_text(value: Any) -> str:
     return _resolution_note(value) + "\n".join(lines)
 
 
+def _fmt_frame_storage(value: Any) -> str:
+    """A frame offset as decimal ``storage`` (what `local list --format json`
+    reports) plus its signed hex, disclosing an uncoercible one (#619)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"<unknown: {value!r}>"
+    sign = "-" if value < 0 else "+"
+    return f"{value} ({sign}0x{abs(value):x})"
+
+
+def _fmt_frame_distance(value: Any) -> str:
+    """A byte distance cell: ``-`` for an explicit absence (``None``), ``?`` for a
+    value that is present but not an int (#619)."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "?"
+    return str(value)
+
+
+@_discloses
+def _render_local_frame_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    function = _field_dict(value, "function")
+    slots = _field_list(value, "items")
+    rows = [slot for slot in slots if isinstance(slot, dict)]
+    malformed = [slot for slot in slots if not isinstance(slot, dict)]
+
+    canary = value.get("canary_storage")
+    canary_note = (f"canary at {_fmt_frame_storage(canary)}" if canary is not None
+                   else "canary slot not found")
+    header = (f"{_escape_control_chars(function.get('name', '<unknown>'))} @ "
+              f"{function.get('address', '<unknown>')} "
+              f"({_fmt_count(value.get('slot_count'))} stack slots, "
+              f"{_fmt_count(value.get('variable_count'))} variables; {canary_note})")
+    lines = [header]
+    if rows:
+        table = [("storage", "next", "to_canary", "kind", "type", "names")]
+        for slot in rows:
+            kind = slot.get("kind")
+            table.append((
+                _fmt_frame_storage(slot.get("storage")),
+                _fmt_frame_distance(slot.get("distance_to_next_slot")),
+                _fmt_frame_distance(slot.get("to_canary")),
+                "" if kind == "local" else _escape_control_chars(kind if kind is not None else "?"),
+                " | ".join(_escape_control_chars(t) for t in _field_list(slot, "types")) or "?",
+                ", ".join(_escape_control_chars(n) for n in _field_list(slot, "names")) or "?",
+            ))
+        widths = [max(len(row[col]) for row in table) for col in range(5)]
+        lines.append("")
+        for row in table:
+            cells = [row[0].ljust(widths[0]), row[1].rjust(widths[1]), row[2].rjust(widths[2]),
+                     row[3].ljust(widths[3]), row[4].ljust(widths[4]), row[5]]
+            lines.append("  " + "  ".join(cells).rstrip())
+        lines.extend([
+            "",
+            "next: bytes to the next recovered slot (slot pitch, not object size -- BN can split "
+            "one buffer into several slots); to_canary: bytes from this offset to the canary slot.",
+        ])
+    if malformed:
+        lines.extend(["", f"malformed entries ({len(malformed)}):"])
+        for item in malformed:
+            lines.append(f"  {item!r}")
+    if not rows and not malformed:
+        lines.extend(["", _empty_result("stack slots")])
+    return _resolution_note(value) + "\n".join(lines)
+
+
 @_discloses
 def _render_type_info_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -1140,10 +1208,9 @@ def _render_comment_list_text(value: Any) -> str:
         # distinguishable in one listing -- same `[doc]` marker `comment get
         # --function` already uses.
         prefix = "[doc] " if item.get("scope") == "function_doc" else ""
-        # Both cells carry settable text -- `comment` via `comment set`, and the
-        # containing function's symbol name via `rename`, which accepts a control
-        # char (`_require_nonempty_name` rejects only empty/whitespace). Either
-        # one raw splits the row (#771).
+        # Comments accept controls, and symbol names from existing databases or
+        # external writers can contain them too. Either raw cell splits the row
+        # (#771), even though bn symbol rename now rejects controls (#923).
         lines.append(f"{address}  {_escape_control_chars(func)}  {prefix}"
                      f"{_escape_control_chars(comment)}")
     return "\n".join(lines)
@@ -5840,7 +5907,7 @@ def _mutation_summary(value: Any) -> Any:
 
 
 # `go rename`'s own counters -- the ONE list, and the read loop below iterates
-# it, so a seventh counter cannot be read outside the capture that decides
+# it, so another counter cannot be read outside the capture that decides
 # whether this summary was measured at all. A tuple maintained BESIDE the reads
 # would be a second declaration to drift; this one IS the reads.
 _GO_RENAME_COUNTERS = (
@@ -5849,6 +5916,8 @@ _GO_RENAME_COUNTERS = (
     "go_verified_count",
     "go_failed_count",
     "skipped_user_named",
+    "skipped_already_named",
+    "skipped_interior_pc",
     "skipped_changed_during_apply",
 )
 
@@ -6042,7 +6111,7 @@ def _go_rename_summary(value: Any) -> Any:
     # `not success`, not on `failed`, is what keeps a revert that failed AFTER
     # every rename verified -- zero failure rows, message only -- from reporting
     # failed=0 with no error while the view sits partially renamed.
-    return _build_mutation_summary(
+    summary = _build_mutation_summary(
         # This op measures through its own counters rather than through
         # `results[]` -- but "measures through" is not "measured": a counter
         # that arrived in a shape no count reads out of leaves the derived
@@ -6066,9 +6135,8 @@ def _go_rename_summary(value: Any) -> Any:
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
-        # inside go_renamed_candidates. Distinct functions considered =
-        # candidates + scan-time-only skips -- keeping verified+noop+failed <=
-        # op_count, the invariant every other mutation summary holds.
+        # inside go_renamed_candidates. Already-named and interior-PC rows
+        # are scan-only skips, not operations; disclose them separately.
         op_count=candidates + skipped
                  - counters["skipped_changed_during_apply"],
         reported_success=reported_success,
@@ -6077,10 +6145,7 @@ def _go_rename_summary(value: Any) -> Any:
         failed=failed,
         changed=changed,
         verified=stated_verified,
-        # Already-user-named functions are deliberately left alone: no change,
-        # which is what `noop` means elsewhere. `op_count` above still uses the
-        # numeric read: it is a literal count of what the op could see, and an
-        # absent counter shrinks it rather than unknowing it.
+        # User-named skips retain the existing operation/noop population.
         noop=stated_noop,
         committed=committed,
         preview=preview,
@@ -6088,6 +6153,23 @@ def _go_rename_summary(value: Any) -> Any:
         message=_text_value(value, "message"),
         default_error="go rename failed",
     )
+    # Preserve operation-count semantics while exposing the scan buckets.
+    # The user-named wire counter includes apply-time skips; its overlap is
+    # explicit here, just as it is in the detailed producer result.
+    summary["go_rename"] = {
+        name: (None if source in unreadable
+               or (source in {"go_renamed_candidates", "skipped_user_named"}
+                   and not _field_present(value, source))
+               else counters[source])
+        for name, source in (
+            ("candidates", "go_renamed_candidates"),
+            ("skipped_user_named", "skipped_user_named"),
+            ("skipped_already_named", "skipped_already_named"),
+            ("skipped_interior_pc", "skipped_interior_pc"),
+            ("skipped_changed_during_apply", "skipped_changed_during_apply"),
+        )
+    }
+    return summary
 
 
 @_discloses
@@ -6127,6 +6209,14 @@ def _render_mutation_summary_text(value: Any) -> str:
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if _field_declared(value, "go_rename"):
+        go = _field_dict(value, "go_rename")
+        line += "\ngo rename: " + "  ".join(
+            f"{key}={_fmt_count(go.get(key))}" for key in (
+                "candidates", "skipped_user_named", "skipped_already_named",
+                "skipped_interior_pc", "skipped_changed_during_apply",
+            )
+        )
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive

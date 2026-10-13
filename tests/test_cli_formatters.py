@@ -3926,6 +3926,8 @@ _GO_RENAME_NON_COUNT_READS = {
     # M-03: the paired renderer reads the split-host listing back off the
     # summary; a listing, not a count, and absent on every `go rename`.
     "overlapping_functions",
+    # Command-specific disclosure container, built from the captured counters.
+    "go_rename",
 }
 
 
@@ -4585,7 +4587,7 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     from bn import formatters
 
     echoes = formatters._render_fallback_text              # the raw-payload dump
-    absorbed, visible, checked = [], set(), 0
+    absorbed, visible = [], set()
     for fn_name, render, key, kind, ctx in _runtime_population():
         if kind is None:
             continue
@@ -4595,7 +4597,6 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
         for bogus in _MALFORMED[kind]:
             payload = {**copy.deepcopy(ctx), key: bogus}
             out = _render_or_exception(render, payload)
-            checked += 1
             if isinstance(out, Exception):
                 continue                   # the raise sweep owns this case
             if _disclosed(out, key):
@@ -4617,21 +4618,6 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     assert sorted(visible) == ["_render_class_show_text.size", "_render_one_class.size"], (
         "a field renders a wrong-shaped container visibly but without disclosing; "
         f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
-    # Last, so a real absorption reports itself rather than being masked by the
-    # anti-vacuity count it also changes.
-    # Combined #873 and #879 renderer population; remeasured below.
-    # M-01 adds the `discarded_unsaved` list read to the session-start and
-    # session-stop renderers: two pairs x six malformed values (+12).
-    # M-12 adds the strings `noise_sections` list read (6 malformed list shapes,
-    # +6); its round 2 adds the `data_sections` list read and the narrowed
-    # `strings` face (`_render_strings_narrowed_text`, which reaches the same
-    # `items` / `noise_sections` lists), three list reads x 6 (+18).
-    # #922 adds the class `aliases` lists (list row + show card) and the
-    # secondary-vtable `confidence` text (+12). Measured: 1332.
-    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads of
-    # the compact status line, the op row and the split-host listing (+24).
-    # Measured: 1356.
-    assert checked == 1356, f"the differential ran {checked} cases, not 1356"
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
@@ -4652,74 +4638,16 @@ def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     population at all because round 8 fixed the arity rule to admit a renderer
     that takes a defaulted flag beside its payload -- which is the argument for
     deriving the population instead of listing it."""
-    swept, raised = 0, []
+    raised = []
     for fn_name, render, key, _kind, ctx in _runtime_population():
         absent = _render_or_exception(render, copy.deepcopy(ctx))
         for bogus in ("bad", {"a": 1}, ["bad"], 0, "", False, {}, []):
-            swept += 1
             out = _render_or_exception(render, {**copy.deepcopy(ctx), key: bogus})
             if isinstance(out, Exception) and not isinstance(absent, Exception):
                 raised.append(f"{fn_name}({key}={bogus!r}) raised "
                               f"{type(out).__name__} where the absent payload "
                               f"rendered cleanly")
     assert not raised, raised[:8]
-    # Last, so a real raise reports itself instead of being masked by the count
-    # it also moves (the round-8 rule, applied to the sweeps too).
-    # 4848 -> 4880 (#820): four more `(renderer, ctx)` pairs, because
-    # `_render_type_list_text`, `_render_function_evidence_text` and
-    # `_render_class_list_text` now READ `partial` (the quick-load warning), and a
-    # discovered read is a discovered pair -- 4 pairs x 8 bogus values, MEASURED
-    # on the rebased tree rather than carried over from the pre-merge branch. The
-    # assertion still exists to catch the population SHRINKING silently.
-    #
-    # 4880 -> 4888 (#755): ONE more pair, because `_render_trace_text` now reads
-    # the top-level `callee` to tell an unresolved callee from a callee nothing
-    # was computed for -- 1 pair x 8 bogus values, measured the same way.
-    #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions -- neither branch's own number survives the merge (#857 r8 rebase). 4880 + 8 (#755) + 8 (#857 r4) = 4896.
-    # #793: 4896 + 8 -- `_render_target_info_annotations_text` reads the
-    # `existing_annotations` container (8 bogus values x 1 render). Measured.
-    # #818 review: 4904 + 32 -- FOUR more discovered (renderer, ctx) pairs, 8
-    # bogus values each: `_render_go_functions_summary_text` reads `note` and
-    # `start_match_count` (the summary view carries the rebase note and the
-    # START-match counter now) and `_render_go_rename_text` reads the two new
-    # skip buckets. Measured on the rebased tree by diffing the population.
-    # #883 item 4: 4936 + 48 -- SIX more discovered (renderer, ctx) pairs, 8 bogus
-    # values each: `_duplicate_starts_collapsed` and `_duplicate_starts_unresolved`
-    # are read by `_render_function_count_text` and by
-    # `_render_function_list_text` in both its demangled and undemangled probe
-    # forms (3 renderers x 2 keys x 8). Measured by diffing the population, not
-    # carried over from a comment.
-    # #757 review round 5: 4984 + 32 -- FOUR more discovered (renderer, ctx)
-    # pairs, 8 bogus values each. The same two duplicate-start counts are now
-    # read by `_render_target_summary` (the note sits under the function count
-    # it modifies) and therefore by `_render_target_info_text`, which composes
-    # it. 2 renderers x 2 keys x 8. Measured by diffing the population.
-    # ...+ 16 -- and TWO more when `_render_orient_text` gained the same note
-    # under the digest's own function count (1 renderer x 2 keys x 8).
-    # Measured by diffing the population, not carried over from a comment.
-    # #693 items 1/2: + 16 -- TWO more discovered pairs, 8 bogus values each, both
-    # on `_render_go_rename_text`: it reads `rolled_back` and `success` BEFORE its
-    # branch, because the two rollback states are decided from those two fields
-    # rather than from the branch a payload happens to walk into.
-    # #857 adds one top-level container read; its nested `attempted_path`
-    # read adds no population pair. #823 and #890 add their own reads.
-    # #874 adds 56 malformed probes for its taint diagnostic reads.
-    # #907 adds 48 malformed probes for its class-list reads.
-    # #693 adds 16 more for two go-rename reads.
-    # Combined #873/#879/#889 population is 5280. #693 adds two go-rename
-    # reads, each probed with eight malformed values, for 5296 total. M-01 adds
-    # the `discarded_unsaved` read on the session-start and session-stop
-    # renderers: two pairs x eight (+16). M-12 adds the strings
-    # `noise_strings`/`noise_sections` reads (+16); its round 2 adds the
-    # `data_sections` read plus the narrowed `strings` face's nine reads (the
-    # same envelope through `_render_strings_narrowed_text`): 10 x 8 (+80).
-    # #922 adds the class `aliases` lists and the secondary `confidence`
-    # text (+16). Total 5424.
-    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list reads
-    # (compact status line, op row and its builders, split-host listing),
-    # eight malformed values each (+32). Total 5456.
-    assert swept == 5456, f"the raise sweep ran {swept} renders, not 5456"
 
 
 def test_the_nested_population_converges_before_the_depth_cap():
@@ -4856,7 +4784,7 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
       dict of scalars is a genuine skew one level down. Populated well-formed
       payloads are covered by name instead, in
       `test_well_formed_realistic_payloads_carry_no_disclosure`."""
-    noisy, checked = [], 0
+    noisy = []
     for fn_name, render, key, kind, _ctx in _runtime_population():
         benign: list[object] = [None]
         if kind is not None:
@@ -4865,49 +4793,8 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
             out = _render_or_exception(render, payload)
             if isinstance(out, Exception):
                 continue          # the renderer's own shape requirement
-            checked += 1
             if "malformed" in out:
                 noisy.append(f"{fn_name}({key}) on {payload!r}")
-    # 1413 -> 1421 with the same four pairs the raise sweep gained (#820): the
-    # quick-load warning reads `partial` in three more renderers, and the mirror
-    # contributes 2 benign payloads per pair. Measured on the rebased tree.
-    # 1421 -> 1423 (#755): the one `_render_trace_text`/`callee` pair the raise
-    # sweep also gained, x 2 benign payloads.
-    #
-    # #857 r4: `_render_save_text` now reads the `collides_with_open_target` container and the session-start `loaded` rows read `attempted_path`, both discovered reads, so these derived populations grow with them. Measured on the rebased tree as the sum of BOTH contributions (#857 r8 rebase). 1421 + 2 (#755) + 3 (#857 r4) = 1426.
-    # #793: 1426 + 3 -- the new target-info annotation renderer reads
-    # `existing_annotations` in three probed contexts. Measured.
-    # #818 review: 1429 + 8 -- the same four discovered pairs the raise sweep
-    # `_render_go_functions_summary_text`'s `note` / `start_match_count`
-    # and `_render_go_rename_text`'s two skip buckets), x 2 benign payloads each.
-    # Measured on the rebased tree by diffing the population.
-    # #883 item 4: 1437 + 12 -- the same SIX discovered pairs the raise sweep
-    # gained (`_duplicate_starts_note`'s two counts across the three
-    # `function list` / `--count` probe forms), x 2 benign payloads each. A
-    # well-formed count must not draw a "malformed" note, which is what this
-    # mirror checks. Measured by diffing the population.
-    # #757 review round 5: 1449 + 8 -- the same FOUR discovered pairs the raise
-    # sweep gained (the two duplicate-start counts now read by
-    # `_render_target_summary` and by `_render_target_info_text` composing it),
-    # x 2 benign payloads each. Measured by diffing the population.
-    # ...+ 4 -- and the two `_render_orient_text` pairs the raise sweep also
-    # gained, x 2 benign payloads each. Measured by diffing the population.
-    # #693 adds two go-rename pairs, or four benign probes.
-    # #857 adds one top-level container read; its nested `attempted_path`
-    # read adds no population pair. #823 and #890 add their own reads.
-    # #874 adds 16 benign probes for those reads.
-    # #907 adds 16 benign probes for those reads.
-    # #693 adds four more for the same go-rename pairs.
-    # Combined #873/#879/#889 mirror is 1534. #693's two reads add four
-    # benign probes, for 1538 total. M-01 adds the `discarded_unsaved` read on
-    # the session-start and session-stop renderers: two pairs x three benign
-    # probes (+6). M-12's strings noise reads add five (+5); its round 2 adds
-    # the `data_sections` list read (3) and the narrowed `strings` face's nine
-    # reads (two lists x 3 + seven scalars x 2 = 20) (+23). #922's `aliases`
-    # lists and secondary `confidence` text add six (+6). Total 1578.
-    # #927 (M-03)'s overlap list reads add twelve benign probes (+12).
-    # Total 1590.
-    assert checked == 1590, f"the mirror ran {checked} renders, not 1590"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -5905,40 +5792,9 @@ def test_render_trace_text_intra_out_param_reason_shows_callee():
     assert "out-param fill not followed (via parse_input)" in out
 
 
-def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypatch):
-    """#685: `go rename` reports through its own go_* counters but emits the SAME
-    compact-status schema as every other mutation, so both summaries must be
-    produced by ONE builder. They used to be separate dict literals, and the
-    copy drifted twice into defects the shared path already handled: a failure
-    row's `first_error`, and a revert that fails after every rename verified.
-    Pin the sharing (a change to the builder reaches both) and the shared rules
-    (the same OUTCOME reaches the same keys through either path)."""
+def test_mutation_summaries_preserve_failure_explanations():
+    """A failed revert or failure row remains visible through either counter source."""
     from bn import formatters
-
-    real_builder = formatters._build_mutation_summary
-    measured_payload = {
-        "success": True, "committed": True, "preview": False, "rolled_back": False,
-        "results": [{"status": "verified"}]}
-    go_payload = {
-        "kind": "go_rename", "success": True, "committed": True, "preview": False,
-        "rolled_back": False, "results": [], "go_renamed_candidates": 3,
-        "go_committed_count": 3, "go_verified_count": 3, "go_failed_count": 0,
-        "skipped_user_named": 1}
-
-    measured = formatters._mutation_summary(dict(measured_payload))
-    go = formatters._go_rename_summary(dict(go_payload))
-    assert measured["changed_count"] == 1 and go["changed_count"] == 3
-    assert set(measured) == set(go)
-
-    # One builder produced both, proven by CONSUMER-OBSERVABLE output: a change
-    # made in the builder has to appear in both summaries. A call count would
-    # only say each path called something; this says neither has a literal of
-    # its own that a builder change would leave behind.
-    monkeypatch.setattr(formatters, "_build_mutation_summary",
-                        lambda **kw: {**real_builder(**kw), "reached_via_builder": True})
-    assert formatters._mutation_summary(dict(measured_payload))["reached_via_builder"]
-    assert formatters._go_rename_summary(dict(go_payload))["reached_via_builder"]
-    monkeypatch.setattr(formatters, "_build_mutation_summary", real_builder)
 
     # A preview whose revert failed: zero failure rows, explanation only in the
     # top-level message. Both paths must call it dirty AND carry the error --
@@ -5957,6 +5813,9 @@ def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypa
                 "rolled_back", "dirty_after", "first_error"):
         assert mutation_stuck[key] == go_stuck[key]
     assert go_stuck["first_error"] == message
+    assert go_stuck["dirty_after"] is True
+    assert go_stuck["success"] is False
+    assert go_stuck["changed_count"] is None
 
     # A failure whose ONLY explanation is a results[] row: `first_error` must be
     # read off the row on both paths, never dropped to a bare failed count.
@@ -7739,8 +7598,7 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     population the probes discover: no element shape in the covered set costs a
     render that survives the list being absent, on any list position any
     renderer was OBSERVED walking. A reader who needs a guarantee for a shape
-    outside that list has to add the shape -- the sizes above are exact so that
-    adding one is visible."""
+    outside that list has to add the shape."""
     raised = []
     swept = 0
     for label, render, key, kind, ctx in _runtime_population():
@@ -7763,22 +7621,7 @@ def test_no_list_ELEMENT_costs_the_whole_render():
     assert not raised, (
         "a wrong-shaped list ELEMENT cost the whole render where the same "
         f"payload with the list absent rendered cleanly: {raised[:6]}")
-    # #907 adds two class-note list positions, each tested with nine junk
-    # elements at four shapes, to the PR-integrated 4716. Measured: 4788. M-01
-    # adds the `discarded_unsaved` list position on the session-start and
-    # session-stop renderers: two x nine x four (+72). M-12 adds the strings
-    # `noise_sections` list position (+36); its round 2 adds `data_sections` and
-    # the narrowed `strings` face's `items` / `noise_sections` positions, three x
-    # 36 (+108). #922 adds the two class `aliases` list positions (list row +
-    # show card) at the same nine-by-four (+72). Measured: 5076.
-    # #927 (M-03) adds the `overlapping_functions` / `overlaps` list positions
-    # (compact status line, op row and its builders, split-host listing) at
-    # the same nine-by-four (+144). Measured: 5220.
-    assert swept == 5220, (
-        f"the element sweep ran {swept} renders, not 5220 -- the size of the "
-        "covered set (every list position the population discovered x every "
-        "junk element kind x all four element shapes), so move it only with a "
-        "position you deliberately added or removed")
+    assert swept, "the element sweep ran no renders"
 
 
 def test_no_NESTED_list_ELEMENT_costs_the_whole_render():

@@ -46,6 +46,7 @@ bn function cfg <fn> [--view {asm|mlil|hlil}]        # basic-block graph: blocks
 bn function structured-il <fn>                       # flat per-instruction list: op plus vars_read/vars_written, no block partitioning
 bn proto get <fn>
 bn local list <fn>
+bn local list --frame <fn>                           # stack frame map: one row per distinct stack offset, saved-register/canary markers, bytes to the canary
 bn data vars --start <addr> --end <addr>             # typed data variables in an address window (the window is mandatory)
 bn data symbols [--limit N] [--offset N]             # named DataSymbols, internal ones included (paged: 100 by default)
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
@@ -56,7 +57,7 @@ bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangl
 bn class show <Name>                                  # one class: methods, vtable, size, bases, instances; falls back to a class type you declared
 bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
-bn exports [--count]                                 # public exported symbols (contrast `imports`)
+bn exports [--count]                                 # global/weak definitions from any symbol table, not loader-visible exports
 bn go functions [--summary | --count]                # recover Go names from .gopclntab (then `bn go rename`, a mutation)
 bn sections [--query <q>]
 bn tag list [--type Bookmarks --query <substr>]      # tags at all scopes; `--type Bookmarks` is the bookmarks tag
@@ -75,6 +76,7 @@ Notes:
 
 - `function search` is a case-insensitive substring search. Use `--exact` for a known API, `--word` for an identifier token, or an anchored `--regex` for a family. A regex-shaped zero-hit literal query may be retried as a regex; `regex_fallback` discloses that choice. Confirm a source or sink against the import and actual call target, not its name alone.
 - `function list --count` counts all functions; `function search <query> --count` counts matches. `--sort size --reverse --min-size N` is useful for large functions. `--named` / `--unnamed` separate meaningful names from auto `sub_*` names.
+- `exports` lists global/weak function and data definitions from any symbol table in BN's combined symbols; `exports list` is an alias, and `--count` counts that same population. It does **not** establish dynamic-loader visibility. On ELF, a global definition may exist only in `.symtab`, not `.dynsym`; use `readelf --dyn-syms` or `nm -D --defined-only` to inspect the dynamic table instead. The synthetic ELF case reported in [#921](https://github.com/m4ul3r/bn/issues/921) had 235 definitions under `bn exports --count` but only 2 under `nm -D --defined-only`: those are different populations, not evidence that all 235 are dynamically exported.
 - **Duplicate function start addresses are disclosed (#757).** Binary Ninja can hold more than one Function record for one start address. Where an answer holds such an address it publishes `duplicate_starts_collapsed` / `duplicate_starts_unresolved`, and every text face that answer reaches discloses it too. This entry states no more than that on purpose: every summary of what the collapse does to a given answer has been false on some shape of it, so the answer carries that truth and this page does not restate it.
 - `evidence orient` reports `existing_annotations` at the top level. A restored `.bndb` can carry earlier names and comments. `decompile` omits stored annotation bodies by default; `--include-annotations` opts in. Redaction covers matching standalone or inline `//` annotation lines, not arbitrary block comments or differently rendered text. Use `--addresses` when mapping a rendered line back to code.
 - `strings` ranks a dump by the section a string sits in: `.rodata`-like (ReadOnlyData) first, `.data`-like next, then code bytes that decode as text and linker metadata, in address order within each tier; where sections overlap the narrowest claiming one decides. An address no section claims is noise only when the view has a ReadOnlyCode section and the address is in an executable segment; on a raw image or a section-header-stripped ELF (BN adds only `.synthetic_builtins`) nothing is ranked and the dump is plain address order. `noise_strings` / `noise_sections` name the last tier and `data_sections` the data sections the listing drew on; the text tip names them only when noise is non-empty, recommends `--section <top data section>` only on an unfiltered dump, and `--section` pins one section in address order. `evidence orient` samples only the first two tiers (`sample_sections` says which, in sampled order) and names the fallback in `sample_fallback` when a view has no strings there.
@@ -95,6 +97,19 @@ Notes:
 
 Before an unfamiliar large read, use `--estimate-output` to measure its output without emitting the body; then slice with `--limit`, `--lines`, or `--out`.
 
+## Data-symbol pagination cost
+
+`data symbols` defaults to 100 rows, but **every page rebuilds the full named-symbol population**: the bridge enumerates all DataSymbols and filters out unnamed ones again to compute the honest `total`. Only row construction and serialization are limited to the requested window. There is no population cache shared between pages; walking every page repeats the full scan under the shared read lock on every request and multiplies aggregate lock-hold cost.
+
+For an index that needs every symbol, prefer one whole-set request:
+
+```bash
+bn data symbols --offset 0 --out /tmp/bn-data-symbols.json   # omit --limit: uncapped, one request
+bn data symbols --offset 0 --limit 50000 --format json     # one large page; whole set only if total <= 50000
+```
+
+`--out` removes the default page limit, but an explicit `--limit` still wins and a nonzero `--offset` still skips rows. Read the artifact named by the output envelope. Programmatic callers can send op `data_symbols` with `{"offset": 0, "limit": "all"}` for the whole set; the response echoes `limit: null`. Omitting `limit` or sending `null` instead requests the default 100-row page, not the whole set; CLI `--limit` accepts a positive integer, not `all`. A single request still pays one full population scan and builds all requested rows while holding the read lock. Check `has_more` before treating a numeric-limit result as complete.
+
 ## JSON reads and coverage
 
 Most collections use `{kind, items, total, offset, limit, returned, has_more}`. Inspect `kind` before selecting a container. Common leaves:
@@ -105,7 +120,8 @@ Most collections use `{kind, items, total, offset, limit, returned, has_more}`. 
 | `function list` / `function search`, `imports`, `exports` | `.items[].name`, `.items[].address` |
 | `sections` | `.items[].name`, `.start`, `.end`, `.length`, `.semantics` |
 | `types` | `.items[].decl`, `.layout`, and aggregate `.members[]` |
-| `local list` → `.items[]` | same list retained under `.locals`; rows carry `.local_id` |
+| `local list` → `.items[]` | same list retained under `.locals`; rows carry `.local_id`; stack rows carry `.distance_to_next_slot` (slot pitch, not object size) |
+| `local list --frame` → `.items[]` | one row per distinct stack offset: `.storage`, `.kind` (`local`/`saved_register`/`canary`/`return_address`/`caller_frame`), `.names`, `.distance_to_next_slot`, `.to_canary`, `.variables[].local_id`; top level `.canary_storage` |
 | `xrefs` | `.items[]`, with `.kind` and `.caller_function` per reference |
 | `callsites` | `.items[].caller_static`, `.callee`, `.containing_function` |
 | `comment list` | `.items[].comment` and `.scope` (`address` or `function_doc`) |
@@ -116,9 +132,25 @@ Addresses in JSON are hex STRING values such as `"0x401000"`; convert before ari
 
 **Absence requires a complete read.** Check `has_more`, caps, and scan notes. In particular, an import xref scan may return `items: []` with `truncated: true` and `scan_note`; text prints `note: the caller scan was TRUNCATED`. That means unknown, not zero callers. For high-fan-in `callsites`, `total: null` is a lower bound: inspect `total_lower_bound`, `scan_truncated`, `caller_scan_truncated`, and `caller_scan_note`. Either truncation flag prevents a complete-caller claim. A determined integer total must remain stable across pages.
 
+`Client.collect` and both `bn-kernel` backends report callsite coverage from the final request's cumulative scan, not the first page or a sum of page counts. The scan starts at row zero and includes lookahead, so `callers_scanned` and `total_lower_bound` need not equal the number of returned rows, especially with finite limits, nonzero offsets, or zero-row probes. An exact `total` replaces the lower bound; `total_lower_bound` is then omitted. A terminal `has_more: false` can still accompany `caller_scan_truncated: true` and `total: null`: all discovered rows were exhausted, but caller enumeration remains incomplete.
+
 For taint JSON, forward flows are `reached_sinks[]`, each with `.sink` and `.path`; backward results are `slices[]`, while top-level `sinks` repeats the query. `sink_status[]` discloses whether a backward sink was seeded or proven `bounded`. On a zero-sink forward run, read `diagnostics.safe_to_report_all_clear`: weak seeds or unmodeled-call assumptions can withhold an all-clear even with no leaves or truncation. A true gate only supports absence of modeled sink flow under that analysis, not absence of bugs. A backward run reports `diagnostics.safe_to_report_complete_slice`; it is false whenever a frontier leaf remains, the run was truncated, or any slice `origin.kind` is `unresolved` (counted under `diagnostics.frontier.unresolved`). A slice that reaches `p = &local_buf` at any offset (`p = &line + off`, or a sink handed `&local_buf` directly) continues through every writer of the buffer on the sink's memory chain, beside the offset -- a modeled call that filled it (`snprintf`, `strcpy`, `memcpy`, a `read`-style source) to that call's operands, including a nested local buffer read at that call's own memory version (`strcpy(buf, &other[i])` walks `other`), a plain store such as a `buf[n] = 0` terminator, a store through a phi'd loop cursor built on `&buf`, a modeled call that reloads the slot `&buf` escaped into, a `memset`/`bzero` literal fill, and a length argument of a bounded fill (`memcpy(buf, lit, n)`); a parameter or source copied in by an older writer outranks a later literal append as the origin. A writer covers a path only when it provably writes the whole buffer from offset 0 on every path (a fill or source handed `&buf` itself, a whole-variable store); an indexed or constant-offset store, a copy at an offset (`strcpy(buf + 60, ..)`), a loop-only fill, an escape of `&buf`, a pointer that may point at another local, and a `{}`-modeled call cover nothing. An `address_of_local_unresolved` leaf names the buffer whenever the walk could not account for its bytes: an unmodeled call that received `&buf` or ran after `&buf` escaped to memory, a path to the sink that no writer covers, a writer input that is neither a literal nor a local (a constant address into read-only data is a literal; the address of a `.data`/`.bss` global, or an element of one at a variable offset such as `g_hosts[i]`, is a leaf with origin `global`), a store through a pointer the walk cannot resolve (a reload after `&buf` escaped), a modeled call whose out-argument pointer cannot be resolved while `&buf` is escaped, or a memory chain past the walk budget (`stats.truncated` with cause `memory_chain`). A `{}`-modeled callee handed `&buf` is named in `assumptions`: the slice trusts that it writes nothing tainted.
 
-Use `--models FILE` for a known wrapper; keys are current symbol names (including `sub_*` on stripped targets), never addresses, and entries nest `sink` or `sources`. For `app_recv(fd, len, buf)`, `{"app_recv":{"sink":{"class":"overflow_len","len_arg":1,"buf_arg":2}}}` models a bounded-write sink; `{"app_recv":{"sources":[{"to":"*arg:2"},{"to":"ret"}]}}` seeds its output buffer and return. `sources` is a list of `to` rules: `*arg:N` means the pointed-to buffer, `arg:N` its value, and `ret` the return. An entry that puts the sink-arming fields (`class`, `tainted_args`, `len_arg`, `buf_arg`) beside the symbol with no `sink` under it, declares no recognized role at all, or declares a role with nothing in it (`"sources": []`, `"propagates": []`, a `varargs` without `to`) is refused with the expected shape named; annotation keys beside a real role are left alone. An entry of annotation keys alone (`return_bound`, `arity_capped`, `destinations_unmodeled`) is merged into the existing model of the same name, keeping its flow roles, and is refused when there is no such model to annotate. The `models:` header counts only entries that carry a role; an empty `{}` or a `_comment`-only entry (a benign function that neither sources, propagates nor sinks taint) is reported separately as `benign`. `bn taint models` lists a `writes` role (`bzero`) under propagators as `literal->*arg:N`.
+Use `--models FILE` for a known wrapper; keys are current symbol names (including `sub_*` on stripped targets), never addresses, and entries nest `sink` or `sources`. For `app_recv(fd, len, buf)`, `{"app_recv":{"sink":{"class":"overflow_len","len_arg":1,"buf_arg":2}}}` models a bounded-write sink; `{"app_recv":{"sources":[{"to":"*arg:2"},{"to":"ret"}]}}` seeds its output buffer and return. `sources` is a list of `to` rules: `*arg:N` means the pointed-to buffer, `arg:N` its value, and `ret` the return. An entry that puts the sink-arming fields (`class`, `tainted_args`, `len_arg`, `buf_arg`) beside the symbol with no `sink` under it, declares no recognized role at all, or declares a role with nothing in it (`"sources": []`, `"propagates": []`, a `varargs` without `to`) is refused with the expected shape named; annotation keys beside a real role are left alone.
+
+Overlay rules are the same for `taint models --models` and `taint forward/backward --models`:
+
+- An **annotation-only** entry (`return_bound`, `arity_capped`, `destinations_unmodeled`, with no flow role) merges only into an existing **flow-bearing** model of the same name, preserving its flow roles. For example, `{"read":{"return_bound":{"max_from_arg":2}}}` keeps the builtin `read` buffer-source, return-source, and sink roles.
+- An entry with **any flow role** — `sources`, `sink`, `propagates`, `writes`, `varargs`, or `continuation` — **replaces the entire model entry**, even when it also supplies annotations. Omitted roles are not inherited.
+- A benign `{}` builtin such as `puts` is **not annotatable**: an annotation-only entry for it is refused, just as for a name with no existing model. To model flow, supply the flow role explicitly. Supplying `{}` instead replaces the entry with a benign marker.
+
+For example, this mixed flow/annotation overlay replaces `read`; it keeps only the declared return source and return bound, dropping the builtin buffer source (`*arg:1`) and sink:
+
+```json
+{"read": {"return_bound": {"max_from_arg": 2}, "sources": [{"to": "ret"}]}}
+```
+
+The `models:` header counts only entries that carry a role; an empty `{}` or a `_comment`-only entry (a benign function that neither sources, propagates nor sinks taint) is reported separately as `benign`. `bn taint models` lists a `writes` role (`bzero`) under propagators as `literal->*arg:N`.
 
 ## Caller-static mapping
 
