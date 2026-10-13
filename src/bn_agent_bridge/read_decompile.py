@@ -404,12 +404,14 @@ _SCALAR_TYPE_CLASSES = frozenset({
 def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     """Evidence-qualified known-layout assistance; never writes a type (#903).
 
-    Match complete scalar members of concrete, non-inherited structs, resolving
+    Match complete scalar members of concrete, base-less structs, resolving
     typedefs only for members at observed offsets/widths. Unclassifiable members
     -- unresolved typedefs, bitfield storage units, overlapping members and
     members of unknown (zero) width -- can block uniqueness but cannot supply a
-    witness. Base-less classes are equally concrete layouts: they compete with
-    structs but are never suggested themselves. Whole-struct aliases do not add
+    witness. Base-less classes, and layouts whose members overrun their recorded
+    width (stale metadata after a member type was redeclared), compete but are
+    never suggested. Nested, union, array and inherited layouts are outside the
+    comparison, and the warning says so. Whole-struct aliases do not add
     candidates (their concrete declarations are already in bv.types). Matching
     two distinct offsets is a minimum witness, not proof of identity.
     """
@@ -450,7 +452,9 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
             elif member.name:
                 scalars[(offset, width)] = member
         if end > limit:
-            continue
+            # Members overrun the recorded width: the metadata disagrees with
+            # itself, so this layout can block but never witness.
+            witness = False
         # Named scalar = positive; None = uncertain; absent = incompatible.
         members: dict[tuple[int, int], str | None] = {}
         for offset, width in observed_keys:
@@ -487,6 +491,9 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
         warnings.append(
             f"struct layout candidate for parameter {index + 1} ({var.name}): "
             f"observed direct MLIL accesses {evidence} match declared struct {name}. "
+            "Only flat scalar members of base-less struct/class layouts were compared; "
+            "a layout holding these offsets in a nested struct, union, array or base "
+            "class was not, so another type may also fit. "
             "Offsets and widths alone do not prove the parameter's type. "
             f"Review `bn struct show {shlex.quote(name)}` and `bn disasm {address}`; "
             f"if confirmed, use `bn proto get {address}`, then `bn proto set {address}` "

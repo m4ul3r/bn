@@ -4685,8 +4685,38 @@ def test_stored_globals_exclude_vtt_and_construction_data_945(monkeypatch, ptr, 
     ctx = seam.BridgeContext(None)
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
     card = read_class._class_show(ctx, None, "svc::Codec")
-    assert card["instances"]["stored_globals"] == [
-        {"symbol": "global_codec", "address": "0xa000"},
-        {"symbol": "neighbor", "address": "0xa080"},
-    ]
-    assert card["instances"]["stored_globals_total"] == 2
+    expected = [{"symbol": "global_codec", "address": "0xa000"}]
+    if not typed_vtt:
+        expected.append({"symbol": None, "address": hex(0xa040 + ptr)})
+        assert any("extent is unknown" in note for note in card["notes"])
+    expected.append({"symbol": "neighbor", "address": "0xa080"})
+    assert card["instances"]["stored_globals"] == expected
+    assert card["instances"]["stored_globals_total"] == len(expected)
+
+
+@pytest.mark.parametrize("ptr", [4, 8])
+@pytest.mark.parametrize("neighbor_kind", ["named", "unnamed", "unnamed_typed"])
+def test_untyped_vtt_does_not_own_adjacent_same_class_object_945(monkeypatch, ptr, neighbor_kind):
+    bv = _slot_array_global_bv(ptr)
+    point = 0x9000 + 2 * ptr
+    bv._symbols.append(_Sym("_ZTTN3svc7DerivedE", "VTT for svc::Derived", 0xa040))
+    neighbor = 0xa040 + 2 * ptr
+    if neighbor_kind == "named":
+        bv._symbols.append(_Sym("adjacent_codec", "adjacent_codec", neighbor))
+    bv._memory[0xa040] = b"".join(
+        value.to_bytes(ptr, "little") for value in (point, point, point, 42))
+    bv.get_data_var_at = lambda address: (
+        types.SimpleNamespace(address=neighbor, type=types.SimpleNamespace(width=2 * ptr))
+        if neighbor_kind == "unnamed_typed" and address == neighbor else None
+    )
+    bv._data_refs[point] = [0xa000, 0xa040, 0xa040 + ptr, neighbor]
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+    card = read_class._class_show(ctx, None, "svc::Codec")
+    refs = card["instances"]["stored_globals"]
+    assert {"symbol": "adjacent_codec" if neighbor_kind == "named" else None,
+            "address": hex(neighbor)} in refs
+    assert {"symbol": None, "address": hex(0xa040 + ptr)} in refs
+    assert not any(ref["address"] == "0xa040" for ref in refs)
+    assert card["instances"]["stored_globals_total"] == 3
+    assert any("extent is unknown" in note for note in card["notes"])
