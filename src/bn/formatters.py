@@ -3203,11 +3203,11 @@ def _witness_items(mapping: dict[str, Any]) -> list[tuple[str, Any]]:
                     if name not in _WITNESS_ORDER]
 
 
-def _render_arity_witness(name: str, verdict: Any) -> str:
+def _render_arity_witness(name: str, verdict: dict[str, Any]) -> str:
     """One witness verdict as `name=status (detail)` (#865). Read through the
     field choke points, so a skewed field is disclosed rather than dropped."""
-    if not isinstance(verdict, dict):
-        return f"{name}=unreadable"
+    if not verdict:
+        return f"{name}=no verdict"
     status = _text_value(verdict, "status")
     detail = ""
     if status in ("agreement", "contradiction"):
@@ -3232,7 +3232,8 @@ def _render_arity_witnesses(witnesses: dict[str, Any]) -> str:
     if not witnesses:
         return ""
     return "  witnesses: " + "; ".join(
-        _render_arity_witness(name, verdict) for name, verdict in _witness_items(witnesses))
+        _render_arity_witness(name, _field_dict(witnesses, name))
+        for name, _ in _witness_items(witnesses))
 
 
 def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> str:
@@ -3242,13 +3243,11 @@ def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> st
     if not counts:
         return ""
     parts = []
-    for name, tally in _witness_items(counts):
-        if not isinstance(tally, dict):
-            parts.append(f"{name} unreadable")
-            continue
+    for name, _ in _witness_items(counts):
+        tally = _field_dict(counts, name)
         cells = ", ".join(f"{status} {_stated_count(tally, status)}"
                           for status in _WITNESS_STATUSES if status in tally)
-        parts.append(f"{name} {cells}" if cells else f"{name} unreadable")
+        parts.append(f"{name} {cells}" if cells else f"{name} no tally")
     scope = f" over {total_calls} call(s)" if isinstance(total_calls, int) else ""
     return (f"arity witnesses{scope}: " + "; ".join(parts)
             + " -- only a contradiction is evidence against a row; unavailable/refused "
