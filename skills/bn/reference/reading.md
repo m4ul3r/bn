@@ -52,7 +52,7 @@ bn data symbols [--limit N] [--offset N]             # named DataSymbols, intern
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
 bn types [--query <q>]
 bn types show <name>
-bn struct show <name>                                 # a derived struct shows `: Base` and its inherited fields tagged `[from Base]` (JSON: `bases`, `inherited_members`)
+bn struct show <name>                                 # a struct BN records bases for (e.g. from debug info) shows `: Base` and inherited fields tagged `[from Base]` (JSON: `bases`, `inherited_members`); `types declare` records none yet (#965)
 bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangled symbols + RTTI (+ your own declared class types under --all)
 bn class show <Name>                                  # one class: methods, vtable, size, bases, instances; falls back to a class type you declared
 bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]

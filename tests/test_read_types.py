@@ -838,6 +838,29 @@ def test_declaration_references_to_existing_types_are_not_redefined(monkeypatch)
     assert by_mention == ["ns::W::VTabl"]
 
 
+def test_every_base_clause_is_reported_never_dropped(monkeypatch):
+    """#965 split out of #989: bn records no C++ base, so it must name every
+    base clause it sees -- whatever sits around the name -- and fail loudly on
+    one it cannot read rather than drop it."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    found = me._unrecorded_base_clauses(
+        "struct A { int a; }; struct alignas(32) D1 : A { char e; };\n"
+        "struct __attribute__((packed)) D2 : public A, private B { char e; };\n"
+        "struct [[gnu::packed]] D3 final : virtual A {};\n"
+        "class `ns::D4` : ns::Base<int, char> { int x; };\n"
+        "struct Outer { struct Inner : A { int i; } in; struct A* p; };\n"
+        "enum class E : int { X }; struct Fwd; int f(struct A* a, struct B b);")
+    assert set(found) == {"D1", "D2", "D3", "ns::D4", "Inner"}
+    assert "A, B" in found["D2"] and "see #965" in found["D1"]
+    assert "ns::Base<int, char>" in found["ns::D4"]
+    assert me._unrecorded_base_clauses("struct P { int a; }; struct Q { struct P p; };") == {}
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._unrecorded_base_clauses("struct D : { int x; };")
+    assert excinfo.value.status == "invalid_request"
+    assert "#965" in excinfo.value.message
+
+
 def test_type_not_found_explains_class_vtable_types(monkeypatch):
     """#963: `struct show <Class>` on a class BN only made vtable types for."""
     bridge = _load_bridge(monkeypatch)

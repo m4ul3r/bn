@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import struct
@@ -943,159 +944,113 @@ class TestTypeStringsAndInheritance:
         assert res.returncode == 3, res.stdout
         assert "struct `demo::Widget::VTable`" in res.stdout, res.stdout
 
-    def test_declared_bases_are_recorded_and_shown(self, shared_bn):
-        shared_bn.load(HELLO_BINARY)
-        summary = shared_bn.json(
-            "types", "declare",
-            "struct Base965 { void* vtable; int x; }; struct Mid965 : Base965 { int m; }; "
-            "struct Derived965 : public Mid965 { int y; }; "
-            "struct Two965 : Base965, Mid965 { char c; }; "
-            "struct Virt965 : virtual Base965 { int z; };",
-            "--summary")
-        # #964: counted per type, not per op.
-        declared = summary["declared_types"]
-        assert declared["count"] == 5, summary
-        assert set(declared["names"]) == {"Base965", "Mid965", "Derived965", "Two965", "Virt965"}
-        # A virtual base has no fixed offset: declared as parsed, and disclosed.
-        assert list(declared["unattached_bases"]) == ["Virt965"], summary
-
-        shown = shared_bn.run("struct", "show", "Derived965").stdout
-        assert shown.splitlines() == [
-            "struct Derived965 : Mid965 // size=0x18",
-            "0x0000: void* vtable  [from Base965]",
-            "0x0008: int32_t x  [from Base965]",
-            "0x0010: int32_t m  [from Mid965]",
-            "0x0014: int32_t y",
-        ], shown
-        two = shared_bn.json("struct", "show", "Two965")
-        assert two["bases"] == [{"name": "Base965", "offset": "0x0", "width": "0x10"},
-                                {"name": "Mid965", "offset": "0x10", "width": "0x18"}], two
-        assert [(m["offset"], m["name"]) for m in two["inherited_members"]] == [
-            ("0x0", "vtable"), ("0x8", "x"), ("0x10", "vtable"), ("0x18", "x"), ("0x20", "m")]
-        assert two["members"] == [{"name": "c", "offset": "0x24", "type": "char"}], two
-
-    # The base shapes compared with g++ in the two #989 reviews, plus a single
-    # earlier-declared base without tail padding (the one earlier-base shape
-    # the bridge is meant to record). Each entry: the `types declare` steps in
-    # order, then {derived struct: expected outcome}. "recorded" must equal g++
-    # in every base offset, every own-member offset and the size; "refused"
-    # must be in `unattached_bases` with no bases recorded; None asserts only
-    # the invariant (recorded => equal to g++), for shapes whose refusal is
-    # BN's parser's call rather than the bridge's.
+    # The base shapes from the third #989 review's matrix (every shape but the
+    # bit-field ones, which the bitfield guard refuses outright), each as the
+    # `types declare` steps it was declared in. Bases from the same declaration
+    # and from earlier ones, empty, virtual, `final`, `alignas`/`__attribute__`
+    # heads, private/protected members, multiple inheritance.
     _BASE_SHAPES = [
-        (["struct MA { long long a; char c; }; struct MB : MA { char d; };",
-          "struct PX { char x; }; struct PC : MB, PX { char e; }; struct QC : MB { char e; };"],
-         {"PC": "refused", "QC": "refused"}),
-        (["struct A3 { long long a; char c; }; struct B3 : A3 { char d; }; struct X3 { char x; }; "
-          "struct Y3 { char y; }; struct T3 : B3, X3, Y3 { char e; };"],
-         {"B3": "recorded", "T3": "recorded"}),
-        (["struct A4 { long long a; char c; }; struct B4 : A4 { char d; };",
-          "struct X4 { char x; }; struct Y4 { char y; }; struct T4 : B4, X4, Y4 { char e; };"],
-         {"T4": "refused"}),
-        (["struct A6 { long long a; char c; }; struct B6 : A6 { char d; };",
-          "struct X6 { char x; }; struct Y6 { char y; }; struct T6 : X6, B6, Y6 { char e; };"],
-         {"T6": "refused"}),
-        (["struct TA { long long a; char c; };",
-          "struct TX { char x; }; struct TD : TA { char d; }; struct TE : TA, TX { char e; };"],
-         {"TD": "refused", "TE": "refused"}),
-        (["struct E1 {}; struct E2 {}; struct ED : E1 { int x; }; struct ED2 : E1, E2 { int x; }; "
-          "struct ED3 : E1 {};"],
-         {"ED": None, "ED2": None, "ED3": None}),
-        (["struct G1 {}; struct GN { int n; }; struct GD : G1, GN { char g; };"], {"GD": None}),
-        (["class CP { long long a; char c; }; struct CD : CP { char d; }; struct CX { char x; }; "
-          "struct CE : CP, CX { char e; };"],
-         {"CD": None, "CE": None}),
-        (["struct NA { long long a; char c; }; struct NB : NA { char d; }; struct NM { NB m; char z; }; "
-          "struct NX { char x; }; struct NE : NM, NX { char e; };"],
-         {"NE": None}),
-        (["struct F1 {}; struct F2 {};", "struct FD2 : F1, F2 { int x; };"], {"FD2": "refused"}),
-        (["class KP { long long a; char c; };",
-          "struct KX { char x; }; struct KE : KP, KX { char e; };"],
-         {"KE": "refused"}),
-        (["struct OA { long long a; char c; }; struct OB : OA { char d; }; "
-          "struct OM { OB m; char z; };",
-          "struct OX { char x; }; struct OE : OM, OX { char e; };"],
-         {"OE": "refused"}),
-        (["struct A5 { long long a; char c; }; struct B5 : A5 { char d; };",
-          "struct X5 { char x; }; struct Y5 { short y; }; struct T5 : X5, Y5, B5 { char e; };"],
-         {"T5": "refused"}),
-        (["struct WA { long long a; long long b; };", "struct WD : WA { int y; };"],
-         {"WD": "recorded"}),
-        (["struct VB { int v; }; struct VD : virtual VB { int z; };"], {"VD": "refused"}),
+        ['struct e02_A { long long a; long long b; };', 'struct e02_D : e02_A { char e; };'],
+        ['struct e03_A { long long a; char c; };', 'struct e03_D : e03_A { char e; };'],
+        ['struct e04_E { };', 'struct e04_D : e04_E { int x; };'],
+        ['struct e05_A { long long a; }; struct e05_B { long long b; };', 'struct e05_D : e05_A, e05_B { char e; };'],
+        ['struct e05b_A { long long a; };', 'struct e05b_B { long long b; }; struct e05b_D : e05b_A, e05b_B { char e; };'],
+        ['struct e17_A { long long a; }; struct e17_B : e17_A { long long b; };', 'struct e17_C : e17_B { long long c; };', 'struct e17_D : e17_C { char e; };'],
+        ['struct alignas(16) e18_A { long long a; };', 'struct e18_D : e18_A { char e; };'],
+        ['struct alignas(16) e18b_A { long long a; long long b; };', 'struct e18b_D : e18b_A { char e; };'],
+        ['struct e19_A { long long a; long long b; };', 'struct alignas(32) e19_D : e19_A { char e; };'],
+        ['struct e20_A { long long a; long long b; };', 'struct __attribute__((packed)) e20_D : e20_A { char e; int f; };'],
+        ['struct e22_B { int b; };', 'struct e22_D : virtual e22_B { int x; };'],
+        ['class e25_K { long long a; long long b; };', 'struct e25_D : e25_K { char e; };'],
+        ['class e37_Z { long long a; char c; };', 'struct e37_A : e37_Z { char d[8]; };', 'struct e37_D : e37_A { char e; };'],
+        ['class e43r_Z { long long a; char c; };', 'struct alignas(8) e43r_A : e43r_Z { char d[8]; };', 'struct e43r_D : e43r_A { char e; };'],
+        ['struct e44_Z { long long z; }; struct e44_A : e44_Z { char c; }; struct e44_B : e44_A { char d; };', 'struct e44_D : e44_B { char e; };'],
+        ['struct e45_Z { long long z; }; struct e45_A : e45_Z { char c; }; struct e45_B : e45_A { };', 'struct e45_D : e45_B { char e; };'],
+        ['struct r2fd_F1 {}; struct r2fd_F2 {};', 'struct r2fd_FD2 : r2fd_F1, r2fd_F2 { int x; };'],
+        ['struct r2fdx_F1 {}; struct r2fdx_F2 {};', 'struct r2fdx_FD2 : r2fdx_F1, r2fdx_F2 { int x; };'],
+        ['class r2ke_KP { long long a; char c; };', 'struct r2ke_KX { char x; }; struct r2ke_KE : r2ke_KP, r2ke_KX { char e; };'],
+        ['class r2kex_KP { long long a; char c; };', 'struct r2kex_KX { char x; }; struct r2kex_KE : r2kex_KP, r2kex_KX { char e; };'],
+        ['struct r2oe_OA { long long a; char c; }; struct r2oe_OB : r2oe_OA { char d; }; struct r2oe_OM { r2oe_OB m; char z; };', 'struct r2oe_OX { char x; }; struct r2oe_OE : r2oe_OM, r2oe_OX { char e; };'],
+        ['struct r2oex_OA { long long a; char c; }; struct r2oex_OB : r2oex_OA { char d; }; struct r2oex_OM { r2oex_OB m; char z; };', 'struct r2oex_OX { char x; }; struct r2oex_OE : r2oex_OM, r2oex_OX { char e; };'],
+        ['struct r2qc_MA { long long a; char c; }; struct r2qc_MB : r2qc_MA { char d; };', 'struct r2qc_QC : r2qc_MB { char e; };'],
+        ['struct r2qcx_MA { long long a; char c; }; struct r2qcx_MB : r2qcx_MA { char d; };', 'struct r2qcx_QC : r2qcx_MB { char e; };'],
+        ['struct r2t5_A5 { long long a; char c; }; struct r2t5_B5 : r2t5_A5 { char d; };', 'struct r2t5_X5 { char x; }; struct r2t5_Y5 { short y; }; struct r2t5_T5 : r2t5_X5, r2t5_Y5, r2t5_B5 { char e; };'],
+        ['struct r2t5x_A5 { long long a; char c; }; struct r2t5x_B5 : r2t5x_A5 { char d; };', 'struct r2t5x_X5 { char x; }; struct r2t5x_Y5 { short y; }; struct r2t5x_T5 : r2t5x_X5, r2t5x_Y5, r2t5x_B5 { char e; };'],
+        ['struct s01_A { int a; }; struct s01_D : s01_A { char e; };'],
+        ['struct s06_A { long long a; char c; }; struct s06_B : s06_A { char d; }; struct s06_X { char x; }; struct s06_D : s06_B, s06_X { char e; };'],
+        ['struct s07_E { }; struct s07_D : s07_E { int x; };'],
+        ['struct s08_N { int a; }; struct s08_E { }; struct s08_D : s08_N, s08_E { int x; };'],
+        ['struct s08b_E { }; struct s08b_D : s08b_E { };'],
+        ['class s09_K { long long a; char c; }; struct s09_D : s09_K { char e; };'],
+        ['struct s10_K { protected: long long a; char c; }; struct s10_D : s10_K { char e; };'],
+        ['struct s10b_K { long long a; private: char c; }; struct s10b_D : s10b_K { char e; };'],
+        ['struct s11_A { long long a; char c = 1; }; struct s11_D : s11_A { char e; };'],
+        ['struct s12_A { long long& r; char c; }; struct s12_D : s12_A { char e; };'],
+        ['struct s13_A { long long a; const char c; }; struct s13_D : s13_A { char e; };'],
+        ['struct s18c_A { char c; alignas(16) char d; }; struct s18c_D : s18c_A { char e; };'],
+        ['struct s21_B { int b; }; struct s21_D : virtual s21_B { int x; };'],
+        ['struct s23_A { long long a; long long b; }; struct s23_D : s23_A { virtual void f(); int y; };'],
+        ['struct s24_A { long long a; long long b; }; struct s24_D : s24_A { int get(); int y; };'],
+        ['struct s35_E { }; struct s35_F : s35_E { int x; }; struct s35_D : s35_E, s35_F { int y; };'],
+        ['struct s35r_E { }; struct s35r_F : s35r_E { int x; }; struct s35r_D : s35r_E, s35r_F { int y; };'],
+        ['struct s38_A { long long a; char c; }; class s38_B : public s38_A { char d; }; struct s38_D : s38_B { char e; };'],
+        ['struct s38r_A { long long a; char c; }; class s38r_B : public s38r_A { char d; }; struct s38r_D : s38r_B { char e; };'],
+        ['struct s39_A { int a; }; struct s39_B { int b; }; struct s39_D : public s39_A, private s39_B { int x; };'],
+        ['struct s39r_A { int a; }; struct s39r_B { int b; }; struct s39r_D : public s39r_A, private s39r_B { int x; };'],
+        ['struct s40_A { long long a; char c; }; struct s40_B : s40_A { }; struct s40_D : s40_B { char e; };'],
+        ['struct s41_A { char c; }; struct s41_B { long double ld; }; struct s41_D : s41_A, s41_B { char e; };'],
+        ['struct s42_A { int a; }; struct s42_D final : s42_A { char e; };'],
+        ['struct s46_Z { long long z; }; struct s46_A : s46_Z { char c; }; struct s46_B : s46_A { char d; }; struct s46_D : s46_B { char e; };'],
+        ['struct t00_A { long long a; long long b; };', 'struct t00_D : t00_A { char e; };'],
     ]
 
-    @staticmethod
-    def _gxx_layouts(tmp_path, shapes) -> dict:
-        """Every derived struct's layout per g++: base offsets (through a real
-        object and `static_cast`), own-member `offsetof`s, and `sizeof`."""
-        import re as _re
-        cxx = shutil.which("c++") or shutil.which("g++")
-        assert cxx is not None, "a C++ compiler is required for the base-layout regression"
-        decls, prints = [], []
-        for steps, _ in shapes:
-            for step in steps:
-                decls.append(step)
-                for m in _re.finditer(r"\b(?:struct|class)\s+(\w+)\s*:\s*([^{]+)\{([^}]*)\}", step):
-                    name, bases, body = m.group(1), m.group(2), m.group(3)
-                    prints.append(f'{{ {name} o; std::printf("{name} size %zu\\n", sizeof(o));')
-                    for base in (b.split()[-1] for b in bases.split(",")):
-                        prints.append(f'std::printf("{name} base {base} %ld\\n", '
-                                      f'(long)((char*)static_cast<{base}*>(&o) - (char*)&o));')
-                    for member in _re.findall(r"(\w+)\s*;", body):
-                        prints.append(f'std::printf("{name} member {member} %ld\\n", '
-                                      f'(long)offsetof({name}, {member}));')
-                    prints.append("}")
-        source = tmp_path / "layout.cpp"
-        source.write_text("#include <cstdio>\n#include <cstddef>\n" + "\n".join(decls)
-                          + "\nint main() {\n" + "\n".join(prints) + "\n}\n")
-        probe = tmp_path / "layout"
-        built = subprocess.run([cxx, "-Wno-invalid-offsetof", "-o", str(probe), str(source)],
-                               capture_output=True, text=True, timeout=120, check=False)
-        assert built.returncode == 0, built.stderr
-        layouts: dict = {}
-        for line in subprocess.run([str(probe)], capture_output=True, text=True,
-                                   check=True).stdout.splitlines():
-            parts = line.split()
-            entry = layouts.setdefault(parts[0], {"bases": [], "members": {}})
-            if parts[1] == "size":
-                entry["size"] = int(parts[2])
-            elif parts[1] == "base":
-                entry["bases"].append((parts[2], int(parts[3])))
-            else:
-                entry["members"][parts[2]] = int(parts[3])
-        return layouts
+    _DERIVED_HEAD_RE = re.compile(
+        r"\b(?:struct|class)\s+(?:alignas\(\d+\)\s*|__attribute__\(\(\w+\)\)\s*)*"
+        r"(\w+)(?:\s+final)?\s*:(?!:)")
 
-    def test_recorded_bases_match_gxx_and_unprovable_ones_are_refused(self, shared_bn, tmp_path):
-        """#989 reviews: bases taken from an EARLIER declaration were recorded at
-        offsets g++ does not use (`PC : MB, PX`, `FD2 : F1, F2`, `KE : KP, KX`,
-        `OE : OM, OX`), and `QC : MB` / `T5 : X5, Y5, B5` got right base offsets
-        but own members and a size g++ does not use -- all `verified`. For every
-        shape: a struct whose bases are recorded must equal g++ in every base
-        offset, own-member offset and its size; the shapes the bridge cannot
-        prove must land in `unattached_bases` with no bases recorded."""
-        gxx = self._gxx_layouts(tmp_path, self._BASE_SHAPES)
+    def test_declared_bases_are_never_recorded_and_always_listed(self, shared_bn):
+        """#965 is split out of #989: three reviews found base layouts bn
+        reconstructed wrong. Until it lands, bn records NO C++ base -- and must
+        not drop one silently either. For every shape of the third review's
+        matrix: no struct carries `bases`, and every struct with a base clause
+        is named in that step's `unattached_bases` with the #965 reason; the
+        derived struct itself is still declared (counted per type, #964)."""
         shared_bn.load(HELLO_BINARY)
-        for steps, expected in self._BASE_SHAPES:
-            unattached: dict = {}
+        for steps in self._BASE_SHAPES:
             for step in steps:
+                expected = set(self._DERIVED_HEAD_RE.findall(step))
                 summary = shared_bn.json("types", "declare", step, "--summary")
-                unattached.update(summary["declared_types"].get("unattached_bases") or {})
-            for name, outcome in expected.items():
-                shown = shared_bn.json("types", "show", name)
-                recorded = "bases" in shown
-                if recorded:
-                    want = gxx[name]
-                    got_size = int(shown["layout"].split("size=")[1].split()[0], 16)
-                    assert [(b["name"], int(b["offset"], 16)) for b in shown["bases"]] == want["bases"], \
-                        (name, shown, want)
-                    assert {m["name"]: int(m["offset"], 16) for m in shown["members"]} == want["members"], \
-                        (name, shown, want)
-                    assert got_size == want["size"], (name, shown, want)
-                    assert name not in unattached
-                else:
-                    assert name in unattached, (name, unattached)
-                if outcome is not None:
-                    assert recorded == (outcome == "recorded"), (name, outcome, unattached.get(name))
+                declared = summary["declared_types"]
+                unattached = declared.get("unattached_bases") or {}
+                assert set(unattached) == expected, (step, unattached)
+                assert all("see #965" in why for why in unattached.values()), unattached
+                for name in expected:
+                    assert name in declared["names"], (step, declared)
+                    assert "bases" not in shared_bn.json("types", "show", name), (step, name)
+
+    def test_struct_show_renders_bases_binary_ninja_records(self, shared_bn):
+        """`struct show` still renders the bases a type ALREADY carries in BN
+        (debug info, a plugin, the API) -- only bn's own reconstruction is gone."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Base965 { void* vtable; int x; };")
+        shared_bn.json("py", "exec", "--code",
+                       "import binaryninja as bn\n"
+                       "s = bn.StructureBuilder.create(width=0x18)\n"
+                       "s.insert(0x10, bn.Type.int(4), 'y')\n"
+                       "s.base_structures = [bn.BaseStructure(bn.NamedTypeReferenceType.create("
+                       "bn.NamedTypeReferenceClass.StructNamedTypeClass, None, 'Base965'), 0, 0x10)]\n"
+                       "bv.define_user_type('Derived965', bn.Type.structure_type(s))\n")
+        shown = shared_bn.run("struct", "show", "Derived965").stdout
+        assert shown.splitlines() == [
+            "struct Derived965 : Base965 // size=0x18",
+            "0x0000: void* vtable  [from Base965]",
+            "0x0008: int32_t x  [from Base965]",
+            "0x0010: int32_t y",
+        ], shown
+        card = shared_bn.json("struct", "show", "Derived965")
+        assert card["bases"] == [{"name": "Base965", "offset": "0x0", "width": "0x10"}], card
+        assert [(m["offset"], m["name"]) for m in card["inherited_members"]] == [
+            ("0x0", "vtable"), ("0x8", "x")], card
 
     def test_reference_only_declarations(self, shared_bn):
         """#989 review: a forward declaration of an existing type is a no-op (it

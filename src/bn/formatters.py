@@ -6270,14 +6270,17 @@ def _render_mutation_summary_text(value: Any) -> str:
         count = declared.get("count")
         hidden = count - len(names) if isinstance(count, int) and count > len(names) else 0
         shown = ", ".join(names) + (f", +{hidden} more" if hidden else "")
-        line += f"\ntypes: {_fmt_count(count).strip()} declared" + (f" ({shown})" if shown else "")
+        kept = [str(name) for name in _field_list(declared, "referenced_existing")]
+        stubs = [str(name) for name in _field_list(declared, "created_by_reference")]
+        # A declare that only referenced existing types declared nothing; its
+        # `referenced` line says all there is, so no "types: 0 declared".
+        if not (count == 0 and not names and (kept or stubs)):
+            line += f"\ntypes: {_fmt_count(count).strip()} declared" + (f" ({shown})" if shown else "")
         bases = _field_dict(declared, "unattached_bases")
         if bases:
             line += "\nbases not recorded: " + "; ".join(f"{name}: {why}" for name, why in bases.items())
-        kept = [str(name) for name in _field_list(declared, "referenced_existing")]
         if kept:
             line += "\nreferenced, left unchanged: " + ", ".join(kept)
-        stubs = [str(name) for name in _field_list(declared, "created_by_reference")]
         if stubs:
             line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
                      + ", ".join(stubs))

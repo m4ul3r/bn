@@ -4116,7 +4116,13 @@ def _declares_body_for(declaration: str, name: str) -> bool:
     quoted = re.escape(name)
     pattern = (r"\b(?:struct|class|union|enum)\s+(?:`" + quoted + r"`|" + quoted + r"(?![\w:]))"
                r"\s*(?:final\s*)?(?::(?!:)[^{};]*)?\{")
-    return re.search(pattern, _strip_c_comments(declaration)) is not None
+    text = _strip_c_comments(declaration)
+    try:
+        # `struct alignas(8) name {` / `struct __attribute__((packed)) name {`
+        text = _strip_head_attributes(text)
+    except ValueError:
+        pass
+    return re.search(pattern, text) is not None
 
 
 def _library_has_type(bv, name: str) -> bool:
@@ -4182,12 +4188,12 @@ def _drop_references_to_existing_types(bv, declaration: str,
     return kept, referenced, by_mention
 
 
-# A C++ base clause on a struct/class definition: `struct D : public B, C {`.
-# The `(?!:)` keeps a `::` scope (`struct ns::D {`) from reading as one.
-_BASE_CLAUSE_RE = re.compile(
-    r"\b(?:struct|class)\s+(`[^`]+`|[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?:final\s*)?"
-    r":(?!:)\s*([^{};]+?)\s*\{")
-_BASE_SPECIFIER_WORDS = {"public", "protected", "private", "struct", "class"}
+# What may sit between `struct`/`class` and the name, or after the name, in a
+# definition head without being part of either: `alignas(N)`,
+# `__attribute__((...))`, `__declspec(...)` and `[[...]]`.
+_HEAD_ATTRIBUTE_RE = re.compile(r"\b(?:alignas|__attribute__|__attribute|__declspec)\s*\(")
+_AGGREGATE_NAME_RE = re.compile(r"`[^`]+`|[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*")
+_BASE_SPECIFIER_WORDS = {"public", "protected", "private", "virtual", "struct", "class"}
 
 
 def _split_base_list(text: str) -> list[str]:
@@ -4208,168 +4214,130 @@ def _split_base_list(text: str) -> list[str]:
     return [part for part in parts if part]
 
 
-def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[list, dict[str, str]]:
-    """#965: BN's type parser lays a derived struct's own members out after its
-    bases but records NO base (`base_structures` comes back empty), so
-    `struct Derived : Base { int y; }` landed as a struct whose only member sits
-    at 0x10 after an unexplained gap, and nothing could say it derives from
-    `Base`. Re-attach each base the source names, at the offset the parser's
-    own layout implies.
-
-    The offsets are recomputed the way the parser lays them out (Itanium C++
-    ABI: bases in order, each aligned to its own alignment; the next base or
-    member starts after a base's full size when that base is a plain C struct,
-    but may reuse its tail padding -- start at the end of its last member --
-    when the base is not POD). Within ONE declaration the parser sees every
-    base's source and lays the struct out as the C++ ABI does for the shapes a
-    C declaration can express (a base with a base clause is non-POD); anything
-    it lays out differently (an empty base, a `class` with private members, a
-    member of non-POD type) fails the layout check below and is refused.
-
-    A base declared in an EARLIER declaration is different: BN's stored type
-    keeps no record of what makes a class POD (access, constructors, member
-    types), so where the C++ ABI puts whatever follows it cannot be shown --
-    and BN's parser lays it out as a plain C struct regardless (#989 reviews:
-    `PC : MB, PX`, `FD2 : F1, F2`, `KE : KP, KX`, `OE : OM, OX`, `QC : MB` all
-    recorded offsets or members g++ does not use). Such a base is accepted only
-    when no answer to that question can change the layout: it is the ONLY base
-    (no primary-base or empty-base choice among several), it is not empty (no
-    empty-base optimisation), and it has no tail padding (its data ends at its
-    size, so nothing after it can move into it). Everything else is refused,
-    deliberately more than strictly necessary.
-
-    The bases are attached only when the struct's own layout then continues
-    exactly where the bases end: its first own member sits at the next offset
-    aligned for that member (or, with no own members, its size is the bases'
-    end rounded to its alignment). A base placed too EARLY fails this as surely
-    as one placed too late.
-
-    A virtual base, an unknown base, or anything failing those checks is NOT
-    guessed at: the type is declared exactly as parsed and the reason is
-    returned so the result can say the bases were not recorded.
-
-    Returns the (possibly updated) ``(name, type)`` list and ``{derived name:
-    reason}`` for every base clause left unattached."""
-    clauses: dict[str, list[str]] = {}
-    for match in _BASE_CLAUSE_RE.finditer(_strip_c_comments(declaration)):
-        clauses[match.group(1).strip("`")] = _split_base_list(match.group(2))
-    if not clauses:
-        return named_types, {}
-    parsed = {str(name): type_obj for name, type_obj in named_types}
-    unattached: dict[str, str] = {}
-    updated = []
-    for name, type_obj in named_types:
-        specs = clauses.get(str(name))
-        if not specs or list(getattr(type_obj, "base_structures", None) or []):
-            updated.append((name, type_obj))
-            continue
-        bases: list[tuple[Any, int, int, str]] = []
-        cursor = 0          # where the parser continues after the bases so far
-        reason = None
-        for spec in specs:
-            words = spec.split()
-            if "virtual" in words:
-                reason = f"virtual base {spec!r} has no fixed offset"
-                break
-            base_name = " ".join(w for w in words if w not in _BASE_SPECIFIER_WORDS).strip("`")
-            base_type = parsed.get(base_name) or _lookup_named_type(bv, base_name)
-            kind = _type_tag_kind(base_type) if base_type is not None else None
-            if kind not in ("struct", "class"):
-                reason = f"base {base_name!r} is not a known struct"
-                break
-            width = int(getattr(base_type, "width", 0) or 0)
-            dsize = _data_size(base_type)
-            if base_name not in parsed:
-                reason = _view_base_refusal(base_name, base_type, width, dsize, len(specs))
-                if reason is not None:
+def _strip_head_attributes(head: str) -> str:
+    """*head* without `alignas(...)`, `__attribute__((...))`, `__declspec(...)`
+    and `[[...]]`, each removed with its balanced brackets."""
+    out = head
+    while True:
+        match = _HEAD_ATTRIBUTE_RE.search(out)
+        opener = "("
+        if match is None:
+            start = out.find("[[")
+            if start < 0:
+                return out
+            body, opener = start + 1, "["
+        else:
+            start, body = match.start(), match.end() - 1
+        depth, end = 0, None
+        closer = ")" if opener == "(" else "]"
+        for i in range(body, len(out)):
+            if out[i] == opener:
+                depth += 1
+            elif out[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
                     break
-            align = max(int(getattr(base_type, "alignment", 1) or 1), 1)
-            offset = _align_up(cursor, align)
-            # Reference the base by the name it is REGISTERED under (a recovered
-            # C++ type is keyed by its component list, not the `::` string); a
-            # base declared in this same declaration is not registered yet and
-            # is referenced by the name it is about to be defined under.
-            registered = getattr(getattr(base_type, "registered_name", None), "name", None)
-            bases.append((registered or base_name, offset, width, kind))
-            # Within one declaration the parser reuses a base's tail padding
-            # exactly when the declaration gives that base a base clause.
-            cursor = offset + (dsize if clauses.get(base_name) else width)
-        if reason is None:
-            reason = _parsed_layout_mismatch(type_obj, cursor)
-        if reason is not None:
-            unattached[str(name)] = reason
-            updated.append((name, type_obj))
+        if end is None:
+            raise ValueError(f"unbalanced attribute in {head.strip()!r}")
+        if opener == "[":
+            end += 1   # the second `]` of `[[...]]`
+        out = out[:start] + " " + out[end:]
+
+
+def _top_level_colon(head: str) -> int:
+    """Index of the first `:` in *head* that is not half of `::` and not inside
+    brackets, or -1."""
+    depth = 0
+    i = 0
+    while i < len(head):
+        ch = head[i]
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif ch == ":" and depth <= 0:
+            if head[i:i + 2] == "::":
+                i += 2
+                continue
+            return i
+        i += 1
+    return -1
+
+
+def _unrecorded_base_clauses(declaration: str) -> dict[str, str]:
+    """#965 (split out of #989): bn does not record C++ bases. BN's type parser
+    lays a derived struct's own members out after its bases but keeps no base
+    (`base_structures` comes back empty), and three reviews of a reconstruction
+    found shapes whose layout it got wrong. So nothing is recorded, and every
+    base clause in the declaration -- whatever attributes precede or follow the
+    name (`struct alignas(32) D : A`, `struct __attribute__((packed)) D : A`,
+    `struct D final : A`) -- is reported as ``{derived name: reason}`` so no
+    base is ever dropped silently.
+
+    A definition head with a base clause this cannot read raises
+    `OperationFailure` rather than being skipped."""
+    text = _strip_c_comments(declaration)
+    unrecorded: dict[str, str] = {}
+    for match in re.finditer(r"\b(?:struct|class)\b", text):
+        before = text[:match.start()].rstrip()
+        if before.endswith("enum"):
+            continue   # `enum class E : int {` -- an underlying type, not a base
+        # The definition head runs to the first top-level `{`; a `;`, `}` or an
+        # unbalanced `)` first means this keyword names a type in a member,
+        # parameter or forward declaration instead.
+        end = match.end()
+        stop = _definition_head_end(text, end)
+        if stop is None:
             continue
-        builder = type_obj.mutable_copy()
-        builder.base_structures = [
-            bn.BaseStructure(
-                bn.NamedTypeReferenceType.create(
-                    bn.NamedTypeReferenceClass.ClassNamedTypeClass if kind == "class"
-                    else bn.NamedTypeReferenceClass.StructNamedTypeClass,
-                    None, ref_name),
-                offset, width)
-            for ref_name, offset, width, kind in bases
-        ]
-        updated.append((name, builder.immutable_copy()))
-    return updated, unattached
+        raw_head = text[end:stop]
+        try:
+            head = _strip_head_attributes(raw_head)
+        except ValueError as exc:
+            raise OperationFailure(
+                "invalid_request",
+                f"could not read the struct/class head {raw_head.strip()!r}: {exc}",
+            ) from exc
+        colon = _top_level_colon(head)
+        if colon < 0:
+            continue
+        name_part = re.sub(r"\bfinal\b", " ", head[:colon]).strip()
+        bases = [" ".join(w for w in spec.split() if w not in _BASE_SPECIFIER_WORDS).strip("`")
+                 for spec in _split_base_list(head[colon + 1:])]
+        if not _AGGREGATE_NAME_RE.fullmatch(name_part) or not bases or not all(bases):
+            raise OperationFailure(
+                "invalid_request",
+                f"could not read the base clause in {('struct' + raw_head).strip()!r}; bn reports "
+                "every C++ base it does not record (#965) and will not drop one it cannot read. "
+                "Declare the struct without the base clause, or with a plainer head.",
+            )
+        name = re.sub(r"\s*::\s*", "::", name_part.strip("`"))
+        unrecorded[name] = (
+            f"bn does not yet record C++ bases (see #965): declared without its base(s) "
+            f"{', '.join(bases)}. Its own members keep the offsets the parser gave them, after "
+            f"the bases, but no base or inherited field is recorded"
+        )
+    return unrecorded
 
 
-def _align_up(value: int, align: int) -> int:
-    return -(-int(value) // max(int(align), 1)) * max(int(align), 1)
-
-
-def _parsed_layout_mismatch(type_obj, bases_end: int) -> str | None:
-    """Why the parsed struct does not continue exactly where its bases end, or
-    None when it does: the first own member must sit at the next offset aligned
-    for it, or -- with no own members -- the size must be the bases' end rounded
-    up to the struct's alignment. Checking only "at or after" let a base placed
-    too early pass with an unexplained gap after it (#989 review)."""
-    members = list(getattr(type_obj, "members", None) or [])
-    if members:
-        first = min(members, key=lambda m: int(getattr(m, "offset", 0)))
-        start = int(getattr(first, "offset", 0))
-        align = int(getattr(getattr(first, "type", None), "alignment", 1) or 1)
-        expected = _align_up(bases_end, align)
-        if start != expected:
-            return (f"the parsed layout puts the first own member at {hex(start)}, but the "
-                    f"bases end at {hex(bases_end)} (next aligned offset {hex(expected)})")
-        return None
-    width = int(getattr(type_obj, "width", 0) or 0)
-    expected = _align_up(bases_end, int(getattr(type_obj, "alignment", 1) or 1))
-    if width != expected:
-        return f"the parsed size {hex(width)} does not match bases ending at {hex(bases_end)}"
+def _definition_head_end(text: str, start: int) -> int | None:
+    """Index of the `{` that opens an aggregate body after *start*, or None when
+    a `;`, `}` or unbalanced `)` (outside brackets) comes first."""
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            if ch == "{":
+                return i
+            if ch in ";}":
+                return None
     return None
-
-
-def _view_base_refusal(base_name: str, base_type, width: int, dsize: int, base_count: int) -> str | None:
-    """Why a base declared in an earlier declaration cannot be recorded with a
-    provably C++-correct layout, or None when it can (see
-    ``_attach_declared_bases``)."""
-    why = None
-    if base_count > 1:
-        why = "it is one of several bases"
-    elif not list(getattr(base_type, "members", None) or []) and not list(
-            getattr(base_type, "base_structures", None) or []):
-        why = "it is empty, and the C++ ABI may overlap an empty base with what follows"
-    elif dsize != width:
-        why = (f"it has tail padding (data ends at {hex(dsize)}, size {hex(width)}) that the C++ "
-               f"ABI reuses when the base is not POD")
-    if why is None:
-        return None
-    return (f"base {base_name!r} was declared in an earlier declaration and {why}; BN does not "
-            f"record whether it is POD, so the C++ layout of this struct cannot be confirmed. "
-            f"Declare the base in the same `types declare` to have the bases recorded")
-
-
-def _data_size(type_obj) -> int:
-    """A struct's size without its tail padding: the end of its last member or
-    recorded base (Itanium's dsize); its full width when it has neither."""
-    ends = [int(getattr(m, "offset", 0)) + _bitfield_member_width(m)
-            for m in list(getattr(type_obj, "members", None) or [])]
-    ends += [int(getattr(b, "offset", 0)) + int(getattr(b, "width", 0) or 0)
-             for b in list(getattr(type_obj, "base_structures", None) or [])]
-    return max(ends) if ends else int(getattr(type_obj, "width", 0) or 0)
-
 
 
 def _bitfield_member_width(member) -> int:
@@ -4605,7 +4573,12 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # `reference_only` marker lets the verifier stamp that case `noop` too.
         named_types = [(name, bv.get_type_by_name(name)) for name in referenced_existing
                        if bv.get_type_by_name(name) is not None]
-    named_types, unattached_bases = _attach_declared_bases(bv, declaration, named_types)
+    # #965: bn records no C++ base; every base clause is reported instead.
+    # Read before anything is defined, so an unreadable clause applies nothing.
+    try:
+        unattached_bases = _unrecorded_base_clauses(declaration)
+    except OperationFailure as exc:
+        raise OperationFailure(exc.status, exc.message, requested=_operation_requested(ctx, op)) from exc
     defined_types = {}
     defined_type_layouts = {}
     before_defined_types = {}
@@ -4631,9 +4604,9 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "parsed_type_count": parsed_type_count,
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
-        # #965: a base clause the parser dropped and this op could not re-attach
-        # (virtual base, unknown base, inconsistent layout), named with the
-        # reason; absent when every base landed, so an ordinary result grows no key.
+        # #965: every C++ base clause in the declaration, none of which bn
+        # records (BN's parser drops them), named with the reason; absent when
+        # the declaration has none, so an ordinary result grows no key.
         **({"unattached_bases": unattached_bases} if unattached_bases else {}),
         # #963: existing types the declaration only REFERENCED (left as they
         # were rather than overwritten by the parser's empty forward stub).
