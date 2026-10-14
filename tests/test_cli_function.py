@@ -3133,20 +3133,23 @@ _ARITY_ROW = {
 }
 
 
-def _decompile_with_warnings(fake_transport, warnings):
-    fake_transport({"decompile": {"ok": True, "result": {
+def _decompile_with_warnings(fake_transport, warnings, rows=None):
+    result = {
         "function": {"name": "save_record", "address": "0x401420"},
         "text": "void save_record()\n{\n    open(&f);  /* bn: +2 args not rendered: x1, x2 */\n}",
         "warnings": warnings, "analysis_skipped": False,
         "analysis_state": "full", "partial": False,
-    }}})
+    }
+    if rows is not None:
+        result["warning_rows"] = rows
+    fake_transport({"decompile": {"ok": True, "result": result}})
 
 
 def test_decompile_text_prints_one_short_line_per_warning_1000(fake_transport, capsys):
     # #1000 item 1: text printed each warning's whole paragraph, so agents
     # filtered `^warning` and lost the dropped-argument findings with the
     # boilerplate. One tagged summary line each; the detail waits for --explain.
-    _decompile_with_warnings(fake_transport, [_ARITY_ROW])
+    _decompile_with_warnings(fake_transport, [_ARITY_ROW["detail"]], [_ARITY_ROW])
     assert bn.cli.main(["decompile", "save_record", "--target", "active"]) == 0
     out = capsys.readouterr().out
     assert f"warning[arity]: {_ARITY_ROW['summary']}" in out

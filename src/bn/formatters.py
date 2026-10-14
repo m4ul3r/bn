@@ -710,16 +710,17 @@ def _slice_text_lines(
 def _render_decompile_warnings(value: Any, *, explain: bool = False) -> str:
     """One `warning[<code>]: <summary>` line per decompile warning (#1000 item 1).
 
-    The bridge sends `{code, summary, detail, ...}` rows. Text printed each
-    detail as a 450-870 character paragraph, mostly the same boilerplate on
-    every function, so agents filtered `^warning` wholesale and lost the
+    The bridge sends `warning_rows` -- `{code, summary, detail, ...}` -- beside
+    the `warnings` sentences every read op carries. Text printed each sentence
+    as a 450-870 character paragraph, mostly the same boilerplate on every
+    function, so agents filtered `^warning` wholesale and lost the
     dropped-argument findings with it (and harnesses cut the longest ones off
     before their advice). The summary is the finding; `--explain` adds the
-    detail -- what it means and what to do -- indented under it. A bare string
-    (a bridge older than the rows) prints as it always did."""
+    detail -- what it means and what to do -- indented under it. A bridge
+    older than the rows sends only `warnings`, which print as they always did."""
     lines: list[str] = []
     explained = False
-    for warning in _field_list(value, "warnings") or []:
+    for warning in _field_list(value, "warning_rows", "warnings"):
         if not isinstance(warning, dict):
             lines.append(f"warning: {warning}")
             continue

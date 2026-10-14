@@ -3934,17 +3934,18 @@ class TestStructLayoutAssistance903:
         assert remaining_types == [], remaining_types
         before = shared_bn.json("proto", "get", "handle")
         missing = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in missing["warnings"]), missing
+        assert not any("struct layout candidate" in w for w in missing["warnings"]), missing
 
         shared_bn.json(
             "types", "declare",
             "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
         untyped = shared_bn.json("decompile", "handle")
-        hint = next((w["detail"] for w in untyped["warnings"] if "struct layout candidate" in w["detail"]), None)
+        hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
         assert hint is not None, untyped
         for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
             assert witness in hint
         assert shared_bn.json("proto", "get", "handle") == before
+        # Text prints the one-line summary; the full sentence is --explain's.
         text_result = shared_bn.run("decompile", "handle", "--explain")
         assert text_result.returncode == 0, text_result.stderr
         assert hint in text_result.stdout
@@ -3954,7 +3955,7 @@ class TestStructLayoutAssistance903:
         shared_bn.json("proto", "set", "handle_alias", "uint64_t handle_alias(void *c)")
         aliased = shared_bn.json("decompile", "handle_alias")
         assert "0x80" in aliased["text"], aliased
-        assert not any("struct layout candidate" in w["detail"] for w in aliased["warnings"]), aliased
+        assert not any("struct layout candidate" in w for w in aliased["warnings"]), aliased
 
         # A bitfield storage unit at a witnessed offset is potentially
         # compatible; it must block uniqueness rather than be skipped. The C
@@ -3971,12 +3972,12 @@ class TestStructLayoutAssistance903:
             "result = [m.bit_width for m in bv.get_type_by_name('bits_cfg').members]\n")["result"]
         assert bit_widths == [0, 0, 20], bit_widths
         blocked = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in blocked["warnings"]), blocked
+        assert not any("struct layout candidate" in w for w in blocked["warnings"]), blocked
         shared_bn.json(
             "py", "exec",
             "bv.undefine_user_type('bits_cfg')\n"
             "bv.update_analysis_and_wait()\n")
-        assert any("struct layout candidate" in w["detail"]
+        assert any("struct layout candidate" in w
                    for w in shared_bn.json("decompile", "handle")["warnings"])
 
         # Equally concrete layouts that cfg's uniqueness must account for: a
@@ -4014,7 +4015,7 @@ class TestStructLayoutAssistance903:
             if script is not None:
                 assert shape[1][-1] == 0, (name, shape)
             competing = shared_bn.json("decompile", "handle")
-            assert not any("struct layout candidate" in w["detail"] for w in competing["warnings"]), (
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
                 name, competing)
             if script is None:
                 # A sole matching class is not suggested as `struct K *`.
@@ -4023,7 +4024,7 @@ class TestStructLayoutAssistance903:
                     "bv.undefine_user_type('cfg')\n"
                     "bv.update_analysis_and_wait()\n")
                 sole = shared_bn.json("decompile", "handle")
-                assert not any("struct layout candidate" in w["detail"] for w in sole["warnings"]), sole
+                assert not any("struct layout candidate" in w for w in sole["warnings"]), sole
                 shared_bn.json(
                     "types", "declare",
                     "struct cfg { char pad[40]; uint64_t flags; uint32_t depth; };")
@@ -4032,7 +4033,7 @@ class TestStructLayoutAssistance903:
                 f"bv.undefine_user_type({name!r})\n"
                 "bv.update_analysis_and_wait()\n")
             restored = shared_bn.json("decompile", "handle")
-            assert any("struct layout candidate" in w["detail"] for w in restored["warnings"]), (
+            assert any("struct layout candidate" in w for w in restored["warnings"]), (
                 name, restored)
 
         # Redeclaring an embedded type can leave the outer struct's stored
@@ -4043,7 +4044,7 @@ class TestStructLayoutAssistance903:
             "struct ext { uint32_t a; }; "
             "struct so_cfg { char pad[40]; uint64_t flags; uint32_t depth; struct ext tail; };")
         fresh = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in fresh["warnings"]), fresh
+        assert not any("struct layout candidate" in w for w in fresh["warnings"]), fresh
         shared_bn.json(
             "types", "declare", "struct ext { uint32_t a, b, c, d; };")
         stale = shared_bn.json(
@@ -4052,27 +4053,27 @@ class TestStructLayoutAssistance903:
             "result = [t.width, max(m.offset + m.type.width for m in t.members)]\n")["result"]
         assert stale[1] > stale[0], stale
         grown = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in grown["warnings"]), grown
+        assert not any("struct layout candidate" in w for w in grown["warnings"]), grown
         shared_bn.json(
             "py", "exec",
             "bv.undefine_user_type('so_cfg')\n"
             "bv.undefine_user_type('ext')\n"
             "bv.update_analysis_and_wait()\n")
-        assert any("struct layout candidate" in w["detail"]
+        assert any("struct layout candidate" in w
                    for w in shared_bn.json("decompile", "handle")["warnings"])
 
         # Application remains an explicit mutation, never part of a read.
         shared_bn.json("proto", "set", "handle", "uint64_t handle(struct cfg *c)")
         typed = shared_bn.json("decompile", "handle")
         assert "c->flags" in typed["text"] and "c->depth" in typed["text"], typed
-        assert not any("struct layout candidate" in w["detail"] for w in typed["warnings"]), typed
+        assert not any("struct layout candidate" in w for w in typed["warnings"]), typed
 
         shared_bn.json("proto", "set", "handle", "uint64_t handle(void *c)")
         shared_bn.json(
             "types", "declare",
             "struct other_cfg { char pad[40]; uint64_t mode; uint32_t count; };")
         ambiguous = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in ambiguous["warnings"]), ambiguous
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
 
         # A typedef on a scalar member must neither hide a compatible layout
         # nor make a distinct, direct-scalar layout appear uniquely compatible.
@@ -4087,7 +4088,7 @@ class TestStructLayoutAssistance903:
             "struct wrapped_cfg { char pad[40]; word_t flags; unsigned int depth; }; "
             "typedef struct wrapped_cfg wrapped_alias;")
         wrapped = shared_bn.json("decompile", "handle")
-        hints = [w["detail"] for w in wrapped["warnings"] if "struct layout candidate" in w["detail"]]
+        hints = [w for w in wrapped["warnings"] if "struct layout candidate" in w]
         assert len(hints) == 1, wrapped
         for witness in ("struct wrapped_cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
             assert witness in hints[0]
@@ -4097,7 +4098,7 @@ class TestStructLayoutAssistance903:
             "types", "declare",
             "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
         ambiguous = shared_bn.json("decompile", "handle")
-        assert not any("struct layout candidate" in w["detail"] for w in ambiguous["warnings"]), ambiguous
+        assert not any("struct layout candidate" in w for w in ambiguous["warnings"]), ambiguous
         assert shared_bn.json("proto", "get", "handle") == before
 
         # Crossing the resolver budget must never turn uncertainty into a
@@ -4119,7 +4120,7 @@ class TestStructLayoutAssistance903:
                 + f"struct wrapped_cfg {{ char pad[40]; {prefix}{hops - 1} flags; "
                 + "unsigned int depth; };")
             sole = shared_bn.json("decompile", "handle")
-            hints = [w["detail"] for w in sole["warnings"] if "struct layout candidate" in w["detail"]]
+            hints = [w for w in sole["warnings"] if "struct layout candidate" in w]
             assert len(hints) == (1 if hops == 16 else 0), (hops, sole)
             if hints:
                 assert "struct wrapped_cfg *" in hints[0]
@@ -4127,7 +4128,7 @@ class TestStructLayoutAssistance903:
                 "types", "declare",
                 "struct cfg { char pad[40]; unsigned long long flags; unsigned int depth; };")
             competing = shared_bn.json("decompile", "handle")
-            assert not any("struct layout candidate" in w["detail"] for w in competing["warnings"]), (
+            assert not any("struct layout candidate" in w for w in competing["warnings"]), (
                 hops, competing)
             assert shared_bn.json("proto", "get", "handle") == before
 

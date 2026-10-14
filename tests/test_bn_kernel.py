@@ -1991,13 +1991,6 @@ def test_decompile_rejects_missing_text_contract(payload):
             "analysis_skipped": True,
             "warnings": [],
         },
-        # #1000: the bridge sends warning rows; the stub sentence is the detail.
-        {
-            "text": "int big_fn() {\n}",
-            "analysis_skipped": False,
-            "warnings": [{"code": "stub", "summary": "analysis stub",
-                          "detail": "this decompile is an incomplete stub"}],
-        },
     ],
 )
 def test_decompile_rejects_analysis_placeholder(payload):
