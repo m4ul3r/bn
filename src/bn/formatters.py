@@ -4469,17 +4469,28 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     trunc = _taint_truncation_note(stats)
     if findings:
         sinks = [_field_dict(f, "sink") for f in findings]
-        # #1001 item 1: a sink reached through a dropped ABI register (an arity
-        # mismatch) is counted like any other, and its class says how many of
-        # its rows rest on the register rather than BN's prototype.
+        # #1001 item 1: a sink reached through a dropped ABI register, or one
+        # whose model declares an arg BN's prototype dropped (an arity
+        # mismatch), is counted like any other, and its class says how many of
+        # its rows rest on the register / on a prototype missing model args.
         abi: dict[str, int] = {}
+        mismatch: dict[str, int] = {}
         for s in sinks:
+            cls = str(s.get("class") or "?")
             if s.get("via") == "abi_register":
-                cls = str(s.get("class") or "?")
                 abi[cls] = abi.get(cls, 0) + 1
-        classes = ", ".join(
-            cls + (f"[{abi[cls]} via ABI register]" if cls in abi else "")
-            for cls in sorted({str(s.get("class") or "?") for s in sinks}))
+            elif _field_dict(s, "arity_mismatch"):
+                mismatch[cls] = mismatch.get(cls, 0) + 1
+
+        def _marks(cls: str) -> str:
+            parts: list[str] = []
+            if cls in abi:
+                parts.append(f"{abi[cls]} via ABI register")
+            if cls in mismatch:
+                parts.append(f"{mismatch[cls]} arity mismatch")
+            return f"[{', '.join(parts)}]" if parts else ""
+        classes = ", ".join(cls + _marks(cls)
+                            for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
@@ -4705,8 +4716,12 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 if _arity:
                     _ref = _text_value(_arity, "callee_ref")
                     _reg = _text_value(_arity, "register")
+                    _basis = (
+                        "class from the recovered args only, without the dropped ones"
+                        if _text_value(_arity, "class_from") == "recovered_args"
+                        else "class unproven (the model's own)")
                     lines.append(
-                        "      class unproven: BN recovered "
+                        f"      {_basis}: BN recovered "
                         f"{_arity.get('recovered', '?')} param(s) for this call and dropped the "
                         f"model's arg(s) {_field_list(_arity, 'dropped')}"
                         + (f"; the tainted arg was read from ABI register {_reg}" if _reg else "")

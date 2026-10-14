@@ -784,7 +784,7 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     assert sink["via"] == "abi_register"
     # memcpy's model declares its source (arg 1) and length (arg 2); BN kept arg 0.
     assert sink["arity_mismatch"] == {"recovered": 1, "dropped": [1, 2], "register": "r2",
-                                      "callee_ref": "0x900"}
+                                      "callee_ref": "0x900", "class_from": "model"}
     # The flow traces back to the seeded param through the register's value.
     assert result["reached_sinks"][0]["path"][-1]["address"] == hex(0x18)
     assert "through ABI register r2" in result["reached_sinks"][0]["path"][-1]["reason"]
@@ -792,7 +792,7 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     rendered = _render_taint_text(result)
     assert "verdict: 1 sink(s) reached (overflow_len[1 via ABI register])" in rendered
     assert "[overflow_len] memcpy @ 0x18 (arg 2 via r2, arity mismatch)" in rendered
-    assert ("class unproven: BN recovered 1 param(s) for this call and dropped the model's "
+    assert ("class unproven (the model's own): BN recovered 1 param(s) for this call and dropped the model's "
             "arg(s) [1, 2]; the tainted arg was read from ABI register r2 -- fix the prototype "
             "(`bn proto get 0x900`, then `bn proto set`) and re-run") in rendered
 
@@ -846,25 +846,73 @@ def _shape_sink(models, monkeypatch, shape, n_params):
     return next(s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == callee)
 
 
-@pytest.mark.parametrize("shape, full_params, n_params, dropped, via", [
-    (_memcpy_bounded_shape, 3, 2, [2], "abi_register"),        # only the length dropped
-    (_memcpy_bounded_shape, 3, 0, [0, 1, 2], "abi_register"),  # all dropped, malloc dest
-    (_app_recv_bounded_shape, 3, 2, [2], None),                # only the buffer dropped
-    (_app_recv_bounded_shape, 3, 1, [1, 2], "abi_register"),   # buffer role after length
+@pytest.mark.parametrize("shape, full_params, n_params, dropped, via, class_from", [
+    (_memcpy_bounded_shape, 3, 2, [2], "abi_register", "model"),        # only the length dropped
+    (_memcpy_bounded_shape, 3, 0, [0, 1, 2], "abi_register", "model"),  # all dropped, malloc dest
+    (_app_recv_bounded_shape, 3, 2, [2], None, "recovered_args"),       # only the buffer dropped
+    (_app_recv_bounded_shape, 3, 1, [1, 2], "abi_register", "model"),   # buffer role after length
 ], ids=["memcpy-len-dropped", "memcpy-all-dropped", "app_recv-buf-dropped",
         "app_recv-out-of-order"])
 def test_dropped_arg_never_lowers_a_sink_class_1001(models, monkeypatch, shape, full_params,
-                                                    n_params, dropped, via):
+                                                    n_params, dropped, via, class_from):
     full = _shape_sink(models, monkeypatch, shape, full_params)
     assert full["class"] == "bounded_len" and "arity_mismatch" not in full, full
     sink = _shape_sink(models, monkeypatch, shape, n_params)
-    # The model's own class: nothing lowered it, and nothing relabelled it.
+    # Nothing lowered it, and nothing relabelled it.
     assert sink["class"] == "overflow_len" and "catalog_class" not in sink, sink
     assert "source_bound" not in sink and "length_shape" not in sink, sink
     assert sink["arity_mismatch"]["dropped"] == dropped
     assert sink["arity_mismatch"]["recovered"] == n_params
+    assert sink["arity_mismatch"]["class_from"] == class_from
     assert sink.get("via") == via
-    assert "class is the model's own and unproven" in sink["detail"]
+    # The detail says what the class rests on -- and only that.
+    unproven = "class is the model's own and unproven" in sink["detail"]
+    recovered_only = "decided from the recovered args only" in sink["detail"]
+    assert (unproven, recovered_only) == (class_from == "model", class_from == "recovered_args")
+
+
+def test_class_from_recovered_args_is_not_called_unproven_1001(models, monkeypatch):
+    # #1001 review round 4: the checked length is recovered and its bound is
+    # proven from recovered args alone (`n = read(fd, b, 0x40)`, #159), while
+    # the model's buffer arg was dropped. The class is the full-prototype class
+    # and comes from the recovered args only; the row must say THAT, not
+    # "the model's own and unproven".
+    n1 = FSSA(FVar("n"), 1); b = FVar("b")
+    rd = FInstr(0, 0x10, "MLIL_CALL_SSA", "n#1 = read(0, &b, 0x40)", reads=[], writes=[n1],
+                dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+                params=[FExpr("MLIL_CONST", "0", constant=0),
+                        FExpr("MLIL_ADDRESS_OF", "&b", src=b),
+                        FExpr("MLIL_CONST", "0x40", constant=0x40)])
+
+    def run(n_params):
+        full = [FExpr("MLIL_CONST", "0", constant=0),
+                FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]), FExpr("MLIL_CONST_PTR", "0x5000",
+                                                                constant=0x5000)]
+        call = FInstr(1, 0x14, "MLIL_CALL_SSA", "app_recv(...)", reads=[n1],
+                      dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+                      params=full[:n_params])
+        func = FFunc("rres", 0x10, FSSAFunc([rd, call]), params=[FVar("fd")])
+        engine = te.TaintEngine(FBV({0x2000: "read", 0x2010: "app_recv"}), te.load_models(
+            {"app_recv": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2}}}))
+        monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                            lambda f, sites, idx: (None, []), raising=False)
+        result = engine.forward(func, [te.parse_locator("ret:read")])
+        return result, next(s["sink"] for s in result["reached_sinks"]
+                            if s["sink"]["callee"] == "app_recv")
+
+    _, full = run(3)
+    result, sink = run(2)
+    assert (sink["class"], sink.get("source_bound")) == (full["class"], full.get("source_bound"))
+    assert full["class"] == "bounded_len"
+    assert sink["arity_mismatch"]["class_from"] == "recovered_args" and "via" not in sink
+    assert "decided from the recovered args only" in sink["detail"]
+    assert "unproven" not in sink["detail"]
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text(result)
+    assert "(arg 1, arity mismatch)" in text
+    assert ("class from the recovered args only, without the dropped ones: BN recovered 2 "
+            "param(s) for this call and dropped the model's arg(s) [2]") in text
+    assert "bounded_len[1 arity mismatch]" in text.splitlines()[2]
 
 
 def test_abi_register_sinks_counted_per_class_in_verdict_1001():

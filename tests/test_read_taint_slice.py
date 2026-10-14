@@ -658,6 +658,18 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
     ]
 
 
+def test_out_param_caveat_keeps_the_raw_callee_name_1001(monkeypatch):
+    # #1001 review round 3: free-text caveats keep raw names, so `--mangled`
+    # and the default print the same caveat; the demangled name rides on the
+    # step (`out_param_callee_display_name`) for the step line and roll-up.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    trace = [{"reason": "out_param_not_followed", "terminates": True,
+              "out_param_callee": "_ZN2ns4fillEPl", "out_param_callee_display_name": "ns::fill"}]
+    assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
+        "value crosses an out-parameter fill by _ZN2ns4fillEPl that this trace did not "
+        "follow; the true origin may be inside it"]
+
+
 def test_build_backward_trace_records_step_for_unsupported_ssa_form(monkeypatch):
     # Round-3 follow-up: an `AttributeError` from `get_ssa_var_definition` (a
     # callee SSA form that doesn't support the query) must not vanish as a

@@ -4603,8 +4603,14 @@ class TaintEngine:
                 if not hit or not dropped:
                     return hit, None
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
+                # `class_from` says what the finding's class rests on:
+                # `recovered_args` -- the checked arg was recovered, so the
+                # in-range classifiers ran on the recovered args and the dropped
+                # ones were simply not used; `model` -- the checked arg itself
+                # was dropped, so no classifier ran and the model's class stands.
                 return hit, {"recovered": len(params), "dropped": dropped, "register": reg,
-                             "callee_ref": hex(int(taddr)) if taddr is not None else None}
+                             "callee_ref": hex(int(taddr)) if taddr is not None else None,
+                             "class_from": "recovered_args" if argidx < len(params) else "model"}
 
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
@@ -4906,24 +4912,29 @@ class TaintEngine:
                             if arity is not None:
                                 # #1001 item 1: the model declares args BN's
                                 # prototype dropped. Say so on the finding, and
-                                # that its class is the model's own -- unproven
-                                # until the prototype is fixed -- rather than
-                                # a bound the engine could not check.
+                                # what its class rests on: the recovered args
+                                # only (dropped ones not used), or -- when the
+                                # checked arg itself was dropped -- the model's
+                                # own class, unproven until the prototype is fixed.
                                 _ref = arity["callee_ref"]
                                 _reg = arity["register"]
+                                _fix = ("fix the prototype"
+                                        + (f" (`bn proto get {_ref}`, then `bn proto set`)" if _ref else "")
+                                        + " and re-run")
+                                if arity["class_from"] == "model":
+                                    _basis = (f"so the class is the model's own and unproven -- {_fix}")
+                                else:
+                                    _basis = ("so the class was decided from the recovered args only, "
+                                              f"without the dropped ones -- {_fix} to classify with them")
                                 eff_sink = {
                                     **eff_sink,
                                     **({"via": "abi_register"} if _reg else {}),
                                     "arity_mismatch": arity,
                                     "detail": (eff_sink.get("detail") or "")
-                                    + (f" (reached through ABI register {_reg}" if _reg else " (")
-                                    + f"{': ' if _reg else ''}Binary Ninja recovered only "
-                                    f"{arity['recovered']} parameter(s) for this call and the "
-                                    f"model's arg(s) {arity['dropped']} were dropped, so the "
-                                    "class is the model's own and unproven -- fix the "
-                                    "prototype"
-                                    + (f" (`bn proto get {_ref}`, then `bn proto set`)" if _ref else "")
-                                    + " and re-run)",
+                                    + (f" (reached through ABI register {_reg}: " if _reg else " (")
+                                    + f"Binary Ninja recovered only {arity['recovered']} parameter(s) "
+                                    f"for this call and the model's arg(s) {arity['dropped']} were "
+                                    f"dropped, {_basis})",
                                 }
                             findings.append(_tag_unconditional_flow(
                                 self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
@@ -5439,7 +5450,7 @@ class TaintEngine:
                                 # one-instruction tail call, so a longer body BN
                                 # still calls a thunk (an oversized function after
                                 # `--force-analysis`) stops here even when its
-                                # tail-call target resolves -- name that target.
+                                # tail-call target resolves -- name every target.
                                 _tails = self._thunk_tail_targets(descend_fn)
                                 if _tails:
                                     _named = [(getattr(t, "name", None) or hex(int(getattr(t, "start", 0))),
