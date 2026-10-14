@@ -228,6 +228,7 @@ _SINK_LOCATOR_HELP = (
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _taint_forward(args: argparse.Namespace) -> int:
@@ -248,7 +249,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
+                                                    mangled=args.mangled)),
         stem="taint-forward",
     )
 
@@ -274,6 +276,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _taint_backward(args: argparse.Namespace) -> int:
@@ -291,7 +294,8 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
+                                                    mangled=args.mangled)),
         stem="taint-backward",
     )
 

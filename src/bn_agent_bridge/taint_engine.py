@@ -68,7 +68,7 @@ from . import taint_il as _taint_il_mod  # noqa: F401
 from . import taint_locators as _taint_locators_mod  # noqa: F401
 from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
-from .il_format import _variadic_determination
+from .il_format import _display_name, _variadic_determination
 from .taint_models import _model_copy_roles
 
 
@@ -2591,12 +2591,13 @@ class TaintEngine:
             fm, fs = derive_flow_facts(
                 direction="forward", path=f.get("path"), sink=f.get("sink"),
                 sources=[] if _unconditional else sources_echo,
-                leaves=sub["leaves"], fn_name=str(func.name))
+                leaves=sub["leaves"], fn_name=str(func.name), display=self._display_for_name)
             f["metrics"] = fm
             f["signature"] = fs
         result = {
             "direction": "forward",
-            "function": {"name": str(func.name), "address": hex(int(func.start))},
+            "function": {"name": str(func.name), "display_name": _display_name(func),
+                         "address": hex(int(func.start))},
             "sources": sources_echo,
             "reached_sinks": unique_findings,
             "leaves": sub["leaves"],
@@ -3851,17 +3852,57 @@ class TaintEngine:
     def _is_internal(self, fn: Any) -> bool:
         """True if a call target is an in-binary function worth descending into
         (not a PLT/import thunk, which we model instead)."""
-        if fn is None or getattr(fn, "is_thunk", False):
-            return False
+        return self._not_internal_reason(fn) is None
+
+    @staticmethod
+    def _not_internal_reason(fn: Any) -> str | None:
+        """Why a call target is NOT descended into, or None when it is.
+
+        ``no_function`` / ``thunk`` / ``import`` are the genuinely external
+        shapes. ``analysis_skipped:<BN reason>`` and ``no_mlil`` are IN-BINARY
+        bodies Binary Ninja did not analyse (an oversized function past
+        ``analysis.limits.maxFunctionSize``, a failed lift) -- the caveat for
+        those must not call the function "external" (#1001 item 3)."""
+        if fn is None:
+            return "no_function"
+        if getattr(fn, "is_thunk", False):
+            return "thunk"
         sym = getattr(fn, "symbol", None)
         stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
         if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
                      "ImportAddressSymbol", "ExternalSymbol"}:
-            return False
+            return "import"
         try:
-            return len(list(fn.mlil.instructions)) > 0
+            has_body = len(list(fn.mlil.instructions)) > 0
         except Exception:
-            return False
+            has_body = False
+        if has_body:
+            return None
+        if getattr(fn, "analysis_skipped", False):
+            try:
+                raw = fn.analysis_skip_reason
+                # An IntEnum: str() is the bare number, so prefer the member name.
+                why = getattr(raw, "name", None) or str(raw)
+            except Exception:
+                why = "unknown"
+            return f"analysis_skipped:{why}"
+        return "no_mlil"
+
+    @staticmethod
+    def _unanalysed_body_phrase(reason: str | None) -> str | None:
+        """The caveat phrase for an IN-BINARY callee whose body BN never
+        analysed, or None for a genuinely external one (see
+        :meth:`_not_internal_reason`)."""
+        if not reason:
+            return None
+        if reason.startswith("analysis_skipped:"):
+            why = reason.split(":", 1)[1]
+            if why == "ExceedFunctionSizeSkipReason":
+                why = "it exceeds analysis.limits.maxFunctionSize"
+            return f"Binary Ninja skipped its analysis: {why}"
+        if reason == "no_mlil":
+            return "Binary Ninja produced no MLIL for it"
+        return None
 
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
@@ -3905,6 +3946,7 @@ class TaintEngine:
             "kind": "unmodeled_callee",
             "address": hex(int(getattr(ins, "address", 0))),
             "callee": {"name": str(getattr(callee_fn, "name", "?")),
+                       "display_name": _display_name(callee_fn) or "?",
                        "address": hex(int(getattr(callee_fn, "start", 0)))},
             "tainted_args": sorted(tainted_arg_indices),
             "note": note,
@@ -3960,6 +4002,7 @@ class TaintEngine:
             "kind": "arg_under_recovered",
             "address": hex(int(getattr(ins, "address", 0))),
             "callee": {"name": name,
+                       "display_name": _display_name(callee_fn) or name,
                        "address": hex(int(getattr(callee_fn, "start", 0)))},
             "recovered_params": n_params,
             "dropped_args": confirmed,
@@ -4465,22 +4508,27 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
-            def _note_under_recovered_sink_arg(argidx: int) -> None:
+            def _note_under_recovered_sink_arg(argidx: int, sink: dict[str, Any]) -> None:
                 # #577: a modeled sink's OWN declared arg index (e.g. memcpy's
                 # length at arg 2) sits beyond the params BN recovered for this
                 # call -- an under-recovered arity, the shape an ARM-Thumb
                 # `j_memcpy` typed `memcpy(int32_t)` produces by dropping the
                 # length register. The in-range sink loop below never inspects
                 # it, and the modeled branch's trailing `continue` bypasses every
-                # other honesty path, so a tainted value passed there vanishes and
-                # a zero-sink run falsely reports all-clear. `backward` RAISES on
-                # this exact condition; the forward walk must at least disclose it.
+                # other honesty path, so a tainted value passed there would vanish
+                # and a zero-sink run falsely report all-clear.
                 # Recover the dropped arg through its calling-convention register
                 # (the #433 reg bridge) and, ONLY when it actually carries taint,
-                # emit a blocking `arg_under_recovered` leaf so the existing leaves
-                # gate withholds. Gating on real taint keeps a merely-under-
-                # recovered but quiet sink from crying wolf on every function that
-                # calls it. Deduped per call site by leaf identity.
+                # report the sink. Gating on real taint keeps a merely-under-
+                # recovered but quiet sink from crying wolf on every function
+                # that calls it.
+                #
+                # #1001 item 1: this used to be an `arg_under_recovered` frontier
+                # LEAF, so a modeled sink the engine SAW reached stayed out of the
+                # verdict and `flows` and was filed with the "we lost track"
+                # leaves. It is a reached sink, reported as one -- with
+                # `via: abi_register` and the `arity_mismatch` that produced it,
+                # because the evidence is the register, not BN's prototype.
                 try:
                     reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
                 except Exception:
@@ -4488,53 +4536,44 @@ class TaintEngine:
                 if not seeds:
                     return
 
-                def _carries_taint(v: Any) -> bool:
+                def _hit_node(v: Any) -> tuple | None:
                     k = var_key(v); ver = getattr(v, "version", None)
-                    if (k, ver) in tainted or (k, None) in tainted:
-                        return True
-                    return self._var_buffer_tainted(ssaf, v, tainted, set(), 0)
+                    for node in ((k, ver), (k, None)):
+                        if node in tainted:
+                            return node
+                    node = self._pointee_tainted(ssaf, v, tainted)
+                    if node is not None:
+                        return node
+                    # A pointer reaching a tainted buffer the store/load keys do
+                    # not name (a PHI of allocations): the register itself is the
+                    # only node to cite.
+                    if self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
+                        return (k, ver)
+                    return None
 
-                if not any(_carries_taint(v) for v, _site in seeds):
+                hit = [n for n in (_hit_node(v) for v, _site in seeds) if n is not None]
+                if not hit:
                     return
-                # Conform to the established `arg_under_recovered` leaf contract
-                # (see `_arg_under_recovered_leaf`): `callee` is ALWAYS a
-                # {name,address} dict and the leaf ALWAYS carries BOTH `dropped_args`
-                # and `stack_dropped_args` (empty when none), so the text renderer
-                # (`_leaf_group_key`/`_render_leaf_line`) and the JSON consumers treat
-                # this leaf identically to the descend-side one. A string callee or a
-                # missing address/stack field diverges from that schema (#576/#577).
-                # The address is the resolved call target: `site_taddr` for the
-                # resolved-indirect branch, else the direct-call target; "0x0" is the
-                # consistent sentinel the established path emits when unresolvable
-                # (`hex(int(getattr(callee_fn, "start", 0)))`). This modeled-sink arg
-                # was recovered through its ABI register (the #433 reg bridge), so it
-                # is register-passed -- `stack_dropped_args` is empty here.
-                callee_name = mkey or name or "?"
+                sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
+                if sig in recorded_sinks:
+                    return
+                recorded_sinks.add(sig)
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
-                callee: dict[str, Any] = {
-                    "name": callee_name,
-                    "address": hex(int(taddr)) if taddr is not None else "0x0",
+                target_ref = hex(int(taddr)) if taddr is not None else (mkey or name or "<callee>")
+                abi_sink = {
+                    **sink,
+                    "via": "abi_register",
+                    "arity_mismatch": {"recovered": len(params), "dropped": [argidx],
+                                       "register": reg, "callee_ref": target_ref},
+                    "detail": (sink.get("detail") or "")
+                    + f" (reached through ABI register {reg}: Binary Ninja recovered only "
+                    f"{len(params)} parameter(s) for this call, so arg {argidx} is read "
+                    f"from the register rather than the call's parameter list -- confirm "
+                    f"the prototype with `bn proto get {target_ref}` and apply it with "
+                    f"`bn proto set {target_ref} \"<prototype>\"`)",
                 }
-                leaf = {
-                    "kind": "arg_under_recovered",
-                    "address": hex(int(getattr(ins, "address", 0))),
-                    "callee": callee,
-                    "recovered_params": len(params),
-                    "dropped_args": [argidx],
-                    "stack_dropped_args": [],
-                    "register": reg,
-                    "note": (
-                        f"a tainted value reaches arg {argidx} of the modeled sink "
-                        f"{callee_name} through its ABI register {reg}, but Binary "
-                        f"Ninja recovered only {len(params)} parameter(s) for this "
-                        f"call, so the sink's declared arg index is out of range and "
-                        f"the tainted flow into it was NOT reported -- a 'no sinks "
-                        f"reached' result here is not proof of safety. Recover the "
-                        f"real prototype and apply `bn proto set {callee_name} "
-                        f"\"<prototype>\"`, then re-run this taint query."),
-                }
-                if leaf not in leaves:
-                    leaves.append(leaf)
+                findings.append(_tag_unconditional_flow(
+                    self._make_finding(ins, mkey or name, argidx, abi_sink, hit, why), hit))
 
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
@@ -4832,11 +4871,10 @@ class TaintEngine:
                                     self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
                     else:
                         # #577: the sink's OWN declared arg index is out of range
-                        # of the recovered params -- disclose the under-recovered
-                        # arity instead of silently skipping it (which would let a
-                        # false all-clear survive when a tainted value is passed
-                        # there through the dropped ABI register).
-                        _note_under_recovered_sink_arg(argidx)
+                        # of the recovered params -- recover it through its ABI
+                        # register and report the sink when it carries taint
+                        # (#1001 item 1) instead of silently skipping it.
+                        _note_under_recovered_sink_arg(argidx, sink)
             co = model.get("continuation")
             if co is not None:
                 cidx = int(co.get("null_arg", 0))
@@ -5333,9 +5371,25 @@ class TaintEngine:
                             # rule is the only information available. (A callee whose
                             # model WAS applied -- at any level -- needs nothing here:
                             # the model already describes its return and propagation.)
+                            # #1001 item 3: an IN-BINARY body BN did not analyse
+                            # (oversized, failed lift) lands here too, and is not
+                            # "external". Name it as what it is, with the remedy,
+                            # and record it as an unread body (#811). The phrase
+                            # keeps "has no model": taint_result's gate keys on it.
+                            _unread = self._unanalysed_body_phrase(
+                                self._not_internal_reason(descend_fn))
+                            _who = nm or hex(taddr)
+                            if _unread is not None:
+                                self._analysis_incomplete.add(str(_who))
+                                _fix = (f"run `bn decompile {hex(int(getattr(descend_fn, 'start', taddr)))} "
+                                        "--force-analysis` (may be slow) and re-run this taint query")
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
-                                add_assumption(f"external {nm or hex(taddr)} has no model; return conservatively tainted")
+                                add_assumption(
+                                    f"external {_who} has no model; return conservatively tainted"
+                                    if _unread is None else
+                                    f"in-binary {_who} was not analysed ({_unread}) and has no "
+                                    f"model; return conservatively tainted -- {_fix}")
                             else:
                                 # F4/#562: `stop` deliberately does NOT propagate taint
                                 # through an unmodeled external -- but taint DID reach it,
@@ -5347,11 +5401,16 @@ class TaintEngine:
                                 _stop_leaf = {
                                     "kind": "unmodeled_callee",
                                     "address": hex(int(getattr(ins, "address", 0))),
-                                    "callee": {"name": str(nm or hex(taddr)),
+                                    "callee": {"name": str(_who),
+                                               "display_name": (_display_name(descend_fn)
+                                                                if descend_fn is not None
+                                                                else str(_who)),
                                                "address": hex(int(taddr))},
                                     "tainted_args": sorted(tainted_args.keys()),
                                     "note": ("--unknown-call stop: taint reached this unmodeled "
-                                             "external and was NOT propagated through it; flow past "
+                                             + ("external" if _unread is None else
+                                                f"in-binary function ({_unread}; {_fix})")
+                                             + " and was NOT propagated through it; flow past "
                                              "this call is not analyzed -- NOT an all-clear"),
                                 }
                                 if _stop_leaf not in leaves:
@@ -6215,6 +6274,10 @@ class TaintEngine:
         # never happened.
         reason = (f"{callee}(): unconditional sink reached (no argument taint required)"
                   if argidx is None else f"tainted arg{argidx} reaches {callee}")
+        _arity = sink.get("arity_mismatch")
+        if sink.get("via") == "abi_register" and isinstance(_arity, dict):
+            reason += (f" through ABI register {_arity.get('register')} "
+                       f"(arity mismatch: BN recovered {_arity.get('recovered')} param(s))")
         tainted_labels = [node_label(n, why) for n in hit_nodes]
         # Round-3 F1 residual: an unconditional sink's hit node is taint_node()'d
         # AT this exact call with empty parents (the call itself IS the
@@ -6236,6 +6299,8 @@ class TaintEngine:
         return {
             "sink": {
                 "callee": callee,
+                **({"callee_display_name": _shown}
+                   if (_shown := self._display_for_name(callee)) else {}),
                 "address": hex(int(getattr(ins, "address", 0))),
                 "tainted_arg_index": argidx,
                 "class": sink.get("class"),
@@ -6243,6 +6308,9 @@ class TaintEngine:
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
+                # #1001 item 1: a sink reached through a dropped ABI register
+                # carries the arity mismatch that made it one.
+                **({"arity_mismatch": sink["arity_mismatch"]} if sink.get("arity_mismatch") else {}),
                 # #791: the residual-chunk disclosure. This dict is an explicit
                 # allow-list, not a spread of `sink`, so a classifier field that
                 # is not named here never reaches the caller -- the reason the
@@ -6260,6 +6328,30 @@ class TaintEngine:
             },
             "path": path,
         }
+
+    def _display_for_name(self, name: Any) -> str | None:
+        """The demangled display name for a symbol name a taint result prints
+        (#1001 item 4), or None when it has none (a C symbol, an unknown name).
+
+        Models key a callee with its leading underscores stripped
+        (``ZNSt13basic_filebuf...``), which neither reads nor demangles, so the
+        raw spelling is tried with them restored. The display name is the
+        symbol's ``short_name`` -- the spelling ``decompile`` prints (#978)."""
+        if not name:
+            return None
+        name = str(name)
+        cache = self.__dict__.setdefault("_display_names", {})
+        if name in cache:
+            return cache[name]
+        shown = None
+        for cand in (name, "_" + name, "__" + name):
+            sym = _symbol_by_raw_name(self.bv, cand)
+            short = getattr(sym, "short_name", None) if sym is not None else None
+            if isinstance(short, str) and short and short != getattr(sym, "name", None):
+                shown = short
+                break
+        cache[name] = shown
+        return shown
 
     def _reconstruct_path(self, node, why) -> list[dict[str, Any]]:
         chain = []
@@ -6395,12 +6487,14 @@ class TaintEngine:
         for sl in slices:
             sm, ss = derive_flow_facts(
                 direction="backward", path=sl.get("slice"), sink=sl.get("sink"),
-                origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"))
+                origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"),
+                display=self._display_for_name)
             sl["metrics"] = sm
             sl["signature"] = ss
         return {
             "direction": "backward",
-            "function": {"name": str(func.name), "address": hex(int(func.start))},
+            "function": {"name": str(func.name), "display_name": _display_name(func),
+                         "address": hex(int(func.start))},
             "sinks": [self._describe_locator(s) for s in sinks],
             "sink_status": sink_status,
             "slices": slices,
@@ -6998,6 +7092,7 @@ class TaintEngine:
             "kind": "caller_sites_truncated",
             "address": hex(int(getattr(func, "start", 0))),
             "function": {"name": str(getattr(func, "name", "?")),
+                         "display_name": _display_name(func) or "?",
                          "address": hex(int(getattr(func, "start", 0)))},
             "callers_total": int(total),
             "callers_followed": int(followed),

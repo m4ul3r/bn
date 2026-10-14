@@ -715,8 +715,9 @@ def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
     assert result["arg_label"]["callee"] == "fill_record"
     assert result["arg_label"]["name"] == "out"
     assert len(result["hints"]) == 1
-    assert "fill_record writes into the pointee" in result["hints"][0]
-    assert "out writes into the pointee" not in result["hints"][0]
+    assert "if fill_record fills it instead" in result["hints"][0]
+    assert "--source call:fill_record`" in result["hints"][0]
+    assert "out fills" not in result["hints"][0]
 
 
 def test_backward_slice_states_the_callee_structurally_755(monkeypatch):

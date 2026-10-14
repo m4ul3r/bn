@@ -761,12 +761,13 @@ def _underrecovered_forward_sink_program(nparams=1):
     return func, len1
 
 
-def test_forward_modeled_sink_arg_out_of_range_emits_under_recovered_leaf(models, monkeypatch):
-    # Positive: memcpy's length (arg 2) is out of range against the 1-param call,
-    # but a tainted value reaches it through arg register r2. The forward walk
-    # must emit a blocking `arg_under_recovered` leaf so the honesty gate
-    # withholds -- instead of silently skipping the invisible arg and reporting a
-    # clean zero-sink all-clear.
+def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(models, monkeypatch):
+    # #1001 item 1: memcpy's length (arg 2) is out of range against the 1-param
+    # call, but a tainted value reaches it through arg register r2. That is a
+    # REACHED modeled sink -- reported under reached_sinks (so the verdict counts
+    # it and `flows` lists it), flagged as resting on the register rather than
+    # BN's prototype -- not an `arg_under_recovered` frontier filed with the
+    # "we lost track" leaves (which left it out of the verdict entirely).
     func, len1 = _underrecovered_forward_sink_program(nparams=1)
     call_ins = func.mlil.ssa_form.instructions[2]
     bv = FBV({0x900: "memcpy"})
@@ -775,71 +776,78 @@ def test_forward_modeled_sink_arg_out_of_range_emits_under_recovered_leaf(models
                         lambda f, sites, idx: ("r2", [(len1, call_ins)]),
                         raising=False)
     result = engine.forward(func, [te.parse_locator("param:0")])
-    assert result["reached_sinks"] == [], result["reached_sinks"]
-    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
-    assert leaf is not None, result["leaves"]
-    # Leaf conforms to the shared `arg_under_recovered` contract: `callee` is a
-    # {name,...} dict and the dropped index lives in `dropped_args` -- so the
-    # default text renderer does not crash on it (#577 regression).
-    assert isinstance(leaf["callee"], dict), leaf
-    assert leaf["callee"]["name"] == "memcpy"
-    assert leaf["dropped_args"] == [2]
-    assert leaf["recovered_params"] == 1
-    # The whole result renders through the default `bn taint forward` text path
-    # without raising (a string callee crashed `_leaf_group_key`).
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+    assert len(result["reached_sinks"]) == 1, result["reached_sinks"]
+    sink = result["reached_sinks"][0]["sink"]
+    assert sink["callee"] == "memcpy" and sink["tainted_arg_index"] == 2
+    assert sink["class"] == "overflow_len"
+    assert sink["via"] == "abi_register"
+    assert sink["arity_mismatch"] == {"recovered": 1, "dropped": [2], "register": "r2",
+                                      "callee_ref": "0x900"}
+    # The flow traces back to the seeded param through the register's value.
+    assert result["reached_sinks"][0]["path"][-1]["address"] == hex(0x18)
+    assert "through ABI register r2" in result["reached_sinks"][0]["path"][-1]["reason"]
     from bn.formatters import _render_taint_text
     rendered = _render_taint_text(result)
-    assert "arg_under_recovered" in rendered
-    assert "memcpy" in rendered
-    diag = result.get("diagnostics") or {}
-    assert diag.get("safe_to_report_all_clear") is False, diag
+    assert "verdict: 1 sink(s) reached (overflow_len[1 via ABI register])" in rendered
+    assert "[overflow_len] memcpy @ 0x18 (arg 2 via r2, arity mismatch)" in rendered
+    assert "`bn proto get 0x900`" in rendered
 
 
-def test_forward_under_recovered_sink_leaf_matches_established_schema_576(models, monkeypatch):
-    # #576 review: the forward modeled-sink `arg_under_recovered` leaf must match
-    # the established descend-side `_arg_under_recovered_leaf` schema EXACTLY --
-    # `callee` is ALWAYS {name, address} and the leaf ALWAYS carries BOTH
-    # `dropped_args` and `stack_dropped_args` (empty when none). The forward path
-    # previously omitted `callee['address']` on the common direct-call site (it was
-    # set only when a resolved-indirect target address was threaded) and never
-    # emitted `stack_dropped_args`, so a consumer keying on the shared schema saw a
-    # divergent leaf. Direct call => the address must be the resolved call target,
-    # not dropped.
-    func, len1 = _underrecovered_forward_sink_program(nparams=1)
-    call_ins = func.mlil.ssa_form.instructions[2]
-    bv = FBV({0x900: "memcpy"})
-    engine = te.TaintEngine(bv, models)
-    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
-                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
-                        raising=False)
-    result = engine.forward(func, [te.parse_locator("param:0")])
-    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
-    assert leaf is not None, result["leaves"]
-
-    # callee is ALWAYS a {name, address} dict, address = resolved direct target.
-    assert isinstance(leaf["callee"], dict)
-    assert set(leaf["callee"]) == {"name", "address"}, leaf["callee"]
-    assert leaf["callee"]["name"] == "memcpy"
-    assert leaf["callee"]["address"] == "0x900"        # the direct-call target
-    # BOTH arg lists are always present; this register-recovered arg is not stack.
-    assert leaf["dropped_args"] == [2]
-    assert leaf["stack_dropped_args"] == []
-
-    # Key-parity with the established descend-side leaf: the forward leaf must
-    # carry at least the same core schema keys (it may add extras like `register`).
-    established = engine._arg_under_recovered_leaf(call_ins, func, [1], 1)
-    # The gated helper may return None on some fakes; only compare when it emits.
-    if established is not None:
-        core = {"kind", "address", "callee", "recovered_params",
-                "dropped_args", "stack_dropped_args", "note"}
-        assert core <= set(leaf), sorted(set(established) - set(leaf))
-        assert set(established["callee"]) == set(leaf["callee"])
+def test_abi_register_sinks_counted_per_class_in_verdict_1001():
+    # The verdict counts every reached sink and, per class, how many of them
+    # rest on a dropped ABI register; a class with none carries no marker.
+    from bn.formatters import _taint_forward_verdict
+    mk = lambda cls, via=None: {"sink": {"class": cls, **({"via": via} if via else {})}}
+    value = {"reached_sinks": [mk("overflow_len"), mk("path_injection", "abi_register"),
+                               mk("path_injection"), mk("path_injection", "abi_register")],
+             "leaves": [], "stats": {"functions_visited": 2}}
+    assert _taint_forward_verdict(value) == (
+        "verdict: 4 sink(s) reached (overflow_len, path_injection[2 via ABI register])"
+        " · taint crossed 2 fn(s)")
 
 
-def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, monkeypatch):
+def test_display_for_name_restores_a_model_keys_stripped_underscore_1001(models):
+    # #1001 item 4: a finding names its callee by MODEL key, which strips a C++
+    # symbol's leading underscore, so it neither reads nor demangles. The
+    # display name comes from the raw symbol with the underscore restored; a C
+    # symbol (short name == raw name) and an unknown name have none.
+    syms = {"_ZN5store4openEPKc": types.SimpleNamespace(name="_ZN5store4openEPKc",
+                                                         short_name="store::open"),
+            "memcpy": types.SimpleNamespace(name="memcpy", short_name="memcpy")}
+
+    class SymBV(FBV):
+        def get_symbol_by_raw_name(self, name):
+            return syms.get(name)
+
+    engine = te.TaintEngine(SymBV({}), models)
+    assert engine._display_for_name("ZN5store4openEPKc") == "store::open"
+    assert engine._display_for_name("_ZN5store4openEPKc") == "store::open"
+    assert engine._display_for_name("memcpy") is None
+    assert engine._display_for_name("not_a_symbol") is None
+
+
+def test_flow_signature_display_keeps_the_raw_grouping_key_1001():
+    # `rendered` is the address-free grouping key and stays raw; the display
+    # spelling rides beside it, and only when it differs.
+    shown = {"_Z8read_keyPc": "read_key", "ZN5store4openEPKc": "store::open"}
+    path = [{"address": "0x10", "callee": "_Z8read_keyPc"},
+            {"address": "0x20", "callee": "ZN5store4openEPKc"}]
+    sink = {"class": "path_injection", "callee": "ZN5store4openEPKc"}
+    _, sig = te.derive_flow_facts(direction="forward", path=path, sink=sink,
+                                  sources=["arg:recv:1"], display=shown.get)
+    assert sig["rendered"] == "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc"
+    assert sig["rendered_display"] == "arg:recv:1 → read_key → [path_injection] store::open"
+    _, plain = te.derive_flow_facts(direction="forward", path=path, sink=sink,
+                                    sources=["arg:recv:1"], display=lambda n: None)
+    assert "rendered_display" not in plain
+
+
+
+def test_forward_modeled_sink_arg_out_of_range_silent_when_untainted(models, monkeypatch):
     # Negative control: same under-recovered shape, but the register bridge's
     # recovered dropped-arg var is NOT tainted -- a merely-under-recovered but
-    # quiet sink must not cry wolf. No leaf, and the gate stays all-clear.
+    # quiet sink must not cry wolf. No sink, no leaf, and the gate stays all-clear.
     func, len1 = _underrecovered_forward_sink_program(nparams=1)
     call_ins = func.mlil.ssa_form.instructions[2]
     untainted = FSSA(FVar("cst"), 1)  # a value never in the tainted set
@@ -848,11 +856,11 @@ def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, mo
     monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
                         lambda f, sites, idx: ("r2", [(untainted, call_ins)]),
                         raising=False)
-    # seed a var that never reaches the call so nothing is tainted at the memcpy
     result = engine.forward(func, [te.parse_locator("param:0")])
     # param 0 (n) IS tainted and flows to len#1, but the bridge here returns a
     # DIFFERENT (untainted) recovered var, so the out-of-range branch must stay
-    # silent -- proves the leaf is gated on real taint, not on mere arity.
+    # silent -- proves the report is gated on real taint, not on mere arity.
+    assert result["reached_sinks"] == [], result["reached_sinks"]
     assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
 
 
@@ -3683,7 +3691,8 @@ def test_forward_unmodeled_in_binary_callee_records_frontier_leaf(models):
     assert len(frontier) == 1, result["leaves"]
     leaf = frontier[0]
     assert leaf["address"] == "0x1008"                                  # the call site
-    assert leaf["callee"] == {"name": "parse_event", "address": "0x3000"}
+    assert leaf["callee"] == {"name": "parse_event", "display_name": "parse_event",
+                              "address": "0x3000"}
     assert leaf["tainted_args"] == [0]                                  # arg 0 carried taint
     assert leaf.get("note")                                            # human guidance present
 
@@ -3730,7 +3739,8 @@ def test_forward_depth_bound_records_frontier_leaf(models):
     assert result["reached_sinks"] == []
     frontier = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"]
     assert len(frontier) == 1, result["leaves"]
-    assert frontier[0]["callee"] == {"name": "parse_event", "address": "0x3000"}
+    assert frontier[0]["callee"] == {"name": "parse_event", "display_name": "parse_event",
+                                     "address": "0x3000"}
     assert frontier[0]["address"] == "0x1008"
     assert frontier[0]["tainted_args"] == [0]
 
@@ -6935,7 +6945,8 @@ def test_arg_under_recovered_leaf_gated_positive(models, monkeypatch):
     leaf = engine._arg_under_recovered_leaf(ins, callee, [1], 1)
     assert leaf is not None
     assert leaf["kind"] == "arg_under_recovered"
-    assert leaf["callee"] == {"name": "_M_create", "address": "0x3000"}
+    assert leaf["callee"] == {"name": "_M_create", "display_name": "_M_create",
+                              "address": "0x3000"}
     assert leaf["recovered_params"] == 1
     assert leaf["dropped_args"] == [1]
     assert leaf["address"] == "0x40130a"
@@ -9204,6 +9215,49 @@ def test_fully_analysed_run_stays_complete_811(models):
         func, [te.parse_locator("call:scanf")])
     assert result["stats"]["analysis_incomplete"] is False, result["stats"]
     assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is True
+
+
+def _call_unanalysed_callee(*, symbol_type="FunctionSymbol", skipped=True):
+    """caller(p): fetch_input(p#0) -- `fetch_input` has no MLIL. With `skipped`
+    BN skipped it (an oversized body past maxFunctionSize); without, the lift
+    produced nothing. `symbol_type` makes it an import instead."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    callee = FFunc("fetch_input", 0xB00, FSSAFunc([]), symbol_type=symbol_type)
+    if skipped:
+        callee.analysis_skipped = True
+        callee.analysis_skip_reason = types.SimpleNamespace(name="ExceedFunctionSizeSkipReason")
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
+    return FFunc("handle", 0x10, FSSAFunc([call]), params=[p]), FBV({}, funcs={0xB00: callee})
+
+
+@pytest.mark.parametrize("skipped, phrase", [
+    (True, "Binary Ninja skipped its analysis: it exceeds analysis.limits.maxFunctionSize"),
+    (False, "Binary Ninja produced no MLIL for it"),
+], ids=["analysis-skipped", "no-mlil"])
+def test_unanalysed_in_binary_callee_is_not_called_external_1001(models, skipped, phrase):
+    # #1001 item 3: an in-binary function BN did not analyse reached the
+    # "external X has no model" caveat because `_is_internal` is also false for
+    # an empty body. It is named for what it is, with the command that analyses
+    # it, and recorded as an unread body (#811). The phrase keeps "has no model":
+    # the all-clear gate keys on it.
+    func, bv = _call_unanalysed_callee(skipped=skipped)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    caveat = next(a for a in result["assumptions"] if "fetch_input" in a)
+    assert caveat == (f"in-binary fetch_input was not analysed ({phrase}) and has no model; "
+                      "return conservatively tainted -- run `bn decompile 0xb00 "
+                      "--force-analysis` (may be slow) and re-run this taint query")
+    assert result["stats"]["analysis_incomplete_functions"] == ["fetch_input"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_unanalysed_import_keeps_the_external_caveat_1001(models):
+    func, bv = _call_unanalysed_callee(symbol_type="ImportedFunctionSymbol", skipped=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert "external fetch_input has no model; return conservatively tainted" in result["assumptions"]
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
 
 
 def test_backward_result_carries_a_completeness_gate_812(process_func, models):

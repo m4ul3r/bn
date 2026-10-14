@@ -396,6 +396,59 @@ def test_arg_under_recovered_leaves_group_per_callee():
                        "recovered_params": 1, "dropped_args": [1], "note": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
     assert "[2 leaves]" in out                             # two call sites of f collapse
+
+
+# --- demangled names in taint / trace text (#1001 item 4) --------------------
+
+_CXX_TAINT = {
+    "direction": "forward",
+    "function": {"name": "_Z9load_userPK4Conn", "display_name": "load_user",
+                 "address": "0x402000"},
+    "sources": ["arg:recv:1"],
+    "reached_sinks": [{
+        "sink": {"class": "path_injection",
+                 "callee": "ZN5store4openEPKc", "callee_display_name": "store::open",
+                 "address": "0x402080", "tainted_arg_index": 1},
+        "path": [],
+        "metrics": {"steps": 4, "fns_spanned": 2, "traverses_unresolved": False},
+        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc",
+                      "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open"},
+    }],
+    "leaves": [{"kind": "unmodeled_callee", "address": "0x402040",
+                "callee": {"name": "_ZN5cache3getEi", "display_name": "cache::get",
+                           "address": "0x403000"},
+                "tainted_args": [0]}],
+}
+
+
+def test_taint_text_names_functions_demangled_unless_mangled_1001():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_CXX_TAINT)
+    assert out.splitlines()[0] == "forward taint in load_user @ 0x402000"
+    assert ("[path_injection] store::open @ 0x402080 (arg 1)   "
+            "arg:recv:1 → read_key → [path_injection] store::open") in out
+    assert "unmodeled_callee @ 0x402040  -> cache::get @ 0x403000" in out
+    raw = _render_taint_text(_CXX_TAINT, mangled=True)
+    assert raw.splitlines()[0] == "forward taint in _Z9load_userPK4Conn @ 0x402000"
+    assert ("[path_injection] ZN5store4openEPKc @ 0x402080 (arg 1)   "
+            "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc") in raw
+    assert "-> _ZN5cache3getEi @ 0x403000" in raw
+
+
+def test_trace_header_names_function_and_callee_demangled_unless_mangled_1001():
+    from bn.formatters import _render_trace_text
+    value = {"function": "_Z8run_toolPK3Req", "function_display_name": "run_tool",
+             "function_address": "0x401660", "target_address": "0x401804", "arg_index": 1,
+             "arg_label": {"index": 1, "register": "x1", "callee": "_ZN3app4execEPPc",
+                           "callee_display_name": "app::exec"},
+             "callee": "_ZN3app4execEPPc", "trace": [], "hints": []}
+    assert _render_trace_text(value).splitlines()[:2] == [
+        "backward trace of arg[1] of app::exec (x1) in run_tool @ 0x401804",
+        "  run_tool @ 0x401660  •  0 steps"]
+    assert _render_trace_text(value, mangled=True).splitlines()[0] == (
+        "backward trace of arg[1] of _ZN3app4execEPPc (x1) in _Z8run_toolPK3Req @ 0x401804")
+
+
 # --- compact-default taint output (Thread C) ---------------------------------
 
 _FWD_FLOW = {
