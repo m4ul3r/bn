@@ -1752,16 +1752,23 @@ class _SignalUnwind:
     Only signals still at SIG_DFL are taken over -- a host that installed its
     own handler (or a `nohup` SIG_IGN) keeps it -- and only on the main thread,
     the one place Python lets a handler be installed. The handlers go in before
-    the child is started and only RECORD a signal until `arm()`, which is the
-    first statement inside the owner's try (and raises at once for a signal
-    recorded meanwhile); from `defer()`, where the reap begins, they record
-    again, so a signal cannot cut the reap short. The first one caught is the
-    one re-delivered.
+    the child is started and only RECORD a signal until `arm()`, the first
+    statement after Popen inside the owner's try (it raises at once for a
+    signal recorded meanwhile); from `defer()`, where the reap begins, they
+    record again, so a signal cannot cut the reap short. The first one caught
+    is the one re-delivered.
+
+    A handler that fires once its owner's frame is no longer running -- left
+    installed because a KeyboardInterrupt unwound the owner before `restore()`
+    ran, which a host that catches it (a REPL, a `Client` user) survives --
+    restores the dispositions and re-delivers, so such a host still dies of its
+    SIGTERM/SIGHUP instead of silently ignoring it.
     """
 
     _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
     def __init__(self) -> None:
+        self._owner: Any = sys._getframe(1)
         self._previous: dict[int, Any] = {}
         self._caught: int | None = None
         # Installed RECORDING: until `arm()` there is no owned child for an
@@ -1776,11 +1783,20 @@ class _SignalUnwind:
             except (ValueError, OSError):
                 continue
 
+    def _owner_running(self, frame: Any) -> bool:
+        while frame is not None:
+            if frame is self._owner:
+                return True
+            frame = frame.f_back
+        return False
+
     def _handle(self, signum: int, frame: Any) -> None:
-        if self._caught is not None:
-            return
-        self._caught = signum
-        if not self._deferred:
+        first = self._caught is None
+        if first:
+            self._caught = signum
+        if not self._owner_running(frame):
+            self.restore()
+        elif first and not self._deferred:
             raise _SpawnWaitSignalled(signum)
 
     def arm(self) -> None:
@@ -1796,6 +1812,7 @@ class _SignalUnwind:
         for signum, previous in self._previous.items():
             signal.signal(signum, previous)
         self._previous.clear()
+        self._owner = None
         if self._caught is not None:
             os.kill(os.getpid(), self._caught)
 
@@ -1872,49 +1889,50 @@ def _spawn_instance_unlocked(
     log_file = open(log_path, "a" if keep_log else "w")  # noqa: SIM115
 
     cmd = _find_bn_agent() + ["--instance-id", instance_id]
-    # Handlers go in BEFORE Popen, recording only (see `_SignalUnwind`), so a
-    # SIGTERM/SIGHUP arriving while the child starts -- or while the log handle
-    # below closes -- is held for the owner instead of killing this process
-    # with the child already running and nobody left to reap it (#916 review).
-    unwind = _SignalUnwind()
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            start_new_session=True,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-    except BaseException:
-        # No child to reap: put the dispositions back and re-deliver a held signal.
-        unwind.restore()
-        raise
-    finally:
-        # The child inherits the fd across a successful Popen; close the parent's
-        # copy either way. Without this the write handle on a failed spawn lives
-        # exactly as long as the traceback that holds the frame owning it: the
-        # measured window is the exception propagating out of here, but anything
-        # that keeps that traceback alive -- a stored exception, a debugger, a
-        # caller that formats it later -- keeps the fd alive with it (#618).
-        log_file.close()
-
-    # From here this call OWNS the child until it hands back the instance that
-    # child registered. Every other exit -- a refused registry, an early exit,
-    # the registration timeout, but ALSO an exception escaping the poll loop
-    # (the deadline expiring inside `_remaining_deadline`, a failing registry
-    # read, a KeyboardInterrupt, or SIGTERM/SIGHUP turned into one by
+    # From the Popen below this call OWNS the child until it hands back the
+    # instance that child registered. Every other exit -- a refused registry, an
+    # early exit, the registration timeout, but ALSO an exception escaping the
+    # poll loop (the deadline expiring inside `_remaining_deadline`, a failing
+    # registry read, a KeyboardInterrupt, or SIGTERM/SIGHUP turned into one by
     # `_SignalUnwind`) -- must reap it. The child runs in its own session, so
     # nothing else will: an exit that bypassed the reap left a live bridge that
     # never registered and that no `instance list/find/gc` or `session stop`
     # could see (#916). The child we hold is the thing reaped, never a pid read
-    # from a registry, and no discovery file is unlinked here. What still
-    # escapes: SIGKILL, which runs no code at all; and SIGTERM/SIGHUP when this
-    # runs off the main thread or the process already had its own disposition
-    # for them, since those are left exactly as they were.
+    # from a registry, and no discovery file is unlinked here.
+    #
+    # The signal handlers go in BEFORE Popen, recording only, and the owner's
+    # try starts before Popen too, so every exit from Popen on -- a signal while
+    # the child starts, a KeyboardInterrupt at the log close -- reaps whatever
+    # child exists and restores the dispositions. What still escapes: SIGKILL,
+    # which runs no code at all; SIGTERM/SIGHUP when this runs off the main
+    # thread or the process already had its own disposition for them, since
+    # those are left exactly as they were; and a KeyboardInterrupt raised inside
+    # the cleanup below before `_reap_child` runs, which leaves the child
+    # running. Handlers that any KeyboardInterrupt leaves installed (there, or
+    # mid-install) hand the next SIGTERM/SIGHUP to the default action rather
+    # than swallowing it; see `_SignalUnwind`.
+    unwind = _SignalUnwind()
+    proc: subprocess.Popen | None = None
     owned = True
     try:
-        # First statement INSIDE the try: a signal held since before Popen
-        # raises here, where the finally below reaps the child.
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+        finally:
+            # The child inherits the fd across a successful Popen; close the
+            # parent's copy either way. Without this the write handle on a failed
+            # spawn lives exactly as long as the traceback that holds the frame
+            # owning it: the measured window is the exception propagating out of
+            # here, but anything that keeps that traceback alive -- a stored
+            # exception, a debugger, a caller that formats it later -- keeps the
+            # fd alive with it (#618).
+            log_file.close()
+        # A signal held since before Popen raises here, inside the try.
         unwind.arm()
         while time.monotonic() < deadline:
             if reg_path.exists():
@@ -1978,7 +1996,7 @@ def _spawn_instance_unlocked(
         # An exited child was already collected by poll(); only a live one needs
         # the terminate/kill escalation. The original failure keeps propagating.
         try:
-            if owned and proc.poll() is None:
+            if owned and proc is not None and proc.poll() is None:
                 _reap_child(proc)
         finally:
             # Re-delivers a caught SIGTERM/SIGHUP, now that the child is reaped.

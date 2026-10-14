@@ -2121,10 +2121,11 @@ def test_spawn_instance_reaps_child_when_registration_wait_raises(monkeypatch, t
 
 
 _SPAWN_WAIT_DRIVER = """
-import inspect, os, signal, sys
+import inspect, os, signal, sys, time
 import bn.transport as transport
 
 pidfile, mode, signum = sys.argv[1], sys.argv[2], int(sys.argv[3])
+before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
 transport.list_instances = lambda **kwargs: []
 transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
 real_popen = transport.subprocess.Popen
@@ -2141,15 +2142,23 @@ def recording_popen(*args, **kwargs):
 
 transport.subprocess.Popen = recording_popen
 
-if mode == "defer":
-    # Deliver the signal exactly on the `unwind.defer()` line of the reaping
-    # finally, which the registration timeout below reaches.
+# Act exactly on one statement of `_spawn_instance_unlocked`: deliver the
+# signal, or raise the KeyboardInterrupt a REAL SIGINT would raise there.
+triggers = {
+    "defer": ("unwind.defer()", "signal"),
+    "close-ki": ("log_file.close()", "interrupt"),
+    "restore-ki": ("unwind.restore()", "interrupt"),
+}
+if mode in triggers:
+    statement, action = triggers[mode]
     code = transport._spawn_instance_unlocked.__code__
     lines, first = inspect.getsourcelines(transport._spawn_instance_unlocked)
-    defer_line = first + next(i for i, text in enumerate(lines) if "unwind.defer()" in text)
+    target = first + max(i for i, text in enumerate(lines) if text.strip() == statement)
 
     def local(frame, event, arg):
-        if event == "line" and frame.f_lineno == defer_line:
+        if event == "line" and frame.f_lineno == target:
+            if action == "interrupt":
+                raise KeyboardInterrupt
             os.kill(os.getpid(), signum)
         return local
 
@@ -2158,11 +2167,19 @@ if mode == "defer":
 
     sys.settrace(tracer)
 
-timeout = 1.0 if mode == "defer" else 60
+timeout = 1.0 if mode in ("defer", "restore-ki") else 60
 try:
     transport.spawn_instance("sample-1", timeout=timeout, poll_interval=0.05)
 except transport.BridgeError as exc:
     print("spawn failed:", exc)
+except KeyboardInterrupt:
+    # A host that survives the interrupt (a REPL, a Client user) must still
+    # die of its own SIGTERM afterwards.
+    after = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    print("restored:", after == before, flush=True)
+    os.kill(os.getpid(), signum)
+    time.sleep(5)
+    print("survived its own signal", flush=True)
 """
 
 
@@ -2171,6 +2188,8 @@ except transport.BridgeError as exc:
     ("external", signal.SIGHUP),
     ("popen", signal.SIGTERM),     # child started, owner not yet entered
     ("defer", signal.SIGTERM),     # at the top of the reaping finally
+    ("close-ki", signal.SIGTERM),  # KeyboardInterrupt at the log close after Popen
+    ("restore-ki", signal.SIGTERM),  # KeyboardInterrupt before restore() runs
 ])
 def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, signum):
     # #916 review: Python's default SIGTERM/SIGHUP action runs no `finally`, so
@@ -2180,6 +2199,9 @@ def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, sig
     # Popen was returning, or on entry to the finally's `unwind.defer()`, which
     # let the exception skip the reap. In every window the CLI must reap the
     # child and then still die OF the signal, as it would have without the fix.
+    # A KeyboardInterrupt in a host that catches it must not leave the host
+    # deaf to its own SIGTERM: at the log close the dispositions are restored,
+    # and handlers left behind by one that skips restore() hand the signal on.
     pidfile = tmp_path / "child.pid"
     env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
     cli = subprocess.Popen(
@@ -2198,7 +2220,14 @@ def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, sig
             cli.send_signal(signum)
         cli.wait(timeout=15)
 
-        assert cli.returncode == -signum, cli.stdout.read().decode(errors="replace")
+        output = cli.stdout.read().decode(errors="replace")
+        assert cli.returncode == -signum, output
+        if mode == "close-ki":
+            assert "restored: True" in output, output
+        if mode == "restore-ki":
+            # restore() never ran, so the host died through the leftover
+            # handler handing its SIGTERM to the default action.
+            assert "restored: False" in output, output
         # The CLI waited on its own child before re-raising the signal, so the
         # pid is gone rather than a zombie or a reparented orphan.
         with pytest.raises(ProcessLookupError):
