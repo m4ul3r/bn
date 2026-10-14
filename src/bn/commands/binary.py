@@ -7,6 +7,7 @@ from typing import Any
 from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
+from ..target_hint import format_multi_target_hint
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -103,12 +104,47 @@ def _load(args: argparse.Namespace) -> int:
     )
 
 
+def _close_target_by_name(args: argparse.Namespace, name: str) -> str:
+    """The ``target_id`` of the ONE open target a bare ``bn close <name>`` names.
+
+    Deliberately narrower than the ``-t`` resolver (#996 review): only an exact
+    basename or a full ``target_id`` counts -- never a view id (``close 5``
+    must not close whichever view became view 5) and never a ``.bndb``-stripped
+    alias (a second ``close hello`` must not go on to close ``hello.bndb``). It
+    must match exactly one target, and the close is sent PINNED to that
+    target's id, like every implicit close resolution (#690 R3).
+    """
+    response = cli.send_request(
+        "list_targets", params={}, target=None,
+        instance_id=getattr(args, "instance", None),
+    )
+    result = cli.unwrap_result(response, "list_targets")
+    if not isinstance(result, list):
+        raise BridgeError(
+            "malformed bridge reply to list_targets (no target list); the "
+            "bridge may be stale -- restart it or pass an explicit --target"
+        )
+    rows = [row for row in result if isinstance(row, dict)]
+    matches = [row for row in rows
+               if name in (row.get("basename"), str(row.get("target_id") or ""))]
+    if len(matches) == 1 and matches[0].get("target_id"):
+        return str(matches[0]["target_id"])
+    headline = (
+        f"{len(matches)} open targets are named {name!r}; close one by selector."
+        if matches else
+        f"No open target is named {name!r}, and no file {name!r} exists in this "
+        "directory. A bare name closes the open target with exactly that file "
+        "name; to close by any selector use `bn close -t <selector>`."
+    )
+    raise BridgeError(format_multi_target_hint(headline, matches or rows))
+
+
 @command("close", help="Close an open target (bn-loaded or a GUI tab)", target=True,
          args=[
              arg("path", nargs="?",
-                 help="Path to close (omit to close the single open target). A name "
-                      "that is not an existing file is taken as a target selector, "
-                      "same as -t"),
+                 help="Path to close (omit to close the single open target). A bare "
+                      "name (no `/`) that is no file here closes the one open target "
+                      "with exactly that file name; any other selector needs -t"),
              arg("--all", action="store_true", help="Close all open targets, including GUI tabs bn did not load"),
          ])
 def _close(args: argparse.Namespace) -> int:
@@ -169,14 +205,15 @@ def _close(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if explicit_path is not None:
         resolved = Path(explicit_path).expanduser().resolve()
-        if "/" in str(explicit_path) or resolved.exists():
+        name = str(explicit_path)
+        if "/" in name or name.strip() == "active" or resolved.exists():
             params["path"] = str(resolved)
         else:
             # #996: every other command takes `hello` as a selector, so a bare
-            # name that is no file in the cwd is one too. Anything spelled as a
-            # path, or an existing file, stays a path: what the operand has
-            # always meant.
-            explicit_target = args.target = str(explicit_path)
+            # name that is no file in the cwd names an open target. Anything
+            # spelled as a path, an existing file, or the volatile `active`
+            # stays a path: what the operand has always meant.
+            explicit_target = args.target = _close_target_by_name(args, name)
             explicit_path = None
     if args.all:
         params["all"] = True

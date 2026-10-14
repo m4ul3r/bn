@@ -365,7 +365,8 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # directive instead of misleading the caller -- "retry" while a refresh is
     # already building them (#996).
     unavailable = analysis_unavailable(
-        bv, "Strings", "Run `bn refresh` to build the full string set first.")
+        bv, "Strings", "Run `bn refresh` to build the full string set first.",
+        plural=True)
     if unavailable is not None:
         raise RuntimeError(unavailable)
     needle = str(query) if query else None

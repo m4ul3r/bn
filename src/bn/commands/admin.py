@@ -884,7 +884,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         except BridgeError:
             # Fallback: signal the pinned process directly.
             if inst is None or signaller is None:
-                raise BridgeError(f"No bridge instance found with id: {target_id}")
+                raise BridgeError(cli.instance_not_found_message(
+                    target_id, "See `bn session list`.")) from None
             reason = signaller.send(signal.SIGTERM)
             if reason is not None:
                 print(f"error: {reason}", file=sys.stderr)
@@ -1496,6 +1497,11 @@ def _session_list(args: argparse.Namespace) -> int:
         else None
     )
     result: Any = _running_instances_result(selector_filter)
+    # #996: an explicit -i that matches nothing is the "lost BN_CACHE_DIR"
+    # case -- say where the id IS registered rather than "(no sessions)".
+    if selector_filter and not result.get("items"):
+        raise BridgeError(cli.instance_not_found_message(
+            selector_filter, "See `bn session list` for running instances."))
     # #733 F1: "is it safe to stop these bridges?" answered on the read path.
     # A live probe, not registry meta: `_write_registry` runs on load/close
     # only, so a registry-sourced count would report "0 unsaved" for a bridge

@@ -109,6 +109,7 @@ Ready immediately after `--quick`:
 Need `bn refresh` first — these depend on the analysis pass:
 
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
+  While a `bn refresh` is already analysing that target, the refusal says `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.` instead; wait rather than start a second refresh.
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
 - Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.

@@ -903,6 +903,37 @@ def test_doctor_judges_headless_bridges_against_this_cli_checkout_992(
     assert f"source: {source_dir}" in text
 
 
+def test_session_list_and_stop_name_the_registry_for_a_missing_id_996(
+    monkeypatch, tmp_path, capsys
+):
+    """#996 review: an instance whose BN_CACHE_DIR was lost "cannot be listed
+    or stopped". `session list -i X` printed `(no sessions)` at exit 0 and
+    `session stop X` a bare not-found; both now name the searched registry and,
+    when the id lives under another root, the export that reaches it."""
+    from bn import transport
+
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setattr(transport, "_instance_registered_elsewhere",
+                        lambda instance_id: elsewhere if instance_id == "ghost" else None)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda *a, **k: None)
+
+    def refuse(op, **kwargs):
+        raise bn.cli.BridgeError("No bridge instance found with id: ghost")
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+
+    for argv in (["-i", "ghost", "session", "list"], ["session", "stop", "ghost"]):
+        assert bn.cli.main(argv) == 2, argv
+        err = capsys.readouterr().err
+        assert "No bridge instance found with id: ghost (searched" in err, argv
+        assert f"export BN_CACHE_DIR={elsewhere}" in err, argv
+
+    # An explicit selector that is simply not running still says so, not "(no sessions)".
+    assert bn.cli.main(["-i", "nobody", "session", "list"]) == 2
+    assert "No bridge instance found with id: nobody" in capsys.readouterr().err
+
+
 def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     from bn.transport import BridgeInstance
     old = type("FakeInstance", (), {

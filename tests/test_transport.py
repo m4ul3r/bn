@@ -2305,9 +2305,12 @@ def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, mon
     the searched registry but registered under the other root must be answered
     with the export that reaches it -- never "start one", which spawns a
     duplicate bridge under the same name."""
-    default_root = tmp_path / "default"
+    import shlex
+
+    default_root = tmp_path / "default root"          # a space: the export is quoted
     (default_root / "instances").mkdir(parents=True)
-    (default_root / "instances" / "demo.json").write_text("{}")
+    live = json.dumps({"pid": os.getpid(), "instance_id": "demo"})
+    (default_root / "instances" / "demo.json").write_text(live)
     monkeypatch.setattr("bn.transport.default_cache_home", lambda: default_root)
     monkeypatch.setattr("bn.transport._agent_cache_dirs_for", lambda instance_id: [])
     private = tmp_path / "private"
@@ -2318,8 +2321,20 @@ def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, mon
     message = str(exc.value)
     assert message.startswith("No bridge instance found with id: demo")
     assert f"searched {private / 'instances'}" in message
-    assert f"export BN_CACHE_DIR={default_root}" in message
+    assert f"export BN_CACHE_DIR={shlex.quote(str(default_root))} " in message
     assert "Start one with" not in message
+
+    # A stale registry there is no evidence: a dead pid, an orphaned `{}`,
+    # garbage, or another id's payload keep the start advice (#996 review).
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    for stale in (json.dumps({"pid": dead.pid, "instance_id": "demo"}), "{}",
+                  "not json", json.dumps({"pid": os.getpid(), "instance_id": "other"})):
+        (default_root / "instances" / "demo.json").write_text(stale)
+        with pytest.raises(BridgeError) as exc:
+            choose_instance("demo")
+        assert "export BN_CACHE_DIR" not in str(exc.value), stale
+        assert "Start one with" in str(exc.value), stale
 
     # An id registered nowhere else keeps the start advice, and says the
     # variable scopes the registry.
@@ -2339,17 +2354,25 @@ def test_missing_instance_found_through_a_running_bridges_environment_996(
     default_root = tmp_path / "default"
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "instances").mkdir(parents=True)
-    (elsewhere / "instances" / "demo.json").write_text("{}")
+    (elsewhere / "instances" / "demo.json").write_text(
+        json.dumps({"pid": os.getpid(), "instance_id": "demo"}))
+    # A bridge started with a RELATIVE BN_CACHE_DIR: it is relative to the
+    # bridge's own cwd, read from /proc/<pid>/cwd, not the caller's.
+    bridge_cwd = tmp_path / "bridge-cwd"
+    (bridge_cwd / "rel" / "instances").mkdir(parents=True)
     proc = tmp_path / "proc"
     for pid, argv, env in (
         ("4242", b"/venv/bin/bn-agent\0--instance-id\0demo\0",
          b"HOME=/h\0BN_CACHE_DIR=" + str(elsewhere).encode() + b"\0"),
         ("4343", b"/usr/bin/python3\0other.py\0--instance-id\0demo\0",
          b"BN_CACHE_DIR=/nowhere\0"),
+        ("4444", b"/venv/bin/bn-agent\0--instance-id\0demo\0",
+         b"BN_CACHE_DIR=rel\0"),
     ):
         (proc / pid).mkdir(parents=True)
         (proc / pid / "cmdline").write_bytes(argv)
         (proc / pid / "environ").write_bytes(env)
+    (proc / "4444" / "cwd").symlink_to(bridge_cwd)
     real_scan = transport._agent_cache_dirs_for
     monkeypatch.setattr(transport, "_agent_cache_dirs_for",
                         lambda instance_id: real_scan(instance_id, proc=proc))
@@ -2358,7 +2381,7 @@ def test_missing_instance_found_through_a_running_bridges_environment_996(
     monkeypatch.setattr(transport, "cache_home", lambda: default_root)
     monkeypatch.setattr(transport, "instances_dir", lambda: default_root / "instances")
 
-    assert real_scan("demo", proc=proc) == [elsewhere]
+    assert sorted(real_scan("demo", proc=proc)) == sorted([elsewhere, bridge_cwd / "rel"])
     message = transport.instance_not_found_message("demo", "Start one.")
     assert f"export BN_CACHE_DIR={elsewhere}" in message
 

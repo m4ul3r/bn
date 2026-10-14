@@ -18,6 +18,8 @@ bn refresh
 
 One open target can be selected implicitly. With several open targets, pass `-t <selector>` from `bn target list`; selectors include the returned selector, view or target id, and an unambiguous filename/path. Each listed `selector` resolves to its own target in that open-target snapshot, including raw/adjacent-`.bndb` views, cache-name aliases and identical paths. The bridge uses a path suffix only when the resolver finds exactly that target; otherwise it lists the full `target_id`. A live full `target_id` takes precedence over filename aliases, so even a file named after another target's ID cannot shadow that fallback. List again after opening or closing views: path aliases can become ambiguous as the open set changes. `-i <instance>` selects a bridge. Put these flags before or after a command; explicit flags take precedence over ambient defaults.
 
+Every alias counts equally, so opening a view never moves a selector onto it: a selector that matches two views is refused with both listed. The one exception is the save round trip: after `bn save` on a raw view and `bn load` of that `.bndb`, the raw view's own name and path still mean the raw view (the database answers to its `.bndb` name). A bare `bn close <name>` (no `/`, no such file in the cwd) closes only the target whose file name is exactly `<name>`; use `-t` for any other selector.
+
 Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick; for `batch apply`, a manifest `"target"` wins over ambient defaults but loses to explicit `-t`. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 
 ```bash
@@ -62,6 +64,8 @@ A saved `.bndb` may be preferred over adjacent raw bytes, but only if it describ
 `existing_annotations.provenance_hint` (in `target info` and `evidence orient`) flags inherited work only. A target this bridge opened from raw bytes gets no hint, however much you annotate or save; one opened from a database is judged by what it held when opened (`present_at_open`), never by your own later renames. The counts beside it are always current.
 
 While `bn refresh` runs, reads answer at once, but writes queue behind it: `py exec`, every mutation, `save`, `close` and `decompile --force-analysis` wait until the refresh finishes. After about two seconds of waiting the CLI prints `bn: <op> is waiting for the running refresh (started Ns ago) to finish` on stderr, so a queue is not a hang. Set `BN_NO_WAIT=1` to make a queued write fail fast with `busy: refresh in progress ...` (exit 2) instead.
+
+An analysis-gated read (callsites, xrefs, `function info`, taint, strings) on a `--quick` view that a `bn refresh` is analysing right now refuses with `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.`; retry after the refresh instead of starting another.
 
 ```bash
 bn session start /path/to/sample.bin --instance-id triage-1 --quick

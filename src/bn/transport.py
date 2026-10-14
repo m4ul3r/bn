@@ -19,6 +19,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import signal
 import socket
 import struct
@@ -1200,9 +1201,39 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path = Path("/proc")) -> list[
         for var in environ:
             if var.startswith(b"BN_CACHE_DIR=") and len(var) > len(b"BN_CACHE_DIR="):
                 cache_dir = Path(os.fsdecode(var[len(b"BN_CACHE_DIR="):])).expanduser()
+                if not cache_dir.is_absolute():
+                    # A relative value is relative to the BRIDGE's cwd, not
+                    # ours; unreadable -> no answer rather than a wrong one.
+                    try:
+                        cache_dir = Path(os.readlink(entry / "cwd")) / cache_dir
+                    except OSError:
+                        cache_dir = None  # type: ignore[assignment]
                 break
-        found.append(cache_dir)
+        if cache_dir is not None:
+            found.append(cache_dir)
     return found
+
+
+def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
+    """Whether *registry_path* is a parseable registry of a still-running bridge.
+
+    The "registered elsewhere" hint replaces the start advice, so a stale file
+    (dead or recycled pid, an orphaned ``{}``, another id's payload) must not
+    produce it (#996 review).
+    """
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    recorded_id = payload.get("instance_id")
+    if recorded_id is not None and recorded_id != instance_id:
+        return False
+    return _process_alive(pid) and identity_verdict(payload, pid) != "mismatch"
 
 
 def _instance_registered_elsewhere(instance_id: str) -> Path | None:
@@ -1212,7 +1243,8 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | None:
     a shell that lost (or never had) the variable cannot see a bridge started
     under it, and the reverse (#996). Candidates are the platform default root
     when BN_CACHE_DIR is set, plus the root every running bridge of that name
-    was launched under; one counts only when it holds ``instances/<id>.json``.
+    was launched under; one counts only when its ``instances/<id>.json`` names
+    a live bridge.
     """
     try:
         current = cache_home().resolve()
@@ -1226,7 +1258,8 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | None:
         try:
             if candidate.resolve() == current:
                 continue
-            if (candidate / "instances" / f"{instance_id}.json").is_file():
+            if _registry_names_live_bridge(
+                    candidate / "instances" / f"{instance_id}.json", instance_id):
                 return candidate
         except OSError:
             continue
@@ -1246,7 +1279,7 @@ def instance_not_found_message(instance_id: str, advice: str) -> str:
     if elsewhere is not None:
         return (
             f"{head} Instance {instance_id} is registered under {elsewhere}: "
-            f"export BN_CACHE_DIR={elsewhere} (BN_CACHE_DIR also moves the "
+            f"export BN_CACHE_DIR={shlex.quote(str(elsewhere))} (BN_CACHE_DIR also moves the "
             "instance registry and sticky session pins)."
         )
     scope = (

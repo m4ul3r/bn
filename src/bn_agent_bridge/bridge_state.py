@@ -86,27 +86,31 @@ def _progress_fragment(bv: Any) -> str:
     return f" ({count}/{total})" if total else ""
 
 
-def analysis_unavailable(bv: Any, what: str, directive: str) -> str | None:
+def analysis_unavailable(
+    bv: Any, what: str, directive: str, *, plural: bool = False
+) -> str | None:
     """Why an analysis-dependent read cannot answer on *bv* yet, or None.
 
     *directive* is the "Run `bn refresh` ..." sentence for a view nobody is
     analysing. While a `bn refresh` is running on it the message says so and
     tells the caller to retry instead -- never to start another (#996). Both
-    forms keep the literal "loaded with --quick" callers match on.
+    forms keep the literal "loaded with --quick" callers match on. *plural*
+    picks "are" for a plural *what* ("Strings are not available").
     """
     if bv not in _quick_loaded_views:
         return None
+    verb = "are" if plural else "is"
     started = _refreshing_views.get(bv)
     if started is not None:
         elapsed = max(0, int(time.monotonic() - started))
         return (
-            f"{what} is not available yet: this target was loaded with --quick and "
+            f"{what} {verb} not available yet: this target was loaded with --quick and "
             f"full analysis is in progress{_progress_fragment(bv)}, started "
             f"{elapsed}s ago by `bn refresh`. Retry when it finishes -- do not "
             "start another refresh."
         )
     return (
-        f"{what} is not available: this target was loaded with --quick "
+        f"{what} {verb} not available: this target was loaded with --quick "
         f"(no analysis). {directive}"
     )
 

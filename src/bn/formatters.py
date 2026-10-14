@@ -1773,13 +1773,12 @@ def _render_target_list_text(value: Any) -> str:
         items = value
     if not isinstance(items, list):
         return _render_fallback_text(value)
-    if not items:
-        return _empty_result("targets")
     body = "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
-    )
-    # #996: the answering instance, once, above the rows it owns.
+    ) if items else _empty_result("targets")
+    # #996: the answering instance, once, above the rows it owns -- an empty
+    # listing included, since "which bridge has nothing open" is the question.
     instance = _text_value(value, "instance") if isinstance(value, dict) else None
     return f"instance: {instance}\n{body}" if instance else body
 

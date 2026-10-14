@@ -892,26 +892,32 @@ class TargetManager:
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
         """The shortest path suffix that RESOLVES to each view, else its target_id.
 
-        Resolution is tiered (`_match_tier`), so a candidate counts when its best
-        non-empty tier is this view alone -- the same rule `_matching_records`
-        applies, which keeps every advertised selector resolvable, and keeps
-        the raw `hello` advertised as `hello` once its `hello.bndb` is open
+        A candidate counts when `_matching_records` would return this view
+        alone for it -- the same relation, including the saved-database pair
+        rule (`_drop_saved_databases`), so every advertised selector resolves and
+        the raw `hello` stays `hello` once the `hello.bndb` it saved is open
         (#996). The resolver's aliases and component suffixes are indexed once
-        per snapshot, per tier; candidate lookup must not re-split every other
-        view's path.
+        per snapshot; candidate lookup must not re-split every other view's path.
         """
-        exact: dict[str, dict[int, set[str]]] = {}
-        tails: dict[tuple[str, ...], dict[int, set[str]]] = {}
+        exact: dict[str, dict[str, str]] = {}
+        tails: dict[tuple[str, ...], dict[str, str]] = {}
         paths = {}
         identities = {}
+
+        def _index(table: dict, key, vid: str, kind: str) -> None:
+            kinds = table.setdefault(key, {})
+            if kinds.get(vid) != self._STRONG:
+                kinds[vid] = kind
+
         for vid, record in records.items():
             identities[record.target_id()] = vid
             parts = paths[vid] = _path_components(record.filename)
-            for alias, tier in self._alias_tiers(record):
-                exact.setdefault(alias, {}).setdefault(tier, set()).add(vid)
-            for variant, tier in self._tail_variants(parts):
+            for alias, kind in self._aliases(record):
+                _index(exact, alias, vid, kind)
+            for variant, kind in self._tail_variants(parts):
                 for depth in range(1, len(variant) + 1):
-                    tails.setdefault(variant[-depth:], {}).setdefault(tier, set()).add(vid)
+                    _index(tails, variant[-depth:], vid, kind)
+        saved_pairs = self._saved_pairs(records)
 
         selectors: dict[str, str] = {}
         for vid, record in records.items():
@@ -925,41 +931,42 @@ class TargetManager:
                 if normalized in identities:
                     matches = {identities[normalized]}
                 else:
-                    by_tier: dict[int, set[str]] = {}
+                    kinds: dict[str, str] = {}
                     for source in (exact.get(normalized, {}),
                                    tails.get(_path_components(normalized), {})):
-                        for tier, vids in source.items():
-                            by_tier.setdefault(tier, set()).update(vids)
-                    matches = by_tier[min(by_tier)] if by_tier else set()
+                        for other, kind in source.items():
+                            if kinds.get(other) != self._STRONG:
+                                kinds[other] = kind
+                    matches = set(self._drop_saved_databases(kinds, saved_pairs))
                 if matches == {vid}:
                     chosen = candidate
                     break
             selectors[vid] = chosen
         return selectors
 
-    # Match tiers, best first (#996). A selector resolves to the views in its
-    # best NON-EMPTY tier, so an exact name is never made ambiguous by a looser
-    # alias of another view: once `hello` is saved and `hello.bndb` opened,
-    # `hello` and `/abs/hello` still mean the raw view, `hello.bndb` the database.
-    _TIER_TARGET_ID = 0
-    _TIER_FILENAME = 1      # exact filename or view id
-    _TIER_BASENAME = 2      # exact basename
-    _TIER_BNDB_CORE = 3     # basename with `.bndb` (and a cache digest) stripped
-    _TIER_TAIL = 4          # path tail
-    _TIER_BNDB_TAIL = 5     # path tail with `.bndb` stripped
+    # How a human selector names a record. Every alias counts equally -- view
+    # id, filename, basename, path tail and the `.bndb`-stripped forms -- so a
+    # selector matching two views is refused as ambiguous, whichever view
+    # opened first. A ranking between aliases was tried and rejected: opening
+    # a view could then silently MOVE a selector that used to be refused onto
+    # the new view (`close 5` closing the view whose id became 5, #996 review).
+    # The kind is kept only for the one narrow exception `_drop_saved_databases`
+    # makes.
+    _STRONG = "strong"        # view id, filename, basename, path tail
+    _STRIPPED = "stripped"    # only through a `.bndb`-stripped alias
 
-    def _alias_tiers(self, record: TargetRecord) -> list[tuple[str, int]]:
-        """Every exact-string alias of *record* with its tier."""
+    def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
+        """Every exact-string alias of *record* with its kind."""
         aliases = [
-            (record.view_id, self._TIER_FILENAME),
-            (record.filename, self._TIER_FILENAME),
-            (record.basename, self._TIER_BASENAME),
+            (record.view_id, self._STRONG),
+            (record.filename, self._STRONG),
+            (record.basename, self._STRONG),
         ]
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
         # <binary>; `-t foo` resolves `foo.bndb` (#312).
         if record.basename.endswith(".bndb"):
             core = record.basename[: -len(".bndb")]
-            aliases.append((core, self._TIER_BNDB_CORE))
+            aliases.append((core, self._STRIPPED))
             # Read-only-mount targets restore the GLOBAL cache DB, named
             # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`; strip
             # a trailing `.<16 hex>` so the cache name resolves by stem.
@@ -967,19 +974,19 @@ class TargetManager:
             if dot and len(digest) == 16 and all(
                 c in "0123456789abcdef" for c in digest
             ):
-                aliases.append((stem, self._TIER_BNDB_CORE))
-        return [(alias, tier) for alias, tier in aliases if alias]
+                aliases.append((stem, self._STRIPPED))
+        return [(alias, kind) for alias, kind in aliases if alias]
 
-    def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], int]]:
+    def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], str]]:
         """The component sequences whose suffixes a path-tail selector matches."""
-        variants = [(parts, self._TIER_TAIL)] if parts else []
+        variants = [(parts, self._STRONG)] if parts else []
         if parts and parts[-1].endswith(".bndb"):
             variants.append(
-                (parts[:-1] + (parts[-1][: -len(".bndb")],), self._TIER_BNDB_TAIL))
+                (parts[:-1] + (parts[-1][: -len(".bndb")],), self._STRIPPED))
         return variants
 
-    def _match_tier(self, record: TargetRecord, selector: str | None) -> int | None:
-        """The best tier at which *selector* names *record*, or None."""
+    def _match_kind(self, record: TargetRecord, selector: str | None) -> str | None:
+        """How *selector* names *record* (strong over stripped), or None."""
         if selector is None:
             return None
         if isinstance(selector, PinnedTarget):
@@ -990,49 +997,94 @@ class TargetManager:
             # DIFFERENT view whose filename happened to spell the pinned id,
             # which is exactly the wrong-target write the pin prevents (#736
             # review rounds 2 and 3).
-            return self._TIER_TARGET_ID if str(selector) == record.target_id() else None
+            return self._STRONG if str(selector) == record.target_id() else None
         candidate = str(selector).strip()
         if candidate in ("", "active"):
             return None
         if candidate == record.target_id():
-            return self._TIER_TARGET_ID
-        best: int | None = None
-        for alias, tier in self._alias_tiers(record):
-            if candidate == alias and (best is None or tier < best):
-                best = tier
-        if best is not None:
-            return best
+            return self._STRONG
+        found: str | None = None
+        for alias, kind in self._aliases(record):
+            if candidate == alias:
+                if kind == self._STRONG:
+                    return kind
+                found = kind
         suffix = _path_components(candidate)
         if suffix:
-            for variant, tier in self._tail_variants(_path_components(record.filename)):
+            for variant, kind in self._tail_variants(_path_components(record.filename)):
                 if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
-                    return tier
-        return None
+                    if kind == self._STRONG:
+                        return kind
+                    found = kind
+        return found
 
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
-        return self._match_tier(record, selector) is not None
+        return self._match_kind(record, selector) is not None
+
+    def _saved_pairs(self, records: dict[str, TargetRecord]) -> dict[str, str]:
+        """database view id -> the raw view id THIS bridge saved it from.
+
+        From the save ledger (`_database_paths`, written by a successful
+        `bn save`), never from filename spelling: two unrelated `foo` and
+        `foo.bndb` views form no pair.
+        """
+        pairs: dict[str, str] = {}
+        for raw_vid, path in self._database_paths.items():
+            if raw_vid not in records:
+                continue
+            for vid, record in records.items():
+                if vid != raw_vid and _same_file(record.filename, path):
+                    pairs[vid] = raw_vid
+        return pairs
+
+    def _drop_saved_databases(
+        self, kinds: dict[str, str], saved_pairs: dict[str, str]
+    ) -> list[str]:
+        """The matched view ids, minus a database its own raw view outranks.
+
+        The one exception to "every alias counts equally" (#996): `bn save` on
+        the raw `hello` then `bn load hello.bndb` -- the round trip the skills
+        recommend -- must not break the `hello` selector `session start`
+        printed. A database view is dropped only when it matched solely through
+        a `.bndb`-stripped alias AND the raw view this bridge saved it from
+        matched strongly. Stable whichever order they opened in, so no
+        selector moves onto a newly opened view; anything else that matches
+        twice stays ambiguous.
+        """
+        return [
+            vid for vid, kind in kinds.items()
+            if not (
+                kind == self._STRIPPED
+                and saved_pairs.get(vid) is not None
+                and kinds.get(saved_pairs[vid]) == self._STRONG
+            )
+        ]
 
     def _matching_records(
         self, records: dict[str, TargetRecord], selector: str | None
     ) -> list[TargetRecord]:
         """The matching relation shared by listings and resolution.
 
-        The records in the selector's best non-empty tier (`_match_tier`): a
-        live full target_id outranks filename aliases, an exact filename
-        outranks a basename, a basename outranks a `.bndb`-stripped alias, and
-        those outrank path tails (#996). PinnedTarget retains its stricter
-        identity-only semantics, including when its view has disappeared.
+        A live full target_id outranks filename aliases, so the last-resort
+        selector remains usable even with a file named after another view's ID.
+        Every other alias counts equally (see `_STRONG`), less only a database
+        whose own saved-from raw view also matched (`_drop_saved_databases`).
+        PinnedTarget retains its stricter identity-only semantics, including
+        when its view has disappeared.
         """
-        best: int | None = None
-        matches: list[TargetRecord] = []
-        for record in records.values():
-            tier = self._match_tier(record, selector)
-            if tier is None or (best is not None and tier > best):
-                continue
-            if best is None or tier < best:
-                best, matches = tier, []
-            matches.append(record)
-        return matches
+        candidate = str(selector).strip() if selector is not None else None
+        if not isinstance(selector, PinnedTarget):
+            for record in records.values():
+                if candidate == record.target_id():
+                    return [record]
+        kinds = {
+            vid: kind for vid, record in records.items()
+            if (kind := self._match_kind(record, selector)) is not None
+        }
+        if len(kinds) > 1:
+            return [records[vid] for vid in
+                    self._drop_saved_databases(kinds, self._saved_pairs(records))]
+        return [records[vid] for vid in kinds]
 
     def matches_target(self, target_id: str, selector: str | None) -> bool:
         """Whether ``selector`` names the record with ``target_id``. Locked."""

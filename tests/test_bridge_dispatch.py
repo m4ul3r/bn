@@ -2838,9 +2838,7 @@ def test_target_id_fallback_outranks_id_like_filename_aliases(monkeypatch, suffi
     _register_views(bridge, alpha, database, named_like_id)
     try:
         rows = manager.refresh()
-        # #996: the raw view's exact basename outranks the database's
-        # `.bndb`-stripped alias, so it keeps its short selector.
-        assert rows[0]["selector"] == "demo"
+        assert rows[0]["selector"] == alpha_id  # raw path collides at every depth
         for row, view in zip(rows, [alpha, database, named_like_id], strict=True):
             assert manager.resolve(row["selector"]) is view
             assert manager.resolve(row["target_id"]) is view
@@ -2975,29 +2973,81 @@ def test_resolve_strips_bndb_in_path_suffix_selector(monkeypatch):
     bridge._headless_views.clear()
 
 
-def test_resolve_prefers_the_exact_name_over_a_bndb_stripped_alias_996(monkeypatch):
-    # #996: a raw `foo` and its saved `foo.bndb` both open. The selector the
-    # raw load advertised (`foo`, and its exact absolute path) must keep naming
-    # the raw view: an exact basename/filename outranks the `.bndb`-stripped
-    # alias of another view, and the listed selectors follow the same ranking.
+def test_resolve_bndb_strip_does_not_silently_pick_on_ambiguity(monkeypatch):
+    # The high-risk case for the .bndb strip: a raw `foo` AND a `foo.bndb` both
+    # open, with no save tying them -> `-t foo` matches both. resolve() must
+    # raise ambiguous, never silently pick one -- in either open order, and for
+    # an unrelated `/x/foo.bndb` + `/y/foo` alike (#996 review).
     bridge = _load_bridge(monkeypatch)
-    raw = _FakeFileBV("/x/foo", session_id="1")
-    db = _FakeFileBV("/x/foo.bndb", session_id="2")
-    _register_views(bridge, raw, db)
-    manager = bridge.TargetManager()
-    assert manager.resolve("foo") is raw
-    assert manager.resolve("/x/foo") is raw
-    assert manager.resolve("x/foo") is raw          # exact tail beats stripped tail
-    assert manager.resolve("foo.bndb") is db
-    assert manager.resolve("/x/foo.bndb") is db
-    selectors = {row["filename"]: row["selector"] for row in manager.refresh()}
-    assert selectors == {"/x/foo": "foo", "/x/foo.bndb": "foo.bndb"}
+    for first, second in (("/x/foo", "/x/foo.bndb"), ("/x/foo.bndb", "/x/foo"),
+                          ("/x/foo.bndb", "/y/foo")):
+        _register_views(bridge, _FakeFileBV(first, session_id="1"))
+        manager = bridge.TargetManager()
+        manager.refresh()
+        _register_views(bridge, _FakeFileBV(first, session_id="1"),
+                        _FakeFileBV(second, session_id="2"))
+        with pytest.raises(Exception) as exc:
+            manager.resolve("foo")
+        assert "mbiguous" in str(exc.value), (first, second)
     bridge._headless_views.clear()
 
 
-def test_resolve_stays_ambiguous_within_one_tier(monkeypatch):
-    # The ranking only breaks ties ACROSS tiers: two views sharing a basename
-    # are still refused, never silently picked.
+def test_opening_a_view_never_moves_an_advertised_selector_onto_it_996(monkeypatch):
+    # #996 review (blocker): `target list` advertised `2` for the file `/public/2`;
+    # a second view then opened and got view id 2. The ranked resolver let the
+    # view id outrank the basename, so `-t 2` -- and `bn close 2` -- silently
+    # moved to the NEW view. It must stay the old view or be refused.
+    bridge = _load_bridge(monkeypatch)
+    named_two = _FakeFileBV("/public/2", session_id="1")
+    _register_views(bridge, named_two)
+    manager = bridge.TargetManager()
+    [row] = manager.refresh()
+    assert row["selector"] == "2"
+    fetch = _FakeFileBV("/public/fetch", session_id="2")
+    _register_views(bridge, named_two, fetch)
+    rows = {r["filename"]: r for r in manager.refresh()}
+    assert rows["/public/fetch"]["view_id"] == "2"
+    try:
+        resolved = manager.resolve("2")
+    except RuntimeError as exc:
+        assert "mbiguous" in str(exc)
+    else:
+        assert resolved is named_two, (
+            "previously advertised selector silently resolves to a different view")
+    for r in rows.values():                 # every listed selector still resolves
+        assert manager.resolve(r["selector"]) is (
+            named_two if r["filename"] == "/public/2" else fetch)
+    bridge._headless_views.clear()
+
+
+def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch):
+    # #996: the one exception to "every alias counts equally". `bn save` of the
+    # raw `foo` then `bn load foo.bndb`: the raw view's own name and path still
+    # mean the raw view, the database answers to `foo.bndb`, and the listing
+    # advertises exactly those -- only because THIS bridge recorded the save.
+    bridge = _load_bridge(monkeypatch)
+    raw = _FakeFileBV("/x/foo", session_id="1")
+    _register_views(bridge, raw)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    manager.note_database(raw, "/x/foo.bndb")
+    db = _FakeFileBV("/x/foo.bndb", session_id="2")
+    _register_views(bridge, raw, db)
+    selectors = {row["filename"]: row["selector"] for row in manager.refresh()}
+    assert selectors == {"/x/foo": "foo", "/x/foo.bndb": "foo.bndb"}
+    assert manager.resolve("foo") is raw
+    assert manager.resolve("/x/foo") is raw
+    assert manager.resolve("x/foo") is raw
+    assert manager.resolve("foo.bndb") is db
+    assert manager.resolve("/x/foo.bndb") is db
+    # A third, unrelated `foo` is a real ambiguity again.
+    _register_views(bridge, raw, db, _FakeFileBV("/y/foo", session_id="3"))
+    with pytest.raises(Exception, match="mbiguous"):
+        manager.resolve("foo")
+    bridge._headless_views.clear()
+
+
+def test_resolve_stays_ambiguous_for_two_views_sharing_a_basename(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     left = _FakeFileBV("/a/foo", session_id="1")
     right = _FakeFileBV("/b/foo", session_id="2")
