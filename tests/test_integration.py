@@ -3883,3 +3883,40 @@ class TestStringsReadImportsBurndownG:
         out = shared_bn.run("read", row["address"], "12", "--encoding", "escaped")
         assert out.returncode == 0, out.stderr
         assert out.stdout.splitlines()[0].endswith('"starting up\\0"'), out.stdout
+
+    def test_hostile_dt_syment_does_not_kill_the_bridge_987(self, shared_bn, tmp_path):
+        """#987 review blocker on real BN: DT_SYMENT is ignored by the loader,
+        so a copy with DT_SYMENT = 1 << 56 still runs -- and that value, used
+        as a read size, made `BinaryView.read` segfault the bridge on
+        `bn imports` and `bn target info`."""
+        import struct
+
+        data = bytearray(HELLO_BINARY.read_bytes())
+        phoff, = struct.unpack_from("<Q", data, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+        patched = False
+        for index in range(phnum):
+            p_type, _flags, p_offset, _vaddr, _paddr, p_filesz = struct.unpack_from(
+                "<IIQQQQ", data, phoff + index * phentsize)
+            if p_type != 2:  # PT_DYNAMIC
+                continue
+            for at in range(p_offset, p_offset + p_filesz, 16):
+                tag, _value = struct.unpack_from("<qQ", data, at)
+                if tag == 11:  # DT_SYMENT
+                    struct.pack_into("<qQ", data, at, 11, 1 << 56)
+                    patched = True
+                    break
+        assert patched, "the fixture has no DT_SYMENT to corrupt"
+        hostile = tmp_path / "hello_hostile_syment"
+        hostile.write_bytes(bytes(data))
+        hostile.chmod(0o755)
+        shared_bn.load(hostile, copy=False)
+
+        info = shared_bn.json("target", "info")
+        assert "libc.so.6" in info["needed_libraries"], info
+        assert any("DT_SYMENT" in note for note in info["dynamic_section_notes"]), info
+        summary = shared_bn.json("imports", "--summary")
+        assert summary["total_symbols"] > 0, summary
+        assert any("DT_SYMENT" in note for note in summary["dynamic_section_notes"]), summary
+        # The bridge is still alive for the next command.
+        assert shared_bn.run("imports", "--count").returncode == 0

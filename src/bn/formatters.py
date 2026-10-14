@@ -1588,6 +1588,14 @@ def _yes_no(flag: Any) -> str:
     return "yes" if flag is True else "no" if flag is False else ""
 
 
+def _dynamic_section_notes(value: Any) -> list[str]:
+    """The `dynamic_section_notes` a target info / imports payload carries: why
+    part of the ELF dynamic section was out of range and skipped (#987 review),
+    escaped for one text line each."""
+    return [_escape_control_chars(str(note))
+            for note in _field_list(value, "dynamic_section_notes")]
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
@@ -1687,7 +1695,7 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         )
     # #969: the dependency list, on `target info` (target list rows carry no
     # such key and render nothing). Declared-but-empty is a real answer -- a
-    # static or non-ELF target has no DT_NEEDED -- so it prints as "none".
+    # static or non-ELF target has no DT_NEEDED -- so it prints as a zero.
     if _field_declared(value, "needed_libraries"):
         needed = [_escape_control_chars(str(lib)) for lib in _field_list(value, "needed_libraries")]
         listed = ", ".join(needed) if needed else "0 (no DT_NEEDED entries)"
@@ -1696,6 +1704,8 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         text = _text_value(value, key)
         if text:
             lines.append(f"\t{key}: {_escape_control_chars(text)}")
+    for note in _dynamic_section_notes(value):
+        lines.append(f"\t! dynamic section: {note}")
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
     segments = _field_list(value, "segments")
@@ -2055,6 +2065,9 @@ def _render_name_address_list_text(value: Any) -> str:
                            for lib in _field_list(value, "needed_libraries"))
         note = (f"// {unattributed} import(s) carry no library (no symbol version names one); "
                 f"this target needs: {needed or '?'} (also in `bn target info`)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    for dynamic_note in _dynamic_section_notes(value):
+        note = f"// dynamic section: {dynamic_note}"
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
 
@@ -4821,6 +4834,10 @@ def _render_imports_summary_text(value: Any) -> str:
         lines.append("by library (symbol version requirements):")
         for lib, count in sorted(by_library.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(lib)}")
+    notes = _dynamic_section_notes(value)
+    if notes:
+        lines.append("")
+        lines.extend(f"! dynamic section: {note}" for note in notes)
     # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
     # rather than printing dangling "by namespace:"/"by kind:" headers.
     namespaces = _field_dict(value, "namespaces")
@@ -4890,9 +4907,14 @@ def _string_xref_suffix(item: dict[str, Any]) -> str:
     text = ", ".join(names) if names else "0 functions"
     if total > len(names):
         text += f" (+{total - len(names)} more)"
-    data_refs = _nonnegative_count(item, "data_ref_count")
-    if data_refs:
-        text += f"; {data_refs} data ref(s)"
+    # An unmeasured count arrives as null with a note: say so, never a zero.
+    unmeasured = _text_value(item, "data_ref_note")
+    if unmeasured:
+        text += f"; data refs unknown ({_escape_control_chars(unmeasured)})"
+    else:
+        data_refs = _nonnegative_count(item, "data_ref_count")
+        if data_refs:
+            text += f"; {data_refs} data ref(s)"
     return f"  [xrefs: {text}]"
 
 
@@ -5193,18 +5215,34 @@ def _render_read_text(value: Any) -> str:
 
 
 # #971: the C escapes `read --encoding escaped` writes. Every escape stands for
-# exactly one byte, so `\0` is always one NUL (no octal run-on) and `\xHH` is
-# always two digits.
-_C_ESCAPES = {0x00: "\\0", 0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+# exactly one byte AND reads back as that byte in C: a C octal escape takes up
+# to three digits and `\x` takes every hex digit that follows, so `\0` before
+# an octal digit is written `\000`, and `\xHH` before a hex digit is written
+# as three-digit octal -- `b"a\x00" b"123"` is `a\000123`, never the `a\0123`
+# that reads back as `a`, `\012`, `3` (#987 review).
+_C_ESCAPES = {0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
               0x0B: "\\v", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+_OCTAL_DIGITS = frozenset(b"01234567")
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
 
 def _c_escape_bytes(data: bytes) -> str:
-    """*data* as the body of a C string literal, one escape per non-printable byte."""
-    return "".join(
-        _C_ESCAPES.get(b) or (chr(b) if 0x20 <= b < 0x7F else f"\\x{b:02x}")
-        for b in data
-    )
+    """*data* as the body of one C string literal: printable ASCII verbatim,
+    every other byte as exactly one unambiguous escape."""
+    out: list[str] = []
+    for index, byte in enumerate(data):
+        following = data[index + 1] if index + 1 < len(data) else None
+        if byte in _C_ESCAPES:
+            out.append(_C_ESCAPES[byte])
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        elif byte == 0:
+            out.append("\\000" if following in _OCTAL_DIGITS else "\\0")
+        elif following in _HEX_DIGITS:
+            out.append(f"\\{byte:03o}")
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "".join(out)
 
 
 # Source bytes per `read --encoding escaped` text line: short enough that a

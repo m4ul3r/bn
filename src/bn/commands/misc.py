@@ -583,8 +583,9 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
              arg("--encoding", choices=("hex", "escaped", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default); escaped, the bytes "
-                      "as a quoted C-escaped string (\\0, \\n, \\xHH; one escape per "
-                      "byte), so the NULs between short strings stay visible; or raw "
+                      "as a quoted C-escaped string (\\0, \\n, \\xHH; one unambiguous "
+                      "escape per byte, octal before a digit), so the NULs between short "
+                      "strings stay visible; or raw "
                       "bytes, for redirection or --out (NULs are invisible on a terminal)"),
          ],
          estimable=True)

@@ -548,20 +548,21 @@ def _string_xref_functions(bv, address: int) -> dict[str, Any]:
         if fn is None:
             continue
         functions.setdefault(int(fn.start), str(fn.name))
+    entry: dict[str, Any] = {"code_ref_count": len(code_refs)}
     try:
-        data_ref_count = len(read_xrefs._data_refs_once(bv, address))
-    except Exception:
-        data_ref_count = 0
+        entry["data_ref_count"] = len(read_xrefs._data_refs_once(bv, address))
+    except Exception as exc:  # noqa: BLE001 - one unreadable row must not fail the page
+        # Unmeasured, not zero: a 0 here would read as "no pointer table holds
+        # this string", which nothing established (#619/#715).
+        entry["data_ref_count"] = None
+        entry["data_ref_note"] = f"data refs could not be read: {type(exc).__name__}: {exc}"
     ordered = sorted(functions.items())
-    return {
-        "code_ref_count": len(code_refs),
-        "data_ref_count": data_ref_count,
-        "xref_function_count": len(ordered),
-        "xref_functions": [
-            {"address": hex(start), "name": name}
-            for start, name in ordered[:_STRING_XREF_FUNCTION_CAP]
-        ],
-    }
+    entry["xref_function_count"] = len(ordered)
+    entry["xref_functions"] = [
+        {"address": hex(start), "name": name}
+        for start, name in ordered[:_STRING_XREF_FUNCTION_CAP]
+    ]
+    return entry
 
 
 def _needed_libraries(bv, elf_info: ElfDynamicInfo | None = None) -> list[str]:
@@ -579,29 +580,43 @@ def _needed_libraries(bv, elf_info: ElfDynamicInfo | None = None) -> list[str]:
 def _elf_dynamic_info(bv) -> ElfDynamicInfo | None:
     """The ELF dynamic-section facts BN does not expose (#969), read from the
     ORIGINAL file bytes (the view's raw parent), or None for a non-ELF / static
-    view or one with no raw parent."""
+    view or one with no raw parent.
+
+    The raw view's length bounds every read the parser issues: BN's
+    ``BinaryView.read`` segfaults on a hostile size, so a view whose length is
+    unknown is not parsed at all. A parser failure is a bug, not "not an ELF":
+    it is logged and surfaced as a note instead of reading as an absent
+    dynamic section."""
     raw = getattr(bv, "parent_view", None)
     read = getattr(raw, "read", None)
     if not callable(read):
         return None
     try:
         base = int(getattr(raw, "start", 0) or 0)
-        return parse_elf_dynamic(lambda offset, size: read(base + offset, size))
-    except Exception:
-        return None
+        length = getattr(raw, "length", None)
+        if length is None:
+            return None
+        return parse_elf_dynamic(lambda offset, size: read(base + offset, size), int(length))
+    except Exception as exc:  # noqa: BLE001 - surfaced below, never swallowed
+        message = f"the ELF dynamic section could not be parsed: {type(exc).__name__}: {exc}"
+        if bn is not None and callable(getattr(bn, "log_warn", None)):
+            bn.log_warn(f"BN Agent Bridge: {message}")
+        return ElfDynamicInfo(notes=[message])
 
 
 def _dynamic_link_info(bv) -> dict[str, Any]:
     """`target info`'s dynamic-linking block (#969): DT_NEEDED, DT_SONAME,
-    DT_RPATH and DT_RUNPATH. Every key is always present (an empty list / null
-    when the target has none), so a reader never has to tell "absent" from
-    "not reported"."""
+    DT_RPATH and DT_RUNPATH, plus `dynamic_section_notes` naming any part of
+    the dynamic section that was out of range and skipped. Every key is always
+    present (an empty list / null when the target has none), so a reader never
+    has to tell "absent" from "not reported"."""
     elf_info = _elf_dynamic_info(bv)
     return {
         "needed_libraries": _needed_libraries(bv, elf_info),
         "soname": elf_info.soname if elf_info else None,
         "rpath": elf_info.rpath if elf_info else None,
         "runpath": elf_info.runpath if elf_info else None,
+        "dynamic_section_notes": list(elf_info.notes) if elf_info else [],
     }
 
 
@@ -886,6 +901,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
         result = _imports_build_summary(items, needed_libraries)
+        if elf_info is not None and elf_info.notes:
+            result["dynamic_section_notes"] = list(elf_info.notes)
         if self_defined_excluded:
             result["self_defined_excluded"] = self_defined_excluded
         if got_collapsed:
@@ -921,6 +938,10 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
+    # Why attribution may be partial: a dynamic-section structure that was out
+    # of range for the file and skipped rather than read (#987 review).
+    if elf_info is not None and elf_info.notes:
+        result["dynamic_section_notes"] = list(elf_info.notes)
     return result
 
 

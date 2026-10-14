@@ -9409,3 +9409,79 @@ def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
     # Nothing attributed: the section would only restate the total.
     assert "by library" not in _render_imports_summary_text(
         {"total_symbols": 3, "by_library": {"(unattributed)": 3}})
+
+
+def _c_unescape(text: str) -> bytes:
+    """A C string-literal body back to bytes, with C's own greedy rules: an
+    octal escape takes up to three digits, `\\x` takes every hex digit."""
+    named = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch != "\\":
+            out.append(ord(ch))
+            i += 1
+            continue
+        nxt = text[i + 1]
+        if nxt in named:
+            out.append(named[nxt])
+            i += 2
+        elif nxt == "x":
+            j = i + 2
+            while j < len(text) and text[j] in "0123456789abcdefABCDEF":
+                j += 1
+            out.append(int(text[i + 2:j], 16) & 0xFF if j - (i + 2) <= 2 else 0x100)
+            i = j
+        else:
+            j = i + 1
+            while j < len(text) and j < i + 4 and text[j] in "01234567":
+                j += 1
+            out.append(int(text[i + 1:j], 8))
+            i = j
+    return bytes(out)
+
+
+@pytest.mark.parametrize("data", [
+    b"a\x00123",                 # NUL before octal digits: the review's case
+    b"a\x0089",                  # NUL before non-octal digits
+    b"\x7f1\xffbeef\x01Z",       # \xHH before a hex digit / letter
+    b"\x00\x00\x007",
+    bytes(range(256)),
+])
+def test_escaped_read_text_reads_back_as_the_same_bytes_987(data):
+    """#987 review: `\\0` before a digit and `\\xHH` before a hex digit read
+    back as different bytes in C. Every escaped run must round-trip."""
+    from bn.formatters import _c_escape_bytes
+
+    escaped = _c_escape_bytes(data)
+    assert _c_unescape(escaped) == data, escaped
+    assert _c_escape_bytes(b"a\x00123") == "a\\000123"
+    assert _c_escape_bytes(b"a\x00Z") == "a\\0Z"
+
+
+def test_unreadable_data_refs_render_as_unknown_not_zero_987():
+    from bn.formatters import _render_strings_rows
+
+    out = _render_strings_rows([{
+        "address": "0x2000", "length": 5, "chars": 5, "type": "ascii", "value": "hello",
+        "code_ref_count": 1, "data_ref_count": None,
+        "data_ref_note": "data refs could not be read: RuntimeError: boom",
+        "xref_function_count": 1, "xref_functions": [{"address": "0x1000", "name": "main"}],
+    }])
+    assert out.endswith("[xrefs: main; data refs unknown (data refs could not be read: "
+                        "RuntimeError: boom)]"), out
+
+
+def test_dynamic_section_notes_reach_every_text_face_987():
+    from bn.formatters import (_render_imports_summary_text, _render_name_address_list_text,
+                               _render_target_info_text)
+
+    note = "DT_SYMENT 72057594037927936 is not the ABI symbol size 24; per-import library attribution was skipped"
+    assert f"\t! dynamic section: {note}" in _render_target_info_text(
+        {"selector": "w", "needed_libraries": ["libc.so.6"], "dynamic_section_notes": [note]})
+    assert f"// dynamic section: {note}" in _render_name_address_list_text(
+        {"kind": "imports", "total": 0, "offset": 0, "limit": 10, "returned": 0,
+         "has_more": False, "items": [], "dynamic_section_notes": [note]})
+    assert f"! dynamic section: {note}" in _render_imports_summary_text(
+        {"total_symbols": 0, "dynamic_section_notes": [note]})

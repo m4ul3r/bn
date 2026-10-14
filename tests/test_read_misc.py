@@ -242,6 +242,29 @@ def test_strings_with_xrefs_names_referencing_functions_968(monkeypatch):
     assert "xref_functions" not in plain
 
 
+def test_strings_with_xrefs_reports_unreadable_data_refs_as_unknown_987(monkeypatch):
+    # #987 review: an unreadable data-ref list is unmeasured, not a zero.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "main")
+    bv = _FakeBV(strings=[_FakeStringRef(0x2000, 5, "hello")],
+                 code_refs={0x2000: [_FakeCodeRef(0x1004, fn)]})
+
+    def broken(address):
+        raise RuntimeError("data refs unavailable")
+
+    bv.get_data_refs = broken
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    row = instance._strings(None, query=None, offset=0, limit=10, with_xrefs=True)["items"][0]
+
+    assert row["data_ref_count"] is None
+    assert row["data_ref_note"] == "data refs could not be read: RuntimeError: data refs unavailable"
+    # The code-ref half was measured and is still reported.
+    assert row["xref_functions"] == [{"address": "0x1000", "name": "main"}]
+
+
+
 def test_strings_probable_format_rejects_blob_noise_keeps_real_format(monkeypatch):
     # The whole point (#554): a raw `%s|%d` regex matches accidental
     # percent-substrings in resource/font/blob data. The directive-grammar mode
@@ -953,7 +976,7 @@ def _versioned_import_bv(fake_bn, *, image):
     bv = _FakeBV(symbols=syms)
     bv.libraries = ["libc.so.6", "libstdc++.so.6"]
     bv.parent_view = types.SimpleNamespace(
-        start=0, read=lambda offset, size: image[offset:offset + size])
+        start=0, length=len(image), read=lambda offset, size: image[offset:offset + size])
     return bv
 
 
