@@ -19,6 +19,7 @@ import json
 import math
 import os
 import secrets
+import signal
 import socket
 import struct
 import subprocess
@@ -1726,6 +1727,68 @@ def spawn_instance(
         )
 
 
+class _SpawnWaitSignalled(SystemExit):
+    """SIGTERM/SIGHUP that arrived while a spawned child was awaiting registration.
+
+    A SystemExit, so no `except Exception` on the way out swallows it, carrying
+    the shell's 128+N status should re-delivering the signal not end the process.
+    """
+
+    def __init__(self, signum: int):
+        super().__init__(128 + signum)
+        self.signum = signum
+
+
+class _SignalUnwind:
+    """Turn SIGTERM/SIGHUP into an exception for the registration wait (#916).
+
+    Python's default action for both signals ends the process without running a
+    single `finally`, so a harness timeout or a closed terminal arriving while
+    the CLI waited for its child to register skipped the reap and left that
+    child running in its own session. For the length of the wait the signal
+    raises instead, the owner reaps the child, and `restore()` puts the default
+    disposition back and re-delivers the signal so the CLI still dies of it.
+
+    Only signals still at SIG_DFL are taken over -- a host that installed its
+    own handler (or a `nohup` SIG_IGN) keeps it -- and only on the main thread,
+    the one place Python lets a handler be installed. Once the reap begins
+    (`defer()`) a signal is only recorded, never raised, so it cannot cut the
+    reap short; the first one caught is the one re-delivered.
+    """
+
+    _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self) -> None:
+        self._previous: dict[int, Any] = {}
+        self._caught: int | None = None
+        self._deferred = False
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for signum in self._SIGNALS:
+            try:
+                if signal.getsignal(signum) is signal.SIG_DFL:
+                    self._previous[signum] = signal.signal(signum, self._handle)
+            except (ValueError, OSError):
+                continue
+
+    def _handle(self, signum: int, frame: Any) -> None:
+        if self._caught is not None:
+            return
+        self._caught = signum
+        if not self._deferred:
+            raise _SpawnWaitSignalled(signum)
+
+    def defer(self) -> None:
+        self._deferred = True
+
+    def restore(self) -> None:
+        for signum, previous in self._previous.items():
+            signal.signal(signum, previous)
+        self._previous.clear()
+        if self._caught is not None:
+            os.kill(os.getpid(), self._caught)
+
+
 def _spawn_instance_unlocked(
     instance_id: str | None = None,
     *,
@@ -1819,12 +1882,16 @@ def _spawn_instance_unlocked(
     # child registered. Every other exit -- a refused registry, an early exit,
     # the registration timeout, but ALSO an exception escaping the poll loop
     # (the deadline expiring inside `_remaining_deadline`, a failing registry
-    # read, a KeyboardInterrupt) -- must reap it. The child runs in its own
-    # session, so nothing else will: an exception that bypassed the reap left a
-    # live bridge that never registered and that no `instance list/find/gc` or
-    # `session stop` could see (#916). The child we hold is the thing reaped,
-    # never a pid read from a registry, and no discovery file is unlinked here.
+    # read, a KeyboardInterrupt, or SIGTERM/SIGHUP turned into one by
+    # `_SignalUnwind`) -- must reap it. The child runs in its own session, so
+    # nothing else will: an exit that bypassed the reap left a live bridge that
+    # never registered and that no `instance list/find/gc` or `session stop`
+    # could see (#916). The child we hold is the thing reaped, never a pid read
+    # from a registry, and no discovery file is unlinked here. What still
+    # escapes: SIGKILL, which runs no code at all, and a SIGTERM/SIGHUP landing
+    # in the instants between Popen returning and the handlers going in.
     owned = True
+    unwind = _SignalUnwind()
     try:
         while time.monotonic() < deadline:
             if reg_path.exists():
@@ -1877,10 +1944,16 @@ def _spawn_instance_unlocked(
         _append_spawn_diagnostic(log_path, message)
         raise BridgeError(f"{message}{leftover_note}")
     finally:
+        # No signal may cut the reap short: from here one is only recorded.
+        unwind.defer()
         # An exited child was already collected by poll(); only a live one needs
         # the terminate/kill escalation. The original failure keeps propagating.
-        if owned and proc.poll() is None:
-            _reap_child(proc)
+        try:
+            if owned and proc.poll() is None:
+                _reap_child(proc)
+        finally:
+            # Re-delivers a caught SIGTERM/SIGHUP, now that the child is reaped.
+            unwind.restore()
 
 
 def wait_for_teardown(

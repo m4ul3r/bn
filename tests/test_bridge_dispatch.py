@@ -226,7 +226,7 @@ def test_write_queued_behind_refresh_is_reported_by_write_gate_status(monkeypatc
 
     writer = threading.Thread(
         target=instance.dispatch,
-        args=({"op": "py_exec", "params": {"code": "1"}, "target": "active", "id": "write-1"},),
+        args=({"op": "py_exec", "params": {"script": "1"}, "target": "active", "id": "write-1"},),
         daemon=True,
     )
     try:
@@ -252,7 +252,7 @@ def test_write_queued_behind_refresh_is_reported_by_write_gate_status(monkeypatc
 
 
 @pytest.mark.parametrize("payload", [
-    {"op": "py_exec", "params": {"code": "1"}},                       # lock="write"
+    {"op": "py_exec", "params": {"script": "1"}},                     # lock="write"
     {"op": "set_comment", "params": {"comment": "x", "address": "0x1000"}},  # self-locking
 ])
 def test_no_wait_write_refuses_busy_instead_of_queueing_behind_refresh(monkeypatch, payload):

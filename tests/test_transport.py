@@ -2120,6 +2120,66 @@ def test_spawn_instance_reaps_child_when_registration_wait_raises(monkeypatch, t
                 proc.wait(timeout=5)
 
 
+_SPAWN_WAIT_DRIVER = """
+import sys, time
+import bn.transport as transport
+
+pidfile = sys.argv[1]
+transport.list_instances = lambda **kwargs: []
+transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
+real_popen = transport.subprocess.Popen
+
+def recording_popen(*args, **kwargs):
+    proc = real_popen(*args, **kwargs)
+    with open(pidfile, "w") as stream:
+        stream.write(str(proc.pid))
+    return proc
+
+transport.subprocess.Popen = recording_popen
+transport.spawn_instance("sample-1", timeout=60, poll_interval=0.05)
+"""
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_signal_during_registration_wait_reaps_child_and_still_kills_cli(tmp_path, signum):
+    # #916 review: Python's default SIGTERM/SIGHUP action runs no `finally`, so
+    # a harness timeout or a closed terminal during the registration wait left
+    # the never-registering child alive in its own session. The CLI must reap
+    # it and then still die OF that signal, as it would have without the fix.
+    pidfile = tmp_path / "child.pid"
+    env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
+    cli = subprocess.Popen(
+        [sys.executable, "-c", _SPAWN_WAIT_DRIVER, str(pidfile)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 30
+        while not (pidfile.exists() and pidfile.read_text()):
+            assert cli.poll() is None, cli.stdout.read().decode(errors="replace")
+            assert time.monotonic() < deadline, "the driver never spawned its child"
+            time.sleep(0.02)
+        child_pid = int(pidfile.read_text())
+        time.sleep(0.3)  # well inside the registration wait
+
+        cli.send_signal(signum)
+        cli.wait(timeout=15)
+
+        assert cli.returncode == -signum, cli.stdout.read().decode(errors="replace")
+        # The CLI waited on its own child before re-raising the signal, so the
+        # pid is gone rather than a zombie or a reparented orphan.
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        child_pid = None
+    finally:
+        if cli.poll() is None:
+            cli.kill()
+            cli.wait(timeout=5)
+        if child_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+
+
 def test_named_spawn_refuses_live_owner_missed_by_initial_discovery(monkeypatch, tmp_path):
     # #916: `bn -i sample-1 load` first looks with NORMAL discovery, which hides
     # a live bridge whose socket is not reachable yet. The spawn path must look
