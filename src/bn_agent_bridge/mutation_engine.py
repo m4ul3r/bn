@@ -1715,6 +1715,18 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     # op path, so "today's only caller cannot produce it" is a weaker guarantee
     # than it looks. Unreachable-by-construction is a reason to keep a boundary
     # check cheap, not a reason to delete it.
+    # #989 review: a declaration of only forward declarations of types a type
+    # library defines (`struct timespec;`) changes nothing and has no view type
+    # to read back. What CAN be observed is that no user stub now shadows them;
+    # that is the whole claim, so it is checked rather than assumed.
+    if not defined_types and item.get("reference_only"):
+        referenced = [str(name) for name in item.get("referenced_existing_types") or []]
+        shadowed = [name for name in referenced if bv.get_type_by_name(name) is not None]
+        item["observed"] = {"defined_types": {}, "referenced_existing_types": referenced,
+                            "shadowing_view_types": shadowed}
+        if referenced and not shadowed:
+            item["status"] = "noop"
+            return item
     if not defined_types:
         item["observed"] = {
             "defined_types": {},
@@ -4208,19 +4220,29 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
     ABI: bases in order, each aligned to its own alignment; the next base or
     member starts after a base's full size when that base is a plain C struct,
     but may reuse its tail padding -- start at the end of its last member --
-    when the base derives from something, i.e. is not POD). The parser knows a
-    base is non-POD only when THIS declaration gives it a base clause: a base
-    taken from the view is laid out at its full size even when it records bases
-    of its own, which is not where the C++ ABI would put what follows it (#989
-    review). So the layout is computed twice -- as the parser did, and as the
-    ABI does -- and the bases are attached only when:
+    when the base is not POD). Within ONE declaration the parser sees every
+    base's source and lays the struct out as the C++ ABI does for the shapes a
+    C declaration can express (a base with a base clause is non-POD); anything
+    it lays out differently (an empty base, a `class` with private members, a
+    member of non-POD type) fails the layout check below and is refused.
 
-    * both computations place every base at the same offset (otherwise the
-      parsed struct matches neither the ABI nor any honest base list), and
-    * the struct's own layout continues exactly where the parser's bases end:
-      its first own member sits at the next offset aligned for that member (or,
-      with no own members, its size is the bases' end rounded to its alignment).
-      A base placed too EARLY fails this as surely as one placed too late.
+    A base declared in an EARLIER declaration is different: BN's stored type
+    keeps no record of what makes a class POD (access, constructors, member
+    types), so where the C++ ABI puts whatever follows it cannot be shown --
+    and BN's parser lays it out as a plain C struct regardless (#989 reviews:
+    `PC : MB, PX`, `FD2 : F1, F2`, `KE : KP, KX`, `OE : OM, OX`, `QC : MB` all
+    recorded offsets or members g++ does not use). Such a base is accepted only
+    when no answer to that question can change the layout: it is the ONLY base
+    (no primary-base or empty-base choice among several), it is not empty (no
+    empty-base optimisation), and it has no tail padding (its data ends at its
+    size, so nothing after it can move into it). Everything else is refused,
+    deliberately more than strictly necessary.
+
+    The bases are attached only when the struct's own layout then continues
+    exactly where the bases end: its first own member sits at the next offset
+    aligned for that member (or, with no own members, its size is the bases'
+    end rounded to its alignment). A base placed too EARLY fails this as surely
+    as one placed too late.
 
     A virtual base, an unknown base, or anything failing those checks is NOT
     guessed at: the type is declared exactly as parsed and the reason is
@@ -4243,7 +4265,6 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
             continue
         bases: list[tuple[Any, int, int, str]] = []
         cursor = 0          # where the parser continues after the bases so far
-        abi_cursor = 0      # where the C++ ABI would
         reason = None
         for spec in specs:
             words = spec.split()
@@ -4257,24 +4278,22 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
                 reason = f"base {base_name!r} is not a known struct"
                 break
             width = int(getattr(base_type, "width", 0) or 0)
+            dsize = _data_size(base_type)
+            if base_name not in parsed:
+                reason = _view_base_refusal(base_name, base_type, width, dsize, len(specs))
+                if reason is not None:
+                    break
             align = max(int(getattr(base_type, "alignment", 1) or 1), 1)
             offset = _align_up(cursor, align)
-            abi_offset = _align_up(abi_cursor, align)
-            if offset != abi_offset:
-                reason = (f"BN's parser placed base {base_name!r} at {hex(offset)}, but the C++ "
-                          f"ABI places it at {hex(abi_offset)}: an earlier base declared outside "
-                          f"this declaration derives from another class, and the parser laid it "
-                          f"out as a plain C struct, so the parsed layout is not the class's")
-                break
             # Reference the base by the name it is REGISTERED under (a recovered
             # C++ type is keyed by its component list, not the `::` string); a
             # base declared in this same declaration is not registered yet and
             # is referenced by the name it is about to be defined under.
             registered = getattr(getattr(base_type, "registered_name", None), "name", None)
             bases.append((registered or base_name, offset, width, kind))
-            dsize = _data_size(base_type)
+            # Within one declaration the parser reuses a base's tail padding
+            # exactly when the declaration gives that base a base clause.
             cursor = offset + (dsize if clauses.get(base_name) else width)
-            abi_cursor = offset + (dsize if _is_non_pod_base(base_name, base_type, clauses) else width)
         if reason is None:
             reason = _parsed_layout_mismatch(type_obj, cursor)
         if reason is not None:
@@ -4322,12 +4341,24 @@ def _parsed_layout_mismatch(type_obj, bases_end: int) -> str | None:
     return None
 
 
-def _is_non_pod_base(base_name: str, base_type, clauses: dict[str, list[str]]) -> bool:
-    """Whether the C++ ABI treats a base as non-POD for layout, so a derived
-    class may reuse its tail padding. Declared structs carry no virtuals, so
-    having a base of its own (in this declaration, or recorded on an existing
-    type) is what makes one non-POD here."""
-    return bool(clauses.get(base_name)) or bool(list(getattr(base_type, "base_structures", None) or []))
+def _view_base_refusal(base_name: str, base_type, width: int, dsize: int, base_count: int) -> str | None:
+    """Why a base declared in an earlier declaration cannot be recorded with a
+    provably C++-correct layout, or None when it can (see
+    ``_attach_declared_bases``)."""
+    why = None
+    if base_count > 1:
+        why = "it is one of several bases"
+    elif not list(getattr(base_type, "members", None) or []) and not list(
+            getattr(base_type, "base_structures", None) or []):
+        why = "it is empty, and the C++ ABI may overlap an empty base with what follows"
+    elif dsize != width:
+        why = (f"it has tail padding (data ends at {hex(dsize)}, size {hex(width)}) that the C++ "
+               f"ABI reuses when the base is not POD")
+    if why is None:
+        return None
+    return (f"base {base_name!r} was declared in an earlier declaration and {why}; BN does not "
+            f"record whether it is POD, so the C++ layout of this struct cannot be confirmed. "
+            f"Declare the base in the same `types declare` to have the bases recorded")
 
 
 def _data_size(type_obj) -> int:
@@ -4569,17 +4600,11 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # (as the clobbering stub) and exit 0; a header of forward declarations
         # must stay a success. It is now the no-op it always should have been:
         # report each view type as declared-and-unchanged so verification
-        # observes it and stamps `noop`.
-        in_view = [name for name in referenced_existing if bv.get_type_by_name(name) is not None]
-        if not in_view:
-            raise OperationFailure(
-                "invalid_request",
-                "the declaration only references types that a loaded type library defines ("
-                + ", ".join(referenced_existing)
-                + ") without defining them; nothing to declare.",
-                requested=_operation_requested(ctx, op),
-            )
-        named_types = [(name, bv.get_type_by_name(name)) for name in in_view]
+        # observes it and stamps `noop`. A type only a type library defines
+        # (`struct timespec;`) has nothing in the view to observe; the result's
+        # `reference_only` marker lets the verifier stamp that case `noop` too.
+        named_types = [(name, bv.get_type_by_name(name)) for name in referenced_existing
+                       if bv.get_type_by_name(name) is not None]
     named_types, unattached_bases = _attach_declared_bases(bv, declaration, named_types)
     defined_types = {}
     defined_type_layouts = {}
@@ -4617,7 +4642,8 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # an unknown name (no body, no forward declaration of their own) --
         # usually a misspelling, e.g. ``struct `ns::W::VTabl`*``.
         **({"created_by_reference": created_by_mention} if created_by_mention else {}),
-        **({"note": "the declaration only forward-declares existing types; nothing was changed"}
+        **({"reference_only": True,
+            "note": "the declaration only forward-declares existing types; nothing was changed"}
            if reference_only else {}),
         # #825 item 3: a `--file` declaration parses with the header's PARENT
         # DIRECTORY as an implicit include root, so `#include "sibling.h"`

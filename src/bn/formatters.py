@@ -5813,10 +5813,13 @@ def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]
             continue
         landed = True
         row_referenced = [str(name) for name in _field_list(row, "referenced_existing_types")]
+        row_stubs = [str(name) for name in _field_list(row, "created_by_reference")]
         referenced.extend(row_referenced)
-        stubs.extend(str(name) for name in _field_list(row, "created_by_reference"))
+        stubs.extend(row_stubs)
+        # Neither a referenced type nor an empty type created by a bare mention
+        # was DECLARED; both are listed on their own lines instead.
         names.extend(str(name) for name in _field_dict(row, "defined_types")
-                     if str(name) not in row_referenced)
+                     if str(name) not in row_referenced and str(name) not in row_stubs)
         unattached.update(_field_dict(row, "unattached_bases"))
     if not landed:
         return None

@@ -85,7 +85,7 @@ def test_types_declare_summary_counts_types_not_ops():
         {"op": "types_declare", "status": "verified",
          "defined_types": {"Holder": "struct Holder", "Alpah": "struct Alpah"},
          "referenced_existing_types": ["Alpha"], "created_by_reference": ["Alpah"]}]})
-    assert refs["declared_types"]["count"] == 2
+    assert refs["declared_types"]["count"] == 1 and refs["declared_types"]["names"] == ["Holder"]
     assert refs["declared_types"]["referenced_existing"] == ["Alpha"]
     assert refs["declared_types"]["created_by_reference"] == ["Alpah"]
     refs_text = _render_mutation_summary_text(refs)
