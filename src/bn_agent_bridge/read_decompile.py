@@ -1894,8 +1894,9 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
     steps.append(
         "stores in this decompile that write code or table addresses into what the jump "
         "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table; "
-        "for a table a store names, `bn xrefs <name>` prints its address (`resolved 'a.1' "
-        "as a data symbol @ <address>`), and `bn evidence table <address>` reads it")
+        "a table a store names is read with `bn evidence table <address>`, where a "
+        "`data_420010` name is the address 0x420010 and a symbol name resolves with "
+        "`bn xrefs a.1` (it prints `resolved 'a.1' as a data symbol @ <address>`)")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
@@ -1917,14 +1918,38 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
 
 
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")
-_OFFSET_NAME_MAX = 48
+_OFFSET_SUMMARY_NAMES = 100
 
 
-def _type_defined(bv, name: str) -> bool:
-    try:
-        return bv.get_type_by_name(name) is not None
-    except Exception:  # noqa: BLE001 - an unparseable name names nothing here
-        return False
+def _type_lookup(bv):
+    """`name -> defined?`, resolved the way `bn types show` resolves it
+    (`seam._find_type`): BN's own lookup first, then the view's type names
+    compared as rendered, case-insensitively. `get_type_by_name("std::X")`
+    takes the whole string as ONE name component and misses every namespaced
+    type (#1000 review round 8), and splitting on `::` would cut through
+    template arguments (`std::map<std::string, int>`); comparing against
+    each type's rendered qualified name does neither. The name list is built
+    once, on the first miss."""
+    names: set[str] | None = None
+
+    def by_bn(name: str) -> bool:
+        try:
+            return bv.get_type_by_name(name) is not None
+        except Exception:  # noqa: BLE001 - an unparseable name falls back to the scan
+            return False
+
+    def defined(name: str) -> bool:
+        nonlocal names
+        if by_bn(name):
+            return True
+        if names is None:
+            try:
+                names = {str(key).lower() for key in list(bv.types.keys())}
+            except Exception:  # noqa: BLE001 - no type list: nothing more is known
+                names = set()
+        return name.lower() in names
+
+    return defined
 
 
 def _this_pointee(func) -> str | None:
@@ -1946,8 +1971,16 @@ def _this_pointee(func) -> str | None:
     return None
 
 
-def _short_type(name: str) -> str:
-    return name if len(name) <= _OFFSET_NAME_MAX else name[:_OFFSET_NAME_MAX - 1] + "…"
+def _name_list(names: list[str]) -> str:
+    """Whole names only -- never cut inside one -- while they fit the summary;
+    the rest as a count."""
+    shown: list[str] = []
+    for name in names:
+        if shown and len(", ".join([*shown, name])) > _OFFSET_SUMMARY_NAMES:
+            break
+        shown.append(name)
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" +{rest} more" if rest else "")
 
 
 def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
@@ -1967,7 +2000,8 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
         return None
     this_type = _this_pointee(func)
     checked = names + ([this_type] if this_type and this_type not in names else [])
-    defined = [name for name in checked if _type_defined(bv, name)]
+    _type_defined = _type_lookup(bv)
+    defined = [name for name in checked if _type_defined(name)]
     missing = [name for name in checked if name not in defined]
     parts = [("Decompile contains raw `__offset(T, N)` expressions: BN's spelling for a "
               "pointer N bytes into an object of type T where T has no member it can name there.")]
@@ -1976,7 +2010,7 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
     vtables = [n for n in missing if n.startswith("vtable_for_")]
     plain = [n for n in missing if n not in vtables]
     if plain:
-        with_vtable = [n for n in plain if _type_defined(bv, f"{n}::VTable")]
+        with_vtable = [n for n in plain if _type_defined(f"{n}::VTable")]
         parts.append(
             f"No definition: {', '.join(plain)} -- "
             + ("each is a named reference" if len(plain) > 1 else "a named reference")
@@ -1995,14 +2029,11 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
         parts.append(f"`this` points at {this_type}, which has no definition either.")
     summary_parts = []
     if plain:
-        summary_parts.append(f"no type defined for {', '.join(_short_type(n) for n in plain[:3])}"
-                             + (f" +{len(plain) - 3} more" if len(plain) > 3 else ""))
+        summary_parts.append(f"no type defined for {_name_list(plain)}")
     if vtables:
-        summary_parts.append(f"vtable object(s), not types: "
-                             f"{', '.join(_short_type(n) for n in vtables[:2])}"
-                             + (f" +{len(vtables) - 2} more" if len(vtables) > 2 else ""))
+        summary_parts.append(f"vtable object(s), not types: {_name_list(vtables)}")
     if defined:
-        summary_parts.append(f"defined: {', '.join(_short_type(n) for n in defined[:3])}")
+        summary_parts.append(f"defined: {_name_list(defined)}")
     summary = ("__offset(T, N) is a pointer N bytes into T; "
                + ("; ".join(summary_parts) or "its base types could not be read"))
     return _warning_row("offset", summary, " ".join(parts),

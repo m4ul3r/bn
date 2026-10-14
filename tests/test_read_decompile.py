@@ -6440,10 +6440,12 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     # decompile's own stores are offered, as a "may".
     assert "None of these steps is sure to find the targets" in detail
     assert "may name the targets" in detail and "`bn xrefs 0x" not in detail
-    # A table a store names (`&a.1`) is read through its address, which
-    # `bn xrefs <name>` prints.
-    assert "`bn xrefs <name>` prints its address" in detail
-    assert "`bn evidence table <address>` reads it" in detail
+    # A table a store names is read through its address: a `data_<hex>` name
+    # is one, a symbol resolves with `bn xrefs <symbol>`; `bn xrefs
+    # data_420010` itself fails.
+    assert "`bn evidence table <address>`" in detail
+    assert "`data_420010` name is the address 0x420010" in detail
+    assert "`bn xrefs a.1`" in detail and "`bn xrefs <name>`" not in detail
     note = read_decompile._JUMP_LINE_NOTE
     assert note.startswith("/* bn:") and note.endswith("*/")
     assert "tail call" in note and "computed goto" in note and "virtual" not in note
@@ -6681,3 +6683,30 @@ def test_a_data_placeholder_is_not_named_without_a_char_pointer_994():
         bv, func, "    return memcmp(arg1, &data_661bd8, 0x10);") is None
     assert read_decompile._raw_string_pointer_note(
         bv, func, "    return memcmp(arg1, 0x661bd8, 0x10);") is not None
+
+
+def test_offset_types_resolve_by_rendered_name_like_types_show_1000():
+    # BN reads `get_type_by_name("std::_Rb_tree_node_base")` as one name part
+    # and misses the type, which `types show` finds by its rendered name; the
+    # note then called a defined type missing (#1000 review round 8).
+    types_by_name = {"std::_Rb_tree_node_base": object(),
+                     "std::map<std::string, int>::VTable": object()}
+    bv = types.SimpleNamespace(get_type_by_name=lambda name: None,
+                               types=types_by_name)
+    text = ("    void* __offset(std::_Rb_tree_node_base, 0x10) a;\n"
+            "    void* __offset(std::map<std::string, int>, 0x8) b;")
+    warning = read_decompile._offset_warning(bv, _offset_func("demo::Store"), text)
+    assert warning["types"]["defined"] == ["std::_Rb_tree_node_base"]
+    assert warning["types"]["missing"] == ["std::map<std::string, int>", "demo::Store"]
+    assert "bn struct show 'std::map<std::string, int>'" in warning["detail"]
+
+
+def test_offset_summary_never_cuts_a_name_1000():
+    long = "vtable_for_std::basic_ios<char, std::char_traits<char> >"
+    other = "vtable_for_std::basic_filebuf<char, std::char_traits<char> >"
+    bv = types.SimpleNamespace(get_type_by_name=lambda name: None, types={})
+    text = f"    a = __offset({long}, 0x10);\n    b = __offset({other}, 0x10);"
+    summary = read_decompile._offset_warning(bv, _offset_func("x"), text)["summary"]
+    assert long in summary and "…" not in summary
+    assert summary == ("__offset(T, N) is a pointer N bytes into T; no type defined for x; "
+                       f"vtable object(s), not types: {long} +1 more")

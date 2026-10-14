@@ -3160,7 +3160,18 @@ def test_decompile_text_prints_one_short_line_per_warning_1000(fake_transport, c
     out = capsys.readouterr().out
     lines = out.splitlines()
     head = lines.index(f"warning[arity]: {_ARITY_ROW['summary']}")
-    assert lines[head + 1] == f"  {_ARITY_ROW['detail']}"
+    # The detail follows, wrapped into short indented lines (agent harnesses
+    # cut a long line at 768 bytes, before its advice), with the backticked
+    # command kept whole on one line.
+    detail_lines = []
+    for line in lines[head + 1:]:
+        if not line.startswith("  "):
+            break
+        detail_lines.append(line)
+    assert len(detail_lines) > 1 and all(len(line) <= 122 for line in detail_lines)
+    assert " ".join(line.strip() for line in detail_lines) == _ARITY_ROW["detail"]
+    assert any("`bn callsites 0x401160 --within 0x401420 --context 4`" in line
+               for line in detail_lines)
     assert "--explain:" not in out
 
 

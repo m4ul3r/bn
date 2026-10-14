@@ -3949,7 +3949,8 @@ class TestStructLayoutAssistance903:
         # Text prints the one-line summary; the full sentence is --explain's.
         text_result = shared_bn.run("decompile", "handle", "--explain")
         assert text_result.returncode == 0, text_result.stderr
-        assert hint in text_result.stdout
+        # --explain wraps the detail into short lines: compare word sequences.
+        assert " ".join(hint.split()) in " ".join(text_result.stdout.split())
 
         # Accesses through a copy of the parameter must not be dropped from
         # the witness while the body visibly uses an offset cfg cannot hold.
@@ -4364,3 +4365,39 @@ class TestShortLiteralBehindDataName994:
         strings = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
         assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
+
+
+class TestOffsetTypeLookup1000:
+    """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
+    name -- every type a library or the demangler supplies -- is not found by
+    `bv.get_type_by_name("std::X")`, which reads the string as ONE name part,
+    so the `__offset` note called defined types missing. The lookup must
+    agree with `bn types show` for a namespaced type, a missing one, and a
+    templated name whose arguments contain `::` themselves."""
+
+    _NAMES = {
+        "demo::Leaf": True,
+        "demo::Box<std::pair<int, demo::Leaf> >": True,
+        "demo::Missing": False,
+    }
+
+    def test_type_lookup_agrees_with_types_show(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        lookup = shared_bn.json(
+            "py", "exec", "--code",
+            "import binaryninja as bn\n"
+            "from bn_agent_bridge import read_decompile as rd\n"
+            "leaf = bn.Type.structure(members=[(bn.Type.int(4), 'x')])\n"
+            "bv.define_user_type(bn.QualifiedName(['demo', 'Leaf']), leaf)\n"
+            "bv.define_user_type(bn.QualifiedName(['demo', 'Box<std::pair<int, demo::Leaf> >']),"
+            " leaf)\n"
+            f"names = {list(self._NAMES)!r}\n"
+            "defined = rd._type_lookup(bv)\n"
+            "result = {'naive': {n: bv.get_type_by_name(n) is not None for n in names},\n"
+            "          'lookup': {n: defined(n) for n in names}}\n")["result"]
+        # The premise: BN's string lookup misses the multi-part names.
+        assert lookup["naive"]["demo::Leaf"] is False, lookup
+        assert lookup["lookup"] == self._NAMES, lookup
+        for name, exists in self._NAMES.items():
+            shown = shared_bn.run("types", "show", name)
+            assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)

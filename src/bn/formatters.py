@@ -735,10 +735,35 @@ def _render_decompile_warnings(value: Any, *, explain: bool = False) -> str:
         if detail and detail != body:
             explained = True
             if explain:
-                lines.append(f"  {detail}")
+                lines.extend(_wrap_detail(detail))
     if explained and not explain:
         lines.append("(--explain: what each warning means and what to do)")
     return "\n".join(lines)
+
+
+_DETAIL_WIDTH = 120
+# A word, where a backticked command counts as one word: wrapping must never
+# split `bn evidence table 0x435ea0 --stride 4 --width 4` across lines. A
+# backtick with no partner is an ordinary character.
+_DETAIL_TOKEN = re.compile(r"(?:`[^`]*`|[^\s`]|`)+")
+
+
+def _wrap_detail(detail: str) -> list[str]:
+    """*detail* as indented lines of at most ~120 characters (#1000 review
+    round 8). One 1100-character line was cut by agent harnesses at 768
+    bytes, before the advice it ended with -- the original #1000 item 1
+    problem, back in the opt-in view."""
+    lines: list[str] = []
+    current = ""
+    for token in _DETAIL_TOKEN.findall(detail):
+        if current and len(current) + 1 + len(token) > _DETAIL_WIDTH:
+            lines.append(f"  {current}")
+            current = token
+        else:
+            current = f"{current} {token}" if current else token
+    if current:
+        lines.append(f"  {current}")
+    return lines
 
 
 # A BOUNDARY, not just a reader: every CLI caller concatenates this note ahead of
