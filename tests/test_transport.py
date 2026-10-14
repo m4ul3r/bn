@@ -1630,7 +1630,15 @@ def _scripted_bridge_sockets(monkeypatch, instance, answer):
     return sent
 
 
-def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("holder, expected", [
+    ({"op": "refresh", "elapsed_seconds": 12.0},
+     "py_exec is waiting for the running refresh (started 12s ago) to finish"),
+    # #992: a read can wait on a writer that is only queued (writer priority).
+    ({"op": "close_binary", "elapsed_seconds": 3.0, "queued": True},
+     "py_exec is waiting for the queued close_binary (queued 3s ago) to finish"),
+])
+def test_request_queued_on_write_gate_prints_waiting_notice(
+        tmp_path, monkeypatch, capsys, holder, expected):
     """#976: a write that sits behind a refresh said nothing for minutes. After a
     quiet interval the CLI asks the bridge, on a side connection, whether THIS
     request is queued on the write gate, and says so on stderr -- while the
@@ -1645,7 +1653,7 @@ def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatc
     def answer(request):
         if request["op"] == "write_gate_status":
             result = {"kind": "write_gate_status", "request_id": request["params"]["request_id"],
-                      "waiting": True, "holder": {"op": "refresh", "elapsed_seconds": 12.0}}
+                      "waiting": True, "holder": holder}
             status_answered.set()
             return result
         # The queued write: answers only after the notice went out.
@@ -1662,7 +1670,7 @@ def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatc
     assert sent[1]["params"] == {"request_id": sent[0]["id"]}
     assert sent[1].get("idle_probe") is True  # the question never asks itself
     err = capsys.readouterr().err
-    assert "py_exec is waiting for the running refresh (started 12s ago) to finish" in err
+    assert expected in err
     assert "BN_NO_WAIT=1" in err
 
 
@@ -2240,6 +2248,117 @@ def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, sig
         if child_pid is not None:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(child_pid, signal.SIGKILL)
+
+
+_LEAKED_HANDLER_DRIVER = """
+import inspect, os, signal, sys, time
+import bn.transport as transport
+
+pidfile, mode = sys.argv[1], sys.argv[2]
+transport.list_instances = lambda **kwargs: []
+transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
+real_popen = transport.subprocess.Popen
+
+def recording_popen(*args, **kwargs):
+    proc = real_popen(*args, **kwargs)
+    with open(pidfile, "a") as stream:
+        stream.write(f"{proc.pid}\\n")
+    return proc
+
+transport.subprocess.Popen = recording_popen
+
+# First spawn: a KeyboardInterrupt at `unwind.restore()` leaves its handlers
+# installed, and the host catches it. In "recorded" mode a SIGTERM reaches the
+# reaping cleanup first, where it is only recorded, never re-delivered.
+code = transport._spawn_instance_unlocked.__code__
+lines, first = inspect.getsourcelines(transport._spawn_instance_unlocked)
+
+def line_of(statement):
+    return first + max(i for i, text in enumerate(lines) if text.strip() == statement)
+
+interrupt_at = line_of("unwind.restore()")
+signal_at = line_of("if owned and proc is not None and proc.poll() is None:")
+
+def local(frame, event, arg):
+    if event == "line" and frame.f_lineno == signal_at and mode == "recorded":
+        os.kill(os.getpid(), signal.SIGTERM)
+    if event == "line" and frame.f_lineno == interrupt_at:
+        sys.settrace(None)
+        raise KeyboardInterrupt
+    return local
+
+sys.settrace(lambda frame, event, arg: local if frame.f_code is code else None)
+try:
+    transport.spawn_instance("sample-1", timeout=0.5, poll_interval=0.05)
+except (transport.BridgeError, KeyboardInterrupt) as exc:
+    print("first spawn ended:", type(exc).__name__, flush=True)
+sys.settrace(None)
+
+# Second spawn in the same host. "signal": the test SIGTERMs it during the
+# wait. "complete": it times out, and the host reports its dispositions.
+timeout = {"signal": 60, "complete": 0.5, "recorded": 3}[mode]
+try:
+    transport.spawn_instance("sample-2", timeout=timeout, poll_interval=0.05)
+except transport.BridgeError as exc:
+    print("second spawn failed:", type(exc).__name__, flush=True)
+print("dispositions after second spawn: SIG_DFL",
+      signal.getsignal(signal.SIGTERM) is signal.SIG_DFL,
+      signal.getsignal(signal.SIGHUP) is signal.SIG_DFL, flush=True)
+"""
+
+
+@pytest.mark.parametrize("mode", ["signal", "complete", "recorded"])
+def test_spawn_after_a_leaked_handler_still_reaps_its_child(tmp_path, mode):
+    # #992 item 4: a KeyboardInterrupt that skips `restore()` leaves the first
+    # spawn's handler installed. The next spawn in that host saw a non-default
+    # disposition, took it for the host's own and installed nothing, so a
+    # SIGTERM in its registration wait reached the stale handler, which
+    # re-delivered at once: the host died with the second child still running.
+    # Adopting the leftover must also hand back SIG_DFL once the second spawn
+    # is done ("complete"), and must not drop a signal the leftover recorded
+    # and never re-delivered: the host dies of it, as the leftover would have
+    # made it on the next signal ("recorded").
+    pidfile = tmp_path / "children.pid"
+    env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
+    cli = subprocess.Popen(
+        [sys.executable, "-c", _LEAKED_HANDLER_DRIVER, str(pidfile), mode],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+    def recorded_pids() -> list[int]:
+        return [int(line) for line in pidfile.read_text().split()] if pidfile.exists() else []
+
+    try:
+        if mode == "signal":
+            deadline = time.monotonic() + 30
+            while len(recorded_pids()) < 2:
+                assert cli.poll() is None, cli.stdout.read().decode(errors="replace")
+                assert time.monotonic() < deadline, "the driver never started its second child"
+                time.sleep(0.02)
+            time.sleep(0.3)  # well inside the second registration wait
+            cli.send_signal(signal.SIGTERM)
+        cli.wait(timeout=15)
+
+        output = cli.stdout.read().decode(errors="replace")
+        assert "first spawn ended: KeyboardInterrupt" in output, output
+        if mode == "complete":
+            assert cli.returncode == 0, output
+            assert "dispositions after second spawn: SIG_DFL True True" in output, output
+        else:
+            assert cli.returncode == -signal.SIGTERM, output
+        if mode == "recorded":
+            # Delivered before a second child was started for nothing.
+            assert len(recorded_pids()) == 1, output
+        for pid in recorded_pids():
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        if cli.poll() is None:
+            cli.kill()
+            cli.wait(timeout=5)
+        for pid in recorded_pids():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 def test_named_spawn_refuses_live_owner_missed_by_initial_discovery(monkeypatch, tmp_path):

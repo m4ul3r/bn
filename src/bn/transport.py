@@ -89,8 +89,8 @@ CANCEL_REQUEST_TIMEOUT = 0.25
 # is queued behind another writer, and the budget for that one question (#976).
 WRITE_GATE_NOTICE_AFTER = 2.0
 WRITE_GATE_STATUS_TIMEOUT = 1.0
-# Set to 1/true/yes to make a write-gated request fail fast with `busy: ...`
-# instead of queueing behind the writer that holds the gate (#976).
+# Set to 1/true/yes to make a request fail fast with `busy: ...` instead of
+# queueing behind the write that holds the gate (#976) or the views (#992).
 NO_WAIT_ENV = "BN_NO_WAIT"
 
 
@@ -106,7 +106,9 @@ def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) 
     hold it for minutes -- while reads in the same window answer at once, so a
     queue looked exactly like a hang (#976). One side-channel question, asked
     only after the request has already gone unanswered for a while; a bridge
-    that predates `write_gate_status`, or any failure to ask, prints nothing.
+    that predates `write_gate_status`, or any failure to ask, prints nothing. A
+    read queued behind a write that holds the views exclusively is reported the
+    same way (#992).
     """
     try:
         response = _send_request_to_instance(
@@ -125,10 +127,12 @@ def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) 
         return
     holder = status.get("holder")
     if isinstance(holder, dict) and isinstance(holder.get("op"), str):
-        what = f"the running {holder['op']}"
+        # A read can wait on a writer that is only queued (writer priority).
+        queued = holder.get("queued") is True
+        what = f"the {'queued' if queued else 'running'} {holder['op']}"
         elapsed = holder.get("elapsed_seconds")
         if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
-            what += f" (started {elapsed:g}s ago)"
+            what += f" ({'queued' if queued else 'started'} {elapsed:g}s ago)"
     else:
         what = "another write operation"
     print(
@@ -1914,11 +1918,12 @@ class _SignalUnwind:
     raises instead, the owner reaps the child, and `restore()` puts the default
     disposition back and re-delivers the signal so the CLI still dies of it.
 
-    Only signals still at SIG_DFL are taken over -- a host that installed its
-    own handler (or a `nohup` SIG_IGN) keeps it -- and only on the main thread,
-    the one place Python lets a handler be installed. The handlers go in before
-    the child is started and only RECORD a signal until `arm()`, the first
-    statement after Popen inside the owner's try (it raises at once for a
+    Signals still at SIG_DFL are taken over, and so is a leftover of an earlier
+    spawn's own handler (below); a host that installed its own handler (or a
+    `nohup` SIG_IGN) keeps it. Off the main thread nothing is taken over, since
+    Python lets only the main thread install a handler. The handlers go
+    in before the child is started and only RECORD a signal until `arm()`, the
+    first statement after Popen inside the owner's try (it raises at once for a
     signal recorded meanwhile); from `defer()`, where the reap begins, they
     record again, so a signal cannot cut the reap short. The first one caught
     is the one re-delivered.
@@ -1927,7 +1932,13 @@ class _SignalUnwind:
     installed because a KeyboardInterrupt unwound the owner before `restore()`
     ran, which a host that catches it (a REPL, a `Client` user) survives --
     restores the dispositions and re-delivers, so such a host still dies of its
-    SIGTERM/SIGHUP instead of silently ignoring it.
+    SIGTERM/SIGHUP instead of silently ignoring it. The next spawn in that host
+    ADOPTS such a leftover rather than reading it as the host's own handler:
+    left in place it would re-deliver a signal from that spawn's wait at once,
+    killing the host before the new child is reaped (#992). A leftover that had
+    already recorded a signal it never re-delivered is not adopted but
+    restored, which delivers that signal before anything is spawned: the host
+    dies of it, as the leftover would have made it on the next signal.
     """
 
     _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
@@ -1943,10 +1954,33 @@ class _SignalUnwind:
             return
         for signum in self._SIGNALS:
             try:
-                if signal.getsignal(signum) is signal.SIG_DFL:
+                current = signal.getsignal(signum)
+                stale = self._stale_unwind(current)
+                if stale is not None and stale._caught is not None:
+                    # Ends the process under the SIG_DFL it puts back; if the
+                    # signal is blocked, the disposition is now SIG_DFL anyway.
+                    stale.restore()
+                    current = signal.getsignal(signum)
+                    stale = None
+                if stale is not None:
+                    # The leftover only ever replaced SIG_DFL, which is the
+                    # disposition to restore; dropping its entry keeps it from
+                    # undoing this install should it ever run `restore()`.
+                    signal.signal(signum, self._handle)
+                    self._previous[signum] = stale._previous.pop(signum, signal.SIG_DFL)
+                elif current is signal.SIG_DFL:
                     self._previous[signum] = signal.signal(signum, self._handle)
             except (ValueError, OSError):
                 continue
+
+    def _stale_unwind(self, handler: Any) -> _SignalUnwind | None:
+        """The `_SignalUnwind` whose `_handle` *handler* is, if its owner is gone."""
+        unwind = getattr(handler, "__self__", None)
+        if not isinstance(unwind, _SignalUnwind) or unwind is self:
+            return None
+        if getattr(handler, "__func__", None) is not _SignalUnwind._handle:
+            return None
+        return None if unwind._owner_running(self._owner) else unwind
 
     def _owner_running(self, frame: Any) -> bool:
         while frame is not None:
@@ -2075,7 +2109,9 @@ def _spawn_instance_unlocked(
     # the cleanup below before `_reap_child` runs, which leaves the child
     # running. Handlers that any KeyboardInterrupt leaves installed (there, or
     # mid-install) hand the next SIGTERM/SIGHUP to the default action rather
-    # than swallowing it; see `_SignalUnwind`.
+    # than swallowing it, and the next spawn takes them over as its own -- or,
+    # when one had recorded a signal, delivers that signal first (#992); see
+    # `_SignalUnwind`.
     unwind = _SignalUnwind()
     proc: subprocess.Popen | None = None
     owned = True
