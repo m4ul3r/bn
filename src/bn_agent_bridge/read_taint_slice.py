@@ -392,7 +392,8 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                 if ai in seen:
                     continue
                 seen.add(ai)
-                shape = _callsite_shape(_containing_fn(bv, ai), ai, targets, flagged)
+                container = _containing_fn(bv, ai)
+                shape = _callsite_shape(container, ai, targets, flagged)
                 if shape == "data":
                     continue
                 fname, kind = _classify_callsite(bv, ai, key, models)
@@ -403,7 +404,11 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                 # #794: carry one line of context per row. `disasm` is the key
                 # the sibling address-row emitters (`read_xrefs` ref rows,
                 # `seam`'s call-context row) already use.
+                # #978's rule: JSON keeps the raw `function`; text prints the
+                # demangled `function_display_name` unless --mangled.
                 rows.append({"address": hex(ai), "function": fname, "kind": kind,
+                             "function_display_name": (il_format._display_name(container)
+                                                       if container is not None else None),
                              "disasm": _disasm_at(bv, ai)})
         rows.sort(key=lambda r: int(r["address"], 16))
         slot["callsite_count"] = len(rows)

@@ -4711,7 +4711,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
 
 
 @_discloses
-def _render_taint_models_text(value: Any) -> str:
+def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines: list[str] = []
@@ -4733,7 +4733,7 @@ def _render_taint_models_text(value: Any) -> str:
             # them and the text dropped them, so the flag read as ignored.
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
                          f"{_callsite_count_note(s)}")
-            lines.extend(_render_callsite_rows(s, indent="    "))
+            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled))
     sbc = _field_dict(value, "sinks_by_class")
     if sbc:
         lines.append("")
@@ -4756,7 +4756,7 @@ def _render_taint_models_text(value: Any) -> str:
                 if not isinstance(e, dict):
                     lines.append(f"    {e!r}")
                     continue
-                lines.extend(_render_taint_sink_entry(e))
+                lines.extend(_render_taint_sink_entry(e, mangled=mangled))
     props = _field_list(value, "propagators")
     if props:
         lines.append("")
@@ -4805,7 +4805,7 @@ _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
                        "inline_builtin": "constant-argument inline builtin"}
 
 
-def _render_callsite_rows(e: dict[str, Any], *, indent: str) -> list[str]:
+def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False) -> list[str]:
     """The enriched callsite rows of a present model entry (address + containing
     function + non-audit kind + one line of disassembly), then a count of the
     non-audit rows the bridge left out (#958: `--all-sites` shows them)."""
@@ -4814,7 +4814,9 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str) -> list[str]:
         if not isinstance(c, dict):
             out.append(f"{indent}{c!r}")
             continue
-        fn = c.get("function") or "?"
+        # #978: the containing function by its demangled name unless --mangled.
+        fn = _shown_name(c, mangled=mangled, name_key="function",
+                         display_key="function_display_name") or "?"
         kind = c.get("kind")
         tag = f" [{kind}]" if kind and kind != "app_caller" else ""
         # #794: append the one-line disassembly the bridge now carries per row.
@@ -4834,7 +4836,7 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str) -> list[str]:
     return out
 
 
-def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
+def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> list[str]:
     """One present/catalog sink entry: the model line plus, under --callsites, its
     enriched callsite rows (address + containing function + non-audit kind)."""
     p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
@@ -4842,7 +4844,7 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
     head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
             f"{_callsite_count_note(e)}{desc}")
     out = [head]
-    out.extend(_render_callsite_rows(e, indent="      "))
+    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled))
     return out
 
 

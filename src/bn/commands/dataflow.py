@@ -12,6 +12,7 @@ from ..cli import (
     arg,
     command,
     decode_json_input,
+    mangled_arg,
     read_text_input,
 )
 from ..formatters import (
@@ -312,6 +313,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--all-sites", action="store_true", default=False,
                  help="With --callsites: also list the self-stub and constant-argument "
                       "inline-builtin rows that are otherwise only counted (implies --callsites)"),
+             mangled_arg(),
              _models_arg(),
          ],
          estimable=True)
@@ -342,6 +344,6 @@ def _taint_models(args: argparse.Namespace) -> int:
         "taint_models",
         params,
         require_target=needs_target,
-        text_renderer=_render_taint_models_text,
+        text_renderer=lambda value: _render_taint_models_text(value, mangled=args.mangled),
         stem="taint-models",
     )

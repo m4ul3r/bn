@@ -498,6 +498,29 @@ def test_constant_inline_builtin_rows_are_non_audit_958():
     assert _sink_entry(res, "__builtin_memset")["audit_callsite_count"] == 1
 
 
+def test_callsite_rows_name_the_caller_demangled_unless_mangled():
+    # #978's rule for text: the containing function by its demangled display
+    # name, the raw symbol under --mangled; JSON keeps the raw name.
+    from bn.formatters import _render_taint_models_text
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            app = _ILFn("_Z9copy_tailPcPKcim", 0x5000,
+                        {0x5010: _Llil("LLIL_CALL", _const(0x1000))})
+            app.symbol.short_name = "copy_tail"
+            self.functions = [app]
+            self._syms = {"memcpy": [_Sym("memcpy", 0x1000)]}
+            self._refs = {0x1000: [_Ref(0x5010)]}
+            self._contain = {0x5010: app}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    row = _sink_entry(res, "memcpy")["callsites"][0]
+    assert row["function"] == "_Z9copy_tailPcPKcim"
+    assert row["function_display_name"] == "copy_tail"
+    assert "0x5010  copy_tail" in _render_taint_models_text(res)
+    assert "0x5010  _Z9copy_tailPcPKcim" in _render_taint_models_text(res, mangled=True)
+
+
 def test_source_callsites_and_bounded_write_args_reach_the_text_958():
     from bn.formatters import _render_taint_models_text
 
