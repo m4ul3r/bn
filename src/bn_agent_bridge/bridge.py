@@ -3968,9 +3968,20 @@ class BinaryNinjaBridge:
         """
         with self._write_gate:
             with self._target_lock.read():
+                bv = self._resolve_view(selector)
+                # #952: this op bypasses the generic engine, so it must apply the
+                # engine's quick-view policy itself -- before the walk and before
+                # any write. A quick view defines a sliver of the pcln entries, and
+                # renaming that sliver reported a measured zero-candidate success
+                # over a target whose functions were simply never discovered.
+                mutation_engine.refuse_quick_view(
+                    bv,
+                    requested={"op": "go_rename", "preview": preview},
+                    why=("Go rename only renames functions analysis has defined, so "
+                         "it would skip almost every recovered pcln entry."),
+                )
                 recovered = read_go._go_functions(self.ctx, selector)
                 items = recovered.get("items") or []
-                bv = self._resolve_view(selector)
                 candidates: list[dict[str, Any]] = []
                 skipped_user_named = 0
                 # #818 review: the DEFECT this closes was an envelope stating two

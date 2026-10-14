@@ -746,6 +746,65 @@ def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) ->
     return result
 
 
+_RESOLVER_MISS_PREFIXES = ("Function not found: ", "Symbol not found: ")
+
+
+def _is_resolver_miss(message: str, name: str) -> bool:
+    """Whether *message* is the name resolver's own miss for exactly *name*
+    (`Function not found: <name>` / `Symbol not found: <name>`, optionally
+    followed by its `.`-led suggestions) -- never a different lookup's miss
+    (`Variable not found: ...`) nor a longer name sharing *name* as a prefix."""
+    for prefix in _RESOLVER_MISS_PREFIXES:
+        head = prefix + name
+        if message == head or message.startswith(head + "."):
+            return True
+    return False
+
+
+def _explain_renamed_reference(op: Any, results: list[dict[str, Any]],
+                               exc: OperationFailure) -> OperationFailure:
+    """#975: a batch resolves each op's names against the state the earlier ops
+    left, so naming a function by the spelling an earlier ``rename_symbol`` just
+    replaced fails lookup -- and the resolver's "Did you mean" list then offers
+    lexically close but unrelated functions, which reads as a wrong address rather
+    than an ordering problem. When the failure IS the resolver's miss for the op's
+    own name, and that name was renamed away earlier in this batch and never
+    assigned again, replace the message with the rename that explains it.
+
+    Both conditions matter. A name a later rename gave back (a round trip) or
+    handed to another function (reuse) still resolves, so the op failed for its
+    own reason -- a missing variable, say -- and a rename hint would bury that
+    cause and point the agent at the function the name USED to denote. Any other
+    failure is returned unchanged."""
+    if not isinstance(op, dict):
+        return exc
+    reassigned = {row.get("new_name") for row in results if row.get("op") == "rename_symbol"}
+    refs = {op[key] for key in ("identifier", "function")
+            if isinstance(op.get(key), str) and op[key] not in reassigned
+            and _is_resolver_miss(exc.message, op[key])}
+    for index, row in enumerate(results):
+        before = row.get("before_name")
+        if row.get("op") != "rename_symbol" or before not in refs:
+            continue
+        address = row.get("address")
+        renamed_to = row.get("new_name")
+        current = renamed_to
+        for later in results[index + 1:]:
+            if later.get("op") == "rename_symbol" and later.get("address") == address:
+                current = later.get("new_name")
+        now = "" if current == renamed_to else f", then to {current}"
+        return OperationFailure(
+            exc.status,
+            f"{before} not found: operation {index} of this batch renamed {before} "
+            f"(at {address}) to {renamed_to}{now}. Each operation resolves "
+            f"names against the state the earlier operations left, so refer to it "
+            f"as {current} or by its address {address}.",
+            requested=exc.requested,
+            observed=exc.observed,
+        )
+    return exc
+
+
 
 def _unattempted_results(ctx, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """A row per op the batch never reached, after a sibling op failed (#675
@@ -2244,6 +2303,28 @@ def _later_create_needs_ranges(operations: list, index: int) -> bool:
 
 
 
+_QUICK_VIEW_REANALYSIS = (
+    "Mutations reanalyze under the write lock, which would wedge the instance."
+)
+
+
+def refuse_quick_view(bv, *, requested: dict[str, Any],
+                      why: str = _QUICK_VIEW_REANALYSIS) -> None:
+    """The mutation eligibility policy for a --quick view (#479): refuse before any
+    write, live and --preview alike, and point at `bn refresh`. Shared by the
+    generic engine and `go rename`, which bypasses the engine (#952) -- on a quick
+    view the pcln walk sees almost no defined functions, so a run would report a
+    measured zero-candidate success over a target that was never analysed. *why*
+    names the caller's own reason the view is ineligible."""
+    if bv in _quick_loaded_views:
+        raise OperationFailure(
+            "invalid_request",
+            "Cannot apply mutations: this target was loaded with --quick (no "
+            f"analysis). {why} Run `bn refresh` first.",
+            requested=requested,
+        )
+
+
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
               exclusive=None):
     """Apply, verify, and (on failure or --preview) revert a batch of mutations.
@@ -2295,14 +2376,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # the reanalysis runs in; it does NOT change this refusal. Subsumes and
         # generalizes the per-op function_create guard to bn type/comment/rename/proto/
         # struct-field/batch-apply on a quick view.
-        if bv in _quick_loaded_views:
-            raise OperationFailure(
-                "invalid_request",
-                "Cannot apply mutations: this target was loaded with --quick (no "
-                "analysis). Mutations reanalyze under the write lock, which would wedge "
-                "the instance. Run `bn refresh` first.",
-                requested={"op": "mutation", "operations": len(operations)},
-            )
+        refuse_quick_view(bv, requested={"op": "mutation", "operations": len(operations)})
         # #630: a --preview of a prototype set on a function with no user type would
         # pin has_user_type, which BN cannot clear -- so the preview could not honor
         # its non-destructive contract. Refuse BEFORE touching the view (pristine, no
@@ -2434,6 +2508,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 # next create's probe sees what the live view will.
                 bv.update_analysis_and_wait()
     except OperationFailure as exc:
+        exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
@@ -2581,25 +2656,33 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
             message = None
             if preview:
+                # #937: a preview whose readback FAILED is still a preview -- but its
+                # message must never claim verification succeeded. The lead names
+                # the verification outcome; the clauses after it name the revert's.
+                lead = (
+                    "Preview verification failed, and" if failed else "Preview verified, but"
+                )
                 if not hosts_ok:
                     message = (
-                        "Preview verified, but a function a create split is not back as "
+                        f"{lead} a function a create split is not back as "
                         "it was before the batch; the view may be left modified."
                     )
                 elif not values_reverted:
                     message = (
-                        "Preview verified, but reverting a non-journaled change "
+                        f"{lead} reverting a non-journaled change "
                         "(local variable or prototype) failed; the view may be left modified."
                     )
                 elif proto_residue:
                     # Value reverted, but has_user_type stuck (BN has no API to clear
                     # it), so the revert is INCOMPLETE and the view is left modified.
                     message = (
-                        "Preview verified and the prototype value was reverted, but the "
-                        "function's has_user_type override could NOT be cleared (Binary "
+                        f"{lead} the function's has_user_type override could NOT be "
+                        "cleared even though the prototype value was reverted (Binary "
                         "Ninja exposes no API to clear it); the view is left modified and "
                         "BN will no longer re-derive that signature."
                     )
+                elif failed:
+                    message = "Preview verification failed; the change was reverted."
                 else:
                     message = "Preview verified and reverted."
             elif failed:
