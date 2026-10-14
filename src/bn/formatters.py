@@ -3410,25 +3410,16 @@ def _render_surface_text(value: Any) -> str:
                 f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
 
     tables = _field_list(value, "candidate_tables")
-    hidden = s.get("vtables_hidden")
-    if tables or (isinstance(hidden, int) and hidden > 0):
+    if tables:
         lines.append("")
         lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
         for t in tables:
             if not isinstance(t, dict):
                 continue
-            # #997 item 3: name the class whose vtable this is, so the few
-            # unlabelled (non-vtable) dispatch tables stand out.
-            owner = _text_value(t, "vtable_of")
-            kind = _text_value(t, "vtable_kind")
-            label = (f"  vtable: {owner}" + (" (secondary)" if kind == "secondary" else "")
-                     if owner else "")
             lines.append(
                 f"  {t.get('address', '?')} [{t.get('section', '?')}]  "
                 f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
-                f"missing={t.get('missing_functions', 0)}{label}")
-        if isinstance(hidden, int) and hidden > 0:
-            lines.append(f"  ({hidden} known C++ vtable(s) hidden by --unknown-only)")
+                f"missing={t.get('missing_functions', 0)}")
 
     cands = _field_list(value, "missing_function_candidates")
     if cands:

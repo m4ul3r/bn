@@ -1291,8 +1291,7 @@ _STRONG_DECODE_DEPTH = 8
 
 def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                     max_tables: int = 64, max_candidates: int = 128,
-                    max_scan_bytes: int = 16_000_000,
-                    unknown_only: bool = False) -> dict[str, Any]:
+                    max_scan_bytes: int = 16_000_000) -> dict[str, Any]:
     """#503: enumerate the HIDDEN code surface a passive `function list` misses -- code
     reachable through data, not direct calls. READ-ONLY: it reports addresses BN did not
     turn into functions, it does NOT create them (that stays the agent's separate write).
@@ -1469,10 +1468,6 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
 
     candidate_tables: list[dict[str, Any]] = []
     tables_over_cap = 0
-    # #997 item 3: tables the Itanium header identifies as a class's vtable,
-    # and how many of them `unknown_only` kept out of the listing.
-    vtables_labelled = 0
-    vtables_hidden = 0
     scanned = 0
     scan_capped = False
     for name, start, end in scan_regions:
@@ -1490,19 +1485,9 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         run: list[int] = []
 
         def flush(run_addr: int, run_vals: list[int]) -> None:
-            nonlocal tables_over_cap, vtables_labelled, vtables_hidden
+            nonlocal tables_over_cap
             if len(run_vals) < table_min_run:
                 return
-            label = _vtable_label(ctx, bv, run_addr, ps)
-            if label is not None:
-                vtables_labelled += 1
-                if unknown_only:
-                    # Hidden, not dropped: its slots still nominate missing
-                    # functions, exactly as when it is listed.
-                    vtables_hidden += 1
-                    for v in run_vals:
-                        note_missing(v, f"table:{hex(run_addr)}")
-                    return
             if len(candidate_tables) >= max_tables:
                 tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
@@ -1513,7 +1498,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             miss = sum(1 for v in run_vals if not has_fn(norm_ptr(v)))
             for v in run_vals:
                 note_missing(v, f"table:{hex(run_addr)}")
-            row = {
+            candidate_tables.append({
                 "address": hex(run_addr),
                 "section": str(name),
                 "entries": len(run_vals),        # the TRUE slot count
@@ -1521,10 +1506,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                 "missing_functions": miss,
                 "slots": [hex(v) for v in run_vals[:32]],
                 "slots_truncated": len(run_vals) > 32,   # `slots` shows the first 32
-            }
-            if label is not None:
-                row.update(label)
-            candidate_tables.append(row)
+            })
 
         run_start = start
         off = 0
@@ -1615,56 +1597,9 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "missing_function_candidates_total": candidates_total,
             # the high-confidence subset (aligned + long clean decode run) -- start here.
             "code_likely_candidates": sum(1 for m in missing.values() if m["code_likely"]),
-            # #997 item 3: tables (listed, capped or hidden) whose Itanium header
-            # names an RTTI class, and how many `--unknown-only` hid -- the
-            # listing above excludes those, and `candidate_tables_total` too.
-            "vtables_labelled": vtables_labelled,
-            "vtables_hidden": vtables_hidden,
         },
         "warnings": warnings,
     }
-
-
-def _vtable_label(ctx, bv, run_addr: int, ptr: int) -> dict[str, Any] | None:
-    """``{"vtable_of", "vtable_kind"}`` when the run of code pointers at
-    *run_addr* provably STARTS at a vtable address point the class lens
-    accepts, else None (#997 item 3).
-
-    Provably: the two words directly before the run are the Itanium header --
-    a ``typeinfo for X`` pointer at ``run_addr - ptr`` and an offset-to-top at
-    ``run_addr - 2*ptr`` -- the table decodes through the class lens
-    (``ctx._vtable_layout_for``), and word[0] passes
-    `read_class._classify_backwalk_candidate` (not a mapped pointer, not
-    positive, within the lens's bound unless thunk slots or BN's group symbol
-    vouch for it). Nothing is inferred from how far the lens decodes the
-    table: its slot walk reads through null and pure-virtual words into
-    whatever follows, so a run that starts INSIDE a vtable (after an abstract
-    class's null or `__cxa_pure_virtual` slots) cannot be told from the plain
-    table placed after an all-pure interface, and stays unlabelled (#1006
-    review, rounds 1-3). An unlabelled vtable is listed like any candidate;
-    a dispatch table labelled as one would be hidden by `--unknown-only`."""
-    from . import read_class
-
-    head = run_addr - 2 * ptr
-    if head < 0:
-        return None
-    try:
-        ti = ctx._read_pointer_value(bv, head + ptr, size=ptr)
-        cls = ctx._typeinfo_name_at(bv, ti) if ti else None
-        if not cls:
-            return None
-        layout = ctx._vtable_layout_for(bv, head)
-        raw = ctx._read_pointer_value(bv, head, size=ptr)
-        if not layout or not layout.get("slots") or raw is None:
-            return None
-        ott, rejection, _proof = read_class._classify_backwalk_candidate(
-            ctx, bv, head, raw, ptr, layout, cls)
-    except Exception:  # noqa: BLE001 - a header the lens cannot judge is no label
-        return None
-    if rejection is not None:
-        return None
-    return {"vtable_of": str(cls),
-            "vtable_kind": "primary" if ott == 0 else "secondary"}
 
 
 def _code_regions(bv) -> list[tuple[int, int]]:
