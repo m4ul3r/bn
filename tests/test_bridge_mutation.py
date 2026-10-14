@@ -402,13 +402,21 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
     assert not _has_event(bv, "commit")
 
 
-@pytest.mark.parametrize("restore_ok", [True, False])
-def test_preview_verification_failure_never_claims_verified_937(monkeypatch, restore_ok):
+@pytest.mark.parametrize("revert_fault,residue_text", [
+    (None, None),
+    ("values", "reverting a non-journaled change"),
+    ("hosts", "a function a create split is not back"),
+    ("proto", "has_user_type override could NOT be cleared"),
+])
+def test_preview_verification_failure_never_claims_verified_937(
+        monkeypatch, revert_fault, residue_text):
     """#937: a preview whose readback FAILED kept its exit/status/rollback
     contract but said "Preview verified and reverted." -- on the clean-revert
-    branch and on the restore-failure branch alike. The message must name the
-    failed verification, and still report whether the revert held."""
+    branch and on every incomplete-revert branch alike. The message must name
+    the failed verification, and still name which part of the revert did not
+    hold."""
     bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
@@ -421,63 +429,103 @@ def test_preview_verification_failure_never_claims_verified_937(monkeypatch, res
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verification_failed"},
     )
-    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores",
-                        lambda ctx, bv_, restores: restore_ok)
+    monkeypatch.setattr(me, "_run_local_restores",
+                        lambda ctx, bv_, restores: revert_fault != "values")
+    monkeypatch.setattr(bridge.create_comments, "_split_hosts_at_baseline",
+                        lambda bv_, baseline, what: revert_fault != "hosts")
+    monkeypatch.setattr(me, "_prototype_user_type_residue",
+                        lambda ctx, bv_, results: revert_fault == "proto")
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
     assert result["preview"] is True
     assert result["success"] is False
     assert result["committed"] is False
-    assert result["rolled_back"] is restore_ok
+    assert result["rolled_back"] is (revert_fault is None)
     assert result["results"][0]["status"] == "verification_failed"
     assert "verified" not in result["message"].replace("verification failed", "")
-    assert result["message"].startswith("Preview verification failed")
-    assert ("may be left modified" in result["message"]) is (not restore_ok)
+    if revert_fault is None:
+        assert result["message"] == "Preview verification failed; the change was reverted."
+    else:
+        assert result["message"].startswith("Preview verification failed, and ")
+        assert residue_text in result["message"]
 
 
 def test_a_name_renamed_earlier_in_the_batch_is_explained_975(monkeypatch):
     """#975: a later op naming a function by the spelling an earlier op renamed
     away failed with the resolver's lexically-close but unrelated suggestions.
-    The failure must name the rename (and follow a chained one), while a lookup
-    failure unrelated to any rename keeps its own message."""
+    The failure must name the rename (and follow a chained one). It must NOT
+    fire when the name still resolves -- a round trip gave it back, or a later
+    rename reused it for another function -- and the real failure is a different
+    one: there the hint would point the agent at the WRONG function."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
-    renamed = {"sub_401d10": "handle_request", "handle_request": "handle_request_v2"}
+    names: dict[str, int] = {}
 
-    def apply(bv_, op, restores=None, **kwargs):
-        name = op.get("identifier") or op.get("function")
-        if op["op"] == "rename_symbol":
-            return {"op": "rename_symbol", "kind": "function", "address": "0x401d10",
-                    "before_name": name, "new_name": op["new_name"], "requested": {}}
-        if name in renamed or name == "sub_missing":
+    def resolve(name):
+        if name not in names:
             raise bridge.OperationFailure(
                 "unsupported", f"Function not found: {name}. Did you mean: sub_4025dc")
+        return names[name]
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op["op"] == "rename_symbol":
+            before = op["identifier"]
+            address = resolve(before)
+            del names[before]
+            names[op["new_name"]] = address
+            return {"op": "rename_symbol", "kind": "function", "address": hex(address),
+                    "before_name": before, "new_name": op["new_name"], "requested": {}}
+        resolve(op["function"])
+        if op["op"] == "local_rename":
+            raise bridge.OperationFailure(
+                "unsupported", f"Variable not found: {op['variable']}")
         return {"op": op["op"], "requested": {}}
 
     _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
-    rename = {"op": "rename_symbol", "identifier": "sub_401d10", "new_name": "handle_request"}
+
+    def run(*ops):
+        names.clear()
+        names.update({"sub_401d10": 0x401d10, "sub_401e20": 0x401e20})
+        return instance._mutation("active", True, list(ops))
+
+    def rename(old, new):
+        return {"op": "rename_symbol", "identifier": old, "new_name": new}
+
     comment = {"op": "set_comment", "function": "sub_401d10", "comment": "entry"}
 
-    result = instance._mutation("active", True, [rename, comment])
-    row = result["results"][1]
+    row = run(rename("sub_401d10", "handle_request"), comment)["results"][1]
     assert row["status"] == "unsupported"
     assert "Did you mean" not in row["message"]
     assert row["message"].startswith(
         "sub_401d10 not found: operation 0 of this batch renamed sub_401d10 "
         "(at 0x401d10) to handle_request.")
 
-    chained = {"op": "rename_symbol", "identifier": "handle_request",
-               "new_name": "handle_request_v2"}
-    result = instance._mutation("active", True, [rename, chained, comment])
-    assert "to handle_request, then to handle_request_v2" in result["results"][2]["message"]
-    assert "refer to it as handle_request_v2" in result["results"][2]["message"]
+    row = run(rename("sub_401d10", "handle_request"),
+              rename("handle_request", "handle_request_v2"), comment)["results"][2]
+    assert "to handle_request, then to handle_request_v2" in row["message"]
+    assert "refer to it as handle_request_v2" in row["message"]
 
+    # A miss on a name no rename touched keeps the resolver's message.
     unrelated = {"op": "set_comment", "function": "sub_missing", "comment": "entry"}
-    result = instance._mutation("active", True, [rename, unrelated])
-    assert result["results"][1]["message"] == (
-        "Function not found: sub_missing. Did you mean: sub_4025dc")
+    row = run(rename("sub_401d10", "handle_request"), unrelated)["results"][1]
+    assert row["message"] == "Function not found: sub_missing. Did you mean: sub_4025dc"
+
+    # Round trip: the name was given back, so it resolves; the real failure is
+    # the variable, and that is what must be reported.
+    bad_local = {"op": "local_rename", "function": "sub_401d10",
+                 "variable": "no_such_var", "new_name": "x"}
+    row = run(rename("sub_401d10", "foo"), rename("foo", "sub_401d10"),
+              bad_local)["results"][2]
+    assert row["message"] == "Variable not found: no_such_var"
+
+    # Reuse: `alpha` moved off 0x401d10, then named 0x401e20. It resolves --
+    # to 0x401e20 -- so no hint may send the agent back to 0x401d10.
+    row = run(rename("sub_401d10", "alpha"), rename("alpha", "gamma"),
+              rename("sub_401e20", "alpha"),
+              {**bad_local, "function": "alpha"})["results"][3]
+    assert row["message"] == "Variable not found: no_such_var"
 
 
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):

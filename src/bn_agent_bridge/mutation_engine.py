@@ -746,21 +746,45 @@ def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) ->
     return result
 
 
+_RESOLVER_MISS_PREFIXES = ("Function not found: ", "Symbol not found: ")
+
+
+def _is_resolver_miss(message: str, name: str) -> bool:
+    """Whether *message* is the name resolver's own miss for exactly *name*
+    (`Function not found: <name>` / `Symbol not found: <name>`, optionally
+    followed by its `.`-led suggestions) -- never a different lookup's miss
+    (`Variable not found: ...`) nor a longer name sharing *name* as a prefix."""
+    for prefix in _RESOLVER_MISS_PREFIXES:
+        head = prefix + name
+        if message == head or message.startswith(head + "."):
+            return True
+    return False
+
+
 def _explain_renamed_reference(op: Any, results: list[dict[str, Any]],
                                exc: OperationFailure) -> OperationFailure:
     """#975: a batch resolves each op's names against the state the earlier ops
     left, so naming a function by the spelling an earlier ``rename_symbol`` just
     replaced fails lookup -- and the resolver's "Did you mean" list then offers
     lexically close but unrelated functions, which reads as a wrong address rather
-    than an ordering problem. When the failed op's name matches a rename that
-    already ran in this batch, replace that message with the rename that explains
-    it. Any other failure is returned unchanged."""
-    if not isinstance(op, dict) or "not found" not in exc.message.lower():
+    than an ordering problem. When the failure IS the resolver's miss for the op's
+    own name, and that name was renamed away earlier in this batch and never
+    assigned again, replace the message with the rename that explains it.
+
+    Both conditions matter. A name a later rename gave back (a round trip) or
+    handed to another function (reuse) still resolves, so the op failed for its
+    own reason -- a missing variable, say -- and a rename hint would bury that
+    cause and point the agent at the function the name USED to denote. Any other
+    failure is returned unchanged."""
+    if not isinstance(op, dict):
         return exc
-    refs = {op[key] for key in ("identifier", "function") if isinstance(op.get(key), str)}
+    reassigned = {row.get("new_name") for row in results if row.get("op") == "rename_symbol"}
+    refs = {op[key] for key in ("identifier", "function")
+            if isinstance(op.get(key), str) and op[key] not in reassigned
+            and _is_resolver_miss(exc.message, op[key])}
     for index, row in enumerate(results):
         before = row.get("before_name")
-        if row.get("op") != "rename_symbol" or before not in refs or before == row.get("new_name"):
+        if row.get("op") != "rename_symbol" or before not in refs:
             continue
         address = row.get("address")
         renamed_to = row.get("new_name")
