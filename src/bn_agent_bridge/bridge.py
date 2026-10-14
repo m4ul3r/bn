@@ -276,6 +276,104 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
+# The request the current thread is serving, as far as the write gate is
+# concerned: set by `dispatch` for the whole request, read when that request
+# reaches the gate -- directly (lock="write" ops) or from inside a self-locking
+# handler (refresh, mutations, function create, go rename).
+_gate_request = threading.local()
+
+
+class _WriteGate:
+    """The writer gate, plus WHO holds it and WHO is queued behind it (#976).
+
+    A write-gated request used to block silently for as long as the holder ran:
+    `py exec` behind a two-minute `refresh` answered nothing for two minutes,
+    while reads in the same window returned at once, so an agent could not tell
+    a queue from a hang. Recording the holder and the waiting request ids lets a
+    side-channel `write_gate_status` answer "request X is waiting for refresh,
+    started N s ago", and lets a request that declared `no_wait` refuse with
+    that same answer instead of queueing.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = threading.Lock()
+        self._holder: dict[str, Any] | None = None
+        self._waiters: set[str] = set()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> None:
+        op = getattr(_gate_request, "op", None)
+        request_id = getattr(_gate_request, "request_id", None)
+        if not self._lock.acquire(blocking=False):
+            if getattr(_gate_request, "no_wait", False):
+                raise RuntimeError(self._busy_message(op))
+            if request_id:
+                with self._state:
+                    self._waiters.add(request_id)
+            try:
+                self._lock.acquire()
+            finally:
+                if request_id:
+                    with self._state:
+                        self._waiters.discard(request_id)
+        with self._state:
+            self._holder = {"op": op, "since": time.monotonic()}
+
+    def __exit__(self, *exc_info: object) -> None:
+        with self._state:
+            self._holder = None
+        self._lock.release()
+
+    def holder(self) -> dict[str, Any] | None:
+        with self._state:
+            if self._holder is None:
+                return None
+            return {
+                "op": self._holder["op"],
+                "elapsed_seconds": round(time.monotonic() - self._holder["since"], 1),
+            }
+
+    def status(self, request_id: str) -> dict[str, Any]:
+        with self._state:
+            waiting = request_id in self._waiters
+        return {
+            "kind": "write_gate_status",
+            "request_id": request_id,
+            "waiting": waiting,
+            "holder": self.holder(),
+        }
+
+    def _busy_message(self, op: str | None) -> str:
+        holder = self.holder()
+        what = (
+            f"{holder['op'] or 'another write'} in progress "
+            f"(started {holder['elapsed_seconds']:g}s ago)"
+            if holder is not None
+            else "another write in progress"
+        )
+        return (
+            f"busy: {what}; {op or 'this request'} needs the write gate and "
+            "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
+            "that operation finishes, or unset BN_NO_WAIT to wait for it."
+        )
+
+
+@contextlib.contextmanager
+def _gate_request_context(op: Any, request_id: Any, no_wait: bool):
+    previous = dict(vars(_gate_request))
+    _gate_request.op = op if isinstance(op, str) else None
+    _gate_request.request_id = request_id if isinstance(request_id, str) and request_id else None
+    _gate_request.no_wait = no_wait
+    try:
+        yield
+    finally:
+        vars(_gate_request).clear()
+        vars(_gate_request).update(previous)
+
+
 class PinnedTarget(str):
     """A target identity the BRIDGE pinned, not a selector a client sent.
 
@@ -571,6 +669,33 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # The manager that took this one's ledger over in a GUI bridge restart
+        # (`succeed`). A request the old bridge admitted can still commit -- or
+        # save, or close -- after the handover; its ledger change is forwarded
+        # so the successor does not lose it (#953).
+        self._successor: TargetManager | None = None
+
+    def succeed(self, predecessor: TargetManager) -> None:
+        """Take over *predecessor*'s per-view ledger before serving anything.
+
+        A GUI "Restart Bridge" replaces the bridge -- and with it the
+        TargetManager -- inside the same BN process, while every tab stays
+        open. A fresh manager started with no view ids and an empty dirty set,
+        so a tab holding a committed-but-unsaved mutation was listed
+        `unsaved=false` the moment the new bridge answered, with nothing saved
+        (#953). Carrying the handle-keyed id map over (not a filename or a
+        selector, which another view can share) keeps each RETAINED view's
+        stable id, and with it its unsaved marker and backing-database path. A
+        view that closed meanwhile is pruned by the first complete `refresh()`
+        exactly as it would have been in the old manager: the carried map holds
+        strong references, so no other view can arrive under its handle.
+        """
+        with predecessor._lock, self._lock:
+            self._ids_by_object = dict(predecessor._ids_by_object)
+            self._next_id = max(self._next_id, predecessor._next_id)
+            self._dirty_view_ids = set(predecessor._dirty_view_ids)
+            self._database_paths = dict(predecessor._database_paths)
+            predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
@@ -581,12 +706,18 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.add(vid)
+            successor = self._successor
+        if successor is not None:
+            successor.mark_dirty(bv)
 
     def clear_dirty(self, bv) -> None:
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
+            successor = self._successor
+        if successor is not None:
+            successor.clear_dirty(bv)
 
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
@@ -613,6 +744,9 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._database_paths[vid] = str(path)
+            successor = self._successor
+        if successor is not None:
+            successor.note_database(bv, path)
 
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
         """The open target whose file IS *path*, other than *exclude*, or None.
@@ -678,6 +812,9 @@ class TargetManager:
                 self._database_paths.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
+            successor = self._successor
+        if successor is not None:
+            successor.forget(bv)
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -1442,7 +1579,9 @@ class BinaryNinjaBridge:
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
-        self._write_gate = threading.Lock()
+        # It records its holder and waiters so a queued writer is observable
+        # (`write_gate_status`) and refusable (`no_wait`) rather than silent (#976).
+        self._write_gate = _WriteGate()
         self._request_state_lock = threading.Lock()
         self._requests_drained = threading.Condition(self._request_state_lock)
         self._request_threads: dict[threading.Thread, int] = {}
@@ -1933,7 +2072,10 @@ class BinaryNinjaBridge:
                     lock = self._write_operation_lock()
                 elif lock_class == "read":
                     lock = self._target_lock.read()
-            with lock:
+            # The gate reads which request reached it from this context, so a
+            # self-locking handler (refresh, mutations) reports and honours
+            # `no_wait` exactly like a lock="write" op does (#976).
+            with _gate_request_context(op, payload.get("id"), payload.get("no_wait") is True), lock:
                 if spec is not None and spec.destructive:
                     # The selector the HANDLER will resolve, which is not
                     # always the request's top-level one (batch_apply prefers
@@ -4602,6 +4744,15 @@ def _bind_cancel_request(bridge, params, target):
     return bridge._cancel_request(params.get("request_id"))
 
 
+@op("write_gate_status", lock="none")
+def _bind_write_gate_status(bridge, params, target):
+    # lock="none": it must answer while the gate it describes is held (#976).
+    request_id = params.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("write_gate_status requires params.request_id")
+    return bridge._write_gate.status(request_id)
+
+
 @op("load_binary", lock="none")
 def _bind_load_binary(bridge, params, target):
     return bridge._load_binary(
@@ -5983,13 +6134,17 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     return bv
 
 
-def start_bridge():  # pragma: no cover - GUI runtime
+def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
     if _bridge is not None:
         return
     bridge = BinaryNinjaBridge()
+    if predecessor is not None:
+        # Before start(): the first request the new bridge answers must already
+        # see the retained tabs' unsaved state (#953).
+        bridge.targets.succeed(predecessor)
     bridge.start()
     _bridge = bridge
 
@@ -6071,6 +6226,12 @@ def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
     restart_bridge()
 
 
+# The TargetManager of a GUI bridge that Restart Bridge stopped and no successor
+# has replaced yet: its per-view ledger (unsaved markers, backing databases)
+# belongs to tabs that are still open (#953).
+_retired_targets: TargetManager | None = None
+
+
 def restart_bridge():  # pragma: no cover - GUI runtime
     """Stop-then-start the bridge, unlike start_bridge()'s start-once no-op.
 
@@ -6079,17 +6240,21 @@ def restart_bridge():  # pragma: no cover - GUI runtime
     running (#585). This tears the live bridge down first so a fresh instance
     always gets constructed and started.
     """
-    global _bridge
+    global _bridge, _retired_targets
     if ui is None:
         return
     if _bridge is not None:
+        # Kept until a successor actually starts, so a failed start followed by
+        # another Restart still carries the retained tabs' ledger (#953).
+        _retired_targets = _bridge.targets
         _stop_bridge()
     try:
-        start_bridge()
+        start_bridge(_retired_targets)
     except Exception as exc:
         bn.log_error(f"BN Agent Bridge restart failed: {exc}")
         return
     if _bridge is not None:
+        _retired_targets = None
         bn.log_info("BN Agent Bridge restarted")
     else:
         bn.log_error("BN Agent Bridge restart failed: bridge did not start")

@@ -269,7 +269,10 @@ def _save(args: argparse.Namespace) -> int:
 @command("refresh",
          help="Run full analysis on the selected target (e.g. after a --quick load). "
               "On a large target this can take minutes; reads stay responsive meanwhile, "
-              "so poll `bn target info` on another connection to watch analysis_progress.",
+              "so poll `bn target info` on another connection to watch analysis_progress. "
+              "Writes wait for it: py exec, mutations, save, close and decompile "
+              "--force-analysis queue until the refresh finishes (a notice on stderr says "
+              "so); set BN_NO_WAIT=1 to make them fail fast with `busy:` instead.",
          target=True)
 def _refresh(args: argparse.Namespace) -> int:
     return _call(

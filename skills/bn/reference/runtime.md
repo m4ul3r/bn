@@ -59,6 +59,8 @@ A saved `.bndb` may be preferred over adjacent raw bytes, but only if it describ
 
 `--quick` skips the full analysis pass. Sections and imports are useful immediately; function listings/searches are partial, strings can refuse, and xrefs, callsites, and taint need analysis. All mutations refuse a quick-loaded target until `bn refresh`. Check `analysis_state` and run `bn refresh` before using these reads for a complete survey. `decompile --force-analysis` can analyze one existing function; it does not replace full target analysis or create a missing function.
 
+While `bn refresh` runs, reads answer at once, but writes queue behind it: `py exec`, every mutation, `save`, `close` and `decompile --force-analysis` wait until the refresh finishes. After about two seconds of waiting the CLI prints `bn: <op> is waiting for the running refresh (started Ns ago) to finish` on stderr, so a queue is not a hang. Set `BN_NO_WAIT=1` to make a queued write fail fast with `busy: refresh in progress ...` (exit 2) instead.
+
 ```bash
 bn session start /path/to/sample.bin --instance-id triage-1 --quick
 bn -i triage-1 target info
