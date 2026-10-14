@@ -6115,11 +6115,33 @@ def test_close_binary_refuses_a_target_named_only_by_its_bndb_stripped_alias(
     _hermetic_registry(instance, tmp_path)
     db = _ClosableBV("/proj/hello.bndb", session_id="11")
     _register_views(bridge, db)
-    with pytest.raises(RuntimeError, match=r"pass `-t hello.bndb`"):
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target="hello")
+    assert str(exc.value).endswith("close it by its listed selector instead: hello.bndb")
     assert not db.closed
     _close_on_watchdog(instance, target="hello.bndb")
     assert db.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_stripped_refusal_suggests_a_selector_that_resolves(
+    monkeypatch, tmp_path
+):
+    # #996 round-3 nit: with `a/hello.bndb` and `b/hello.bndb` open, the hint
+    # for `close -t a/hello` named the basename `hello.bndb`, itself ambiguous.
+    # It names the LISTED selector, which resolves to exactly that target.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    left = _ClosableBV("/proj/a/hello.bndb", session_id="11")
+    right = _ClosableBV("/proj/b/hello.bndb", session_id="22")
+    _register_views(bridge, left, right)
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target="a/hello")
+    suggested = str(exc.value).rsplit("listed selector instead: ", 1)[1]
+    assert suggested == "a/hello.bndb"
+    assert instance.targets.resolve(suggested) is left
+    assert not left.closed and not right.closed
     bridge._headless_views.clear()
 
 

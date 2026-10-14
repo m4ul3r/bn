@@ -65,7 +65,7 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
-from .target_hint import format_multi_target_hint, open_target_lines
+from .target_hint import LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -1127,10 +1127,12 @@ class TargetManager:
                     pairs[vid] = raw_vid
         return pairs
 
-    def stripped_only_name(self, selector: str | None, bv) -> str | None:
-        """*bv*'s basename when *selector* names it ONLY through a `.bndb`-stripped
-        alias (`hello` for `hello.bndb`), else None. A destructive close refuses
-        that convenience (#996 review)."""
+    def stripped_only_match(self, selector: str | None, bv) -> tuple[str, str] | None:
+        """``(filename, listed selector)`` of *bv* when *selector* names it ONLY
+        through a `.bndb`-stripped alias (`hello` for `hello.bndb`), else None.
+        A destructive close refuses that convenience (#996 review). The listed
+        selector is the one `target list` advertises, which resolves to exactly
+        this view -- unlike its basename, which another open view may share."""
         if selector is None or isinstance(selector, PinnedTarget):
             return None
         with self._lock:
@@ -1138,7 +1140,9 @@ class TargetManager:
             record = self._records.get(vid) if vid is not None else None
             if record is None or self._match_kind(record, selector) != self._STRIPPED:
                 return None
-            return record.basename
+        row = next((r for r in self.refresh() if r.get("view_id") == vid), None)
+        listed = str(row.get("selector") or "") if row else ""
+        return record.filename, listed or record.target_id()
 
     def _drop_saved_databases(
         self, kinds: dict[str, str], saved_pairs: dict[str, str]
@@ -3224,11 +3228,13 @@ class BinaryNinjaBridge:
             # convenience (#312). Once the raw `hello` is closed, `-t hello`
             # names `hello.bndb` only through that alias -- say so, rather than
             # tear down the database the caller may not have meant.
-            stripped = self.targets.stripped_only_name(target, target_bv)
+            stripped = self.targets.stripped_only_match(target, target_bv)
             if stripped is not None:
+                filename, listed = stripped
                 raise RuntimeError(
-                    f"close_binary: {str(target)!r} names {stripped} only through "
-                    f"its `.bndb`-stripped name; to close it pass `-t {stripped}`."
+                    f"close_binary: {str(target)!r} names {filename} only through "
+                    f"its `.bndb`-stripped name; {LISTED_SELECTOR_LEAD}"
+                    f"{shlex.quote(listed)}"
                 )
 
         # Target-based close takes priority and must succeed even when

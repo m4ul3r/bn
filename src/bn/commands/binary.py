@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 from typing import Any
 
 from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
-from ..target_hint import format_multi_target_hint
+from ..target_hint import LISTED_SELECTOR_LEAD, format_multi_target_hint
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -256,14 +257,36 @@ def _close(args: argparse.Namespace) -> int:
                     "including GUI tabs bn did not load)."
                 ) from None
             raise
-    return _call(
-        args,
-        "close_binary",
-        params,
-        require_target=False,
-        text_renderer=_render_close_text,
-        stem="close",
-    )
+    try:
+        return _call(
+            args,
+            "close_binary",
+            params,
+            require_target=False,
+            text_renderer=_render_close_text,
+            stem="close",
+        )
+    except BridgeError as exc:
+        raise _close_hint_in_run_form(args, exc) from None
+
+
+def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> BridgeError:
+    """Spell the bridge's "listed selector" refusal as the command that was run.
+
+    The bridge names the selector `target list` advertises for the target (one
+    that resolves to exactly it); only the CLI knows whether that goes after
+    `bn close -t` or as `bn target close`'s positional (#996 review).
+    """
+    message = str(exc)
+    if LISTED_SELECTOR_LEAD not in message:
+        return exc
+    head, quoted = message.rsplit(LISTED_SELECTOR_LEAD, 1)
+    instance = getattr(args, "instance", None)
+    routing = f"-i {shlex.quote(str(instance))} " if instance else ""
+    command = (f"bn {routing}target close {quoted}"
+               if getattr(args, "_close_spelling", None) == "target close"
+               else f"bn {routing}close -t {quoted}")
+    return BridgeError(f"{head}close it with `{command}`.")
 
 
 @command("target", "close", help="Close one open target by selector", fmt="text",
@@ -306,6 +329,7 @@ def _target_close(args: argparse.Namespace) -> int:
     args.path = None
     args.all = False
     args._sticky_target = False
+    args._close_spelling = "target close"
     return _close(args)
 
 

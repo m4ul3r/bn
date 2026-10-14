@@ -986,6 +986,35 @@ def test_close_by_name_refuses_two_targets_with_that_file_name_996(
     assert "Open targets:" not in err
 
 
+def test_stripped_close_refusal_is_spelled_as_the_command_that_was_run_996(
+    monkeypatch, capsys
+):
+    """#996 round-3 nit: the bridge names the listed selector; `bn close` gets
+    `bn close -t <sel>` and `bn target close` (positional) `bn target close <sel>`
+    -- never a `-t` the second command rejects."""
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    refusal = (
+        "close_binary: 'a/hello' names /p/a/hello.bndb only through its "
+        "`.bndb`-stripped name; close it by its listed selector instead: "
+        "'a/hello db.bndb'")
+
+    def refuse(op, **kwargs):
+        assert op == "close_binary"
+        raise bn.cli.BridgeError(refusal)  # what send_request raises for ok:false
+
+    for argv, expected in (
+        (["close", "-t", "a/hello"], "`bn close -t 'a/hello db.bndb'`"),
+        (["target", "close", "a/hello"], "`bn target close 'a/hello db.bndb'`"),
+        (["-i", "demo", "target", "close", "a/hello"],
+         "`bn -i demo target close 'a/hello db.bndb'`"),
+    ):
+        monkeypatch.setattr(bn.cli, "send_request", refuse)
+        assert bn.cli.main(argv) == 2, argv
+        err = capsys.readouterr().err
+        assert f"close it with {expected}." in err, (argv, err)
+        assert "listed selector instead" not in err
+
+
 def test_target_list_and_info_name_the_answering_instance_996(fake_transport, capsys):
     """#996: a lone instance answers from any cwd, so the output names it."""
     row = {"target_id": "123:1:7", "selector": "hello", "view_id": "1"}

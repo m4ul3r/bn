@@ -25,6 +25,12 @@ from typing import Any, Callable
 SELECT_HINT_LINE = "Pass -t <selector> (--target) to choose one."
 OPEN_TARGETS_HEADING = "Open targets:"
 STABLE_ID_NOTE = "note: view_id / target_id are stable across `bn save`"
+# #996 review: the tail of a destructive close's refusal when its selector named
+# the target only through a `.bndb`-stripped alias. The bridge ends the message
+# with this lead plus the shell-quoted LISTED selector (which resolves to
+# exactly that target); the CLI replaces the tail with the spelling of the
+# command that was run (`bn close -t X` / `bn target close X`).
+LISTED_SELECTOR_LEAD = "close it by its listed selector instead: "
 
 
 def target_row(target: dict[str, Any]) -> str:
