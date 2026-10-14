@@ -423,9 +423,9 @@ def _xrefs_any(ctx, selector: str | None, symbols: list[Any]) -> dict[str, Any]:
             "data_ref_count": res.get("data_ref_count", 0),
             "caller_function_count": res.get("caller_function_count", 0),
         }
-        # A probed address that is a string start: the row only COUNTS its
-        # referencing functions, so the renderer points at the one call that
-        # names them for a whole filtered string set (#1002).
+        # A probed address that reads as a string -- its start or a byte inside
+        # it: the row only COUNTS the referencing functions, so the renderer
+        # points at the one call that names them for a whole string set (#1002).
         target_context = res.get("target_context")
         if isinstance(target_context, dict) and target_context.get("kind") == "string":
             row["target_kind"] = "string"

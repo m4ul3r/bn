@@ -2368,7 +2368,7 @@ def test_xrefs_any_points_string_addresses_at_strings_with_xrefs(monkeypatch, ca
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "tip: 2 probed address(es) are strings" in out
+    assert "tip: 2 probed address(es) point into strings" in out
     assert "bn strings --query <text> --with-xrefs" in out
 
 

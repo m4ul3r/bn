@@ -2776,7 +2776,7 @@ def _render_xrefs_any_text(value: Any) -> str:
             lines.append(f"  {s.get('symbol')}: absent")
     if string_targets:
         lines.append(
-            f"tip: {string_targets} probed address(es) are strings; "
+            f"tip: {string_targets} probed address(es) point into strings; "
             "`bn strings --query <text> --with-xrefs` names the functions "
             "referencing every matching string in one call")
     return "\n".join(lines)
@@ -6914,12 +6914,15 @@ def _render_skill_install_text(value: Any) -> str:
         lines.extend(f"- {dest}" for dest in up_to_date)
 
     # #1002: these were left alone and are NOT this install -- a link into a
-    # previous checkout, dangling, or a foreign directory. Never "installed".
+    # previous checkout, dangling, another mode, or a foreign directory. Never
+    # "installed". Each row carries its own remedy: --force refuses some of
+    # them, so one blanket "re-run with --force" would be false.
     if not_updated:
-        lines.append("Not updated, existing destination is not this install "
-                     "(re-run with --force to replace):")
-        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
-                     for row in not_updated)
+        lines.append("Not updated, existing destination is not this install:")
+        for row in not_updated:
+            remedy = _text_value(row, "remedy")
+            tail = f"; {remedy}" if remedy else ""
+            lines.append(f"- {row.get('destination')} ({row.get('detail')}){tail}")
 
     return "\n".join(lines) + "\n"
 

@@ -86,13 +86,13 @@ def test_truncation_note_fires_when_output_is_not_spilled(monkeypatch, capsys):
     assert "spilled" not in stderr
 
 
-@pytest.mark.parametrize("destination", ["regular_file", "pipe"])
-def test_truncation_note_is_dropped_only_for_a_regular_file_stdout(
+@pytest.mark.parametrize("destination", ["regular_file", "null_device", "pipe"])
+def test_truncation_note_is_dropped_only_where_no_agent_reads_stdout(
     monkeypatch, capsys, tmp_path, destination
 ):
-    """#1002: `> out.json` puts nothing in an agent's context, so the note is
-    noise there. A pipe keeps it: an agent harness captures stdout through a
-    pipe too, so a pipe cannot be told apart from `| jq` (user decision)."""
+    """#1002: `> out.json` or `> /dev/null` puts nothing in an agent's context, so
+    the note is noise there. A pipe keeps it: an agent harness captures stdout
+    through a pipe too, so a pipe cannot be told apart from `| jq` (user decision)."""
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"items": [], "total": 0}}
 
@@ -101,9 +101,11 @@ def test_truncation_note_is_dropped_only_for_a_regular_file_stdout(
         bn.cli, "write_output_result",
         lambda value, *, fmt, out_path, stem, **kwargs: _oversized_unspilled_namespace(),
     )
+    reader = None
     if destination == "regular_file":
-        stdout = open(tmp_path / "fl.json", "w")
-        reader = None
+        stdout = open(tmp_path / "fl.json", "w")  # noqa: SIM115 -- closed below
+    elif destination == "null_device":
+        stdout = open(os.devnull, "w")  # noqa: SIM115 -- closed below
     else:
         read_fd, write_fd = os.pipe()
         stdout = os.fdopen(write_fd, "w")
@@ -119,12 +121,13 @@ def test_truncation_note_is_dropped_only_for_a_regular_file_stdout(
 
     assert rc == 0
     stderr = capsys.readouterr().err
-    if destination == "regular_file":
-        assert (tmp_path / "fl.json").read_text() == "ok: true\n"
-        assert "estimated tokens" not in stderr
-    else:
+    if destination == "pipe":
         assert "12345 estimated tokens" in stderr
         assert "--limit/--offset" in stderr
+    else:
+        assert "estimated tokens" not in stderr
+        if destination == "regular_file":
+            assert (tmp_path / "fl.json").read_text() == "ok: true\n"
 
 
 def test_every_advised_flag_is_accepted_by_the_command_it_names():

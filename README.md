@@ -41,7 +41,7 @@ bn skill install
 
 That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
-Re-running either install is safe: an existing link (or copy) of the same source is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at and exits `1`, `plugin install` refuses it, and both name `--force` to replace it.
+Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at and exits `1`, and `plugin install` refuses it. Each names its remedy: `--force` where `--force` will replace it (a link, an empty directory, a previous install of the same source, or one in the other mode), otherwise moving it aside by hand.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
@@ -215,7 +215,7 @@ The only exception is `bn bundle function`, which writes the bundle artifact fro
 
 `bn function list` and `bn function search` return the full matching set for the selected target or address range, and by default that full set goes to stdout — `bn` writes nothing to disk unless you ask it to. Spilling is opt-in: set `BN_SPILL_TOKENS=<positive N>` to divert any result over N estimated tokens to an artifact, in which case stdout carries the compact envelope above (with `spilled: true`) and stderr a short warning naming the path. Any other value — unset, empty, `0`, negative, non-numeric — means no spill, so a typo cannot silently re-arm disk output; `--out <path>` writes the body wherever you name regardless. With spilling off, a payload over 10 000 estimated tokens still draws one stderr `note:` naming that command's own slicing flag (`--limit`/`--offset` for lists, `--lines` for `decompile`/`il`/`disasm`), because what truncates a long payload then is the consuming agent's harness rather than `bn`.
 
-The note is skipped when stdout is redirected to a regular file (`> out.json`): nothing there lands in an agent's context. A pipe keeps it, because an agent harness captures stdout through a pipe too and `bn` cannot tell that pipe from `| jq`.
+The note is skipped when stdout is redirected to a regular file (`> out.json`) or `/dev/null`: nothing there lands in an agent's context. A pipe keeps it, because an agent harness captures stdout through a pipe too and `bn` cannot tell that pipe from `| jq`.
 
 ## Extraction Commands
 
