@@ -160,12 +160,13 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
     )
 
 
-@command("dataflow", "values", help="Value-set (possible values) at an address",
+@command("dataflow", "values", help="Instruction/source value-set and separate call-destination value-set",
          target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--at", dest="at", required=True,
-                 help="Instruction address (hex 0x.. or decimal) within the function"),
+                 help="Instruction start address (hex 0x.. or decimal) within the function; "
+                      "call destinations are reported separately, not as return values"),
          ],
          estimable=True)
 def _dataflow_values(args: argparse.Namespace) -> int:

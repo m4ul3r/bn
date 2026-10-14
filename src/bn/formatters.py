@@ -4373,28 +4373,36 @@ def _render_values_text(value: Any) -> str:
     fn = _field_dict(value, "function")
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
-    pvs = _field_dict(value, "possible_values")
-    if not pvs:
-        # `<unavailable>` is what an ABSENT field prints: a present but malformed
-        # one must not impersonate "the analysis had no answer" (#619).
-        lines.append(f"possible values: <malformed: {value['possible_values']!r}>"
-                     if value.get("possible_values")
-                     else "possible values: <unavailable>")
-        return "\n".join(lines)
-    # `str()` because the type is INTERPOLATED and then appended to: a non-string
-    # `type` beside a readable `value` made `summary +=` a TypeError and cost the
-    # whole values card, where the same payload without the type renders (#619).
-    summary = str(pvs.get("type", "?"))
-    if "value" in pvs:
-        summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
-    if pvs.get("values"):
-        summary += f"  values={pvs['values']}"
-    if pvs.get("ranges"):
-        summary += f"  ranges={pvs['ranges']}"
-    lines.append(f"possible values: {summary}")
-    lines.append(f"  raw: {pvs.get('raw', '')}")
-    if value.get("value_basis") == "source_expression" and value.get("source_expression"):
-        lines.append(f"  of source expression: {value['source_expression']}")
+    value_sets = [("possible values", value)]
+    if _field_present(value, "call_destination"):
+        destination = _field_dict(value, "call_destination")
+        lines.append(f"call destination: {destination.get('expression', '<unavailable>')}")
+        value_sets.append(("call destination possible values", destination))
+    for label, value_set in value_sets:
+        pvs = _field_dict(value_set, "possible_values")
+        if not pvs:
+            # An absent set is unavailable, not malformed analysis (#619).
+            lines.append(f"{label}: <malformed: {value_set['possible_values']!r}>"
+                         if value_set.get("possible_values")
+                         else f"{label}: <unavailable>")
+            continue
+        # Coerce the type before appending value details (#619).
+        summary = str(pvs.get("type", "?"))
+        if "value" in pvs:
+            summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
+        if pvs.get("values"):
+            summary += f"  values={pvs['values']}"
+        if pvs.get("ranges"):
+            summary += f"  ranges={pvs['ranges']}"
+        lines.append(f"{label}: {summary}")
+        lines.append(f"  raw: {pvs.get('raw', '')}")
+        basis = value_set.get("value_basis")
+        if basis == "source_expression" and value_set.get("source_expression"):
+            lines.append(f"  of source expression: {value_set['source_expression']}")
+        elif basis == "instruction":
+            lines.append("  of instruction")
+        elif basis == "destination_expression":
+            lines.append(f"  of destination expression: {value_set.get('expression')}")
     return "\n".join(lines)
 
 

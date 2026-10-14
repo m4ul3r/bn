@@ -422,7 +422,7 @@ def _decompile_many(
              arg("--explain", action="store_true", default=False,
                  help="Print each warning's full explanation and next step under its "
                       "one-line `warning[<code>]:` summary (text mode; json carries "
-                      "the sentences in `warnings` and `{code, summary, detail}` rows "
+                      "the sentences in `warnings` and `{code, summary, detail, address}` rows "
                       "in `warning_rows`). In the Pseudo C, a `❓` line is control "
                       "flow BN could not resolve -- an indirect jump with no known "
                       "target, which may be a tail call (its arguments are not "

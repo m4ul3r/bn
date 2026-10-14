@@ -57,6 +57,13 @@ def _warning_row(code: str, summary: str, detail: str, **extra: Any) -> dict[str
 
     Text used to print *detail* alone, and agents filtered every `warning:` line
     out wholesale -- dropping the ones that mattered with the boilerplate."""
+    if "address" not in extra:
+        addresses = extra.get("addresses") or []
+        calls = extra.get("calls") or []
+        if addresses:
+            extra["address"] = addresses[0]
+        elif calls:
+            extra["address"] = calls[0]["address"]
     return {"code": code, "summary": summary, "detail": detail, **extra}
 
 
@@ -1518,9 +1525,8 @@ def _callee_split_notes(bv, func) -> list[dict[str, Any]]:
 
 _SHORT_STRING_MAX = 64
 _STRING_NOTE_LISTED_MAX = 8
-# Without a `char *` parameter to say so, a run this short is as likely a small
-# integer, a UTF-16 code unit or a struct field as a string: `{0x41, 0, 0, 0}`
-# reads as "A" (#985 review). Three printable bytes is the issue's own `" -n"`.
+# Below three characters, untyped byte previews are too noisy (#985).
+# This is only a display threshold, never evidence that bytes are a string.
 _UNTYPED_STRING_MIN = 3
 _CHAR_POINTER_RE = re.compile(r"^(?:const\s+)?(?:(?:un)?signed\s+)?char\b[^*]*\*(?:\s*const)?$")
 
@@ -1532,7 +1538,7 @@ _CHAR_POINTER_RE = re.compile(r"^(?:const\s+)?(?:(?:un)?signed\s+)?char\b[^*]*\*
 # call on a typed import rendered the literal. A curated list rather than a
 # heuristic because the name is the whole witness: only a callee that IS this
 # libc function (an import, or a body whose prototype stops short of the
-# argument) consults it, so the three-character rule for unknown callees holds.
+# argument) consults it; unknown callees provide no string-type evidence.
 # The printf/scanf format positions are NOT repeated here: they are
 # `il_format._VARIADIC_FORMAT_FAMILY`'s, read through `_variadic_format_family`,
 # so the two tables cannot disagree.
@@ -1598,12 +1604,10 @@ def _read_only_data(bv, address: int) -> bool:
 
 
 def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
-    """The printable NUL-terminated string at *address*, when BN defined none
-    and it is at least *min_length* characters long."""
+    """Decode printable UTF-8 bytes before a NUL, not evidence of their type."""
+    import unicodedata
+
     if bv.get_string_at(address) is not None:
-        return None
-    var = bv.get_data_var_at(address)
-    if var is not None and "char" in str(getattr(var, "type", "")):
         return None
     if not _read_only_data(bv, address):
         return None
@@ -1611,10 +1615,15 @@ def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
     end = data.find(b"\0")
     if end < max(1, min_length):
         return None
-    body = data[:end]
-    if not all(0x20 <= c < 0x7f or c in (0x09, 0x0a, 0x0d) for c in body):
+    try:
+        value = data[:end].decode("utf-8")
+    except UnicodeDecodeError:
         return None
-    return body.decode("ascii")
+    if len(value) < min_length or not all(
+            c.isprintable() or c in "\t\n\r" or unicodedata.category(c) == "Zs"
+            for c in value):
+        return None
+    return value
 
 
 def _char_pointer_parameter(bv, target: int | None, index: int,
@@ -1689,36 +1698,25 @@ def _libc_char_pointer(bv, raw_name: str, index: int, memo: dict[str, Any]) -> b
 
 
 def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
-    """Name call arguments rendered as a raw address that point at a short C
-    string BN never defined (#970).
+    """Describe raw call arguments using type facts, never byte length alone.
 
-    BN's string scan has a minimum length, so `" -n"` in `s << "cat " << f <<
-    " -n"` stays an untyped address: decompile prints `0x402ae0` and `strings`
-    lists nothing. Only a constant argument whose hex spelling actually appears
-    in the rendered text is reported, and only into read-only data, so a
-    pointer BN already renders as a literal or a writable buffer never is.
-
-    Printable bytes before a NUL are weak evidence on their own: an `int[]`, a
-    UTF-16 string and a struct all start that way (#985 review). So a run is
-    reported at any length only when the callee takes a `char *` there, and
-    otherwise only from `_UNTYPED_STRING_MIN` characters.
-    Read-only: defining the string is the caller's choice (`bn data retype`)."""
+    A narrow character array data variable or a callee's character-pointer
+    parameter supports naming a string. Otherwise printable NUL-terminated
+    bytes are only a byte preview, even when there are three or more (#1019).
+    """
     try:
         mlil = getattr(func, "mlil", None) or getattr(func, "medium_level_il", None)
         instructions = list(mlil.instructions) if mlil is not None else []
     except Exception:  # noqa: BLE001
         return None
-    found: dict[int, tuple[str, int]] = {}
+    found: dict[int, tuple[str, int, bool]] = {}
     memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
     # BN's placeholder name for untyped data counts too: a library prototype
     # that types the argument as a pointer (aarch64 libc's `setlocale(int32_t,
     # int64_t*)`) renders it `&data_400b90`, not `0x400b90` (#1000 review).
-    # But BN gave that address a data variable, which on a stripped binary is
-    # as often an `int[]` or a struct (`memcmp(p, &data_4008f0, 0x10)` read as
-    # "ABC"), so a placeholder is named only on the evidence the short-literal
-    # rule already demands: a callee that takes a narrow `char *` there.
+    # Placeholder names and raw hex addresses carry no string-type evidence.
     raw = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
     placeholders = {int(token, 16)
                     for token in re.findall(r"\bdata_([0-9a-fA-F]+)\b", text)} - raw
@@ -1736,32 +1734,45 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
                 address = int(param.constant)
                 if address in found or (address not in raw and address not in placeholders):
                     continue
-                typed = _char_pointer_parameter(bv, target, index, memo)
-                if address in placeholders and not typed:
-                    continue
+                var = bv.get_data_var_at(address)
+                array_type = str(getattr(var, "type", "")).strip()
+                typed = bool(re.fullmatch(
+                    r"(?:const\s+)?(?:(?:un)?signed\s+)?char(?:\s+const)?\s*\[\s*\d+\s*\]",
+                    array_type)) or _char_pointer_parameter(bv, target, index, memo)
                 value = _undefined_c_string(
                     bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
             except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
                 continue
             if value is not None:
-                found[address] = (value, int(getattr(ins, "address", 0)))
+                call = int(getattr(ins, "address", 0))
+                found[address] = (value, call, typed)
     if not found:
         return None
-    rows = [f"{hex(a)} = {_c_quote(v)} (call at {hex(c)})"
-            for a, (v, c) in list(found.items())[:_STRING_NOTE_LISTED_MAX]]
+    rows = [f"{hex(a)} = {_c_quote(v)} (call at {hex(c)})" if typed
+            else f"bytes at {hex(a)} read as {_c_quote(v)} (call at {hex(c)})"
+            for a, (v, c, typed) in list(found.items())[:_STRING_NOTE_LISTED_MAX]]
     more = len(found) - len(rows)
-    first, (value, _) = next(iter(found.items()))
-    retype = f"bn data retype {hex(first)} 'char[{len(value) + 1}]'"
+    strings = [{"address": hex(a), "value": v, "call": hex(c)}
+               for a, (v, c, typed) in found.items() if typed]
+    previews = [{"address": hex(a), "value": v, "call": hex(c)}
+                for a, (v, c, typed) in found.items() if not typed]
+    advice = ""
+    if strings:
+        first = strings[0]
+        size = len(first["value"].encode("utf-8")) + 1
+        retype = f"bn data retype {first['address']} 'char[{size}]'"
+        advice = f" To declare a character array, use `{retype}`; BN may still render an address."
+    counts = ", ".join(f"{n} {label}" for n, label in (
+        (len(strings), "undefined string(s)"), (len(previews), "byte preview(s)")) if n)
     return _warning_row(
-        "string",
-        f"{len(found)} raw address(es) hold an undefined string: {'; '.join(rows[:2])}"
-        + (f"; +{len(found) - 2} more" if len(found) > 2 else "")
-        + f"; define with `{retype}`",
-        f"raw string pointer(s): {len(found)} call argument(s) render as an address "
-        f"that holds a NUL-terminated string BN did not define (so `bn strings` does not "
-        f"list it either): {'; '.join(rows)}" + (f"; and {more} more" if more > 0 else "")
-        + f". To render it inline, define it: `{retype}`.",
-        strings=[{"address": hex(a), "value": v, "call": hex(c)} for a, (v, c) in found.items()],
+        "string" if strings else "bytes",
+        f"{counts}: {'; '.join(rows[:2])}"
+        + (f"; +{len(found) - 2} more" if len(found) > 2 else "") + advice,
+        f"raw call argument(s): {counts}: {'; '.join(rows)}"
+        + (f"; and {more} more" if more > 0 else "")
+        + (". Byte previews do not establish a string type." if previews else ".") + advice,
+        address=hex(next(iter(found.values()))[1]),
+        strings=strings, bytes=previews,
     )
 
 
@@ -1893,10 +1904,10 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
             "table filled at run time reads as zeros")
     steps.append(
         "stores in this decompile that write code or table addresses into what the jump "
-        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table; "
-        "a table a store names is read with `bn evidence table <address>`, where a "
-        "`data_420010` name is the address 0x420010 and a symbol name resolves with "
-        "`bn xrefs a.1` (it prints `resolved 'a.1' as a data symbol @ <address>`)")
+        "reads may name the targets or their table; "
+        "a table a store names is read with `bn evidence table <address>`. "
+        "For a `data_<hex>` placeholder, use its hexadecimal address; "
+        "resolve a symbol with `bn xrefs <symbol>` (its header gives `<address>`)")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
@@ -1917,8 +1928,48 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
                         table=hex(table) if table is not None else None)
 
 
+def _resolved_branch_warnings(bv: Any, func: Any) -> list[dict[str, Any]]:
+    """Report BN's indirect-branch records without reconstructing missing targets."""
+    if _is_plt_stub(bv, func):
+        return []
+    groups: dict[int, set[int]] = {}
+    for branch in getattr(func, "indirect_branches", None) or []:
+        source = int(branch.source_addr)
+        groups.setdefault(source, set()).add(int(branch.dest_addr))
+    warnings = []
+    for source, destinations in sorted(groups.items()):
+        targets = []
+        separate = []
+        for address in sorted(destinations):
+            target: dict[str, Any] = {"address": hex(address)}
+            other = bv.get_function_at(address)
+            if other is not None and int(other.start) == address and address != int(func.start):
+                target["function"] = {"address": hex(address),
+                                      "name": il_format._display_name(other)}
+                separate.append(_function_label(other))
+            targets.append(target)
+        where = hex(source)
+        listed = ", ".join(target["address"] for target in targets[:3])
+        if len(targets) > 3:
+            listed += f" +{len(targets) - 3} more"
+        detail = (f"BN reports indirect branch targets at {where}: "
+                  + ", ".join(target["address"] for target in targets)
+                  + ". These are the targets BN resolved, not a claim that every "
+                  "table entry or possible destination was recovered.")
+        if separate:
+            detail += (" BN models these target addresses as separate function starts: "
+                       + "; ".join(separate)
+                       + ". Their bodies are listed separately; read them with "
+                       "`bn decompile <address>`.")
+        warnings.append(_warning_row(
+            "branch", f"BN resolved {len(targets)} indirect branch target(s) at {where}: "
+            + listed + (f"; {len(separate)} separate function start(s)" if separate else ""),
+            detail, address=where, targets=targets))
+    return warnings
+
+
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")
-_OFFSET_SUMMARY_NAMES = 100
+_OFFSET_SUMMARY_MAX = 240
 
 
 def _type_lookup(bv):
@@ -1971,16 +2022,20 @@ def _this_pointee(func) -> str | None:
     return None
 
 
-def _name_list(names: list[str]) -> str:
-    """Whole names only -- never cut inside one -- while they fit the summary;
-    the rest as a count."""
+def _name_list(names: list[str], budget: int) -> str:
+    """Fit whole names and an omitted count within the caller's total budget."""
     shown: list[str] = []
-    for name in names:
-        if shown and len(", ".join([*shown, name])) > _OFFSET_SUMMARY_NAMES:
+    used = 0
+    for index, name in enumerate(names):
+        rest = len(names) - index - 1
+        suffix = f" +{rest} more" if rest else ""
+        added = len(name) + (2 if shown else 0)
+        if used + added + len(suffix) > budget:
             break
         shown.append(name)
+        used += added
     rest = len(names) - len(shown)
-    return ", ".join(shown) + (f" +{rest} more" if rest else "")
+    return ", ".join(shown) + (f"{' ' if shown else ''}+{rest} more" if rest else "")
 
 
 def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
@@ -2027,16 +2082,18 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
             "the vtable's address point, the value a constructor stores into an object's vptr.")
     if this_type and this_type in missing and this_type not in names:
         parts.append(f"`this` points at {this_type}, which has no definition either.")
-    summary_parts = []
-    if plain:
-        summary_parts.append(f"no type defined for {_name_list(plain)}")
-    if vtables:
-        summary_parts.append(f"vtable object(s), not types: {_name_list(vtables)}")
-    if defined:
-        summary_parts.append(f"defined: {_name_list(defined)}")
-    summary = ("__offset(T, N) is a pointer N bytes into T; "
-               + ("; ".join(summary_parts) or "its base types could not be read"))
-    return _warning_row("offset", summary, " ".join(parts),
+    groups = [(label, group) for label, group in (
+        ("no type defined for ", plain),
+        ("vtable object(s), not types: ", vtables),
+        ("defined: ", defined),
+    ) if group]
+    prefix = "__offset(T, N) is a pointer N bytes into T; "
+    budget = (_OFFSET_SUMMARY_MAX - len(prefix)
+              - sum(len(label) for label, _ in groups) - 2 * max(0, len(groups) - 1))
+    summary_parts = [label + _name_list(group, budget // len(groups))
+                     for label, group in groups]
+    summary = prefix + ("; ".join(summary_parts) or "its base types could not be read")
+    return _warning_row("offset", summary, " ".join(parts), address=hex(int(func.start)),
                         types={"defined": defined, "missing": missing})
 
 
@@ -2156,11 +2213,14 @@ def _decompile(
         warnings.append(arity_warn)
     warnings.extend(_unresolved_jump_warning(func, row, row["address"] in placed)
                     for row in jumps)
+    warnings.extend(_resolved_branch_warnings(bv, func))
     warnings.extend(_split_body_notes(bv, func))
     warnings.extend(_callee_split_notes(bv, func))
     string_note = _raw_string_pointer_note(bv, func, text)
     if string_note:
         warnings.append(string_note)
+    for warning in warnings:
+        warning.setdefault("address", hex(int(func.start)))
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
@@ -3284,7 +3344,10 @@ def _possible_values(ctx, selector, identifier, at):
         for ins in list(il.instructions):
             if int(getattr(ins, "address", -1)) == address:
                 target_ins = ins
-                break
+                # SSA inserts PHIs at the following instruction's address.
+                # Keep a PHI only if there is no actual operation at that site.
+                if il_format._il_op_name(ins) not in ("MLIL_VAR_PHI", "MLIL_MEM_PHI"):
+                    break
     except Exception:
         target_ins = None
     if target_ins is None:
@@ -3323,5 +3386,18 @@ def _possible_values(ctx, selector, identifier, at):
         "source_expression": str(src_expr) if src_expr is not None else None,
         "possible_values": il_format._serialize_pvs(chosen),
     }
+    # The destination's addresses are not possible instruction/return values.
+    # Expose the operand separately, even when its analysis is undetermined,
+    # without changing the instruction/source selection above (#947).
+    opn = il_format._il_op_name(target_ins)
+    if opn.startswith(("MLIL_CALL", "MLIL_TAILCALL")):
+        dest_expr = getattr(target_ins, "dest", None)
+        result["call_destination"] = {
+            "expression": str(dest_expr) if dest_expr is not None else None,
+            "value_basis": "destination_expression",
+            "possible_values": il_format._serialize_pvs(
+                getattr(dest_expr, "possible_values", None) if dest_expr is not None else None
+            ),
+        }
     _annotate_containment(ctx, result, identifier, func)
     return result
