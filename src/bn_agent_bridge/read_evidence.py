@@ -1523,6 +1523,45 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             off += ps
         flush(run_start, run)
 
+    # 3) #967: executable addresses REFERENCED FROM CODE with no function -- the
+    # `sa.sa_handler = on_signal` shape, where an adrp/add (or lea, or a literal-pool
+    # load) materialises a handler's address and BN, never seeing it called, leaves a
+    # bare `data_<addr>` behind. BN records each such address as a data variable with
+    # code refs, so walk the data variables inside CODE regions rather than every
+    # function's IL. Two kinds of site do not nominate: one that only LOADS from the
+    # address (a literal-pool slot, a constant read out of `.text`), and one in a
+    # block that leaves through an indirect branch -- the `adr x3, base; add; br`
+    # jump-table base, measured as the one false lead on an aarch64 libc. A site
+    # whose IL says neither still nominates: BN already decided the reference
+    # exists, and the decode signals carry the rest -- except a decode depth of 0:
+    # an address whose first instruction does not decode cannot be an entry. That
+    # is the aarch64 `adrp` page anchor (BN makes a data variable at the PAGE an
+    # `adrp x0, page; add x0, x0, #off` pair starts from), measured as the one
+    # false lead on an aarch64 libstdc++.
+    code_ref_scan = _CodeRefScan(bv, has_fn, exec_target, max_probes=_MAX_CODE_REF_PROBES)
+    for addr, sites in code_ref_scan:
+        if norm_ptr(addr) in missing:
+            continue        # already nominated by an init/table pointer: keep that lead
+        if _code_signals(addr)[1] == 0:
+            continue
+        first_site, first_fn = sites[0]
+        note_missing(addr, f"code_ref:{first_fn}@{hex(first_site)}")
+        row = missing.get(norm_ptr(addr))
+        if row is not None:
+            row["referenced_from"] = [{"address": hex(site), "function": fn}
+                                      for site, fn in sites[:_MAX_CODE_REF_SITES]]
+            row["referenced_from_total"] = len(sites)
+    if code_ref_scan.capped:
+        warnings.append(
+            f"code-referenced address scan stopped after {_MAX_CODE_REF_PROBES} data "
+            "variable(s) in executable regions; addresses beyond them were not checked")
+    if code_ref_scan.region_walk_failures or code_ref_scan.code_ref_failures:
+        warnings.append(
+            "code-referenced address scan is PARTIAL: BN raised while walking data "
+            f"variables in {code_ref_scan.region_walk_failures} code region(s) (the rest "
+            "of each was not visited) and while reading code refs for "
+            f"{code_ref_scan.code_ref_failures} address(es) (skipped) -- missing "
+            "code_ref candidates are not evidence of absence")
     if scan_capped:
         warnings.append(
             f"data scan capped at {max_scan_bytes} bytes; regions (or their tails) beyond "
@@ -1561,6 +1600,171 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         },
         "warnings": warnings,
     }
+
+
+def _code_regions(bv) -> list[tuple[int, int]]:
+    """The address ranges `evidence surface` treats as CODE for #967's scan: the
+    sections BN calls code, or -- on a raw image with no sections at all -- the
+    executable segments, mirroring the table scan's segment fallback."""
+    sections = list((getattr(bv, "sections", {}) or {}).values())
+    regions: list[tuple[int, int]] = []
+    for sec in sections:
+        start = int(getattr(sec, "start", 0) or 0)
+        end = int(getattr(sec, "end", 0) or 0)
+        if end > start and _section_is_code_like(bv, start) is True:
+            regions.append((start, end))
+    if not sections:
+        for seg in (getattr(bv, "segments", []) or []):
+            if getattr(seg, "executable", False):
+                regions.append((int(seg.start), int(seg.end)))
+    return sorted(regions)
+
+
+def _il_reference_kind(expr, target: int, depth: int = 0) -> str | None:
+    """How an IL expression tree uses *target*: ``"load"`` when it only reads memory
+    AT it, ``"address"`` when it carries it as a value, None when it says neither."""
+    if expr is None or depth > 24:
+        return None
+    op = _op(expr)
+    if op.endswith("_LOAD") or "_LOAD_" in op:
+        src = getattr(expr, "src", None)
+        if _vc_const(src) == target:
+            return "load"
+    elif "CONST" in op or op.endswith("ADDRESS_OF"):
+        if _vc_const(expr) == target:
+            return "address"
+    found = None
+    for operand in getattr(expr, "operands", None) or ():
+        children = operand if isinstance(operand, (list, tuple)) else (operand,)
+        for child in children:
+            if not hasattr(child, "operation"):
+                continue
+            kind = _il_reference_kind(child, target, depth + 1)
+            if kind == "address":
+                return kind
+            found = found or kind
+    return found
+
+
+def _block_ends_in_indirect_branch(func, site: int) -> bool:
+    """Does the basic block holding *site* leave through an indirect branch --
+    resolved (an ``IndirectBranch`` edge) or one BN could not resolve?"""
+    try:
+        bb = func.get_basic_block_at(site)
+    except Exception:
+        return False
+    if bb is None:
+        return False
+    for edge in getattr(bb, "outgoing_edges", None) or ():
+        if str(getattr(getattr(edge, "type", None), "name", "")) == "IndirectBranch":
+            return True
+    try:
+        unresolved = list(getattr(func, "unresolved_indirect_branches", None) or ())
+    except Exception:
+        return False
+    start, end = int(getattr(bb, "start", 0)), int(getattr(bb, "end", 0))
+    return any(start <= int(addr) < end for _arch, addr in unresolved)
+
+
+def _code_ref_site_kind(ref, target: int) -> str | None:
+    """How the code reference at ``ref`` uses *target*: ``"load"`` (it reads memory
+    there), ``"branch_base"`` (it computes the base of a jump table or computed
+    goto: the referencing block leaves through an indirect branch), ``"address"``
+    (its IL carries the address as a value), or None when the IL says neither."""
+    func = getattr(ref, "function", None)
+    site = getattr(ref, "address", None)
+    if func is None or site is None:
+        return None
+    try:
+        llils = list(func.get_llils_at(int(site)) or [])
+    except Exception:
+        llils = []
+    kind = None
+    for llil in llils:
+        for expr in (getattr(llil, "mlil", None), llil):
+            this = _il_reference_kind(expr, target)
+            if this == "address":
+                kind = this
+                break
+            kind = kind or this
+        if kind == "address":
+            break
+    if kind != "load" and _block_ends_in_indirect_branch(func, int(site)):
+        return "branch_base"
+    return kind
+
+
+# A site that uses a code-region address as data, not as a pointer to a routine.
+_NON_NOMINATING_SITE_KINDS = frozenset({"load", "branch_base"})
+
+
+# #967: an upper bound on the data variables the code-reference scan inspects, so a
+# monolithic image whose single r-x segment is mostly data cannot stall the command.
+_MAX_CODE_REF_PROBES = 20_000
+# Referencing sites carried per candidate; the rest are reachable with `bn xrefs`.
+_MAX_CODE_REF_SITES = 4
+
+
+class _CodeRefScan:
+    """#967: iterate ``(address, [(site, function name), ...])`` for every
+    function-less, code-referenced address in a code region, sites sorted. After
+    iteration ``capped`` says whether the probe budget stopped the walk early, and
+    the two failure counters say whether BN errors made it PARTIAL: a region whose
+    data-variable walk raised (the rest of that region was not visited) and an
+    address whose code refs could not be read (it was skipped). A partial scan
+    must not read as a complete one."""
+
+    def __init__(self, bv, has_fn, exec_target, *, max_probes: int):
+        self._bv = bv
+        self._has_fn = has_fn
+        self._exec_target = exec_target
+        self._max_probes = max_probes
+        self.capped = False
+        self.region_walk_failures = 0
+        self.code_ref_failures = 0
+
+    def _data_var_starts(self, start: int, end: int):
+        """Addresses of BN's data variables in ``[start, end)``, in order."""
+        stepper = getattr(self._bv, "get_next_data_var_start_after", None)
+        if not callable(stepper):
+            return
+        addr = start - 1
+        while True:
+            try:
+                nxt = int(stepper(addr))
+            except Exception:
+                self.region_walk_failures += 1
+                return
+            if nxt <= addr or nxt >= end:
+                return
+            yield nxt
+            addr = nxt
+
+    def __iter__(self):
+        bv = self._bv
+        probes = 0
+        for start, end in _code_regions(bv):
+            for addr in self._data_var_starts(start, end):
+                if probes >= self._max_probes:
+                    self.capped = True
+                    return
+                probes += 1
+                if self._has_fn(addr) or not self._exec_target(addr):
+                    continue
+                try:
+                    refs = list(bv.get_code_refs(addr) or [])
+                except Exception:
+                    self.code_ref_failures += 1
+                    continue
+                sites: list[tuple[int, str]] = []
+                for ref in refs:
+                    if _code_ref_site_kind(ref, addr) in _NON_NOMINATING_SITE_KINDS:
+                        continue
+                    func = getattr(ref, "function", None)
+                    sites.append((int(getattr(ref, "address", 0) or 0),
+                                  str(getattr(func, "name", "") or "?")))
+                if sites:
+                    yield addr, sorted(sites)
 
 
 def _as_int(v: Any) -> int:

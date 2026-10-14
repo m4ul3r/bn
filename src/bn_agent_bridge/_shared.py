@@ -156,10 +156,13 @@ IMPORT_SYMBOL_TYPE_NAMES = frozenset(
 )
 
 
-def is_imported_function(fn) -> bool:
-    sym = getattr(fn, "symbol", None)
+def is_imported_symbol(sym) -> bool:
     sym_type = getattr(sym, "type", None)
     return getattr(sym_type, "name", None) in IMPORT_SYMBOL_TYPE_NAMES
+
+
+def is_imported_function(fn) -> bool:
+    return is_imported_symbol(getattr(fn, "symbol", None))
 
 
 def is_auto_function_name(name: str) -> bool:
