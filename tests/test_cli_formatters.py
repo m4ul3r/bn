@@ -4165,8 +4165,8 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # row's `arity_witnesses`. Covered by name in
         # `test_render_evidence_states_each_arity_witness_and_the_function_tally_865`,
         # which drives the nested payload and asserts the `?` refusal.
-        "_render_arity_witness(declared_arity) [not a payload renderer]",
-        "_render_arity_witness(witness_arity) [not a payload renderer]",
+        "_arity_witness_text(declared_arity) [not a payload renderer]",
+        "_arity_witness_text(witness_arity) [not a payload renderer]",
         # #795 round-6 review: the class lens states these two on its
         # COUNT-ONLY branch, which this differential's context never takes --
         # it fills every harvested key, so the listing branch always wins.
@@ -5351,6 +5351,30 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
     out = _render_function_evidence_text({**value, "calls": [row]})
     assert "callee_body=agreement (body uses ? up to x1, prototype 2)" in out
     assert "malformed witness_arity field" in out
+
+    # Review of #991: the refusal is scoped to the value that was malformed. A
+    # malformed row before a clean one, and a malformed tally beside a clean one,
+    # must leave the clean ones stating their numbers.
+    bad, good = copy.deepcopy(value["calls"][1]), copy.deepcopy(value["calls"][1])
+    bad["address"], good["address"] = "0x1000", "0x1004"
+    bad["arity_witnesses"]["callee_body"]["witness_arity"] = "many"
+    two_rows = {
+        **value,
+        "arity_witness_counts": {
+            "library": {"agreement": "x", "contradiction": 0, "unavailable": 2, "refused": 0},
+            "callee_body": {"agreement": 2, "contradiction": 0, "unavailable": 0, "refused": 0},
+        },
+        "calls": [bad, good],
+    }
+    out = _render_function_evidence_text(two_rows)
+    rows = out.split("- 0x")
+    assert "body uses ? up to x1" in rows[1]
+    assert "callee_body=agreement (body uses 2 up to x1, prototype 2)" in rows[2]
+    assert "library agreement ?, contradiction 0" in out
+    assert "callee_body agreement 2, contradiction 0" in out
+    # Both refusals are still disclosed by name on the card.
+    note = out.split("\n! malformed ", 1)[1]
+    assert "witness_arity" in note and "agreement" in note
 
 
 def test_render_evidence_function_shows_recorded_local_tailcall_target_704():

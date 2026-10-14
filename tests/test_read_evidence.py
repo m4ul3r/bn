@@ -5177,6 +5177,80 @@ def test_each_arity_witness_reports_its_own_verdict_865(
     assert call["argument_confidence"] == confidence
 
 
+def _two_disagreeing_libraries(bv):
+    def lib(name, count):
+        proto = types.SimpleNamespace(
+            parameters=[types.SimpleNamespace(name=f"p{i}") for i in range(count)],
+            has_variable_arguments=False)
+        return types.SimpleNamespace(
+            name=name, get_named_object=lambda n, _p=proto: _p if str(n) == "hw_get_version" else None)
+    bv.type_libraries = [lib("libfirst.so", 1), lib("libsecond.so", 3)]
+    _as_import(bv)
+
+
+def _variadic_callee_with_library(bv):
+    _with_type_library(bv, symbol="hw_get_version", params=2)
+    _as_import(bv)
+    _callee(bv).type.has_variable_arguments = True
+
+
+def _no_declared_arity(bv):
+    callee = _callee(bv)
+    callee.type.parameters = None
+    callee.parameter_vars = None
+
+
+def _no_declared_arity_imported_with_library(bv):
+    _no_declared_arity(bv)
+    _with_type_library(bv, symbol="hw_get_version", params=2)
+    _as_import(bv)
+
+
+def _no_declared_arity_local_with_body(bv):
+    _no_declared_arity(bv)
+    _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))
+
+
+def _no_abi_registers(bv):
+    _callee(bv).calling_convention = types.SimpleNamespace(int_arg_regs=[])
+    _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))
+
+
+@pytest.mark.parametrize(
+    ("setup", "witness", "verdict"),
+    [
+        pytest.param(_two_disagreeing_libraries, "library",
+                     {"status": "refused", "reason": "libraries_disagree"},
+                     id="libraries-disagree"),
+        pytest.param(_variadic_callee_with_library, "library",
+                     {"status": "refused", "reason": "variadic_callee"},
+                     id="library-variadic-callee"),
+        pytest.param(_no_declared_arity_imported_with_library, "library",
+                     {"status": "refused", "reason": "no_declared_arity"},
+                     id="library-no-declared-arity"),
+        pytest.param(_no_declared_arity_local_with_body, "callee_body",
+                     {"status": "refused", "reason": "no_declared_arity"},
+                     id="body-no-declared-arity"),
+        pytest.param(_no_abi_registers, "callee_body",
+                     {"status": "refused", "reason": "no_abi_registers"},
+                     id="body-no-abi-registers"),
+    ],
+)
+def test_each_refusal_reason_is_stated_and_never_demotes_on_its_own_865(
+    monkeypatch, setup, witness, verdict,
+):
+    """#865: the refusals the first table does not reach. Each is stated as
+    `refused` with its reason, and a refusal by itself never contradicts: where
+    the row is demoted, it is for a reason of its own (`arity_unknown` on an
+    undeclared prototype), never because a witness refused."""
+    _, call = _witness_call(monkeypatch, setup=setup)
+    assert call["arity_witnesses"][witness] == verdict
+    assert "prototype_unverified" not in call
+    assert "callee_under_recovered" not in call
+    if call["argument_confidence"] != "recovered":
+        assert call["arity_unknown"] is True
+
+
 def test_arity_witness_counts_tally_the_full_call_set_not_the_page_865(monkeypatch):
     """#865: the function-level tally is over EVERY call row, like the hoisted
     warnings, so a paged reader still sees how much of the card any witness backs."""

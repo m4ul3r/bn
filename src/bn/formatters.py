@@ -3237,9 +3237,34 @@ def _witness_items(mapping: dict[str, Any]) -> list[tuple[str, Any]]:
                     if name not in _WITNESS_ORDER]
 
 
+def _scoped_reads(read: Callable[[], str]) -> str:
+    """Run *read* inside its own skew capture, then re-record what it refused.
+
+    `_stated_count` answers `?` whenever `_field_skewed(key)` is true, and that
+    record covers the WHOLE render keyed by field name only -- so one malformed
+    `witness_arity` on one row would turn every later row's well-formed one into
+    `?`, and one witness's malformed `agreement` tally the other's (#865
+    review). The class listing's per-row `method_count` capture is the same
+    repair; re-recording keeps the card's disclosure naming the field."""
+    token = _SKEWED_FIELDS.set([])
+    try:
+        text = read()
+        unreadable = list(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    return text
+
+
 def _render_arity_witness(name: str, verdict: dict[str, Any]) -> str:
     """One witness verdict as `name=status (detail)` (#865). Read through the
-    field choke points, so a skewed field is disclosed rather than dropped."""
+    field choke points, so a skewed field is disclosed rather than dropped, and
+    inside its own capture, so it is disclosed for THIS verdict only."""
+    return _scoped_reads(lambda: _arity_witness_text(name, verdict))
+
+
+def _arity_witness_text(name: str, verdict: dict[str, Any]) -> str:
     if not verdict:
         return f"{name}=no verdict"
     status = _text_value(verdict, "status")
@@ -3279,8 +3304,9 @@ def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> st
     parts = []
     for name, _ in _witness_items(counts):
         tally = _field_dict(counts, name)
-        cells = ", ".join(f"{status} {_stated_count(tally, status)}"
-                          for status in _WITNESS_STATUSES if status in tally)
+        cells = _scoped_reads(lambda tally=tally: ", ".join(
+            f"{status} {_stated_count(tally, status)}"
+            for status in _WITNESS_STATUSES if status in tally))
         parts.append(f"{name} {cells}" if cells else f"{name} no tally")
     scope = f" over {total_calls} call(s)" if isinstance(total_calls, int) else ""
     return (f"arity witnesses{scope}: " + "; ".join(parts)
